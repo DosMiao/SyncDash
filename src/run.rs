@@ -7,9 +7,19 @@ use crate::table::Snapshot;
 use crate::{apply, compare, scan};
 use std::path::Path;
 
-pub fn compare_job(job: &Job) -> std::io::Result<Plan> {
+/// 严谨级 → 扫描参数：quick（不 hash）| standard（hash+缓存）| paranoid（全量重 hash）
+fn scan_opts(job: &Job) -> scan::ScanOptions {
     let filter = crate::filter::PathFilter::build(&job.include, &job.exclude);
-    let opt = scan::ScanOptions { hash: !job.no_hash, filter };
+    let (hash, force_rehash) = match job.rigor.as_str() {
+        "quick" => (false, false),
+        "paranoid" => (true, true),
+        _ => (true, false),
+    };
+    scan::ScanOptions { hash: hash && !job.no_hash, force_rehash, filter }
+}
+
+pub fn compare_job(job: &Job) -> std::io::Result<Plan> {
+    let opt = scan_opts(job);
     for (label, r) in [("source", &job.source), ("target", &job.target)] {
         if !r.is_dir() {
             return Err(std::io::Error::new(
@@ -24,7 +34,8 @@ pub fn compare_job(job: &Job) -> std::io::Result<Plan> {
         (Some(p), "sync") if p.is_file() => Some(Snapshot::load(p)?),
         _ => None,
     };
-    Ok(compare::compare(&s, &t, &job.mode, archive.as_ref(), false))
+    let copts = compare::CompareOptions { case_insensitive: !job.case_sensitive };
+    Ok(compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts))
 }
 
 /// 执行选中的 ops；全部成功且是 sync 模式时刷新 archive（冲突路径从存档剔除，下次继续报冲突）。
@@ -33,7 +44,7 @@ pub fn apply_job(job: &Job, plan: &Plan, ops: &[Op], trash: Option<std::path::Pa
         ops,
         Path::new(&plan.header.source_root),
         Path::new(&plan.header.target_root),
-        &apply::ApplyOptions { dry_run: false, trash, verbose },
+        &apply::ApplyOptions { dry_run: false, trash, verbose, verify: job.rigor == "paranoid" },
     );
     if errors == 0 && job.mode == "sync" {
         if let Some(arch_path) = &job.archive {
@@ -43,8 +54,7 @@ pub fn apply_job(job: &Job, plan: &Plan, ops: &[Op], trash: Option<std::path::Pa
                 .filter(|o| o.action == Action::Conflict)
                 .map(|o| o.path.as_str())
                 .collect();
-            let filter = crate::filter::PathFilter::build(&job.include, &job.exclude);
-            let opt = scan::ScanOptions { hash: !job.no_hash, filter };
+            let opt = scan_opts(job);
             if let Ok(mut snap) = scan::scan(&job.source, &opt) {
                 snap.header.kind = "archive".into();
                 snap.entries.retain(|e| !conflicted.contains(e.path.as_str()));

@@ -1,11 +1,11 @@
 //! GUI（参考 FFS 的核心交互）：任务下拉 → Compare → 差异表（勾选+方向徽章）→ Synchronize。
 //! 后台线程跑扫描/执行，界面不卡；conflict/note 行默认不勾且不可勾。
 
-use crate::compare::{Action, Op, Plan, Side};
-use crate::config::{self, Job};
-use crate::run;
 use eframe::egui;
 use std::sync::{Arc, Mutex};
+use syncdash::compare::{Action, Op, Plan, Side};
+use syncdash::config::{self, Job};
+use syncdash::run;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Phase {

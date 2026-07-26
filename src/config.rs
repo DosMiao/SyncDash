@@ -21,6 +21,16 @@ pub struct Job {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub no_hash: bool,
+    /// 严谨级：quick（不 hash，size+mtime）| standard（hash＋缓存，默认）| paranoid（全量重 hash＋复制后校验）
+    #[serde(default = "default_rigor")]
+    pub rigor: String,
+    /// 默认 false（大小写不敏感匹配——NTFS/APFS 默认行为）；true 则大小写敏感
+    #[serde(default)]
+    pub case_sensitive: bool,
+}
+
+fn default_rigor() -> String {
+    "standard".into()
 }
 
 pub fn jobs_dir() -> PathBuf {
@@ -77,5 +87,7 @@ target = '\\host\share\dir'
 # archive = 'C:\Users\me\AppData\Roaming\syncdash\archive\<名字>.jsonl'   # sync 模式用
 # include = ['*']                       # FFS 过滤器语法白名单（留空 = 全部）
 # exclude = ['*/big_temp/', '*/*.log']  # FFS 语法；默认垃圾/可重建排除已内置
+# rigor = "standard"                    # quick | standard | paranoid（复制后校验）
+# case_sensitive = false                # 默认大小写不敏感（NTFS/APFS 默认行为）
 # no_hash = false
 "#;

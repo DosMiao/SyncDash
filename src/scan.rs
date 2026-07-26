@@ -18,6 +18,16 @@ fn file_id(_md: &std::fs::Metadata) -> Option<String> {
     None
 }
 
+#[cfg(unix)]
+fn unix_mode(md: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Some(md.mode() & 0o7777)
+}
+#[cfg(not(unix))]
+fn unix_mode(_md: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
 fn mtime_ms(md: &std::fs::Metadata) -> i64 {
     md.modified()
         .ok()
@@ -83,6 +93,8 @@ fn save_cache(root: &Path, entries: &[Entry]) {
 
 pub struct ScanOptions {
     pub hash: bool,
+    /// paranoid 严谨级：无视 (size,mtime) 缓存，全部重新 hash
+    pub force_rehash: bool,
     /// FFS 语义的过滤器（见 filter.rs），默认排除已内置
     pub filter: crate::filter::PathFilter,
 }
@@ -135,18 +147,20 @@ pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
         };
         if item.file_type().is_dir() {
             if opt.filter.pass_dir(&rel).0 {
-                entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None });
+                entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None });
             }
         } else if item.file_type().is_symlink() {
-            entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None });
+            entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None });
         } else {
             let size = md.len();
             let mt = mtime_ms(&md);
             let mut hash = None;
             if opt.hash {
-                if let Some((cs, cm, ch)) = cache.get(&rel) {
-                    if *cs == size && *cm == mt {
-                        hash = Some(ch.clone());
+                if !opt.force_rehash {
+                    if let Some((cs, cm, ch)) = cache.get(&rel) {
+                        if *cs == size && *cm == mt {
+                            hash = Some(ch.clone());
+                        }
                     }
                 }
                 if hash.is_none() {
@@ -157,7 +171,7 @@ pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
                     }
                 }
             }
-            entries.push(Entry { path: rel, kind: EntryKind::File, size, mtime_ms: mt, hash, file_id: file_id(&md) });
+            entries.push(Entry { path: rel, kind: EntryKind::File, size, mtime_ms: mt, hash, file_id: file_id(&md), mode: unix_mode(&md) });
         }
     }
 

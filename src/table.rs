@@ -39,6 +39,9 @@ pub struct Entry {
     /// unix: dev:inode；windows 暂空。仅用于同机 move 佐证，跨机靠 hash。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_id: Option<String>,
+    /// unix 权限位（八进制 mode）。SMB 传不过去 exec 位，先记录，v0.4 打包模式恢复用。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mode: Option<u32>,
 }
 
 pub struct Snapshot {

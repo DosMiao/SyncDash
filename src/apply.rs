@@ -12,6 +12,8 @@ pub struct ApplyOptions {
     pub dry_run: bool,
     pub trash: Option<PathBuf>,
     pub verbose: bool,
+    /// paranoid 严谨级：复制/更新后重读目标文件校验 blake3（FFS "verify copied files" 同款）
+    pub verify: bool,
 }
 
 fn default_trash() -> PathBuf {
@@ -114,6 +116,19 @@ pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOpti
                         move_to_trash(&dst, &op.path, &trash)?;
                     }
                     std::fs::copy(&src, &dst)?;
+                    if opt.verify {
+                        if let Some(expect) = &op.hash {
+                            let mut hasher = blake3::Hasher::new();
+                            hasher.update_mmap_rayon(&dst)?;
+                            let got = hasher.finalize().to_hex().to_string();
+                            if &got != expect {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("verify failed after copy: expected {expect}, got {got}"),
+                                ));
+                            }
+                        }
+                    }
                     if let Some(mt) = op.mtime_ms {
                         set_mtime(&dst, mt);
                     } else if let Ok(md) = std::fs::metadata(&src) {

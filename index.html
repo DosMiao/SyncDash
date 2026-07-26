@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SyncDash</title>
+  <link rel="stylesheet" href="/typescript/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="brand">Sync<span>Dash</span></div>
+      <div id="joblist"></div>
+      <div id="jobsdir" class="dim"></div>
+    </aside>
+    <main id="main">
+      <header id="toolbar">
+        <button id="btn-compare" class="btn primary" disabled>Compare</button>
+        <button id="btn-sync" class="btn accent" disabled>Synchronize</button>
+        <label class="chkall"><input type="checkbox" id="chk-all" checked /> 全选</label>
+        <span id="stats" class="stats"></span>
+        <span id="spin" class="spinner hidden"></span>
+      </header>
+      <div id="pathline" class="pathline mono dim"></div>
+      <div id="tablewrap">
+        <div id="empty" class="empty">← 选择任务，然后 Compare</div>
+        <table id="plantable" class="hidden">
+          <thead>
+            <tr>
+              <th class="c-chk"></th>
+              <th class="c-act">action</th>
+              <th>path</th>
+              <th>from</th>
+              <th class="c-size">size</th>
+              <th>reason</th>
+            </tr>
+          </thead>
+          <tbody id="planbody"></tbody>
+        </table>
+      </div>
+      <footer id="status">就绪</footer>
+    </main>
+  </div>
+  <script type="module" src="/typescript/main.ts"></script>
+</body>
+</html>

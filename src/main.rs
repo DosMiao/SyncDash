@@ -1,16 +1,9 @@
-mod apply;
-mod compare;
-mod config;
-mod filter;
 mod gui;
-mod lock;
-mod run;
-mod scan;
-mod table;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use compare::{Action, Op};
 use std::path::PathBuf;
+use syncdash::compare::{Action, Op};
+use syncdash::{apply, compare, config, filter, run, scan, table};
 
 #[derive(Parser)]
 #[command(name = "syncdash", version, about = "Table-driven multi-node file sync (scan -> compare -> apply)")]
@@ -69,6 +62,9 @@ enum Cmd {
         /// 跳过内容 hash（快，但比对退化为 size+mtime，且无法做移动检测）
         #[arg(long)]
         no_hash: bool,
+        /// 无视 hash 缓存，全部重新 hash（paranoid）
+        #[arg(long)]
+        force_rehash: bool,
         /// 追加排除（FFS 过滤器语法，如 */big_temp/ 或 */*.log，可多次）
         #[arg(long)]
         exclude: Vec<String>,
@@ -87,6 +83,9 @@ enum Cmd {
         /// sync 无 archive 时，差异按"新者胜"解决（默认只报冲突）
         #[arg(long)]
         resolve_newer: bool,
+        /// 大小写敏感匹配（默认不敏感——NTFS/APFS 默认行为）
+        #[arg(long)]
+        case_sensitive: bool,
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -101,6 +100,9 @@ enum Cmd {
         target_root: Option<PathBuf>,
         #[arg(long)]
         trash: Option<PathBuf>,
+        /// 复制后重读校验 blake3（paranoid）
+        #[arg(long)]
+        verify: bool,
         #[arg(short, long)]
         verbose: bool,
     },
@@ -195,12 +197,12 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             gui::run_gui(job).map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(0)
         }
-        Cmd::Scan { root, out, no_hash, exclude } => {
+        Cmd::Scan { root, out, no_hash, force_rehash, exclude } => {
             if !root.is_dir() {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
             }
-            let snap = scan::scan(&root, &scan::ScanOptions { hash: !no_hash, filter: filter::PathFilter::build(&[], &exclude) })?;
+            let snap = scan::scan(&root, &scan::ScanOptions { hash: !no_hash, force_rehash, filter: filter::PathFilter::build(&[], &exclude) })?;
             eprintln!(
                 "scanned {} entries in {} ms ({})",
                 snap.header.entry_count, snap.header.duration_ms, snap.header.root
@@ -208,7 +210,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             write_out(&out, |w| snap.write_to(w))?;
             Ok(0)
         }
-        Cmd::Compare { source, target, mode, archive, resolve_newer, out } => {
+        Cmd::Compare { source, target, mode, archive, resolve_newer, case_sensitive, out } => {
             let s = table::Snapshot::load(&source)?;
             let t = table::Snapshot::load(&target)?;
             let a = match &archive {
@@ -220,7 +222,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 Mode::Sync => "sync",
                 Mode::Enrich => "enrich",
             };
-            let plan = compare::compare(&s, &t, mode_str, a.as_ref(), resolve_newer);
+            let plan = compare::compare(&s, &t, mode_str, a.as_ref(), resolve_newer, &compare::CompareOptions { case_insensitive: !case_sensitive });
             eprintln!(
                 "plan: {} op(s), {} conflict(s)  [{} -> {}]",
                 plan.header.op_count, plan.header.conflict_count, plan.header.source_root, plan.header.target_root
@@ -228,7 +230,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             write_out(&out, |w| plan.write_to(w))?;
             Ok(if plan.header.conflict_count > 0 { 1 } else { 0 })
         }
-        Cmd::Apply { plan, apply: do_apply, source_root, target_root, trash, verbose } => {
+        Cmd::Apply { plan, apply: do_apply, source_root, target_root, trash, verify, verbose } => {
             let p = compare::Plan::load(&plan)?;
             let sr = source_root.unwrap_or_else(|| PathBuf::from(&p.header.source_root));
             let tr = target_root.unwrap_or_else(|| PathBuf::from(&p.header.target_root));
@@ -238,7 +240,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     return Ok(2);
                 }
             }
-            let (done, skipped, errors) = apply::apply(&p.ops, &sr, &tr, &apply::ApplyOptions { dry_run: !do_apply, trash, verbose });
+            let (done, skipped, errors) = apply::apply(&p.ops, &sr, &tr, &apply::ApplyOptions { dry_run: !do_apply, trash, verbose, verify });
             println!(
                 "{}: {done} done, {skipped} {}, {errors} error(s)",
                 if do_apply { "applied" } else { "dry-run" },
