@@ -84,6 +84,9 @@ let ovFilter: string | null = null;
 let ovExpanded = new Set<string>();
 /// M4：任务名 → 最近一次运行
 let lastMap: Record<string, RunRecord> = {};
+/// 路径显示模式：rel = 相对比对根目录（offset），full = 完整路径
+type PathMode = 'rel' | 'full';
+let pathMode: PathMode = localStorage.getItem('sd.pathmode') === 'full' ? 'full' : 'rel';
 /// 用户在确认单里勾了"我确认无误"（等同 CLI --i-know）；每次重新比对后归零
 let acknowledged = false;
 
@@ -126,6 +129,35 @@ function category(op: OpDto): Chip {
     case 'move': return 'move';
     case 'delete': case 'delete_dir': return 'delete';
     default: return 'conflict';
+  }
+}
+
+function sepOf(root: string): string {
+  return root.includes('\\') ? '\\' : '/';
+}
+function fullPath(root: string, rel: string): string {
+  const sep = sepOf(root);
+  const r = root.endsWith(sep) ? root.slice(0, -1) : root;
+  return r + sep + (sep === '\\' ? rel.replace(/\//g, '\\') : rel);
+}
+
+/// 该行在 source / target 侧**现存**的路径（比对时点的状态，非执行后）：
+/// copy 只存在于来源侧；delete 只存在于被删侧；move 的执行侧还叫 from、对面已是 path；
+/// update/chmod/conflict/note 双侧都有。
+function sidePaths(op: OpDto): [string | null, string | null] {
+  const execOnTarget = op.side === 'target';
+  switch (op.action) {
+    case 'copy':
+      return execOnTarget ? [op.path, null] : [null, op.path];
+    case 'move': {
+      const cur = op.from ?? op.path;
+      return execOnTarget ? [op.path, cur] : [cur, op.path];
+    }
+    case 'delete':
+    case 'delete_dir':
+      return execOnTarget ? [null, op.path] : [op.path, null];
+    default:
+      return [op.path, op.path];
   }
 }
 
@@ -329,14 +361,21 @@ function renderTable() {
     }
     tdAct.appendChild(span);
 
-    const tdPath = document.createElement('td');
-    tdPath.className = 'mono';
-    tdPath.textContent = op.path;
-    tdPath.title = op.path;
-
-    const tdFrom = document.createElement('td');
-    tdFrom.className = 'mono dim';
-    tdFrom.textContent = op.from ?? '';
+    // 左右双路径列（FFS 双栏语义）；tooltip 恒为完整路径
+    const [sp, tp] = sidePaths(op);
+    const mkPath = (p: string | null, root: string) => {
+      const td = document.createElement('td');
+      td.className = 'mono c-path';
+      if (p) {
+        td.textContent = pathMode === 'full' ? fullPath(root, p) : p;
+        td.title = fullPath(root, p);
+      } else {
+        td.classList.add('dim');
+      }
+      return td;
+    };
+    const tdPath = mkPath(sp, plan.header.source_root);
+    const tdFrom = mkPath(tp, plan.header.target_root);
 
     const tdSize = document.createElement('td');
     tdSize.className = 'c-size mono';
@@ -802,6 +841,19 @@ $('btn-log').addEventListener('click', openLogPanel);
 logBack.addEventListener('click', logShowList);
 $('log-close').addEventListener('click', () => logModal.classList.add('hidden'));
 logModal.addEventListener('click', (e) => { if (e.target === logModal) logModal.classList.add('hidden'); });
+
+// 路径显示模式切换（相对 ↔ 完整；记住选择）
+const btnPathMode = $<HTMLButtonElement>('btn-pathmode');
+function renderPathModeBtn() {
+  btnPathMode.textContent = pathMode === 'rel' ? '相对路径' : '完整路径';
+}
+btnPathMode.addEventListener('click', () => {
+  pathMode = pathMode === 'rel' ? 'full' : 'rel';
+  localStorage.setItem('sd.pathmode', pathMode);
+  renderPathModeBtn();
+  renderTable();
+});
+renderPathModeBtn();
 
 // M3 Overview 折叠/清除
 const ovEl = $('overview');

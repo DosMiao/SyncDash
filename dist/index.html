@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SyncDash</title>
-  <script type="module" crossorigin src="/assets/main-DegoIzCs.js"></script>
-  <link rel="modulepreload" crossorigin href="/assets/event-C9Lv0RyS.js">
-  <link rel="stylesheet" crossorigin href="/assets/event-BSX9xl3v.css">
+  <script type="module" crossorigin src="/assets/main-BVZAbb9B.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/event-B_GLANzP.js">
+  <link rel="stylesheet" crossorigin href="/assets/event-B11hpqUo.css">
 </head>
 <body>
   <div id="dragstrip" data-tauri-drag-region></div>
@@ -33,6 +33,7 @@
       <div id="filterbar" class="hidden">
         <input id="search" class="mono" type="text" placeholder="搜索 path / from / reason   (Ctrl+F)" />
         <div id="chips"></div>
+        <button id="btn-pathmode" class="btn" title="切换：相对（相对比对根目录）↔ 完整路径">相对路径</button>
       </div>
       <div id="reviewrow">
       <aside id="overview" class="collapsed">
@@ -49,8 +50,8 @@
             <tr>
               <th class="c-chk"><input type="checkbox" id="chk-head" checked title="全选/全不选（当前视图）" /></th>
               <th class="c-act">action <span class="dim thin">（点徽章翻方向）</span></th>
-              <th>path</th>
-              <th>from</th>
+              <th class="c-path">source 侧</th>
+              <th class="c-path">target 侧</th>
               <th class="c-size">size</th>
               <th>reason</th>
             </tr>
