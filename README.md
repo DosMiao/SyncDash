@@ -119,6 +119,27 @@ FFS 还有而我们暂缺的：GUI 内编辑过滤器/任务 —— 在 roadmap�
 - **文件属性**：unix mode（exec 位等）已记录进快照表（`mode` 字段）；SMB 带不动它，
   v0.4 打包模式负责恢复。复制后显式回写 mtime，保证下次比对的相等判定成立。
 
+### 版本控制（v0.8，可选：`versioning = true`）
+
+开启后，被删/被覆盖的文件不再进本机 trash，而是存进**该 root 自己的 `.version_syncDash/`**——
+历史跟着数据走，两台机器经 SMB 都能看见、都能恢复：
+
+```
+<root>/.version_syncDash/
+  index.jsonl                版本索引（id、时间、主机、op 数、保存数、字节）
+  <id>/plan.jsonl            本次执行的指令清单（审计）
+  <id>/manifest.json         保存条目：whole|rdelta、各 hash、原 mtime/mode
+  <id>/files/<rel>           原内容整存（小文件、被删除文件）
+  <id>/rdelta/<rel>          FastCDC 反向补丁（≥4MB 被覆盖文件：旧文件 = 新文件已有块 + 旧独有块 blob）
+```
+
+- `syncdash versions <root> [--prune N]` —— 列出/清理版本历史
+- `syncdash restore <root> --version <id> [--file rel]... [--apply]` —— 找回（默认 dry-run；
+  rdelta 要求当前文件与记录的 new_hash 一致，重组后按 old_hash 校验；被顶掉的当前内容留在旁路目录，不销毁）
+- 实测：5MB 文件被覆盖，版本库只占 70,602 B（1.3%）；restore 后 SHA256 与原始逐位一致
+- 全链路生效：本地 apply、`apply-pack --versioning`、远程管线自动透传；scan 与 FFS 生成器
+  模板都排除 `.version_syncDash/`，版本库绝不会被当成数据同步出去
+
 ### sync 与 archive（Unison 思路）
 
 “对面没有这个文件”天然有两种解释：**它是我新增的**（该复制过去）还是**对面删掉的**（该跟着删）？
@@ -207,6 +228,7 @@ source 侧回拉经挂载路径直落 → archive 刷新。`gen-jobs --remote-ho
 - [x] v0.5 `territories` / `gen-jobs`：扫 `.ffs-sync` 标记为每个领地生成 `cs-<slug>.toml`（sync 模式＋自动 archive 路径）——syncdash 版 CodeSync 生成器，11 个领地实测生成；与 FFS 并行运行，切换时机由使用者定
 - [x] v0.6 `run --all`/`--prefix`；ssh 远程管线一条龙（job 配 remote_host 即启用，真机验证：dry→apply→复跑 0 ops，含 symlink）；symlink 策略 exclude/direct（按指向比对，apply 建/换/删链接本身）；同父目录 rename 优先配对（reason 区分 rename/move）；git bundle 经 SMB 更新 Mac（挂载不在线时的通道）
 - [x] v0.7 三个"后续候选"全部落地：**Windows 作为远端**（`recv` 子命令用 Rust 原始 stdin 收包、按 probe 的 os 选 shell 方言：PowerShell 单引号翻倍＋chcp 65001 前奏＋`& 'exe'`；实测 Mac 反向驱动 Windows：8.4MB 包经 ssh stdin 落地、apply-pack 执行、复跑 0 ops）；**FastCDC 增量传输**（16K/64K/256K v2020，远端 `chunks` 出块表，≥4MB 更新只传缺失块＋重组 recipe，blob/base/成品三重 blake3；实测 8MB 改 6KB 只传 148KB，省 98.2%）；**GUI 任务编辑**（egui：New/Edit/Delete 全字段表单＋校验＋二次确认删除；`config::save_job/delete_job` 供桌面壳复用）
+- [x] v0.8 可选版本控制：root 内 `.version_syncDash/`（plan 指令清单＋整存＋FastCDC 反向补丁）＋ `versions`/`restore` 命令；实测大文件旧版占 1.3%、restore 哈希逐位一致
 - **roadmap 全部完成**。仅存的远期方向：版本向量 P2P（见"多端"——明确非目标，除非出现绕过 hub 的直连写入）
 
 ## 构建
