@@ -66,8 +66,14 @@ FFS 形态的暗色双栏界面：左侧任务列表（模式徽章：mirror 蓝
 统计条（项数 / 已选 / 待传字节 / 冲突）→ **Synchronize** 执行勾选项，完成后**自动复比对**验证收敛。
 conflict/note 行锁定不可勾。前端零框架（Vite + 原生 TS，约 400 行）。
 
-旧 egui 界面保留在 CLI（`syncdash gui`），功能同前。
-FFS 还有而我们暂缺的：逐行翻转方向、GUI 内编辑过滤器/任务 —— 在 roadmap。
+v0.3.2 追加：**逐行翻转方向**（点动作徽章切换，语义由核心 `reverse_op` 预计算：copy↔delete 互逆、update 换边；
+翻转行虚线边框+底色提示）、**筛选 chips**（全部/复制/更新/移动/删除/冲突，实时计数，0 项变淡——GitDash 风格）、
+**搜索框**（path/from/reason 子串）、**同步前确认单**（分类计数+字节数，删除红色高亮）、
+**比对进度事件**（扫描 source → 扫描 target → 比对中，状态栏实时显示）、**快捷键**（Ctrl/⌘+R 比对、
+Ctrl/⌘+F 搜索、Enter 同步、Esc 关弹层）、**Mac 沉浸式标题栏**（Overlay + 红绿灯让位 + 顶部拖拽条）。
+
+旧 egui 界面保留在 CLI（`syncdash gui`），已同步支持逐行翻方向。
+FFS 还有而我们暂缺的：GUI 内编辑过滤器/任务 —— 在 roadmap。
 
 - `scan` 默认写 stdout（ssh 友好：`ssh mac syncdash scan ~/Data > mac.jsonl`）。
 - `apply` **默认 dry-run**，`--apply` 才动手；删除/覆盖的文件先进本机
