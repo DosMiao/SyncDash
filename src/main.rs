@@ -3,7 +3,7 @@ mod gui;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use syncdash::compare::{Action, Op};
-use syncdash::{apply, compare, config, filter, pack, run, scan, table};
+use syncdash::{apply, compare, config, filter, pack, run, scan, table, territory};
 
 #[derive(Parser)]
 #[command(name = "syncdash", version, about = "Table-driven multi-node file sync (scan -> compare -> apply)")]
@@ -88,6 +88,20 @@ enum Cmd {
         case_sensitive: bool,
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// 列出 .ffs-sync 标记的同步领地（CodeSync 生态）
+    Territories {
+        root: PathBuf,
+    },
+    /// 按 .ffs-sync 标记为每个领地生成 cs-<slug>.toml 任务（syncdash 版 CodeSync 生成器）
+    GenJobs {
+        root: PathBuf,
+        #[arg(long)]
+        target_root: PathBuf,
+        #[arg(long, default_value = "sync")]
+        mode: String,
+        #[arg(long, default_value = "standard")]
+        rigor: String,
     },
     /// 打包计划中 target 侧的操作为 tar 包（payload+计划+双 hash 清单），供对端 apply-pack
     Pack {
@@ -249,6 +263,26 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             );
             write_out(&out, |w| plan.write_to(w))?;
             Ok(if plan.header.conflict_count > 0 { 1 } else { 0 })
+        }
+        Cmd::Territories { root } => {
+            let ts = territory::find_territories(&root);
+            if ts.is_empty() {
+                println!("no .ffs-sync territories under {}", root.display());
+            } else {
+                for t in &ts {
+                    println!("{t}");
+                }
+                eprintln!("{} territor(ies)", ts.len());
+            }
+            Ok(0)
+        }
+        Cmd::GenJobs { root, target_root, mode, rigor } => {
+            let outs = territory::gen_jobs(&root, &target_root, &mode, &rigor)?;
+            for o in &outs {
+                println!("{:<44} <- {}", o.name, o.territory);
+            }
+            println!("{} job(s) written to {}", outs.len(), config::jobs_dir().display());
+            Ok(0)
         }
         Cmd::Pack { plan, out, source_root } => {
             let p = compare::Plan::load(&plan)?;

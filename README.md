@@ -130,7 +130,7 @@ FFS 还有而我们暂缺的：逐行翻转方向、GUI 内编辑过滤器/任�
 
 target 上一次 `rename` 完事，大文件零重传。`--no-hash` 扫描时自动退回复制+删除（并放弃移动检测）。
 
-## 远端模式（v0.4 设计，未实现）
+## 远端模式（v0.4，已实现并真机验证）
 
 1. `ssh <host> syncdash probe` —— 探测对面：OS/arch/版本/schema；二进制不存在则给出安装指引
    （两台机器都有 Rust 工具链，`cargo build --release` 即可；或经共享盘直接拷二进制）。
@@ -180,9 +180,10 @@ Win↔Mac 的 SSH 已验证可用（Mac 22 端口开着，免密只差把公钥�
 - [x] v0.2.2 严谨级 quick/standard/paranoid（复制后校验）＋跨平台正确性：NFC 归一比对键、大小写折叠、Windows 非法名预检、unix mode 记录（含单测）
 - [x] v0.3 Tauri v2 桌面壳（参照 AlexQuant Desktop：Vite+TS 前端、builder 双平台脚本、dist 入库使 Mac 免 node 纯 cargo 构建）；
       rigor 严谨级（quick/standard/paranoid：免hash / hash缓存 / 全量重hash+复制后校验）；NFC+大小写折叠比对键；Windows 非法路径预检
-- [ ] v0.3.x 单测覆盖 compare 分类矩阵；并行扫描；symlink 策略；GUI 逐行方向翻转、任务编辑；同目录 rename 合并显示
-- [ ] v0.4 远端：`pack` / `apply-pack`（zip+清单+双 hash+对端校验）/ ssh 传输封装
-- [ ] v0.5 多端配置文件（节点×领地×模式），领地清单与 `.ffs-sync` 标记打通
+- [x] v0.3.x compare 分类矩阵单测（archive 归因全矩阵，20 项测试）；两阶段并行扫描（rayon 全文件并行哈希，≥32MB 内部再分块）；`compare::reverse_op` 逐行翻方向（egui 点动作徽章翻转；Tauri 壳可直接复用同一 lib 函数）
+- [x] v0.4 远端：`pack` / `apply-pack`——tar 容器（plan.jsonl＋payload＋收尾 manifest），计划 blake3＋逐文件 blake3＋合并 hash；staging 全部验完才动 target；复用 apply 的锁/回收/复制后校验；unix mode 恢复。**Win 打包 → SMB 送包 → Mac apply-pack → 远程复扫 0 ops，真机全流程验证**
+- [x] v0.5 `territories` / `gen-jobs`：扫 `.ffs-sync` 标记为每个领地生成 `cs-<slug>.toml`（sync 模式＋自动 archive 路径）——syncdash 版 CodeSync 生成器，11 个领地实测生成；与 FFS 并行运行，切换时机由使用者定
+- [ ] v0.6 symlink 策略；同目录 rename 合并显示；GUI 任务编辑；`run --all`；ssh 一条龙（scan/pack/ship/apply 单命令）；真 N 向（版本向量）
 
 ## 构建
 
