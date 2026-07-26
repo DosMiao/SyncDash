@@ -87,6 +87,9 @@ let lastMap: Record<string, RunRecord> = {};
 /// 路径显示模式：rel = 相对比对根目录（offset），full = 完整路径
 type PathMode = 'rel' | 'full';
 let pathMode: PathMode = localStorage.getItem('sd.pathmode') === 'full' ? 'full' : 'rel';
+/// 树状分组（FFS 分组行语义）：连续同目录的行共享一条目录组头，文件行只显示文件名
+let grouped = localStorage.getItem('sd.grouped') !== 'off';
+const collapsedDirs = new Set<string>();
 /// 用户在确认单里勾了"我确认无误"（等同 CLI --i-know）；每次重新比对后归零
 let acknowledged = false;
 
@@ -130,6 +133,15 @@ function category(op: OpDto): Chip {
     case 'delete': case 'delete_dir': return 'delete';
     default: return 'conflict';
   }
+}
+
+function dirOf(p: string): string {
+  const i = p.lastIndexOf('/');
+  return i < 0 ? '' : p.slice(0, i);
+}
+function baseOf(p: string): string {
+  const i = p.lastIndexOf('/');
+  return i < 0 ? p : p.slice(i + 1);
 }
 
 function sepOf(root: string): string {
@@ -315,6 +327,122 @@ function renderOverview() {
   }
 }
 
+/// 单个 op 行（groupDir = 树状分组时所在组目录；组内文件只显示文件名，
+/// 跨目录的 move 来源自动保留完整相对路径以免信息丢失）
+function buildRow(i: number, groupDir: string | null): HTMLTableRowElement {
+  const p = plan!;
+  const op = eff(i);
+  const canFlip = !!p.reversed[i] && selectable(p.ops[i]);
+  const tr = document.createElement('tr');
+  if (!checked[i]) tr.classList.add('off');
+  if (flipped[i]) tr.classList.add('flip');
+  if (groupDir !== null) tr.classList.add('ingrp');
+
+  const tdChk = document.createElement('td');
+  tdChk.className = 'c-chk';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = checked[i];
+  cb.disabled = !selectable(op);
+  cb.addEventListener('change', () => {
+    checked[i] = cb.checked;
+    tr.classList.toggle('off', !cb.checked);
+    renderStats();
+    syncHeadCheckbox();
+  });
+  tdChk.appendChild(cb);
+
+  const tdAct = document.createElement('td');
+  tdAct.className = 'c-act';
+  const [txt, cls] = badge(op, canFlip);
+  const span = document.createElement('span');
+  span.className = 'badge ' + cls;
+  span.textContent = txt;
+  if (canFlip) {
+    span.title = '点按翻转方向（再点恢复）';
+    span.addEventListener('click', () => {
+      flipped[i] = !flipped[i];
+      renderAll();
+    });
+  }
+  tdAct.appendChild(span);
+
+  // 左右双路径列（FFS 双栏语义）；tooltip 恒为完整路径
+  const [sp, tp] = sidePaths(op);
+  const mkPath = (pv: string | null, root: string) => {
+    const td = document.createElement('td');
+    td.className = 'mono c-path';
+    if (pv) {
+      td.textContent =
+        groupDir !== null && dirOf(pv) === groupDir
+          ? baseOf(pv)
+          : pathMode === 'full' ? fullPath(root, pv) : pv;
+      td.title = fullPath(root, pv);
+    } else {
+      td.classList.add('dim');
+    }
+    return td;
+  };
+  const tdPath = mkPath(sp, p.header.source_root);
+  const tdFrom = mkPath(tp, p.header.target_root);
+
+  const tdSize = document.createElement('td');
+  tdSize.className = 'c-size mono';
+  tdSize.textContent = humanSize(op.size);
+
+  const tdReason = document.createElement('td');
+  tdReason.className = 'reason';
+  tdReason.textContent = op.reason;
+
+  tr.append(tdChk, tdAct, tdPath, tdFrom, tdSize, tdReason);
+  return tr;
+}
+
+/// 目录组头行：▾/▸ 目录 · N 项 · 合计体积 + 整组勾选框（三态）
+function buildGroupRow(dir: string, items: number[]): HTMLTableRowElement {
+  const p = plan!;
+  const tr = document.createElement('tr');
+  tr.className = 'grp';
+  const selectableItems = items.filter((i) => selectable(eff(i)));
+  const nChecked = selectableItems.filter((i) => checked[i]).length;
+
+  const tdChk = document.createElement('td');
+  tdChk.className = 'c-chk';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = selectableItems.length > 0 && nChecked === selectableItems.length;
+  cb.indeterminate = nChecked > 0 && nChecked < selectableItems.length;
+  cb.disabled = selectableItems.length === 0;
+  cb.title = '勾选/取消整个目录';
+  cb.addEventListener('click', (e) => e.stopPropagation());
+  cb.addEventListener('change', () => {
+    for (const i of selectableItems) checked[i] = cb.checked;
+    renderTable();
+  });
+  tdChk.appendChild(cb);
+
+  const td = document.createElement('td');
+  td.colSpan = 5;
+  const folded = collapsedDirs.has(dir);
+  let bytes = 0;
+  for (const i of items) bytes += eff(i).size ?? 0;
+  const label = dir === '' ? '(根目录)' : dir;
+  td.innerHTML =
+    `<span class="gchev">${folded ? '▸' : '▾'}</span> <span class="gdir mono">${escapeHtml(label)}</span>` +
+    `<span class="gmeta">${items.length} 项${bytes ? ` · ${humanSize(bytes)}` : ''}</span>`;
+  td.title = `${plan!.header.source_root}\n${p.header.target_root}\n… ${label}`;
+  tr.appendChild(td);
+  tr.addEventListener('click', () => {
+    if (collapsedDirs.has(dir)) collapsedDirs.delete(dir);
+    else collapsedDirs.add(dir);
+    renderModeButtons();
+    renderTable();
+  });
+  return tr;
+}
+
+let lastGroupDirs: string[] = [];
+
 function renderTable() {
   bodyEl.innerHTML = '';
   const has = !!plan && plan.ops.length > 0;
@@ -325,68 +453,24 @@ function renderTable() {
   if (plan.ops.length === 0) { emptyEl.textContent = '✓ 两侧一致，没有需要同步的内容'; return; }
 
   const vis = visibleIdx();
-  for (const i of vis) {
-    const op = eff(i);
-    const canFlip = !!plan.reversed[i] && selectable(plan.ops[i]);
-    const tr = document.createElement('tr');
-    if (!checked[i]) tr.classList.add('off');
-    if (flipped[i]) tr.classList.add('flip');
-
-    const tdChk = document.createElement('td');
-    tdChk.className = 'c-chk';
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.checked = checked[i];
-    cb.disabled = !selectable(op);
-    cb.addEventListener('change', () => {
-      checked[i] = cb.checked;
-      tr.classList.toggle('off', !cb.checked);
-      renderStats();
-      syncHeadCheckbox();
-    });
-    tdChk.appendChild(cb);
-
-    const tdAct = document.createElement('td');
-    tdAct.className = 'c-act';
-    const [txt, cls] = badge(op, canFlip);
-    const span = document.createElement('span');
-    span.className = 'badge ' + cls;
-    span.textContent = txt;
-    if (canFlip) {
-      span.title = '点按翻转方向（再点恢复）';
-      span.addEventListener('click', () => {
-        flipped[i] = !flipped[i];
-        renderAll();
-      });
+  if (!grouped) {
+    lastGroupDirs = [];
+    for (const i of vis) bodyEl.appendChild(buildRow(i, null));
+  } else {
+    // 连续同目录成组（计划本身按 walk 序，过滤后依然是连续子序列）
+    const groups: { dir: string; items: number[] }[] = [];
+    for (const i of vis) {
+      const d = dirOf(eff(i).path);
+      if (!groups.length || groups[groups.length - 1].dir !== d) groups.push({ dir: d, items: [] });
+      groups[groups.length - 1].items.push(i);
     }
-    tdAct.appendChild(span);
-
-    // 左右双路径列（FFS 双栏语义）；tooltip 恒为完整路径
-    const [sp, tp] = sidePaths(op);
-    const mkPath = (p: string | null, root: string) => {
-      const td = document.createElement('td');
-      td.className = 'mono c-path';
-      if (p) {
-        td.textContent = pathMode === 'full' ? fullPath(root, p) : p;
-        td.title = fullPath(root, p);
-      } else {
-        td.classList.add('dim');
+    lastGroupDirs = [...new Set(groups.map((g) => g.dir))];
+    for (const g of groups) {
+      bodyEl.appendChild(buildGroupRow(g.dir, g.items));
+      if (!collapsedDirs.has(g.dir)) {
+        for (const i of g.items) bodyEl.appendChild(buildRow(i, g.dir));
       }
-      return td;
-    };
-    const tdPath = mkPath(sp, plan.header.source_root);
-    const tdFrom = mkPath(tp, plan.header.target_root);
-
-    const tdSize = document.createElement('td');
-    tdSize.className = 'c-size mono';
-    tdSize.textContent = humanSize(op.size);
-
-    const tdReason = document.createElement('td');
-    tdReason.className = 'reason';
-    tdReason.textContent = op.reason;
-
-    tr.append(tdChk, tdAct, tdPath, tdFrom, tdSize, tdReason);
-    bodyEl.appendChild(tr);
+    }
   }
   syncHeadCheckbox();
   renderStats();
@@ -933,18 +1017,37 @@ $('cmp-cancel').addEventListener('click', () => {
   setStatus('正在取消比对…');
 });
 
-// 路径显示模式切换（相对 ↔ 完整；记住选择）
+// 显示模式：树状分组 / 折叠 / 路径模式（选择均记住）
 const btnPathMode = $<HTMLButtonElement>('btn-pathmode');
-function renderPathModeBtn() {
+const btnGroup = $<HTMLButtonElement>('btn-group');
+const btnFold = $<HTMLButtonElement>('btn-fold');
+function renderModeButtons() {
   btnPathMode.textContent = pathMode === 'rel' ? '相对路径' : '完整路径';
+  btnGroup.textContent = grouped ? '树状分组' : '平铺列表';
+  btnGroup.classList.toggle('on', grouped);
+  btnFold.classList.toggle('hidden', !grouped);
+  btnFold.textContent = collapsedDirs.size > 0 ? '全部展开' : '全部折叠';
 }
 btnPathMode.addEventListener('click', () => {
   pathMode = pathMode === 'rel' ? 'full' : 'rel';
   localStorage.setItem('sd.pathmode', pathMode);
-  renderPathModeBtn();
+  renderModeButtons();
   renderTable();
 });
-renderPathModeBtn();
+btnGroup.addEventListener('click', () => {
+  grouped = !grouped;
+  localStorage.setItem('sd.grouped', grouped ? 'on' : 'off');
+  collapsedDirs.clear();
+  renderModeButtons();
+  renderTable();
+});
+btnFold.addEventListener('click', () => {
+  if (collapsedDirs.size > 0) collapsedDirs.clear();
+  else for (const d of lastGroupDirs) collapsedDirs.add(d);
+  renderModeButtons();
+  renderTable();
+});
+renderModeButtons();
 
 // M3 Overview 折叠/清除
 const ovEl = $('overview');

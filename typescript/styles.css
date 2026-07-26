@@ -393,3 +393,17 @@ td.c-path { max-width: 430px; overflow: hidden; text-overflow: ellipsis; white-s
 #cmp-rows { display: flex; flex-direction: column; gap: 8px; width: min(560px, 82%); }
 #cmp-rows .stagerow { background: var(--panel); }
 #cmp-panel .btn { padding: 5px 16px; font-size: 12px; }
+
+/* ---- 树状分组显示（FFS 分组行语义） ---- */
+tr.grp { background: var(--panel2); cursor: pointer; user-select: none; }
+tr.grp:hover { background: var(--panel3); }
+tr.grp td { padding: 5px 8px; border-top: 1px solid var(--border); font-size: 12px; }
+tr.grp .gchev { color: var(--dim); display: inline-block; width: 14px; }
+tr.grp .gdir { color: var(--accent); }
+tr.grp .gmeta { color: var(--dim); margin-left: 10px; font-size: 11px; font-variant-numeric: tabular-nums; }
+tr.ingrp td.c-path:first-of-type { padding-left: 26px; }
+#btn-group, #btn-fold { flex: none; padding: 4px 10px; font-size: 12px; }
+#btn-group.on { border-color: var(--accent); color: var(--accent); }
+#btn-fold { margin-left: auto; }
+#btn-fold.hidden ~ #btn-group { margin-left: auto; }
+#btn-pathmode { margin-left: 0; }
