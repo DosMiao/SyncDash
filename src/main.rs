@@ -1,4 +1,3 @@
-mod gui;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -56,12 +55,18 @@ enum Cmd {
         i_know: bool,
         #[arg(short, long)]
         verbose: bool,
+        /// M6 值守：循环 比对→（有差异且自动档时）执行→睡眠。Ctrl-C 退出
+        #[arg(long)]
+        watch: bool,
+        /// watch 间隔秒（缺省用任务的 watch_interval_secs，其次 30）
+        #[arg(long)]
+        interval: Option<u64>,
+        /// watch 发现差异时自动执行（等同任务里的 watch_auto_apply = true）
+        #[arg(long = "auto-apply")]
+        auto_apply: bool,
     },
-    /// 打开图形界面（参考 FFS：Compare → 勾选 → Synchronize）
-    Gui {
-        /// 启动时选中的任务名
-        job: Option<String>,
-    },
+    /// 打开图形界面（Tauri 桌面版；egui 旧界面已于 v0.9 退役）
+    Gui,
     /// 扫描目录，产出快照表（JSONL，默认 stdout —— ssh 管道友好）
     Scan {
         root: PathBuf,
@@ -293,14 +298,34 @@ fn main() {
     std::process::exit(code);
 }
 
+/// v0.9 M5：egui 退役后，GUI = Tauri 桌面版。找同目录的 syncdash-desktop 启动；
+/// 找不到就说清楚去哪拿，而不是无声退出。
+fn launch_desktop() -> std::io::Result<i32> {
+    let exe_name = if cfg!(windows) { "syncdash-desktop.exe" } else { "syncdash-desktop" };
+    let cand = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(exe_name)));
+    match cand {
+        Some(p) if p.exists() => {
+            std::process::Command::new(p).spawn()?;
+            Ok(0)
+        }
+        _ => {
+            eprintln!("desktop app not found next to this binary ({exe_name}).");
+            eprintln!("build it with: cargo build -p syncdash-desktop --release");
+            eprintln!("(CLI subcommands all still work — run `syncdash --help`)");
+            Ok(2)
+        }
+    }
+}
+
 fn run_cli(cli: Cli) -> std::io::Result<i32> {
     let cmd = match cli.cmd {
         Some(c) => c,
         None => {
-            // 双击 exe：无参数 → 直接进 GUI
+            // 双击 exe：无参数 → 启动 Tauri 桌面版（egui 旧界面已退役）
             detach_console();
-            gui::run_gui(None).map_err(|e| std::io::Error::other(e.to_string()))?;
-            return Ok(0);
+            return launch_desktop();
         }
     };
     match cmd {
@@ -329,7 +354,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Run { job, all, prefix, apply: do_apply, i_know, verbose } => {
+        Cmd::Run { job, all, prefix, apply: do_apply, i_know, verbose, watch, interval, auto_apply } => {
             let list: Vec<(String, config::Job)> = if all || prefix.is_some() {
                 config::load_all()
                     .into_iter()
@@ -344,6 +369,32 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             if list.is_empty() {
                 eprintln!("no matching jobs");
                 return Ok(2);
+            }
+            // M6 值守：hash 缓存让未变的树每拍只付 walk 成本；RootLock 防两端同时动手
+            if watch {
+                let iv = interval
+                    .or_else(|| list.iter().filter_map(|(_, j)| j.watch_interval_secs).min())
+                    .unwrap_or(30)
+                    .max(1);
+                eprintln!("watch: {} job(s), every {iv}s — Ctrl-C to stop", list.len());
+                loop {
+                    for (name, j) in &list {
+                        let auto = auto_apply || j.watch_auto_apply;
+                        let res = if j.remote_host.is_some() {
+                            run::run_remote_job(name, j, auto, verbose, i_know)
+                        } else {
+                            run::run_local_job(name, j, auto, verbose, i_know)
+                        };
+                        match res {
+                            Ok((d, _s, e, c)) if d + e + c > 0 => {
+                                eprintln!("[{name}] watch: {d} done, {e} error(s), {c} conflict(s)");
+                            }
+                            Ok(_) => {}
+                            Err(err) => eprintln!("[{name}] watch error: {err}"),
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(iv));
+                }
             }
             let many = list.len() > 1;
             let mut tot = (0u64, 0u64, 0u64, 0u64);
@@ -381,10 +432,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(if tot.2 > 0 { 1 } else { 0 })
         }
-        Cmd::Gui { job } => {
-            gui::run_gui(job).map_err(|e| std::io::Error::other(e.to_string()))?;
-            Ok(0)
-        }
+        Cmd::Gui => launch_desktop(),
         Cmd::Scan { root, out, no_hash, force_rehash, symlinks_direct, exclude, progress } => {
             if !root.is_dir() {
                 eprintln!("error: not a directory: {}", root.display());

@@ -9,6 +9,7 @@ interface JobDto {
   name: string; mode: string; rigor: string; source: string; target: string; has_archive: boolean;
   remote: boolean; remote_host?: string; versioning: boolean; delta: boolean; parallel?: number;
   include: string[]; exclude: string[];
+  watch_interval_secs?: number; watch_auto_apply: boolean;
 }
 interface OpDto {
   side: 'source' | 'target';
@@ -27,6 +28,17 @@ interface PlanDto {
   reversed: (OpDto | null)[];
 }
 interface ApplyDto { done: number; skipped: number; errors: number; bytes_copied: number; cancelled: boolean }
+/// M5：编辑器用的完整 Job（与 Rust config::Job 的 serde 形状一一对应）
+interface JobFull {
+  mode: string; source: string; target: string; archive?: string | null;
+  include: string[]; exclude: string[]; no_hash: boolean; rigor: string;
+  case_sensitive: boolean; symlinks: string; versioning: boolean;
+  remote_host?: string | null; remote_root?: string | null; remote_exe?: string | null;
+  require_marker: boolean; min_free_pct: number; max_delete_ratio: number;
+  fsync: boolean; on_conflict: string; max_conflicts: number; sync_mode: boolean;
+  deletable: string[]; delta: boolean; parallel?: number | null;
+  watch_interval_secs?: number | null; watch_auto_apply: boolean;
+}
 interface RunRecord {
   ts_ms: number; job: string; kind: string;
   done: number; skipped: number; errors: number; bytes: number;
@@ -374,8 +386,12 @@ function renderJobs() {
       const note = r.errors > 0 ? ` · ${r.errors} 错误` : r.cancelled ? ' · 已取消' : '';
       sub = `<div class="jrow2${stale}"><span class="dot ${dot}">●</span>${relTime(r.ts_ms)} · ${r.done} 项${note}</div>`;
     }
-    div.innerHTML = `<div class="jrow1"><span class="name">${j.name}</span>${remote}${rigor}<span class="mode ${j.mode}">${j.mode}</span></div>${sub}`;
+    div.innerHTML = `<div class="jrow1"><span class="name">${j.name}</span>${remote}${rigor}<span class="mode ${j.mode}">${j.mode}</span><button class="jedit" title="编辑任务">✎</button></div>${sub}`;
     div.title = `${j.source}\n→ ${j.target}` + (j.remote ? `\nssh:${j.remote_host ?? ''}` : '');
+    (div.querySelector('.jedit') as HTMLButtonElement).addEventListener('click', (e) => {
+      e.stopPropagation();
+      openEditor(j.name);
+    });
     div.addEventListener('click', () => {
       if (busy) return;
       currentJob = j;
@@ -386,6 +402,8 @@ function renderJobs() {
       pathEl.textContent = `${j.source}   ⇄   ${j.target}`;
       btnCompare.disabled = false;
       btnSync.disabled = true;
+      btnWatch.disabled = false;
+      watchStop();
       setStatus(`已选 '${j.name}'（${j.mode}${j.has_archive ? '，带 archive' : ''}${j.rigor !== 'standard' ? '，' + j.rigor : ''}）— Compare 开始比对`);
     });
     jobListEl.appendChild(div);
@@ -521,6 +539,205 @@ searchEl.addEventListener('input', () => {
   renderTable();
 });
 
+// ---------- M5：任务编辑器（schema 驱动，字段与 config::Job 对齐） ----------
+
+const editModal = $('editmodal');
+const edForm = $('ed-form');
+const edDelete = $<HTMLButtonElement>('ed-delete');
+let edName: string | null = null; // 正在编辑的任务名（null = 新建）
+
+type FKind = 'text' | 'num' | 'bool' | 'select' | 'lines';
+interface FSpec { key: string; label: string; kind: FKind; opts?: string[]; hint?: string; wide?: boolean; group?: string }
+const ED_FIELDS: FSpec[] = [
+  { key: '__name', label: '任务名（文件名）', kind: 'text', group: '基本' },
+  { key: 'mode', label: '模式', kind: 'select', opts: ['mirror', 'sync', 'enrich'] },
+  { key: 'source', label: 'source 根目录', kind: 'text', wide: true },
+  { key: 'target', label: 'target 根目录', kind: 'text', wide: true },
+  { key: 'archive', label: 'archive 存档文件（sync 模式）', kind: 'text', hint: '留空 = 无；建议 %APPDATA%\\syncdash\\archives\\<名>.jsonl', wide: true },
+  { key: 'rigor', label: '严谨级', kind: 'select', opts: ['quick', 'standard', 'paranoid'] },
+  { key: 'symlinks', label: 'symlink 策略', kind: 'select', opts: ['exclude', 'direct'] },
+  { key: 'case_sensitive', label: '大小写敏感比对', kind: 'bool' },
+  { key: 'versioning', label: '版本控制（.version_syncDash）', kind: 'bool', group: '行为' },
+  { key: 'delta', label: '本地增量写（delta）', kind: 'bool' },
+  { key: 'fsync', label: 'rename 前 fsync', kind: 'bool' },
+  { key: 'sync_mode', label: '同步 unix 权限位', kind: 'bool' },
+  { key: 'parallel', label: '并行宽度（空=4）', kind: 'num' },
+  { key: 'on_conflict', label: '冲突策略', kind: 'select', opts: ['report', 'copy', 'newer'] },
+  { key: 'max_conflicts', label: '冲突副本上限', kind: 'num' },
+  { key: 'require_marker', label: '要求 .syncdash-root 标记', kind: 'bool', group: '守护' },
+  { key: 'min_free_pct', label: '最低空闲盘比例（0.01=1%）', kind: 'num' },
+  { key: 'max_delete_ratio', label: '删除占比闸门（0.5=50%）', kind: 'num' },
+  { key: 'include', label: 'include（每行一条）', kind: 'lines', group: '过滤', wide: true },
+  { key: 'exclude', label: 'exclude（每行一条；! 开头 = 例外）', kind: 'lines', wide: true },
+  { key: 'deletable', label: 'deletable（删父目录可连带删）', kind: 'lines', wide: true },
+  { key: 'remote_host', label: 'ssh 主机别名', kind: 'text', group: '远程（可选）' },
+  { key: 'remote_root', label: '远端根路径', kind: 'text' },
+  { key: 'remote_exe', label: '远端 syncdash 路径（空=PATH）', kind: 'text' },
+  { key: 'watch_interval_secs', label: '定时扫描间隔（秒；空=关）', kind: 'num', group: '值守（Watch）', hint: '秒级=准实时；UNC 目标建议 ≥30' },
+  { key: 'watch_auto_apply', label: '发现差异自动执行', kind: 'bool' },
+];
+
+function defaultJob(): JobFull {
+  return {
+    mode: 'mirror', source: '', target: '', archive: null,
+    include: [], exclude: [], no_hash: false, rigor: 'standard',
+    case_sensitive: false, symlinks: 'exclude', versioning: false,
+    remote_host: null, remote_root: null, remote_exe: null,
+    require_marker: false, min_free_pct: 0.01, max_delete_ratio: 0.5,
+    fsync: true, on_conflict: 'report', max_conflicts: 5, sync_mode: false,
+    deletable: [], delta: false, parallel: null,
+    watch_interval_secs: null, watch_auto_apply: false,
+  };
+}
+
+function edBuild(j: JobFull, name: string) {
+  edForm.innerHTML = '';
+  for (const f of ED_FIELDS) {
+    if (f.group) {
+      const g = document.createElement('div');
+      g.className = 'ed-group';
+      g.textContent = f.group;
+      edForm.appendChild(g);
+    }
+    const wrap = document.createElement('label');
+    wrap.className = 'ed-field' + (f.wide ? ' wide' : '') + (f.kind === 'bool' ? ' ed-check' : '');
+    const v: unknown = f.key === '__name' ? name : (j as unknown as Record<string, unknown>)[f.key];
+    let inner = '';
+    if (f.kind === 'select') {
+      inner = `<span>${f.label}</span><select data-k="${f.key}">` +
+        f.opts!.map((o) => `<option${o === v ? ' selected' : ''}>${o}</option>`).join('') + '</select>';
+    } else if (f.kind === 'bool') {
+      inner = `<input type="checkbox" data-k="${f.key}"${v ? ' checked' : ''}/><span>${f.label}</span>`;
+    } else if (f.kind === 'lines') {
+      inner = `<span>${f.label}</span><textarea data-k="${f.key}" spellcheck="false">${escapeHtml(((v as string[]) ?? []).join('\n'))}</textarea>`;
+    } else if (f.kind === 'num') {
+      inner = `<span>${f.label}</span><input type="number" step="any" data-k="${f.key}" value="${v ?? ''}"/>`;
+    } else {
+      inner = `<span>${f.label}</span><input type="text" data-k="${f.key}" value="${escapeHtml(String(v ?? ''))}" spellcheck="false"/>`;
+    }
+    if (f.hint) inner += `<span class="thin">${f.hint}</span>`;
+    wrap.innerHTML = inner;
+    edForm.appendChild(wrap);
+  }
+}
+
+async function openEditor(name?: string) {
+  edName = name ?? null;
+  $('ed-title').textContent = name ? `编辑任务 — ${name}` : '新任务';
+  edDelete.classList.toggle('hidden', !name);
+  let j = defaultJob();
+  if (name) {
+    try { j = await invoke<JobFull>('get_job', { name }); } catch (e) { setStatus(`读取任务失败：${e}`, 'err'); return; }
+  }
+  edBuild(j, name ?? '');
+  editModal.classList.remove('hidden');
+}
+
+function edCollect(): { name: string; job: JobFull } | null {
+  const j = defaultJob() as unknown as Record<string, unknown>;
+  let name = '';
+  for (const el of edForm.querySelectorAll<HTMLElement>('[data-k]')) {
+    const k = el.dataset.k!;
+    let val: unknown;
+    if (el instanceof HTMLInputElement && el.type === 'checkbox') val = el.checked;
+    else if (el instanceof HTMLInputElement && el.type === 'number') val = el.value.trim() === '' ? null : Number(el.value);
+    else if (el instanceof HTMLTextAreaElement) val = el.value.split('\n').map((s) => s.trim()).filter(Boolean);
+    else val = (el as HTMLInputElement | HTMLSelectElement).value.trim();
+    if (k === '__name') { name = String(val); continue; }
+    // 空字符串的可选项落成 null（serde Option）
+    if ((k === 'archive' || k === 'remote_host' || k === 'remote_root' || k === 'remote_exe') && val === '') val = null;
+    j[k] = val;
+  }
+  if (!name) { setStatus('任务名不能为空', 'err'); return null; }
+  const jf = j as unknown as JobFull;
+  if (!jf.source || !jf.target) { setStatus('source / target 不能为空', 'err'); return null; }
+  return { name, job: jf };
+}
+
+$('btn-newjob').addEventListener('click', () => openEditor());
+$('ed-cancel').addEventListener('click', () => editModal.classList.add('hidden'));
+editModal.addEventListener('click', (e) => { if (e.target === editModal) editModal.classList.add('hidden'); });
+$('ed-save').addEventListener('click', async () => {
+  const c = edCollect();
+  if (!c) return;
+  try {
+    await invoke('save_job', { name: c.name, job: c.job });
+    editModal.classList.add('hidden');
+    jobs = await invoke<JobDto[]>('list_jobs');
+    renderJobs();
+    setStatus(`已保存 '${c.name}'`, 'ok');
+  } catch (e) {
+    setStatus(`保存失败：${e}`, 'err');
+  }
+});
+edDelete.addEventListener('click', async () => {
+  if (!edName) return;
+  if (!confirm(`删除任务配置 '${edName}'？（只删 TOML，不动任何数据）`)) return;
+  try {
+    await invoke('delete_job', { name: edName });
+    editModal.classList.add('hidden');
+    if (currentJob?.name === edName) { currentJob = null; plan = null; renderAll(); }
+    jobs = await invoke<JobDto[]>('list_jobs');
+    renderJobs();
+    setStatus(`已删除 '${edName}'`);
+  } catch (e) {
+    setStatus(`删除失败：${e}`, 'err');
+  }
+});
+
+// ---------- M6：值守（定时扫描；秒级=准实时） ----------
+
+const btnWatch = $<HTMLButtonElement>('btn-watch');
+let watchTimer: number | null = null;
+let watchNext = 0;
+
+function watchStop() {
+  if (watchTimer !== null) { clearInterval(watchTimer); watchTimer = null; }
+  btnWatch.classList.remove('on');
+  btnWatch.textContent = '⏱ Watch';
+}
+
+async function watchTick() {
+  if (!currentJob) { watchStop(); return; }
+  const iv = (currentJob.watch_interval_secs ?? 30) * 1000;
+  const left = watchNext - Date.now();
+  if (left > 0) {
+    if (!busy) setStatus(`⏱ 值守中 — ${Math.ceil(left / 1000)}s 后扫描（${currentJob.name}）`);
+    return;
+  }
+  if (busy) return; // 上一轮还没完，跳过这拍
+  watchNext = Date.now() + iv;
+  await doCompare(false);
+  if (plan && plan.ops.length > 0) {
+    if (currentJob.watch_auto_apply) {
+      const finalOps = plan.ops.filter((op) => selectable(op));
+      setStatus(`⏱ 值守发现 ${finalOps.length} 项差异 — 自动执行中…`);
+      setBusy(true);
+      try {
+        const r = await invoke<ApplyDto>('apply_job', { name: currentJob.name, plan, ops: finalOps, acknowledged: false });
+        setStatus(`⏱ 自动同步完成：${r.done} 执行，${r.errors} 错误`, r.errors ? 'err' : 'ok');
+        refreshLastSyncs();
+      } catch (e) {
+        setStatus(`⏱ 自动同步失败：${e}`, 'err');
+      }
+      setBusy(false);
+    } else {
+      setStatus(`⏱ 值守发现 ${plan.ops.length} 项差异 — 审阅后 Synchronize`, 'err');
+    }
+  }
+}
+
+btnWatch.addEventListener('click', () => {
+  if (watchTimer !== null) { watchStop(); setStatus('值守已停止'); return; }
+  if (!currentJob) return;
+  const iv = currentJob.watch_interval_secs ?? 30;
+  watchNext = Date.now() + iv * 1000;
+  watchTimer = window.setInterval(watchTick, 1000);
+  btnWatch.classList.add('on');
+  btnWatch.textContent = `⏱ Watch ${iv}s`;
+  setStatus(`⏱ 值守已开启：每 ${iv}s 比对一次（hash 缓存让未变的树只付 walk 成本）${currentJob.watch_auto_apply ? ' · 自动执行' : ''}`);
+});
+
 // ---------- M4：运行日志面板 ----------
 
 const logModal = $('logmodal');
@@ -595,6 +812,10 @@ $('ov-clear').addEventListener('click', () => { ovFilter = null; renderAll(); })
 
 document.addEventListener('keydown', (e) => {
   const mod = e.ctrlKey || e.metaKey;
+  if (!editModal.classList.contains('hidden')) {
+    if (e.key === 'Escape') editModal.classList.add('hidden');
+    return;
+  }
   if (!logModal.classList.contains('hidden')) {
     if (e.key === 'Escape') logModal.classList.add('hidden');
     return;

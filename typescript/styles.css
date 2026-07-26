@@ -306,3 +306,23 @@ tr.flip .badge { border-style: dashed; }
 .logrow .k { color: var(--dim); font-size: 10px; }
 #log-detail { max-height: 50vh; overflow: auto; font-size: 11px; background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin: 8px 0; white-space: pre-wrap; word-break: break-all; }
 .logempty { color: var(--dim); padding: 18px; text-align: center; }
+
+/* ---- M5: 任务编辑器 + M6 watch ---- */
+.newjob { margin: 0 2px; }
+.jedit { background: none; border: none; color: var(--dim); cursor: pointer; font-size: 11px; padding: 0 2px; flex: none; }
+.jedit:hover { color: var(--accent); }
+#editmodal { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; z-index: 95; }
+.edsheet { width: 720px; max-width: 94vw; max-height: 82vh; display: flex; flex-direction: column; }
+#ed-form { overflow-y: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; padding: 8px 2px; }
+.ed-group { grid-column: 1 / -1; font-size: 11px; color: var(--accent); border-bottom: 1px solid var(--border); padding: 8px 0 3px; }
+.ed-field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.ed-field.wide { grid-column: 1 / -1; }
+.ed-field > span { color: var(--dim); font-size: 11px; }
+.ed-field input[type="text"], .ed-field input[type="number"], .ed-field select, .ed-field textarea {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 5px 8px; font-size: 12px;
+}
+.ed-field textarea { min-height: 44px; resize: vertical; }
+.ed-check { flex-direction: row; align-items: center; gap: 6px; padding-top: 4px; }
+.btn.danger { border-color: var(--red); color: var(--red); }
+.btn.danger:hover { background: rgba(217,58,58,0.12); }
+#btn-watch.on { background: var(--green); border-color: var(--green); color: #fff; }

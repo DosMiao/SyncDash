@@ -4,9 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SyncDash</title>
-  <script type="module" crossorigin src="/assets/main-DChuJTOc.js"></script>
-  <link rel="modulepreload" crossorigin href="/assets/event-Bm1tz_ou.js">
-  <link rel="stylesheet" crossorigin href="/assets/event-Dq3CaAh_.css">
+  <script type="module" crossorigin src="/assets/main-DlKHyjke.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/event-DoqXT23T.js">
+  <link rel="stylesheet" crossorigin href="/assets/event-DyR3lXc3.css">
 </head>
 <body>
   <div id="dragstrip" data-tauri-drag-region></div>
@@ -14,6 +14,7 @@
     <aside id="sidebar">
       <div class="brand" data-tauri-drag-region>Sync<span>Dash</span></div>
       <div id="joblist"></div>
+      <button id="btn-newjob" class="btn newjob">＋ 新任务</button>
       <div id="sidefoot">
         <span id="appver" class="dim"></span>
         <span id="jobsdir" class="dim"></span>
@@ -24,6 +25,7 @@
         <button id="btn-compare" class="btn primary" disabled>⟳ Compare</button>
         <button id="btn-sync" class="btn accent" disabled>▶ Synchronize</button>
         <button id="btn-log" class="btn" title="运行日志">🗒</button>
+        <button id="btn-watch" class="btn" title="值守：按任务的 watch 间隔定时比对" disabled>⏱ Watch</button>
         <span id="stats" class="stats"></span>
         <span id="spin" class="spinner hidden"></span>
       </header>
@@ -59,6 +61,18 @@
       </div>
       <footer id="status">就绪</footer>
     </main>
+  </div>
+  <div id="editmodal" class="hidden">
+    <div class="sheet edsheet">
+      <h3 id="ed-title">编辑任务</h3>
+      <div id="ed-form"></div>
+      <div class="btnrow">
+        <button id="ed-delete" class="btn danger hidden">删除任务</button>
+        <span style="flex:1"></span>
+        <button id="ed-cancel" class="btn">取消 (Esc)</button>
+        <button id="ed-save" class="btn accent">保存</button>
+      </div>
+    </div>
   </div>
   <div id="logmodal" class="hidden">
     <div class="sheet logsheet">

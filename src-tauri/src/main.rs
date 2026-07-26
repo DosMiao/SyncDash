@@ -32,6 +32,8 @@ struct JobDto {
     parallel: Option<usize>,
     include: Vec<String>,
     exclude: Vec<String>,
+    watch_interval_secs: Option<u64>,
+    watch_auto_apply: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -206,6 +208,8 @@ fn list_jobs() -> Vec<JobDto> {
             parallel: j.parallel,
             include: j.include.clone(),
             exclude: j.exclude.clone(),
+            watch_interval_secs: j.watch_interval_secs,
+            watch_auto_apply: j.watch_auto_apply,
         })
         .collect()
 }
@@ -213,6 +217,27 @@ fn list_jobs() -> Vec<JobDto> {
 #[tauri::command]
 fn jobs_dir() -> String {
     config::jobs_dir().display().to_string()
+}
+
+/// M5：编辑器读取完整 Job（list_jobs 的 DTO 只有摘要）
+#[tauri::command]
+fn get_job(name: String) -> Result<config::Job, String> {
+    config::load(&name).map(|(_, j)| j).map_err(|e| e.to_string())
+}
+
+/// M5：保存任务（新建或覆盖同名 TOML）
+#[tauri::command]
+fn save_job(name: String, job: config::Job) -> Result<String, String> {
+    if name.trim().is_empty() {
+        return Err("任务名不能为空".into());
+    }
+    config::save_job(name.trim(), &job).map(|p| p.display().to_string()).map_err(|e| e.to_string())
+}
+
+/// M5：删除任务配置文件（数据一个字节都不动）
+#[tauri::command]
+fn delete_job(name: String) -> Result<(), String> {
+    config::delete_job(&name).map_err(|e| e.to_string())
 }
 
 /// M4：运行历史（新→旧）。job = null 时看全部
@@ -415,7 +440,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_jobs, jobs_dir, compare_job, preflight, apply_job, cancel_run, pause_run,
             open_progress_window, close_progress_window, post_sync_action,
-            run_history, last_syncs, run_detail
+            run_history, last_syncs, run_detail,
+            get_job, save_job, delete_job
         ])
         .run(tauri::generate_context!())
         .expect("error while running SyncDash");

@@ -78,6 +78,12 @@ pub struct Job {
     /// Copy/Update 相位的并行宽度（1 = 顺序）。缺省 4；clamp 1..=16
     #[serde(default)]
     pub parallel: Option<usize>,
+    /// M6 定时扫描：每 N 秒自动比对（None = 关闭）。秒级档＝"准实时"；UNC 目标建议 ≥30
+    #[serde(default)]
+    pub watch_interval_secs: Option<u64>,
+    /// watch 发现差异时自动执行（默认 false = 只提醒不动手）
+    #[serde(default)]
+    pub watch_auto_apply: bool,
 }
 
 impl Default for Job {
@@ -107,6 +113,8 @@ impl Default for Job {
             deletable: Vec::new(),
             delta: false,
             parallel: None,
+            watch_interval_secs: None,
+            watch_auto_apply: false,
         }
     }
 }
@@ -268,6 +276,10 @@ target = '\\host\share\dir'
 # --- 增量与并行 ---
 # delta = true                          # 本地/挂载盘大文件按块增量写；SMB 上传划算，对称链路打平
 # parallel = 4                          # Copy/Update 并行宽度（1 = 顺序；SMB 上 2-4 条流基本吃满上行）
+#
+# --- 值守（M6 定时扫描）---
+# watch_interval_secs = 30              # 每 N 秒自动比对；hash 缓存让未变的树只付 walk 成本
+# watch_auto_apply = false              # 发现差异自动执行（默认只提醒）
 #
 # 远程管线（可选）：远端在自己盘上扫描（快），target 侧打包经 ssh 送达执行
 # remote_host = 'mac'

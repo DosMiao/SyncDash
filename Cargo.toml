@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 members = [".", "src-tauri"]
 
 [package]
@@ -20,11 +20,8 @@ unicode-normalization = "0.1"
 rayon = "1"
 tar = "0.4"
 fastcdc = "3"
-eframe = "0.31"
-egui_extras = "0.31"
 
-# statvfs（磁盘空间预检）。Windows 侧走 kernel32 的 GetDiskFreeSpaceExW，无需额外 crate。
-[target.'cfg(unix)'.dependencies]
+# statvfs锛堢鐩樼┖闂撮妫€锛夈€俉indows 渚ц蛋 kernel32 鐨?GetDiskFreeSpaceExW锛屾棤闇€棰濆 crate銆?[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [profile.release]
