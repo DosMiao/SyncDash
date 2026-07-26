@@ -96,6 +96,21 @@ pub fn load_all() -> Vec<(String, Job)> {
     out
 }
 
+/// 保存任务（GUI 编辑器用）。返回文件路径。
+pub fn save_job(name: &str, job: &Job) -> std::io::Result<PathBuf> {
+    let dir = jobs_dir();
+    std::fs::create_dir_all(&dir)?;
+    let text = toml::to_string_pretty(job)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}")))?;
+    let path = dir.join(format!("{name}.toml"));
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+pub fn delete_job(name: &str) -> std::io::Result<()> {
+    std::fs::remove_file(jobs_dir().join(format!("{name}.toml")))
+}
+
 pub const SAMPLE: &str = r#"# %APPDATA%\syncdash\jobs\<名字>.toml —— 一个文件一个任务
 mode = "mirror"            # mirror | sync | enrich
 source = 'D:\some\dir'

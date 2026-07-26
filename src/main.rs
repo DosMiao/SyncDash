@@ -120,6 +120,18 @@ enum Cmd {
         #[arg(long)]
         remote_exe: Option<String>,
     },
+    /// 从 stdin 收一个文件写到 path（远程送包用：ssh 对面跑这个，双平台二进制级可靠）
+    Recv {
+        path: PathBuf,
+    },
+    /// 输出指定文件的 FastCDC 分块表（增量传输用；每文件一行 JSON）
+    Chunks {
+        #[arg(long)]
+        root: PathBuf,
+        /// 相对路径，可多次
+        #[arg(long = "file")]
+        files: Vec<String>,
+    },
     /// 打包计划中 target 侧的操作为 tar 包（payload+计划+双 hash 清单），供对端 apply-pack
     Pack {
         plan: PathBuf,
@@ -137,6 +149,9 @@ enum Cmd {
         target_root: Option<PathBuf>,
         #[arg(long)]
         apply: bool,
+        /// 成功后删除包文件（远程管线的清场步骤，免 shell 方言差异）
+        #[arg(long)]
+        remove_pkg: bool,
         #[arg(short, long)]
         verbose: bool,
     },
@@ -339,16 +354,42 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
         Cmd::Pack { plan, out, source_root } => {
             let p = compare::Plan::load(&plan)?;
             let sr = source_root.unwrap_or_else(|| PathBuf::from(&p.header.source_root));
-            let s = pack::pack(&p, &sr, &out)?;
+            let s = pack::pack(&p, &sr, &out, None)?;
             println!("packed: {} op(s), {} payload file(s), {} bytes -> {}", s.ops, s.files, s.bytes, out.display());
             Ok(0)
         }
-        Cmd::ApplyPack { pkg, target_root, apply: do_apply, verbose } => {
+        Cmd::Recv { path } => {
+            if let Some(p) = path.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            let mut f = std::fs::File::create(&path)?;
+            let n = std::io::copy(&mut std::io::stdin().lock(), &mut f)?;
+            eprintln!("received {n} bytes -> {}", path.display());
+            Ok(0)
+        }
+        Cmd::Chunks { root, files } => {
+            let stdout = std::io::stdout();
+            let mut w = std::io::BufWriter::new(stdout.lock());
+            for rel in &files {
+                match syncdash::chunk::chunk_file(&root, rel) {
+                    Ok(fc) => {
+                        use std::io::Write;
+                        writeln!(w, "{}", serde_json::to_string(&fc)?)?;
+                    }
+                    Err(e) => eprintln!("warning: chunking {rel} failed: {e}"),
+                }
+            }
+            Ok(0)
+        }
+        Cmd::ApplyPack { pkg, target_root, apply: do_apply, remove_pkg, verbose } => {
             let (done, skipped, errors) = pack::apply_pack(&pkg, target_root.as_deref(), do_apply, verbose)?;
             println!(
                 "{}: {done} done, {skipped} skipped, {errors} error(s)",
                 if do_apply { "applied" } else { "dry-run" }
             );
+            if remove_pkg && errors == 0 && do_apply {
+                let _ = std::fs::remove_file(&pkg);
+            }
             Ok(if errors > 0 { 1 } else { 0 })
         }
         Cmd::Apply { plan, apply: do_apply, source_root, target_root, trash, verify, verbose } => {

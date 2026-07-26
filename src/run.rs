@@ -122,22 +122,25 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool) -> s
     if pv["schema"].as_u64() != Some(crate::table::SCHEMA as u64) {
         eprintln!("[{name}] warning: remote schema {} != local {} — rebuild the remote binary", pv["schema"], crate::table::SCHEMA);
     }
-    eprintln!("[{name}] remote {}: {} {}", host, pv["os"].as_str().unwrap_or("?"), pv["arch"].as_str().unwrap_or("?"));
+    let remote_os = pv["os"].as_str().unwrap_or("").to_string();
+    let shell = crate::remote::RemoteShell::from_os(&remote_os);
+    eprintln!("[{name}] remote {}: {} {}", host, remote_os, pv["arch"].as_str().unwrap_or("?"));
 
     // 2) 远端扫描（在远端自己的盘上哈希——比经 UNC 拉数据快得多）
-    let mut scan_cmd = format!("{exe} scan {}", crate::remote::shq(rroot));
+    let mut scan_args: Vec<String> = vec!["scan".into(), rroot.to_string()];
     match job.rigor.as_str() {
-        "quick" => scan_cmd.push_str(" --no-hash"),
-        "paranoid" => scan_cmd.push_str(" --force-rehash"),
+        "quick" => scan_args.push("--no-hash".into()),
+        "paranoid" => scan_args.push("--force-rehash".into()),
         _ => {}
     }
     for ex in &job.exclude {
-        scan_cmd.push_str(&format!(" --exclude {}", crate::remote::shq(ex)));
+        scan_args.push("--exclude".into());
+        scan_args.push(ex.clone());
     }
     if job.symlinks == "direct" {
-        scan_cmd.push_str(" --symlinks-direct");
+        scan_args.push("--symlinks-direct".into());
     }
-    let table_bytes = crate::remote::ssh_capture(host, &scan_cmd)?;
+    let table_bytes = crate::remote::ssh_capture(host, &crate::remote::remote_cmd(shell, exe, &scan_args))?;
     let t = Snapshot::from_reader(std::io::BufReader::new(&table_bytes[..]))?;
 
     // 3) 本地扫描 + 比对
@@ -161,17 +164,68 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool) -> s
     let mut skipped = 0u64;
     let mut errors = 0u64;
 
-    // 4) target 侧：打包 → ssh 送包 → 远端 apply-pack（远端自带锁/回收/校验）
+    // 4) target 侧：（大更新先要远端块表走 FastCDC 增量）打包 → ssh 送包 → 远端 apply-pack
     let has_target_ops = plan.ops.iter().any(|o| o.side == Side::Target && !matches!(o.action, Action::Conflict | Action::Note));
     if has_target_ops {
+        let delta_rels: Vec<String> = plan
+            .ops
+            .iter()
+            .filter(|o| {
+                o.side == Side::Target
+                    && o.action == Action::Update
+                    && o.link.is_none()
+                    && o.size.map(|s| s >= crate::chunk::DELTA_MIN_SIZE).unwrap_or(false)
+            })
+            .map(|o| o.path.clone())
+            .collect();
+        let remote_chunks = if delta_rels.is_empty() {
+            None
+        } else {
+            let mut args: Vec<String> = vec!["chunks".into(), "--root".into(), rroot.to_string()];
+            for r in &delta_rels {
+                args.push("--file".into());
+                args.push(r.clone());
+            }
+            match crate::remote::ssh_capture(host, &crate::remote::remote_cmd(shell, exe, &args)) {
+                Ok(bytes) => {
+                    let mut m = std::collections::HashMap::new();
+                    for line in String::from_utf8_lossy(&bytes).lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Ok(fc) = serde_json::from_str::<crate::chunk::FileChunks>(line) {
+                            m.insert(fc.rel.clone(), fc);
+                        }
+                    }
+                    eprintln!("[{name}] delta: got chunk tables for {} large file(s)", m.len());
+                    Some(m)
+                }
+                Err(e) => {
+                    eprintln!("[{name}] delta disabled (chunk request failed: {e})");
+                    None
+                }
+            }
+        };
         let tmp = std::env::temp_dir().join(format!("syncdash-remote-{}.tar", crate::table::now_ms()));
-        let sum = crate::pack::pack(&plan, &job.source, &tmp)?;
-        let rpkg = format!("/tmp/syncdash-{}.tar", crate::table::now_ms());
-        let ship = crate::remote::ssh_send_file(host, &tmp, &rpkg);
+        let sum = crate::pack::pack(&plan, &job.source, &tmp, remote_chunks.as_ref())?;
+        if sum.delta_saved > 0 {
+            eprintln!("[{name}] packed {} B, delta saved {} B", sum.bytes, sum.delta_saved);
+        }
+        let rpkg = if shell == crate::remote::RemoteShell::PowerShell {
+            format!("syncdash-{}.tar", crate::table::now_ms()) // 相对路径 → 远端家目录
+        } else {
+            format!("/tmp/syncdash-{}.tar", crate::table::now_ms())
+        };
+        let recv_cmd = crate::remote::remote_cmd(shell, exe, &["recv".into(), rpkg.clone()]);
+        let ship = crate::remote::ssh_run_with_stdin(host, &recv_cmd, &tmp);
         let _ = std::fs::remove_file(&tmp);
         ship?;
-        let vflag = if verbose { " -v" } else { "" };
-        let ok = crate::remote::ssh_run(host, &format!("{exe} apply-pack {} --apply{vflag}; rc=$?; rm -f {}; exit $rc", crate::remote::shq(&rpkg), crate::remote::shq(&rpkg)))?;
+        let mut ap_args: Vec<String> = vec!["apply-pack".into(), rpkg.clone(), "--apply".into(), "--remove-pkg".into()];
+        if verbose {
+            ap_args.push("-v".into());
+        }
+        let ok = crate::remote::ssh_run(host, &crate::remote::remote_cmd(shell, exe, &ap_args))?;
         if ok {
             done += sum.ops;
         } else {

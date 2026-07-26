@@ -19,6 +19,7 @@ toml = "0.8"
 unicode-normalization = "0.1"
 rayon = "1"
 tar = "0.4"
+fastcdc = "3"
 eframe = "0.31"
 egui_extras = "0.31"
 

@@ -28,6 +28,105 @@ pub struct App {
     jobs: Vec<(String, Job)>,
     sel: usize,
     shared: Arc<Mutex<Shared>>,
+    editor: Option<EditorState>,
+}
+
+/// 任务编辑器（FFS 的"配置对话框"对应物）。全部字符串编辑，Save 时校验落盘。
+struct EditorState {
+    is_new: bool,
+    name: String,
+    mode: String,
+    source: String,
+    target: String,
+    archive: String,
+    rigor: String,
+    symlinks: String,
+    case_sensitive: bool,
+    include: String,
+    exclude: String,
+    remote_host: String,
+    remote_root: String,
+    remote_exe: String,
+    delete_armed: bool,
+    error: Option<String>,
+}
+
+impl EditorState {
+    fn new_blank() -> Self {
+        EditorState {
+            is_new: true,
+            name: String::new(),
+            mode: "sync".into(),
+            source: String::new(),
+            target: String::new(),
+            archive: String::new(),
+            rigor: "standard".into(),
+            symlinks: "exclude".into(),
+            case_sensitive: false,
+            include: String::new(),
+            exclude: String::new(),
+            remote_host: String::new(),
+            remote_root: String::new(),
+            remote_exe: String::new(),
+            delete_armed: false,
+            error: None,
+        }
+    }
+    fn from_job(name: &str, j: &Job) -> Self {
+        EditorState {
+            is_new: false,
+            name: name.to_string(),
+            mode: j.mode.clone(),
+            source: j.source.to_string_lossy().into_owned(),
+            target: j.target.to_string_lossy().into_owned(),
+            archive: j.archive.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            rigor: j.rigor.clone(),
+            symlinks: j.symlinks.clone(),
+            case_sensitive: j.case_sensitive,
+            include: j.include.join("\n"),
+            exclude: j.exclude.join("\n"),
+            remote_host: j.remote_host.clone().unwrap_or_default(),
+            remote_root: j.remote_root.clone().unwrap_or_default(),
+            remote_exe: j.remote_exe.clone().unwrap_or_default(),
+            delete_armed: false,
+            error: None,
+        }
+    }
+    fn to_job(&self) -> Result<Job, String> {
+        let name = self.name.trim();
+        if name.is_empty() || name.contains(['/', '\\']) {
+            return Err("name is empty or contains path separators".into());
+        }
+        if self.source.trim().is_empty() || self.target.trim().is_empty() {
+            return Err("source and target are required".into());
+        }
+        let lines = |s: &str| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>();
+        let opt = |s: &str| {
+            let t = s.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        };
+        Ok(Job {
+            mode: self.mode.clone(),
+            source: self.source.trim().into(),
+            target: self.target.trim().into(),
+            archive: opt(&self.archive).map(Into::into),
+            include: lines(&self.include),
+            exclude: lines(&self.exclude),
+            no_hash: false,
+            rigor: self.rigor.clone(),
+            case_sensitive: self.case_sensitive,
+            symlinks: self.symlinks.clone(),
+            remote_host: opt(&self.remote_host),
+            remote_root: opt(&self.remote_root),
+            remote_exe: opt(&self.remote_exe),
+        })
+    }
+}
+
+enum EditorAction {
+    Save,
+    Cancel,
+    Delete,
 }
 
 impl App {
@@ -39,6 +138,7 @@ impl App {
         App {
             jobs,
             sel,
+            editor: None,
             shared: Arc::new(Mutex::new(Shared {
                 phase: Phase::Idle,
                 status: format!("jobs dir: {}", config::jobs_dir().display()),
@@ -117,6 +217,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut do_compare = false;
         let mut do_apply = false;
+        let mut open_editor: Option<Option<usize>> = None; // Some(None)=新建, Some(Some(i))=编辑第 i 个
 
         {
             let mut sh = self.shared.lock().unwrap();
@@ -129,6 +230,9 @@ impl eframe::App for App {
                     ui.separator();
                     if self.jobs.is_empty() {
                         ui.label(format!("no jobs — put <name>.toml under {}", config::jobs_dir().display()));
+                        if ui.button("New").clicked() {
+                            open_editor = Some(None);
+                        }
                     } else {
                         egui::ComboBox::from_id_salt("job")
                             .selected_text(self.jobs[self.sel].0.clone())
@@ -146,6 +250,13 @@ impl eframe::App for App {
                         let can_sync = sh.phase == Phase::Ready && sh.plan.is_some();
                         if ui.add_enabled(can_sync, egui::Button::new("Synchronize")).clicked() {
                             do_apply = true;
+                        }
+                        ui.separator();
+                        if ui.button("Edit").clicked() {
+                            open_editor = Some(Some(self.sel));
+                        }
+                        if ui.button("New").clicked() {
+                            open_editor = Some(None);
                         }
                         if busy {
                             ui.spinner();
@@ -317,6 +428,146 @@ impl eframe::App for App {
                     sh.phase = Phase::Idle;
                     ctx2.request_repaint();
                 });
+            }
+        }
+
+        // ---------- 任务编辑器（FFS 配置对话框的对应物） ----------
+        if let Some(which) = open_editor {
+            self.editor = Some(match which {
+                None => EditorState::new_blank(),
+                Some(i) => self
+                    .jobs
+                    .get(i)
+                    .map(|(n, j)| EditorState::from_job(n, j))
+                    .unwrap_or_else(EditorState::new_blank),
+            });
+        }
+
+        let mut action: Option<EditorAction> = None;
+        if let Some(ed) = &mut self.editor {
+            let mut open = true;
+            egui::Window::new(if ed.is_new { "New Job" } else { "Edit Job" })
+                .open(&mut open)
+                .resizable(true)
+                .default_width(640.0)
+                .show(ctx, |ui| {
+                    egui::Grid::new("jobform").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                        ui.label("name");
+                        ui.add_enabled(ed.is_new, egui::TextEdit::singleline(&mut ed.name).desired_width(420.0));
+                        ui.end_row();
+                        ui.label("mode");
+                        ui.horizontal(|ui| {
+                            for m in ["mirror", "sync", "enrich"] {
+                                ui.selectable_value(&mut ed.mode, m.to_string(), m);
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("source");
+                        ui.add(egui::TextEdit::singleline(&mut ed.source).desired_width(480.0));
+                        ui.end_row();
+                        ui.label("target");
+                        ui.add(egui::TextEdit::singleline(&mut ed.target).desired_width(480.0));
+                        ui.end_row();
+                        ui.label("archive");
+                        ui.add(egui::TextEdit::singleline(&mut ed.archive).desired_width(480.0).hint_text("sync 模式的存档路径；留空=无"));
+                        ui.end_row();
+                        ui.label("rigor");
+                        ui.horizontal(|ui| {
+                            for r in ["quick", "standard", "paranoid"] {
+                                ui.selectable_value(&mut ed.rigor, r.to_string(), r);
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("symlinks");
+                        ui.horizontal(|ui| {
+                            for s in ["exclude", "direct"] {
+                                ui.selectable_value(&mut ed.symlinks, s.to_string(), s);
+                            }
+                            ui.checkbox(&mut ed.case_sensitive, "case sensitive");
+                        });
+                        ui.end_row();
+                        ui.label("include");
+                        ui.add(egui::TextEdit::multiline(&mut ed.include).desired_rows(2).desired_width(480.0).hint_text("FFS 过滤器语法，每行一条；留空 = 全部"));
+                        ui.end_row();
+                        ui.label("exclude");
+                        ui.add(egui::TextEdit::multiline(&mut ed.exclude).desired_rows(2).desired_width(480.0).hint_text("默认垃圾/可重建排除已内置"));
+                        ui.end_row();
+                        ui.label("remote host");
+                        ui.add(egui::TextEdit::singleline(&mut ed.remote_host).desired_width(480.0).hint_text("ssh 别名如 mac；留空 = 本地/挂载盘"));
+                        ui.end_row();
+                        ui.label("remote root");
+                        ui.add(egui::TextEdit::singleline(&mut ed.remote_root).desired_width(480.0).hint_text("远端本地绝对路径"));
+                        ui.end_row();
+                        ui.label("remote exe");
+                        ui.add(egui::TextEdit::singleline(&mut ed.remote_exe).desired_width(480.0).hint_text("默认当 syncdash 在远端 PATH 里"));
+                        ui.end_row();
+                    });
+                    if let Some(err) = &ed.error {
+                        ui.colored_label(egui::Color32::from_rgb(0xd9, 0x3a, 0x3a), err);
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            action = Some(EditorAction::Save);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            action = Some(EditorAction::Cancel);
+                        }
+                        if !ed.is_new {
+                            if ed.delete_armed {
+                                if ui.button("Confirm delete?").clicked() {
+                                    action = Some(EditorAction::Delete);
+                                }
+                            } else if ui.button("Delete").clicked() {
+                                ed.delete_armed = true;
+                            }
+                        }
+                    });
+                });
+            if !open {
+                action = Some(EditorAction::Cancel);
+            }
+        }
+        match action {
+            None => {}
+            Some(EditorAction::Cancel) => self.editor = None,
+            Some(EditorAction::Save) => {
+                let outcome = self.editor.as_ref().map(|ed| (ed.name.trim().to_string(), ed.to_job()));
+                if let Some((name, res)) = outcome {
+                    match res {
+                        Ok(job) => match config::save_job(&name, &job) {
+                            Ok(path) => {
+                                self.jobs = config::load_all();
+                                self.sel = self.jobs.iter().position(|(n, _)| n == &name).unwrap_or(0);
+                                self.shared.lock().unwrap().status = format!("saved {}", path.display());
+                                self.editor = None;
+                            }
+                            Err(e) => {
+                                if let Some(ed) = &mut self.editor {
+                                    ed.error = Some(format!("save failed: {e}"));
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            if let Some(ed) = &mut self.editor {
+                                ed.error = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(EditorAction::Delete) => {
+                let name = self.editor.as_ref().map(|ed| ed.name.trim().to_string());
+                if let Some(name) = name {
+                    let msg = match config::delete_job(&name) {
+                        Ok(_) => format!("deleted job '{name}'"),
+                        Err(e) => format!("delete failed: {e}"),
+                    };
+                    self.jobs = config::load_all();
+                    self.sel = 0;
+                    self.shared.lock().unwrap().status = msg;
+                    self.editor = None;
+                }
             }
         }
     }
