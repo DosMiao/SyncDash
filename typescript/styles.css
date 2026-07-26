@@ -255,3 +255,34 @@ tr.flip .badge { border-style: dashed; }
 .mrow.danger b { color: var(--red); }
 .mrow.warn b { color: var(--accent); }
 .btnrow { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+
+/* ---- M3: Overview 聚合竖栏（FFS 同款，可折叠） + 图标统计条 ---- */
+#reviewrow { flex: 1; display: flex; min-height: 0; }
+#overview { width: 232px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+#overview.collapsed { width: 26px; }
+#overview.collapsed #ov-body { display: none; }
+#ov-toggle { background: none; border: none; color: var(--dim); cursor: pointer; padding: 6px 0; font-size: 13px; }
+#ov-toggle:hover { color: var(--text); }
+#ov-body { flex: 1; overflow-y: auto; padding: 4px 8px; }
+.ov-head { font-size: 11px; color: var(--dim); display: flex; justify-content: space-between; padding: 2px 2px 6px; }
+#ov-clear { cursor: pointer; }
+#ov-clear:hover { color: var(--red); }
+.ovrow { padding: 4px 6px; border-radius: 5px; cursor: pointer; font-size: 12px; margin-bottom: 2px; }
+.ovrow:hover { background: var(--panel2); }
+.ovrow.on { background: var(--panel2); outline: 1px solid var(--accent); }
+.ovrow .l1 { display: flex; gap: 6px; align-items: center; }
+.ovrow .chev { width: 12px; color: var(--dim); flex: none; }
+.ovrow .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ovrow .ct { color: var(--dim); font-size: 10px; font-variant-numeric: tabular-nums; flex: none; }
+.ovbar { height: 3px; background: var(--panel3); border-radius: 2px; margin-top: 3px; overflow: hidden; }
+.ovbar > div { height: 100%; background: var(--accent); }
+.ovchild { margin-left: 16px; }
+.st { display: inline-flex; gap: 3px; align-items: center; margin-left: 10px; font-variant-numeric: tabular-nums; }
+.st.zero { opacity: 0.35; }
+.st b { font-weight: 600; }
+.st.s-copy b { color: var(--green); }
+.st.s-upd b { color: var(--orange); }
+.st.s-mv b { color: var(--accent); }
+.st.s-del b { color: var(--red); }
+.st.s-conf b { color: var(--purple); }
+.rbadge { font-size: 9px; padding: 1px 5px; border-radius: 6px; background: var(--panel3); color: var(--accent); border: 1px solid var(--accent); }

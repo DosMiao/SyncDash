@@ -29,6 +29,14 @@
         <input id="search" class="mono" type="text" placeholder="搜索 path / from / reason   (Ctrl+F)" />
         <div id="chips"></div>
       </div>
+      <div id="reviewrow">
+      <aside id="overview" class="collapsed">
+        <button id="ov-toggle" title="Overview 聚合（展开/收起）">☰</button>
+        <div id="ov-body">
+          <div class="ov-head"><span>Overview</span><span id="ov-clear" title="清除过滤">✕</span></div>
+          <div id="ov-list"></div>
+        </div>
+      </aside>
       <div id="tablewrap">
         <div id="empty" class="empty">← 选择任务，然后 Compare（Ctrl+R）</div>
         <table id="plantable" class="hidden">
@@ -44,6 +52,7 @@
           </thead>
           <tbody id="planbody"></tbody>
         </table>
+      </div>
       </div>
       <footer id="status">就绪</footer>
     </main>

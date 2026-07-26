@@ -5,7 +5,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
 
-interface JobDto { name: string; mode: string; rigor: string; source: string; target: string; has_archive: boolean }
+interface JobDto {
+  name: string; mode: string; rigor: string; source: string; target: string; has_archive: boolean;
+  remote: boolean; remote_host?: string; versioning: boolean; delta: boolean; parallel?: number;
+  include: string[]; exclude: string[];
+}
 interface OpDto {
   side: 'source' | 'target';
   action: 'copy' | 'update' | 'move' | 'delete' | 'delete_dir' | 'chmod' | 'conflict' | 'note';
@@ -58,6 +62,9 @@ let flipped: boolean[] = [];
 let chip: Chip = 'all';
 let search = '';
 let busy = false;
+/// M3 Overview：按顶层目录过滤（null = 不过滤；'(root)' = 根下散文件；'a' 或 'a/b' = 前缀）
+let ovFilter: string | null = null;
+let ovExpanded = new Set<string>();
 /// 用户在确认单里勾了"我确认无误"（等同 CLI --i-know）；每次重新比对后归零
 let acknowledged = false;
 
@@ -111,12 +118,18 @@ function matchesSearch(op: OpDto): boolean {
     || op.reason.toLowerCase().includes(q);
 }
 
+function matchesOv(op: OpDto): boolean {
+  if (!ovFilter) return true;
+  if (ovFilter === '(root)') return !op.path.includes('/');
+  return op.path === ovFilter || op.path.startsWith(ovFilter + '/');
+}
+
 function visibleIdx(): number[] {
   if (!plan) return [];
   const out: number[] = [];
   plan.ops.forEach((_, i) => {
     const op = eff(i);
-    if ((chip === 'all' || category(op) === chip) && matchesSearch(op)) out.push(i);
+    if ((chip === 'all' || category(op) === chip) && matchesSearch(op) && matchesOv(op)) out.push(i);
   });
   return out;
 }
@@ -158,17 +171,95 @@ function renderChips() {
   }
 }
 
+/// M3：图标化统计条（FFS 底部统计条同款语义：0 值置灰、非 0 加粗）
 function renderStats() {
   if (!plan) { statsEl.textContent = ''; return; }
-  const selN = checked.filter(Boolean).length;
+  const cnt = { copy: 0, upd: 0, mv: 0, del: 0 };
   let bytes = 0;
   plan.ops.forEach((_, i) => {
+    if (!checked[i]) return;
     const op = eff(i);
-    if (checked[i] && (op.action === 'copy' || op.action === 'update') && op.size) bytes += op.size;
+    switch (op.action) {
+      case 'copy': cnt.copy++; bytes += op.size ?? 0; break;
+      case 'update': case 'chmod': cnt.upd++; bytes += op.size ?? 0; break;
+      case 'move': cnt.mv++; break;
+      case 'delete': case 'delete_dir': cnt.del++; break;
+    }
   });
   const flips = flipped.filter(Boolean).length;
-  statsEl.textContent =
-    `${plan.ops.length} 项 · 已选 ${selN}${flips ? ` · 翻向 ${flips}` : ''} · 待传 ${humanSize(bytes) || '0 B'} · 冲突 ${plan.header.conflict_count}`;
+  const seg = (cls: string, icon: string, n: number, title: string) =>
+    `<span class="st ${cls}${n === 0 ? ' zero' : ''}" title="${title}">${icon}<b>${n}</b></span>`;
+  statsEl.innerHTML =
+    seg('s-copy', '＋', cnt.copy, '复制') +
+    seg('s-upd', '✎', cnt.upd, '更新') +
+    seg('s-mv', '⇢', cnt.mv, '移动（零重传）') +
+    seg('s-del', '✕', cnt.del, '删除（进回收目录）') +
+    seg('s-conf', '⚡', plan.header.conflict_count, '冲突') +
+    `<span class="st${bytes === 0 ? ' zero' : ''}" title="待传字节">Σ<b>${humanSize(bytes) || '0 B'}</b></span>` +
+    (flips ? `<span class="st" title="翻转方向">⇄<b>${flips}</b></span>` : '');
+}
+
+/// M3：Overview——按顶层目录聚合（条数/字节/占比条），点击过滤差异表，chevron 惰性展开二层
+function renderOverview() {
+  const listEl = $('ov-list');
+  listEl.innerHTML = '';
+  if (!plan || plan.ops.length === 0) return;
+  interface Agg { items: number; bytes: number; children: Map<string, { items: number; bytes: number }> }
+  const groups = new Map<string, Agg>();
+  let totBytes = 0, totItems = 0;
+  plan.ops.forEach((_, i) => {
+    const op = eff(i);
+    const slash = op.path.indexOf('/');
+    const seg = slash < 0 ? '(root)' : op.path.slice(0, slash);
+    let g = groups.get(seg);
+    if (!g) { g = { items: 0, bytes: 0, children: new Map() }; groups.set(seg, g); }
+    g.items++;
+    g.bytes += op.size ?? 0;
+    totItems++;
+    totBytes += op.size ?? 0;
+    if (slash >= 0) {
+      const rest = op.path.slice(slash + 1);
+      const slash2 = rest.indexOf('/');
+      const seg2 = slash2 < 0 ? '(files)' : rest.slice(0, slash2);
+      const c = g.children.get(seg2) ?? { items: 0, bytes: 0 };
+      c.items++;
+      c.bytes += op.size ?? 0;
+      g.children.set(seg2, c);
+    }
+  });
+  const share = (b: number, n: number) => (totBytes > 0 ? b / totBytes : totItems > 0 ? n / totItems : 0);
+  const mkRow = (key: string, label: string, items: number, bytes: number, depth: number, hasKids: boolean) => {
+    const row = document.createElement('div');
+    row.className = 'ovrow' + (ovFilter === key ? ' on' : '') + (depth ? ' ovchild' : '');
+    const pct = Math.round(share(bytes, items) * 100);
+    row.innerHTML = `<div class="l1">` +
+      (hasKids ? `<span class="chev">${ovExpanded.has(key) ? '▾' : '▸'}</span>` : `<span class="chev"></span>`) +
+      `<span class="nm" title="${escapeHtml(label)}">${escapeHtml(label)}</span>` +
+      `<span class="ct">${items} · ${humanSize(bytes) || '0 B'}</span></div>` +
+      `<div class="ovbar"><div style="width:${pct}%"></div></div>`;
+    row.addEventListener('click', (e) => {
+      const onChev = (e.target as HTMLElement).classList.contains('chev');
+      if (onChev && hasKids) {
+        if (ovExpanded.has(key)) ovExpanded.delete(key); else ovExpanded.add(key);
+      } else {
+        ovFilter = ovFilter === key ? null : key;
+      }
+      renderAll();
+    });
+    return row;
+  };
+  const sorted = [...groups.entries()].sort((a, b) => b[1].bytes - a[1].bytes || b[1].items - a[1].items);
+  for (const [seg, g] of sorted) {
+    const hasKids = seg !== '(root)' && g.children.size > 0;
+    listEl.appendChild(mkRow(seg, seg, g.items, g.bytes, 0, hasKids));
+    if (hasKids && ovExpanded.has(seg)) {
+      const kids = [...g.children.entries()].sort((a, b) => b[1].bytes - a[1].bytes || b[1].items - a[1].items);
+      for (const [seg2, c] of kids) {
+        if (seg2 === '(files)') continue;
+        listEl.appendChild(mkRow(`${seg}/${seg2}`, seg2, c.items, c.bytes, 1, false));
+      }
+    }
+  }
 }
 
 function renderTable() {
@@ -248,6 +339,7 @@ function syncHeadCheckbox() {
 
 function renderAll() {
   renderChips();
+  renderOverview();
   renderTable();
 }
 
@@ -257,12 +349,14 @@ function renderJobs() {
     const div = document.createElement('div');
     div.className = 'job' + (currentJob?.name === j.name ? ' active' : '');
     const rigor = j.rigor && j.rigor !== 'standard' ? `<span class="rigor">${j.rigor}</span>` : '';
-    div.innerHTML = `<span class="name">${j.name}</span>${rigor}<span class="mode ${j.mode}">${j.mode}</span>`;
-    div.title = `${j.source}\n→ ${j.target}`;
+    const remote = j.remote ? `<span class="rbadge">ssh</span>` : '';
+    div.innerHTML = `<span class="name">${j.name}</span>${remote}${rigor}<span class="mode ${j.mode}">${j.mode}</span>`;
+    div.title = `${j.source}\n→ ${j.target}` + (j.remote ? `\nssh:${j.remote_host ?? ''}` : '');
     div.addEventListener('click', () => {
       if (busy) return;
       currentJob = j;
       plan = null; checked = []; flipped = []; chip = 'all'; search = ''; searchEl.value = '';
+      ovFilter = null; ovExpanded.clear();
       renderJobs();
       renderAll();
       pathEl.textContent = `${j.source}   ⇄   ${j.target}`;
@@ -289,6 +383,7 @@ async function doCompare(showWindow = true) {
     checked = plan.ops.map((op) => selectable(op));
     flipped = plan.ops.map(() => false);
     chip = 'all';
+    ovFilter = null; ovExpanded.clear();
     renderAll();
     setStatus(
       plan.ops.length === 0
@@ -400,6 +495,15 @@ searchEl.addEventListener('input', () => {
   search = searchEl.value.trim();
   renderTable();
 });
+
+// M3 Overview 折叠/清除
+const ovEl = $('overview');
+ovEl.classList.toggle('collapsed', localStorage.getItem('sd.ov') !== 'open');
+$('ov-toggle').addEventListener('click', () => {
+  ovEl.classList.toggle('collapsed');
+  localStorage.setItem('sd.ov', ovEl.classList.contains('collapsed') ? 'closed' : 'open');
+});
+$('ov-clear').addEventListener('click', () => { ovFilter = null; renderAll(); });
 
 document.addEventListener('keydown', (e) => {
   const mod = e.ctrlKey || e.metaKey;

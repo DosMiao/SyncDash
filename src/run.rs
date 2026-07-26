@@ -214,9 +214,9 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackn
     run_remote_job_with(name, job, do_apply, verbose, acknowledged, &crate::progress::RunCtx::null())
 }
 
-/// v0.9 M1：远程管线的级边界事件化——每级 PhaseStart、级间协作点（取消/暂停响应）、终态 Summary。
-/// ssh 传输内部的逐字节计数与 kill-on-cancel 是明确后补（M1 步骤 8）；本层保证的是：
-/// 桌面能看见管线走到哪一级、能在级间取消、Summary 数字如实。
+/// v0.9 M1/M3：远程管线 = 比对段 + 执行段（desktop 分两次 IPC 各自调用；CLI 在这里一条龙）。
+/// 级边界 PhaseStart、级间协作点、终态 Summary；ssh 传输内部的逐字节计数与
+/// kill-on-cancel 是明确后补（M1 步骤 8）。
 pub fn run_remote_job_with(
     name: &str,
     job: &Job,
@@ -225,38 +225,58 @@ pub fn run_remote_job_with(
     acknowledged: bool,
     ctx: &crate::progress::RunCtx,
 ) -> std::io::Result<(u64, u64, u64, u64)> {
-    let t0 = std::time::Instant::now();
-    let r = run_remote_job_inner(name, job, do_apply, verbose, acknowledged, ctx, t0);
-    if let Err(e) = &r {
-        // 级间取消：计数尚无意义，但终态必须可见（desktop 靠 Summary 收窗）
-        if crate::progress::is_cancelled(e) {
-            ctx.sink.emit(crate::progress::ProgressEvent::Summary {
-                ts_ms: crate::table::now_ms(),
-                done: 0,
-                skipped: 0,
-                errors: 0,
-                bytes_done: 0,
-                elapsed_ms: t0.elapsed().as_millis() as u64,
-                paused_ms: ctx.ctl.paused_total_ms(),
-                cancelled: true,
-            });
+    let plan = match compare_remote_job_with(name, job, ctx) {
+        Ok(p) => p,
+        Err(e) => {
+            // 比对段取消：终态必须可见（desktop 靠 Summary 收窗）
+            if crate::progress::is_cancelled(&e) {
+                emit_cancel_summary(ctx, std::time::Instant::now());
+            }
+            return Err(e);
         }
+    };
+    eprintln!("[{name}] {} op(s), {} conflict(s)  (remote pipeline via ssh)", plan.header.op_count, plan.header.conflict_count);
+    for op in &plan.ops {
+        println!("{}", serde_json::to_string(op)?);
     }
-    r
+    if !do_apply {
+        println!("dry-run (rerun with --apply)");
+        return Ok((0, plan.ops.len() as u64, 0, plan.header.conflict_count));
+    }
+    let ops: Vec<Op> = plan
+        .ops
+        .iter()
+        .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
+        .cloned()
+        .collect();
+    let out = apply_remote_job_with(name, job, &plan, &ops, verbose, acknowledged, ctx)?;
+    Ok((out.done, out.skipped, out.errors, plan.header.conflict_count))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_remote_job_inner(
-    name: &str,
-    job: &Job,
-    do_apply: bool,
-    verbose: bool,
-    acknowledged: bool,
-    ctx: &crate::progress::RunCtx,
-    t0: std::time::Instant,
-) -> std::io::Result<(u64, u64, u64, u64)> {
-    use crate::compare::Side;
-    use crate::progress::{Phase, PhaseProgress, ProgressEvent};
+fn emit_cancel_summary(ctx: &crate::progress::RunCtx, t0: std::time::Instant) {
+    ctx.sink.emit(crate::progress::ProgressEvent::Summary {
+        ts_ms: crate::table::now_ms(),
+        done: 0,
+        skipped: 0,
+        errors: 0,
+        bytes_done: 0,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+        paused_ms: ctx.ctl.paused_total_ms(),
+        cancelled: true,
+    });
+}
+
+/// 远端连接参数（probe 的产物）。desktop 的比对/执行是两次独立 IPC，
+/// 中间不保存连接——执行段重新 probe（一次 ssh 往返，顺带就是可达性预检）。
+pub struct RemoteLink {
+    pub host: String,
+    pub exe: String,
+    pub rroot: String,
+    pub shell: crate::remote::RemoteShell,
+}
+
+/// 阶段 1：探测可达性 + schema 一致性 + 远端 OS（决定 shell 方言）
+pub fn probe_remote(name: &str, job: &Job) -> std::io::Result<RemoteLink> {
     let host = job
         .remote_host
         .as_deref()
@@ -266,8 +286,6 @@ fn run_remote_job_inner(
         .remote_root
         .as_deref()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "remote_root required for remote jobs"))?;
-
-    // 1) 探测：可达性 + schema 一致性
     let probe = crate::remote::ssh_capture(host, &format!("{exe} probe"))?;
     let pv: serde_json::Value = serde_json::from_slice(&probe)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad probe output: {e}")))?;
@@ -275,11 +293,23 @@ fn run_remote_job_inner(
         eprintln!("[{name}] warning: remote schema {} != local {} — rebuild the remote binary", pv["schema"], crate::table::SCHEMA);
     }
     let remote_os = pv["os"].as_str().unwrap_or("").to_string();
-    let shell = crate::remote::RemoteShell::from_os(&remote_os);
     eprintln!("[{name}] remote {}: {} {}", host, remote_os, pv["arch"].as_str().unwrap_or("?"));
+    Ok(RemoteLink {
+        host: host.to_string(),
+        exe: exe.to_string(),
+        rroot: rroot.to_string(),
+        shell: crate::remote::RemoteShell::from_os(&remote_os),
+    })
+}
+
+/// v0.9 M3：远程任务的**比对段**——desktop `compare_job` 对 remote 任务直接走这里，
+/// 不再静默落进本地管线（那会经 UNC 拉数据重哈希，慢一个数量级还语义错位）。
+pub fn compare_remote_job_with(name: &str, job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<Plan> {
+    use crate::progress::{Phase, PhaseProgress};
+    let link = probe_remote(name, job)?;
 
     // 2) 远端扫描（在远端自己的盘上哈希——比经 UNC 拉数据快得多）
-    let mut scan_args: Vec<String> = vec!["scan".into(), rroot.to_string()];
+    let mut scan_args: Vec<String> = vec!["scan".into(), link.rroot.clone()];
     match job.rigor.as_str() {
         "quick" => scan_args.push("--no-hash".into()),
         "paranoid" => scan_args.push("--force-rehash".into()),
@@ -294,8 +324,8 @@ fn run_remote_job_inner(
     }
     ctx.checkpoint()?;
     // 远端在自己盘上扫描，本地只能看到"进行中"——总量归零、label 说明白在等谁
-    let _pp_rs = PhaseProgress::begin(ctx, Phase::ScanTarget, Some(format!("ssh:{host} {rroot}")), 0, 0);
-    let table_bytes = crate::remote::ssh_capture(host, &crate::remote::remote_cmd(shell, exe, &scan_args))?;
+    let _pp_rs = PhaseProgress::begin(ctx, Phase::ScanTarget, Some(format!("ssh:{} {}", link.host, link.rroot)), 0, 0);
+    let table_bytes = crate::remote::ssh_capture(&link.host, &crate::remote::remote_cmd(link.shell, &link.exe, &scan_args))?;
     let t = Snapshot::from_reader(std::io::BufReader::new(&table_bytes[..]))?;
 
     // 3) 本地扫描 + 比对（本地 source 侧同样过挂载点闸门）
@@ -303,6 +333,14 @@ fn run_remote_job_inner(
     crate::preflight::check_root("source", &job.source, job.require_marker, &mut v);
     for w in &v.warnings {
         eprintln!("[{name}] warning: {w}");
+        ctx.sink.emit(crate::progress::ProgressEvent::Error {
+            phase: Phase::ScanSource,
+            ts_ms: crate::table::now_ms(),
+            path: String::new(),
+            action: "warning".into(),
+            side: "source".into(),
+            message: w.clone(),
+        });
     }
     if !v.ok() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
@@ -320,25 +358,75 @@ fn run_remote_job_inner(
         0,
     );
     let copts = job.compare_opts();
-    let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
-    eprintln!("[{name}] {} op(s), {} conflict(s)  (remote pipeline via ssh:{host})", plan.header.op_count, plan.header.conflict_count);
-    for op in &plan.ops {
-        println!("{}", serde_json::to_string(op)?);
-    }
-    if !do_apply {
-        println!("dry-run (rerun with --apply)");
-        return Ok((0, plan.ops.len() as u64, 0, plan.header.conflict_count));
-    }
+    Ok(compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts))
+}
 
-    // 计划体检：远端磁盘空间查不到，但"删掉对面一大半"这类事故本地就能拦
+/// 远程任务的计划体检（desktop 确认单用）：只有删除占比闸门——
+/// 磁盘空间与 marker 在远端机器上，本地查不到也不该假装查了。
+pub fn preflight_remote_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::preflight::Verdict {
     let g = job.guards(acknowledged);
-    let st = crate::preflight::stat_plan(&plan.ops);
+    let st = crate::preflight::stat_plan(ops);
     let mut gv = crate::preflight::Verdict { blockers: Vec::new(), warnings: Vec::new() };
     crate::preflight::check_delete_ratio("target", &st.target, plan.header.target_entries, &g, &mut gv);
     crate::preflight::check_delete_ratio("source", &st.source, plan.header.source_entries, &g, &mut gv);
-    if !gv.report(name) {
-        return Ok((0, plan.ops.len() as u64, 1, plan.header.conflict_count));
+    gv
+}
+
+/// v0.9 M3：远程任务的**执行段**——`ops` 是用户在差异表定稿的子集（翻向/勾选已生效）。
+/// 重新 probe → 体检 → 打包选中项 → ssh 送包 → 远端 apply-pack → source 回拉 → 刷新 → Summary。
+pub fn apply_remote_job_with(
+    name: &str,
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    verbose: bool,
+    acknowledged: bool,
+    ctx: &crate::progress::RunCtx,
+) -> std::io::Result<crate::progress::ApplyOutcome> {
+    let t0 = std::time::Instant::now();
+    let r = apply_remote_inner(name, job, plan, ops, verbose, acknowledged, ctx, t0);
+    if let Err(e) = &r {
+        if crate::progress::is_cancelled(e) {
+            emit_cancel_summary(ctx, t0);
+        }
     }
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_remote_inner(
+    name: &str,
+    job: &Job,
+    plan_full: &Plan,
+    sel_ops: &[Op],
+    verbose: bool,
+    acknowledged: bool,
+    ctx: &crate::progress::RunCtx,
+    t0: std::time::Instant,
+) -> std::io::Result<crate::progress::ApplyOutcome> {
+    use crate::compare::Side;
+    use crate::progress::{ApplyOutcome, Phase, PhaseProgress, ProgressEvent};
+
+    // 计划体检：远端磁盘空间查不到，但"删掉对面一大半"这类事故本地就能拦
+    let gv = preflight_remote_job(job, plan_full, sel_ops, acknowledged);
+    if !gv.report(name) {
+        for b in &gv.blockers {
+            ctx.sink.emit(ProgressEvent::Error {
+                phase: Phase::Apply,
+                ts_ms: crate::table::now_ms(),
+                path: String::new(),
+                action: "preflight".into(),
+                side: "target".into(),
+                message: b.clone(),
+            });
+        }
+        return Ok(ApplyOutcome { done: 0, skipped: sel_ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false });
+    }
+
+    let link = probe_remote(name, job)?;
+    let (host, exe, rroot, shell) = (link.host.as_str(), link.exe.as_str(), link.rroot.as_str(), link.shell);
+    // 打包/回拉都只看定稿子集；full plan 只用于 archive 刷新（冲突路径剔除要看全量）
+    let plan = Plan { header: plan_full.header.clone(), ops: sel_ops.to_vec() };
 
     let mut done = 0u64;
     let mut skipped = 0u64;
@@ -469,7 +557,7 @@ fn run_remote_job_inner(
     }
 
     if errors == 0 && !ctx.ctl.cancelled() && job.mode == "sync" {
-        refresh_archive_with(job, &plan, ctx);
+        refresh_archive_with(job, plan_full, ctx);
     }
     ctx.sink.emit(ProgressEvent::Summary {
         ts_ms: crate::table::now_ms(),
@@ -481,5 +569,11 @@ fn run_remote_job_inner(
         paused_ms: ctx.ctl.paused_total_ms(),
         cancelled: ctx.ctl.cancelled(),
     });
-    Ok((done, skipped, errors, plan.header.conflict_count))
+    Ok(ApplyOutcome {
+        done,
+        skipped,
+        errors,
+        bytes_copied: bytes_done_total,
+        cancelled: ctx.ctl.cancelled(),
+    })
 }

@@ -24,6 +24,14 @@ struct JobDto {
     source: String,
     target: String,
     has_archive: bool,
+    // v0.9 M3：补齐前端需要感知的字段（remote 徽章 / versioning 标识 / 过滤器提示）
+    remote: bool,
+    remote_host: Option<String>,
+    versioning: bool,
+    delta: bool,
+    parallel: Option<usize>,
+    include: Vec<String>,
+    exclude: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -191,6 +199,13 @@ fn list_jobs() -> Vec<JobDto> {
             source: j.source.display().to_string(),
             target: j.target.display().to_string(),
             has_archive: j.archive.is_some(),
+            remote: j.remote_host.is_some(),
+            remote_host: j.remote_host.clone(),
+            versioning: j.versioning,
+            delta: j.delta,
+            parallel: j.parallel,
+            include: j.include.clone(),
+            exclude: j.exclude.clone(),
         })
         .collect()
 }
@@ -281,7 +296,12 @@ async fn compare_job(
         let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
         let (run_id, ctl) = begin_run(&st)?;
         let ctx = make_ctx(&app, run_id, ctl);
-        let r = run::compare_job_with(&job, &ctx);
+        // M3：remote 任务走远程管线（远端自己盘上扫描），不再静默落进本地管线
+        let r = if job.remote_host.is_some() {
+            run::compare_remote_job_with(&name, &job, &ctx)
+        } else {
+            run::compare_job_with(&job, &ctx)
+        };
         end_run(&st);
         let plan = r.map_err(user_err)?;
         let reversed = plan.ops.iter().map(compare::reverse_op).collect();
@@ -302,7 +322,12 @@ async fn preflight(name: String, plan: PlanDto, ops: Vec<Op>, acknowledged: bool
             .into_iter()
             .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
             .collect();
-        let v = run::preflight_job(&job, &full, &ops, acknowledged);
+        // remote 任务只有删除占比闸门（磁盘空间/marker 在远端机器上，本地查了也是错的）
+        let v = if job.remote_host.is_some() {
+            run::preflight_remote_job(&job, &full, &ops, acknowledged)
+        } else {
+            run::preflight_job(&job, &full, &ops, acknowledged)
+        };
         Ok(PreflightDto { ok: v.ok(), blockers: v.blockers, warnings: v.warnings })
     })
     .await
@@ -327,13 +352,28 @@ async fn apply_job(
             .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
             .collect();
         // 闸门不通过时不动手，并把理由回传给界面
-        let v = run::preflight_job(&job, &full, &ops, acknowledged);
+        let v = if job.remote_host.is_some() {
+            run::preflight_remote_job(&job, &full, &ops, acknowledged)
+        } else {
+            run::preflight_job(&job, &full, &ops, acknowledged)
+        };
         if !v.ok() {
             return Err(v.blockers.join("\n"));
         }
         let (run_id, ctl) = begin_run(&st)?;
         let ctx = make_ctx(&app, run_id, ctl);
-        let out = run::apply_job_guarded_with(&job, &full, &ops, None, false, acknowledged, &ctx);
+        let out = if job.remote_host.is_some() {
+            let r = run::apply_remote_job_with(&name, &job, &full, &ops, false, acknowledged, &ctx);
+            match r {
+                Ok(o) => o,
+                Err(e) => {
+                    end_run(&st);
+                    return Err(user_err(e));
+                }
+            }
+        } else {
+            run::apply_job_guarded_with(&job, &full, &ops, None, false, acknowledged, &ctx)
+        };
         end_run(&st);
         Ok(ApplyDto {
             done: out.done,
