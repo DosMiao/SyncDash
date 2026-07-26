@@ -4,7 +4,7 @@
 //! - copy 后把 mtime 设成源表里的值 —— 下次比对的相等判定依赖它
 //! 远端打包模式（tar/zip + 清单 + 双 hash + 对端校验执行）在 v0.4，见 README。
 
-use crate::compare::{Action, Plan, Side};
+use crate::compare::{Action, Op, Side};
 use filetime::FileTime;
 use std::path::{Path, PathBuf};
 
@@ -49,13 +49,13 @@ fn set_mtime(path: &Path, mtime_ms: i64) {
     let _ = filetime::set_file_mtime(path, ft);
 }
 
-pub fn apply(plan: &Plan, source_root: &Path, target_root: &Path, opt: &ApplyOptions) -> (u64, u64, u64) {
+pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOptions) -> (u64, u64, u64) {
     let trash = opt.trash.clone().unwrap_or_else(default_trash);
     let mut done = 0u64;
     let mut skipped = 0u64;
     let mut errors = 0u64;
 
-    for op in &plan.ops {
+    for op in ops {
         let (exec_root, other_root) = match op.side {
             Side::Target => (target_root, source_root),
             Side::Source => (source_root, target_root),

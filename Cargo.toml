@@ -12,6 +12,9 @@ walkdir = "2"
 clap = { version = "4", features = ["derive"] }
 filetime = "0.2"
 hostname = "0.4"
+toml = "0.8"
+eframe = "0.31"
+egui_extras = "0.31"
 
 [profile.release]
 lto = true

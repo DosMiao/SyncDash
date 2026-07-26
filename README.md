@@ -15,12 +15,39 @@
 ## 命令
 
 ```bash
+syncdash jobs                                    # 列出任务配置
+syncdash run <job> [--apply]                     # 一条龙：扫双侧→比对→(--apply)执行→刷新 archive
+syncdash gui [job]                               # 图形界面（见下）
 syncdash probe                                   # 本机环境 JSON（远端探测：ssh 对面跑这个）
 syncdash scan <root> [--out t.jsonl] [--no-hash] [--exclude NAME]...
 syncdash compare --source a.jsonl --target b.jsonl \
     [--mode mirror|sync|enrich] [--archive last.jsonl] [--resolve-newer] [--out plan.jsonl]
 syncdash apply plan.jsonl [--apply] [--source-root R] [--target-root R] [-v]
 ```
+
+## 任务配置（参考 FFS 的"一个 .ffs_gui 一个配置"）
+
+一个 TOML 一个任务，放在 `%APPDATA%\syncdash\jobs\`（mac: `~/.config/syncdash/jobs/`）：
+
+```toml
+mode = "sync"              # mirror | sync | enrich
+source = 'D:\Code\Utilities\flight'
+target = '\\192.168.0.115\xuanbomiao\Code\Utilities\flight'
+archive = 'C:\Users\xuanb\AppData\Roaming\syncdash\archive\flight.jsonl'   # sync 模式
+# exclude = ["big_temp"]
+# no_hash = false
+```
+
+`run <job> --apply` 成功（0 错误）且为 sync 模式时**自动刷新 archive**（冲突路径会从存档剔除，
+下次继续报冲突而不是被悄悄仲裁）。
+
+## GUI
+
+`syncdash gui [job]`：任务下拉 → **Compare**（后台线程扫描，不卡界面）→ 差异表
+（勾选框 + 彩色动作徽章：`-> copy` / `<- copy` / `mv` / `DEL` / `CONFLICT`，size、reason 列）
+→ 底部统计（op 数 / 已选 / 待传字节 / 冲突数）→ **Synchronize** 执行勾选项。
+conflict/note 行不可勾选，只能看。自动加载系统 CJK 字体（微软雅黑 / PingFang）。
+FFS 还有而我们暂缺的：逐行翻转方向、GUI 里编辑过滤器 —— 在 roadmap。
 
 - `scan` 默认写 stdout（ssh 友好：`ssh mac syncdash scan ~/Data > mac.jsonl`）。
 - `apply` **默认 dry-run**，`--apply` 才动手；删除/覆盖的文件先进本机
@@ -91,14 +118,14 @@ Win↔Mac 的 SSH 已验证可用（Mac 22 端口开着，免密只差把公钥�
 ## Roadmap
 
 - [x] v0.1 `scan`（表+hash 缓存）、`compare`（mirror/sync/enrich + 移动检测 + archive 归因）、`apply`（本地/挂载盘，dry-run 默认，回收目录）、`probe`
-- [ ] v0.2 单测覆盖 compare 分类矩阵；`--exclude` 支持路径模式；symlink 策略
-- [ ] v0.3 archive 自动化（apply 成功后自动落档）+ `sync` 的一条龙命令
-- [ ] v0.4 远端：`pack` / `apply-pack` / ssh 传输封装
+- [x] v0.2 任务配置（jobs/*.toml）、`run` 一条龙、GUI（Compare→勾选→Synchronize）、sync 成功后自动刷新 archive
+- [ ] v0.3 单测覆盖 compare 分类矩阵；`--exclude` 支持路径模式；symlink 策略；GUI 逐行方向翻转
+- [ ] v0.4 远端：`pack` / `apply-pack`（zip+清单+双 hash+对端校验）/ ssh 传输封装
 - [ ] v0.5 多端配置文件（节点×领地×模式），领地清单与 `.ffs-sync` 标记打通
 
 ## 构建
 
 ```bash
 cargo build --release        # Windows: target\release\syncdash.exe
-# Mac：ssh 过去跑同一条命令（仓库经 git 到位后），产物 target/release/syncdash
+ssh mac "cd ~/Code/Utilities/SyncDash && cargo build --release"   # Mac 侧（仓库经 git 到位后）
 ```

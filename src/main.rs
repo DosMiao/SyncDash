@@ -1,9 +1,13 @@
 mod apply;
 mod compare;
+mod config;
+mod gui;
+mod run;
 mod scan;
 mod table;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use compare::{Action, Op};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -24,6 +28,22 @@ enum Mode {
 enum Cmd {
     /// 打印本机环境信息（远端探测用：ssh 对面跑这个）
     Probe,
+    /// 列出任务配置（%APPDATA%\syncdash\jobs\*.toml）
+    Jobs,
+    /// 跑一个任务：扫双侧 → 比对 →（--apply 时）执行 + 刷新 archive
+    Run {
+        /// 任务名（jobs 目录里的文件名）或 toml 路径
+        job: String,
+        #[arg(long)]
+        apply: bool,
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// 打开图形界面（参考 FFS：Compare → 勾选 → Synchronize）
+    Gui {
+        /// 启动时选中的任务名
+        job: Option<String>,
+    },
     /// 扫描目录，产出快照表（JSONL，默认 stdout —— ssh 管道友好）
     Scan {
         root: PathBuf,
@@ -58,7 +78,6 @@ enum Cmd {
         plan: PathBuf,
         #[arg(long)]
         apply: bool,
-        /// 覆盖计划头里的 source root（如换了挂载点）
         #[arg(long)]
         source_root: Option<PathBuf>,
         #[arg(long)]
@@ -87,7 +106,7 @@ fn write_out<F: Fn(&mut dyn std::io::Write) -> std::io::Result<()>>(out: &Option
 
 fn main() {
     let cli = Cli::parse();
-    let code = match run(cli) {
+    let code = match run_cli(cli) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
@@ -97,7 +116,7 @@ fn main() {
     std::process::exit(code);
 }
 
-fn run(cli: Cli) -> std::io::Result<i32> {
+fn run_cli(cli: Cli) -> std::io::Result<i32> {
     match cli.cmd {
         Cmd::Probe => {
             let info = serde_json::json!({
@@ -108,8 +127,46 @@ fn run(cli: Cli) -> std::io::Result<i32> {
                 "arch": std::env::consts::ARCH,
                 "host": table::host_name(),
                 "exe": std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned()),
+                "jobs_dir": config::jobs_dir().to_string_lossy().into_owned(),
             });
             println!("{}", serde_json::to_string_pretty(&info)?);
+            Ok(0)
+        }
+        Cmd::Jobs => {
+            let jobs = config::load_all();
+            if jobs.is_empty() {
+                println!("no jobs in {}\n\nsample job file:\n{}", config::jobs_dir().display(), config::SAMPLE);
+            } else {
+                for (name, j) in jobs {
+                    println!("{:<24} {:<7} {}  ->  {}", name, j.mode, j.source.display(), j.target.display());
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Run { job, apply: do_apply, verbose } => {
+            let (name, j) = config::load(&job)?;
+            let plan = run::compare_job(&j)?;
+            eprintln!("[{name}] {} op(s), {} conflict(s)", plan.header.op_count, plan.header.conflict_count);
+            for op in &plan.ops {
+                println!("{}", serde_json::to_string(op)?);
+            }
+            if do_apply {
+                let ops: Vec<Op> = plan
+                    .ops
+                    .iter()
+                    .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
+                    .cloned()
+                    .collect();
+                let (done, skipped, errors) = run::apply_job(&j, &plan, &ops, None, verbose);
+                println!("applied: {done} done, {skipped} skipped, {errors} error(s)");
+                Ok(if errors > 0 { 1 } else { 0 })
+            } else {
+                println!("dry-run (rerun with --apply)");
+                Ok(if plan.header.conflict_count > 0 { 1 } else { 0 })
+            }
+        }
+        Cmd::Gui { job } => {
+            gui::run_gui(job).map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(0)
         }
         Cmd::Scan { root, out, no_hash, exclude } => {
@@ -155,7 +212,7 @@ fn run(cli: Cli) -> std::io::Result<i32> {
                     return Ok(2);
                 }
             }
-            let (done, skipped, errors) = apply::apply(&p, &sr, &tr, &apply::ApplyOptions { dry_run: !do_apply, trash, verbose });
+            let (done, skipped, errors) = apply::apply(&p.ops, &sr, &tr, &apply::ApplyOptions { dry_run: !do_apply, trash, verbose });
             println!(
                 "{}: {done} done, {skipped} {}, {errors} error(s)",
                 if do_apply { "applied" } else { "dry-run" },
