@@ -469,7 +469,10 @@ mod tests {
         let s = snap("windows", vec![file("Readme.md", "h1")]);
         let t = snap("macos", vec![file("readme.md", "h1")]);
         assert_eq!(compare(&s, &t, "mirror", None, false, &CompareOptions { case_insensitive: true }).ops.len(), 0);
-        assert_eq!(compare(&s, &t, "mirror", None, false, &CompareOptions { case_insensitive: false }).ops.len(), 2); // copy + delete
+        // 大小写敏感时：同 hash 的大小写双胞胎被移动检测配对成一次 rename——比复制+删除更聪明
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions { case_insensitive: false });
+        assert_eq!(plan.ops.len(), 1);
+        assert_eq!(plan.ops[0].action, Action::Move);
     }
 
     #[test]

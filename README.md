@@ -50,6 +50,8 @@ target = '\\192.168.0.115\xuanbomiao\Code\Utilities\flight'
 archive = 'C:\Users\xuanb\AppData\Roaming\syncdash\archive\flight.jsonl'   # sync 模式
 # include = ['*']                       # FFS 过滤器语法白名单（留空 = 全部）
 # exclude = ['*/big_temp/', '*/*.log']  # FFS 语法；默认垃圾/可重建排除已内置
+# rigor = "standard"                    # quick | standard | paranoid（见"严谨级"）
+# case_sensitive = false                # 默认大小写不敏感（NTFS/APFS 默认行为）
 # no_hash = false
 ```
 
@@ -82,6 +84,29 @@ FFS 还有而我们暂缺的：逐行翻转方向、GUI 内编辑过滤器/任�
 | **enrich**（只增不删） | ✅ 补到 target | source 严格较新才更新 | ❌ 永不 | ❌（move 含删，违背只增） |
 
 相等判定：双方都有 hash → hash 相等；否则 size 相等且 |Δmtime| ≤ 2s（FAT/SMB 时间粒度）。
+
+### 严谨级（rigor）
+
+| 级别 | 扫描 | 执行 | 适用 |
+|---|---|---|---|
+| `quick` | 不 hash：size+mtime±2s | 正常 | 超大树快速巡检；无移动检测 |
+| `standard`（默认） | BLAKE3＋缓存（(path,size,mtime) 未变即复用） | 正常 | 日常 |
+| `paranoid` | 全量重 hash（无视缓存） | **复制后重读目标校验 hash**（FFS "verify copied files" 同款） | 冷备、可疑介质、首次大迁移 |
+
+### 跨平台正确性（v0.2.2）
+
+- **Unicode 归一化**：Mac（HFS+ 强制 NFD；APFS 保留写入形态但按归一化不敏感匹配）与
+  Windows/Linux（NFC 惯例）会给同一个名字不同的字节序列。比对键统一 NFC 归一——
+  `café`(NFC) 与 `café`(NFD) 判为同一个文件；**落盘 I/O 永远用各侧自己的原拼写，
+  绝不像 Syncthing 那样改写对方的形态**（它有把 NFC 转 NFD 弄断引用的前科）。
+- **大小写**：NTFS/APFS 默认大小写不敏感 → 比对键默认折叠大小写（job 里 `case_sensitive = true` 可关；
+  关掉后大小写改名会被移动检测配对成一次 rename）。同侧归一化撞名（NFD/NFC 双胞胎、大小写双胞胎）
+  → Note 报告并保留先出现者，绝不静默合并。
+- **Windows 非法名预检**：要在 Windows 侧新建的路径先查保留设备名（CON/AUX/NUL/COM1-9/LPT1-9）、
+  非法字符（`<>:"|?*`、控制符）、尾部点/空格 → **计划阶段**直接标 `Conflict("illegal-on-windows")`，
+  不让 apply 执行到一半才炸。
+- **文件属性**：unix mode（exec 位等）已记录进快照表（`mode` 字段）；SMB 带不动它，
+  v0.4 打包模式负责恢复。复制后显式回写 mtime，保证下次比对的相等判定成立。
 
 ### sync 与 archive（Unison 思路）
 
@@ -145,12 +170,14 @@ Win↔Mac 的 SSH 已验证可用（Mac 22 端口开着，免密只差把公钥�
 - N 向同步的版本向量：[File Synchronization with Vector Time Pairs](https://www.researchgate.net/publication/37991997_File_Synchronization_with_Vector_Time_Pairs)、[Syncthing: Understanding Synchronization](https://docs.syncthing.net/users/syncing.html)、[Syncthing 冲突检测改进 PR#10351](https://github.com/syncthing/syncthing/pull/10351)
 - 代数化的文件系统调和：[An Algebraic Approach to File Synchronization](https://www.cs.tufts.edu/~nr/pubs/sync.pdf)
 - 增量传输（v2 备选）：[The rsync algorithm](https://www.samba.org/rsync/tech_report/node2.html)、[Dsync: Lightweight Delta Synchronization](https://lingfenghsiang.github.io/docs/DSync.pdf)（FastCDC 内容分块）；.mph 等压缩二进制增量收益低，优先级放后
+- Unicode 归一化与跨平台文件名：[Explainer: Unicode, normalization and APFS](https://eclecticlight.co/2021/05/08/explainer-unicode-normalization-and-apfs/)、[APFS's "Bag of Bytes" Filenames](https://mjtsai.com/blog/2017/03/24/apfss-bag-of-bytes-filenames/)、[Apple APFS FAQ](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/FAQ/FAQ.html)、[File names & unicode normalization problems](https://nicolasbouliane.com/blog/unicode-normalization)、[Windows 文件名规则 (Microsoft Learn)](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file)
 
 ## Roadmap
 
 - [x] v0.1 `scan`（表+hash 缓存）、`compare`（mirror/sync/enrich + 移动检测 + archive 归因）、`apply`（本地/挂载盘，dry-run 默认，回收目录）、`probe`
 - [x] v0.2 任务配置（jobs/*.toml）、`run` 一条龙、GUI（Compare→勾选→Synchronize）、sync 成功后自动刷新 archive
 - [x] v0.2.1 FFS 语法过滤器（include/exclude 完全兼容，含单测）＋根目录心跳锁（防双机并发 apply，遗弃锁自动接管）
+- [x] v0.2.2 严谨级 quick/standard/paranoid（复制后校验）＋跨平台正确性：NFC 归一比对键、大小写折叠、Windows 非法名预检、unix mode 记录（含单测）
 - [x] v0.3 Tauri v2 桌面壳（参照 AlexQuant Desktop：Vite+TS 前端、builder 双平台脚本、dist 入库使 Mac 免 node 纯 cargo 构建）；
       rigor 严谨级（quick/standard/paranoid：免hash / hash缓存 / 全量重hash+复制后校验）；NFC+大小写折叠比对键；Windows 非法路径预检
 - [ ] v0.3.x 单测覆盖 compare 分类矩阵；并行扫描；symlink 策略；GUI 逐行方向翻转、任务编辑；同目录 rename 合并显示
