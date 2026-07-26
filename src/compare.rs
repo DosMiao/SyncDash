@@ -309,6 +309,55 @@ pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &Compa
     Evidence { metas, equal_count, equal_bytes }
 }
 
+/// 一条"两侧相同"的记录。计划里没有它——它不是动作，是证据。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SameRow {
+    pub path: String,
+    pub size: u64,
+    pub mtime_ms: i64,
+    /// target 侧的时间（内容相同但时间戳可以差几毫秒——FAT/SMB 粒度）
+    pub other_mtime_ms: i64,
+}
+
+/// 两侧判定相等的文件，按 source 侧路径序分页。
+/// FFS 底部那个 "22,631" 按钮的数据源：一个文件没出现在差异表里时，
+/// 你得能确认它是"相等"，而不是"根本没扫到"。
+pub fn same_page(
+    source: &Snapshot,
+    target: &Snapshot,
+    copts: &CompareOptions,
+    query: &str,
+    offset: usize,
+    limit: usize,
+) -> (u64, Vec<SameRow>) {
+    let ci = copts.case_insensitive;
+    let (s_files, _) = map_of(source, EntryKind::File, ci);
+    let (t_files, _) = map_of(target, EntryKind::File, ci);
+    let q = query.trim().to_lowercase();
+    let mut total = 0u64;
+    let mut out = Vec::new();
+    for (k, se) in &s_files {
+        let Some(te) = t_files.get(k) else { continue };
+        if !files_equal(se, te) {
+            continue;
+        }
+        if !q.is_empty() && !se.path.to_lowercase().contains(&q) {
+            continue;
+        }
+        total += 1;
+        let idx = (total - 1) as usize;
+        if idx >= offset && out.len() < limit {
+            out.push(SameRow {
+                path: se.path.clone(),
+                size: se.size,
+                mtime_ms: se.mtime_ms,
+                other_mtime_ms: te.mtime_ms,
+            });
+        }
+    }
+    (total, out)
+}
+
 /// Windows 侧新建此相对路径是否合法（保留名 / 非法字符 / 尾点尾空格）
 fn win_invalid_reason(rel: &str) -> Option<String> {
     const RESERVED: [&str; 22] = [
@@ -1477,6 +1526,30 @@ mod tests {
         let m = by("only_t.txt");
         assert!(m.src.is_none());
         assert_eq!(m.dst.unwrap().size, 4);
+    }
+
+    #[test]
+    fn same_page_lists_only_equal_files_and_pages() {
+        let mk = |n: usize, h: &str| Entry { size: n as u64, mtime_ms: n as i64 * 1000, ..file(&format!("d{}/f{n}.bin", n % 3), h) };
+        let s = snap("windows", (0..10).map(|n| mk(n, "same")).collect());
+        // 后 3 个在 target 侧内容不同 → 不算相同
+        let t = snap("windows", (0..10).map(|n| mk(n, if n >= 7 { "diff" } else { "same" })).collect());
+        let copts = CompareOptions::default();
+        let (total, rows) = same_page(&s, &t, &copts, "", 0, 100);
+        assert_eq!(total, 7);
+        assert_eq!(rows.len(), 7);
+        // 分页
+        let (total, rows) = same_page(&s, &t, &copts, "", 5, 100);
+        assert_eq!(total, 7, "total 是过滤后的总数，与分页窗口无关");
+        assert_eq!(rows.len(), 2);
+        let (_t, rows) = same_page(&s, &t, &copts, "", 0, 3);
+        assert_eq!(rows.len(), 3);
+        // 子串过滤（大小写不敏感）
+        let (total, rows) = same_page(&s, &t, &copts, "D1/", 0, 100);
+        assert_eq!(total as usize, rows.len());
+        assert!(rows.iter().all(|r| r.path.starts_with("d1/")));
+        // 两侧时间都要带出来（内容相同但时间戳可以不同）
+        assert!(rows.iter().all(|r| r.mtime_ms == r.other_mtime_ms));
     }
 
     #[test]

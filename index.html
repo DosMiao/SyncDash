@@ -39,6 +39,8 @@
         <input id="search" class="mono" type="text" placeholder="搜索 path / from / reason   (Ctrl+F)" />
         <div id="chips"></div>
         <button id="btn-funnel" class="btn" title="筛选：名称掩码 / 大小 / 修改时间（作用于当前结果，不重扫）">🔻 筛选</button>
+        <button id="btn-same" class="btn" title="查看两侧判定相同的文件（不重扫，读上次比对的快照）">≡ 相同</button>
+        <button id="btn-csv" class="btn" title="把当前视图导出为 CSV（UTF-8 带 BOM，Excel 直开）">⤓ CSV</button>
         <button id="btn-fold" class="btn" title="折叠/展开全部目录组">全部折叠</button>
         <button id="btn-group" class="btn" title="切换：树状分组（按目录聚合，FFS 同款）↔ 平铺列表">树状分组</button>
         <button id="btn-pathmode" class="btn" title="切换：相对（相对比对根目录）↔ 完整路径">相对路径</button>
@@ -58,6 +60,19 @@
           <button id="cmp-cancel" class="btn">✕ 取消</button>
         </div>
         <div id="empty" class="empty">← 选择任务，然后 Compare（Ctrl+R）</div>
+        <div id="samepanel" class="hidden">
+          <div class="sp-head">
+            <span>两侧相同的文件</span>
+            <input id="sp-q" class="mono" type="text" placeholder="过滤路径…" />
+            <span id="sp-count" class="dim"></span>
+            <button id="sp-close" class="btn">✕ 返回差异表</button>
+          </div>
+          <table id="sametable">
+            <thead><tr><th class="c-path">相对路径</th><th class="c-size">大小</th><th class="c-meta">source 时间</th><th class="c-meta">target 时间</th></tr></thead>
+            <tbody id="sp-body"></tbody>
+          </table>
+          <button id="sp-more" class="btn hidden">加载更多</button>
+        </div>
         <table id="plantable" class="hidden">
           <thead>
             <tr>
@@ -110,6 +125,7 @@
       <div id="ed-form"></div>
       <div class="btnrow">
         <button id="ed-delete" class="btn danger hidden">删除任务</button>
+        <button id="ed-sched" class="btn hidden" title="复制 schtasks 命令（自己在管理员终端里执行；本程序不代为注册系统计划任务）">复制计划任务命令</button>
         <span class="spacer"></span>
         <button id="ed-cancel" class="btn">取消 (Esc)</button>
         <button id="ed-save" class="btn accent">保存</button>

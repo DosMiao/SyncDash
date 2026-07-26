@@ -85,6 +85,28 @@ struct PathVerdict {
     warnings: Vec<String>,
 }
 
+// ---------- 快照缓存（"相同项"面板的数据源） ----------
+//
+// compare 已经把两侧完整扫过一遍，丢掉快照等于逼界面为了看一眼"相同项"再扫一次。
+// 单槽缓存：每次 compare 覆盖，换任务即失效；两份快照 2 万条目量级约十几 MB。
+
+struct CachedSnaps {
+    job: String,
+    source: syncdash::table::Snapshot,
+    target: syncdash::table::Snapshot,
+}
+
+#[derive(Default)]
+struct SnapCache(Mutex<Option<CachedSnaps>>);
+
+#[derive(Serialize)]
+struct SamePage {
+    total: u64,
+    rows: Vec<compare::SameRow>,
+    /// 缓存里躺的是哪个任务的快照（对不上就让界面提示重新比对）
+    job: String,
+}
+
 // ---------- 运行状态（互斥 + 取消/暂停句柄） ----------
 
 #[derive(Default)]
@@ -329,6 +351,114 @@ fn mask_match(masks: Vec<String>, paths: Vec<String>) -> Vec<bool> {
     syncdash::filter::mask_hits(&masks, &paths)
 }
 
+/// "相同项"分页。数据源是上一次 compare 留下的快照——不重扫。
+#[tauri::command]
+fn list_same(
+    snaps: tauri::State<'_, Arc<SnapCache>>,
+    name: String,
+    query: String,
+    offset: usize,
+    limit: usize,
+) -> Result<SamePage, String> {
+    let g = snaps.0.lock().unwrap();
+    let Some(c) = g.as_ref() else {
+        return Err("还没有比对结果——先 Compare".into());
+    };
+    if c.job != name {
+        return Err(format!("缓存里是 '{}' 的快照，请对 '{}' 重新 Compare", c.job, name));
+    }
+    let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
+    let (total, rows) = compare::same_page(&c.source, &c.target, &job.compare_opts(), &query, offset, limit.min(2000));
+    Ok(SamePage { total, rows, job: c.job.clone() })
+}
+
+/// 导出当前视图为 CSV。转义只在这里做一次，UTF-8 **带 BOM**——
+/// 不加 BOM 的话 Excel 会按本地代码页解释，中文路径直接乱码。
+#[tauri::command]
+fn export_csv(
+    path: String,
+    header: PlanHeader,
+    ops: Vec<Op>,
+    metas: Vec<compare::RowMeta>,
+    checked: Vec<bool>,
+) -> Result<usize, String> {
+    use std::io::Write;
+    fn esc(s: &str) -> String {
+        if s.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    }
+    fn stamp(ms: i64) -> String {
+        if ms <= 0 {
+            return String::new();
+        }
+        // 本地时区偏移交给界面；这里落 UTC 的 ISO 形态，跨机对账不会歧义
+        let secs = ms / 1000;
+        let days = secs.div_euclid(86_400);
+        let tod = secs.rem_euclid(86_400);
+        let (y, m, d) = civil_from_days(days);
+        format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", tod / 3600, (tod % 3600) / 60, tod % 60)
+    }
+    let f = std::fs::File::create(&path).map_err(|e| format!("{path}: {e}"))?;
+    let mut w = std::io::BufWriter::new(f);
+    w.write_all(&[0xEF, 0xBB, 0xBF]).map_err(|e| e.to_string())?;
+    writeln!(w, "checked,action,side,rel_path,from,source_path,target_path,src_size,src_mtime_utc,dst_size,dst_mtime_utc,reason")
+        .map_err(|e| e.to_string())?;
+    let sep = if header.target_root.contains('\\') { '\\' } else { '/' };
+    let join = |root: &str, rel: &str| {
+        let r = root.trim_end_matches(['/', '\\']);
+        let rel = if sep == '\\' { rel.replace('/', "\\") } else { rel.to_string() };
+        format!("{r}{sep}{rel}")
+    };
+    // 动作/侧别用 serde 的 snake_case 形态（见 json_token），与 plan JSONL、
+    // 事件流的字面量一致——Debug 的 PascalCase 会让 CSV 和其它出口对不上账
+    for (i, op) in ops.iter().enumerate() {
+        let m = metas.get(i).cloned().unwrap_or_default();
+        let on = checked.get(i).copied().unwrap_or(false);
+        writeln!(
+            w,
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            if on { 1 } else { 0 },
+            json_token(&op.action),
+            json_token(&op.side),
+            esc(&op.path),
+            esc(op.from.as_deref().unwrap_or("")),
+            esc(&join(&header.source_root, &op.path)),
+            esc(&join(&header.target_root, &op.path)),
+            m.src.map(|s| s.size.to_string()).unwrap_or_default(),
+            m.src.map(|s| stamp(s.mtime_ms)).unwrap_or_default(),
+            m.dst.map(|s| s.size.to_string()).unwrap_or_default(),
+            m.dst.map(|s| stamp(s.mtime_ms)).unwrap_or_default(),
+            esc(&op.reason),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    w.flush().map_err(|e| e.to_string())?;
+    Ok(ops.len())
+}
+
+/// 枚举的对外字面量以 serde 为准（Action/Side 都标了 rename_all = "snake_case"），
+/// 这样 CSV 里的 delete_dir 与 plan JSONL、事件流写的是同一个词。
+fn json_token<T: Serialize>(v: &T) -> String {
+    serde_json::to_string(v).unwrap_or_default().trim_matches('"').to_string()
+}
+
+/// days → (y, m, d)，Howard Hinnant 的 civil_from_days（无依赖）
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 /// 在系统文件管理器里选中该路径。参数单独传给 exe，不过 shell。
 #[tauri::command]
 fn reveal(path: String) -> Result<(), String> {
@@ -451,9 +581,11 @@ fn pause_run(state: tauri::State<'_, Arc<RunState>>, paused: bool) -> bool {
 async fn compare_job(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RunState>>,
+    snaps: tauri::State<'_, Arc<SnapCache>>,
     name: String,
 ) -> Result<PlanDto, String> {
     let st = state.inner().clone();
+    let cache = snaps.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
         let (run_id, ctl) = begin_run(&st)?;
@@ -470,14 +602,17 @@ async fn compare_job(
         // 证据层：两侧实测 size/mtime + 相等项统计。与 compare() 共用同一套
         // norm_key/files_equal，口径不会漂移。
         let ev = compare::evidence(&out.source, &out.target, &out.plan, &job.compare_opts());
-        Ok(PlanDto {
+        let dto = PlanDto {
             header: out.plan.header,
             ops: out.plan.ops,
             reversed,
             metas: ev.metas,
             equal_count: ev.equal_count,
             equal_bytes: ev.equal_bytes,
-        })
+        };
+        // 快照留给"相同项"面板；单槽，下次 compare 直接覆盖
+        *cache.0.lock().unwrap() = Some(CachedSnaps { job: name, source: out.source, target: out.target });
+        Ok(dto)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -579,13 +714,84 @@ fn main() {
         })
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(RunState::default()))
+        .manage(Arc::new(SnapCache::default()))
         .invoke_handler(tauri::generate_handler![
             list_jobs, jobs_dir, compare_job, preflight, apply_job, cancel_run, pause_run,
             open_progress_window, close_progress_window, post_sync_action,
             run_history, last_syncs, run_detail,
             get_job, save_job, delete_job,
-            inspect_paths, reveal, mask_match
+            inspect_paths, reveal, mask_match, list_same, export_csv
         ])
         .run(tauri::generate_context!())
         .expect("error while running SyncDash");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syncdash::compare::{Action, Side, SideMeta};
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(19_000), (2022, 1, 8));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    }
+
+    #[test]
+    fn csv_escapes_commas_and_quotes_and_carries_both_sides() {
+        let dir = std::env::temp_dir().join("syncdash-csv-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("plan.csv");
+        let header = PlanHeader {
+            schema: 1, kind: "plan".into(), mode: "mirror".into(), generated_at_ms: 0,
+            source_root: r"D:\S".into(), source_host: "h".into(),
+            target_root: r"E:\T".into(), target_host: "h".into(),
+            op_count: 1, conflict_count: 0, source_entries: 1, target_entries: 1,
+        };
+        let ops = vec![Op {
+            side: Side::Target,
+            action: Action::DeleteDir,
+            // 逗号与双引号都在路径里——CSV 的两个经典地雷
+            path: "b/y,z\"q.txt".into(),
+            from: None, size: Some(20), mtime_ms: None, hash: None, link: None, mode: None,
+            reason: "gone, really".into(),
+        }];
+        // mtime_ms = 0 在快照里的含义是"取不到时间"（scan 拿不到 metadata 时写 0），
+        // 所以这里用真实的非零时间，别拿纪元当日期使
+        let metas = vec![compare::RowMeta {
+            src: Some(SideMeta { size: 10, mtime_ms: 86_400_000 }),
+            dst: Some(SideMeta { size: 20, mtime_ms: 172_800_000 }),
+        }];
+        let n = export_csv(out.display().to_string(), header, ops, metas, vec![true]).unwrap();
+        assert_eq!(n, 1);
+        let bytes = std::fs::read(&out).unwrap();
+        // Excel 不认没有 BOM 的 UTF-8，中文路径会整列乱码
+        assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
+        let text = String::from_utf8(bytes[3..].to_vec()).unwrap();
+        let row = text.lines().nth(1).unwrap();
+        assert!(row.contains("\"b/y,z\"\"q.txt\""), "路径里的逗号与引号要按 RFC4180 转义: {row}");
+        assert!(row.contains("\"gone, really\""));
+        // 枚举字面量与 plan JSONL 同源（snake_case），不是 Debug 的 PascalCase
+        assert!(row.contains(",delete_dir,target,"), "枚举应为 snake_case: {row}");
+        // 双侧 size/时间都要落地
+        assert!(row.contains(",10,1970-01-02T00:00:00Z,20,1970-01-03T00:00:00Z,"), "{row}");
+        // 缺席的一侧留空列，不补 0 也不伪造日期
+        let one_sided = vec![compare::RowMeta { src: None, dst: Some(SideMeta { size: 5, mtime_ms: 86_400_000 }) }];
+        let ops2 = vec![Op {
+            side: Side::Target, action: Action::Delete, path: "x".into(), from: None,
+            size: Some(5), mtime_ms: None, hash: None, link: None, mode: None, reason: "gone".into(),
+        }];
+        let h2 = PlanHeader {
+            schema: 1, kind: "plan".into(), mode: "mirror".into(), generated_at_ms: 0,
+            source_root: "/s".into(), source_host: "h".into(),
+            target_root: "/t".into(), target_host: "h".into(),
+            op_count: 1, conflict_count: 0, source_entries: 1, target_entries: 1,
+        };
+        export_csv(out.display().to_string(), h2, ops2, one_sided, vec![false]).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        let row = text.lines().nth(1).unwrap();
+        assert!(row.starts_with("0,delete,target,x,,/s/x,/t/x,,,5,1970-01-02T00:00:00Z,gone"), "{row}");
+        let _ = std::fs::remove_file(&out);
+    }
 }

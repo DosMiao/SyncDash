@@ -584,6 +584,9 @@ function buildGroupRow(dir: string, items: number[]): HTMLTableRowElement {
 let lastGroupDirs: string[] = [];
 
 function renderTable() {
+  // 相同项模式独占表格区域，显隐归 sameShow 管——否则点一下 chip 就会把差异表
+  // 重新显示出来，两张表叠在一起
+  if (sameOpen()) return;
   bodyEl.innerHTML = '';
   const has = !!plan && plan.ops.length > 0;
   filterBar.classList.toggle('hidden', !has);
@@ -711,6 +714,7 @@ function renderJobs() {
 
 async function doCompare() {
   if (!currentJob || busy) return;
+  sameShow(false); // 新一轮比对 = 新快照，旧的相同项列表作废
   setBusy(true);
   setStatus(`正在比对 '${currentJob.name}' ...`);
   // v0.9.1 第一性重设计：compare 进度原地显示在差异表区域——主窗本来就在眼前，
@@ -1075,6 +1079,7 @@ async function openEditor(name?: string, focusGroup?: string) {
     try { j = await invoke<JobFull>('get_job', { name }); } catch (e) { setStatus(`读取任务失败：${e}`, 'err'); return; }
   }
   edBuild(j, name ?? '');
+  $('ed-sched').classList.toggle('hidden', !name);
   editModal.classList.remove('hidden');
   if (focusGroup) {
     for (const g of edForm.querySelectorAll<HTMLElement>('.ed-group')) {
@@ -1104,6 +1109,11 @@ function edCollect(): { name: string; job: JobFull } | null {
   return { name, job: jf };
 }
 
+$('ed-sched').addEventListener('click', () => {
+  if (!edName) return;
+  copyText(schtasksCmd(edName));
+  setStatus(`已复制计划任务命令 —— 在管理员终端里执行它（本程序不代为注册系统任务）`, 'ok');
+});
 $('btn-newjob').addEventListener('click', () => openEditor());
 $('ed-cancel').addEventListener('click', () => editModal.classList.add('hidden'));
 editModal.addEventListener('click', (e) => { if (e.target === editModal) editModal.classList.add('hidden'); });
@@ -1787,6 +1797,106 @@ $('fp-promote').addEventListener('click', async () => {
     setStatus(`写入失败：${e}`, 'err');
   }
 });
+
+// ---------- P4：相同项面板 / CSV 导出 / 计划任务命令 ----------
+
+interface SameRow { path: string; size: number; mtime_ms: number; other_mtime_ms: number }
+interface SamePage { total: number; rows: SameRow[]; job: string }
+
+const samePanel = $('samepanel');
+const spBody = $('sp-body');
+const spQ = $<HTMLInputElement>('sp-q');
+const spMore = $<HTMLButtonElement>('sp-more');
+const SP_PAGE = 300;
+let spOffset = 0;
+let spTotal = 0;
+let spQTimer: number | null = null;
+
+function sameOpen(): boolean { return !samePanel.classList.contains('hidden'); }
+
+/// 读上一次 compare 留下的快照，分页。**不重扫**——两侧刚扫过，
+/// 为了看一眼"相同项"再走一遍目录树是纯浪费。
+async function spLoad(reset: boolean) {
+  if (!currentJob) return;
+  if (reset) { spOffset = 0; spBody.innerHTML = ''; }
+  try {
+    const page = await invoke<SamePage>('list_same', {
+      name: currentJob.name, query: spQ.value.trim(), offset: spOffset, limit: SP_PAGE,
+    });
+    spTotal = page.total;
+    for (const r of page.rows) {
+      const tr = document.createElement('tr');
+      const drift = Math.abs(r.mtime_ms - r.other_mtime_ms) > MTIME_SLACK;
+      tr.innerHTML =
+        `<td class="mono c-path" title="${escapeHtml(r.path)}">${escapeHtml(r.path)}</td>` +
+        `<td class="c-size mono">${humanSize(r.size)}</td>` +
+        `<td class="c-meta mono">${fmtTime(r.mtime_ms)}</td>` +
+        `<td class="c-meta mono${drift ? ' drift' : ''}">${fmtTime(r.other_mtime_ms)}</td>`;
+      spBody.appendChild(tr);
+    }
+    spOffset += page.rows.length;
+    $('sp-count').textContent = `${spOffset} / ${spTotal.toLocaleString()}`;
+    spMore.classList.toggle('hidden', spOffset >= spTotal);
+  } catch (e) {
+    spBody.innerHTML = `<tr><td colspan="4" class="dim">${escapeHtml(String(e))}</td></tr>`;
+    spMore.classList.add('hidden');
+    $('sp-count').textContent = '';
+  }
+}
+
+function sameShow(on: boolean) {
+  samePanel.classList.toggle('hidden', !on);
+  tableEl.classList.toggle('hidden', on || !plan || plan.ops.length === 0);
+  emptyEl.classList.toggle('hidden', on || (!!plan && plan.ops.length > 0));
+  // 差异表的筛选条在相同项模式下不适用（相同项有自己的过滤框）
+  filterBar.classList.toggle('hidden', on || !plan || plan.ops.length === 0);
+  $('btn-same').classList.toggle('on', on);
+  if (on) { spQ.value = ''; spLoad(true); }
+  else renderTable();
+}
+
+$('btn-same').addEventListener('click', () => {
+  if (!plan) { setStatus('先 Compare —— 相同项读的是上次比对的快照', 'err'); return; }
+  sameShow(!sameOpen());
+});
+$('sp-close').addEventListener('click', () => sameShow(false));
+spMore.addEventListener('click', () => spLoad(false));
+spQ.addEventListener('input', () => {
+  if (spQTimer !== null) clearTimeout(spQTimer);
+  spQTimer = window.setTimeout(() => spLoad(true), 250);
+});
+
+/// 导出当前视图（可见的那批，带勾选态）。转义与 BOM 都在 Rust 侧做一次。
+$('btn-csv').addEventListener('click', async () => {
+  if (!plan || !currentJob) { setStatus('先 Compare', 'err'); return; }
+  const vis = visibleIdx();
+  if (!vis.length) { setStatus('当前视图是空的', 'err'); return; }
+  const stamp = new Date();
+  const def = `${currentJob.name}-${stamp.getFullYear()}${p2(stamp.getMonth() + 1)}${p2(stamp.getDate())}.csv`;
+  const path = await pickPath({ save: true, title: '导出 CSV', defaultPath: def });
+  if (!path) return;
+  try {
+    const n = await invoke<number>('export_csv', {
+      path,
+      header: plan.header,
+      ops: vis.map((i) => eff(i)),
+      metas: vis.map((i) => metaOf(i)),
+      checked: vis.map((i) => checked[i]),
+    });
+    setStatusUndo(`已导出 ${n} 行到 ${path}`, '打开所在目录', async () => {
+      await invoke('reveal', { path });
+    });
+  } catch (e) {
+    setStatus(`导出失败：${e}`, 'err');
+  }
+});
+
+/// FFS 的 "Save as batch job" 对应物：我们已经有 CLI，缺的只是把命令递到手上。
+/// 不代为注册系统计划任务——那是系统设置级动作，该由人自己按下。
+function schtasksCmd(job: string): string {
+  const exe = 'syncdash.exe';
+  return `schtasks /create /tn "SyncDash-${job}" /tr "\\"${exe}\\" run ${job} --yes" /sc daily /st 22:00`;
+}
 
 // M3 Overview 折叠/清除
 const ovEl = $('overview');

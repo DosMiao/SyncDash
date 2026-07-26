@@ -487,3 +487,19 @@ th .sortable::after { content: attr(data-dir); font-size: 9px; margin-left: 2px;
 .fp-stat { font-size: 11px; min-height: 15px; }
 .fp-btns { display: flex; gap: 8px; justify-content: flex-end; padding-top: 4px; }
 .fp-btns .btn { padding: 5px 12px; font-size: 12px; }
+
+/* ---- P4：相同项面板 / 导出 ---- */
+#btn-same, #btn-csv { flex: none; padding: 4px 10px; font-size: 12px; }
+#btn-same.on { border-color: var(--green); color: var(--green); }
+#samepanel { display: flex; flex-direction: column; height: 100%; }
+.sp-head { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--border); font-size: 12px; }
+.sp-head #sp-q { width: 260px; padding: 4px 8px; border-radius: 5px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px; outline: none; }
+.sp-head #sp-q:focus { border-color: var(--accent); }
+.sp-head #sp-count { margin-left: auto; font-variant-numeric: tabular-nums; }
+.sp-head .btn { padding: 4px 12px; font-size: 12px; }
+#sametable { width: 100%; border-collapse: collapse; }
+#sametable thead th { position: sticky; top: 0; background: var(--panel2); text-align: left; padding: 6px 10px; font-size: 11px; color: var(--dim); border-bottom: 1px solid var(--border); font-weight: 500; }
+#sametable td { padding: 3px 10px; border-bottom: 1px solid #1e222a; font-size: 11px; }
+#sametable tr:hover { background: var(--panel2); }
+#sametable td.c-meta.drift { color: var(--orange); }
+#sp-more { margin: 10px auto; padding: 5px 20px; font-size: 12px; }
