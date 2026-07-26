@@ -4,6 +4,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 
 interface JobDto {
   name: string; mode: string; rigor: string; source: string; target: string; has_archive: boolean;
@@ -46,6 +47,8 @@ interface RunRecord {
 }
 interface Progress { phase: string; detail: string; pct: number; rate: number }
 interface PreflightDto { ok: boolean; blockers: string[]; warnings: string[] }
+interface PathInfo { exists: boolean; is_dir: boolean; has_marker: boolean }
+interface PathVerdict { source: PathInfo; target: PathInfo; warnings: string[] }
 
 type Chip = 'all' | 'copy' | 'update' | 'move' | 'delete' | 'conflict';
 const CHIPS: [Chip, string][] = [
@@ -67,6 +70,8 @@ const tableEl = $('plantable');
 const bodyEl = $('planbody');
 const emptyEl = $('empty');
 const statusEl = $('status');
+const statusMsgEl = $('statusmsg');
+const undoBtn = $<HTMLButtonElement>('btn-undo');
 const modalEl = $('modal');
 const modalBody = $('modal-body');
 const modalOk = $('modal-ok') as HTMLButtonElement;
@@ -76,7 +81,9 @@ let currentJob: JobDto | null = null;
 let plan: PlanDto | null = null;
 let checked: boolean[] = [];
 let flipped: boolean[] = [];
-let chip: Chip = 'all';
+/// 类别过滤：FFS 底部那三个大按钮是**各自独立的开关**，不是单选。
+/// 空集 = 不过滤（对应"全部"高亮）
+let chips = new Set<Chip>();
 let search = '';
 let busy = false;
 /// M3 Overview：按顶层目录过滤（null = 不过滤；'(root)' = 根下散文件；'a' 或 'a/b' = 前缀）
@@ -96,15 +103,35 @@ let acknowledged = false;
 // ---------- 小工具 ----------
 
 function setStatus(msg: string, cls: '' | 'err' | 'ok' = '') {
-  statusEl.textContent = msg;
+  statusMsgEl.textContent = msg;
   statusEl.className = cls;
+  undoBtn.classList.add('hidden');
+  undoAction = null;
 }
+
+/// 带撤销的状态提示：任何"我替你改了任务文件"的动作都必须给一条回头路
+let undoAction: (() => Promise<void>) | null = null;
+function setStatusUndo(msg: string, label: string, fn: () => Promise<void>, cls: '' | 'err' | 'ok' = 'ok') {
+  setStatus(msg, cls);
+  undoAction = fn;
+  undoBtn.textContent = label;
+  undoBtn.classList.remove('hidden');
+}
+undoBtn.addEventListener('click', async () => {
+  const fn = undoAction;
+  if (!fn) return;
+  undoBtn.classList.add('hidden');
+  undoAction = null;
+  try { await fn(); } catch (e) { setStatus(`撤销失败：${e}`, 'err'); }
+});
 
 function setBusy(b: boolean) {
   busy = b;
   spinEl.classList.toggle('hidden', !b);
   btnCompare.disabled = b || !currentJob;
   btnSync.disabled = b || !plan || plan.ops.length === 0;
+  const sw = document.getElementById('btn-swap') as HTMLButtonElement | null;
+  if (sw) sw.disabled = b || !currentJob;
 }
 
 function humanSize(b?: number): string {
@@ -192,7 +219,7 @@ function visibleIdx(): number[] {
   const out: number[] = [];
   plan.ops.forEach((_, i) => {
     const op = eff(i);
-    if ((chip === 'all' || category(op) === chip) && matchesSearch(op) && matchesOv(op)) out.push(i);
+    if ((chips.size === 0 || chips.has(category(op))) && matchesSearch(op) && matchesOv(op)) out.push(i);
   });
   return out;
 }
@@ -226,10 +253,17 @@ function renderChips() {
   counts.set('all', plan.ops.length);
   for (const [key, label] of CHIPS) {
     const n = counts.get(key) ?? 0;
+    const on = key === 'all' ? chips.size === 0 : chips.has(key);
     const b = document.createElement('button');
-    b.className = 'chip' + (chip === key ? ' on' : '') + (n === 0 ? ' zero' : '');
+    b.className = 'chip' + (on ? ' on' : '') + (n === 0 ? ' zero' : '');
     b.textContent = `${label} ${n}`;
-    b.addEventListener('click', () => { chip = key; renderAll(); });
+    b.title = key === 'all' ? '清除类别过滤' : '这一类的开关（可与其它类同时打开）';
+    b.addEventListener('click', () => {
+      if (key === 'all') chips.clear();
+      else if (chips.has(key)) chips.delete(key);
+      else chips.add(key);
+      renderAll();
+    });
     chipsEl.appendChild(b);
   }
 }
@@ -395,6 +429,10 @@ function buildRow(i: number, groupDir: string | null): HTMLTableRowElement {
   tdReason.textContent = op.reason;
 
   tr.append(tdChk, tdAct, tdPath, tdFrom, tdSize, tdReason);
+  tr.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    rowMenu(i, e.clientX, e.clientY);
+  });
   return tr;
 }
 
@@ -520,7 +558,7 @@ function renderJobs() {
     div.addEventListener('click', () => {
       if (busy) return;
       currentJob = j;
-      plan = null; checked = []; flipped = []; chip = 'all'; search = ''; searchEl.value = '';
+      plan = null; checked = []; flipped = []; chips.clear(); search = ''; searchEl.value = '';
       ovFilter = null; ovExpanded.clear();
       renderJobs();
       renderAll();
@@ -528,6 +566,7 @@ function renderJobs() {
       btnCompare.disabled = false;
       btnSync.disabled = true;
       btnWatch.disabled = false;
+      renderVariants();
       watchStop();
       setStatus(`已选 '${j.name}'（${j.mode}${j.has_archive ? '，带 archive' : ''}${j.rigor !== 'standard' ? '，' + j.rigor : ''}）— Compare 开始比对`);
     });
@@ -550,7 +589,7 @@ async function doCompare() {
     plan = await invoke<PlanDto>('compare_job', { name: currentJob.name });
     checked = plan.ops.map((op) => selectable(op));
     flipped = plan.ops.map(() => false);
-    chip = 'all';
+    chips.clear();
     ovFilter = null; ovExpanded.clear();
     renderAll();
     setStatus(
@@ -672,14 +711,14 @@ const edForm = $('ed-form');
 const edDelete = $<HTMLButtonElement>('ed-delete');
 let edName: string | null = null; // 正在编辑的任务名（null = 新建）
 
-type FKind = 'text' | 'num' | 'bool' | 'select' | 'lines';
+type FKind = 'text' | 'num' | 'bool' | 'select' | 'lines' | 'dir' | 'file';
 interface FSpec { key: string; label: string; kind: FKind; opts?: string[]; hint?: string; wide?: boolean; group?: string }
 const ED_FIELDS: FSpec[] = [
   { key: '__name', label: '任务名（文件名）', kind: 'text', group: '基本' },
   { key: 'mode', label: '模式', kind: 'select', opts: ['mirror', 'sync', 'enrich'] },
-  { key: 'source', label: 'source 根目录', kind: 'text', wide: true },
-  { key: 'target', label: 'target 根目录', kind: 'text', wide: true },
-  { key: 'archive', label: 'archive 存档文件（sync 模式）', kind: 'text', hint: '留空 = 无；建议 %APPDATA%\\syncdash\\archives\\<名>.jsonl', wide: true },
+  { key: 'source', label: 'source 根目录', kind: 'dir', wide: true },
+  { key: 'target', label: 'target 根目录', kind: 'dir', wide: true },
+  { key: 'archive', label: 'archive 存档文件（sync 模式）', kind: 'file', hint: '留空 = 无；建议 %APPDATA%\\syncdash\\archives\\<名>.jsonl', wide: true },
   { key: 'rigor', label: '严谨级', kind: 'select', opts: ['quick', 'fast', 'standard', 'paranoid'], hint: 'fast=抽样摘要：大文件只读头/中/尾各256KB，比quick多内容防线、比standard快百倍（云盘/媒体库推荐）' },
   { key: 'symlinks', label: 'symlink 策略', kind: 'select', opts: ['exclude', 'direct'] },
   { key: 'case_sensitive', label: '大小写敏感比对', kind: 'bool' },
@@ -716,8 +755,85 @@ function defaultJob(): JobFull {
   };
 }
 
+// ---------- P1：路径选择器 / 历史 / 体检 ----------
+
+/// 原生对话框。@tauri-apps/plugin-dialog 那个 npm 包只是这一行 invoke 的包装，
+/// 直接调 IPC 省一个前端依赖（Rust 侧已注册 tauri_plugin_dialog）。
+async function pickPath(opts: { directory?: boolean; save?: boolean; title: string; defaultPath?: string }): Promise<string | null> {
+  const { directory, save, title, defaultPath } = opts;
+  try {
+    const r = await invoke<unknown>(save ? 'plugin:dialog|save' : 'plugin:dialog|open', {
+      options: { title, defaultPath: defaultPath || undefined, directory: !!directory, multiple: false, recursive: false },
+    });
+    if (!r) return null;
+    // open 在不同小版本里可能回 string | string[] | {path}
+    const one = Array.isArray(r) ? r[0] : r;
+    if (typeof one === 'string') return one;
+    if (one && typeof one === 'object' && typeof (one as { path?: string }).path === 'string') return (one as { path: string }).path;
+    return null;
+  } catch (e) {
+    setStatus(`打不开选择器：${e}`, 'err');
+    return null;
+  }
+}
+
+const HIST_KEY = 'sd.pathhist';
+function pathHistory(): string[] {
+  try { return JSON.parse(localStorage.getItem(HIST_KEY) ?? '[]') as string[]; } catch { return []; }
+}
+function pushHistory(p: string) {
+  const v = p.trim();
+  if (!v) return;
+  const list = [v, ...pathHistory().filter((x) => x.toLowerCase() !== v.toLowerCase())].slice(0, 12);
+  localStorage.setItem(HIST_KEY, JSON.stringify(list));
+}
+
+function edInput(key: string): HTMLInputElement | null {
+  return edForm.querySelector<HTMLInputElement>(`input[data-k="${key}"]`);
+}
+
+let verdictTimer: number | null = null;
+/// 路径体检（去抖）：存不存在、是不是目录、两根是否相同/嵌套。
+/// 写错根目录的代价太大，不该等到 Compare 才知道。
+function scheduleVerdict() {
+  if (verdictTimer !== null) clearTimeout(verdictTimer);
+  verdictTimer = window.setTimeout(async () => {
+    const box = document.getElementById('ed-verdict');
+    if (!box) return;
+    const s = edInput('source')?.value ?? '';
+    const t = edInput('target')?.value ?? '';
+    if (!s && !t) { box.innerHTML = ''; return; }
+    try {
+      const v = await invoke<PathVerdict>('inspect_paths', { source: s, target: t });
+      const mark = (el: HTMLInputElement | null, info: PathInfo, val: string) => {
+        if (!el) return;
+        el.classList.toggle('bad', !!val.trim() && !info.is_dir);
+        el.classList.toggle('good', info.is_dir);
+      };
+      mark(edInput('source'), v.source, s);
+      mark(edInput('target'), v.target, t);
+      const marks = [
+        v.source.has_marker ? 'source 有 .syncdash-root 标记' : '',
+        v.target.has_marker ? 'target 有 .syncdash-root 标记' : '',
+      ].filter(Boolean).join(' · ');
+      box.innerHTML =
+        v.warnings.map((w) => `<div class="vwarn">⚠ ${escapeHtml(w)}</div>`).join('') +
+        (marks ? `<div class="vok">✓ ${escapeHtml(marks)}</div>` : '');
+    } catch { /* 体检失败不该挡住编辑 */ }
+  }, 300);
+}
+
 function edBuild(j: JobFull, name: string) {
   edForm.innerHTML = '';
+  // 路径历史走原生 datalist：键盘可用、零自定义弹层代码
+  const dl = document.createElement('datalist');
+  dl.id = 'sd-paths';
+  for (const p of pathHistory()) {
+    const o = document.createElement('option');
+    o.value = p;
+    dl.appendChild(o);
+  }
+  edForm.appendChild(dl);
   for (const f of ED_FIELDS) {
     if (f.group) {
       const g = document.createElement('div');
@@ -738,16 +854,70 @@ function edBuild(j: JobFull, name: string) {
       inner = `<span>${f.label}</span><textarea data-k="${f.key}" spellcheck="false">${escapeHtml(((v as string[]) ?? []).join('\n'))}</textarea>`;
     } else if (f.kind === 'num') {
       inner = `<span>${f.label}</span><input type="number" step="any" data-k="${f.key}" value="${v ?? ''}"/>`;
+    } else if (f.kind === 'dir' || f.kind === 'file') {
+      const swap = f.key === 'source'
+        ? `<button type="button" class="pbtn" data-swap="1" title="与 target 对调">⇄</button>` : '';
+      inner = `<span>${f.label}</span><div class="pathrow">` +
+        `<input type="text" data-k="${f.key}" data-drop="1" list="sd-paths" value="${escapeHtml(String(v ?? ''))}" spellcheck="false"/>` +
+        swap +
+        `<button type="button" class="pbtn" data-pick="${f.kind}" data-for="${f.key}" title="浏览…">📁</button></div>`;
     } else {
       inner = `<span>${f.label}</span><input type="text" data-k="${f.key}" value="${escapeHtml(String(v ?? ''))}" spellcheck="false"/>`;
     }
     if (f.hint) inner += `<span class="thin">${f.hint}</span>`;
     wrap.innerHTML = inner;
     edForm.appendChild(wrap);
+    // 两个根目录之后立刻贴体检结果，警告紧挨着它们说的那两个字段
+    if (f.key === 'target') {
+      const box = document.createElement('div');
+      box.id = 'ed-verdict';
+      box.className = 'ed-verdict';
+      edForm.appendChild(box);
+    }
   }
+  wireEditorPaths();
 }
 
-async function openEditor(name?: string) {
+/// 给刚生成的表单接线：浏览按钮、⇄ 对调、输入触发体检
+function wireEditorPaths() {
+  for (const b of edForm.querySelectorAll<HTMLButtonElement>('button[data-pick]')) {
+    b.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const key = b.dataset.for!;
+      const el = edInput(key);
+      if (!el) return;
+      const isDir = b.dataset.pick === 'dir';
+      const p = await pickPath({
+        directory: isDir,
+        save: !isDir,
+        title: isDir ? '选择目录' : '选择存档文件',
+        defaultPath: el.value.trim(),
+      });
+      if (!p) return;
+      el.value = p;
+      if (isDir) pushHistory(p);
+      scheduleVerdict();
+    });
+  }
+  const sw = edForm.querySelector<HTMLButtonElement>('button[data-swap]');
+  if (sw) {
+    sw.addEventListener('click', (e) => {
+      e.preventDefault();
+      const s = edInput('source'), t = edInput('target');
+      if (!s || !t) return;
+      const tmp = s.value;
+      s.value = t.value;
+      t.value = tmp;
+      scheduleVerdict();
+    });
+  }
+  for (const el of edForm.querySelectorAll<HTMLInputElement>('input[data-drop]')) {
+    el.addEventListener('input', scheduleVerdict);
+  }
+  scheduleVerdict();
+}
+
+async function openEditor(name?: string, focusGroup?: string) {
   edName = name ?? null;
   $('ed-title').textContent = name ? `编辑任务 — ${name}` : '新任务';
   edDelete.classList.toggle('hidden', !name);
@@ -757,6 +927,11 @@ async function openEditor(name?: string) {
   }
   edBuild(j, name ?? '');
   editModal.classList.remove('hidden');
+  if (focusGroup) {
+    for (const g of edForm.querySelectorAll<HTMLElement>('.ed-group')) {
+      if (g.textContent === focusGroup) { g.scrollIntoView({ block: 'start' }); break; }
+    }
+  }
 }
 
 function edCollect(): { name: string; job: JobFull } | null {
@@ -789,8 +964,16 @@ $('ed-save').addEventListener('click', async () => {
   try {
     await invoke('save_job', { name: c.name, job: c.job });
     editModal.classList.add('hidden');
+    pushHistory(c.job.source);
+    pushHistory(c.job.target);
     jobs = await invoke<JobDto[]>('list_jobs');
     renderJobs();
+    // 改的就是当前选中的任务时，工具栏副标题与路径行要跟着变
+    if (currentJob?.name === c.name) {
+      currentJob = jobs.find((x) => x.name === c.name) ?? currentJob;
+      pathEl.textContent = `${currentJob.source}   ⇄   ${currentJob.target}`;
+      renderVariants();
+    }
     setStatus(`已保存 '${c.name}'`, 'ok');
   } catch (e) {
     setStatus(`保存失败：${e}`, 'err');
@@ -1076,6 +1259,228 @@ btnFold.addEventListener('click', () => {
 });
 renderModeButtons();
 
+// ---------- P1：工具栏变体副标题 + 齿轮 + 交换 ----------
+
+const RIGOR_HINT: Record<string, string> = {
+  quick: '只比 size 与时间', fast: '抽样摘要', standard: '哈希 + 缓存', paranoid: '全量重哈希 + 复制后校验',
+};
+const MODE_HINT: Record<string, string> = {
+  mirror: 'source 为准', sync: '双向', enrich: '只增不删',
+};
+const CONFLICT_HINT: Record<string, string> = {
+  report: '冲突只报告', copy: '冲突留副本', newer: '新者胜',
+};
+const btnCmpCfg = $<HTMLButtonElement>('btn-cmpcfg');
+const btnSyncCfg = $<HTMLButtonElement>('btn-synccfg');
+const btnSwap = $<HTMLButtonElement>('btn-swap');
+
+/// 按钮上直接写清楚"这一下按下去会发生什么"（FFS 的 Compare/Synchronize 副标题同款）
+function renderVariants() {
+  const j = currentJob;
+  $('cmp-variant').textContent = j ? `${j.rigor} · ${RIGOR_HINT[j.rigor] ?? ''}` : '选择任务';
+  $('sync-variant').textContent = j ? `${j.mode} · ${MODE_HINT[j.mode] ?? ''}` : '先比对';
+  btnCmpCfg.disabled = !j;
+  btnSyncCfg.disabled = !j;
+  btnSwap.disabled = !j || busy;
+  if (j) {
+    btnCmpCfg.title = `比对设置：严谨级 ${j.rigor} / 大小写 / symlink`;
+    btnSyncCfg.title = `同步设置：模式 ${j.mode}${j.versioning ? ' / 版本控制开' : ''}`;
+    btnSwap.title = `交换：${j.source} ⇄ ${j.target}（写回任务文件）`;
+  }
+}
+btnCmpCfg.addEventListener('click', () => { if (currentJob) openEditor(currentJob.name, '基本'); });
+btnSyncCfg.addEventListener('click', () => { if (currentJob) openEditor(currentJob.name, '行为'); });
+
+/// FFS 的 ⇄ 换的是内存里那份配置；我们的任务是磁盘上的具名 TOML，
+/// 所以交换必须落盘——否则计划头里的两个根和任务文件说的不是一回事，
+/// 运行日志与 archive 刷新都会指向错误的方向。
+btnSwap.addEventListener('click', async () => {
+  if (!currentJob || busy) return;
+  const name = currentJob.name;
+  const j = await invoke<JobFull>('get_job', { name }).catch((e) => { setStatus(`读取任务失败：${e}`, 'err'); return null; });
+  if (!j) return;
+  const warn = j.mode === 'mirror'
+    ? `\n\nmirror 模式下这会调转主从：交换后以原 target 为准。`
+    : '';
+  if (!confirm(`交换 '${name}' 的两个根目录？\n\nsource ← ${j.target}\ntarget ← ${j.source}${warn}\n\n任务文件会被改写，当前比对结果作废。`)) return;
+  const prev = { source: j.source, target: j.target };
+  const swapped: JobFull = { ...j, source: j.target, target: j.source };
+  try {
+    await invoke('save_job', { name, job: swapped });
+    jobs = await invoke<JobDto[]>('list_jobs');
+    currentJob = jobs.find((x) => x.name === name) ?? currentJob;
+    plan = null; checked = []; flipped = []; chips.clear();
+    ovFilter = null; ovExpanded.clear();
+    renderJobs();
+    renderAll();
+    pathEl.textContent = `${currentJob!.source}   ⇄   ${currentJob!.target}`;
+    btnSync.disabled = true;
+    renderVariants();
+    setStatusUndo(`已交换 '${name}' 的两个根 — 重新 Compare（Ctrl+R）`, '撤销交换', async () => {
+      const cur = await invoke<JobFull>('get_job', { name });
+      await invoke('save_job', { name, job: { ...cur, ...prev } });
+      jobs = await invoke<JobDto[]>('list_jobs');
+      currentJob = jobs.find((x) => x.name === name) ?? currentJob;
+      renderJobs();
+      pathEl.textContent = `${currentJob!.source}   ⇄   ${currentJob!.target}`;
+      renderVariants();
+      setStatus(`已还原 '${name}' 的两个根`);
+    });
+  } catch (e) {
+    setStatus(`交换失败：${e}`, 'err');
+  }
+});
+
+// ---------- P1：拖放目录到路径框 ----------
+//
+// Tauri v2 的 dragDropEnabled 默认开着，webview 里的 HTML5 drop 事件是收不到的——
+// 必须走 onDragDropEvent，且 payload.position 是**物理像素**，要自己换算成 CSS 像素。
+
+function dropTargetAt(px: number, py: number): HTMLInputElement | null {
+  if (editModal.classList.contains('hidden')) return null;
+  const r = window.devicePixelRatio || 1;
+  const x = px / r, y = py / r;
+  for (const el of edForm.querySelectorAll<HTMLInputElement>('input[data-drop]')) {
+    const b = el.getBoundingClientRect();
+    if (x >= b.left && x <= b.right && y >= b.top && y <= b.bottom) return el;
+  }
+  return null;
+}
+
+function clearDropHint() {
+  for (const el of edForm.querySelectorAll<HTMLInputElement>('input[data-drop]')) el.classList.remove('dropon');
+}
+
+async function wireDragDrop() {
+  await getCurrentWebview().onDragDropEvent((ev) => {
+    const p = ev.payload as unknown as { type: string; paths?: string[]; position?: { x: number; y: number } };
+    if (p.type === 'leave') { clearDropHint(); return; }
+    const pos = p.position;
+    if (!pos) return;
+    const el = dropTargetAt(pos.x, pos.y);
+    if (p.type === 'over' || p.type === 'enter') {
+      clearDropHint();
+      if (el) el.classList.add('dropon');
+      return;
+    }
+    if (p.type !== 'drop') return;
+    clearDropHint();
+    const first = p.paths?.[0];
+    if (!el || !first) return;
+    void (async () => {
+      // 丢进来的是文件时取它所在目录——根目录字段要的是目录
+      let v = first;
+      try {
+        const info = await invoke<PathVerdict>('inspect_paths', { source: first, target: '' });
+        if (info.source.exists && !info.source.is_dir) {
+          const i = Math.max(v.lastIndexOf('\\'), v.lastIndexOf('/'));
+          if (i > 0) v = v.slice(0, i);
+        }
+      } catch { /* 拿不到就按原样填 */ }
+      el.value = v;
+      pushHistory(v);
+      scheduleVerdict();
+      setStatus(`已填入：${v}`);
+    })();
+  });
+}
+
+// ---------- P1：差异表右键菜单 ----------
+
+const ctxEl = $('ctxmenu');
+interface CtxItem { label: string; disabled?: boolean; danger?: boolean; sep?: boolean; run?: () => void }
+
+function closeCtx() { ctxEl.classList.add('hidden'); }
+document.addEventListener('click', closeCtx);
+document.addEventListener('scroll', closeCtx, true);
+
+function copyText(s: string) {
+  navigator.clipboard?.writeText(s).then(
+    () => setStatus(`已复制：${s}`),
+    () => setStatus('复制失败（剪贴板不可用）', 'err'),
+  );
+}
+
+/// 排除项写回任务的 exclude。扫描阶段的剪枝要下次 Compare 才生效，
+/// 所以提示里必须说清楚，并留一条撤销。
+async function addExclude(mask: string) {
+  if (!currentJob) return;
+  const name = currentJob.name;
+  try {
+    const j = await invoke<JobFull>('get_job', { name });
+    if (j.exclude.includes(mask)) { setStatus(`任务里已有这条排除：${mask}`); return; }
+    const prev = [...j.exclude];
+    await invoke('save_job', { name, job: { ...j, exclude: [...prev, mask] } });
+    jobs = await invoke<JobDto[]>('list_jobs');
+    currentJob = jobs.find((x) => x.name === name) ?? currentJob;
+    renderJobs();
+    setStatusUndo(`已加入 exclude：${mask} — 重新 Compare（Ctrl+R）后生效`, '撤销排除', async () => {
+      const cur = await invoke<JobFull>('get_job', { name });
+      await invoke('save_job', { name, job: { ...cur, exclude: prev } });
+      jobs = await invoke<JobDto[]>('list_jobs');
+      currentJob = jobs.find((x) => x.name === name) ?? currentJob;
+      renderJobs();
+      setStatus(`已撤销排除：${mask}`);
+    });
+  } catch (e) {
+    setStatus(`写入 exclude 失败：${e}`, 'err');
+  }
+}
+
+function openCtx(x: number, y: number, items: CtxItem[]) {
+  ctxEl.innerHTML = '';
+  for (const it of items) {
+    if (it.sep) {
+      const d = document.createElement('div');
+      d.className = 'ctxsep';
+      ctxEl.appendChild(d);
+      continue;
+    }
+    const d = document.createElement('div');
+    d.className = 'ctxitem' + (it.disabled ? ' off' : '') + (it.danger ? ' danger' : '');
+    d.textContent = it.label;
+    if (!it.disabled && it.run) {
+      d.addEventListener('click', (e) => { e.stopPropagation(); closeCtx(); it.run!(); });
+    }
+    ctxEl.appendChild(d);
+  }
+  // 定位走 CSSOM：style="" 属性会被注入 nonce 后的 CSP 拦掉
+  ctxEl.classList.remove('hidden');
+  const w = ctxEl.offsetWidth, h = ctxEl.offsetHeight;
+  ctxEl.style.left = `${Math.min(x, window.innerWidth - w - 6)}px`;
+  ctxEl.style.top = `${Math.min(y, window.innerHeight - h - 6)}px`;
+}
+
+function rowMenu(i: number, x: number, y: number) {
+  const p = plan!;
+  const op = eff(i);
+  const [sp, tp] = sidePaths(op);
+  const sAbs = sp ? fullPath(p.header.source_root, sp) : null;
+  const tAbs = tp ? fullPath(p.header.target_root, tp) : null;
+  const rel = op.path;
+  const base = baseOf(rel);
+  const dot = base.lastIndexOf('.');
+  const ext = dot > 0 ? base.slice(dot + 1) : '';
+  const dir = dirOf(rel);
+  const canFlip = !!p.reversed[i] && selectable(p.ops[i]);
+  const sameDir = visibleIdx().filter((k) => dirOf(eff(k).path) === dir && selectable(eff(k)));
+  const items: CtxItem[] = [
+    { label: '在资源管理器中显示 · source', disabled: !sAbs, run: () => { invoke('reveal', { path: sAbs }).catch((e) => setStatus(String(e), 'err')); } },
+    { label: '在资源管理器中显示 · target', disabled: !tAbs, run: () => { invoke('reveal', { path: tAbs }).catch((e) => setStatus(String(e), 'err')); } },
+    { sep: true, label: '' },
+    { label: '复制完整路径', run: () => copyText((sAbs ?? tAbs)!) },
+    { label: '复制相对路径', run: () => copyText(rel) },
+    { sep: true, label: '' },
+    { label: ext ? `排除此类型 */*.${ext}` : '排除此类型（无扩展名）', disabled: !ext || !currentJob, run: () => addExclude(`*/*.${ext}`) },
+    { label: dir ? `排除此目录 /${dir}/` : '排除此目录（已在根下）', disabled: !dir || !currentJob, run: () => addExclude(`/${dir}/`) },
+    { sep: true, label: '' },
+    { label: flipped[i] ? '恢复原方向' : '反向此行', disabled: !canFlip, run: () => { flipped[i] = !flipped[i]; renderAll(); } },
+    { label: '只勾选此项', run: () => { checked = checked.map((_, k) => k === i && selectable(eff(k))); renderTable(); } },
+    { label: `取消勾选本目录（${sameDir.length}）`, disabled: sameDir.length === 0, run: () => { for (const k of sameDir) checked[k] = false; renderTable(); } },
+  ];
+  openCtx(x, y, items);
+}
+
 // M3 Overview 折叠/清除
 const ovEl = $('overview');
 ovEl.classList.toggle('collapsed', localStorage.getItem('sd.ov') !== 'open');
@@ -1087,6 +1492,7 @@ $('ov-clear').addEventListener('click', () => { ovFilter = null; renderAll(); })
 
 document.addEventListener('keydown', (e) => {
   const mod = e.ctrlKey || e.metaKey;
+  if (!ctxEl.classList.contains('hidden') && e.key === 'Escape') { closeCtx(); return; }
   if (!editModal.classList.contains('hidden')) {
     if (e.key === 'Escape') editModal.classList.add('hidden');
     return;
@@ -1100,7 +1506,10 @@ document.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !modalOk.disabled) doSync();
     return;
   }
-  if (mod && e.key.toLowerCase() === 'r') { e.preventDefault(); doCompare(); }
+  // F5 / F9 = FFS 的比对 / 同步；Ctrl+R / Enter 依然管用
+  if (e.key === 'F5') { e.preventDefault(); doCompare(); }
+  else if (e.key === 'F9') { e.preventDefault(); if (plan && !busy && !btnSync.disabled) openConfirm(); }
+  else if (mod && e.key.toLowerCase() === 'r') { e.preventDefault(); doCompare(); }
   else if (mod && e.key.toLowerCase() === 'f') { e.preventDefault(); searchEl.focus(); }
   else if (e.key === 'Enter' && document.activeElement !== searchEl && plan && !busy && !btnSync.disabled) openConfirm();
 });
@@ -1109,6 +1518,8 @@ document.addEventListener('keydown', (e) => {
 
 (async function init() {
   if (navigator.userAgent.includes('Macintosh')) document.body.classList.add('mac');
+  renderVariants();
+  wireDragDrop().catch(() => { /* 拖放不可用不影响手打路径 */ });
   await listen<CmpEv>('run-progress', (ev) => onCmpEvent(ev.payload));
   await listen<Progress>('progress', (ev) => {
     const { phase, detail, pct, rate } = ev.payload;

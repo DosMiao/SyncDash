@@ -20,9 +20,16 @@
     </aside>
     <main id="main">
       <header id="toolbar">
-        <button id="btn-compare" class="btn primary" disabled>⟳ Compare</button>
-        <button id="btn-sync" class="btn accent" disabled>▶ Synchronize</button>
-        <button id="btn-log" class="btn" title="运行日志">🗒</button>
+        <button id="btn-compare" class="btn primary two" disabled>
+          <span class="l1">⟳ Compare</span><span class="l2" id="cmp-variant">选择任务</span>
+        </button>
+        <button id="btn-cmpcfg" class="btn cog" title="比对设置：严谨级 / 大小写 / symlink" disabled>⚙</button>
+        <button id="btn-sync" class="btn accent two" disabled>
+          <span class="l1">▶ Synchronize</span><span class="l2" id="sync-variant">先比对</span>
+        </button>
+        <button id="btn-synccfg" class="btn cog" title="同步设置：模式 / 冲突策略 / 版本控制" disabled>⚙</button>
+        <button id="btn-swap" class="btn cog" title="交换 source / target（写回任务文件，需重新比对）" disabled>⇄</button>
+        <button id="btn-log" class="btn cog" title="运行日志">🗒</button>
         <button id="btn-watch" class="btn" title="值守：按任务的 watch 间隔定时比对" disabled>⏱ Watch</button>
         <span id="stats" class="stats"></span>
         <span id="spin" class="spinner hidden"></span>
@@ -65,9 +72,10 @@
         </table>
       </div>
       </div>
-      <footer id="status">就绪</footer>
+      <footer id="status"><span id="statusmsg">就绪</span><button id="btn-undo" class="linkbtn hidden"></button></footer>
     </main>
   </div>
+  <div id="ctxmenu" class="hidden"></div>
   <div id="editmodal" class="hidden">
     <div class="sheet edsheet">
       <h3 id="ed-title">编辑任务</h3>

@@ -60,6 +60,21 @@ struct PreflightDto {
     warnings: Vec<String>,
 }
 
+#[derive(Serialize, Default)]
+struct PathInfo {
+    exists: bool,
+    is_dir: bool,
+    has_marker: bool,
+}
+
+#[derive(Serialize, Default)]
+struct PathVerdict {
+    source: PathInfo,
+    target: PathInfo,
+    /// 人话警告，编辑器直接贴在字段下面
+    warnings: Vec<String>,
+}
+
 // ---------- 运行状态（互斥 + 取消/暂停句柄） ----------
 
 #[derive(Default)]
@@ -242,6 +257,86 @@ fn save_job(name: String, job: config::Job) -> Result<String, String> {
 #[tauri::command]
 fn delete_job(name: String) -> Result<(), String> {
     config::delete_job(&name).map_err(|e| e.to_string())
+}
+
+// ---------- P1：路径体检与"在资源管理器中显示" ----------
+
+/// 归一化到可比较形态：小写 + 统一 '/' + 去尾分隔符。
+/// 只用于"两根是否相同/是否嵌套"的判断，不参与任何同步语义。
+fn norm_root(p: &str) -> String {
+    let s = p.trim().replace('\\', "/").to_lowercase();
+    let s = s.trim_end_matches('/');
+    s.to_string()
+}
+
+/// 编辑器实时体检：路径存不存在、是不是目录、有没有挂载点标记，
+/// 以及两根之间的关系（相同 / 互相嵌套）。写错路径的代价太大，
+/// 不该等到 Compare 才在状态栏里说。
+#[tauri::command]
+fn inspect_paths(source: String, target: String) -> PathVerdict {
+    fn info(p: &str) -> PathInfo {
+        if p.trim().is_empty() {
+            return PathInfo::default();
+        }
+        let path = std::path::Path::new(p.trim());
+        let is_dir = path.is_dir();
+        PathInfo {
+            exists: is_dir || path.is_file(),
+            is_dir,
+            has_marker: is_dir && syncdash::preflight::has_marker(path),
+        }
+    }
+    let mut v = PathVerdict { source: info(&source), target: info(&target), warnings: Vec::new() };
+    let (s, t) = (source.trim(), target.trim());
+    if !s.is_empty() && !v.source.exists {
+        v.warnings.push(format!("source 不存在：{s}"));
+    } else if !s.is_empty() && !v.source.is_dir {
+        v.warnings.push("source 不是目录".into());
+    }
+    if !t.is_empty() && !v.target.exists {
+        v.warnings.push(format!("target 不存在：{t}（首次同步会自动创建）"));
+    } else if !t.is_empty() && !v.target.is_dir {
+        v.warnings.push("target 不是目录".into());
+    }
+    let (ns, nt) = (norm_root(s), norm_root(t));
+    if !ns.is_empty() && ns == nt {
+        v.warnings.push("source 与 target 是同一个目录".into());
+    } else if !ns.is_empty() && !nt.is_empty() {
+        // 嵌套：mirror 会把外层的内容往内层灌，再把灌进去的当成外层新增——自食其尾
+        if nt.starts_with(&format!("{ns}/")) {
+            v.warnings.push("target 在 source 之下——嵌套的两根会自我复制".into());
+        } else if ns.starts_with(&format!("{nt}/")) {
+            v.warnings.push("source 在 target 之下——嵌套的两根会自我复制".into());
+        }
+    }
+    v
+}
+
+/// 在系统文件管理器里选中该路径。参数单独传给 exe，不过 shell。
+#[tauri::command]
+fn reveal(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("路径已不存在：{path}"));
+    }
+    #[cfg(windows)]
+    {
+        // explorer 选中成功时也返回 exit 1，状态码在这里没有意义——只看能不能起进程
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", p.display()))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg("-R").arg(p).spawn().map_err(|e| e.to_string())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = if p.is_dir() { p } else { p.parent().unwrap_or(p) };
+        std::process::Command::new("xdg-open").arg(dir).spawn().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// M4：运行历史（新→旧）。job = null 时看全部
@@ -455,12 +550,14 @@ fn main() {
                 }
             }
         })
+        .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(RunState::default()))
         .invoke_handler(tauri::generate_handler![
             list_jobs, jobs_dir, compare_job, preflight, apply_job, cancel_run, pause_run,
             open_progress_window, close_progress_window, post_sync_action,
             run_history, last_syncs, run_detail,
-            get_job, save_job, delete_job
+            get_job, save_job, delete_job,
+            inspect_paths, reveal
         ])
         .run(tauri::generate_context!())
         .expect("error while running SyncDash");
