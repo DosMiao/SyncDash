@@ -105,6 +105,7 @@ pub fn gen_jobs(source_root: &Path, target_root: &Path, mode: &str, rigor: &str,
             remote_host: remote.map(|r| r.host.clone()),
             remote_root: remote.map(|r| format!("{}/{}", r.root_base.trim_end_matches('/'), rel)),
             remote_exe: remote.and_then(|r| r.exe.clone()),
+            ..Default::default()
         };
         let toml_text = toml::to_string_pretty(&job)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}")))?;

@@ -8,21 +8,23 @@ import { getVersion } from '@tauri-apps/api/app';
 interface JobDto { name: string; mode: string; rigor: string; source: string; target: string; has_archive: boolean }
 interface OpDto {
   side: 'source' | 'target';
-  action: 'copy' | 'update' | 'move' | 'delete' | 'delete_dir' | 'conflict' | 'note';
+  action: 'copy' | 'update' | 'move' | 'delete' | 'delete_dir' | 'chmod' | 'conflict' | 'note';
   path: string;
   from?: string;
   size?: number;
   mtime_ms?: number;
   hash?: string;
+  mode?: number;
   reason: string;
 }
 interface PlanDto {
-  header: { mode: string; source_root: string; target_root: string; op_count: number; conflict_count: number };
+  header: { mode: string; source_root: string; target_root: string; op_count: number; conflict_count: number; source_entries: number; target_entries: number };
   ops: OpDto[];
   reversed: (OpDto | null)[];
 }
 interface ApplyDto { done: number; skipped: number; errors: number }
-interface Progress { phase: string; detail: string }
+interface Progress { phase: string; detail: string; pct: number; rate: number }
+interface PreflightDto { ok: boolean; blockers: string[]; warnings: string[] }
 
 type Chip = 'all' | 'copy' | 'update' | 'move' | 'delete' | 'conflict';
 const CHIPS: [Chip, string][] = [
@@ -46,6 +48,7 @@ const emptyEl = $('empty');
 const statusEl = $('status');
 const modalEl = $('modal');
 const modalBody = $('modal-body');
+const modalOk = $('modal-ok') as HTMLButtonElement;
 
 let jobs: JobDto[] = [];
 let currentJob: JobDto | null = null;
@@ -55,6 +58,8 @@ let flipped: boolean[] = [];
 let chip: Chip = 'all';
 let search = '';
 let busy = false;
+/// 用户在确认单里勾了"我确认无误"（等同 CLI --i-know）；每次重新比对后归零
+let acknowledged = false;
 
 // ---------- 小工具 ----------
 
@@ -91,7 +96,7 @@ function selectable(op: OpDto): boolean {
 function category(op: OpDto): Chip {
   switch (op.action) {
     case 'copy': return 'copy';
-    case 'update': return 'update';
+    case 'update': case 'chmod': return 'update';
     case 'move': return 'move';
     case 'delete': case 'delete_dir': return 'delete';
     default: return 'conflict';
@@ -125,6 +130,7 @@ function badge(op: OpDto, canFlip: boolean): [string, string] {
     case 'move':   txt = (toTarget ? '→' : '←') + ' move'; cls = 'mv'; break;
     case 'delete':
     case 'delete_dir': txt = (toTarget ? '→' : '←') + ' delete'; cls = 'del'; break;
+    case 'chmod':  txt = (toTarget ? '→' : '←') + ' chmod'; cls = 'update'; break;
     case 'conflict': txt = '⚡ conflict'; cls = 'conflict'; break;
     case 'note':   txt = 'ⓘ note'; cls = 'note'; break;
   }
@@ -275,6 +281,8 @@ async function doCompare() {
   setBusy(true);
   setStatus(`正在比对 '${currentJob.name}' ...`);
   try {
+    acknowledged = false;
+    modalOk.disabled = false;
     plan = await invoke<PlanDto>('compare_job', { name: currentJob.name });
     checked = plan.ops.map((op) => selectable(op));
     flipped = plan.ops.map(() => false);
@@ -294,7 +302,7 @@ async function doCompare() {
   setBusy(false);
 }
 
-function openConfirm() {
+async function openConfirm() {
   if (!currentJob || !plan || busy) return;
   const idx = checked.map((c, i) => (c ? i : -1)).filter((i) => i >= 0);
   if (idx.length === 0) { setStatus('没有勾选任何项', 'err'); return; }
@@ -315,6 +323,35 @@ function openConfirm() {
     ${flipped.some(Boolean) ? `<div class="mrow warn"><span>其中翻转方向</span><b>${flipped.filter(Boolean).length}</b></div>` : ''}
   `;
   modalEl.classList.remove('hidden');
+
+  // 闸门体检（磁盘空间 / 删除占比）——理由要摆在按下 Synchronize 之前，
+  // 而不是等执行时才在看不见的 stderr 里出现
+  try {
+    const pf = await invoke<PreflightDto>('preflight', {
+      name: currentJob.name, plan, ops: idx.map((i) => eff(i)), acknowledged: acknowledged,
+    });
+    for (const w of pf.warnings) {
+      modalBody.innerHTML += `<div class="mrow warn"><span>提醒</span><span class="dim">${escapeHtml(w)}</span></div>`;
+    }
+    if (!pf.ok) {
+      for (const b of pf.blockers) {
+        modalBody.innerHTML += `<div class="mrow danger"><span>拒绝执行</span><span class="dim">${escapeHtml(b)}</span></div>`;
+      }
+      modalBody.innerHTML += `<div class="mrow"><label><input type="checkbox" id="ackbox"> 我确认无误，继续（等同 CLI 的 --i-know）</label></div>`;
+      const box = document.getElementById('ackbox') as HTMLInputElement | null;
+      if (box) box.onchange = () => { acknowledged = box.checked; };
+      modalOk.disabled = true;
+      if (box) box.addEventListener('change', () => { modalOk.disabled = !box.checked; });
+    } else {
+      modalOk.disabled = false;
+    }
+  } catch (e) {
+    modalBody.innerHTML += `<div class="mrow danger"><span>体检失败</span><span class="dim">${escapeHtml(String(e))}</span></div>`;
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 }
 
 async function doSync() {
@@ -325,7 +362,7 @@ async function doSync() {
   setBusy(true);
   setStatus(`正在同步 '${currentJob.name}'（${finalOps.length} 项）...`);
   try {
-    const r = await invoke<ApplyDto>('apply_job', { name: currentJob.name, plan, ops: finalOps });
+    const r = await invoke<ApplyDto>('apply_job', { name: currentJob.name, plan, ops: finalOps, acknowledged });
     setStatus(`完成：${r.done} 执行，${r.skipped} 跳过，${r.errors} 错误 — 复核中...`, r.errors ? 'err' : 'ok');
     setBusy(false);
     await doCompare();
@@ -358,7 +395,7 @@ document.addEventListener('keydown', (e) => {
   const mod = e.ctrlKey || e.metaKey;
   if (!modalEl.classList.contains('hidden')) {
     if (e.key === 'Escape') modalEl.classList.add('hidden');
-    if (e.key === 'Enter') doSync();
+    if (e.key === 'Enter' && !modalOk.disabled) doSync();
     return;
   }
   if (mod && e.key.toLowerCase() === 'r') { e.preventDefault(); doCompare(); }
@@ -371,11 +408,12 @@ document.addEventListener('keydown', (e) => {
 (async function init() {
   if (navigator.userAgent.includes('Macintosh')) document.body.classList.add('mac');
   await listen<Progress>('progress', (ev) => {
-    const { phase, detail } = ev.payload;
+    const { phase, detail, pct, rate } = ev.payload;
     const map: Record<string, string> = {
-      'scan-source': '扫描 source：', 'scan-target': '扫描 target：', 'comparing': '比对中：',
+      'scan-source': '扫描 source：', 'scan-target': '扫描 target：', 'comparing': '比对中：', 'warning': '⚠ ',
     };
-    setStatus((map[phase] ?? phase) + detail);
+    const suffix = pct >= 0 ? `  ${pct}%${rate > 0 ? `  ${rate.toFixed(1)} MiB/s` : ''}` : '';
+    setStatus((map[phase] ?? phase) + detail + suffix, phase === 'warning' ? 'err' : '');
   });
   try {
     jobs = await invoke<JobDto[]>('list_jobs');

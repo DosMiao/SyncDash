@@ -29,16 +29,18 @@ SyncDash/
 
 ```bash
 syncdash jobs                                    # 列出任务配置
-syncdash run <job> [--apply]                     # 一条龙：扫双侧→比对→(--apply)执行→刷新 archive
+syncdash run <job> [--apply] [--i-know]          # 一条龙：扫双侧→比对→闸门→(--apply)执行→刷新 archive
 syncdash run --all | --prefix cs- [--apply]      # 批量跑（hub-and-spoke 多端的引擎）
 syncdash territories <root>                      # 列出 .ffs-sync 领地
 syncdash gen-jobs <root> --target-root R [--remote-host mac --remote-root-base /Users/x/Code]
 syncdash gui [job]                               # 旧 egui 界面（桌面版见 syncdash-desktop）
 syncdash probe                                   # 本机环境 JSON（远端探测：ssh 对面跑这个）
-syncdash scan <root> [--out t.jsonl] [--no-hash] [--force-rehash] [--symlinks-direct] [--exclude PHRASE]...
+syncdash scan <root> [--out t.jsonl] [--no-hash] [--force-rehash] [--symlinks-direct] [--progress] [--exclude PHRASE]...
 syncdash compare --source a.jsonl --target b.jsonl \
     [--mode mirror|sync|enrich] [--archive last.jsonl] [--resolve-newer] [--case-sensitive] [--out plan.jsonl]
-syncdash apply plan.jsonl [--apply] [--verify] [--source-root R] [--target-root R] [-v]
+syncdash apply plan.jsonl [--apply] [--verify] [--delta] [--no-fsync] [--source-root R] [--target-root R] [-v]
+syncdash mark <root> [--job NAME]                # 打 .syncdash-root 挂载点标记（配 require_marker）
+syncdash trash runs|find <pat>|restore <pat> --into R|prune   # 本机回收目录：查看/找回/清理
 syncdash pack plan.jsonl --out pkg.tar           # 打包 target 侧操作（payload+计划+双 hash 清单）
 syncdash apply-pack pkg.tar [--apply] [-v]       # 对端：验 hash→提取→执行（锁/回收/校验全带）
 syncdash-desktop                                 # Tauri 桌面版（主力 GUI）
@@ -207,6 +209,37 @@ source 侧回拉经挂载路径直落 → archive 刷新。`gen-jobs --remote-ho
   FFS 把同目录 rename 合并为单行展示——列入 v0.3。
 - **parallel_scan.cpp**：目录树并行遍历（我们目前 walkdir 串行＋单文件 rayon 哈希）——列入 v0.3。
 
+## 从 Syncthing 源码借鉴的（`.docs/syncthing` @ `119d5e72`，MPL-2.0——按语义重写，未搬代码）
+
+完整对照分析见 [PLAN-syncthing-upgrade.md](PLAN-syncthing-upgrade.md)（每条都带双侧真实行号）。落地的：
+
+- **`lib/osutil/atomic.go` → [src/atomic.rs](src/atomic.rs)**：写同目录临时文件 → fsync → rename。
+  同卷 rename 原子，中断只留临时文件。这条修的是一个真实的数据丢失路径，不是洁癖。
+- **`lib/config/folderconfiguration.go` 的 `.stfolder` → [src/preflight.rs](src/preflight.rs)**：
+  挂载点标记。它跟着**数据**走，盘没挂上标记就不在——这是"共享盘掉线"唯一可靠的判据。
+  标记自身必须排除出同步（否则空目录会凭空长出标记），syncthing 同样把它列为 internal。
+- **`CheckAvailableSpace` / `minDiskFree`** → 写入前按计划里的 size 汇总预检。
+- **`deleteDirOnDiskHandleChildren`（folder_sendrecv.go:1985）** → 目录删不掉时分类汇报，
+  区分"被过滤器保护""可连带删""真错误"，不再静默。
+- **`conflictName`（:2219）/ `WinsConflict`（bep_fileinfo.go:212）** → `.sync-conflict-<ts>-<host>` 副本，
+  mtime 新者胜、host 名做稳定 tie-break（我们没有 device id）。**默认仍是只报告**——不自动仲裁是 SyncDash 的立身之本。
+- **`PreviousBlocksHash`（bep_fileinfo.go:200）** → archive 的 `prev` 多代链：一侧只是"落后一代"
+  不是并发修改。这是 archive 模型下对版本向量的廉价近似。
+- **`lib/fs/mtimefs.go`** → 设完 mtime 回读，把 (ondisk, intended) 记进本机缓存，
+  不再让 ±2s 容差当唯一判据（`rigor = "quick"` 时尤其要紧）。
+- **`lib/ignore/ignore.go` 的 `!` 与 `(?d)`** → 过滤器的 `!` 例外与 `deletable` 列表，FFS 语法的严格超集。
+- **`lib/versioner/staggered.go:toRemove`** → 回收站的分级稀释（近期密、远期疏），配 `trash prune`。
+- **`lib/model/folder.go:930` 的 `Size == 0` 守卫** → 空文件不参与移动配对。
+  所有零长文件 blake3 相同，过去会被配成一堆编出来的"重命名"。
+- **`lib/fs/casefs.go` 的 `CaseConflictError`** → 大小写敏感模式下的落盘撞名预检（计划阶段拦，不到 apply 才炸）。
+- **`shortcutFile`（:1253）** → `Action::Chmod`：内容相同只差权限位时不重传。
+- **`lib/protocol/vector.go` → [src/vclock.rs](src/vclock.rs)**：版本向量数学核心（含代数性质穷举验证）。
+  **尚未接管 archive 归因**——真 N 向是 v1.0 的收敛性工程，见"多端"。
+
+明确**不抄**的：BEP 协议栈 / TLS / 设备发现 / 中继 / NAT 穿透（我们走 ssh + SMB 是刻意的简化）、
+常驻 daemon（会破坏"默认 dry-run、人点才动"的核心承诺）、索引数据库（JSONL 表可读可 diff 可管道，是卖点）、
+加密文件夹、文件系统监视（`watchaggregator` 的聚合策略值得读，但引入它就得常驻）。
+
 ## 算法调研来源
 
 - Unison 形式化规范与 archive 模型：[Balboa/Pierce, "What's in Unison?"](https://www.researchgate.net/publication/32205844_What's_in_Unison_A_Formal_Specification_and_Reference_Implementation_of_a_File_Synchronizer)、[Unison: A File Synchronizer and Its Specification](https://link.springer.com/chapter/10.1007/3-540-45500-0_28)、[Unison (Wikipedia)](https://en.wikipedia.org/wiki/Unison_(software))
@@ -229,7 +262,24 @@ source 侧回拉经挂载路径直落 → archive 刷新。`gen-jobs --remote-ho
 - [x] v0.6 `run --all`/`--prefix`；ssh 远程管线一条龙（job 配 remote_host 即启用，真机验证：dry→apply→复跑 0 ops，含 symlink）；symlink 策略 exclude/direct（按指向比对，apply 建/换/删链接本身）；同父目录 rename 优先配对（reason 区分 rename/move）；git bundle 经 SMB 更新 Mac（挂载不在线时的通道）
 - [x] v0.7 三个"后续候选"全部落地：**Windows 作为远端**（`recv` 子命令用 Rust 原始 stdin 收包、按 probe 的 os 选 shell 方言：PowerShell 单引号翻倍＋chcp 65001 前奏＋`& 'exe'`；实测 Mac 反向驱动 Windows：8.4MB 包经 ssh stdin 落地、apply-pack 执行、复跑 0 ops）；**FastCDC 增量传输**（16K/64K/256K v2020，远端 `chunks` 出块表，≥4MB 更新只传缺失块＋重组 recipe，blob/base/成品三重 blake3；实测 8MB 改 6KB 只传 148KB，省 98.2%）；**GUI 任务编辑**（egui：New/Edit/Delete 全字段表单＋校验＋二次确认删除；`config::save_job/delete_job` 供桌面壳复用）
 - [x] v0.8 可选版本控制：root 内 `.version_syncDash/`（plan 指令清单＋整存＋FastCDC 反向补丁）＋ `versions`/`restore` 命令；实测大文件旧版占 1.3%、restore 哈希逐位一致
-- **roadmap 全部完成**。仅存的远期方向：版本向量 P2P（见"多端"——明确非目标，除非出现绕过 hub 的直连写入）
+- [x] v0.9 **对照 syncthing 源码的安全网与能力补齐**（计划见 [PLAN-syncthing-upgrade.md](PLAN-syncthing-upgrade.md)，78 项测试）：
+      **原子落盘**（同目录临时文件→fsync→rename，中断绝不在最终路径留半截——此前 `fs::copy` 直写目标，
+      Update 断掉会让截断文件在下一轮被反向传播回 source）；
+      **挂载点标记 `.syncdash-root` + 计划体检**（`require_marker` / `max_delete_ratio` / `--i-know`：
+      共享盘没挂上、过滤器写错、source/target 写反，长得一模一样，这道闸把三者一起拦住）；
+      **磁盘空间预检**（`min_free_pct`）；**目录删除分类汇报**（不再 `Err(_) => Ok(())` 静默吞掉）；
+      **冲突副本**（`on_conflict = copy|newer`，`.sync-conflict-<ts>-<host>` + `max_conflicts`，默认仍是只报告）；
+      **多代 archive**（`prev` 链：一侧只是"落后一代"不再误报 both-changed）；
+      **mtime 回读校正**（FAT/SMB 截断时间戳时不再靠 ±2s 容差硬扛）；
+      **过滤器 `!` 取反 + `deletable`**（FFS 语法的超集，粘进来的 FFS 规则行为不变）；
+      **回收站保留期**（`trash runs/find/restore/prune` + syncthing staggered 稀释算法）；
+      **本地增量**（`delta`：大文件按 FastCDC 块补写，SMB 上传划算）；
+      **`Action::Chmod`**（`sync_mode`：内容相同只差权限位时不重传）；
+      空文件不再被乱配成"重命名"、歧义配对如实标注候选数、大小写撞名预检、扫描进度（CLI `--progress` + GUI 进度条）
+- **roadmap 全部完成**。仅存的远期方向：版本向量 P2P（见"多端"——明确非目标，除非出现绕过 hub 的直连写入）。
+  数学前置件已就位：[src/vclock.rs](src/vclock.rs) 是照 syncthing `lib/protocol/vector.go` 语义重写的完整实现
+  （`update` 单调性、`merge` 上确界、比较关系反对称性均有穷举验证），但**尚未接管 archive 归因**——
+  真 N 向要求每次 apply 后精确维护向量并保证收敛，那是 v1.0 的工程。
 
 ## 构建
 

@@ -1,6 +1,6 @@
 [package]
 name = "syncdash-desktop"
-version = "0.3.0"
+version = "0.9.0"
 edition = "2021"
 description = "SyncDash desktop shell (Tauri v2) over the syncdash core library"
 

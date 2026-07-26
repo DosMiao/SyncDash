@@ -73,6 +73,63 @@ fn load_cache(root: &Path) -> HashMap<String, (u64, i64, String)> {
     map
 }
 
+// ---------- mtime 校正表（P1-4）----------
+//
+// FAT/exFAT 只有 2 秒粒度，某些 SMB 服务端会自行截断/偏移写入的时间戳。
+// 过去我们设完 mtime 就不管，靠比对时的 ±2s 容差硬扛——容差既可能漏判（真改动在 2 秒内）
+// 也可能误判（偏移大于容差），而且 rigor = "quick" 时容差是**唯一**判据。
+// syncthing 的 mtimeFS（`lib/fs/mtimefs.go:68`）写完立刻 stat 回来，
+// 把 (ondisk, virtual) 存进库，之后一律对外报 virtual。这里做同样的事，
+// 存储沿用已有的用户缓存目录，绝不污染被扫描的目录。
+
+fn mtime_fix_file_for_root(root: &Path) -> PathBuf {
+    let key = blake3::hash(root.to_string_lossy().to_lowercase().as_bytes());
+    cache_dir().join(format!("{}.mtimefix.jsonl", &key.to_hex()[..16]))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MtimeFix {
+    path: String,
+    ondisk_ms: i64,
+    intended_ms: i64,
+}
+
+/// path -> (ondisk, intended)
+pub fn load_mtime_fixes(root: &Path) -> HashMap<String, (i64, i64)> {
+    let mut map = HashMap::new();
+    if let Ok(f) = std::fs::File::open(mtime_fix_file_for_root(root)) {
+        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+            if let Ok(c) = serde_json::from_str::<MtimeFix>(&line) {
+                map.insert(c.path, (c.ondisk_ms, c.intended_ms));
+            }
+        }
+    }
+    map
+}
+
+/// 记录若干条校正。同 path 以最新一条为准（读取时后写的覆盖先写的）。
+pub fn record_mtime_fixes(root: &Path, fixes: &[(String, i64, i64)]) {
+    if fixes.is_empty() {
+        return;
+    }
+    let file = mtime_fix_file_for_root(root);
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // 合并后整体重写：避免无限追加
+    let mut map = load_mtime_fixes(root);
+    for (p, ondisk, intended) in fixes {
+        map.insert(p.clone(), (*ondisk, *intended));
+    }
+    if let Ok(f) = std::fs::File::create(&file) {
+        let mut w = std::io::BufWriter::new(f);
+        for (path, (ondisk_ms, intended_ms)) in map {
+            let rec = MtimeFix { path, ondisk_ms, intended_ms };
+            let _ = writeln!(w, "{}", serde_json::to_string(&rec).unwrap());
+        }
+    }
+}
+
 fn save_cache(root: &Path, entries: &[Entry]) {
     let file = cache_file_for_root(root);
     if let Some(dir) = file.parent() {
@@ -101,10 +158,60 @@ pub struct ScanOptions {
     pub filter: crate::filter::PathFilter,
 }
 
+/// 扫描进度（P2-6）。syncthing 的 `FolderScanProgress` 同款信息量：
+/// 阶段 + 已处理/总字节 + 速率，够前端画进度条与估算剩余时间。
+#[derive(Clone, Copy, Debug)]
+pub struct ScanProgress {
+    /// "walk"（遍历元数据）| "hash"（并行哈希）
+    pub phase: &'static str,
+    pub files_total: u64,
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    pub mib_per_s: f64,
+}
+
+pub type ProgressFn<'a> = &'a (dyn Fn(ScanProgress) + Sync);
+
 pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
+    scan_impl(root, opt, None, None)
+}
+
+pub fn scan_with_progress(
+    root: &Path,
+    opt: &ScanOptions,
+    progress: Option<ProgressFn<'_>>,
+) -> std::io::Result<Snapshot> {
+    scan_impl(root, opt, progress, None)
+}
+
+/// v0.9 M1 统一底座入口：取消/暂停/ProgressEvent 事件流（见 progress.rs）。
+/// 旧的 ScanProgress 回调形态（P2-6）原样保留——两条通路共用同一个 scan_impl。
+pub fn scan_ctx(
+    root: &Path,
+    opt: &ScanOptions,
+    ctx: &crate::progress::RunCtx,
+    phase: crate::progress::Phase,
+) -> std::io::Result<Snapshot> {
+    scan_impl(root, opt, None, Some((ctx, phase)))
+}
+
+fn scan_impl(
+    root: &Path,
+    opt: &ScanOptions,
+    progress: Option<ProgressFn<'_>>,
+    ctxp: Option<(&crate::progress::RunCtx, crate::progress::Phase)>,
+) -> std::io::Result<Snapshot> {
+    let pp = ctxp.map(|(ctx, phase)| {
+        crate::progress::PhaseProgress::begin(ctx, phase, Some(root.to_string_lossy().into_owned()), 0, 0)
+    });
+    let side = match ctxp.map(|(_, ph)| ph) {
+        Some(crate::progress::Phase::ScanTarget) => "target",
+        _ => "source",
+    };
     let started = now_ms();
     let t0 = std::time::Instant::now();
     let cache = if opt.hash { load_cache(root) } else { HashMap::new() };
+    let mtime_fixes = load_mtime_fixes(root);
     let mut entries: Vec<Entry> = Vec::new();
     let mut hash_errors = 0u64;
 
@@ -143,6 +250,9 @@ pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
     let mut pending: Vec<PendingFile> = Vec::new();
 
     for item in walker {
+        if let Some(pp) = &pp {
+            pp.checkpoint()?; // 取消/暂停协作点（每迭代一次 relaxed 原子读）
+        }
         let item = match item {
             Ok(i) => i,
             Err(_) => continue, // 无权限等：跳过但不中断
@@ -162,18 +272,24 @@ pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
         };
         if item.file_type().is_dir() {
             if opt.filter.pass_dir(&rel).0 {
-                entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None, link: None });
+                entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None, link: None, prev: None });
             }
         } else if item.file_type().is_symlink() {
             if opt.symlinks_direct {
                 let target = std::fs::read_link(item.path())
                     .ok()
                     .map(|t| t.to_string_lossy().into_owned());
-                entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None, link: target });
+                entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None, link: target, prev: None });
             }
         } else {
             let size = md.len();
-            let mt = mtime_ms(&md);
+            // P1-4：文件系统当初把我们要的 mtime 存成了别的值（FAT 2 秒粒度 / SMB 截断），
+            // 这里换算回我们的本意，让比对不必依赖容差
+            let raw_mt = mtime_ms(&md);
+            let mt = match mtime_fixes.get(&rel) {
+                Some((ondisk, intended)) if *ondisk == raw_mt => *intended,
+                _ => raw_mt,
+            };
             let mut hash = None;
             if opt.hash && !opt.force_rehash {
                 if let Some((cs, cm, ch)) = cache.get(&rel) {
@@ -183,32 +299,103 @@ pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
                 }
             }
             pending.push(PendingFile { rel, abs: item.path().to_path_buf(), size, mt, hash, file_id: file_id(&md), mode: unix_mode(&md) });
+            if let Some(pp) = &pp {
+                pp.item_done(&pending.last().unwrap().rel);
+            }
         }
+    }
+
+    // walk 结束即知总量（P2-6 的洞察）：条数 = 文件数；字节 = 真要读盘哈希的那部分
+    if let Some(pp) = &pp {
+        let bytes_to_hash: u64 = if opt.hash {
+            pending.iter().filter(|p| p.hash.is_none()).map(|p| p.size).sum()
+        } else {
+            0
+        };
+        pp.set_totals(pending.len() as u64, bytes_to_hash);
     }
 
     let hash_err_count = std::sync::atomic::AtomicU64::new(0);
     if opt.hash {
         use rayon::prelude::*;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         const BIG_FILE: u64 = 32 * 1024 * 1024;
-        pending.par_iter_mut().for_each(|p| {
-            if p.hash.is_none() {
-                let mut hasher = blake3::Hasher::new();
-                let res = if p.size >= BIG_FILE {
-                    hasher.update_mmap_rayon(&p.abs).map(|_| ())
-                } else {
-                    hasher.update_mmap(&p.abs).map(|_| ())
-                };
-                match res {
-                    Ok(_) => p.hash = Some(hasher.finalize().to_hex().to_string()),
-                    Err(_) => {
-                        hash_err_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 只有缓存没命中的文件才真的要读，进度条按它们的字节数算才准
+        let bytes_total: u64 = pending.iter().filter(|p| p.hash.is_none()).map(|p| p.size).sum();
+        let files_total = pending.len() as u64;
+        let bytes_done = AtomicU64::new(0);
+        let hashing = AtomicBool::new(true);
+
+        if let Some(cb) = progress {
+            cb(ScanProgress { phase: "walk", files_total, bytes_total, bytes_done: 0, mib_per_s: 0.0 });
+        }
+
+        // 进度采样单独一个线程（syncthing 的 ProgressTicker 同款结构）：
+        // 哈希线程只做一次 relaxed 累加，不承担任何回调开销
+        std::thread::scope(|sc| {
+            if let Some(cb) = progress {
+                let (bd, hz, t_start) = (&bytes_done, &hashing, std::time::Instant::now());
+                sc.spawn(move || {
+                    while hz.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        let done = bd.load(Ordering::Relaxed);
+                        let secs = t_start.elapsed().as_secs_f64().max(0.001);
+                        cb(ScanProgress {
+                            phase: "hash",
+                            files_total,
+                            bytes_total,
+                            bytes_done: done,
+                            mib_per_s: done as f64 / secs / (1024.0 * 1024.0),
+                        });
+                    }
+                });
+            }
+            pending.par_iter_mut().for_each(|p| {
+                if let Some(pp) = &pp {
+                    if pp.checkpoint().is_err() {
+                        return; // 取消：余下工单空转排空（rayon 标准提前退出法）
                     }
                 }
-            }
+                if p.hash.is_none() {
+                    let mut hasher = blake3::Hasher::new();
+                    let res = if p.size >= BIG_FILE {
+                        hasher.update_mmap_rayon(&p.abs).map(|_| ())
+                    } else {
+                        hasher.update_mmap(&p.abs).map(|_| ())
+                    };
+                    match res {
+                        Ok(_) => p.hash = Some(hasher.finalize().to_hex().to_string()),
+                        Err(e) => {
+                            hash_err_count.fetch_add(1, Ordering::Relaxed);
+                            if let Some(pp) = &pp {
+                                pp.error(&p.rel, "hash", side, &e.to_string());
+                            }
+                        }
+                    }
+                    bytes_done.fetch_add(p.size, Ordering::Relaxed);
+                    if let Some(pp) = &pp {
+                        pp.add_bytes(p.size, &p.rel);
+                    }
+                }
+            });
+            hashing.store(false, Ordering::Relaxed);
         });
+        if let Some(pp) = &pp {
+            pp.checkpoint()?; // 取消发生在哈希期时，从这里如实返回 Interrupted
+        }
+
+        if let Some(cb) = progress {
+            cb(ScanProgress {
+                phase: "hash",
+                files_total,
+                bytes_total,
+                bytes_done: bytes_total,
+                mib_per_s: 0.0,
+            });
+        }
     }
     for p in pending {
-        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, file_id: p.file_id, mode: p.mode, link: None });
+        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, file_id: p.file_id, mode: p.mode, link: None, prev: None });
     }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -234,4 +421,66 @@ pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
         },
         entries,
     })
+}
+
+#[cfg(test)]
+mod ctx_tests {
+    use super::*;
+    use crate::progress::{is_cancelled, Phase, ProgressEvent, RunCtl, RunCtx};
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+
+    fn mk_tree(tag: &str, n: usize) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("syncdash-scanctx-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        for i in 0..n {
+            std::fs::write(root.join("sub").join(format!("f{i}.dat")), vec![i as u8; 100]).unwrap();
+        }
+        root
+    }
+
+    fn opts() -> ScanOptions {
+        ScanOptions {
+            hash: true,
+            force_rehash: true, // 测试不吃缓存
+            symlinks_direct: false,
+            filter: crate::filter::PathFilter::build(&[], &[]),
+        }
+    }
+
+    #[test]
+    fn scan_ctx_reports_exact_totals() {
+        let root = mk_tree("totals", 20);
+        let store: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let s2 = store.clone();
+        let ctx = RunCtx::new(RunCtl::new(), Arc::new(move |ev| s2.lock().unwrap().push(ev)));
+        let snap = scan_ctx(&root, &opts(), &ctx, Phase::ScanSource).unwrap();
+        assert_eq!(snap.entries.iter().filter(|e| e.kind == EntryKind::File).count(), 20);
+        let evs = store.lock().unwrap();
+        let totals = evs.iter().find_map(|e| match e {
+            ProgressEvent::Totals { items_total, bytes_total, .. } => Some((*items_total, *bytes_total)),
+            _ => None,
+        });
+        assert_eq!(totals, Some((20, 2000)), "walk 结束必须给出精确总量");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_ctx_cancels_midway() {
+        let root = mk_tree("cancel", 50);
+        let ctl = RunCtl::new();
+        let ctl2 = ctl.clone();
+        let sink = move |ev: ProgressEvent| {
+            if matches!(ev, ProgressEvent::Progress { .. }) {
+                ctl2.cancel.store(true, Ordering::SeqCst); // 第一个进度事件就喊停
+            }
+        };
+        let ctx = RunCtx::new(ctl, Arc::new(sink));
+        match scan_ctx(&root, &opts(), &ctx, Phase::ScanSource) {
+            Err(e) => assert!(is_cancelled(&e)),
+            Ok(_) => panic!("expected cancellation"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

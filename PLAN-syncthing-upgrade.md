@@ -3,7 +3,44 @@
 > 生成日期：2026-07-26
 > 参照源：`.docs/syncthing`（`git clone --depth 1`，commit `119d5e72` / 2026-07-25，Go 1.25，MPL-2.0）
 > 本文只做**语义借鉴**，不搬运代码（MPL-2.0 与本项目许可不一定兼容，且 Go 的并发模型与 Rust 差异大，照抄无意义）。
-> 现状基线：SyncDash v0.5（`src/` 2933 行），见 [README.md](README.md)。
+
+## 实施状态（2026-07-26 收尾）
+
+**P0 / P1 / P2 全部实现完毕，`cargo test --workspace` 78 项全绿，端到端真机验证通过。**
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| P0-1 原子落盘 | ✅ | 新 [src/atomic.rs](src/atomic.rs)（`Staged` RAII）+ [apply.rs](src/apply.rs) 全路径改写 |
+| P0-2 挂载点标记 + 计划体检 | ✅ | 新 [src/preflight.rs](src/preflight.rs)、`syncdash mark`、`require_marker` / `max_delete_ratio` / `--i-know` |
+| P0-3 磁盘空间预检 | ✅ | [preflight.rs](src/preflight.rs) `disk_space`（Win: `GetDiskFreeSpaceExW`；unix: `statvfs`）+ `min_free_pct` |
+| P0-4 目录删除分类汇报 | ✅ | [apply.rs](src/apply.rs) `try_delete_dir` / `DirOutcome` |
+| P1-1 增量传输 | ✅ | 远程 pack 路径 v0.7 已有；本增补本地/挂载盘路径（`delta`，[apply.rs](src/apply.rs) `update_with_delta`） |
+| P1-2 冲突副本 | ✅ | [compare.rs](src/compare.rs) `ConflictPolicy` / `conflict_name` / `max_conflicts` |
+| P1-3 多代 archive | ✅ | [table.rs](src/table.rs) `prev` + `roll_generations`，[compare.rs](src/compare.rs) `generation_of` |
+| P1-4 mtime 回读校正 | ✅ | [apply.rs](src/apply.rs) 回读 + [scan.rs](src/scan.rs) `record_mtime_fixes` / `load_mtime_fixes` |
+| P1-5 过滤器 `!` 取反 + deletable | ✅ | [filter.rs](src/filter.rs) `except` / `deletable` / `except_blocks_pruning` |
+| P2-1 版本向量 | ✅ 数学核心 | 新 [src/vclock.rs](src/vclock.rs)（`Vector` / `Ordering` / 节点 ID，穷举式代数性质测试） |
+| P2-2 回收站保留期 | ✅ | 新 [src/trash.rs](src/trash.rs)：`trash runs\|find\|restore\|prune` + staggered 稀释 |
+| P2-3 大小写撞名预检 | ✅ | [compare.rs](src/compare.rs) 折叠撞名 → Conflict（大小写改名不误伤） |
+| P2-4 Chmod op | ✅ | `Action::Chmod` + `sync_mode`，Copy/Update 顺带带 mode |
+| P2-5 空文件不参与配对 | ✅ | [compare.rs](src/compare.rs) `detect_moves` + `MovePair.candidates` 歧义标注 |
+| P2-6 扫描进度 | ✅ | [scan.rs](src/scan.rs) `scan_with_progress`、CLI `--progress`、Tauri 进度事件 |
+
+**P2-1 的范围**：`vclock.rs` 是完整可用、测试充分的版本向量实现（含 `update` 单调性、`merge` 上确界、
+比较关系的反对称性穷举验证）。**但它尚未接管 archive 归因**——真 N 向要求每次 apply 后精确维护
+每个文件的向量并保证收敛，那是 v1.0 的工程，不在本轮范围内。本轮交付的是数学核心 + 节点身份，
+以及 P1-3 这个 archive 模型下的廉价近似（它已经解决了绝大多数误报冲突）。
+
+**两处对原计划的修正**（计划写于仓库处于 v0.5 时，实施时仓库已到 v0.8）：
+- P1-1 所说的"整文件复制"只对**本地/挂载盘**路径成立；远程 pack 管线在 v0.7 已有 FastCDC 增量。本轮补的是前者。
+- P2-2 所说的"没有版本化"不准确：v0.8 已有 `versioning` 模式（各 root 内 `.version_syncDash/`）。
+  真正缺的是**默认 trash 从不清理**，本轮补的是这个。
+
+冒烟测试还揪出一个原计划没预见的真 bug：`.syncdash-root` 标记文件自己会被同步过去——
+那样没挂载的空目录也会凭空长出标记，闸门等于白设。已加入 `DEFAULT_EXCLUDES`
+（syncthing 同样把 `.stfolder` 列为 internal）。
+
+---
 
 ---
 
@@ -399,6 +436,10 @@ watcher 只负责**触发一次 compare 并把结果推给 GUI**，绝不自动 
 ---
 
 ## 3. 版本规划
+
+> **实施结果**：下面三档（原定 v0.6 / v0.7 / v0.8）已一次性全部落地，见开头的实施状态表。
+> 保留原始分档，因为它记录了当时的**优先级判断依据**——那才是这份计划的价值所在。
+> v1.0（真 N 向）按计划**未启动**，只交付了它的数学前置件。
 
 ### v0.6 —— 安全网（P0 全做完，不加新能力）
 

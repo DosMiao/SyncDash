@@ -5,6 +5,13 @@
 //!   - 尾部 `/` 或 `/*` = 目录（含其下全部内容）；尾部 `:` = 仅文件
 //!   - 开头 `/` = 相对 root；`*/abc` 同时命中任意层级与根级的 abc
 //!   - include 侧用"前缀可能命中"（matches_begin）决定目录是否值得下钻
+//!
+//! FFS 语法之外的两处**超集**扩展（借 syncthing `lib/ignore/ignore.go` 之意，
+//! 粘进来的 FFS 规则行为完全不变）：
+//!   - exclude 项以 `!` 开头 = **例外**：命中即放行，压过其它 exclude
+//!     （syncthing 的 `!` 前缀，ignore.go:372）
+//!   - `deletable` 列表 = syncthing 的 `(?d)`（ignore.go:380）：这些东西不参与同步，
+//!     但删除父目录时允许连带删掉，解开"目录里有被过滤的文件 → 永远删不掉"的死结
 
 use std::collections::HashSet;
 
@@ -183,17 +190,35 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "*/.DS_Store", "*/._*", "*/Thumbs.db", "*/desktop.ini",
     "*/sync.ffs_db", "*/sync.ffs_lock", "*/.syncdash.lock",
     "*/*.recovery", "*/*.status",
+    // 原子落盘的中间产物：永远不该进快照表，更不该被当成待同步内容
+    "*/.syncdash.tmp.*",
+    // 挂载点标记：它证明的是**这一侧**的数据真的在。一旦被同步过去，
+    // 没挂载的空目录也会凭空长出标记，闸门就白设了（syncthing 同样把 .stfolder 列为 internal）。
+    "*/.syncdash-root",
 ];
 
 #[derive(Clone)]
 pub struct PathFilter {
     include: MaskSet,
     exclude: MaskSet,
+    /// `!` 前缀的例外：命中即放行，压过 exclude
+    except: MaskSet,
+    /// syncthing `(?d)` 同义：不同步，但删父目录时可连带删
+    deletable: MaskSet,
+    /// 存在非锚定（不以 `/` 开头）的例外时，被排除的目录不能再剪枝——
+    /// 因为例外可能藏在里面。锚定例外（`!/a/b/keep.log`）不影响剪枝。
+    except_blocks_pruning: bool,
 }
 
 impl PathFilter {
-    /// include 为空 → 默认 `*`；exclude = 默认列表 + 追加项。语法即 FFS 语法。
+    /// include 为空 → 默认 `*`；exclude = 默认列表 + 追加项。语法即 FFS 语法
+    /// （外加 `!` 例外前缀）。
     pub fn build(includes: &[String], extra_excludes: &[String]) -> PathFilter {
+        Self::build_full(includes, extra_excludes, &[])
+    }
+
+    /// 完整构造：额外给一份 `deletable` 列表。
+    pub fn build_full(includes: &[String], extra_excludes: &[String], deletables: &[String]) -> PathFilter {
         let mut inc = MaskSet::default();
         if includes.is_empty() {
             parse_phrase("*", &mut inc);
@@ -203,21 +228,50 @@ impl PathFilter {
             }
         }
         let mut exc = MaskSet::default();
+        let mut exn = MaskSet::default();
+        let mut blocks_pruning = false;
         for p in DEFAULT_EXCLUDES {
             parse_phrase(p, &mut exc);
         }
         for p in extra_excludes {
-            parse_phrase(p, &mut exc);
+            match p.trim().strip_prefix('!') {
+                Some(rest) => {
+                    let rest = rest.trim();
+                    if rest.is_empty() {
+                        continue;
+                    }
+                    if !rest.starts_with('/') {
+                        blocks_pruning = true;
+                    }
+                    parse_phrase(rest, &mut exn);
+                }
+                None => parse_phrase(p, &mut exc),
+            }
         }
-        PathFilter { include: inc, exclude: exc }
+        let mut del = MaskSet::default();
+        for p in deletables {
+            parse_phrase(p, &mut del);
+        }
+        PathFilter { include: inc, exclude: exc, except: exn, deletable: del, except_blocks_pruning: blocks_pruning }
+    }
+
+    /// 该路径是否命中 `!` 例外
+    fn is_excepted(&self, path_upper: &str, parent: Option<&str>) -> bool {
+        self.except.file_masks.matches(path_upper, false)
+            || parent.map_or(false, |pp| self.except.folder_masks.matches(pp, true))
     }
 
     /// rel 用 '/' 分隔、不带开头分隔符
     pub fn pass_file(&self, rel: &str) -> bool {
+        // 原子写的临时文件：任何情况下都不入表（不依赖模式匹配，避免用户改 exclude 时误开）
+        if crate::atomic::is_temp_rel(rel) {
+            return false;
+        }
         let path = rel.to_uppercase();
         let parent = path.rfind('/').map(|i| &path[..i]);
-        if self.exclude.file_masks.matches(&path, false)
-            || parent.map_or(false, |pp| self.exclude.folder_masks.matches(pp, true))
+        if !self.is_excepted(&path, parent)
+            && (self.exclude.file_masks.matches(&path, false)
+                || parent.map_or(false, |pp| self.exclude.folder_masks.matches(pp, true)))
         {
             return false;
         }
@@ -228,8 +282,13 @@ impl PathFilter {
     /// 返回 (目录本身是否入表, 子项是否可能命中——决定要不要下钻)
     pub fn pass_dir(&self, rel: &str) -> (bool, bool) {
         let path = rel.to_uppercase();
-        if self.exclude.folder_masks.matches(&path, true) {
-            return (false, false);
+        let excepted = self.except.folder_masks.matches(&path, true);
+        if !excepted && self.exclude.folder_masks.matches(&path, true) {
+            // 目录被排除。有非锚定例外时仍要下钻——例外可能就藏在里面。
+            let child = self.except_blocks_pruning
+                && (self.except.file_masks.matches_begin(&path)
+                    || self.except.folder_masks.matches_begin(&path));
+            return (false, child);
         }
         if self.include.folder_masks.matches(&path, true) {
             return (true, true);
@@ -237,6 +296,18 @@ impl PathFilter {
         let child = self.include.file_masks.matches_begin(&path)
             || self.include.folder_masks.matches_begin(&path);
         (false, child)
+    }
+
+    /// syncthing `(?d)`：删除父目录时这一项可以连带删掉，不算"目录非空"的阻塞物。
+    /// 临时文件天然可删（它们就是上次中断的残骸）。
+    pub fn is_deletable(&self, rel: &str) -> bool {
+        if crate::atomic::is_temp_rel(rel) {
+            return true;
+        }
+        let path = rel.to_uppercase();
+        let parent = path.rfind('/').map(|i| &path[..i]);
+        self.deletable.file_masks.matches(&path, false)
+            || parent.map_or(false, |pp| self.deletable.folder_masks.matches(pp, true))
     }
 }
 
@@ -288,5 +359,55 @@ mod tests {
         let pf = f(&[], &["*/v?/"]);
         assert!(!pf.pass_file("a/v1/x"));
         assert!(pf.pass_file("a/v12/x")); // ? 只吃一个字符
+    }
+
+    #[test]
+    fn bang_prefix_is_an_exception() {
+        let pf = f(&[], &["*/*.log", "!*/important.log"]);
+        assert!(!pf.pass_file("app/debug.log"));
+        assert!(pf.pass_file("app/important.log"), "! must override the exclude");
+    }
+
+    #[test]
+    fn anchored_exception_keeps_directory_pruning() {
+        // 锚定例外（以 / 开头）不影响剪枝：node_modules 依然不下钻
+        let pf = f(&[], &["!/keep/this.txt"]);
+        assert!(!pf.pass_dir("proj/node_modules").1, "anchored ! must not disable pruning");
+        // 非锚定例外会让被排除目录重新可下钻（代价换能力，与 gitignore 同样的取舍）
+        let pf2 = f(&[], &["!*/keep.txt"]);
+        assert!(pf2.pass_dir("proj/node_modules").1, "unanchored ! must allow descending");
+    }
+
+    #[test]
+    fn exception_survives_an_excluded_parent_dir() {
+        let pf = f(&[], &["*/logs/", "!*/logs/audit.txt"]);
+        assert!(!pf.pass_file("srv/logs/debug.txt"));
+        assert!(pf.pass_file("srv/logs/audit.txt"), "! must beat an excluded parent dir");
+        assert!(pf.pass_dir("srv/logs").1, "must descend to reach the exception");
+    }
+
+    #[test]
+    fn deletable_list_and_temp_files() {
+        let pf = PathFilter::build_full(&[], &[], &["*/node_modules/".to_string()]);
+        assert!(pf.is_deletable("proj/node_modules/x/y.js"));
+        assert!(!pf.is_deletable("proj/src/main.rs"));
+        // 原子写的残骸天然可删
+        assert!(pf.is_deletable("proj/.syncdash.tmp.a.123"));
+    }
+
+    #[test]
+    fn mount_marker_is_never_synced() {
+        // 标记被同步过去 = 没挂载的空目录也会长出标记 = 闸门失效
+        let pf = f(&[], &[]);
+        assert!(!pf.pass_file(".syncdash-root"));
+        assert!(!pf.pass_file("nested/.syncdash-root"));
+    }
+
+    #[test]
+    fn temp_files_never_enter_the_table() {
+        let pf = f(&[], &[]);
+        assert!(!pf.pass_file(".syncdash.tmp.report.pdf.4242"));
+        assert!(!pf.pass_file("deep/dir/.syncdash.tmp.x.1"));
+        assert!(pf.pass_file("deep/dir/x"));
     }
 }

@@ -9,7 +9,7 @@ use std::path::Path;
 
 /// 严谨级 → 扫描参数：quick（不 hash）| standard（hash+缓存）| paranoid（全量重 hash）
 pub fn scan_opts(job: &Job) -> scan::ScanOptions {
-    let filter = crate::filter::PathFilter::build(&job.include, &job.exclude);
+    let filter = crate::filter::PathFilter::build_full(&job.include, &job.exclude, &job.deletable);
     let (hash, force_rehash) = match job.rigor.as_str() {
         "quick" => (false, false),
         "paranoid" => (true, true),
@@ -20,6 +20,12 @@ pub fn scan_opts(job: &Job) -> scan::ScanOptions {
 
 /// sync 成功后刷新 archive：重扫 source、剔除冲突路径（冲突下次继续报，绝不被静默仲裁）
 fn refresh_archive(job: &Job, plan: &Plan) {
+    refresh_archive_with(job, plan, &crate::progress::RunCtx::null());
+}
+
+/// v0.9 M1：Refresh 阶段可见化——archive 重扫是个今天完全隐形的长阶段，挂上事件流与取消。
+/// 被取消只意味着冲突下轮重报，安全。
+fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::progress::RunCtx) {
     let Some(arch_path) = &job.archive else {
         eprintln!("hint: sync job without `archive` — add one so deletions/moves can be attributed next time");
         return;
@@ -31,9 +37,15 @@ fn refresh_archive(job: &Job, plan: &Plan) {
         .map(|o| o.path.as_str())
         .collect();
     let opt = scan_opts(job);
-    if let Ok(mut snap) = scan::scan(&job.source, &opt) {
+    // 上一代 archive：新表的每条把旧 hash 推进 prev 链，让"落后一代"能与
+    // "并发修改"区分开（P1-3，见 compare::generation_of）
+    let previous = if arch_path.is_file() { Snapshot::load(arch_path).ok() } else { None };
+    if let Ok(mut snap) = scan::scan_ctx(&job.source, &opt, ctx, crate::progress::Phase::Refresh) {
         snap.header.kind = "archive".into();
         snap.entries.retain(|e| !conflicted.contains(e.path.as_str()));
+        if let Some(prev) = &previous {
+            crate::table::roll_generations(&mut snap.entries, &prev.entries);
+        }
         if let Some(dir) = arch_path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -47,41 +59,144 @@ fn refresh_archive(job: &Job, plan: &Plan) {
 }
 
 pub fn compare_job(job: &Job) -> std::io::Result<Plan> {
+    compare_job_with(job, &crate::progress::RunCtx::null())
+}
+
+/// v0.9 M1：带事件流/取消的比对一条龙。src-tauri 里那份为插事件而内联复制的
+/// 第二套管线由本函数取代（撤销双份漂移）。
+pub fn compare_job_with(job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<Plan> {
+    use crate::progress::Phase;
     let opt = scan_opts(job);
-    for (label, r) in [("source", &job.source), ("target", &job.target)] {
-        if !r.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("{label} root not accessible: {}", r.display()),
-            ));
-        }
+    // P0-2：root 可达性 + 挂载点标记。共享盘没挂上时 target 常常是个空目录，
+    // 照常比对会产出"把对面删光"或"全量重传"的计划。
+    let mut v = crate::preflight::Verdict { blockers: Vec::new(), warnings: Vec::new() };
+    crate::preflight::check_root("source", &job.source, job.require_marker, &mut v);
+    crate::preflight::check_root("target", &job.target, job.require_marker, &mut v);
+    for w in &v.warnings {
+        eprintln!("warning: {w}");
     }
-    let s = scan::scan(&job.source, &opt)?;
-    let t = scan::scan(&job.target, &opt)?;
+    if !v.ok() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
+    }
+    let s = scan::scan_ctx(&job.source, &opt, ctx, Phase::ScanSource)?;
+    let t = scan::scan_ctx(&job.target, &opt, ctx, Phase::ScanTarget)?;
     let archive = match (&job.archive, job.mode.as_str()) {
         (Some(p), "sync") if p.is_file() => Some(Snapshot::load(p)?),
         _ => None,
     };
-    let copts = compare::CompareOptions { case_insensitive: !job.case_sensitive };
+    // compare 本身是亚秒级 CPU 活：只报阶段边界，不做内部计数
+    let _pp = crate::progress::PhaseProgress::begin(
+        ctx,
+        Phase::Compare,
+        Some(format!("{} × {} 条目", s.header.entry_count, t.header.entry_count)),
+        0,
+        0,
+    );
+    let copts = job.compare_opts();
     Ok(compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts))
 }
 
 /// 执行选中的 ops；全部成功且是 sync 模式时刷新 archive（冲突路径从存档剔除，下次继续报冲突）。
 pub fn apply_job(job: &Job, plan: &Plan, ops: &[Op], trash: Option<std::path::PathBuf>, verbose: bool) -> (u64, u64, u64) {
-    let (done, skipped, errors) = apply::apply(
+    apply_job_guarded(job, plan, ops, trash, verbose, false)
+}
+
+/// 只跑闸门不执行——GUI 在弹确认单之前调它，把拒绝理由完整展示给人看，
+/// 而不是让理由只出现在没人看的 stderr 上。
+pub fn preflight_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::preflight::Verdict {
+    crate::preflight::run_all(
         ops,
         Path::new(&plan.header.source_root),
         Path::new(&plan.header.target_root),
-        &apply::ApplyOptions { dry_run: false, trash, verbose, verify: job.rigor == "paranoid", versioning: job.versioning },
+        plan.header.source_entries,
+        plan.header.target_entries,
+        &job.guards(acknowledged),
+    )
+}
+
+/// `acknowledged` = 用户显式 --i-know，只放行"计划体检"类闸门；
+/// 标记缺失与磁盘空间不足始终拦截（那是环境问题，不是判断问题）。
+pub fn apply_job_guarded(
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    trash: Option<std::path::PathBuf>,
+    verbose: bool,
+    acknowledged: bool,
+) -> (u64, u64, u64) {
+    apply_job_guarded_with(job, plan, ops, trash, verbose, acknowledged, &crate::progress::RunCtx::null()).into_tuple()
+}
+
+/// v0.9 M1：带事件流的执行编排——Apply 阶段（总量开跑前即知）→ Refresh 阶段 → Summary 终态。
+/// 注：per-op/逐字节事件在 apply_with（M1 步骤 5）落地后由 apply 层发出；本层先保证
+/// 阶段边界、总量与终态摘要正确，desktop 即可先接骨架。
+pub fn apply_job_guarded_with(
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    trash: Option<std::path::PathBuf>,
+    verbose: bool,
+    acknowledged: bool,
+    ctx: &crate::progress::RunCtx,
+) -> crate::progress::ApplyOutcome {
+    use crate::progress::{ApplyOutcome, Phase, ProgressEvent};
+    let t0 = std::time::Instant::now();
+    let src_root = Path::new(&plan.header.source_root);
+    let tgt_root = Path::new(&plan.header.target_root);
+    let verdict = crate::preflight::run_all(
+        ops,
+        src_root,
+        tgt_root,
+        plan.header.source_entries,
+        plan.header.target_entries,
+        &job.guards(acknowledged),
     );
-    if errors == 0 && job.mode == "sync" {
-        refresh_archive(job, plan);
+    if !verdict.report("preflight") {
+        for b in &verdict.blockers {
+            ctx.sink.emit(ProgressEvent::Error {
+                phase: Phase::Apply,
+                ts_ms: crate::table::now_ms(),
+                path: String::new(),
+                action: "preflight".into(),
+                side: "target".into(),
+                message: b.clone(),
+            });
+        }
+        return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
     }
-    (done, skipped, errors)
+    let items_total = ops.iter().filter(|o| !matches!(o.action, Action::Conflict | Action::Note)).count() as u64;
+    let bytes_total: u64 = ops
+        .iter()
+        .filter(|o| matches!(o.action, Action::Copy | Action::Update) && o.link.is_none())
+        .filter_map(|o| o.size)
+        .sum();
+    let _pp = crate::progress::PhaseProgress::begin(ctx, Phase::Apply, None, items_total, bytes_total);
+    let (done, skipped, errors) = apply::apply(ops, src_root, tgt_root, &job.apply_opts(trash, verbose));
+    if errors == 0 && job.mode == "sync" {
+        refresh_archive_with(job, plan, ctx);
+    }
+    let out = ApplyOutcome {
+        done,
+        skipped,
+        errors,
+        bytes_copied: bytes_total, // apply_with 落地后换成真实累计
+        cancelled: ctx.ctl.cancelled(),
+    };
+    ctx.sink.emit(ProgressEvent::Summary {
+        ts_ms: crate::table::now_ms(),
+        done: out.done,
+        skipped: out.skipped,
+        errors: out.errors,
+        bytes_done: out.bytes_copied,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+        paused_ms: ctx.ctl.paused_total_ms(),
+        cancelled: out.cancelled,
+    });
+    out
 }
 
 /// 本地/挂载盘任务的一条龙（原 CLI run 的主体）。返回 (done, skipped, errors, conflicts)。
-pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool) -> std::io::Result<(u64, u64, u64, u64)> {
+pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
     let plan = compare_job(job)?;
     eprintln!("[{name}] {} op(s), {} conflict(s)", plan.header.op_count, plan.header.conflict_count);
     for op in &plan.ops {
@@ -97,13 +212,13 @@ pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool) -> st
         .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
         .cloned()
         .collect();
-    let (done, skipped, errors) = apply_job(job, &plan, &ops, None, verbose);
+    let (done, skipped, errors) = apply_job_guarded(job, &plan, &ops, None, verbose, acknowledged);
     Ok((done, skipped, errors, plan.header.conflict_count))
 }
 
 /// 远程管线（v0.6 ssh 一条龙）：ssh 探测 → 远端本地扫描（stdout 收表）→ 本地扫描 → 比对
 /// → target 侧打包 ssh 送达 apply-pack → source 侧经挂载路径直落 → sync 成功后刷新 archive。
-pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool) -> std::io::Result<(u64, u64, u64, u64)> {
+pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
     use crate::compare::Side;
     let host = job
         .remote_host
@@ -143,13 +258,21 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool) -> s
     let table_bytes = crate::remote::ssh_capture(host, &crate::remote::remote_cmd(shell, exe, &scan_args))?;
     let t = Snapshot::from_reader(std::io::BufReader::new(&table_bytes[..]))?;
 
-    // 3) 本地扫描 + 比对
+    // 3) 本地扫描 + 比对（本地 source 侧同样过挂载点闸门）
+    let mut v = crate::preflight::Verdict { blockers: Vec::new(), warnings: Vec::new() };
+    crate::preflight::check_root("source", &job.source, job.require_marker, &mut v);
+    for w in &v.warnings {
+        eprintln!("[{name}] warning: {w}");
+    }
+    if !v.ok() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
+    }
     let s = scan::scan(&job.source, &scan_opts(job))?;
     let archive = match (&job.archive, job.mode.as_str()) {
         (Some(p), "sync") if p.is_file() => Some(Snapshot::load(p)?),
         _ => None,
     };
-    let copts = compare::CompareOptions { case_insensitive: !job.case_sensitive };
+    let copts = job.compare_opts();
     let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
     eprintln!("[{name}] {} op(s), {} conflict(s)  (remote pipeline via ssh:{host})", plan.header.op_count, plan.header.conflict_count);
     for op in &plan.ops {
@@ -158,6 +281,16 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool) -> s
     if !do_apply {
         println!("dry-run (rerun with --apply)");
         return Ok((0, plan.ops.len() as u64, 0, plan.header.conflict_count));
+    }
+
+    // 计划体检：远端磁盘空间查不到，但"删掉对面一大半"这类事故本地就能拦
+    let g = job.guards(acknowledged);
+    let st = crate::preflight::stat_plan(&plan.ops);
+    let mut gv = crate::preflight::Verdict { blockers: Vec::new(), warnings: Vec::new() };
+    crate::preflight::check_delete_ratio("target", &st.target, plan.header.target_entries, &g, &mut gv);
+    crate::preflight::check_delete_ratio("source", &st.source, plan.header.source_entries, &g, &mut gv);
+    if !gv.report(name) {
+        return Ok((0, plan.ops.len() as u64, 1, plan.header.conflict_count));
     }
 
     let mut done = 0u64;
@@ -250,7 +383,7 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool) -> s
                 &src_ops,
                 &job.source,
                 &job.target,
-                &crate::apply::ApplyOptions { dry_run: false, trash: None, verbose, verify: job.rigor == "paranoid", versioning: job.versioning },
+                &job.apply_opts(None, verbose),
             );
             done += d2;
             skipped += s2;

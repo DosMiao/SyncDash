@@ -43,6 +43,121 @@ pub struct Job {
     /// 远端 syncdash 可执行文件路径（默认当它在 PATH 里）
     #[serde(default)]
     pub remote_exe: Option<String>,
+
+    // ---------- v0.9 安全网与新能力 ----------
+    /// 要求两侧 root 都有 `.syncdash-root` 标记才动手（防 SMB 共享盘没挂上就把对面当空目录）。
+    /// 新任务建议开；`syncdash mark <root>` 打标记。
+    #[serde(default)]
+    pub require_marker: bool,
+    /// 至少保留的空闲磁盘比例（0.01 = 1%）。0 关闭
+    #[serde(default = "default_min_free")]
+    pub min_free_pct: f64,
+    /// 单侧删除条目占比超过它就拒绝执行（0.5 = 50%）。0 或 >=1 关闭。
+    /// 过滤器写错、source/target 写反、共享盘没挂上，长得都跟这个一模一样。
+    #[serde(default = "default_max_delete_ratio")]
+    pub max_delete_ratio: f64,
+    /// 临时文件 rename 前 fsync。默认开；SMB 上嫌慢可关（自担风险）
+    #[serde(default = "default_true")]
+    pub fsync: bool,
+    /// 冲突策略：report（默认，只报告）| copy（败方存成 .sync-conflict 副本）| newer（新者直接覆盖）
+    #[serde(default = "default_conflict")]
+    pub on_conflict: String,
+    /// on_conflict = "copy" 时每个文件最多保留几份冲突副本（-1 = 不限）
+    #[serde(default = "default_max_conflicts")]
+    pub max_conflicts: i32,
+    /// 同步 unix 权限位（两侧都是 unix 才有意义）
+    #[serde(default)]
+    pub sync_mode: bool,
+    /// 这些路径不参与同步，但删除父目录时可连带删掉（syncthing 的 `(?d)`）
+    #[serde(default)]
+    pub deletable: Vec<String>,
+    /// 本地/挂载盘的增量更新：多读一遍目标换少写很多字节。
+    /// SMB/WAN 上传是净赚，对称链路打平——所以默认关，按链路自行开。
+    #[serde(default)]
+    pub delta: bool,
+}
+
+impl Default for Job {
+    fn default() -> Self {
+        Job {
+            mode: "mirror".into(),
+            source: PathBuf::new(),
+            target: PathBuf::new(),
+            archive: None,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            no_hash: false,
+            rigor: default_rigor(),
+            case_sensitive: false,
+            symlinks: default_symlinks(),
+            versioning: false,
+            remote_host: None,
+            remote_root: None,
+            remote_exe: None,
+            require_marker: false,
+            min_free_pct: default_min_free(),
+            max_delete_ratio: default_max_delete_ratio(),
+            fsync: true,
+            on_conflict: default_conflict(),
+            max_conflicts: default_max_conflicts(),
+            sync_mode: false,
+            deletable: Vec::new(),
+            delta: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_min_free() -> f64 {
+    0.01
+}
+fn default_max_delete_ratio() -> f64 {
+    0.5
+}
+fn default_conflict() -> String {
+    "report".into()
+}
+fn default_max_conflicts() -> i32 {
+    5
+}
+
+impl Job {
+    pub fn guards(&self, acknowledged: bool) -> crate::preflight::Guards {
+        crate::preflight::Guards {
+            require_marker: self.require_marker,
+            min_free_pct: self.min_free_pct,
+            max_delete_ratio: self.max_delete_ratio,
+            acknowledged,
+        }
+    }
+
+    pub fn compare_opts(&self) -> crate::compare::CompareOptions {
+        crate::compare::CompareOptions {
+            case_insensitive: !self.case_sensitive,
+            conflict: match self.on_conflict.as_str() {
+                "copy" => crate::compare::ConflictPolicy::Copy,
+                "newer" => crate::compare::ConflictPolicy::Newer,
+                _ => crate::compare::ConflictPolicy::Report,
+            },
+            sync_mode: self.sync_mode,
+            max_conflicts: self.max_conflicts,
+        }
+    }
+
+    pub fn apply_opts(&self, trash: Option<PathBuf>, verbose: bool) -> crate::apply::ApplyOptions {
+        crate::apply::ApplyOptions {
+            dry_run: false,
+            trash,
+            verbose,
+            verify: self.rigor == "paranoid",
+            versioning: self.versioning,
+            fsync: self.fsync,
+            filter: Some(crate::filter::PathFilter::build_full(&self.include, &self.exclude, &self.deletable)),
+            delta: self.delta,
+        }
+    }
 }
 
 fn default_rigor() -> String {
@@ -128,6 +243,25 @@ target = '\\host\share\dir'
 # versioning = true                     # 被删/被覆盖文件存进各 root 的 .version_syncDash/
 #                                       #（syncdash versions / restore 查看与找回；默认走本机 trash）
 # no_hash = false
+#
+# --- 安全闸门（v0.9）---
+# require_marker = true                 # 两侧 root 都要有 .syncdash-root 才动手
+#                                       #（`syncdash mark <root>` 打标记；防共享盘没挂上就把对面当空目录）
+# min_free_pct = 0.01                   # 写入后至少保留的空闲比例；0 关闭
+# max_delete_ratio = 0.5                # 单侧删除占比超过它就拒绝执行（--i-know 可放行）；0 关闭
+# fsync = true                          # 临时文件 rename 前 fsync；SMB 嫌慢可关（自担风险）
+#
+# --- 冲突与权限 ---
+# on_conflict = "report"                # report（默认，只报告）| copy（败方存 .sync-conflict 副本）| newer
+# max_conflicts = 5                     # on_conflict="copy" 时每个文件保留几份副本（-1 不限）
+# sync_mode = false                     # 同步 unix 权限位（两侧都是 unix 才有意义）
+#
+# --- 过滤器扩展 ---
+# exclude = ['*/*.log', '!*/audit.log'] # `!` 前缀 = 例外，压过其它 exclude
+# deletable = ['*/node_modules/']       # 不同步，但删父目录时可连带删（syncthing 的 (?d)）
+#
+# --- 增量 ---
+# delta = true                          # 本地/挂载盘大文件按块增量写；SMB 上传划算，对称链路打平
 #
 # 远程管线（可选）：远端在自己盘上扫描（快），target 侧打包经 ssh 送达执行
 # remote_host = 'mac'

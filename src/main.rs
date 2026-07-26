@@ -51,6 +51,9 @@ enum Cmd {
         prefix: Option<String>,
         #[arg(long)]
         apply: bool,
+        /// 放行"计划体检"（删除占比过高）。标记缺失/空间不足依然拦截
+        #[arg(long = "i-know")]
+        i_know: bool,
         #[arg(short, long)]
         verbose: bool,
     },
@@ -76,6 +79,9 @@ enum Cmd {
         /// 追加排除（FFS 过滤器语法，如 */big_temp/ 或 */*.log，可多次）
         #[arg(long)]
         exclude: Vec<String>,
+        /// 往 stderr 打哈希进度（百分比 + MiB/s）
+        #[arg(long)]
+        progress: bool,
     },
     /// 比对两张快照表，产出行动计划（JSONL）
     Compare {
@@ -174,6 +180,20 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// 在 root 写下 `.syncdash-root` 挂载点标记（配 job 的 require_marker，防共享盘没挂上）
+    Mark {
+        root: PathBuf,
+        /// 记进标记文件的任务名（仅供人看）
+        #[arg(long, default_value = "")]
+        job: String,
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// 本机回收目录：查看 / 找回 / 清理
+    Trash {
+        #[command(subcommand)]
+        cmd: TrashCmd,
+    },
     /// 执行计划。默认 dry-run，--apply 才动手
     Apply {
         plan: PathBuf,
@@ -191,8 +211,47 @@ enum Cmd {
         /// 被删/被覆盖文件存进各 root 的 .version_syncDash/（而非本机 trash）
         #[arg(long)]
         versioning: bool,
+        /// 大文件按 FastCDC 块增量写入（多读一遍目标换少写很多字节；SMB 上传划算）
+        #[arg(long)]
+        delta: bool,
+        /// 临时文件 rename 前不 fsync（快，但断电可能丢最后的写入）
+        #[arg(long)]
+        no_fsync: bool,
         #[arg(short, long)]
         verbose: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrashCmd {
+    /// 列出全部回收批次（时间、文件数、体积）
+    Runs,
+    /// 跨全部批次查找某个路径的历史版本（子串匹配，新的在前）
+    Find { pattern: String },
+    /// 找回文件到指定 root。默认 dry-run
+    Restore {
+        pattern: String,
+        #[arg(long)]
+        into: PathBuf,
+        /// 指定批次 id（默认取最新一版）
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        apply: bool,
+    },
+    /// 按保留策略清理。默认 dry-run
+    Prune {
+        /// 超过这么多天的批次一律删（0 = 关）
+        #[arg(long, default_value = "30")]
+        keep_days: i64,
+        /// 总体积上限 GiB（0 = 关）
+        #[arg(long, default_value = "10")]
+        max_gib: u64,
+        /// 关闭 staggered 稀释（近期密、远期疏）
+        #[arg(long)]
+        no_staggered: bool,
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -259,7 +318,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Run { job, all, prefix, apply: do_apply, verbose } => {
+        Cmd::Run { job, all, prefix, apply: do_apply, i_know, verbose } => {
             let list: Vec<(String, config::Job)> = if all || prefix.is_some() {
                 config::load_all()
                     .into_iter()
@@ -279,9 +338,9 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             let mut tot = (0u64, 0u64, 0u64, 0u64);
             for (name, j) in &list {
                 let res = if j.remote_host.is_some() {
-                    run::run_remote_job(name, j, do_apply, verbose)
+                    run::run_remote_job(name, j, do_apply, verbose, i_know)
                 } else {
-                    run::run_local_job(name, j, do_apply, verbose)
+                    run::run_local_job(name, j, do_apply, verbose, i_know)
                 };
                 match res {
                     Ok((d, s, e, c)) => {
@@ -315,12 +374,25 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             gui::run_gui(job).map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(0)
         }
-        Cmd::Scan { root, out, no_hash, force_rehash, symlinks_direct, exclude } => {
+        Cmd::Scan { root, out, no_hash, force_rehash, symlinks_direct, exclude, progress } => {
             if !root.is_dir() {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
             }
-            let snap = scan::scan(&root, &scan::ScanOptions { hash: !no_hash, force_rehash, symlinks_direct, filter: filter::PathFilter::build(&[], &exclude) })?;
+            let sopt = scan::ScanOptions { hash: !no_hash, force_rehash, symlinks_direct, filter: filter::PathFilter::build(&[], &exclude) };
+            let bar = |p: scan::ScanProgress| {
+                let pct = if p.bytes_total > 0 { p.bytes_done * 100 / p.bytes_total } else { 100 };
+                eprint!("\r{} {:>3}%  {}/{}  {:.1} MiB/s   ", p.phase, pct,
+                    syncdash::preflight::human_bytes(p.bytes_done),
+                    syncdash::preflight::human_bytes(p.bytes_total), p.mib_per_s);
+            };
+            let snap = if progress {
+                let r = scan::scan_with_progress(&root, &sopt, Some(&bar))?;
+                eprintln!();
+                r
+            } else {
+                scan::scan(&root, &sopt)?
+            };
             eprintln!(
                 "scanned {} entries in {} ms ({})",
                 snap.header.entry_count, snap.header.duration_ms, snap.header.root
@@ -340,7 +412,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 Mode::Sync => "sync",
                 Mode::Enrich => "enrich",
             };
-            let plan = compare::compare(&s, &t, mode_str, a.as_ref(), resolve_newer, &compare::CompareOptions { case_insensitive: !case_sensitive });
+            let plan = compare::compare(&s, &t, mode_str, a.as_ref(), resolve_newer, &compare::CompareOptions { case_insensitive: !case_sensitive, ..Default::default() });
             eprintln!(
                 "plan: {} op(s), {} conflict(s)  [{} -> {}]",
                 plan.header.op_count, plan.header.conflict_count, plan.header.source_root, plan.header.target_root
@@ -437,7 +509,72 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(if errors > 0 { 1 } else { 0 })
         }
-        Cmd::Apply { plan, apply: do_apply, source_root, target_root, trash, verify, versioning, verbose } => {
+        Cmd::Mark { root, job, note } => {
+            let (path, created) = syncdash::preflight::write_marker(&root, &job, &note)?;
+            if created {
+                println!("marked: {}", path.display());
+            } else {
+                let m = syncdash::preflight::read_marker(&root);
+                println!(
+                    "already marked: {}{}",
+                    path.display(),
+                    m.map(|m| format!("  (job '{}', by {} )", m.job, m.host)).unwrap_or_default()
+                );
+            }
+            println!("set `require_marker = true` in the job to have syncdash refuse to run without it");
+            Ok(0)
+        }
+        Cmd::Trash { cmd } => {
+            use syncdash::preflight::human_bytes;
+            match cmd {
+                TrashCmd::Runs => {
+                    let runs = syncdash::trash::list_runs();
+                    if runs.is_empty() {
+                        println!("no trash runs under {}", syncdash::trash::trash_root().display());
+                    }
+                    let mut total = 0u64;
+                    for r in &runs {
+                        println!("{:<16} {:>7} files  {:>10}", r.id, r.files, human_bytes(r.bytes));
+                        total += r.bytes;
+                    }
+                    if !runs.is_empty() {
+                        println!("== {} run(s), {} total", runs.len(), human_bytes(total));
+                    }
+                    Ok(0)
+                }
+                TrashCmd::Find { pattern } => {
+                    let hits = syncdash::trash::find(&pattern);
+                    for h in &hits {
+                        println!("{:<16} {:>10}  {}", h.run_id, human_bytes(h.size), h.rel);
+                    }
+                    println!("{} version(s)", hits.len());
+                    Ok(0)
+                }
+                TrashCmd::Restore { pattern, into, run, apply: do_apply } => {
+                    let (r, s, e) = syncdash::trash::restore(&pattern, run.as_deref(), &into, !do_apply)?;
+                    println!(
+                        "{}: {r} restored, {s} skipped, {e} error(s)",
+                        if do_apply { "restore" } else { "dry-run (rerun with --apply)" }
+                    );
+                    Ok(if e > 0 { 1 } else { 0 })
+                }
+                TrashCmd::Prune { keep_days, max_gib, no_staggered, apply: do_apply } => {
+                    let ret = syncdash::trash::Retention {
+                        keep_days,
+                        max_bytes: max_gib * 1024 * 1024 * 1024,
+                        staggered: !no_staggered,
+                    };
+                    let (n, freed) = syncdash::trash::prune(&ret, !do_apply)?;
+                    println!(
+                        "{}: {n} run(s), {} freed",
+                        if do_apply { "pruned" } else { "dry-run (rerun with --apply)" },
+                        human_bytes(freed)
+                    );
+                    Ok(0)
+                }
+            }
+        }
+        Cmd::Apply { plan, apply: do_apply, source_root, target_root, trash, verify, versioning, delta, no_fsync, verbose } => {
             let p = compare::Plan::load(&plan)?;
             let sr = source_root.unwrap_or_else(|| PathBuf::from(&p.header.source_root));
             let tr = target_root.unwrap_or_else(|| PathBuf::from(&p.header.target_root));
@@ -447,7 +584,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     return Ok(2);
                 }
             }
-            let (done, skipped, errors) = apply::apply(&p.ops, &sr, &tr, &apply::ApplyOptions { dry_run: !do_apply, trash, verbose, verify, versioning });
+            let (done, skipped, errors) = apply::apply(&p.ops, &sr, &tr, &apply::ApplyOptions { dry_run: !do_apply, trash, verbose, verify, versioning, delta, fsync: !no_fsync, filter: None });
             println!(
                 "{}: {done} done, {skipped} {}, {errors} error(s)",
                 if do_apply { "applied" } else { "dry-run" },

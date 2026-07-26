@@ -123,6 +123,7 @@ impl EditorState {
             remote_host: opt(&self.remote_host),
             remote_root: opt(&self.remote_root),
             remote_exe: opt(&self.remote_exe),
+            ..Default::default()
         })
     }
 }
@@ -165,6 +166,7 @@ fn action_badge(op: &Op) -> (&'static str, egui::Color32) {
         Action::Update => (if to_target { "-> update" } else { "<- update" }, egui::Color32::from_rgb(0xd9, 0x9a, 0x22)),
         Action::Move => ("mv", egui::Color32::from_rgb(0x3a, 0x8f, 0xd9)),
         Action::Delete | Action::DeleteDir => ("DEL", egui::Color32::from_rgb(0xd9, 0x3a, 0x3a)),
+        Action::Chmod => ("chmod", egui::Color32::from_rgb(0x7a, 0x8b, 0x99)),
         Action::Conflict => ("CONFLICT", egui::Color32::from_rgb(0xaa, 0x66, 0xcc)),
         Action::Note => ("note", egui::Color32::GRAY),
     }

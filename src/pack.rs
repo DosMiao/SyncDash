@@ -448,7 +448,7 @@ pub fn apply_pack(
         &ops,
         &staging,
         &target_root,
-        &crate::apply::ApplyOptions { dry_run: false, trash: None, verbose, verify: true, versioning },
+        &crate::apply::ApplyOptions { dry_run: false, verbose, verify: true, versioning, ..Default::default() },
     );
 
     // unix：恢复 exec 等权限位（SMB/打包路径上唯一会丢的属性）

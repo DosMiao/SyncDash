@@ -45,6 +45,51 @@ pub struct Entry {
     /// symlink 的指向（symlinks="direct" 时记录；比对按指向字符串相等）
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub link: Option<String>,
+    /// **仅 archive 表使用**：这条路径更早若干代的内容 hash，最新的在前（P1-3）。
+    /// 用途：一侧的当前内容如果只是"停在某个历史版本上"，那它并没有并发修改，
+    /// 不该报 both-changed。这是 archive 模型下对版本向量的廉价近似
+    /// （syncthing 用 `PreviousBlocksHash` 达到同样目的，
+    ///  `lib/protocol/bep_fileinfo.go:200-207`）。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub prev: Option<Vec<String>>,
+}
+
+/// archive 保留的历史代数。3 代足以覆盖"改了没刷存档"的常见情形，
+/// 而每条只多几十字节。
+pub const ARCHIVE_GENERATIONS: usize = 3;
+
+impl Entry {
+    /// 当前内容是否等于本条目**记录过的任一历史版本**
+    pub fn matches_any_generation(&self, hash: &str) -> bool {
+        if self.hash.as_deref() == Some(hash) {
+            return true;
+        }
+        self.prev.as_ref().map(|v| v.iter().any(|h| h == hash)).unwrap_or(false)
+    }
+}
+
+/// 生成新一代 archive：把旧 archive 里同路径的 hash 推进 `prev` 链。
+/// `fresh` 是刚扫出来的快照（会被就地改写），`old` 是上一代 archive。
+pub fn roll_generations(fresh: &mut [Entry], old: &[Entry]) {
+    use std::collections::HashMap;
+    let prior: HashMap<&str, &Entry> = old.iter().map(|e| (e.path.as_str(), e)).collect();
+    for e in fresh.iter_mut() {
+        let Some(o) = prior.get(e.path.as_str()) else { continue };
+        // 内容没变就不必新增一代，避免历史被同一个 hash 灌满
+        if o.hash.is_some() && o.hash == e.hash {
+            e.prev = o.prev.clone();
+            continue;
+        }
+        let mut chain = Vec::with_capacity(ARCHIVE_GENERATIONS);
+        if let Some(h) = &o.hash {
+            chain.push(h.clone());
+        }
+        if let Some(p) = &o.prev {
+            chain.extend(p.iter().cloned());
+        }
+        chain.truncate(ARCHIVE_GENERATIONS);
+        e.prev = if chain.is_empty() { None } else { Some(chain) };
+    }
 }
 
 pub struct Snapshot {

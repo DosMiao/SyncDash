@@ -29,6 +29,9 @@ pub enum Action {
     Move,
     Delete,
     DeleteDir,
+    /// 只有权限位不同：不重传内容，只回写 mode
+    /// （syncthing 的 shortcutFile，`lib/model/folder_sendrecv.go:1253`）
+    Chmod,
     Conflict,
     Note,
 }
@@ -57,6 +60,9 @@ pub struct Op {
     /// Some = 这是一个 symlink 操作，值为链接指向（apply 创建链接而非复制内容）
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub link: Option<String>,
+    /// 目标 unix 权限位。Chmod 用它作为要写入的值；Copy/Update 带上它则复制后一并回写
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mode: Option<u32>,
     pub reason: String,
 }
 
@@ -72,6 +78,11 @@ pub struct PlanHeader {
     pub target_host: String,
     pub op_count: u64,
     pub conflict_count: u64,
+    /// 两侧快照的条目数。计划体检（删除占比）要用，也让计划文件本身可自证规模。
+    #[serde(default)]
+    pub source_entries: u64,
+    #[serde(default)]
+    pub target_entries: u64,
 }
 
 pub struct Plan {
@@ -105,16 +116,83 @@ impl Plan {
     }
 }
 
+/// 冲突处理策略。默认 Report（只报告，绝不自动仲裁）——这是 SyncDash 的立身之本，
+/// 不因为对齐 syncthing 而改默认。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ConflictPolicy {
+    /// 只报告，人来处理
+    Report,
+    /// 败方改名成 `<name>.sync-conflict-<ts>-<host><ext>`，胜方落地
+    /// （syncthing `conflictName`，`lib/model/folder_sendrecv.go:2219`）
+    Copy,
+    /// mtime 新者胜，旧的直接被覆盖（不留副本）
+    Newer,
+}
+
 #[derive(Clone, Copy)]
 pub struct CompareOptions {
     /// 默认 true：NTFS 与 APFS 默认都大小写不敏感
     pub case_insensitive: bool,
+    /// 冲突策略
+    pub conflict: ConflictPolicy,
+    /// 同步 unix 权限位（两侧都是 unix 时才有意义；Win 侧无 mode，开了会一直报差异）
+    pub sync_mode: bool,
+    /// 每个文件最多保留几份冲突副本（-1 = 不限）。仅 ConflictPolicy::Copy 有效
+    pub max_conflicts: i32,
 }
 
 impl Default for CompareOptions {
     fn default() -> Self {
-        CompareOptions { case_insensitive: true }
+        CompareOptions {
+            case_insensitive: true,
+            conflict: ConflictPolicy::Report,
+            sync_mode: false,
+            max_conflicts: 5,
+        }
     }
+}
+
+/// 冲突副本名：`report.pdf` → `report.sync-conflict-20260726-143000-WIN01.pdf`
+/// （与 syncthing 的命名同构，便于人一眼认出，也便于双方的过滤器识别）
+pub fn conflict_name(path: &str, host: &str, at_ms: u64) -> String {
+    let (dir, base) = match path.rfind('/') {
+        Some(i) => (&path[..=i], &path[i + 1..]),
+        None => ("", path),
+    };
+    // 只认最后一个点之后的扩展名；隐藏文件（.gitignore）不当作扩展名
+    let (stem, ext) = match base.rfind('.') {
+        Some(i) if i > 0 => (&base[..i], &base[i..]),
+        _ => (base, ""),
+    };
+    let safe_host: String = host
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    format!("{dir}{stem}.sync-conflict-{}-{safe_host}{ext}", stamp(at_ms))
+}
+
+/// 冲突副本自身不该再参与同步/冲突判定（syncthing `isConflict`，:2224）
+pub fn is_conflict_copy(path: &str) -> bool {
+    path.rsplit('/').next().unwrap_or(path).contains(".sync-conflict-")
+}
+
+/// UTC 时间戳 YYYYMMDD-HHMMSS（不引入 chrono：只需要一个稳定可读的标签）
+fn stamp(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    // 民用历法换算（Howard Hinnant 的 civil_from_days）
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}{:02}{:02}-{:02}{:02}{:02}", y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60)
 }
 
 /// 比对键：NFC 归一化 ＋（可选）大小写折叠。只用于匹配，不用于 I/O。
@@ -128,6 +206,17 @@ fn files_equal(a: &Entry, b: &Entry) -> bool {
         return ha == hb;
     }
     a.size == b.size && (a.mtime_ms - b.mtime_ms).abs() <= MTIME_SLACK_MS
+}
+
+/// `e` 的内容对应 archive 条目 `r` 的第几代：
+/// `Some(0)` = 与 archive 当前记录一致，`Some(n)` = 第 n 代历史，`None` = archive 没见过。
+/// 代数越小越新——这让"落后一代"与"并发修改"能被区分开（P1-3）。
+fn generation_of(e: &Entry, r: &Entry) -> Option<usize> {
+    if files_equal(e, r) {
+        return Some(0);
+    }
+    let h = e.hash.as_deref()?;
+    r.prev.as_ref()?.iter().position(|x| x == h).map(|i| i + 1)
 }
 
 /// 归一键 → 条目；撞名（NFD/NFC 或大小写双胞胎）保留先出现者并记录
@@ -170,20 +259,37 @@ fn win_invalid_reason(rel: &str) -> Option<String> {
     None
 }
 
-/// 移动配对。返回 (from, to, size, rename_in_place)。
-/// 配对优先级（借 FFS "同目录 rename 合并"之意）：
+/// 一次移动配对的结果
+pub struct MovePair {
+    pub from: String,
+    pub to: String,
+    pub size: u64,
+    /// 同父目录 = 就地改名（FFS "同目录 rename 合并"）
+    pub rename_in_place: bool,
+    /// 配对时的同内容候选个数。>1 说明 `from` 是从多个等价候选里任选的——
+    /// 结果内容仍然正确，但归因不确定，reason 里必须如实标注，不能假装确定。
+    pub candidates: usize,
+}
+
+/// 移动配对。配对优先级（借 FFS "同目录 rename 合并"之意）：
 ///   1) 同父目录（就地改名）  2) 同文件名（整目录搬迁）  3) 任意同 hash
+///
+/// **空文件不参与配对**：所有零长文件的 blake3 相同，会挤进同一个桶，
+/// 把一堆互不相干的 `__init__.py` / `.gitkeep` 配成"重命名"。
+/// syncthing 在 `findRename`（`lib/model/folder.go:930-932`）第一件事就是排除
+/// `Size == 0`，我们照做。
 fn detect_moves<'a>(
     adds: Vec<&'a Entry>,
     dels: Vec<&'a Entry>,
-) -> (Vec<(String, String, u64, bool)>, Vec<&'a Entry>, Vec<&'a Entry>) {
+) -> (Vec<MovePair>, Vec<&'a Entry>, Vec<&'a Entry>) {
     fn parent(p: &str) -> &str {
         p.rfind('/').map(|i| &p[..i]).unwrap_or("")
     }
+    let eligible = |e: &Entry| e.size > 0 && e.hash.is_some() && !is_conflict_copy(&e.path);
     let mut by_key: HashMap<(String, u64), Vec<&'a Entry>> = HashMap::new();
     for &d in &dels {
-        if let Some(h) = &d.hash {
-            by_key.entry((h.clone(), d.size)).or_default().push(d);
+        if eligible(d) {
+            by_key.entry((d.hash.clone().unwrap(), d.size)).or_default().push(d);
         }
     }
     let mut moves = Vec::new();
@@ -191,9 +297,10 @@ fn detect_moves<'a>(
     let mut used: HashSet<String> = HashSet::new();
     for a in adds {
         let mut matched = None;
-        if let Some(h) = &a.hash {
-            if let Some(cands) = by_key.get_mut(&(h.clone(), a.size)) {
+        if eligible(a) {
+            if let Some(cands) = by_key.get_mut(&(a.hash.clone().unwrap(), a.size)) {
                 if !cands.is_empty() {
+                    let n = cands.len();
                     let pick = cands
                         .iter()
                         .position(|c| parent(&c.path) == parent(&a.path))
@@ -206,8 +313,13 @@ fn detect_moves<'a>(
                         .unwrap_or(0);
                     let c = cands.remove(pick);
                     used.insert(c.path.clone());
-                    let rename = parent(&c.path) == parent(&a.path);
-                    matched = Some((c.path.clone(), a.path.clone(), a.size, rename));
+                    matched = Some(MovePair {
+                        rename_in_place: parent(&c.path) == parent(&a.path),
+                        from: c.path.clone(),
+                        to: a.path.clone(),
+                        size: a.size,
+                        candidates: n,
+                    });
                 }
             }
         }
@@ -218,6 +330,15 @@ fn detect_moves<'a>(
     }
     let rest_dels = dels.into_iter().filter(|d| !used.contains(&d.path)).collect();
     (moves, rest_adds, rest_dels)
+}
+
+/// move op 的 reason：歧义配对如实标注候选数
+fn move_reason(base: &str, m: &MovePair) -> String {
+    if m.candidates > 1 {
+        format!("{base} (ambiguous: {} identical candidates)", m.candidates)
+    } else {
+        base.to_string()
+    }
 }
 
 /// GUI 逐行翻方向（FFS 同款交互的语义核心）。返回 None = 该 op 不可反转（move/dir/conflict/note）。
@@ -239,6 +360,7 @@ pub fn reverse_op(op: &Op) -> Option<Op> {
             mtime_ms: None,
             hash: None,
             link: None,
+            mode: None,
             reason: format!("flipped({})", op.reason),
         }),
         Action::Update => Some(Op {
@@ -250,6 +372,7 @@ pub fn reverse_op(op: &Op) -> Option<Op> {
             mtime_ms: None,
             hash: None,
             link: None,
+            mode: None,
             reason: format!("flipped({})", op.reason),
         }),
         Action::Delete => Some(Op {
@@ -261,6 +384,7 @@ pub fn reverse_op(op: &Op) -> Option<Op> {
             mtime_ms: None,
             hash: None,
             link: None,
+            mode: None,
             reason: format!("flipped({})", op.reason),
         }),
         _ => None,
@@ -268,7 +392,7 @@ pub fn reverse_op(op: &Op) -> Option<Op> {
 }
 
 fn push_copy(ops: &mut Vec<Op>, side: Side, e: &Entry, reason: &str) {
-    ops.push(Op { side, action: Action::Copy, path: e.path.clone(), from: None, size: Some(e.size), mtime_ms: Some(e.mtime_ms), hash: e.hash.clone(), link: None, reason: reason.into() });
+    ops.push(Op { side, action: Action::Copy, path: e.path.clone(), from: None, size: Some(e.size), mtime_ms: Some(e.mtime_ms), hash: e.hash.clone(), link: None, mode: None, reason: reason.into() });
 }
 
 pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option<&Snapshot>, resolve_newer: bool, copts: &CompareOptions) -> Plan {
@@ -281,10 +405,10 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
     let mut ops: Vec<Op> = Vec::new();
 
     for d in s_dups {
-        ops.push(Op { side: Side::Source, action: Action::Note, path: d, from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "duplicate-after-normalization (kept first; NFC/case twin)".into() });
+        ops.push(Op { side: Side::Source, action: Action::Note, path: d, from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "duplicate-after-normalization (kept first; NFC/case twin)".into() });
     }
     for d in t_dups {
-        ops.push(Op { side: Side::Target, action: Action::Note, path: d, from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "duplicate-after-normalization (kept first; NFC/case twin)".into() });
+        ops.push(Op { side: Side::Target, action: Action::Note, path: d, from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "duplicate-after-normalization (kept first; NFC/case twin)".into() });
     }
 
     match mode {
@@ -299,7 +423,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                         if !files_equal(se, te) && (mode == "mirror" || se.mtime_ms > te.mtime_ms + MTIME_SLACK_MS) {
                             let reason = if mode == "mirror" { "differs-master-wins" } else { "source-newer" };
                             // 更新写到 target 已存在的文件上：用 target 的原拼写打开，不改对方形态
-                            ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, reason: reason.into() });
+                            ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, mode: None, reason: reason.into() });
                         }
                     }
                 }
@@ -315,17 +439,18 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                 } else {
                     (Vec::new(), adds, dels)
                 };
-                for (from, to, size, rename) in moves {
-                    let reason = if rename { "rename-detected-by-hash" } else { "move-detected-by-hash" };
-                    ops.push(Op { side: Side::Target, action: Action::Move, path: to, from: Some(from), size: Some(size), mtime_ms: None, hash: None, link: None, reason: reason.into() });
+                for m in moves {
+                    let base = if m.rename_in_place { "rename-detected-by-hash" } else { "move-detected-by-hash" };
+                    let reason = move_reason(base, &m);
+                    ops.push(Op { side: Side::Target, action: Action::Move, path: m.to, from: Some(m.from), size: Some(m.size), mtime_ms: None, hash: None, link: None, mode: None, reason });
                 }
                 for a in rest_adds { push_copy(&mut ops, Side::Target, a, "only-in-source"); }
                 for d in rest_dels {
-                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, reason: "gone-from-source".into() });
+                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, mode: None, reason: "gone-from-source".into() });
                 }
                 for (p, te) in &t_dirs {
                     if !s_dirs.contains_key(p) {
-                        ops.push(Op { side: Side::Target, action: Action::DeleteDir, path: te.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "dir-gone-from-source".into() });
+                        ops.push(Op { side: Side::Target, action: Action::DeleteDir, path: te.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "dir-gone-from-source".into() });
                     }
                 }
             } else {
@@ -348,24 +473,42 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                             continue;
                         }
                         if has_archive {
+                            // P1-3：不只看"是否等于 archive 当前那一代"，还看历史代。
+                            // 一侧只是**落后**（停在某个旧版本）并不是并发修改——
+                            // syncthing 用 PreviousBlocksHash 达到同样目的
+                            // （`lib/protocol/bep_fileinfo.go:200-207`）。
+                            // generation_of 返回 0 = 与 archive 当前代一致，1..n = 第 n 代历史。
                             let r = arch_files.get(p).copied();
-                            let s_unchanged = r.map(|r| files_equal(se, r)).unwrap_or(false);
-                            let t_unchanged = r.map(|r| files_equal(te, r)).unwrap_or(false);
-                            if s_unchanged && !t_unchanged {
-                                ops.push(Op { side: Side::Source, action: Action::Update, path: se.path.clone(), from: None, size: Some(te.size), mtime_ms: Some(te.mtime_ms), hash: te.hash.clone(), link: None, reason: "target-changed".into() });
-                            } else if t_unchanged && !s_unchanged {
-                                ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, reason: "source-changed".into() });
-                            } else {
-                                ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "both-changed".into() });
+                            let sg = r.and_then(|r| generation_of(se, r));
+                            let tg = r.and_then(|r| generation_of(te, r));
+                            let push_to_source = |ops: &mut Vec<Op>, why: &str| {
+                                ops.push(Op { side: Side::Source, action: Action::Update, path: se.path.clone(), from: None, size: Some(te.size), mtime_ms: Some(te.mtime_ms), hash: te.hash.clone(), link: None, mode: None, reason: why.into() });
+                            };
+                            let push_to_target = |ops: &mut Vec<Op>, why: &str| {
+                                ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, mode: None, reason: why.into() });
+                            };
+                            match (sg, tg) {
+                                // source 停在已知版本、target 是新内容 → target 改的
+                                (Some(_), None) => push_to_source(&mut ops, "target-changed"),
+                                (None, Some(_)) => push_to_target(&mut ops, "source-changed"),
+                                // 两侧都停在已知版本但代数不同 → 新的那一代赢，不是冲突
+                                (Some(a), Some(b)) if a < b => {
+                                    push_to_target(&mut ops, "target-behind-by-generations")
+                                }
+                                (Some(a), Some(b)) if a > b => {
+                                    push_to_source(&mut ops, "source-behind-by-generations")
+                                }
+                                // 两侧都是 archive 从未见过的内容 → 真并发修改
+                                _ => ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "both-changed".into() }),
                             }
                         } else if resolve_newer {
                             if se.mtime_ms >= te.mtime_ms {
-                                ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, reason: "differs-newer-wins".into() });
+                                ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, mode: None, reason: "differs-newer-wins".into() });
                             } else {
-                                ops.push(Op { side: Side::Source, action: Action::Update, path: se.path.clone(), from: None, size: Some(te.size), mtime_ms: Some(te.mtime_ms), hash: te.hash.clone(), link: None, reason: "differs-newer-wins".into() });
+                                ops.push(Op { side: Side::Source, action: Action::Update, path: se.path.clone(), from: None, size: Some(te.size), mtime_ms: Some(te.mtime_ms), hash: te.hash.clone(), link: None, mode: None, reason: "differs-newer-wins".into() });
                             }
                         } else {
-                            ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "differs-no-archive".into() });
+                            ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "differs-no-archive".into() });
                         }
                     }
                     None => {
@@ -374,7 +517,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                                 if files_equal(se, r) {
                                     del_on_source.push(se);
                                 } else {
-                                    ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "deleted-on-target-but-changed-on-source".into() });
+                                    ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-target-but-changed-on-source".into() });
                                 }
                                 continue;
                             }
@@ -393,7 +536,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                         if files_equal(te, r) {
                             del_on_target.push(te);
                         } else {
-                            ops.push(Op { side: Side::Target, action: Action::Conflict, path: te.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "deleted-on-source-but-changed-on-target".into() });
+                            ops.push(Op { side: Side::Target, action: Action::Conflict, path: te.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-source-but-changed-on-target".into() });
                         }
                         continue;
                     }
@@ -403,22 +546,24 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
 
             if has_archive && both_hashed {
                 let (mv_on_target, rest_s_adds, rest_del_t) = detect_moves(s_adds, del_on_target);
-                for (from, to, size, rename) in mv_on_target {
-                    let reason = if rename { "rename-on-source-replayed" } else { "move-on-source-replayed" };
-                    ops.push(Op { side: Side::Target, action: Action::Move, path: to, from: Some(from), size: Some(size), mtime_ms: None, hash: None, link: None, reason: reason.into() });
+                for m in mv_on_target {
+                    let base = if m.rename_in_place { "rename-on-source-replayed" } else { "move-on-source-replayed" };
+                    let reason = move_reason(base, &m);
+                    ops.push(Op { side: Side::Target, action: Action::Move, path: m.to, from: Some(m.from), size: Some(m.size), mtime_ms: None, hash: None, link: None, mode: None, reason });
                 }
                 let (mv_on_source, rest_t_adds, rest_del_s) = detect_moves(t_adds, del_on_source);
-                for (from, to, size, rename) in mv_on_source {
-                    let reason = if rename { "rename-on-target-replayed" } else { "move-on-target-replayed" };
-                    ops.push(Op { side: Side::Source, action: Action::Move, path: to, from: Some(from), size: Some(size), mtime_ms: None, hash: None, link: None, reason: reason.into() });
+                for m in mv_on_source {
+                    let base = if m.rename_in_place { "rename-on-target-replayed" } else { "move-on-target-replayed" };
+                    let reason = move_reason(base, &m);
+                    ops.push(Op { side: Side::Source, action: Action::Move, path: m.to, from: Some(m.from), size: Some(m.size), mtime_ms: None, hash: None, link: None, mode: None, reason });
                 }
                 for a in rest_s_adds { push_copy(&mut ops, Side::Target, a, "added-on-source"); }
                 for a in rest_t_adds { push_copy(&mut ops, Side::Source, a, "added-on-target"); }
                 for d in rest_del_t {
-                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, reason: "deleted-on-source".into() });
+                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-source".into() });
                 }
                 for d in rest_del_s {
-                    ops.push(Op { side: Side::Source, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, reason: "deleted-on-target".into() });
+                    ops.push(Op { side: Side::Source, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-target".into() });
                 }
             } else {
                 if both_hashed {
@@ -428,7 +573,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                     for a in &s_adds {
                         if let Some(h) = a.hash.as_deref() {
                             if let Some(&other) = t_only.get(h) {
-                                ops.push(Op { side: Side::Target, action: Action::Note, path: a.path.clone(), from: Some(other.to_string()), size: Some(a.size), mtime_ms: None, hash: None, link: None, reason: "possible-move-needs-archive".into() });
+                                ops.push(Op { side: Side::Target, action: Action::Note, path: a.path.clone(), from: Some(other.to_string()), size: Some(a.size), mtime_ms: None, hash: None, link: None, mode: None, reason: "possible-move-needs-archive".into() });
                             }
                         }
                     }
@@ -436,10 +581,10 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                 for a in s_adds { push_copy(&mut ops, Side::Target, a, "only-in-source"); }
                 for a in t_adds { push_copy(&mut ops, Side::Source, a, "only-in-target"); }
                 for d in del_on_target {
-                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, reason: "deleted-on-source".into() });
+                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-source".into() });
                 }
                 for d in del_on_source {
-                    ops.push(Op { side: Side::Source, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, reason: "deleted-on-target".into() });
+                    ops.push(Op { side: Side::Source, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-target".into() });
                 }
             }
         }
@@ -460,6 +605,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
             mtime_ms: None,
             hash: None,
             link: e.link.clone(),
+            mode: None,
             reason: reason.into(),
         };
         for (p, se) in &s_links {
@@ -493,6 +639,197 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
         }
     }
 
+    // ---------- unix 权限位（P2-4）----------
+    // 两侧都是 unix、且 job 显式开了 sync_mode 才做：Windows 侧没有 mode，
+    // 开着会每次比对都报差异。过去 mode 只记进快照表却从不参与比对，
+    // 挂载盘路径同步过去的脚本会丢 exec 位（pack 路径反而会恢复，两条路径行为不一致）。
+    let both_unix = source.header.os != "windows" && target.header.os != "windows";
+    if copts.sync_mode && both_unix {
+        // 1) 要复制内容的 op 顺带带上目标 mode，apply 复制完直接回写，不用多一趟
+        for op in &mut ops {
+            if matches!(op.action, Action::Copy | Action::Update) && op.link.is_none() {
+                let key = norm_key(&op.path, ci);
+                let from_entry = match op.side {
+                    Side::Target => s_files.get(&key),
+                    Side::Source => t_files.get(&key),
+                };
+                if let Some(e) = from_entry {
+                    op.mode = e.mode;
+                }
+            }
+        }
+        // 2) 内容相同、只有权限不同 → 单独一条 Chmod，绝不为了几个权限位重传文件
+        //    （syncthing 的 shortcutFile 同样思路）。sync 模式没有"谁是 master"，
+        //    权限归属无从判断，只报告不动手。
+        if mode == "mirror" || mode == "enrich" {
+            for (p, se) in &s_files {
+                let se = *se;
+                if let Some(&te) = t_files.get(p) {
+                    if files_equal(se, te) && se.mode.is_some() && se.mode != te.mode {
+                        ops.push(Op {
+                            side: Side::Target,
+                            action: Action::Chmod,
+                            path: te.path.clone(),
+                            from: None,
+                            size: None,
+                            mtime_ms: None,
+                            hash: None,
+                            link: None,
+                            mode: se.mode,
+                            reason: format!(
+                                "mode-differs-master-wins ({:04o} -> {:04o})",
+                                te.mode.unwrap_or(0),
+                                se.mode.unwrap_or(0)
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------- 大小写敏感模式下的落盘撞名预检（P2-3）----------
+    // case_sensitive = true 时比对键区分大小写，但底层 NTFS/APFS 通常**不**区分：
+    // 往 target 写 `Foo.txt` 会静默覆盖已存在的 `foo.txt`。syncthing 在写入前解析
+    // 目录真名并报 CaseConflictError（`lib/fs/casefs.go:27-37`）；我们在计划阶段就拦。
+    if !ci {
+        let fold = |p: &str| -> String { p.nfc().collect::<String>().to_uppercase() };
+        let mut folded: HashMap<(bool, String), Vec<&str>> = HashMap::new();
+        for (is_target, snap) in [(false, source), (true, target)] {
+            for e in &snap.entries {
+                folded.entry((is_target, fold(&e.path))).or_default().push(&e.path);
+            }
+        }
+        for op in &mut ops {
+            if !matches!(op.action, Action::Copy | Action::Move) {
+                continue;
+            }
+            let is_target = op.side == Side::Target;
+            if let Some(existing) = folded.get(&(is_target, fold(&op.path))) {
+                // Move 的 from 就是那个"撞名"的文件时，这恰恰是一次**大小写改名**
+                // （`readme.md` → `Readme.md`），是移动检测的正确产物，不是撞名事故。
+                let from = op.from.as_deref();
+                if let Some(other) = existing.iter().find(|p| **p != op.path && Some(**p) != from) {
+                    op.action = Action::Conflict;
+                    op.reason = format!(
+                        "case-collision: writing '{}' would overwrite existing '{other}' on a \
+                         case-insensitive filesystem (set case_sensitive = false, or rename one side)",
+                        op.path
+                    );
+                }
+            }
+        }
+    }
+
+    // ---------- 冲突策略（P1-2）----------
+    // 默认 Report：只报告，人来处理——这是 SyncDash 的立身之本，不改。
+    // Copy/Newer 是显式 opt-in，让双机日常使用时一个冲突不会把文件卡住到天荒地老。
+    // 只处理**内容冲突**（两侧都有该文件且都改过）；删改冲突与
+    // illegal-on-windows 一律保持 Report——自动仲裁"删还是留"太危险。
+    if copts.conflict != ConflictPolicy::Report {
+        const RESOLVABLE: [&str; 3] = ["both-changed", "differs-no-archive", "symlink-differs"];
+        let now = now_ms();
+        let mut extra: Vec<Op> = Vec::new();
+        for op in &mut ops {
+            if op.action != Action::Conflict || !RESOLVABLE.contains(&op.reason.as_str()) {
+                continue;
+            }
+            // 冲突副本自身不再生成冲突副本（syncthing isConflict，:1863）
+            if is_conflict_copy(&op.path) {
+                continue;
+            }
+            let key = norm_key(&op.path, ci);
+            let (Some(&se), Some(&te)) = (s_files.get(&key), t_files.get(&key)) else { continue };
+            // mtime 新者胜；完全相同则 host 名字典序做稳定 tie-break
+            // （syncthing 用版本向量里的 device id，我们没有，用 host 等效）
+            let source_wins = match se.mtime_ms.cmp(&te.mtime_ms) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => source.header.host <= target.header.host,
+            };
+            let (winner, loser, loser_side, loser_host) = if source_wins {
+                (se, te, Side::Target, target.header.host.as_str())
+            } else {
+                (te, se, Side::Source, source.header.host.as_str())
+            };
+            if copts.conflict == ConflictPolicy::Copy {
+                let kept = conflict_name(&loser.path, loser_host, now);
+                extra.push(Op {
+                    side: loser_side.clone(),
+                    action: Action::Move,
+                    path: kept.clone(),
+                    from: Some(loser.path.clone()),
+                    size: Some(loser.size),
+                    mtime_ms: Some(loser.mtime_ms),
+                    hash: loser.hash.clone(),
+                    link: None,
+                    mode: None,
+                    reason: format!("conflict-loser-kept-as-copy ({})", op.reason),
+                });
+            }
+            // 胜方内容落到败方那一侧
+            extra.push(Op {
+                side: loser_side,
+                action: Action::Update,
+                path: loser.path.clone(),
+                from: None,
+                size: Some(winner.size),
+                mtime_ms: Some(winner.mtime_ms),
+                hash: winner.hash.clone(),
+                link: winner.link.clone(),
+                mode: None,
+                reason: format!(
+                    "conflict-resolved-newer-wins ({})",
+                    if copts.conflict == ConflictPolicy::Copy { "loser kept as .sync-conflict copy" } else { "loser overwritten (recoverable from trash)" }
+                ),
+            });
+            // 原冲突行降级为记录，保留可审计的痕迹
+            op.action = Action::Note;
+            op.reason = format!("auto-resolved: {}", op.reason);
+        }
+        ops.extend(extra);
+
+        // max_conflicts：同一路径的冲突副本超额时删掉最老的几份
+        // （syncthing `lib/model/folder_sendrecv.go:1888-1898`）。
+        // 副本名里带时间戳，字典序即时间序。
+        if copts.conflict == ConflictPolicy::Copy && copts.max_conflicts >= 0 {
+            let limit = copts.max_conflicts as usize;
+            for (is_target, snap) in [(false, source), (true, target)] {
+                let mut groups: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+                for e in snap.entries.iter().filter(|e| e.kind == EntryKind::File) {
+                    if is_conflict_copy(&e.path) {
+                        // 归组到原始文件名：去掉 `.sync-conflict-…` 那一段
+                        if let Some(i) = e.path.find(".sync-conflict-") {
+                            let stem = &e.path[..i];
+                            groups.entry(stem.to_string()).or_default().push(&e.path);
+                        }
+                    }
+                }
+                for (_stem, mut copies) in groups {
+                    if copies.len() <= limit {
+                        continue;
+                    }
+                    copies.sort_unstable(); // 时间戳在名字里 → 字典序 = 时间序
+                    let doomed = copies.len() - limit;
+                    for p in copies.into_iter().take(doomed) {
+                        ops.push(Op {
+                            side: if is_target { Side::Target } else { Side::Source },
+                            action: Action::Delete,
+                            path: p.to_string(),
+                            from: None,
+                            size: None,
+                            mtime_ms: None,
+                            hash: None,
+                            link: None,
+                            mode: None,
+                            reason: format!("conflict-copy-over-limit (max_conflicts = {limit})"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // Windows 侧新建路径的合法性预检：计划阶段拦下，不让 apply 执行到一半才炸
     for op in &mut ops {
         if matches!(op.action, Action::Copy | Action::Move) {
@@ -512,9 +849,10 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
     let rank = |o: &Op| match o.action {
         Action::Move => 0,
         Action::Copy | Action::Update => 1,
-        Action::Delete => 2,
-        Action::DeleteDir => 3,
-        Action::Conflict | Action::Note => 4,
+        Action::Chmod => 2,
+        Action::Delete => 3,
+        Action::DeleteDir => 4,
+        Action::Conflict | Action::Note => 5,
     };
     ops.sort_by(|a, b| {
         rank(a).cmp(&rank(b)).then_with(|| {
@@ -539,6 +877,8 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
             target_host: target.header.host.clone(),
             op_count: ops.len() as u64,
             conflict_count,
+            source_entries: source.entries.len() as u64,
+            target_entries: target.entries.len() as u64,
         },
         ops,
     }
@@ -560,7 +900,301 @@ mod tests {
         }
     }
     fn file(path: &str, hash: &str) -> Entry {
-        Entry { path: path.into(), kind: EntryKind::File, size: 1, mtime_ms: 0, hash: Some(hash.into()), file_id: None, mode: None, link: None }
+        Entry { path: path.into(), kind: EntryKind::File, size: 1, mtime_ms: 0, hash: Some(hash.into()), file_id: None, mode: None, link: None, prev: None }
+    }
+    /// 带 mtime 的文件（冲突仲裁按 mtime）
+    fn file_at(path: &str, hash: &str, mtime_ms: i64) -> Entry {
+        Entry { mtime_ms, ..file(path, hash) }
+    }
+    fn sized(path: &str, hash: &str, size: u64) -> Entry {
+        Entry { size, ..file(path, hash) }
+    }
+    /// archive 条目：当前 hash + 历史代
+    fn arch(path: &str, hash: &str, prev: &[&str]) -> Entry {
+        Entry {
+            prev: if prev.is_empty() { None } else { Some(prev.iter().map(|s| s.to_string()).collect()) },
+            ..file(path, hash)
+        }
+    }
+    fn snap_named(os: &str, host: &str, entries: Vec<Entry>) -> Snapshot {
+        let mut s = snap(os, entries);
+        s.header.host = host.into();
+        s
+    }
+    fn actions(plan: &Plan) -> Vec<(&str, &str)> {
+        plan.ops
+            .iter()
+            .map(|o| {
+                (
+                    match o.action {
+                        Action::Copy => "copy",
+                        Action::Update => "update",
+                        Action::Move => "move",
+                        Action::Delete => "delete",
+                        Action::DeleteDir => "deletedir",
+                        Action::Chmod => "chmod",
+                        Action::Conflict => "conflict",
+                        Action::Note => "note",
+                    },
+                    o.path.as_str(),
+                )
+            })
+            .collect()
+    }
+
+    // ---------- P2-5：空文件 / 歧义配对 ----------
+
+    #[test]
+    fn empty_files_are_never_paired_as_moves() {
+        // 所有零长文件的 blake3 相同。过去它们会被配成一堆"重命名"，
+        // 结果内容虽对，归因却是编的。syncthing 在 findRename 里直接排除 Size == 0。
+        let e = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+        let s = snap("windows", vec![sized("new/a.py", e, 0), sized("new/b.py", e, 0)]);
+        let t = snap("windows", vec![sized("old/x.py", e, 0), sized("old/y.py", e, 0)]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        assert!(
+            !plan.ops.iter().any(|o| o.action == Action::Move),
+            "zero-length files must never be paired as renames: {:?}",
+            actions(&plan)
+        );
+        assert_eq!(plan.ops.iter().filter(|o| o.action == Action::Copy).count(), 2);
+        assert_eq!(plan.ops.iter().filter(|o| o.action == Action::Delete).count(), 2);
+    }
+
+    #[test]
+    fn ambiguous_move_is_labelled_as_such() {
+        // 同内容的多个候选：配对结果内容正确，但 from 是任选的——reason 必须说实话
+        let s = snap("windows", vec![sized("moved/one.bin", "h", 10)]);
+        let t = snap(
+            "windows",
+            vec![sized("a/one.bin", "h", 10), sized("b/one.bin", "h", 10), sized("c/one.bin", "h", 10)],
+        );
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        let mv = plan.ops.iter().find(|o| o.action == Action::Move).expect("should still pair one");
+        assert!(mv.reason.contains("ambiguous"), "reason must admit the ambiguity, got {:?}", mv.reason);
+        assert!(mv.reason.contains('3'), "and say how many candidates: {:?}", mv.reason);
+    }
+
+    #[test]
+    fn unambiguous_move_stays_clean() {
+        let s = snap("windows", vec![sized("moved/one.bin", "h", 10)]);
+        let t = snap("windows", vec![sized("one.bin", "h", 10)]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        let mv = plan.ops.iter().find(|o| o.action == Action::Move).unwrap();
+        assert!(!mv.reason.contains("ambiguous"), "a single candidate must not be flagged: {:?}", mv.reason);
+    }
+
+    // ---------- P1-3：archive 多代归因 ----------
+
+    #[test]
+    fn a_side_that_is_merely_behind_is_not_a_conflict() {
+        // archive 已推进到 H2；source 改到 H3，target 还停在 H1（上次没同步成功）。
+        // 过去两边都 != archive 当前代 → 误报 both-changed。
+        let s = snap("windows", vec![file("f.txt", "H3")]);
+        let t = snap("macos", vec![file("f.txt", "H1")]);
+        let a = snap("windows", vec![arch("f.txt", "H2", &["H1", "H0"])]);
+        let plan = compare(&s, &t, "sync", Some(&a), false, &CompareOptions::default());
+        assert_eq!(plan.header.conflict_count, 0, "being behind is not concurrent editing: {:?}", actions(&plan));
+        let up = plan.ops.iter().find(|o| o.action == Action::Update).expect("should propagate");
+        assert_eq!(up.side, Side::Target);
+        assert_eq!(up.hash.as_deref(), Some("H3"));
+    }
+
+    #[test]
+    fn genuinely_novel_content_on_both_sides_is_still_a_conflict() {
+        // 两边的内容 archive 都没见过 → 这才是真并发修改，绝不能被多代逻辑放过
+        let s = snap("windows", vec![file("f.txt", "X")]);
+        let t = snap("macos", vec![file("f.txt", "Y")]);
+        let a = snap("windows", vec![arch("f.txt", "H2", &["H1", "H0"])]);
+        let plan = compare(&s, &t, "sync", Some(&a), false, &CompareOptions::default());
+        assert_eq!(plan.header.conflict_count, 1, "{:?}", actions(&plan));
+    }
+
+    #[test]
+    fn newer_generation_wins_when_both_sides_are_behind() {
+        // source 停在第 1 代、target 停在第 2 代 → source 较新，向 target 传播
+        let s = snap("windows", vec![file("f.txt", "H1")]);
+        let t = snap("macos", vec![file("f.txt", "H0")]);
+        let a = snap("windows", vec![arch("f.txt", "H2", &["H1", "H0"])]);
+        let plan = compare(&s, &t, "sync", Some(&a), false, &CompareOptions::default());
+        assert_eq!(plan.header.conflict_count, 0);
+        let up = plan.ops.iter().find(|o| o.action == Action::Update).unwrap();
+        assert_eq!(up.side, Side::Target);
+        assert!(up.reason.contains("behind-by-generations"), "{}", up.reason);
+    }
+
+    #[test]
+    fn roll_generations_builds_the_history_chain() {
+        use crate::table::roll_generations;
+        let old = vec![arch("f.txt", "H1", &["H0"])];
+        let mut fresh = vec![file("f.txt", "H2")];
+        roll_generations(&mut fresh, &old);
+        assert_eq!(fresh[0].prev.as_ref().unwrap(), &vec!["H1".to_string(), "H0".to_string()]);
+
+        // 内容没变时不该把同一个 hash 灌进历史
+        let mut same = vec![file("f.txt", "H1")];
+        roll_generations(&mut same, &old);
+        assert_eq!(same[0].prev.as_ref().unwrap(), &vec!["H0".to_string()]);
+    }
+
+    // ---------- P1-2：冲突副本 ----------
+
+    #[test]
+    fn conflict_policy_report_is_the_default_and_changes_nothing() {
+        let s = snap_named("windows", "WIN", vec![file_at("f.txt", "X", 200)]);
+        let t = snap_named("macos", "MAC", vec![file_at("f.txt", "Y", 100)]);
+        let plan = compare(&s, &t, "sync", None, false, &CompareOptions::default());
+        assert_eq!(plan.header.conflict_count, 1);
+        assert!(!plan.ops.iter().any(|o| o.action == Action::Move), "report policy must not touch anything");
+    }
+
+    #[test]
+    fn conflict_copy_keeps_the_loser_and_lands_the_winner() {
+        let s = snap_named("windows", "WIN", vec![file_at("doc/report.pdf", "NEW", 5_000)]);
+        let t = snap_named("macos", "MAC", vec![file_at("doc/report.pdf", "OLD", 1_000)]);
+        let opts = CompareOptions { conflict: ConflictPolicy::Copy, ..Default::default() };
+        let plan = compare(&s, &t, "sync", None, false, &opts);
+
+        // 败方（target，mtime 旧）先改名留档
+        let mv = plan.ops.iter().find(|o| o.action == Action::Move).expect("loser must be kept");
+        assert_eq!(mv.side, Side::Target);
+        assert_eq!(mv.from.as_deref(), Some("doc/report.pdf"));
+        assert!(mv.path.starts_with("doc/report.sync-conflict-"), "{}", mv.path);
+        assert!(mv.path.ends_with(".pdf"), "extension must be preserved: {}", mv.path);
+        // 胜方内容落到 target
+        let up = plan.ops.iter().find(|o| o.action == Action::Update && o.path == "doc/report.pdf").unwrap();
+        assert_eq!(up.hash.as_deref(), Some("NEW"));
+        // 原冲突行降级为可审计的 note，不再计入冲突数
+        assert_eq!(plan.header.conflict_count, 0);
+        assert!(plan.ops.iter().any(|o| o.action == Action::Note && o.reason.starts_with("auto-resolved")));
+    }
+
+    #[test]
+    fn conflict_newer_overwrites_without_a_copy() {
+        let s = snap_named("windows", "WIN", vec![file_at("f.txt", "NEW", 900)]);
+        let t = snap_named("macos", "MAC", vec![file_at("f.txt", "OLD", 100)]);
+        let opts = CompareOptions { conflict: ConflictPolicy::Newer, ..Default::default() };
+        let plan = compare(&s, &t, "sync", None, false, &opts);
+        assert!(!plan.ops.iter().any(|o| o.action == Action::Move), "newer policy keeps no copy");
+        let up = plan.ops.iter().find(|o| o.action == Action::Update).unwrap();
+        assert_eq!(up.side, Side::Target);
+        assert_eq!(up.hash.as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn conflict_resolution_respects_the_older_side_winning() {
+        // target 更新 → 胜方是 target，副本与覆盖都发生在 source 侧
+        let s = snap_named("windows", "WIN", vec![file_at("f.txt", "OLD", 100)]);
+        let t = snap_named("macos", "MAC", vec![file_at("f.txt", "NEW", 900)]);
+        let opts = CompareOptions { conflict: ConflictPolicy::Copy, ..Default::default() };
+        let plan = compare(&s, &t, "sync", None, false, &opts);
+        let mv = plan.ops.iter().find(|o| o.action == Action::Move).unwrap();
+        assert_eq!(mv.side, Side::Source);
+        let up = plan.ops.iter().find(|o| o.action == Action::Update && o.path == "f.txt").unwrap();
+        assert_eq!(up.side, Side::Source);
+        assert_eq!(up.hash.as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn delete_versus_change_conflicts_are_never_auto_resolved() {
+        // "对面删了但我改了" —— 自动仲裁"删还是留"太危险，任何策略下都只报告
+        let s = snap_named("windows", "WIN", vec![file("f.txt", "CHANGED")]);
+        let t = snap_named("macos", "MAC", Vec::new());
+        let a = snap("windows", vec![file("f.txt", "ORIGINAL")]);
+        let opts = CompareOptions { conflict: ConflictPolicy::Copy, ..Default::default() };
+        let plan = compare(&s, &t, "sync", Some(&a), false, &opts);
+        assert_eq!(plan.header.conflict_count, 1, "{:?}", actions(&plan));
+        assert!(plan.ops.iter().any(|o| o.reason.contains("deleted-on-target-but-changed-on-source")));
+    }
+
+    #[test]
+    fn conflict_names_are_well_formed() {
+        let n = conflict_name("a/b/report.pdf", "WIN 01", 1_769_000_000_000);
+        assert!(n.starts_with("a/b/report.sync-conflict-"), "{n}");
+        assert!(n.ends_with("-WIN-01.pdf"), "host must be sanitised and extension kept: {n}");
+        assert!(is_conflict_copy(&n));
+        // 隐藏文件没有扩展名可言
+        let h = conflict_name(".gitignore", "H", 0);
+        assert!(h.starts_with(".gitignore.sync-conflict-"), "{h}");
+        assert!(!is_conflict_copy("a/b/normal.pdf"));
+    }
+
+    #[test]
+    fn conflict_copies_over_the_limit_are_pruned() {
+        let mut entries = vec![file("f.txt", "SAME")];
+        for i in 1..=4 {
+            entries.push(file(&format!("f.sync-conflict-2026070{i}-120000-MAC.txt"), &format!("c{i}")));
+        }
+        let s = snap_named("windows", "WIN", vec![file("f.txt", "SAME")]);
+        let t = snap_named("macos", "MAC", entries);
+        let opts = CompareOptions { conflict: ConflictPolicy::Copy, max_conflicts: 2, ..Default::default() };
+        let plan = compare(&s, &t, "sync", None, false, &opts);
+        let pruned: Vec<&str> = plan
+            .ops
+            .iter()
+            .filter(|o| o.reason.contains("conflict-copy-over-limit"))
+            .map(|o| o.path.as_str())
+            .collect();
+        assert_eq!(pruned.len(), 2, "4 copies, limit 2 -> drop the 2 oldest: {pruned:?}");
+        assert!(pruned.iter().all(|p| p.contains("20260701") || p.contains("20260702")), "{pruned:?}");
+    }
+
+    // ---------- P2-4：unix 权限位 ----------
+
+    #[test]
+    fn mode_only_difference_produces_a_chmod_not_a_recopy() {
+        let mut se = file("run.sh", "SAME");
+        se.mode = Some(0o755);
+        let mut te = file("run.sh", "SAME");
+        te.mode = Some(0o644);
+        let s = snap("macos", vec![se]);
+        let t = snap("linux", vec![te]);
+        let opts = CompareOptions { sync_mode: true, ..Default::default() };
+        let plan = compare(&s, &t, "mirror", None, false, &opts);
+        assert_eq!(actions(&plan), vec![("chmod", "run.sh")], "content is identical; only the bits differ");
+        assert_eq!(plan.ops[0].mode, Some(0o755));
+    }
+
+    #[test]
+    fn mode_is_ignored_unless_enabled_and_both_sides_are_unix() {
+        let mut se = file("run.sh", "SAME");
+        se.mode = Some(0o755);
+        let mut te = file("run.sh", "SAME");
+        te.mode = Some(0o644);
+        // 默认关
+        let plan = compare(&snap("macos", vec![se.clone()]), &snap("linux", vec![te.clone()]), "mirror", None, false, &CompareOptions::default());
+        assert!(plan.ops.is_empty());
+        // Windows 一侧没有 mode，开了也不该报差异
+        let opts = CompareOptions { sync_mode: true, ..Default::default() };
+        let plan2 = compare(&snap("macos", vec![se]), &snap("windows", vec![te]), "mirror", None, false, &opts);
+        assert!(plan2.ops.is_empty(), "{:?}", actions(&plan2));
+    }
+
+    #[test]
+    fn copies_carry_the_source_mode_when_enabled() {
+        let mut se = file("new.sh", "H");
+        se.mode = Some(0o755);
+        let s = snap("macos", vec![se]);
+        let t = snap("linux", Vec::new());
+        let opts = CompareOptions { sync_mode: true, ..Default::default() };
+        let plan = compare(&s, &t, "mirror", None, false, &opts);
+        assert_eq!(plan.ops.len(), 1);
+        assert_eq!(plan.ops[0].mode, Some(0o755), "a fresh copy must land with the right bits in one step");
+    }
+
+    // ---------- P2-3：大小写撞名 ----------
+
+    #[test]
+    fn case_sensitive_mode_flags_a_write_that_would_clobber_a_case_twin() {
+        // case_sensitive = true 时 Foo.txt 与 foo.txt 是两个文件，
+        // 但 NTFS/APFS 上写前者会静默覆盖后者。
+        let s = snap("windows", vec![file("Foo.txt", "A"), file("foo.txt", "B")]);
+        let t = snap("windows", vec![file("foo.txt", "B")]);
+        let opts = CompareOptions { case_insensitive: false, ..Default::default() };
+        let plan = compare(&s, &t, "mirror", None, false, &opts);
+        let c = plan.ops.iter().find(|o| o.path == "Foo.txt").expect("Foo.txt must be planned somehow");
+        assert_eq!(c.action, Action::Conflict, "{:?}", c.reason);
+        assert!(c.reason.contains("case-collision"), "{}", c.reason);
     }
 
     #[test]
@@ -578,9 +1212,9 @@ mod tests {
     fn case_insensitive_match_and_opt_out() {
         let s = snap("windows", vec![file("Readme.md", "h1")]);
         let t = snap("macos", vec![file("readme.md", "h1")]);
-        assert_eq!(compare(&s, &t, "mirror", None, false, &CompareOptions { case_insensitive: true }).ops.len(), 0);
+        assert_eq!(compare(&s, &t, "mirror", None, false, &CompareOptions { case_insensitive: true, ..Default::default() }).ops.len(), 0);
         // 大小写敏感时：同 hash 的大小写双胞胎被移动检测配对成一次 rename——比复制+删除更聪明
-        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions { case_insensitive: false });
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions { case_insensitive: false, ..Default::default() });
         assert_eq!(plan.ops.len(), 1);
         assert_eq!(plan.ops[0].action, Action::Move);
     }
@@ -705,19 +1339,19 @@ mod tests {
 
     #[test]
     fn reverse_op_semantics() {
-        let copy = Op { side: Side::Target, action: Action::Copy, path: "x".into(), from: None, size: Some(5), mtime_ms: Some(1), hash: None, link: None, reason: "only-in-source".into() };
+        let copy = Op { side: Side::Target, action: Action::Copy, path: "x".into(), from: None, size: Some(5), mtime_ms: Some(1), hash: None, link: None, mode: None, reason: "only-in-source".into() };
         let r = reverse_op(&copy).unwrap();
         assert_eq!((r.side, r.action), (Side::Source, Action::Delete));
 
-        let del = Op { side: Side::Target, action: Action::Delete, path: "x".into(), from: None, size: Some(5), mtime_ms: None, hash: None, link: None, reason: "gone-from-source".into() };
+        let del = Op { side: Side::Target, action: Action::Delete, path: "x".into(), from: None, size: Some(5), mtime_ms: None, hash: None, link: None, mode: None, reason: "gone-from-source".into() };
         let r = reverse_op(&del).unwrap();
         assert_eq!((r.side, r.action), (Side::Source, Action::Copy));
 
-        let upd = Op { side: Side::Target, action: Action::Update, path: "x".into(), from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "differs".into() };
+        let upd = Op { side: Side::Target, action: Action::Update, path: "x".into(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "differs".into() };
         let r = reverse_op(&upd).unwrap();
         assert_eq!((r.side, r.action), (Side::Source, Action::Update));
 
-        let mv = Op { side: Side::Target, action: Action::Move, path: "b".into(), from: Some("a".into()), size: None, mtime_ms: None, hash: None, link: None, reason: "m".into() };
+        let mv = Op { side: Side::Target, action: Action::Move, path: "b".into(), from: Some("a".into()), size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "m".into() };
         assert!(reverse_op(&mv).is_none());
     }
 
