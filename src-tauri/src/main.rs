@@ -1,14 +1,19 @@
 //! SyncDash 桌面壳（Tauri v2）：只做 IPC 编排，全部同步逻辑在 syncdash 核心库。
-//! - compare_job 分阶段发 progress 事件（scan-source / scan-target / comparing）
+//! - v0.9 M1：统一事件流 —— 引擎经 `run::*_with(ctx)` 发 ProgressEvent，
+//!   TauriSink 节流后以 `run-progress` 事件（带 run_id）发往前端；
+//!   旧 `progress` 事件由 shim 从 PhaseStart/Progress 合成，M2 前端落地后拆除。
+//! - 单运行互斥：RunState.active 持 RunCtl；cancel_run / pause_run 对它生效。
 //! - 每个 op 预计算 reverse_op（前端"点徽章翻方向"零逻辑漂移）
 //! - apply_job 接收前端最终定稿的 op 列表（已含翻向与勾选），重活全走 spawn_blocking
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use syncdash::compare::{self, Action, Op, Plan, PlanHeader};
-use syncdash::table::Snapshot;
-use syncdash::{config, run, scan};
+use syncdash::progress::{Phase, ProgressEvent, ProgressSink, RunCtl, RunCtx};
+use syncdash::{config, run};
 use tauri::Emitter;
 
 #[derive(Serialize)]
@@ -34,6 +39,8 @@ struct ApplyDto {
     done: u64,
     skipped: u64,
     errors: u64,
+    bytes_copied: u64,
+    cancelled: bool,
 }
 
 #[derive(Serialize)]
@@ -43,38 +50,135 @@ struct PreflightDto {
     warnings: Vec<String>,
 }
 
+// ---------- 运行状态（互斥 + 取消/暂停句柄） ----------
+
+#[derive(Default)]
+struct RunState {
+    active: Mutex<Option<Arc<RunCtl>>>,
+    seq: AtomicU64,
+}
+
+fn begin_run(st: &RunState) -> Result<(u64, Arc<RunCtl>), String> {
+    let mut g = st.active.lock().unwrap();
+    if g.is_some() {
+        return Err("另一个运行正在进行——先取消它或等它结束".into());
+    }
+    let ctl = RunCtl::new();
+    *g = Some(ctl.clone());
+    Ok((st.seq.fetch_add(1, Ordering::Relaxed) + 1, ctl))
+}
+
+fn end_run(st: &RunState) {
+    *st.active.lock().unwrap() = None;
+}
+
+// ---------- 事件桥 ----------
+
+/// 发往前端的 run-progress 载荷：run_id 让前端丢弃已取消运行的迟到事件
 #[derive(Serialize, Clone)]
-struct Progress {
+struct RunEvent {
+    run_id: u64,
+    #[serde(flatten)]
+    ev: ProgressEvent,
+}
+
+/// 旧状态栏事件（M2 前端落地前的过渡 shim）
+#[derive(Serialize, Clone)]
+struct LegacyProgress {
     phase: String,
     detail: String,
-    /// 哈希阶段的完成百分比（0-100）；非哈希阶段为 -1
+    /// 哈希/复制阶段的完成百分比（0-100）；边界事件为 -1
     pct: i32,
-    /// MiB/s，非哈希阶段为 0
+    /// 保留字段：新流里速率归前端算（4s 滑窗），shim 不再伪造
     rate: f64,
 }
 
-fn emit_progress(app: &tauri::AppHandle, phase: &str, detail: String) {
-    let _ = app.emit("progress", Progress { phase: phase.into(), detail, pct: -1, rate: 0.0 });
+fn legacy_phase(p: Phase) -> &'static str {
+    match p {
+        Phase::ScanSource => "scan-source",
+        Phase::ScanTarget => "scan-target",
+        Phase::Compare => "comparing",
+        Phase::Apply => "applying",
+        Phase::Pack => "packing",
+        Phase::Ship => "shipping",
+        Phase::Verify => "verifying",
+        Phase::Refresh => "refreshing",
+    }
 }
 
-/// 把 scan 的字节级进度转成前端事件（P2-6）。大树扫描时用户能看见百分比与速率，
-/// 而不是盯着一个不动的"扫描中"。
-fn emit_scan_progress(app: &tauri::AppHandle, phase: &'static str, p: scan::ScanProgress) {
-    let pct = if p.bytes_total > 0 { (p.bytes_done * 100 / p.bytes_total) as i32 } else { 100 };
-    let _ = app.emit(
-        "progress",
-        Progress {
-            phase: phase.into(),
-            detail: format!(
-                "{} / {}",
-                syncdash::preflight::human_bytes(p.bytes_done),
-                syncdash::preflight::human_bytes(p.bytes_total)
-            ),
-            pct,
-            rate: p.mib_per_s,
-        },
-    );
+fn legacy_shim(app: &tauri::AppHandle, ev: &ProgressEvent) {
+    match ev {
+        ProgressEvent::PhaseStart { phase, label, .. } => {
+            let _ = app.emit(
+                "progress",
+                LegacyProgress {
+                    phase: legacy_phase(*phase).into(),
+                    detail: label.clone().unwrap_or_default(),
+                    pct: -1,
+                    rate: 0.0,
+                },
+            );
+        }
+        ProgressEvent::Progress { phase, bytes_done, bytes_total, items_done, items_total, .. } => {
+            let pct = if *bytes_total > 0 {
+                (bytes_done * 100 / bytes_total) as i32
+            } else if *items_total > 0 {
+                (items_done * 100 / items_total) as i32
+            } else {
+                -1
+            };
+            let _ = app.emit(
+                "progress",
+                LegacyProgress {
+                    phase: legacy_phase(*phase).into(),
+                    detail: format!(
+                        "{} / {}",
+                        syncdash::preflight::human_bytes(*bytes_done),
+                        syncdash::preflight::human_bytes(*bytes_total)
+                    ),
+                    pct,
+                    rate: 0.0,
+                },
+            );
+        }
+        _ => {}
+    }
 }
+
+/// ProgressSink → Tauri 事件。Progress 类 ≥100ms/条节流（=FFS 图表采样率），
+/// PhaseStart/Totals/Error/Paused/Resumed/Summary 直通。
+struct TauriSink {
+    app: tauri::AppHandle,
+    run_id: u64,
+    last_progress_ms: AtomicU64,
+}
+
+impl ProgressSink for TauriSink {
+    fn emit(&self, ev: ProgressEvent) {
+        if let ProgressEvent::Progress { ts_ms, .. } = &ev {
+            let last = self.last_progress_ms.load(Ordering::Relaxed);
+            if ts_ms.saturating_sub(last) < 100 {
+                return;
+            }
+            self.last_progress_ms.store(*ts_ms, Ordering::Relaxed);
+        }
+        legacy_shim(&self.app, &ev);
+        let _ = self.app.emit("run-progress", RunEvent { run_id: self.run_id, ev });
+    }
+}
+
+fn make_ctx(app: &tauri::AppHandle, run_id: u64, ctl: Arc<RunCtl>) -> RunCtx {
+    RunCtx::new(
+        ctl,
+        Arc::new(TauriSink { app: app.clone(), run_id, last_progress_ms: AtomicU64::new(0) }),
+    )
+}
+
+fn user_err(e: std::io::Error) -> String {
+    if syncdash::progress::is_cancelled(&e) { "cancelled".into() } else { e.to_string() }
+}
+
+// ---------- 命令 ----------
 
 #[tauri::command]
 fn list_jobs() -> Vec<JobDto> {
@@ -96,38 +200,44 @@ fn jobs_dir() -> String {
     config::jobs_dir().display().to_string()
 }
 
+/// 对活动运行请求协作取消。返回是否存在活动运行。
 #[tauri::command]
-async fn compare_job(app: tauri::AppHandle, name: String) -> Result<PlanDto, String> {
+fn cancel_run(state: tauri::State<'_, Arc<RunState>>) -> bool {
+    match state.active.lock().unwrap().as_ref() {
+        Some(ctl) => {
+            ctl.request_cancel();
+            true
+        }
+        None => false,
+    }
+}
+
+/// 暂停/恢复活动运行（暂停期间 elapsed 不涨、RootLock 心跳继续跳）
+#[tauri::command]
+fn pause_run(state: tauri::State<'_, Arc<RunState>>, paused: bool) -> bool {
+    match state.active.lock().unwrap().as_ref() {
+        Some(ctl) => {
+            ctl.set_paused(paused);
+            true
+        }
+        None => false,
+    }
+}
+
+#[tauri::command]
+async fn compare_job(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<RunState>>,
+    name: String,
+) -> Result<PlanDto, String> {
+    let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
-        // P0-2：root 可达性 + 挂载点标记。共享盘没挂上时照常比对会产出
-        // "把对面删光"的计划，这道闸必须在扫描之前。
-        let mut v = syncdash::preflight::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-        syncdash::preflight::check_root("source", &job.source, job.require_marker, &mut v);
-        syncdash::preflight::check_root("target", &job.target, job.require_marker, &mut v);
-        for w in &v.warnings {
-            emit_progress(&app, "warning", w.clone());
-        }
-        if !v.ok() {
-            return Err(v.blockers.join("\n"));
-        }
-        let opt = run::scan_opts(&job);
-        emit_progress(&app, "scan-source", job.source.display().to_string());
-        let s = {
-            let cb = |p: scan::ScanProgress| emit_scan_progress(&app, "scan-source", p);
-            scan::scan_with_progress(&job.source, &opt, Some(&cb)).map_err(|e| e.to_string())?
-        };
-        emit_progress(&app, "scan-target", job.target.display().to_string());
-        let t = {
-            let cb = |p: scan::ScanProgress| emit_scan_progress(&app, "scan-target", p);
-            scan::scan_with_progress(&job.target, &opt, Some(&cb)).map_err(|e| e.to_string())?
-        };
-        emit_progress(&app, "comparing", format!("{} × {} 条目", s.header.entry_count, t.header.entry_count));
-        let archive = match (&job.archive, job.mode.as_str()) {
-            (Some(p), "sync") if p.is_file() => Some(Snapshot::load(p).map_err(|e| e.to_string())?),
-            _ => None,
-        };
-        let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &job.compare_opts());
+        let (run_id, ctl) = begin_run(&st)?;
+        let ctx = make_ctx(&app, run_id, ctl);
+        let r = run::compare_job_with(&job, &ctx);
+        end_run(&st);
+        let plan = r.map_err(user_err)?;
         let reversed = plan.ops.iter().map(compare::reverse_op).collect();
         Ok(PlanDto { header: plan.header, ops: plan.ops, reversed })
     })
@@ -154,7 +264,15 @@ async fn preflight(name: String, plan: PlanDto, ops: Vec<Op>, acknowledged: bool
 }
 
 #[tauri::command]
-async fn apply_job(name: String, plan: PlanDto, ops: Vec<Op>, acknowledged: bool) -> Result<ApplyDto, String> {
+async fn apply_job(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<RunState>>,
+    name: String,
+    plan: PlanDto,
+    ops: Vec<Op>,
+    acknowledged: bool,
+) -> Result<ApplyDto, String> {
+    let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
         let full = Plan { header: plan.header.clone(), ops: plan.ops.clone() };
@@ -167,8 +285,17 @@ async fn apply_job(name: String, plan: PlanDto, ops: Vec<Op>, acknowledged: bool
         if !v.ok() {
             return Err(v.blockers.join("\n"));
         }
-        let (done, skipped, errors) = run::apply_job_guarded(&job, &full, &ops, None, false, acknowledged);
-        Ok(ApplyDto { done, skipped, errors })
+        let (run_id, ctl) = begin_run(&st)?;
+        let ctx = make_ctx(&app, run_id, ctl);
+        let out = run::apply_job_guarded_with(&job, &full, &ops, None, false, acknowledged, &ctx);
+        end_run(&st);
+        Ok(ApplyDto {
+            done: out.done,
+            skipped: out.skipped,
+            errors: out.errors,
+            bytes_copied: out.bytes_copied,
+            cancelled: out.cancelled,
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -176,7 +303,10 @@ async fn apply_job(name: String, plan: PlanDto, ops: Vec<Op>, acknowledged: bool
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![list_jobs, jobs_dir, compare_job, preflight, apply_job])
+        .manage(Arc::new(RunState::default()))
+        .invoke_handler(tauri::generate_handler![
+            list_jobs, jobs_dir, compare_job, preflight, apply_job, cancel_run, pause_run
+        ])
         .run(tauri::generate_context!())
         .expect("error while running SyncDash");
 }

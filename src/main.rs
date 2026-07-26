@@ -584,7 +584,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     return Ok(2);
                 }
             }
-            let (done, skipped, errors) = apply::apply(&p.ops, &sr, &tr, &apply::ApplyOptions { dry_run: !do_apply, trash, verbose, verify, versioning, delta, fsync: !no_fsync, filter: None });
+            let (done, skipped, errors) = apply::apply(&p.ops, &sr, &tr, &apply::ApplyOptions { dry_run: !do_apply, trash, verbose, verify, versioning, delta, fsync: !no_fsync, ..Default::default() });
             println!(
                 "{}: {done} done, {skipped} {}, {errors} error(s)",
                 if do_apply { "applied" } else { "dry-run" },

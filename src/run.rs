@@ -18,11 +18,7 @@ pub fn scan_opts(job: &Job) -> scan::ScanOptions {
     scan::ScanOptions { hash: hash && !job.no_hash, force_rehash, symlinks_direct: job.symlinks == "direct", filter }
 }
 
-/// sync 成功后刷新 archive：重扫 source、剔除冲突路径（冲突下次继续报，绝不被静默仲裁）
-fn refresh_archive(job: &Job, plan: &Plan) {
-    refresh_archive_with(job, plan, &crate::progress::RunCtx::null());
-}
-
+/// sync 成功后刷新 archive：重扫 source、剔除冲突路径（冲突下次继续报，绝不被静默仲裁）。
 /// v0.9 M1：Refresh 阶段可见化——archive 重扫是个今天完全隐形的长阶段，挂上事件流与取消。
 /// 被取消只意味着冲突下轮重报，安全。
 fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::progress::RunCtx) {
@@ -74,6 +70,15 @@ pub fn compare_job_with(job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Re
     crate::preflight::check_root("target", &job.target, job.require_marker, &mut v);
     for w in &v.warnings {
         eprintln!("warning: {w}");
+        // windowed 桌面构建里 stderr 会丢——警告也走事件流（action 区分，不算 errors 计数）
+        ctx.sink.emit(crate::progress::ProgressEvent::Error {
+            phase: Phase::ScanSource,
+            ts_ms: crate::table::now_ms(),
+            path: String::new(),
+            action: "warning".into(),
+            side: "source".into(),
+            message: w.clone(),
+        });
     }
     if !v.ok() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
@@ -127,9 +132,8 @@ pub fn apply_job_guarded(
     apply_job_guarded_with(job, plan, ops, trash, verbose, acknowledged, &crate::progress::RunCtx::null()).into_tuple()
 }
 
-/// v0.9 M1：带事件流的执行编排——Apply 阶段（总量开跑前即知）→ Refresh 阶段 → Summary 终态。
-/// 注：per-op/逐字节事件在 apply_with（M1 步骤 5）落地后由 apply 层发出；本层先保证
-/// 阶段边界、总量与终态摘要正确，desktop 即可先接骨架。
+/// v0.9 M1：带事件流的执行编排——Apply 阶段（apply_with 自报总量与逐字节进度）→
+/// Refresh 阶段 → Summary 终态。
 pub fn apply_job_guarded_with(
     job: &Job,
     plan: &Plan,
@@ -164,24 +168,12 @@ pub fn apply_job_guarded_with(
         }
         return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
     }
-    let items_total = ops.iter().filter(|o| !matches!(o.action, Action::Conflict | Action::Note)).count() as u64;
-    let bytes_total: u64 = ops
-        .iter()
-        .filter(|o| matches!(o.action, Action::Copy | Action::Update) && o.link.is_none())
-        .filter_map(|o| o.size)
-        .sum();
-    let _pp = crate::progress::PhaseProgress::begin(ctx, Phase::Apply, None, items_total, bytes_total);
-    let (done, skipped, errors) = apply::apply(ops, src_root, tgt_root, &job.apply_opts(trash, verbose));
-    if errors == 0 && job.mode == "sync" {
+    let ap = apply::apply_with(ops, src_root, tgt_root, &job.apply_opts(trash, verbose), ctx);
+    // 取消的运行不做 archive 刷新：用户要的是"立刻停"，且冲突下轮重报本来就安全
+    if ap.errors == 0 && !ap.cancelled && job.mode == "sync" {
         refresh_archive_with(job, plan, ctx);
     }
-    let out = ApplyOutcome {
-        done,
-        skipped,
-        errors,
-        bytes_copied: bytes_total, // apply_with 落地后换成真实累计
-        cancelled: ctx.ctl.cancelled(),
-    };
+    let out = ApplyOutcome { cancelled: ctx.ctl.cancelled(), ..ap };
     ctx.sink.emit(ProgressEvent::Summary {
         ts_ms: crate::table::now_ms(),
         done: out.done,
@@ -219,7 +211,52 @@ pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackno
 /// 远程管线（v0.6 ssh 一条龙）：ssh 探测 → 远端本地扫描（stdout 收表）→ 本地扫描 → 比对
 /// → target 侧打包 ssh 送达 apply-pack → source 侧经挂载路径直落 → sync 成功后刷新 archive。
 pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
+    run_remote_job_with(name, job, do_apply, verbose, acknowledged, &crate::progress::RunCtx::null())
+}
+
+/// v0.9 M1：远程管线的级边界事件化——每级 PhaseStart、级间协作点（取消/暂停响应）、终态 Summary。
+/// ssh 传输内部的逐字节计数与 kill-on-cancel 是明确后补（M1 步骤 8）；本层保证的是：
+/// 桌面能看见管线走到哪一级、能在级间取消、Summary 数字如实。
+pub fn run_remote_job_with(
+    name: &str,
+    job: &Job,
+    do_apply: bool,
+    verbose: bool,
+    acknowledged: bool,
+    ctx: &crate::progress::RunCtx,
+) -> std::io::Result<(u64, u64, u64, u64)> {
+    let t0 = std::time::Instant::now();
+    let r = run_remote_job_inner(name, job, do_apply, verbose, acknowledged, ctx, t0);
+    if let Err(e) = &r {
+        // 级间取消：计数尚无意义，但终态必须可见（desktop 靠 Summary 收窗）
+        if crate::progress::is_cancelled(e) {
+            ctx.sink.emit(crate::progress::ProgressEvent::Summary {
+                ts_ms: crate::table::now_ms(),
+                done: 0,
+                skipped: 0,
+                errors: 0,
+                bytes_done: 0,
+                elapsed_ms: t0.elapsed().as_millis() as u64,
+                paused_ms: ctx.ctl.paused_total_ms(),
+                cancelled: true,
+            });
+        }
+    }
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_remote_job_inner(
+    name: &str,
+    job: &Job,
+    do_apply: bool,
+    verbose: bool,
+    acknowledged: bool,
+    ctx: &crate::progress::RunCtx,
+    t0: std::time::Instant,
+) -> std::io::Result<(u64, u64, u64, u64)> {
     use crate::compare::Side;
+    use crate::progress::{Phase, PhaseProgress, ProgressEvent};
     let host = job
         .remote_host
         .as_deref()
@@ -255,6 +292,9 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackn
     if job.symlinks == "direct" {
         scan_args.push("--symlinks-direct".into());
     }
+    ctx.checkpoint()?;
+    // 远端在自己盘上扫描，本地只能看到"进行中"——总量归零、label 说明白在等谁
+    let _pp_rs = PhaseProgress::begin(ctx, Phase::ScanTarget, Some(format!("ssh:{host} {rroot}")), 0, 0);
     let table_bytes = crate::remote::ssh_capture(host, &crate::remote::remote_cmd(shell, exe, &scan_args))?;
     let t = Snapshot::from_reader(std::io::BufReader::new(&table_bytes[..]))?;
 
@@ -267,11 +307,18 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackn
     if !v.ok() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
     }
-    let s = scan::scan(&job.source, &scan_opts(job))?;
+    let s = scan::scan_ctx(&job.source, &scan_opts(job), ctx, Phase::ScanSource)?;
     let archive = match (&job.archive, job.mode.as_str()) {
         (Some(p), "sync") if p.is_file() => Some(Snapshot::load(p)?),
         _ => None,
     };
+    let _pp_cmp = PhaseProgress::begin(
+        ctx,
+        Phase::Compare,
+        Some(format!("{} × {} 条目", s.header.entry_count, t.header.entry_count)),
+        0,
+        0,
+    );
     let copts = job.compare_opts();
     let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
     eprintln!("[{name}] {} op(s), {} conflict(s)  (remote pipeline via ssh:{host})", plan.header.op_count, plan.header.conflict_count);
@@ -296,6 +343,7 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackn
     let mut done = 0u64;
     let mut skipped = 0u64;
     let mut errors = 0u64;
+    let mut bytes_done_total = 0u64;
 
     // 4) target 侧：（大更新先要远端块表走 FastCDC 增量）打包 → ssh 送包 → 远端 apply-pack
     let has_target_ops = plan.ops.iter().any(|o| o.side == Side::Target && !matches!(o.action, Action::Conflict | Action::Note));
@@ -340,8 +388,11 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackn
                 }
             }
         };
+        ctx.checkpoint()?;
+        let pp_pack = PhaseProgress::begin(ctx, Phase::Pack, Some("打包 target 侧内容".into()), 0, 0);
         let tmp = std::env::temp_dir().join(format!("syncdash-remote-{}.tar", crate::table::now_ms()));
         let sum = crate::pack::pack(&plan, &job.source, &tmp, remote_chunks.as_ref())?;
+        pp_pack.set_totals(sum.ops, sum.bytes);
         if sum.delta_saved > 0 {
             eprintln!("[{name}] packed {} B, delta saved {} B", sum.bytes, sum.delta_saved);
         }
@@ -350,10 +401,19 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackn
         } else {
             format!("/tmp/syncdash-{}.tar", crate::table::now_ms())
         };
+        ctx.checkpoint()?;
+        let tar_len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        let pp_ship = PhaseProgress::begin(ctx, Phase::Ship, Some(format!("→ ssh:{host}")), 1, tar_len);
         let recv_cmd = crate::remote::remote_cmd(shell, exe, &["recv".into(), rpkg.clone()]);
         let ship = crate::remote::ssh_run_with_stdin(host, &recv_cmd, &tmp);
         let _ = std::fs::remove_file(&tmp);
         ship?;
+        pp_ship.add_bytes(tar_len, &rpkg);
+        pp_ship.item_done(&rpkg);
+        bytes_done_total += sum.bytes;
+
+        ctx.checkpoint()?;
+        let _pp_ra = PhaseProgress::begin(ctx, Phase::Apply, Some(format!("ssh:{host} apply-pack")), sum.ops, 0);
         let mut ap_args: Vec<String> = vec!["apply-pack".into(), rpkg.clone(), "--apply".into(), "--remove-pkg".into()];
         if job.versioning {
             ap_args.push("--versioning".into());
@@ -367,6 +427,14 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackn
         } else {
             errors += 1;
             eprintln!("[{name}] remote apply-pack reported failure");
+            ctx.sink.emit(ProgressEvent::Error {
+                phase: Phase::Apply,
+                ts_ms: crate::table::now_ms(),
+                path: rpkg.clone(),
+                action: "apply-pack".into(),
+                side: "target".into(),
+                message: "remote apply-pack reported failure".into(),
+            });
         }
     }
 
@@ -379,15 +447,17 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackn
         .collect();
     if !src_ops.is_empty() {
         if job.target.is_dir() {
-            let (d2, s2, e2) = crate::apply::apply(
+            let out = crate::apply::apply_with(
                 &src_ops,
                 &job.source,
                 &job.target,
                 &job.apply_opts(None, verbose),
+                ctx,
             );
-            done += d2;
-            skipped += s2;
-            errors += e2;
+            done += out.done;
+            skipped += out.skipped;
+            errors += out.errors;
+            bytes_done_total += out.bytes_copied;
         } else {
             skipped += src_ops.len() as u64;
             eprintln!(
@@ -398,8 +468,18 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackn
         }
     }
 
-    if errors == 0 && job.mode == "sync" {
-        refresh_archive(job, &plan);
+    if errors == 0 && !ctx.ctl.cancelled() && job.mode == "sync" {
+        refresh_archive_with(job, &plan, ctx);
     }
+    ctx.sink.emit(ProgressEvent::Summary {
+        ts_ms: crate::table::now_ms(),
+        done,
+        skipped,
+        errors,
+        bytes_done: bytes_done_total,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+        paused_ms: ctx.ctl.paused_total_ms(),
+        cancelled: ctx.ctl.cancelled(),
+    });
     Ok((done, skipped, errors, plan.header.conflict_count))
 }

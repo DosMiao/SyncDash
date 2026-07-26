@@ -144,6 +144,39 @@ impl RunCtx {
     pub fn new(ctl: Arc<RunCtl>, sink: Arc<dyn ProgressSink>) -> RunCtx {
         RunCtx { ctl, sink }
     }
+
+    /// 协作点：取消 → Err(Interrupted)；暂停 → 100ms 小睡循环（Paused/Resumed CAS 去重发射）。
+    /// PhaseProgress::checkpoint 委托到这里；远程管线的级间协作点（无计数器语境）直接用它。
+    pub fn checkpoint(&self) -> std::io::Result<()> {
+        let ctl = &self.ctl;
+        if ctl.cancel.load(Ordering::Relaxed) {
+            return Err(cancelled_err());
+        }
+        if ctl.paused.load(Ordering::Relaxed) {
+            if !ctl.pause_announced.swap(true, Ordering::SeqCst) {
+                ctl.paused_since_ms.store(crate::table::now_ms(), Ordering::SeqCst);
+                self.sink.emit(ProgressEvent::Paused { ts_ms: crate::table::now_ms() });
+            }
+            while ctl.paused.load(Ordering::Relaxed) {
+                if ctl.cancel.load(Ordering::Relaxed) {
+                    return Err(cancelled_err());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if ctl.pause_announced.swap(false, Ordering::SeqCst) {
+                let since = ctl.paused_since_ms.swap(0, Ordering::SeqCst);
+                if since > 0 {
+                    let dur = crate::table::now_ms().saturating_sub(since);
+                    ctl.paused_total_ms.fetch_add(dur, Ordering::SeqCst);
+                }
+                self.sink.emit(ProgressEvent::Resumed {
+                    ts_ms: crate::table::now_ms(),
+                    paused_ms: ctl.paused_total_ms.load(Ordering::SeqCst),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// apply 类运行的结果（旧元组接口走 into_tuple）
@@ -238,34 +271,7 @@ impl<'a> PhaseProgress<'a> {
     /// 协作点：取消 → Err(Interrupted)；暂停 → 100ms 小睡循环（Paused/Resumed CAS 去重发射）。
     /// 放进每个 walk 迭代、每个待哈希文件、每个 1MiB 复制块之间。
     pub fn checkpoint(&self) -> std::io::Result<()> {
-        let ctl = &self.ctx.ctl;
-        if ctl.cancel.load(Ordering::Relaxed) {
-            return Err(cancelled_err());
-        }
-        if ctl.paused.load(Ordering::Relaxed) {
-            if !ctl.pause_announced.swap(true, Ordering::SeqCst) {
-                ctl.paused_since_ms.store(crate::table::now_ms(), Ordering::SeqCst);
-                self.ctx.sink.emit(ProgressEvent::Paused { ts_ms: crate::table::now_ms() });
-            }
-            while ctl.paused.load(Ordering::Relaxed) {
-                if ctl.cancel.load(Ordering::Relaxed) {
-                    return Err(cancelled_err());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            if ctl.pause_announced.swap(false, Ordering::SeqCst) {
-                let since = ctl.paused_since_ms.swap(0, Ordering::SeqCst);
-                if since > 0 {
-                    let dur = crate::table::now_ms().saturating_sub(since);
-                    ctl.paused_total_ms.fetch_add(dur, Ordering::SeqCst);
-                }
-                self.ctx.sink.emit(ProgressEvent::Resumed {
-                    ts_ms: crate::table::now_ms(),
-                    paused_ms: ctl.paused_total_ms.load(Ordering::SeqCst),
-                });
-            }
-        }
-        Ok(())
+        self.ctx.checkpoint()
     }
 
     /// (items_done, items_total, bytes_done, bytes_total)

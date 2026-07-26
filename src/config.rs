@@ -75,6 +75,9 @@ pub struct Job {
     /// SMB/WAN 上传是净赚，对称链路打平——所以默认关，按链路自行开。
     #[serde(default)]
     pub delta: bool,
+    /// Copy/Update 相位的并行宽度（1 = 顺序）。缺省 4；clamp 1..=16
+    #[serde(default)]
+    pub parallel: Option<usize>,
 }
 
 impl Default for Job {
@@ -103,6 +106,7 @@ impl Default for Job {
             sync_mode: false,
             deletable: Vec::new(),
             delta: false,
+            parallel: None,
         }
     }
 }
@@ -156,6 +160,7 @@ impl Job {
             fsync: self.fsync,
             filter: Some(crate::filter::PathFilter::build_full(&self.include, &self.exclude, &self.deletable)),
             delta: self.delta,
+            parallel: self.parallel.unwrap_or(4).clamp(1, 16),
         }
     }
 }
@@ -260,8 +265,9 @@ target = '\\host\share\dir'
 # exclude = ['*/*.log', '!*/audit.log'] # `!` 前缀 = 例外，压过其它 exclude
 # deletable = ['*/node_modules/']       # 不同步，但删父目录时可连带删（syncthing 的 (?d)）
 #
-# --- 增量 ---
+# --- 增量与并行 ---
 # delta = true                          # 本地/挂载盘大文件按块增量写；SMB 上传划算，对称链路打平
+# parallel = 4                          # Copy/Update 并行宽度（1 = 顺序；SMB 上 2-4 条流基本吃满上行）
 #
 # 远程管线（可选）：远端在自己盘上扫描（快），target 侧打包经 ssh 送达执行
 # remote_host = 'mac'

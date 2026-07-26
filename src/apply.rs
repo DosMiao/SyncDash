@@ -4,10 +4,16 @@
 //!   中断绝不会在最终路径留半截内容。
 //! - 删除与被覆盖的文件先挪进本机回收目录 / `.version_syncDash`（可找回），不做原地销毁
 //! - copy 后把 mtime 设成源表里的值，并**回读校正** —— 下次比对的相等判定依赖它
+//! - v0.9 M1：执行分五个**串行相位**，其中 Copy/Update 相位内部并行
+//!   （唯一 I/O 重类；宽度 = `ApplyOptions::parallel`）。不信输入顺序——桌面翻向的
+//!   ops 会破坏计划的 rank 排序，apply 自己重新分类分相。
 
 use crate::compare::{Action, Op, Side};
+use crate::progress::{ApplyOutcome, Phase, PhaseProgress, RunCtx};
 use filetime::FileTime;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// 超过这个体积就不做内存内增量（避免把几 GB 读进内存）
 const DELTA_MEM_CAP: u64 = 1024 * 1024 * 1024;
@@ -26,6 +32,9 @@ pub struct ApplyOptions {
     pub filter: Option<crate::filter::PathFilter>,
     /// 本地/挂载盘的增量更新（详见 update_with_delta 的注释；默认关）
     pub delta: bool,
+    /// Copy/Update 相位的并行宽度（1 = 顺序）。默认 4：SMB 上 2-4 条流基本吃满
+    /// 上行带宽，再宽只会加剧对端排队。clamp 到 1..=16。
+    pub parallel: usize,
 }
 
 impl Default for ApplyOptions {
@@ -39,6 +48,7 @@ impl Default for ApplyOptions {
             fsync: true,
             filter: None,
             delta: false,
+            parallel: 4,
         }
     }
 }
@@ -222,266 +232,435 @@ fn update_with_delta(
     Ok(Some((written, new.len() as u64)))
 }
 
-pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOptions) -> (u64, u64, u64) {
-    // FFS dir_lock 思路：动手前锁两侧 root（带心跳），防两台机器同时 apply 同一目录
-    let _lock_guard: Option<(crate::lock::RootLock, crate::lock::RootLock)> = if opt.dry_run {
-        None
+/// 工作线程共享的执行环境。计数器全原子、写入器上锁——worker 只借 &Shared。
+struct Shared<'a> {
+    opt: &'a ApplyOptions,
+    ctx: &'a RunCtx,
+    source_root: &'a Path,
+    target_root: &'a Path,
+    trash: PathBuf,
+    ver_source: Mutex<Option<crate::version::VersionWriter>>,
+    ver_target: Mutex<Option<crate::version::VersionWriter>>,
+    // P1-4：文件系统实际存下来的 mtime 与我们想要的不一致时（FAT 2 秒粒度、
+    // 某些 SMB 服务端截断），记下 (ondisk, intended) 供下次扫描换算，
+    // 而不是靠 ±2s 容差硬扛。syncthing 的 mtimeFS 同款做法。
+    mtime_fixes: Mutex<Vec<(bool, String, i64, i64)>>,
+    delta_saved: AtomicU64,
+}
+
+#[derive(Default)]
+struct Counters {
+    done: AtomicU64,
+    skipped: AtomicU64,
+    errors: AtomicU64,
+}
+
+/// 被覆盖/被删的原件先留档（trash 或 .version_syncDash）
+fn preserve(sh: &Shared, op: &Op, exec_root: &Path, dst: &Path, why: &str, newer: Option<&Path>) -> std::io::Result<()> {
+    if sh.opt.versioning {
+        let slot = if op.side == Side::Source { &sh.ver_source } else { &sh.ver_target };
+        let mut w = slot.lock().unwrap();
+        if w.is_none() {
+            *w = Some(crate::version::VersionWriter::begin(exec_root)?);
+        }
+        w.as_mut().unwrap().preserve(&op.path, dst, newer, why)
     } else {
+        move_to_trash(dst, &op.path, &sh.trash)
+    }
+}
+
+/// 执行单个 op。取消/暂停经 `pp.checkpoint()` 在块边界响应；
+/// 取消返回 Interrupted，Staged::Drop 保证终点无残留。
+fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
+    let (exec_root, other_root) = match op.side {
+        Side::Target => (sh.target_root, sh.source_root),
+        Side::Source => (sh.source_root, sh.target_root),
+    };
+    let dst = exec_root.join(to_native(&op.path));
+    match op.action {
+        Action::Copy | Action::Update => {
+            if let Some(p) = dst.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            // symlink 操作：创建链接本身，不复制内容（链接是元数据，无所谓原子写）
+            if let Some(target) = &op.link {
+                if exists_no_follow(&dst) {
+                    preserve(sh, op, exec_root, &dst, "overwritten", None)?;
+                }
+                return create_symlink(target, &dst);
+            }
+            let src = other_root.join(to_native(&op.path));
+
+            // ---- 原子落盘（P0-1）----
+            let mut staged = crate::atomic::Staged::create(&dst)?;
+            let mut used_delta = false;
+            if sh.opt.delta && op.action == Action::Update && exists_no_follow(&dst) {
+                if let Some((written, total)) = update_with_delta(&src, &dst, &mut staged)? {
+                    sh.delta_saved.fetch_add(total.saturating_sub(written), Ordering::Relaxed);
+                    // 进度按"这个文件完成了"记账（与 bytes_total 同一口径）；省下的字节另行汇报
+                    pp.add_bytes(total, &op.path);
+                    used_delta = true;
+                }
+            }
+            if !used_delta {
+                staged.copy_from(&src, &mut |n| {
+                    pp.add_bytes(n, &op.path);
+                    pp.checkpoint()
+                })?;
+            }
+            staged.seal(sh.opt.fsync)?;
+
+            // 校验在临时文件上做：不合格就根本不会成为最终文件
+            if sh.opt.verify {
+                if let Some(expect) = &op.hash {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update_mmap_rayon(staged.path())?;
+                    let got = hasher.finalize().to_hex().to_string();
+                    if &got != expect {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("verify failed before commit: expected {expect}, got {got}"),
+                        ));
+                    }
+                }
+            }
+            // mtime / mode 也在临时文件上设好，rename 之后立刻就是终态
+            let intended = match op.mtime_ms {
+                Some(mt) => {
+                    set_mtime(staged.path(), mt);
+                    Some(mt)
+                }
+                None => read_mtime_ms(&src).inspect(|mt| set_mtime(staged.path(), *mt)),
+            };
+            if let Some(m) = op.mode {
+                set_mode(staged.path(), m)?;
+            }
+            // 旧文件留档：放在 commit 前一刻，窗口只有一次 rename
+            if exists_no_follow(&dst) {
+                preserve(sh, op, exec_root, &dst, "overwritten", Some(&src))?;
+            }
+            staged.commit()?;
+
+            // ---- mtime 回读校正（P1-4）----
+            if let Some(want) = intended {
+                if let Some(got) = read_mtime_ms(&dst) {
+                    if got != want {
+                        sh.mtime_fixes.lock().unwrap().push((op.side == Side::Source, op.path.clone(), got, want));
+                    }
+                }
+            }
+            Ok(())
+        }
+        Action::Chmod => {
+            let m = op.mode.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "chmod op without mode")
+            })?;
+            set_mode(&dst, m)
+        }
+        Action::Move => {
+            let from = exec_root.join(to_native(op.from.as_deref().unwrap_or_default()));
+            if let Some(p) = dst.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            match std::fs::rename(&from, &dst) {
+                Ok(_) => Ok(()),
+                Err(_) => {
+                    // 跨卷退路：同样走原子写，中断不会留半截。
+                    // Move 的字节不在 bytes_total 里，这里只挂检查点、不计字节。
+                    let mut staged = crate::atomic::Staged::create(&dst)?;
+                    staged.copy_from(&from, &mut |_| pp.checkpoint())?;
+                    staged.seal(sh.opt.fsync)?;
+                    if let Some(mt) = read_mtime_ms(&from) {
+                        set_mtime(staged.path(), mt);
+                    }
+                    staged.commit()?;
+                    std::fs::remove_file(&from)
+                }
+            }
+        }
+        Action::Delete => {
+            // symlink_metadata：断链的 symlink exists() 会误报 false，这里不跟随
+            if exists_no_follow(&dst) {
+                preserve(sh, op, exec_root, &dst, "deleted", None)?;
+            }
+            Ok(())
+        }
+        Action::DeleteDir => {
+            // P0-4：分类汇报，不再静默吞掉
+            match try_delete_dir(&dst, &op.path, sh.opt.filter.as_ref()) {
+                DirOutcome::Removed | DirOutcome::Absent => Ok(()),
+                DirOutcome::NotEmpty { sample } => Err(std::io::Error::new(
+                    std::io::ErrorKind::DirectoryNotEmpty,
+                    format!(
+                        "directory not empty, kept: {} (protected by filters or unknown to the plan). \
+                         Add them to `deletable` in the job to have them removed with the directory.",
+                        sample.join(", ")
+                    ),
+                )),
+                DirOutcome::Failed(e) => Err(e),
+            }
+        }
+        Action::Conflict | Action::Note => Ok(()),
+    }
+}
+
+/// 单个 op 的结果入账：错误绝不中断整体（FFS 累积语义），
+/// 逐条经 sink 发 Error 事件（windowed 桌面构建首次真正看得见错误）＋保留 eprintln 给 CLI。
+fn record(sh: &Shared, op: &Op, res: std::io::Result<()>, pp: &PhaseProgress, acc: &Counters) {
+    let label = format!(
+        "[{}] {:?} {}",
+        if op.side == Side::Target { "target" } else { "source" },
+        op.action,
+        op.path
+    );
+    match res {
+        Ok(_) => {
+            acc.done.fetch_add(1, Ordering::Relaxed);
+            if sh.opt.verbose {
+                println!("OK   {label}");
+            }
+            pp.item_done(&op.path);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            // 目录留着不是错误（保护过滤中的文件是对的），但必须让人看见
+            acc.skipped.fetch_add(1, Ordering::Relaxed);
+            println!("KEPT      {} ({e})", op.path);
+            pp.item_done(&op.path);
+        }
+        Err(e) if crate::progress::is_cancelled(&e) && sh.ctx.ctl.cancelled() => {
+            // 用户取消：这个 op 没完成也不算错——摘要里 cancelled=true 说明一切
+        }
+        Err(e) => {
+            acc.errors.fetch_add(1, Ordering::Relaxed);
+            eprintln!("ERR  {label}: {e}");
+            pp.error(
+                &op.path,
+                &format!("{:?}", op.action),
+                if op.side == Side::Target { "target" } else { "source" },
+                &e.to_string(),
+            );
+            pp.item_done(&op.path);
+        }
+    }
+}
+
+/// 跑一类 op。width==1 在当前线程顺序执行；否则 scoped 线程池
+/// （AtomicUsize 工单索引，不切分区间——大文件不会把某个 worker 拖成长尾）。
+/// 不用 rayon：verify 的 blake3 已在 rayon 全局池里，嵌套会过订阅且缠住暂停语义。
+fn run_class(class: &[&Op], width: usize, sh: &Shared, pp: &PhaseProgress, acc: &Counters) {
+    if class.is_empty() {
+        return;
+    }
+    let width = width.clamp(1, 16).min(class.len());
+    let next = AtomicUsize::new(0);
+    let work = || {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= class.len() {
+                break;
+            }
+            let op = class[i];
+            // 相邻两个 op 之间的协作点（暂停在这里打转、取消在这里退场）
+            if pp.checkpoint().is_err() {
+                break;
+            }
+            let res = exec_op(sh, op, pp);
+            let bail = matches!(&res, Err(e) if crate::progress::is_cancelled(e) && sh.ctx.ctl.cancelled());
+            record(sh, op, res, pp, acc);
+            if bail {
+                break;
+            }
+        }
+    };
+    if width == 1 {
+        work();
+    } else {
+        std::thread::scope(|s| {
+            for _ in 0..width {
+                s.spawn(&work);
+            }
+        });
+    }
+}
+
+pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOptions) -> (u64, u64, u64) {
+    apply_with(ops, source_root, target_root, opt, &RunCtx::null()).into_tuple()
+}
+
+/// v0.9 M1：带进度/取消/暂停的执行主体。五个串行相位：
+/// Moves → **Copy/Update（并行）** → Chmod → Delete → DeleteDir（类内 deepest-first）。
+/// 开 delta 的 Update 留在串行道——update_with_delta 会把新旧两份读进内存（≤1GB 帽），
+/// 并行 4 工 × 2GB 峰值不可接受。
+pub fn apply_with(
+    ops: &[Op],
+    source_root: &Path,
+    target_root: &Path,
+    opt: &ApplyOptions,
+    ctx: &RunCtx,
+) -> ApplyOutcome {
+    // Apply 的总量开跑前即知：UI 百分比公式从 t=0 生效
+    let items_total = ops.iter().filter(|o| !matches!(o.action, Action::Conflict | Action::Note)).count() as u64;
+    let bytes_total: u64 = ops
+        .iter()
+        .filter(|o| matches!(o.action, Action::Copy | Action::Update) && o.link.is_none())
+        .filter_map(|o| o.size)
+        .sum();
+    let pp = PhaseProgress::begin(ctx, Phase::Apply, None, items_total, bytes_total);
+    let acc = Counters::default();
+
+    // Conflict/Note 只报告，与执行相位无关，先走完
+    for op in ops {
+        match op.action {
+            Action::Conflict => {
+                println!("CONFLICT  {} ({})", op.path, op.reason);
+                acc.skipped.fetch_add(1, Ordering::Relaxed);
+            }
+            Action::Note => {
+                println!("NOTE      {} ({} from={})", op.path, op.reason, op.from.clone().unwrap_or_default());
+                acc.skipped.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    if opt.dry_run {
+        for op in ops.iter().filter(|o| !matches!(o.action, Action::Conflict | Action::Note)) {
+            if opt.verbose {
+                let label = format!(
+                    "[{}] {:?} {}",
+                    if op.side == Side::Target { "target" } else { "source" },
+                    op.action,
+                    op.path
+                );
+                println!("DRY  {label}  ({})", op.reason);
+            }
+            acc.skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        return ApplyOutcome {
+            done: 0,
+            skipped: acc.skipped.load(Ordering::Relaxed),
+            errors: 0,
+            bytes_copied: 0,
+            cancelled: false,
+        };
+    }
+
+    // FFS dir_lock 思路：动手前锁两侧 root（带心跳），防两台机器同时 apply 同一目录。
+    // 暂停用 100ms 自旋而非挂起返回，正是为了让这两个锁的心跳线程在暂停期间继续跳。
+    let _lock_guard: (crate::lock::RootLock, crate::lock::RootLock) = {
         let ls = match crate::lock::RootLock::acquire(source_root) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("cannot lock source root: {e}");
-                return (0, ops.len() as u64, 1);
+                return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
             }
         };
         let lt = match crate::lock::RootLock::acquire(target_root) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("cannot lock target root: {e}");
-                return (0, ops.len() as u64, 1);
+                return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
             }
         };
-        Some((ls, lt))
+        (ls, lt)
     };
 
-    let trash = opt.trash.clone().unwrap_or_else(default_trash);
-    let mut done = 0u64;
-    let mut skipped = 0u64;
-    let mut errors = 0u64;
-    let mut ver_source: Option<crate::version::VersionWriter> = None;
-    let mut ver_target: Option<crate::version::VersionWriter> = None;
-    // P1-4：文件系统实际存下来的 mtime 与我们想要的不一致时（FAT 2 秒粒度、
-    // 某些 SMB 服务端截断），记下 (ondisk, intended) 供下次扫描换算，
-    // 而不是靠 ±2s 容差硬扛。syncthing 的 mtimeFS 同款做法。
-    let mut mtime_fixes: Vec<(bool, String, i64, i64)> = Vec::new();
-    let mut delta_saved = 0u64;
+    let sh = Shared {
+        opt,
+        ctx,
+        source_root,
+        target_root,
+        trash: opt.trash.clone().unwrap_or_else(default_trash),
+        ver_source: Mutex::new(None),
+        ver_target: Mutex::new(None),
+        mtime_fixes: Mutex::new(Vec::new()),
+        delta_saved: AtomicU64::new(0),
+    };
 
+    // 分相（不信输入顺序）
+    let mut moves: Vec<&Op> = Vec::new();
+    let mut copies: Vec<&Op> = Vec::new();
+    let mut copies_delta: Vec<&Op> = Vec::new();
+    let mut chmods: Vec<&Op> = Vec::new();
+    let mut deletes: Vec<&Op> = Vec::new();
+    let mut deldirs: Vec<&Op> = Vec::new();
     for op in ops {
-        let (exec_root, other_root) = match op.side {
-            Side::Target => (target_root, source_root),
-            Side::Source => (source_root, target_root),
-        };
-        let label = format!("[{}] {:?} {}", if op.side == Side::Target { "target" } else { "source" }, op.action, op.path);
         match op.action {
-            Action::Conflict => {
-                println!("CONFLICT  {} ({})", op.path, op.reason);
-                skipped += 1;
-                continue;
-            }
-            Action::Note => {
-                println!("NOTE      {} ({} from={})", op.path, op.reason, op.from.clone().unwrap_or_default());
-                skipped += 1;
-                continue;
-            }
-            _ => {}
-        }
-        if opt.dry_run {
-            if opt.verbose {
-                println!("DRY  {label}  ({})", op.reason);
-            }
-            skipped += 1;
-            continue;
-        }
-
-        // 被覆盖/被删的原件先留档（trash 或 .version_syncDash）
-        let preserve = |dst: &Path, why: &str,
-                            ver_source: &mut Option<crate::version::VersionWriter>,
-                            ver_target: &mut Option<crate::version::VersionWriter>,
-                            newer: Option<&Path>|
-         -> std::io::Result<()> {
-            if opt.versioning {
-                let w = if op.side == Side::Source { ver_source } else { ver_target };
-                if w.is_none() {
-                    *w = Some(crate::version::VersionWriter::begin(exec_root)?);
-                }
-                w.as_mut().unwrap().preserve(&op.path, dst, newer, why)
-            } else {
-                move_to_trash(dst, &op.path, &trash)
-            }
-        };
-
-        let res: std::io::Result<()> = (|| {
-            let dst = exec_root.join(to_native(&op.path));
-            match op.action {
-                Action::Copy | Action::Update => {
-                    if let Some(p) = dst.parent() {
-                        std::fs::create_dir_all(p)?;
-                    }
-                    // symlink 操作：创建链接本身，不复制内容（链接是元数据，无所谓原子写）
-                    if let Some(target) = &op.link {
-                        if exists_no_follow(&dst) {
-                            preserve(&dst, "overwritten", &mut ver_source, &mut ver_target, None)?;
-                        }
-                        return create_symlink(target, &dst);
-                    }
-                    let src = other_root.join(to_native(&op.path));
-
-                    // ---- 原子落盘（P0-1）----
-                    let mut staged = crate::atomic::Staged::create(&dst)?;
-                    let mut used_delta = false;
-                    if opt.delta && op.action == Action::Update && exists_no_follow(&dst) {
-                        if let Some((written, total)) = update_with_delta(&src, &dst, &mut staged)? {
-                            delta_saved += total.saturating_sub(written);
-                            used_delta = true;
-                        }
-                    }
-                    if !used_delta {
-                        let mut fsrc = std::fs::File::open(&src)?;
-                        staged.write_all_from(&mut fsrc)?;
-                    }
-                    staged.seal(opt.fsync)?;
-
-                    // 校验在临时文件上做：不合格就根本不会成为最终文件
-                    if opt.verify {
-                        if let Some(expect) = &op.hash {
-                            let mut hasher = blake3::Hasher::new();
-                            hasher.update_mmap_rayon(staged.path())?;
-                            let got = hasher.finalize().to_hex().to_string();
-                            if &got != expect {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("verify failed before commit: expected {expect}, got {got}"),
-                                ));
-                            }
-                        }
-                    }
-                    // mtime / mode 也在临时文件上设好，rename 之后立刻就是终态
-                    let intended = match op.mtime_ms {
-                        Some(mt) => {
-                            set_mtime(staged.path(), mt);
-                            Some(mt)
-                        }
-                        None => read_mtime_ms(&src).inspect(|mt| set_mtime(staged.path(), *mt)),
-                    };
-                    if let Some(m) = op.mode {
-                        set_mode(staged.path(), m)?;
-                    }
-                    // 旧文件留档：放在 commit 前一刻，窗口只有一次 rename
-                    if exists_no_follow(&dst) {
-                        preserve(&dst, "overwritten", &mut ver_source, &mut ver_target, Some(&src))?;
-                    }
-                    staged.commit()?;
-
-                    // ---- mtime 回读校正（P1-4）----
-                    if let Some(want) = intended {
-                        if let Some(got) = read_mtime_ms(&dst) {
-                            if got != want {
-                                mtime_fixes.push((op.side == Side::Source, op.path.clone(), got, want));
-                            }
-                        }
-                    }
-                    Ok(())
-                }
-                Action::Chmod => {
-                    let m = op.mode.ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "chmod op without mode")
-                    })?;
-                    set_mode(&dst, m)
-                }
-                Action::Move => {
-                    let from = exec_root.join(to_native(op.from.as_deref().unwrap_or_default()));
-                    if let Some(p) = dst.parent() {
-                        std::fs::create_dir_all(p)?;
-                    }
-                    match std::fs::rename(&from, &dst) {
-                        Ok(_) => Ok(()),
-                        Err(_) => {
-                            // 跨卷退路：同样走原子写，中断不会留半截
-                            let mut staged = crate::atomic::Staged::create(&dst)?;
-                            let mut f = std::fs::File::open(&from)?;
-                            staged.write_all_from(&mut f)?;
-                            drop(f);
-                            staged.seal(opt.fsync)?;
-                            if let Some(mt) = read_mtime_ms(&from) {
-                                set_mtime(staged.path(), mt);
-                            }
-                            staged.commit()?;
-                            std::fs::remove_file(&from)
-                        }
-                    }
-                }
-                Action::Delete => {
-                    // symlink_metadata：断链的 symlink exists() 会误报 false，这里不跟随
-                    if exists_no_follow(&dst) {
-                        preserve(&dst, "deleted", &mut ver_source, &mut ver_target, None)?;
-                    }
-                    Ok(())
-                }
-                Action::DeleteDir => {
-                    // P0-4：分类汇报，不再静默吞掉
-                    match try_delete_dir(&dst, &op.path, opt.filter.as_ref()) {
-                        DirOutcome::Removed | DirOutcome::Absent => Ok(()),
-                        DirOutcome::NotEmpty { sample } => Err(std::io::Error::new(
-                            std::io::ErrorKind::DirectoryNotEmpty,
-                            format!(
-                                "directory not empty, kept: {} (protected by filters or unknown to the plan). \
-                                 Add them to `deletable` in the job to have them removed with the directory.",
-                                sample.join(", ")
-                            ),
-                        )),
-                        DirOutcome::Failed(e) => Err(e),
-                    }
-                }
-                Action::Conflict | Action::Note => Ok(()),
-            }
-        })();
-        match res {
-            Ok(_) => {
-                done += 1;
-                if opt.verbose {
-                    println!("OK   {label}");
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-                // 目录留着不是错误（保护过滤中的文件是对的），但必须让人看见
-                skipped += 1;
-                println!("KEPT      {} ({e})", op.path);
-            }
-            Err(e) => {
-                errors += 1;
-                eprintln!("ERR  {label}: {e}");
-            }
-        }
-    }
-
-    if !opt.dry_run {
-        if !mtime_fixes.is_empty() {
-            let mut src_fix = Vec::new();
-            let mut tgt_fix = Vec::new();
-            for (is_source, rel, ondisk, intended) in mtime_fixes {
-                if is_source {
-                    src_fix.push((rel, ondisk, intended));
+            Action::Move => moves.push(op),
+            Action::Copy | Action::Update => {
+                if opt.delta && op.action == Action::Update && op.link.is_none() {
+                    copies_delta.push(op);
                 } else {
-                    tgt_fix.push((rel, ondisk, intended));
+                    copies.push(op);
                 }
             }
-            if !src_fix.is_empty() {
-                crate::scan::record_mtime_fixes(source_root, &src_fix);
-            }
-            if !tgt_fix.is_empty() {
-                crate::scan::record_mtime_fixes(target_root, &tgt_fix);
-            }
-        }
-        if delta_saved > 0 {
-            println!("delta: {} not re-written", crate::preflight::human_bytes(delta_saved));
-        }
-        if let Some(w) = ver_source {
-            let side_ops: Vec<crate::compare::Op> = ops.iter().filter(|o| o.side == Side::Source).cloned().collect();
-            if let Ok(Some(id)) = w.finish(&side_ops) {
-                println!("version saved: {} (id {id})", source_root.join(crate::version::STORE_DIR).display());
-            }
-        }
-        if let Some(w) = ver_target {
-            let side_ops: Vec<crate::compare::Op> = ops.iter().filter(|o| o.side == Side::Target).cloned().collect();
-            if let Ok(Some(id)) = w.finish(&side_ops) {
-                println!("version saved: {} (id {id})", target_root.join(crate::version::STORE_DIR).display());
-            }
-        }
-        if !opt.versioning && done > 0 {
-            println!("trash (deleted/overwritten files kept at): {}", trash.display());
+            Action::Chmod => chmods.push(op),
+            Action::Delete => deletes.push(op),
+            Action::DeleteDir => deldirs.push(op),
+            Action::Conflict | Action::Note => {}
         }
     }
-    (done, skipped, errors)
+    // 深目录先删，父目录才可能变空
+    deldirs.sort_by_key(|o| std::cmp::Reverse(o.path.matches('/').count()));
+
+    // 同一 (side, path) 出现两次（理论上计划不会生成，但翻向操作人为可造）→ 并行会竞写，强制串行
+    let mut seen = std::collections::HashSet::new();
+    let has_dup = copies.iter().any(|o| !seen.insert((o.side == Side::Source, o.path.as_str())));
+    let width = if has_dup { 1 } else { opt.parallel };
+
+    run_class(&moves, 1, &sh, &pp, &acc);
+    run_class(&copies, width, &sh, &pp, &acc);
+    run_class(&copies_delta, 1, &sh, &pp, &acc);
+    run_class(&chmods, 1, &sh, &pp, &acc);
+    run_class(&deletes, 1, &sh, &pp, &acc);
+    run_class(&deldirs, 1, &sh, &pp, &acc);
+
+    // ---- 串行收尾 ----
+    let mtime_fixes = std::mem::take(&mut *sh.mtime_fixes.lock().unwrap());
+    if !mtime_fixes.is_empty() {
+        let mut src_fix = Vec::new();
+        let mut tgt_fix = Vec::new();
+        for (is_source, rel, ondisk, intended) in mtime_fixes {
+            if is_source {
+                src_fix.push((rel, ondisk, intended));
+            } else {
+                tgt_fix.push((rel, ondisk, intended));
+            }
+        }
+        if !src_fix.is_empty() {
+            crate::scan::record_mtime_fixes(source_root, &src_fix);
+        }
+        if !tgt_fix.is_empty() {
+            crate::scan::record_mtime_fixes(target_root, &tgt_fix);
+        }
+    }
+    let delta_saved = sh.delta_saved.load(Ordering::Relaxed);
+    if delta_saved > 0 {
+        println!("delta: {} not re-written", crate::preflight::human_bytes(delta_saved));
+    }
+    if let Some(w) = sh.ver_source.into_inner().unwrap() {
+        let side_ops: Vec<Op> = ops.iter().filter(|o| o.side == Side::Source).cloned().collect();
+        if let Ok(Some(id)) = w.finish(&side_ops) {
+            println!("version saved: {} (id {id})", source_root.join(crate::version::STORE_DIR).display());
+        }
+    }
+    if let Some(w) = sh.ver_target.into_inner().unwrap() {
+        let side_ops: Vec<Op> = ops.iter().filter(|o| o.side == Side::Target).cloned().collect();
+        if let Ok(Some(id)) = w.finish(&side_ops) {
+            println!("version saved: {} (id {id})", target_root.join(crate::version::STORE_DIR).display());
+        }
+    }
+    let done = acc.done.load(Ordering::Relaxed);
+    if !opt.versioning && done > 0 {
+        println!("trash (deleted/overwritten files kept at): {}", sh.trash.display());
+    }
+    ApplyOutcome {
+        done,
+        skipped: acc.skipped.load(Ordering::Relaxed),
+        errors: acc.errors.load(Ordering::Relaxed),
+        bytes_copied: pp.counts().2,
+        cancelled: ctx.ctl.cancelled(),
+    }
 }
 
 #[cfg(test)]
@@ -645,6 +824,148 @@ mod tests {
         let (done, _, errors) = apply(&[op(Action::Update, "shrink.bin")], &s, &t, &o);
         assert_eq!((done, errors), (1, 0));
         assert_eq!(std::fs::read(t.join("shrink.bin")).unwrap().len(), new.len(), "tail must be truncated");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- v0.9 M1：并行/进度/取消 ----
+
+    use crate::progress::{ProgressEvent, RunCtl, RunCtx};
+    use std::sync::Arc;
+
+    fn collecting_ctx() -> (RunCtx, Arc<Mutex<Vec<ProgressEvent>>>) {
+        let store: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let s2 = store.clone();
+        let sink = move |ev: ProgressEvent| {
+            s2.lock().unwrap().push(ev);
+        };
+        (RunCtx::new(RunCtl::new(), Arc::new(sink)), store)
+    }
+
+    /// 并行与串行必须产出逐字节相同的结果树（含 trash 保存集）
+    #[test]
+    fn parallel_and_sequential_agree() {
+        let run = |tag: &str, parallel: usize| -> (PathBuf, PathBuf, (u64, u64, u64)) {
+            let base = tmproot(&format!("par-{tag}"));
+            let (s, t) = (base.join("s"), base.join("t"));
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::create_dir_all(&t).unwrap();
+            let mut ops = Vec::new();
+            for i in 0..12 {
+                let name = format!("f{i:02}.bin");
+                std::fs::write(s.join(&name), vec![i as u8; 20_000 + i * 1000]).unwrap();
+                ops.push(op(Action::Copy, &name));
+            }
+            // 混入一个 update（旧内容进 trash）与一个 delete
+            std::fs::write(s.join("up.txt"), b"NEW").unwrap();
+            std::fs::write(t.join("up.txt"), b"OLD").unwrap();
+            ops.push(op(Action::Update, "up.txt"));
+            std::fs::write(t.join("gone.txt"), b"bye").unwrap();
+            ops.push(op(Action::Delete, "gone.txt"));
+
+            let mut o = opts(base.join("trash"));
+            o.parallel = parallel;
+            let r = apply(&ops, &s, &t, &o);
+            (base.clone(), t, r)
+        };
+        let (b1, t1, r1) = run("seq", 1);
+        let (b2, t2, r2) = run("par", 4);
+        assert_eq!(r1, r2, "counts must match");
+        // 结果树逐文件一致
+        for e in std::fs::read_dir(&t1).unwrap().flatten() {
+            let name = e.file_name();
+            let a = std::fs::read(e.path()).unwrap();
+            let b = std::fs::read(t2.join(&name)).unwrap();
+            assert_eq!(a, b, "file {:?} differs between seq and par runs", name);
+        }
+        assert_eq!(
+            std::fs::read_dir(&t1).unwrap().count(),
+            std::fs::read_dir(&t2).unwrap().count()
+        );
+        let _ = std::fs::remove_dir_all(&b1);
+        let _ = std::fs::remove_dir_all(&b2);
+    }
+
+    /// 错误不中断：10 好 1 坏 → 10 应用 + 1 Error 事件，字节账目 = Σ 成功文件
+    #[test]
+    fn errors_accumulate_without_aborting() {
+        let base = tmproot("errs");
+        let (s, t) = (base.join("s"), base.join("t"));
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::create_dir_all(&t).unwrap();
+        let mut ops = Vec::new();
+        let mut expect_bytes = 0u64;
+        for i in 0..10 {
+            let name = format!("g{i}.bin");
+            let body = vec![9u8; 5_000];
+            std::fs::write(s.join(&name), &body).unwrap();
+            expect_bytes += body.len() as u64;
+            let mut o = op(Action::Copy, &name);
+            o.size = Some(body.len() as u64);
+            ops.push(o);
+        }
+        ops.push(op(Action::Copy, "missing-on-source.bin")); // 必失败
+
+        let (ctx, store) = collecting_ctx();
+        let out = apply_with(&ops, &s, &t, &opts(base.join("trash")), &ctx);
+        assert_eq!(out.done, 10);
+        assert_eq!(out.errors, 1);
+        assert!(!out.cancelled);
+        assert_eq!(out.bytes_copied, expect_bytes, "byte ledger must equal the sum of successful copies");
+        let evs = store.lock().unwrap();
+        assert_eq!(
+            evs.iter().filter(|e| matches!(e, ProgressEvent::Error { .. })).count(),
+            1,
+            "exactly one Error event"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 大文件复制中途取消：块间响应、终点无半截文件、零 .syncdash.tmp 残留
+    #[test]
+    fn cancel_mid_copy_leaves_no_debris() {
+        let base = tmproot("cancel");
+        let (s, t) = (base.join("s"), base.join("t"));
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(s.join("big.bin"), vec![3u8; 64 * 1024 * 1024]).unwrap();
+        let mut o = op(Action::Copy, "big.bin");
+        o.size = Some(64 * 1024 * 1024);
+
+        let ctl = RunCtl::new();
+        let ctl2 = ctl.clone();
+        // 第一个 Progress 事件（= 第一个 1MiB 块）后立刻请求取消
+        let sink = move |ev: ProgressEvent| {
+            if matches!(ev, ProgressEvent::Progress { .. }) {
+                ctl2.request_cancel();
+            }
+        };
+        let ctx = RunCtx::new(ctl, Arc::new(sink));
+        let out = apply_with(&[o], &s, &t, &opts(base.join("trash")), &ctx);
+        assert!(out.cancelled);
+        assert_eq!(out.done, 0);
+        assert_eq!(out.errors, 0, "cancellation is not an error");
+        assert!(!t.join("big.bin").exists(), "no partial file may reach the destination");
+        let leftovers: Vec<_> = std::fs::read_dir(&t)
+            .unwrap()
+            .flatten()
+            .filter(|e| crate::atomic::is_temp_name(&e.file_name().to_string_lossy()))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files must be cleaned on cancel");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// DeleteDir 深度序：子目录先于父目录被删，父目录才可能空
+    #[test]
+    fn delete_dirs_deepest_first_regardless_of_input_order() {
+        let base = tmproot("depth");
+        let (s, t) = (base.join("s"), base.join("t"));
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::create_dir_all(t.join("a").join("b").join("c")).unwrap();
+        // 故意按浅→深的错误顺序给 op
+        let ops = vec![op(Action::DeleteDir, "a"), op(Action::DeleteDir, "a/b"), op(Action::DeleteDir, "a/b/c")];
+        let (done, _, errors) = apply(&ops, &s, &t, &opts(base.join("trash")));
+        assert_eq!((done, errors), (3, 0), "all three directories must go");
+        assert!(!t.join("a").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 }
