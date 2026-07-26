@@ -258,9 +258,12 @@ fn run_detail(detail: String) -> Vec<String> {
     syncdash::runlog::detail_lines(&detail, 2000)
 }
 
-/// 打开（或聚焦）独立进度子窗口。运行事件广播到所有窗口，子窗自行过滤。
+/// 打开（或聚焦）独立进度子窗口（只用于 Synchronize；compare 进度在主窗原地显示）。
+/// **必须是 async 命令**：同步命令在主线程的 IPC 里执行，而 wry 建窗要靠主事件循环
+/// 泵消息——同步建窗会让子窗导航卡死在 about:blank（整窗纯白），关闭事件也排不上队
+/// （表现为"整个 app 关不掉"）。async 命令跑在独立线程，建窗经事件循环正确代理。
 #[tauri::command]
-fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
+async fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager;
     if let Some(w) = app.get_webview_window("progress") {
         let _ = w.show();
@@ -276,12 +279,12 @@ fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 隐藏进度子窗口（比对结束后由主窗调用；同步窗口的去留归子窗自己的 Auto-close）
+/// 销毁进度子窗口。不是 hide：隐藏的子窗会在主窗关闭后让进程赖着不退
 #[tauri::command]
-fn close_progress_window(app: tauri::AppHandle) {
+async fn close_progress_window(app: tauri::AppHandle) {
     use tauri::Manager;
     if let Some(w) = app.get_webview_window("progress") {
-        let _ = w.hide();
+        let _ = w.destroy();
     }
 }
 
@@ -436,6 +439,17 @@ async fn apply_job(
 
 fn main() {
     tauri::Builder::default()
+        // 主窗关闭 → 级联销毁进度子窗；否则残留窗口让 Tauri 不退出（"app 关不掉"）
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                if window.label() == "main" {
+                    use tauri::Manager;
+                    if let Some(p) = window.app_handle().get_webview_window("progress") {
+                        let _ = p.destroy();
+                    }
+                }
+            }
+        })
         .manage(Arc::new(RunState::default()))
         .invoke_handler(tauri::generate_handler![
             list_jobs, jobs_dir, compare_job, preflight, apply_job, cancel_run, pause_run,

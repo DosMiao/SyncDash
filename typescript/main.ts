@@ -453,12 +453,13 @@ function renderJobs() {
 
 // ---------- 动作 ----------
 
-async function doCompare(showWindow = true) {
+async function doCompare() {
   if (!currentJob || busy) return;
   setBusy(true);
   setStatus(`正在比对 '${currentJob.name}' ...`);
-  // FFS 同款：比对期也用进度子窗（扫描双侧的条数/字节实时跳动），结束后自动收起
-  if (showWindow) invoke('open_progress_window').catch(() => {});
+  // v0.9.1 第一性重设计：compare 进度原地显示在差异表区域——主窗本来就在眼前，
+  // 不再弹独立窗口（小目录不闪窗、大目录有实时双侧计数、且规避子窗生命周期问题）
+  cmpShow();
   try {
     acknowledged = false;
     modalOk.disabled = false;
@@ -479,7 +480,7 @@ async function doCompare(showWindow = true) {
     renderAll();
     setStatus(String(e) === 'cancelled' ? '比对已取消' : `比对失败：${e}`, String(e) === 'cancelled' ? '' : 'err');
   }
-  if (showWindow) invoke('close_progress_window').catch(() => {});
+  cmpHide();
   setBusy(false);
 }
 
@@ -554,7 +555,7 @@ async function doSync() {
     );
     setBusy(false);
     refreshLastSyncs();
-    await doCompare(false);
+    await doCompare();
   } catch (e) {
     setStatus(`同步失败：${e}`, 'err');
     setBusy(false);
@@ -748,7 +749,7 @@ async function watchTick() {
   }
   if (busy) return; // 上一轮还没完，跳过这拍
   watchNext = Date.now() + iv;
-  await doCompare(false);
+  await doCompare();
   if (plan && plan.ops.length > 0) {
     if (currentJob.watch_auto_apply) {
       const finalOps = plan.ops.filter((op) => selectable(op));
@@ -842,6 +843,94 @@ logBack.addEventListener('click', logShowList);
 $('log-close').addEventListener('click', () => logModal.classList.add('hidden'));
 logModal.addEventListener('click', (e) => { if (e.target === logModal) logModal.classList.add('hidden'); });
 
+// ---------- v0.9.1：主窗内嵌 compare 进度面板（数据源 = run-progress 事件流） ----------
+
+interface CmpEv {
+  kind: string;
+  phase?: string;
+  label?: string | null;
+  ts_ms?: number;
+  items_done?: number;
+  items_total?: number;
+  bytes_done?: number;
+  bytes_total?: number;
+}
+
+const CMP_LABEL: Record<string, string> = {
+  'scan-source': '扫描 source', 'scan-target': '扫描 target', 'compare': '比对', 'refresh': '刷新存档',
+};
+const cmpPanel = $('cmp-panel');
+const cmpRows = $('cmp-rows');
+let cmpActive = false;
+const cmpRate = new Map<string, { t: number; b: number }>();
+
+function cmpShow() {
+  cmpActive = true;
+  cmpRows.innerHTML = '';
+  cmpRate.clear();
+  emptyEl.classList.add('hidden');
+  tableEl.classList.add('hidden');
+  filterBar.classList.add('hidden');
+  cmpPanel.classList.remove('hidden');
+}
+
+function cmpHide() {
+  cmpActive = false;
+  cmpPanel.classList.add('hidden');
+  // 表格/空态的显隐交还给 renderTable（doCompare 的 renderAll 已调用）
+}
+
+function cmpRow(phase: string): { row: HTMLElement; detail: HTMLElement; ico: HTMLElement } {
+  const id = `cmp-r-${phase}`;
+  let row = document.getElementById(id);
+  if (!row) {
+    row = document.createElement('div');
+    row.id = id;
+    row.className = 'stagerow';
+    row.innerHTML = `<span class="st-ico">⟳</span><span class="st-name">${CMP_LABEL[phase] ?? phase}</span><span class="st-detail"></span>`;
+    cmpRows.appendChild(row);
+  }
+  return {
+    row,
+    detail: row.querySelector('.st-detail') as HTMLElement,
+    ico: row.querySelector('.st-ico') as HTMLElement,
+  };
+}
+
+function onCmpEvent(ev: CmpEv) {
+  if (!cmpActive || !ev.phase) return;
+  if (ev.kind === 'phase_start') {
+    for (const done of cmpRows.querySelectorAll('.stagerow.active')) {
+      done.classList.remove('active');
+      done.classList.add('done');
+      (done.querySelector('.st-ico') as HTMLElement).textContent = '✓';
+    }
+    const r = cmpRow(ev.phase);
+    r.row.classList.add('active');
+    if (ev.label) r.detail.textContent = ev.label;
+  } else if (ev.kind === 'progress') {
+    const r = cmpRow(ev.phase);
+    const bd = ev.bytes_done ?? 0;
+    const ts = ev.ts_ms ?? Date.now();
+    const prev = cmpRate.get(ev.phase);
+    let rate = '';
+    if (prev && ts > prev.t) {
+      const bps = (bd - prev.b) * 1000 / (ts - prev.t);
+      if (bps > 512 * 1024) rate = ` · ${(bps / (1 << 20)).toFixed(1)} MiB/s`;
+    }
+    cmpRate.set(ev.phase, { t: ts, b: bd });
+    const bt = ev.bytes_total ?? 0;
+    r.detail.textContent =
+      `${ev.items_done ?? 0}${ev.items_total ? ` / ${ev.items_total}` : ''} 项` +
+      ` · ${humanSize(bd) || '0 B'}${bt ? ` / ${humanSize(bt)}` : ''}${rate}`;
+  }
+}
+
+$('cmp-cancel').addEventListener('click', () => {
+  invoke('cancel_run').catch(() => {});
+  setStatus('正在取消比对…');
+});
+
 // 路径显示模式切换（相对 ↔ 完整；记住选择）
 const btnPathMode = $<HTMLButtonElement>('btn-pathmode');
 function renderPathModeBtn() {
@@ -888,6 +977,7 @@ document.addEventListener('keydown', (e) => {
 
 (async function init() {
   if (navigator.userAgent.includes('Macintosh')) document.body.classList.add('mac');
+  await listen<CmpEv>('run-progress', (ev) => onCmpEvent(ev.payload));
   await listen<Progress>('progress', (ev) => {
     const { phase, detail, pct, rate } = ev.payload;
     const map: Record<string, string> = {
