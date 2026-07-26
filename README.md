@@ -122,8 +122,27 @@ v0.9 "Progress & Polish"（对照 FFS 14.10 源码行为参数，计划见 plans
 | 级别 | 扫描 | 执行 | 适用 |
 |---|---|---|---|
 | `quick` | 不 hash：size+mtime±2s | 正常 | 超大树快速巡检；无移动检测 |
+| `fast` | <4MB 全量 BLAKE3；≥4MB 抽样摘要（size＋头/中/尾各 256KB）＋缓存 | 正常 | 云盘/媒体库/数据归档：比 quick 多内容防线，读盘约省百倍 |
 | `standard`（默认） | BLAKE3＋缓存（(path,size,mtime) 未变即复用） | 正常 | 日常 |
 | `paranoid` | 全量重 hash（无视缓存） | **复制后重读目标校验 hash**（FFS "verify copied files" 同款） | 冷备、可疑介质、首次大迁移 |
+
+**审计矩阵——每级具体核对什么**。相等判定规则（compare.rs `files_equal`）：
+双方都有哈希 → **只看哈希**；否则 size 相等且 |Δmtime| ≤ 2s（FAT/SMB 时间粒度）。
+
+所有级别共有的审计项（来自 walk 与 compare 本身，与 rigor 无关）：
+存在性（增/删）、路径名（NFC 归一＋大小写折叠比对键，同侧撞名出 Note）、类型（文件/目录/symlink）、
+size、mtime（含 mtime 回读校正表换算）、symlink 指向（`symlinks="direct"` 时按指向字符串比对）、
+unix 权限位（`sync_mode` 时差异出 Chmod op）、Windows 非法名预检（出 Conflict）、
+sync 模式的 archive 归因（多代，含冲突检测）、执行前闸门（marker / 磁盘空间 / 删除占比）。
+
+各级**新增**的内容审计与盲区（如实说）：
+
+| | 内容核对 | 移动检测 | 能抓 | 抓不到 |
+|---|---|---|---|---|
+| `quick` | 无 | **无**（配对靠 hash） | 增删、size 变化、mtime 变化 | 一切保 size+mtime 的内容差异；改名成"删+增" |
+| `fast` | 小文件全量；大文件三窗抽样（`~` 前缀，与全量哈希缓存隔离） | 有 | quick 全部＋小文件任意改动＋大文件的截断/头中尾改动/采样区 bitrot | 大文件**采样窗之外**且不改 size 的修改（哈希在场时 mtime 不参与裁决，两侧摘要相同即判相等） |
+| `standard` | 全量 BLAKE3（缓存：(size,mtime) 未变即信旧哈希） | 有 | 一切改动过 size 或 mtime 的内容差异 | ① 保 size+mtime 的改写（时间戳伪造/个别工具）；② **静默 bitrot**（内容坏了但 mtime 没动 → 缓存返回旧哈希，两侧一致地错） |
+| `paranoid` | 全量重读重算（无视缓存）＋复制后在临时文件上重读校验 | 有 | standard 的两个盲区全补上：bitrot、保时间戳改写、传输损坏 | 无（代价：每次扫描读全树） |
 
 ### 跨平台正确性（v0.2.2）
 
