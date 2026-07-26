@@ -4,32 +4,39 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SyncDash</title>
-  <script type="module" crossorigin src="/assets/index-CEkQOpQ3.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/index-BtQaY_g7.css">
+  <script type="module" crossorigin src="/assets/index-pny4bUab.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-HH6oorgV.css">
 </head>
 <body>
+  <div id="dragstrip" data-tauri-drag-region></div>
   <div id="app">
     <aside id="sidebar">
-      <div class="brand">Sync<span>Dash</span></div>
+      <div class="brand" data-tauri-drag-region>Sync<span>Dash</span></div>
       <div id="joblist"></div>
-      <div id="jobsdir" class="dim"></div>
+      <div id="sidefoot">
+        <span id="appver" class="dim"></span>
+        <span id="jobsdir" class="dim"></span>
+      </div>
     </aside>
     <main id="main">
       <header id="toolbar">
-        <button id="btn-compare" class="btn primary" disabled>Compare</button>
-        <button id="btn-sync" class="btn accent" disabled>Synchronize</button>
-        <label class="chkall"><input type="checkbox" id="chk-all" checked /> 全选</label>
+        <button id="btn-compare" class="btn primary" disabled>⟳ Compare</button>
+        <button id="btn-sync" class="btn accent" disabled>▶ Synchronize</button>
         <span id="stats" class="stats"></span>
         <span id="spin" class="spinner hidden"></span>
       </header>
       <div id="pathline" class="pathline mono dim"></div>
+      <div id="filterbar" class="hidden">
+        <input id="search" class="mono" type="text" placeholder="搜索 path / from / reason   (Ctrl+F)" />
+        <div id="chips"></div>
+      </div>
       <div id="tablewrap">
-        <div id="empty" class="empty">← 选择任务，然后 Compare</div>
+        <div id="empty" class="empty">← 选择任务，然后 Compare（Ctrl+R）</div>
         <table id="plantable" class="hidden">
           <thead>
             <tr>
-              <th class="c-chk"></th>
-              <th class="c-act">action</th>
+              <th class="c-chk"><input type="checkbox" id="chk-head" checked title="全选/全不选（当前视图）" /></th>
+              <th class="c-act">action <span class="dim thin">（点徽章翻方向）</span></th>
               <th>path</th>
               <th>from</th>
               <th class="c-size">size</th>
@@ -41,6 +48,16 @@
       </div>
       <footer id="status">就绪</footer>
     </main>
+  </div>
+  <div id="modal" class="hidden">
+    <div class="sheet">
+      <h3>确认同步</h3>
+      <div id="modal-body"></div>
+      <div class="btnrow">
+        <button id="modal-cancel" class="btn">取消 (Esc)</button>
+        <button id="modal-ok" class="btn accent">执行 (Enter)</button>
+      </div>
+    </div>
   </div>
 </body>
 </html>

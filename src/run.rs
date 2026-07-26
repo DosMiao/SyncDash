@@ -8,7 +8,7 @@ use crate::{apply, compare, scan};
 use std::path::Path;
 
 /// 严谨级 → 扫描参数：quick（不 hash）| standard（hash+缓存）| paranoid（全量重 hash）
-fn scan_opts(job: &Job) -> scan::ScanOptions {
+pub fn scan_opts(job: &Job) -> scan::ScanOptions {
     let filter = crate::filter::PathFilter::build(&job.include, &job.exclude);
     let (hash, force_rehash) = match job.rigor.as_str() {
         "quick" => (false, false),
