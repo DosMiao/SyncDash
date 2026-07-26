@@ -59,9 +59,22 @@ pub fn compare_job(job: &Job) -> std::io::Result<Plan> {
     compare_job_with(job, &crate::progress::RunCtx::null())
 }
 
+/// 比对的完整产出：计划 + 两侧快照。
+/// 桌面壳要靠快照算"证据层"（双侧 size/mtime、相同项），CLI 只要 plan。
+pub struct CompareOutcome {
+    pub plan: Plan,
+    pub source: Snapshot,
+    pub target: Snapshot,
+}
+
 /// v0.9 M1：带事件流/取消的比对一条龙。src-tauri 里那份为插事件而内联复制的
 /// 第二套管线由本函数取代（撤销双份漂移）。
 pub fn compare_job_with(job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<Plan> {
+    compare_job_detailed(job, ctx).map(|o| o.plan)
+}
+
+/// 同一条管线，额外把两侧快照交出来（丢掉它们等于逼界面再扫一遍）
+pub fn compare_job_detailed(job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<CompareOutcome> {
     use crate::progress::Phase;
     let opt = scan_opts(job);
     // P0-2：root 可达性 + 挂载点标记。共享盘没挂上时 target 常常是个空目录，
@@ -106,7 +119,8 @@ pub fn compare_job_with(job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Re
         0,
     );
     let copts = job.compare_opts();
-    Ok(compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts))
+    let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
+    Ok(CompareOutcome { plan, source: s, target: t })
 }
 
 /// 执行选中的 ops；全部成功且是 sync 模式时刷新 archive（冲突路径从存档剔除，下次继续报冲突）。
@@ -320,6 +334,16 @@ pub fn probe_remote(name: &str, job: &Job) -> std::io::Result<RemoteLink> {
 /// v0.9 M3：远程任务的**比对段**——desktop `compare_job` 对 remote 任务直接走这里，
 /// 不再静默落进本地管线（那会经 UNC 拉数据重哈希，慢一个数量级还语义错位）。
 pub fn compare_remote_job_with(name: &str, job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<Plan> {
+    compare_remote_job_detailed(name, job, ctx).map(|o| o.plan)
+}
+
+/// 远程管线的同款细节版：远端快照是经 ssh 拉回来的完整表，
+/// 证据层（双侧 size/mtime、相同项）在这里和本地任务一样能算。
+pub fn compare_remote_job_detailed(
+    name: &str,
+    job: &Job,
+    ctx: &crate::progress::RunCtx,
+) -> std::io::Result<CompareOutcome> {
     use crate::progress::{Phase, PhaseProgress};
     let link = probe_remote(name, job)?;
 
@@ -374,7 +398,8 @@ pub fn compare_remote_job_with(name: &str, job: &Job, ctx: &crate::progress::Run
         0,
     );
     let copts = job.compare_opts();
-    Ok(compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts))
+    let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
+    Ok(CompareOutcome { plan, source: s, target: t })
 }
 
 /// 远程任务的计划体检（desktop 确认单用）：只有删除占比闸门——

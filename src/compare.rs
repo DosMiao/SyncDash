@@ -234,6 +234,81 @@ fn map_of<'a>(snap: &'a Snapshot, kind: EntryKind, ci: bool) -> (BTreeMap<String
     (m, dups)
 }
 
+// ---------- 证据层（只读，界面用；compare() 不受影响） ----------
+
+/// 比对时点某一侧的实测状态。**只供展示与排序**，apply 一个字节都不读它。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct SideMeta {
+    pub size: u64,
+    pub mtime_ms: i64,
+}
+
+/// 与 `plan.ops[i]` 一一对应的两侧实测状态（缺席的一侧为 None）
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct RowMeta {
+    pub src: Option<SideMeta>,
+    pub dst: Option<SideMeta>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct Evidence {
+    /// 长度恒等于 plan.ops.len()
+    pub metas: Vec<RowMeta>,
+    /// 两侧都有且判定相等的文件数 —— FFS 那句 "Showing 481 of 23,112" 的分母来源
+    pub equal_count: u64,
+    pub equal_bytes: u64,
+}
+
+/// 计划之外的"证据"：每行两侧的实测 size/mtime + 相等项统计。
+///
+/// 为什么不把这两个字段直接塞进 `Op`：`Op { .. }` 的结构体字面量在本文件里有
+/// 三十多处，加字段等于改三十多个点，还会改变 plan JSONL 的落盘格式与 CLI 行为。
+/// 这里走 `PlanDto.reversed` 同款的平行数组，`compare()` 一行不动。
+///
+/// 口径与 `compare()` 共用 `norm_key` / `files_equal`，不可能漂移。
+pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &CompareOptions) -> Evidence {
+    let ci = copts.case_insensitive;
+    let (s_files, _) = map_of(source, EntryKind::File, ci);
+    let (t_files, _) = map_of(target, EntryKind::File, ci);
+    let (s_dirs, _) = map_of(source, EntryKind::Dir, ci);
+    let (t_dirs, _) = map_of(target, EntryKind::Dir, ci);
+
+    let meta = |e: &Entry| SideMeta { size: e.size, mtime_ms: e.mtime_ms };
+    let look = |files: &BTreeMap<String, &Entry>, dirs: &BTreeMap<String, &Entry>, rel: &str| -> Option<SideMeta> {
+        let k = norm_key(rel, ci);
+        files.get(&k).or_else(|| dirs.get(&k)).map(|e| meta(e))
+    };
+
+    let metas = plan
+        .ops
+        .iter()
+        .map(|op| {
+            // move 的执行侧此刻还叫 from，对面已经是 path——两侧各查各的名字
+            let (s_rel, t_rel) = match (&op.action, &op.side) {
+                (Action::Move, Side::Target) => (op.path.as_str(), op.from.as_deref().unwrap_or(&op.path)),
+                (Action::Move, Side::Source) => (op.from.as_deref().unwrap_or(&op.path), op.path.as_str()),
+                _ => (op.path.as_str(), op.path.as_str()),
+            };
+            RowMeta {
+                src: look(&s_files, &s_dirs, s_rel),
+                dst: look(&t_files, &t_dirs, t_rel),
+            }
+        })
+        .collect();
+
+    let mut equal_count = 0u64;
+    let mut equal_bytes = 0u64;
+    for (k, se) in &s_files {
+        if let Some(te) = t_files.get(k) {
+            if files_equal(se, te) {
+                equal_count += 1;
+                equal_bytes += se.size;
+            }
+        }
+    }
+    Evidence { metas, equal_count, equal_bytes }
+}
+
 /// Windows 侧新建此相对路径是否合法（保留名 / 非法字符 / 尾点尾空格）
 fn win_invalid_reason(rel: &str) -> Option<String> {
     const RESERVED: [&str; 22] = [
@@ -1361,5 +1436,58 @@ mod tests {
         let t = snap("windows", vec![file("caf\u{00e9}.txt", "h1")]);
         let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
         assert!(plan.ops.iter().any(|o| o.action == Action::Note && o.reason.contains("duplicate-after-normalization")));
+    }
+
+    // ---------- 证据层 ----------
+
+    #[test]
+    fn evidence_reports_both_sides_and_equal_count() {
+        // same 两侧一致；upd 两侧都在但内容不同；only_s 只在 source；only_t 只在 target
+        let s = snap("windows", vec![
+            Entry { size: 10, mtime_ms: 1_000, ..file("same.txt", "h0") },
+            Entry { size: 30, mtime_ms: 9_000, ..file("upd.txt", "hs") },
+            Entry { size: 7, mtime_ms: 5_000, ..file("only_s.txt", "h1") },
+        ]);
+        let t = snap("windows", vec![
+            Entry { size: 10, mtime_ms: 1_000, ..file("same.txt", "h0") },
+            Entry { size: 20, mtime_ms: 2_000, ..file("upd.txt", "ht") },
+            Entry { size: 4, mtime_ms: 3_000, ..file("only_t.txt", "h2") },
+        ]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        let ev = evidence(&s, &t, &plan, &CompareOptions::default());
+        assert_eq!(ev.metas.len(), plan.ops.len(), "证据数组必须与 ops 一一对应");
+        assert_eq!(ev.equal_count, 1);
+        assert_eq!(ev.equal_bytes, 10);
+
+        let by = |name: &str| {
+            let i = plan.ops.iter().position(|o| o.path == name).expect(name);
+            ev.metas[i].clone()
+        };
+        // update 行：两侧都要有各自的实测值——今天 Op.size/mtime 只带得动 source 那一份
+        let m = by("upd.txt");
+        assert_eq!(m.src.unwrap().size, 30);
+        assert_eq!(m.src.unwrap().mtime_ms, 9_000);
+        assert_eq!(m.dst.unwrap().size, 20);
+        assert_eq!(m.dst.unwrap().mtime_ms, 2_000);
+        // copy 行只有 source 侧存在
+        let m = by("only_s.txt");
+        assert_eq!(m.src.unwrap().size, 7);
+        assert!(m.dst.is_none());
+        // delete 行只有 target 侧存在
+        let m = by("only_t.txt");
+        assert!(m.src.is_none());
+        assert_eq!(m.dst.unwrap().size, 4);
+    }
+
+    #[test]
+    fn evidence_follows_move_naming_on_each_side() {
+        // 同内容改名：source 已叫 b.bin，target 还叫 a.bin —— 两侧各查各的名字
+        let s = snap("windows", vec![Entry { size: 42, mtime_ms: 8_000, ..file("b.bin", "hm") }]);
+        let t = snap("windows", vec![Entry { size: 42, mtime_ms: 4_000, ..file("a.bin", "hm") }]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        let i = plan.ops.iter().position(|o| o.action == Action::Move).expect("move");
+        let ev = evidence(&s, &t, &plan, &CompareOptions::default());
+        assert_eq!(ev.metas[i].src.unwrap().mtime_ms, 8_000, "source 侧按新名字 b.bin 查");
+        assert_eq!(ev.metas[i].dst.unwrap().mtime_ms, 4_000, "target 侧按旧名字 a.bin 查");
     }
 }

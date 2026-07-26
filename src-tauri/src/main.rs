@@ -42,6 +42,16 @@ struct PlanDto {
     ops: Vec<Op>,
     /// 与 ops 一一对应：可翻方向的行给出反向 op，不可翻为 null
     reversed: Vec<Option<Op>>,
+    /// 与 ops 一一对应：两侧比对时点的实测 size/mtime（界面列与排序用）。
+    /// 走平行数组而不是往 Op 里加字段——Op 的字面量在 compare.rs 里有三十多处，
+    /// 且那会改变 plan JSONL 的落盘格式。preflight/apply 收到的 ops 形状不变。
+    #[serde(default)]
+    metas: Vec<compare::RowMeta>,
+    /// 两侧判定相等的文件数/字节（"显示 X / 共 Y"的分母）
+    #[serde(default)]
+    equal_count: u64,
+    #[serde(default)]
+    equal_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -443,14 +453,24 @@ async fn compare_job(
         let ctx = make_ctx(&app, run_id, ctl, "compare");
         // M3：remote 任务走远程管线（远端自己盘上扫描），不再静默落进本地管线
         let r = if job.remote_host.is_some() {
-            run::compare_remote_job_with(&name, &job, &ctx)
+            run::compare_remote_job_detailed(&name, &job, &ctx)
         } else {
-            run::compare_job_with(&job, &ctx)
+            run::compare_job_detailed(&job, &ctx)
         };
         end_run(&st);
-        let plan = r.map_err(user_err)?;
-        let reversed = plan.ops.iter().map(compare::reverse_op).collect();
-        Ok(PlanDto { header: plan.header, ops: plan.ops, reversed })
+        let out = r.map_err(user_err)?;
+        let reversed = out.plan.ops.iter().map(compare::reverse_op).collect();
+        // 证据层：两侧实测 size/mtime + 相等项统计。与 compare() 共用同一套
+        // norm_key/files_equal，口径不会漂移。
+        let ev = compare::evidence(&out.source, &out.target, &out.plan, &job.compare_opts());
+        Ok(PlanDto {
+            header: out.plan.header,
+            ops: out.plan.ops,
+            reversed,
+            metas: ev.metas,
+            equal_count: ev.equal_count,
+            equal_bytes: ev.equal_bytes,
+        })
     })
     .await
     .map_err(|e| e.to_string())?

@@ -23,10 +23,16 @@ interface OpDto {
   mode?: number;
   reason: string;
 }
+interface SideMeta { size: number; mtime_ms: number }
+interface RowMeta { src: SideMeta | null; dst: SideMeta | null }
 interface PlanDto {
   header: { mode: string; source_root: string; target_root: string; op_count: number; conflict_count: number; source_entries: number; target_entries: number };
   ops: OpDto[];
   reversed: (OpDto | null)[];
+  /// 与 ops 一一对应的两侧实测 size/mtime（Rust 侧 compare::evidence 产出）
+  metas: RowMeta[];
+  equal_count: number;
+  equal_bytes: number;
 }
 interface ApplyDto { done: number; skipped: number; errors: number; bytes_copied: number; cancelled: boolean }
 /// M5：编辑器用的完整 Job（与 Rust config::Job 的 serde 形状一一对应）
@@ -99,6 +105,10 @@ let grouped = localStorage.getItem('sd.grouped') !== 'off';
 const collapsedDirs = new Set<string>();
 /// 用户在确认单里勾了"我确认无误"（等同 CLI --i-know）；每次重新比对后归零
 let acknowledged = false;
+/// 排序：null = 计划原序（walk 序）。分组算法依赖"同目录的行连续"，
+/// 所以一旦排序就必须切平铺，两者互斥。
+type SortKey = 'path' | 'action' | 's.size' | 's.mtime' | 't.size' | 't.mtime';
+let sort: { key: SortKey; dir: 1 | -1 } | null = null;
 
 // ---------- 小工具 ----------
 
@@ -140,6 +150,18 @@ function humanSize(b?: number): string {
   if (b >= 1 << 20) return (b / (1 << 20)).toFixed(1) + ' MB';
   if (b >= 1024) return (b / 1024).toFixed(1) + ' KB';
   return b + ' B';
+}
+
+/// 与 Rust 侧 MTIME_SLACK_MS 同值：FAT/SMB 的时间粒度，2 秒内不算"更新"
+const MTIME_SLACK = 2000;
+
+const p2 = (n: number) => String(n).padStart(2, '0');
+/// 今年只显示 月-日 时:分，往年补上年份——列窄，信息密度优先
+function fmtTime(ms: number): string {
+  if (!ms) return '';
+  const d = new Date(ms);
+  const md = `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+  return d.getFullYear() === new Date().getFullYear() ? md : `${d.getFullYear()}-${md}`;
 }
 
 /// 该行当前生效的 op（翻向后取 reversed）
@@ -214,6 +236,24 @@ function matchesOv(op: OpDto): boolean {
   return op.path === ovFilter || op.path.startsWith(ovFilter + '/');
 }
 
+function metaOf(i: number): RowMeta {
+  return plan?.metas?.[i] ?? { src: null, dst: null };
+}
+
+/// 排序取值。缺席的一侧排在最后（不管升降序），免得"没有的东西"抢占视线
+function sortVal(i: number, key: SortKey): [number, string] {
+  const op = eff(i);
+  const m = metaOf(i);
+  switch (key) {
+    case 'path': return [0, op.path.toLowerCase()];
+    case 'action': return [0, op.action];
+    case 's.size': return [m.src ? 0 : 1, String(m.src?.size ?? 0).padStart(20, '0')];
+    case 's.mtime': return [m.src ? 0 : 1, String(m.src?.mtime_ms ?? 0).padStart(20, '0')];
+    case 't.size': return [m.dst ? 0 : 1, String(m.dst?.size ?? 0).padStart(20, '0')];
+    case 't.mtime': return [m.dst ? 0 : 1, String(m.dst?.mtime_ms ?? 0).padStart(20, '0')];
+  }
+}
+
 function visibleIdx(): number[] {
   if (!plan) return [];
   const out: number[] = [];
@@ -221,6 +261,15 @@ function visibleIdx(): number[] {
     const op = eff(i);
     if ((chips.size === 0 || chips.has(category(op))) && matchesSearch(op) && matchesOv(op)) out.push(i);
   });
+  if (sort) {
+    const { key, dir } = sort;
+    out.sort((a, b) => {
+      const [ma, va] = sortVal(a, key);
+      const [mb, vb] = sortVal(b, key);
+      if (ma !== mb) return ma - mb; // 缺席恒排后
+      return va < vb ? -dir : va > vb ? dir : a - b;
+    });
+  }
   return out;
 }
 
@@ -420,15 +469,30 @@ function buildRow(i: number, groupDir: string | null): HTMLTableRowElement {
   const tdPath = mkPath(sp, p.header.source_root);
   const tdFrom = mkPath(tp, p.header.target_root);
 
-  const tdSize = document.createElement('td');
-  tdSize.className = 'c-size mono';
-  tdSize.textContent = humanSize(op.size);
+  // 双侧实测 size/时间（FFS 的两组 date/size 列）：较新的一侧染色，
+  // "哪边新"是审阅时最常问的一句，今天只能去 reason 里猜
+  const m = metaOf(i);
+  const newer = m.src && m.dst
+    ? (m.src.mtime_ms - m.dst.mtime_ms > MTIME_SLACK ? 's' : m.dst.mtime_ms - m.src.mtime_ms > MTIME_SLACK ? 't' : '')
+    : '';
+  const mkMeta = (sm: SideMeta | null, isNewer: boolean) => {
+    const td = document.createElement('td');
+    td.className = 'c-meta mono' + (isNewer ? ' newer' : '');
+    if (sm) {
+      td.textContent = `${humanSize(sm.size)} · ${fmtTime(sm.mtime_ms)}`;
+      td.title = `${sm.size.toLocaleString()} 字节\n${new Date(sm.mtime_ms).toLocaleString()}`;
+    } else {
+      td.classList.add('dim');
+      td.textContent = '—';
+    }
+    return td;
+  };
 
   const tdReason = document.createElement('td');
   tdReason.className = 'reason';
   tdReason.textContent = op.reason;
 
-  tr.append(tdChk, tdAct, tdPath, tdFrom, tdSize, tdReason);
+  tr.append(tdChk, tdAct, tdPath, mkMeta(m.src, newer === 's'), tdFrom, mkMeta(m.dst, newer === 't'), tdReason);
   tr.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     rowMenu(i, e.clientX, e.clientY);
@@ -460,7 +524,7 @@ function buildGroupRow(dir: string, items: number[]): HTMLTableRowElement {
   tdChk.appendChild(cb);
 
   const td = document.createElement('td');
-  td.colSpan = 5;
+  td.colSpan = 6;
   const folded = collapsedDirs.has(dir);
   let bytes = 0;
   for (const i of items) bytes += eff(i).size ?? 0;
@@ -491,7 +555,8 @@ function renderTable() {
   if (plan.ops.length === 0) { emptyEl.textContent = '✓ 两侧一致，没有需要同步的内容'; return; }
 
   const vis = visibleIdx();
-  if (!grouped) {
+  // 排序中一律平铺：分组靠"同目录的行在计划里连续"这条不变量，排完就没有了
+  if (!grouped || sort) {
     lastGroupDirs = [];
     for (const i of vis) bodyEl.appendChild(buildRow(i, null));
   } else {
@@ -512,6 +577,34 @@ function renderTable() {
   }
   syncHeadCheckbox();
   renderStats();
+  renderCounts();
+  renderSortMarks();
+}
+
+/// FFS 状态条的那句 "Showing 481 of 23,112 items"：
+/// 显示数 / 计划数 / 两侧已扫描 / 判定相等。缺了它，一个文件没出现在表里时
+/// 你分不清它是"相等"还是"根本没扫到"。
+function renderCounts() {
+  const el = document.getElementById('counts');
+  if (!el) return;
+  if (!plan) { el.textContent = ''; return; }
+  const vis = visibleIdx().length;
+  const tot = plan.ops.length;
+  const h = plan.header;
+  const parts = [`显示 ${vis} / ${tot}`];
+  if (vis < tot) parts.push(`隐藏 ${tot - vis}`);
+  parts.push(`已扫描 ${h.source_entries.toLocaleString()} ⇄ ${h.target_entries.toLocaleString()}`);
+  parts.push(`相同 ${(plan.equal_count ?? 0).toLocaleString()}`);
+  el.textContent = parts.join(' · ');
+  el.title = `计划 ${tot} 项；两侧相同 ${(plan.equal_count ?? 0).toLocaleString()} 个文件（${humanSize(plan.equal_bytes ?? 0)}）`;
+}
+
+function renderSortMarks() {
+  for (const el of document.querySelectorAll<HTMLElement>('#plantable th .sortable')) {
+    const on = !!sort && el.dataset.sort === sort.key;
+    el.classList.toggle('on', on);
+    el.dataset.dir = on ? (sort!.dir === 1 ? '▲' : '▼') : '';
+  }
 }
 
 function syncHeadCheckbox() {
@@ -559,7 +652,7 @@ function renderJobs() {
       if (busy) return;
       currentJob = j;
       plan = null; checked = []; flipped = []; chips.clear(); search = ''; searchEl.value = '';
-      ovFilter = null; ovExpanded.clear();
+      ovFilter = null; ovExpanded.clear(); sort = null;
       renderJobs();
       renderAll();
       pathEl.textContent = `${j.source}   ⇄   ${j.target}`;
@@ -590,7 +683,7 @@ async function doCompare() {
     checked = plan.ops.map((op) => selectable(op));
     flipped = plan.ops.map(() => false);
     chips.clear();
-    ovFilter = null; ovExpanded.clear();
+    ovFilter = null; ovExpanded.clear(); sort = null;
     renderAll();
     setStatus(
       plan.ops.length === 0
@@ -1233,10 +1326,23 @@ const btnGroup = $<HTMLButtonElement>('btn-group');
 const btnFold = $<HTMLButtonElement>('btn-fold');
 function renderModeButtons() {
   btnPathMode.textContent = pathMode === 'rel' ? '相对路径' : '完整路径';
-  btnGroup.textContent = grouped ? '树状分组' : '平铺列表';
-  btnGroup.classList.toggle('on', grouped);
-  btnFold.classList.toggle('hidden', !grouped);
+  btnGroup.textContent = sort ? `排序：${sort.key}` : grouped ? '树状分组' : '平铺列表';
+  btnGroup.classList.toggle('on', grouped && !sort);
+  btnGroup.title = sort ? '点此清除排序，回到分组视图' : '切换：树状分组（按目录聚合，FFS 同款）↔ 平铺列表';
+  btnFold.classList.toggle('hidden', !grouped || !!sort);
   btnFold.textContent = collapsedDirs.size > 0 ? '全部展开' : '全部折叠';
+}
+
+/// 点表头排序：同一键再点换方向，第三下清除回计划原序
+function toggleSort(key: SortKey) {
+  if (!sort || sort.key !== key) sort = { key, dir: key === 'path' || key === 'action' ? 1 : -1 };
+  else if (sort.dir === (key === 'path' || key === 'action' ? 1 : -1)) sort = { key, dir: (sort.dir === 1 ? -1 : 1) as 1 | -1 };
+  else sort = null;
+  renderModeButtons();
+  renderTable();
+}
+for (const el of document.querySelectorAll<HTMLElement>('#plantable th .sortable')) {
+  el.addEventListener('click', () => toggleSort(el.dataset.sort as SortKey));
 }
 btnPathMode.addEventListener('click', () => {
   pathMode = pathMode === 'rel' ? 'full' : 'rel';
@@ -1245,7 +1351,9 @@ btnPathMode.addEventListener('click', () => {
   renderTable();
 });
 btnGroup.addEventListener('click', () => {
-  grouped = !grouped;
+  // 排序中点它 = 清排序回到分组，而不是在"排序 + 平铺"里再切一层
+  if (sort) sort = null;
+  else grouped = !grouped;
   localStorage.setItem('sd.grouped', grouped ? 'on' : 'off');
   collapsedDirs.clear();
   renderModeButtons();
@@ -1447,8 +1555,9 @@ function openCtx(x: number, y: number, items: CtxItem[]) {
   // 定位走 CSSOM：style="" 属性会被注入 nonce 后的 CSP 拦掉
   ctxEl.classList.remove('hidden');
   const w = ctxEl.offsetWidth, h = ctxEl.offsetHeight;
-  ctxEl.style.left = `${Math.min(x, window.innerWidth - w - 6)}px`;
-  ctxEl.style.top = `${Math.min(y, window.innerHeight - h - 6)}px`;
+  // 下界 6：窗口比菜单还窄时 min() 会算出负数，菜单整个跑到屏幕外
+  ctxEl.style.left = `${Math.max(6, Math.min(x, window.innerWidth - w - 6))}px`;
+  ctxEl.style.top = `${Math.max(6, Math.min(y, window.innerHeight - h - 6))}px`;
 }
 
 function rowMenu(i: number, x: number, y: number) {

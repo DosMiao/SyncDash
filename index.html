@@ -61,10 +61,11 @@
           <thead>
             <tr>
               <th class="c-chk"><input type="checkbox" id="chk-head" checked title="全选/全不选（当前视图）" /></th>
-              <th class="c-act">action <span class="dim thin">（点徽章翻方向）</span></th>
-              <th class="c-path">source 侧</th>
-              <th class="c-path">target 侧</th>
-              <th class="c-size">size</th>
+              <th class="c-act"><span class="sortable" data-sort="action">action</span> <span class="dim thin">（点徽章翻方向）</span></th>
+              <th class="c-path"><span class="sortable" data-sort="path">source 侧</span></th>
+              <th class="c-meta"><span class="sortable" data-sort="s.size">大小</span> · <span class="sortable" data-sort="s.mtime">时间</span></th>
+              <th class="c-path"><span class="sortable" data-sort="path">target 侧</span></th>
+              <th class="c-meta"><span class="sortable" data-sort="t.size">大小</span> · <span class="sortable" data-sort="t.mtime">时间</span></th>
               <th>reason</th>
             </tr>
           </thead>
@@ -72,7 +73,7 @@
         </table>
       </div>
       </div>
-      <footer id="status"><span id="statusmsg">就绪</span><button id="btn-undo" class="linkbtn hidden"></button></footer>
+      <footer id="status"><span id="statusmsg">就绪</span><button id="btn-undo" class="linkbtn hidden"></button><span id="counts" class="counts"></span></footer>
     </main>
   </div>
   <div id="ctxmenu" class="hidden"></div>
