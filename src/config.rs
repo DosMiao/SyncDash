@@ -30,6 +30,10 @@ pub struct Job {
     /// symlink 策略：exclude（默认，忽略）| direct（同步链接本身，按指向字符串比对）
     #[serde(default = "default_symlinks")]
     pub symlinks: String,
+    /// 版本控制（可选）：true 时被删/被覆盖文件存进各 root 的 .version_syncDash/（历史随数据走），
+    /// 配 `syncdash versions` / `syncdash restore` 查看与找回；false 走本机 trash
+    #[serde(default)]
+    pub versioning: bool,
     /// 远程管线（可选）：设置后 run 走 ssh —— 远端在自己盘上扫描（免 UNC 哈希慢）＋打包送达执行
     #[serde(default)]
     pub remote_host: Option<String>,
@@ -121,6 +125,8 @@ target = '\\host\share\dir'
 # rigor = "standard"                    # quick | standard | paranoid（复制后校验）
 # case_sensitive = false                # 默认大小写不敏感（NTFS/APFS 默认行为）
 # symlinks = "exclude"                  # exclude | direct（同步链接本身）
+# versioning = true                     # 被删/被覆盖文件存进各 root 的 .version_syncDash/
+#                                       #（syncdash versions / restore 查看与找回；默认走本机 trash）
 # no_hash = false
 #
 # 远程管线（可选）：远端在自己盘上扫描（快），target 侧打包经 ssh 送达执行

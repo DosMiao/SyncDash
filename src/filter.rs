@@ -179,7 +179,7 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "*/.git/", "*/node_modules/", "*/target/", "*/build/", "*/dist/", "*/__pycache__/",
     "*/.venv/", "*/venv/", "*/worktrees/", "*/.Spotlight-V100/", "*/.fseventsd/",
     "*/.Trashes/", "*/.TemporaryItems/", "*/.DocumentRevisions-V100/", "*/$RECYCLE.BIN/",
-    "*/System Volume Information/", "*/.syncdash/",
+    "*/System Volume Information/", "*/.syncdash/", "*/.version_syncDash/",
     "*/.DS_Store", "*/._*", "*/Thumbs.db", "*/desktop.ini",
     "*/sync.ffs_db", "*/sync.ffs_lock", "*/.syncdash.lock",
     "*/*.recovery", "*/*.status",

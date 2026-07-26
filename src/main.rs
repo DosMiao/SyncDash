@@ -152,8 +152,27 @@ enum Cmd {
         /// 成功后删除包文件（远程管线的清场步骤，免 shell 方言差异）
         #[arg(long)]
         remove_pkg: bool,
+        /// 被删/被覆盖文件存进 target 的 .version_syncDash/（而非本机 trash）
+        #[arg(long)]
+        versioning: bool,
         #[arg(short, long)]
         verbose: bool,
+    },
+    /// 列出某 root 的版本历史（.version_syncDash）；--prune N 只保留最新 N 个
+    Versions {
+        root: PathBuf,
+        #[arg(long)]
+        prune: Option<usize>,
+    },
+    /// 从版本历史找回文件（默认 dry-run；--file 可多次，不给 = 整个版本）
+    Restore {
+        root: PathBuf,
+        #[arg(long)]
+        version: String,
+        #[arg(long = "file")]
+        files: Vec<String>,
+        #[arg(long)]
+        apply: bool,
     },
     /// 执行计划。默认 dry-run，--apply 才动手
     Apply {
@@ -169,6 +188,9 @@ enum Cmd {
         /// 复制后重读校验 blake3（paranoid）
         #[arg(long)]
         verify: bool,
+        /// 被删/被覆盖文件存进各 root 的 .version_syncDash/（而非本机 trash）
+        #[arg(long)]
+        versioning: bool,
         #[arg(short, long)]
         verbose: bool,
     },
@@ -381,8 +403,31 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::ApplyPack { pkg, target_root, apply: do_apply, remove_pkg, verbose } => {
-            let (done, skipped, errors) = pack::apply_pack(&pkg, target_root.as_deref(), do_apply, verbose)?;
+        Cmd::Versions { root, prune } => {
+            if let Some(keep) = prune {
+                let dropped = syncdash::version::prune(&root, keep)?;
+                println!("pruned {} version(s), kept newest {keep}", dropped.len());
+            }
+            let list = syncdash::version::list(&root)?;
+            if list.is_empty() {
+                println!("no versions under {}", root.join(syncdash::version::STORE_DIR).display());
+            } else {
+                for v in &list {
+                    println!("{}  {}  ops={} preserved={} bytes={}", v.id, v.host, v.ops, v.preserved, v.bytes);
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Restore { root, version, files, apply: do_apply } => {
+            let (restored, skipped, errors) = syncdash::version::restore(&root, &version, &files, !do_apply)?;
+            println!(
+                "{}: {restored} restored, {skipped} skipped, {errors} error(s)",
+                if do_apply { "restore" } else { "dry-run (rerun with --apply)" }
+            );
+            Ok(if errors > 0 { 1 } else { 0 })
+        }
+        Cmd::ApplyPack { pkg, target_root, apply: do_apply, remove_pkg, versioning, verbose } => {
+            let (done, skipped, errors) = pack::apply_pack(&pkg, target_root.as_deref(), do_apply, verbose, versioning)?;
             println!(
                 "{}: {done} done, {skipped} skipped, {errors} error(s)",
                 if do_apply { "applied" } else { "dry-run" }
@@ -392,7 +437,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(if errors > 0 { 1 } else { 0 })
         }
-        Cmd::Apply { plan, apply: do_apply, source_root, target_root, trash, verify, verbose } => {
+        Cmd::Apply { plan, apply: do_apply, source_root, target_root, trash, verify, versioning, verbose } => {
             let p = compare::Plan::load(&plan)?;
             let sr = source_root.unwrap_or_else(|| PathBuf::from(&p.header.source_root));
             let tr = target_root.unwrap_or_else(|| PathBuf::from(&p.header.target_root));
@@ -402,7 +447,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     return Ok(2);
                 }
             }
-            let (done, skipped, errors) = apply::apply(&p.ops, &sr, &tr, &apply::ApplyOptions { dry_run: !do_apply, trash, verbose, verify });
+            let (done, skipped, errors) = apply::apply(&p.ops, &sr, &tr, &apply::ApplyOptions { dry_run: !do_apply, trash, verbose, verify, versioning });
             println!(
                 "{}: {done} done, {skipped} {}, {errors} error(s)",
                 if do_apply { "applied" } else { "dry-run" },

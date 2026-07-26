@@ -42,6 +42,7 @@ struct EditorState {
     rigor: String,
     symlinks: String,
     case_sensitive: bool,
+    versioning: bool,
     include: String,
     exclude: String,
     remote_host: String,
@@ -63,6 +64,7 @@ impl EditorState {
             rigor: "standard".into(),
             symlinks: "exclude".into(),
             case_sensitive: false,
+            versioning: false,
             include: String::new(),
             exclude: String::new(),
             remote_host: String::new(),
@@ -83,6 +85,7 @@ impl EditorState {
             rigor: j.rigor.clone(),
             symlinks: j.symlinks.clone(),
             case_sensitive: j.case_sensitive,
+            versioning: j.versioning,
             include: j.include.join("\n"),
             exclude: j.exclude.join("\n"),
             remote_host: j.remote_host.clone().unwrap_or_default(),
@@ -116,6 +119,7 @@ impl EditorState {
             rigor: self.rigor.clone(),
             case_sensitive: self.case_sensitive,
             symlinks: self.symlinks.clone(),
+            versioning: self.versioning,
             remote_host: opt(&self.remote_host),
             remote_root: opt(&self.remote_root),
             remote_exe: opt(&self.remote_exe),
@@ -484,6 +488,7 @@ impl eframe::App for App {
                                 ui.selectable_value(&mut ed.symlinks, s.to_string(), s);
                             }
                             ui.checkbox(&mut ed.case_sensitive, "case sensitive");
+                            ui.checkbox(&mut ed.versioning, "versioning (.version_syncDash)");
                         });
                         ui.end_row();
                         ui.label("include");

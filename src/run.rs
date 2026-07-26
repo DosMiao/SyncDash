@@ -72,7 +72,7 @@ pub fn apply_job(job: &Job, plan: &Plan, ops: &[Op], trash: Option<std::path::Pa
         ops,
         Path::new(&plan.header.source_root),
         Path::new(&plan.header.target_root),
-        &apply::ApplyOptions { dry_run: false, trash, verbose, verify: job.rigor == "paranoid" },
+        &apply::ApplyOptions { dry_run: false, trash, verbose, verify: job.rigor == "paranoid", versioning: job.versioning },
     );
     if errors == 0 && job.mode == "sync" {
         refresh_archive(job, plan);
@@ -222,6 +222,9 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool) -> s
         let _ = std::fs::remove_file(&tmp);
         ship?;
         let mut ap_args: Vec<String> = vec!["apply-pack".into(), rpkg.clone(), "--apply".into(), "--remove-pkg".into()];
+        if job.versioning {
+            ap_args.push("--versioning".into());
+        }
         if verbose {
             ap_args.push("-v".into());
         }
@@ -247,7 +250,7 @@ pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool) -> s
                 &src_ops,
                 &job.source,
                 &job.target,
-                &crate::apply::ApplyOptions { dry_run: false, trash: None, verbose, verify: job.rigor == "paranoid" },
+                &crate::apply::ApplyOptions { dry_run: false, trash: None, verbose, verify: job.rigor == "paranoid", versioning: job.versioning },
             );
             done += d2;
             skipped += s2;

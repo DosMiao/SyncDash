@@ -14,6 +14,8 @@ pub struct ApplyOptions {
     pub verbose: bool,
     /// paranoid 严谨级：复制/更新后重读目标文件校验 blake3（FFS "verify copied files" 同款）
     pub verify: bool,
+    /// 版本控制（可选）：被删/被覆盖的文件存进各 root 的 .version_syncDash/ 而非本机 trash
+    pub versioning: bool,
 }
 
 fn default_trash() -> PathBuf {
@@ -92,6 +94,8 @@ pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOpti
     let mut done = 0u64;
     let mut skipped = 0u64;
     let mut errors = 0u64;
+    let mut ver_source: Option<crate::version::VersionWriter> = None;
+    let mut ver_target: Option<crate::version::VersionWriter> = None;
 
     for op in ops {
         let (exec_root, other_root) = match op.side {
@@ -129,13 +133,29 @@ pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOpti
                     // symlink 操作：创建链接本身，不复制内容
                     if let Some(target) = &op.link {
                         if exists_no_follow(&dst) {
-                            move_to_trash(&dst, &op.path, &trash)?;
+                            if opt.versioning {
+                                let w = if op.side == Side::Source { &mut ver_source } else { &mut ver_target };
+                                if w.is_none() {
+                                    *w = Some(crate::version::VersionWriter::begin(exec_root)?);
+                                }
+                                w.as_mut().unwrap().preserve(&op.path, &dst, None, "overwritten")?;
+                            } else {
+                                move_to_trash(&dst, &op.path, &trash)?;
+                            }
                         }
                         return create_symlink(target, &dst);
                     }
                     let src = other_root.join(to_native(&op.path));
                     if op.action == Action::Update && exists_no_follow(&dst) {
-                        move_to_trash(&dst, &op.path, &trash)?;
+                        if opt.versioning {
+                            let w = if op.side == Side::Source { &mut ver_source } else { &mut ver_target };
+                            if w.is_none() {
+                                *w = Some(crate::version::VersionWriter::begin(exec_root)?);
+                            }
+                            w.as_mut().unwrap().preserve(&op.path, &dst, Some(&src), "overwritten")?;
+                        } else {
+                            move_to_trash(&dst, &op.path, &trash)?;
+                        }
                     }
                     std::fs::copy(&src, &dst)?;
                     if opt.verify {
@@ -176,7 +196,15 @@ pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOpti
                 Action::Delete => {
                     // symlink_metadata：断链的 symlink exists() 会误报 false，这里不跟随
                     if exists_no_follow(&dst) {
-                        move_to_trash(&dst, &op.path, &trash)?;
+                        if opt.versioning {
+                            let w = if op.side == Side::Source { &mut ver_source } else { &mut ver_target };
+                            if w.is_none() {
+                                *w = Some(crate::version::VersionWriter::begin(exec_root)?);
+                            }
+                            w.as_mut().unwrap().preserve(&op.path, &dst, None, "deleted")?;
+                        } else {
+                            move_to_trash(&dst, &op.path, &trash)?;
+                        }
                     }
                     Ok(())
                 }
@@ -204,8 +232,22 @@ pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOpti
         }
     }
 
-    if !opt.dry_run && done > 0 {
-        println!("trash (deleted/overwritten files kept at): {}", trash.display());
+    if !opt.dry_run {
+        if let Some(w) = ver_source {
+            let side_ops: Vec<crate::compare::Op> = ops.iter().filter(|o| o.side == Side::Source).cloned().collect();
+            if let Ok(Some(id)) = w.finish(&side_ops) {
+                println!("version saved: {} (id {id})", source_root.join(crate::version::STORE_DIR).display());
+            }
+        }
+        if let Some(w) = ver_target {
+            let side_ops: Vec<crate::compare::Op> = ops.iter().filter(|o| o.side == Side::Target).cloned().collect();
+            if let Ok(Some(id)) = w.finish(&side_ops) {
+                println!("version saved: {} (id {id})", target_root.join(crate::version::STORE_DIR).display());
+            }
+        }
+        if !opt.versioning && done > 0 {
+            println!("trash (deleted/overwritten files kept at): {}", trash.display());
+        }
     }
     (done, skipped, errors)
 }

@@ -13,3 +13,4 @@ pub mod run;
 pub mod scan;
 pub mod table;
 pub mod territory;
+pub mod version;

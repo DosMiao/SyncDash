@@ -238,6 +238,7 @@ pub fn apply_pack(
     target_root_override: Option<&Path>,
     do_apply: bool,
     verbose: bool,
+    versioning: bool,
 ) -> std::io::Result<(u64, u64, u64)> {
     // ---------- 第 1 遍：读 plan.jsonl 与 manifest.json ----------
     let mut plan_bytes: Option<Vec<u8>> = None;
@@ -447,7 +448,7 @@ pub fn apply_pack(
         &ops,
         &staging,
         &target_root,
-        &crate::apply::ApplyOptions { dry_run: false, trash: None, verbose, verify: true },
+        &crate::apply::ApplyOptions { dry_run: false, trash: None, verbose, verify: true, versioning },
     );
 
     // unix：恢复 exec 等权限位（SMB/打包路径上唯一会丢的属性）
