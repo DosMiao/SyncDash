@@ -7,6 +7,13 @@ description = "SyncDash desktop shell (Tauri v2) over the syncdash core library"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+# custom-protocol 是"加载内置 dist"的开关：没有它，release 构建也会去连
+# devUrl(localhost:5173) —— 表现为整窗 ERR_CONNECTION_REFUSED 空白页。
+# `tauri build` 会自动传；我们用裸 cargo build，必须放进 default。
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
