@@ -680,7 +680,7 @@ const ED_FIELDS: FSpec[] = [
   { key: 'source', label: 'source 根目录', kind: 'text', wide: true },
   { key: 'target', label: 'target 根目录', kind: 'text', wide: true },
   { key: 'archive', label: 'archive 存档文件（sync 模式）', kind: 'text', hint: '留空 = 无；建议 %APPDATA%\\syncdash\\archives\\<名>.jsonl', wide: true },
-  { key: 'rigor', label: '严谨级', kind: 'select', opts: ['quick', 'standard', 'paranoid'] },
+  { key: 'rigor', label: '严谨级', kind: 'select', opts: ['quick', 'fast', 'standard', 'paranoid'], hint: 'fast=抽样摘要：大文件只读头/中/尾各256KB，比quick多内容防线、比standard快百倍（云盘/媒体库推荐）' },
   { key: 'symlinks', label: 'symlink 策略', kind: 'select', opts: ['exclude', 'direct'] },
   { key: 'case_sensitive', label: '大小写敏感比对', kind: 'bool' },
   { key: 'versioning', label: '版本控制（.version_syncDash）', kind: 'bool', group: '行为' },

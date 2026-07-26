@@ -78,6 +78,10 @@ enum Cmd {
         /// 无视 hash 缓存，全部重新 hash（paranoid）
         #[arg(long)]
         force_rehash: bool,
+        /// fast 严谨级：≥4MB 文件抽样摘要（size+头/中/尾 256KB），少读约百倍字节；
+        /// 云盘占位文件只水合三小段。非逐字节相等证明
+        #[arg(long)]
+        fast: bool,
         /// 记录 symlink 本身（指向字符串）；默认忽略 symlink
         #[arg(long)]
         symlinks_direct: bool,
@@ -434,12 +438,12 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             Ok(if tot.2 > 0 { 1 } else { 0 })
         }
         Cmd::Gui => launch_desktop(),
-        Cmd::Scan { root, out, no_hash, force_rehash, symlinks_direct, exclude, progress } => {
+        Cmd::Scan { root, out, no_hash, force_rehash, fast, symlinks_direct, exclude, progress } => {
             if !root.is_dir() {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
             }
-            let sopt = scan::ScanOptions { hash: !no_hash, force_rehash, symlinks_direct, filter: filter::PathFilter::build(&[], &exclude) };
+            let sopt = scan::ScanOptions { hash: !no_hash, force_rehash, sampled: fast, symlinks_direct, filter: filter::PathFilter::build(&[], &exclude) };
             let bar = |p: scan::ScanProgress| {
                 let pct = if p.bytes_total > 0 { p.bytes_done * 100 / p.bytes_total } else { 100 };
                 eprint!("\r{} {:>3}%  {}/{}  {:.1} MiB/s   ", p.phase, pct,

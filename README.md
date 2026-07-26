@@ -57,7 +57,7 @@ target = '\\192.168.0.115\xuanbomiao\Code\Utilities\flight'
 archive = 'C:\Users\xuanb\AppData\Roaming\syncdash\archive\flight.jsonl'   # sync 模式
 # include = ['*']                       # FFS 过滤器语法白名单（留空 = 全部）
 # exclude = ['*/big_temp/', '*/*.log']  # FFS 语法；默认垃圾/可重建排除已内置
-# rigor = "standard"                    # quick | standard | paranoid（见"严谨级"）
+# rigor = "standard"                    # quick | fast（抽样摘要）| standard | paranoid（见"严谨级"）
 # case_sensitive = false                # 默认大小写不敏感（NTFS/APFS 默认行为）
 # no_hash = false
 ```

@@ -7,15 +7,16 @@ use crate::table::Snapshot;
 use crate::{apply, compare, scan};
 use std::path::Path;
 
-/// 严谨级 → 扫描参数：quick（不 hash）| standard（hash+缓存）| paranoid（全量重 hash）
+/// 严谨级 → 扫描参数：quick（不 hash）| fast（抽样摘要）| standard（hash+缓存）| paranoid（全量重 hash）
 pub fn scan_opts(job: &Job) -> scan::ScanOptions {
     let filter = crate::filter::PathFilter::build_full(&job.include, &job.exclude, &job.deletable);
-    let (hash, force_rehash) = match job.rigor.as_str() {
-        "quick" => (false, false),
-        "paranoid" => (true, true),
-        _ => (true, false),
+    let (hash, force_rehash, sampled) = match job.rigor.as_str() {
+        "quick" => (false, false, false),
+        "fast" => (true, false, true),
+        "paranoid" => (true, true, false),
+        _ => (true, false, false),
     };
-    scan::ScanOptions { hash: hash && !job.no_hash, force_rehash, symlinks_direct: job.symlinks == "direct", filter }
+    scan::ScanOptions { hash: hash && !job.no_hash, force_rehash, sampled, symlinks_direct: job.symlinks == "direct", filter }
 }
 
 /// sync 成功后刷新 archive：重扫 source、剔除冲突路径（冲突下次继续报，绝不被静默仲裁）。
@@ -83,8 +84,15 @@ pub fn compare_job_with(job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Re
     if !v.ok() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
     }
-    let s = scan::scan_ctx(&job.source, &opt, ctx, Phase::ScanSource)?;
-    let t = scan::scan_ctx(&job.target, &opt, ctx, Phase::ScanTarget)?;
+    // 双侧并行扫描：source 与 target 几乎总在不同的盘/链路上（本地盘 vs SMB、
+    // OneDrive vs 外置盘），串行等于白白排队——并行后墙钟≈慢的一侧。
+    // 两侧各自的 PhaseStart 会同时出现，进度面板双行同时跳。
+    let (s, t) = std::thread::scope(|sc| {
+        let hs = sc.spawn(|| scan::scan_ctx(&job.source, &opt, ctx, Phase::ScanSource));
+        let ht = sc.spawn(|| scan::scan_ctx(&job.target, &opt, ctx, Phase::ScanTarget));
+        (hs.join().unwrap(), ht.join().unwrap())
+    });
+    let (s, t) = (s?, t?);
     let archive = match (&job.archive, job.mode.as_str()) {
         (Some(p), "sync") if p.is_file() => Some(Snapshot::load(p)?),
         _ => None,
@@ -319,6 +327,7 @@ pub fn compare_remote_job_with(name: &str, job: &Job, ctx: &crate::progress::Run
     let mut scan_args: Vec<String> = vec!["scan".into(), link.rroot.clone()];
     match job.rigor.as_str() {
         "quick" => scan_args.push("--no-hash".into()),
+        "fast" => scan_args.push("--fast".into()),
         "paranoid" => scan_args.push("--force-rehash".into()),
         _ => {}
     }

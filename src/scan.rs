@@ -192,10 +192,49 @@ pub struct ScanOptions {
     pub hash: bool,
     /// paranoid 严谨级：无视 (size,mtime) 缓存，全部重新 hash
     pub force_rehash: bool,
+    /// fast 严谨级：≥4MB 的文件不读全文，抽样摘要（size + 头/中/尾各 256KB 的 blake3，
+    /// 值带 `~` 前缀与全量哈希严格隔离）。比 quick 多一层内容防线（截断、头尾/多数
+    /// 原地修改、采样区 bitrot 全能抓），比 standard 少读约百倍字节；
+    /// 云盘占位文件只水合三小段而不是整只下载。语义上不是逐字节相等证明。
+    pub sampled: bool,
     /// symlinks="direct"：记录链接本身（指向字符串），否则忽略 symlink
     pub symlinks_direct: bool,
     /// FFS 语义的过滤器（见 filter.rs），默认排除已内置
     pub filter: crate::filter::PathFilter,
+}
+
+/// 抽样摘要的参数与实现（fast 严谨级）
+pub const SAMPLE_MIN: u64 = 4 * 1024 * 1024;
+const SAMPLE_CHUNK: usize = 256 * 1024;
+
+/// fast 模式下这次扫描真正要读的字节（进度总量/速率按它算才诚实）
+fn effective_read(size: u64, sampled: bool) -> u64 {
+    if sampled && size >= SAMPLE_MIN {
+        (3 * SAMPLE_CHUNK as u64).min(size)
+    } else {
+        size
+    }
+}
+
+fn sampled_digest(path: &Path, size: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&size.to_le_bytes());
+    let mut buf = vec![0u8; SAMPLE_CHUNK];
+    for off in [0u64, size / 2, size.saturating_sub(SAMPLE_CHUNK as u64)] {
+        f.seek(SeekFrom::Start(off))?;
+        let mut read = 0usize;
+        while read < SAMPLE_CHUNK {
+            let n = f.read(&mut buf[read..])?;
+            if n == 0 {
+                break;
+            }
+            read += n;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(format!("~{}", hasher.finalize().to_hex()))
 }
 
 /// 扫描进度（P2-6）。syncthing 的 `FolderScanProgress` 同款信息量：
@@ -333,7 +372,9 @@ fn scan_impl(
             let mut hash = None;
             if opt.hash && !opt.force_rehash {
                 if let Some((cs, cm, ch)) = cache.get(&rel) {
-                    if *cs == size && *cm == mt {
+                    // 缓存值按模式隔离：`~` 前缀 = 抽样摘要，绝不能顶替全量哈希（反之亦然）
+                    let want_sampled = opt.sampled && size >= SAMPLE_MIN;
+                    if *cs == size && *cm == mt && ch.starts_with('~') == want_sampled {
                         hash = Some(ch.clone());
                     }
                 }
@@ -350,7 +391,7 @@ fn scan_impl(
     // ——否则界面从哈希一开始就停在 N/N。
     if let Some(pp) = &pp {
         let bytes_to_hash: u64 = if opt.hash {
-            pending.iter().filter(|p| p.hash.is_none()).map(|p| p.size).sum()
+            pending.iter().filter(|p| p.hash.is_none()).map(|p| effective_read(p.size, opt.sampled)).sum()
         } else {
             0
         };
@@ -404,6 +445,25 @@ fn scan_impl(
                     }
                 }
                 if p.hash.is_none() {
+                    // fast 严谨级：大文件只读三个采样窗（云盘占位文件也只水合这三段）
+                    if opt.sampled && p.size >= SAMPLE_MIN {
+                        match sampled_digest(&p.abs, p.size) {
+                            Ok(d) => p.hash = Some(d),
+                            Err(e) => {
+                                hash_err_count.fetch_add(1, Ordering::Relaxed);
+                                if let Some(pp) = &pp {
+                                    pp.error(&p.rel, "hash", side, &e.to_string());
+                                }
+                            }
+                        }
+                        let eff = effective_read(p.size, true);
+                        bytes_done.fetch_add(eff, Ordering::Relaxed);
+                        if let Some(pp) = &pp {
+                            pp.add_bytes(eff, &p.rel);
+                            pp.item_done(&p.rel);
+                        }
+                        return;
+                    }
                     let mut hasher = blake3::Hasher::new();
                     let res = if p.size >= BIG_FILE {
                         (|| -> std::io::Result<()> {
@@ -506,9 +566,33 @@ mod ctx_tests {
         root
     }
 
+    #[test]
+    fn sampled_digest_catches_edge_edits_only() {
+        let d = std::env::temp_dir().join(format!("sd-sample-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("s.bin");
+        let mut data = vec![5u8; 8 * 1024 * 1024];
+        std::fs::write(&f, &data).unwrap();
+        let a = sampled_digest(&f, data.len() as u64).unwrap();
+        assert!(a.starts_with('~'), "sampled digests carry the ~ marker");
+        // 中点在采样窗内 → 摘要必须变
+        data[4 * 1024 * 1024 + 10] = 9;
+        std::fs::write(&f, &data).unwrap();
+        let b = sampled_digest(&f, data.len() as u64).unwrap();
+        assert_ne!(a, b, "an edit inside a sample window must change the digest");
+        // 1MB 处在三个采样窗之外 → 摘要不变。这是 fast 的安全边界，如实断言
+        data[1024 * 1024] = 7;
+        std::fs::write(&f, &data).unwrap();
+        let c = sampled_digest(&f, data.len() as u64).unwrap();
+        assert_eq!(b, c, "fast mode by design does not see edits outside sample windows");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     fn opts() -> ScanOptions {
         ScanOptions {
             hash: true,
+            sampled: false,
             force_rehash: true, // 测试不吃缓存
             symlinks_direct: false,
             filter: crate::filter::PathFilter::build(&[], &[]),
