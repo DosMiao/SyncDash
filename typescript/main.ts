@@ -255,7 +255,9 @@ function renderOverview() {
       (hasKids ? `<span class="chev">${ovExpanded.has(key) ? '▾' : '▸'}</span>` : `<span class="chev"></span>`) +
       `<span class="nm" title="${escapeHtml(label)}">${escapeHtml(label)}</span>` +
       `<span class="ct">${items} · ${humanSize(bytes) || '0 B'}</span></div>` +
-      `<div class="ovbar"><div style="width:${pct}%"></div></div>`;
+      `<div class="ovbar"><div></div></div>`;
+    // 宽度走 CSSOM：style="" 属性会被 Tauri 注入 nonce 后的 CSP 拦掉，JS 赋值不受管
+    (row.querySelector('.ovbar > div') as HTMLElement).style.width = `${pct}%`;
     row.addEventListener('click', (e) => {
       const onChev = (e.target as HTMLElement).classList.contains('chev');
       if (onChev && hasKids) {

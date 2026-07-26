@@ -326,3 +326,59 @@ tr.flip .badge { border-style: dashed; }
 .btn.danger { border-color: var(--red); color: var(--red); }
 .btn.danger:hover { background: rgba(217,58,58,0.12); }
 #btn-watch.on { background: var(--green); border-color: var(--green); color: #fff; }
+
+/* ---- M2 进度子窗口（原 progress.html 内联块外移：Tauri 注入 CSP nonce 后
+       'unsafe-inline' 失效，内联 <style> 会被整块拦掉 → 白屏） ---- */
+#pwin { display: flex; flex-direction: column; height: 100vh; padding: 12px 14px; gap: 8px; }
+#phead { display: flex; align-items: baseline; gap: 10px; }
+#pjob { font-size: 15px; font-weight: 600; }
+#pphase { color: var(--dim); }
+#ppct { margin-left: auto; font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+#ppct.paused { color: var(--orange); }
+#ppct.err { color: var(--red); }
+#ppct.ok { color: var(--green); }
+#stagerows { display: flex; flex-direction: column; gap: 6px; padding: 6px 2px; }
+.stagerow { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
+.stagerow .st-ico { width: 16px; text-align: center; }
+.stagerow .st-name { min-width: 96px; }
+.stagerow .st-detail { flex: 1; color: var(--dim); font-variant-numeric: tabular-nums; text-align: right; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.stagerow.active { border-color: var(--accent); }
+.stagerow.done .st-ico { color: var(--green); }
+#graphs { display: none; flex-direction: column; gap: 8px; }
+#pwin.applying #graphs { display: flex; }
+#pwin.applying #stagerows { flex-direction: row; flex-wrap: wrap; padding: 0; }
+#pwin.applying .stagerow { padding: 3px 8px; font-size: 11px; }
+.gwrap { position: relative; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
+.gwrap canvas { display: block; width: 100%; height: 96px; }
+.gcap { position: absolute; top: 4px; left: 8px; font-size: 10px; color: var(--dim); }
+.grate { position: absolute; top: 4px; right: 8px; font-size: 11px; color: var(--text); font-variant-numeric: tabular-nums; }
+#readouts { display: grid; grid-template-columns: auto 1fr 1fr; gap: 4px 14px; padding: 6px 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; font-variant-numeric: tabular-nums; }
+#readouts .rh { color: var(--dim); }
+#readouts div { white-space: nowrap; }
+#curfile { color: var(--dim); font-size: 11px; padding: 0 2px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; direction: rtl; text-align: left; }
+#errsec { border: 1px solid var(--border); border-radius: 6px; background: var(--panel); max-height: 110px; display: none; flex-direction: column; }
+#errsec.show { display: flex; }
+#errhead { padding: 5px 10px; cursor: pointer; display: flex; gap: 8px; align-items: center; }
+#errhead .cnt-err { color: var(--red); font-weight: 600; }
+#errhead .cnt-warn { color: var(--orange); }
+#errhead .errtip { margin-left: auto; }
+#errlist { overflow-y: auto; font-size: 11px; padding: 0 10px 6px; display: none; }
+#errsec.open #errlist { display: block; }
+#errlist .erow { padding: 3px 0; border-top: 1px dashed var(--border); }
+#errlist .erow .epath { color: var(--text); }
+#errlist .erow .emsg { color: var(--dim); }
+#errlist .erow.warn .epath { color: var(--orange); }
+#controls { margin-top: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#controls .btn { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel2); color: var(--text); cursor: pointer; font-size: 13px; }
+#controls .btn:hover { background: var(--panel3); }
+#controls .btn:disabled { opacity: 0.45; cursor: default; }
+#btn-stop { border-color: #6b3030; }
+.chkline { display: flex; align-items: center; gap: 4px; }
+#wfin { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; }
+#wfin select, #wfin label { font-size: 12px; }
+#wfin select { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; }
+#countdown { display: none; align-items: center; gap: 10px; padding: 7px 10px; border: 1px solid var(--orange); border-radius: 6px; background: var(--panel); }
+#countdown.show { display: flex; }
+#cdbar { flex: 1; height: 6px; background: var(--panel3); border-radius: 3px; overflow: hidden; }
+#cdfill { height: 100%; background: var(--orange); width: 100%; transition: width 1s linear; }
+.spacer { flex: 1; }
