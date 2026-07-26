@@ -30,12 +30,17 @@ SyncDash/
 ```bash
 syncdash jobs                                    # 列出任务配置
 syncdash run <job> [--apply]                     # 一条龙：扫双侧→比对→(--apply)执行→刷新 archive
+syncdash run --all | --prefix cs- [--apply]      # 批量跑（hub-and-spoke 多端的引擎）
+syncdash territories <root>                      # 列出 .ffs-sync 领地
+syncdash gen-jobs <root> --target-root R [--remote-host mac --remote-root-base /Users/x/Code]
 syncdash gui [job]                               # 旧 egui 界面（桌面版见 syncdash-desktop）
 syncdash probe                                   # 本机环境 JSON（远端探测：ssh 对面跑这个）
-syncdash scan <root> [--out t.jsonl] [--no-hash] [--force-rehash] [--exclude PHRASE]...
+syncdash scan <root> [--out t.jsonl] [--no-hash] [--force-rehash] [--symlinks-direct] [--exclude PHRASE]...
 syncdash compare --source a.jsonl --target b.jsonl \
     [--mode mirror|sync|enrich] [--archive last.jsonl] [--resolve-newer] [--case-sensitive] [--out plan.jsonl]
 syncdash apply plan.jsonl [--apply] [--verify] [--source-root R] [--target-root R] [-v]
+syncdash pack plan.jsonl --out pkg.tar           # 打包 target 侧操作（payload+计划+双 hash 清单）
+syncdash apply-pack pkg.tar [--apply] [-v]       # 对端：验 hash→提取→执行（锁/回收/校验全带）
 syncdash-desktop                                 # Tauri 桌面版（主力 GUI）
 ```
 
@@ -147,10 +152,21 @@ target 上一次 `rename` 完事，大文件零重传。`--no-hash` 扫描时自
 
 Win↔Mac 的 SSH 已验证可用（Mac 22 端口开着，免密只差把公钥写进 authorized_keys）。
 
-## 多端（v0.5 方向）
+## 多端（v0.6 定型：hub-and-spoke）
 
-- 1 master 对 N slave：master 表分别与每张 slave 表比对 → N 份计划（现在就能手动做）。
-- 真 N 向 sync 需要版本向量（Syncthing 思路）；hub-and-spoke（Win01 当 hub）在此之前够用。
+**支持的拓扑 = hub-and-spoke**：Win01 当 hub，每个 spoke（Mac、E: 冷备、未来任何一台）
+一份 job（sync/mirror 各取所需、各自 archive），`run --all` / `run --prefix cs-` 一键全跑。
+两两 sync＋各自 archive 在数学上等价于经 hub 的 N 向传播——对"单 hub、多 spoke"的现实完全正确。
+
+**真 P2P N 向（版本向量，Syncthing 思路）明确列为非目标**，除非哪天出现"绕过 hub 的
+spoke↔spoke 直连写入"需求——届时再上版本向量，架构上表格式已预留（表是一等公民，
+每端一张表天然成立）。
+
+远程管线（job 配 `remote_host`/`remote_root`/`remote_exe`）：`run` 自动走
+ssh 探测 → **远端在自己盘上扫描**（免 UNC 拉数据哈希，大领地快一个量级）→ 本地比对 →
+target 侧打包经 ssh stdin 送达 → 远端 `apply-pack`（自带锁/回收/校验）→
+source 侧回拉经挂载路径直落 → archive 刷新。`gen-jobs --remote-host mac
+--remote-root-base /Users/xxx/Code` 可为全部领地一次生成远程管线任务。
 
 ## 与 CodeSync（FFS）的关系
 
@@ -189,7 +205,8 @@ Win↔Mac 的 SSH 已验证可用（Mac 22 端口开着，免密只差把公钥�
 - [x] v0.3.x compare 分类矩阵单测（archive 归因全矩阵，20 项测试）；两阶段并行扫描（rayon 全文件并行哈希，≥32MB 内部再分块）；`compare::reverse_op` 逐行翻方向（egui 点动作徽章翻转；Tauri 壳可直接复用同一 lib 函数）
 - [x] v0.4 远端：`pack` / `apply-pack`——tar 容器（plan.jsonl＋payload＋收尾 manifest），计划 blake3＋逐文件 blake3＋合并 hash；staging 全部验完才动 target；复用 apply 的锁/回收/复制后校验；unix mode 恢复。**Win 打包 → SMB 送包 → Mac apply-pack → 远程复扫 0 ops，真机全流程验证**
 - [x] v0.5 `territories` / `gen-jobs`：扫 `.ffs-sync` 标记为每个领地生成 `cs-<slug>.toml`（sync 模式＋自动 archive 路径）——syncdash 版 CodeSync 生成器，11 个领地实测生成；与 FFS 并行运行，切换时机由使用者定
-- [ ] v0.6 symlink 策略；同目录 rename 合并显示；GUI 任务编辑；`run --all`；ssh 一条龙（scan/pack/ship/apply 单命令）；真 N 向（版本向量）
+- [x] v0.6 `run --all`/`--prefix`；ssh 远程管线一条龙（job 配 remote_host 即启用，真机验证：dry→apply→复跑 0 ops，含 symlink）；symlink 策略 exclude/direct（按指向比对，apply 建/换/删链接本身）；同父目录 rename 优先配对（reason 区分 rename/move）；git bundle 经 SMB 更新 Mac（挂载不在线时的通道）
+- **roadmap 完成**。后续候选（按需）：GUI 任务编辑（桌面线）、Windows 作为远端（PowerShell 引号规则）、版本向量 P2P（见"多端"——当前明确非目标）、FastCDC 增量传输
 
 ## 构建
 
