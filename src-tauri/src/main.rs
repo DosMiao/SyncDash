@@ -200,6 +200,52 @@ fn jobs_dir() -> String {
     config::jobs_dir().display().to_string()
 }
 
+/// 打开（或聚焦）独立进度子窗口。运行事件广播到所有窗口，子窗自行过滤。
+#[tauri::command]
+fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("progress") {
+        let _ = w.show();
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(&app, "progress", tauri::WebviewUrl::App("progress.html".into()))
+        .title("SyncDash — 运行")
+        .inner_size(620.0, 500.0)
+        .min_inner_size(440.0, 380.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 隐藏进度子窗口（比对结束后由主窗调用；同步窗口的去留归子窗自己的 Auto-close）
+#[tauri::command]
+fn close_progress_window(app: tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("progress") {
+        let _ = w.hide();
+    }
+}
+
+/// When finished 动作（FFS 同款）：sleep / shutdown。倒计时与确认都在前端做完才调这里。
+#[tauri::command]
+fn post_sync_action(kind: String) -> Result<(), String> {
+    let (prog, args): (&str, Vec<&str>) = if cfg!(windows) {
+        match kind.as_str() {
+            "sleep" => ("rundll32.exe", vec!["powrprof.dll,SetSuspendState", "0,1,0"]),
+            "shutdown" => ("shutdown", vec!["/s", "/t", "5"]),
+            _ => return Ok(()),
+        }
+    } else {
+        match kind.as_str() {
+            "sleep" => ("pmset", vec!["sleepnow"]),
+            "shutdown" => ("osascript", vec!["-e", "tell application \"System Events\" to shut down"]),
+            _ => return Ok(()),
+        }
+    };
+    std::process::Command::new(prog).args(&args).spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
 /// 对活动运行请求协作取消。返回是否存在活动运行。
 #[tauri::command]
 fn cancel_run(state: tauri::State<'_, Arc<RunState>>) -> bool {
@@ -305,7 +351,8 @@ fn main() {
     tauri::Builder::default()
         .manage(Arc::new(RunState::default()))
         .invoke_handler(tauri::generate_handler![
-            list_jobs, jobs_dir, compare_job, preflight, apply_job, cancel_run, pause_run
+            list_jobs, jobs_dir, compare_job, preflight, apply_job, cancel_run, pause_run,
+            open_progress_window, close_progress_window, post_sync_action
         ])
         .run(tauri::generate_context!())
         .expect("error while running SyncDash");

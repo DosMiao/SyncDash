@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SyncDash — 运行</title>
+  <link rel="stylesheet" href="/typescript/styles.css" />
+  <style>
+    /* 子窗口自己的布局；styles.css 只借主题变量与字体 */
+    #pwin { display: flex; flex-direction: column; height: 100vh; padding: 12px 14px; gap: 8px; }
+
+    #phead { display: flex; align-items: baseline; gap: 10px; }
+    #pjob { font-size: 15px; font-weight: 600; }
+    #pphase { color: var(--dim); }
+    #ppct { margin-left: auto; font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    #ppct.paused { color: var(--orange); }
+    #ppct.err { color: var(--red); }
+    #ppct.ok { color: var(--green); }
+
+    /* 比对/阶段行模式 */
+    #stagerows { display: flex; flex-direction: column; gap: 6px; padding: 6px 2px; }
+    .stagerow { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
+    .stagerow .st-ico { width: 16px; text-align: center; }
+    .stagerow .st-name { min-width: 96px; }
+    .stagerow .st-detail { flex: 1; color: var(--dim); font-variant-numeric: tabular-nums; text-align: right; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .stagerow.active { border-color: var(--accent); }
+    .stagerow.done .st-ico { color: var(--green); }
+
+    /* 图表区（apply） */
+    #graphs { display: none; flex-direction: column; gap: 8px; }
+    #pwin.applying #graphs { display: flex; }
+    #pwin.applying #stagerows { flex-direction: row; flex-wrap: wrap; padding: 0; }
+    #pwin.applying .stagerow { padding: 3px 8px; font-size: 11px; }
+    .gwrap { position: relative; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
+    .gwrap canvas { display: block; width: 100%; height: 96px; }
+    .gcap { position: absolute; top: 4px; left: 8px; font-size: 10px; color: var(--dim); }
+    .grate { position: absolute; top: 4px; right: 8px; font-size: 11px; color: var(--text); font-variant-numeric: tabular-nums; }
+
+    #readouts { display: grid; grid-template-columns: auto 1fr 1fr; gap: 4px 14px; padding: 6px 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; font-variant-numeric: tabular-nums; }
+    #readouts .rh { color: var(--dim); }
+    #readouts div { white-space: nowrap; }
+    #curfile { color: var(--dim); font-size: 11px; padding: 0 2px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; direction: rtl; text-align: left; }
+
+    #errsec { border: 1px solid var(--border); border-radius: 6px; background: var(--panel); max-height: 110px; display: none; flex-direction: column; }
+    #errsec.show { display: flex; }
+    #errhead { padding: 5px 10px; cursor: pointer; display: flex; gap: 8px; align-items: center; }
+    #errhead .cnt-err { color: var(--red); font-weight: 600; }
+    #errhead .cnt-warn { color: var(--orange); }
+    #errlist { overflow-y: auto; font-size: 11px; padding: 0 10px 6px; display: none; }
+    #errsec.open #errlist { display: block; }
+    #errlist .erow { padding: 3px 0; border-top: 1px dashed var(--border); }
+    #errlist .erow .epath { color: var(--text); }
+    #errlist .erow .emsg { color: var(--dim); }
+    #errlist .erow.warn .epath { color: var(--orange); }
+
+    #controls { margin-top: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    #controls .btn { padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel2); color: var(--text); cursor: pointer; font-size: 13px; }
+    #controls .btn:hover { background: var(--panel3); }
+    #controls .btn:disabled { opacity: 0.45; cursor: default; }
+    #btn-stop { border-color: #6b3030; }
+    #wfin { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; }
+    #wfin select, #wfin label { font-size: 12px; }
+    #wfin select { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px; }
+
+    #countdown { display: none; align-items: center; gap: 10px; padding: 7px 10px; border: 1px solid var(--orange); border-radius: 6px; background: var(--panel); }
+    #countdown.show { display: flex; }
+    #cdbar { flex: 1; height: 6px; background: var(--panel3); border-radius: 3px; overflow: hidden; }
+    #cdfill { height: 100%; background: var(--orange); width: 100%; transition: width 1s linear; }
+  </style>
+</head>
+<body>
+  <div id="pwin">
+    <div id="phead">
+      <span id="pjob">SyncDash</span>
+      <span id="pphase">等待运行…</span>
+      <span id="ppct">—</span>
+    </div>
+
+    <div id="stagerows"></div>
+
+    <div id="graphs">
+      <div class="gwrap">
+        <span class="gcap">数据（累计字节）</span>
+        <span class="grate" id="rate-bytes"></span>
+        <canvas id="cv-bytes"></canvas>
+      </div>
+      <div class="gwrap">
+        <span class="gcap">条目（累计项数）</span>
+        <span class="grate" id="rate-items"></span>
+        <canvas id="cv-items"></canvas>
+      </div>
+      <div id="readouts">
+        <div class="rh"></div><div class="rh">已处理</div><div class="rh">剩余</div>
+        <div class="rh">条目</div><div id="ro-items-done">—</div><div id="ro-items-left">—</div>
+        <div class="rh">字节</div><div id="ro-bytes-done">—</div><div id="ro-bytes-left">—</div>
+        <div class="rh">时间</div><div id="ro-elapsed">—</div><div id="ro-eta">—</div>
+      </div>
+      <div id="curfile"></div>
+    </div>
+
+    <div id="errsec">
+      <div id="errhead">
+        <span>⚠</span>
+        <span class="cnt-err" id="cnt-err"></span>
+        <span class="cnt-warn" id="cnt-warn"></span>
+        <span class="dim" style="margin-left:auto">点击展开</span>
+      </div>
+      <div id="errlist"></div>
+    </div>
+
+    <div id="countdown">
+      <span id="cdtext"></span>
+      <div id="cdbar"><div id="cdfill"></div></div>
+      <button class="btn" id="cd-cancel">取消</button>
+    </div>
+
+    <div id="controls">
+      <button class="btn" id="btn-pause" disabled>⏸ 暂停</button>
+      <button class="btn" id="btn-stop" disabled>■ 停止</button>
+      <label class="dim" style="display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="chk-autoclose" /> 完成后自动关窗
+      </label>
+      <span id="wfin">
+        完成后
+        <select id="sel-wfin">
+          <option value="none">无动作</option>
+          <option value="sleep">睡眠</option>
+          <option value="shutdown">关机</option>
+        </select>
+      </span>
+    </div>
+  </div>
+  <script type="module" src="/typescript/progress.ts"></script>
+</body>
+</html>

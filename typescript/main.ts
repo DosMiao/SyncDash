@@ -22,7 +22,7 @@ interface PlanDto {
   ops: OpDto[];
   reversed: (OpDto | null)[];
 }
-interface ApplyDto { done: number; skipped: number; errors: number }
+interface ApplyDto { done: number; skipped: number; errors: number; bytes_copied: number; cancelled: boolean }
 interface Progress { phase: string; detail: string; pct: number; rate: number }
 interface PreflightDto { ok: boolean; blockers: string[]; warnings: string[] }
 
@@ -276,10 +276,12 @@ function renderJobs() {
 
 // ---------- 动作 ----------
 
-async function doCompare() {
+async function doCompare(showWindow = true) {
   if (!currentJob || busy) return;
   setBusy(true);
   setStatus(`正在比对 '${currentJob.name}' ...`);
+  // FFS 同款：比对期也用进度子窗（扫描双侧的条数/字节实时跳动），结束后自动收起
+  if (showWindow) invoke('open_progress_window').catch(() => {});
   try {
     acknowledged = false;
     modalOk.disabled = false;
@@ -297,8 +299,9 @@ async function doCompare() {
   } catch (e) {
     plan = null;
     renderAll();
-    setStatus(`比对失败：${e}`, 'err');
+    setStatus(String(e) === 'cancelled' ? '比对已取消' : `比对失败：${e}`, String(e) === 'cancelled' ? '' : 'err');
   }
+  if (showWindow) invoke('close_progress_window').catch(() => {});
   setBusy(false);
 }
 
@@ -361,11 +364,18 @@ async function doSync() {
   const finalOps = idx.map((i) => eff(i));
   setBusy(true);
   setStatus(`正在同步 '${currentJob.name}'（${finalOps.length} 项）...`);
+  // 同步期的子窗去留归它自己的 Auto-close / When-finished，主窗不收
+  invoke('open_progress_window').catch(() => {});
   try {
     const r = await invoke<ApplyDto>('apply_job', { name: currentJob.name, plan, ops: finalOps, acknowledged });
-    setStatus(`完成：${r.done} 执行，${r.skipped} 跳过，${r.errors} 错误 — 复核中...`, r.errors ? 'err' : 'ok');
+    setStatus(
+      r.cancelled
+        ? `已停止：${r.done} 执行后取消 — 复核中...`
+        : `完成：${r.done} 执行，${r.skipped} 跳过，${r.errors} 错误 — 复核中...`,
+      r.errors ? 'err' : 'ok',
+    );
     setBusy(false);
-    await doCompare();
+    await doCompare(false);
   } catch (e) {
     setStatus(`同步失败：${e}`, 'err');
     setBusy(false);
@@ -374,7 +384,7 @@ async function doSync() {
 
 // ---------- 事件接线 ----------
 
-btnCompare.addEventListener('click', doCompare);
+btnCompare.addEventListener('click', () => doCompare());
 btnSync.addEventListener('click', openConfirm);
 $('modal-ok').addEventListener('click', doSync);
 $('modal-cancel').addEventListener('click', () => modalEl.classList.add('hidden'));

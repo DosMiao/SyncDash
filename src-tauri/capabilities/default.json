@@ -1,6 +1,14 @@
 {
   "identifier": "default",
-  "description": "SyncDash main window",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "description": "SyncDash windows (main + progress child)",
+  "windows": ["main", "progress"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-title",
+    "core:window:allow-set-progress-bar",
+    "core:window:allow-close",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-focus"
+  ]
 }
