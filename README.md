@@ -12,17 +12,31 @@
 | 远端"打包过去、对面校验后执行" | 无 | v0.4：zip + 清单 + 双 hash + 对端校验 |
 | 比对依据可检查、可留档 | 黑盒 | ✅ 快照表/计划表都是 JSONL 文件 |
 
+## 架构（v0.3，参照 AlexQuant Desktop）
+
+```
+SyncDash/
+├─ src/                 syncdash 核心库（scan/compare/apply/filter/lock/…）+ CLI bin（含旧 egui 界面）
+├─ src-tauri/           Tauri v2 桌面壳：薄 IPC 层（list_jobs / compare_job / apply_job）
+├─ typescript/          前端（Vite + 原生 TS，无框架）：main.ts + styles.css
+├─ index.html           前端入口
+├─ dist/                前端构建产物 —— 特意提交进 git（Mac 无 node，见"构建"）
+├─ builder.bat          Windows 构建菜单（Dev / Desktop / CLI / All）
+└─ builder.command      Mac 构建脚本（纯 cargo）
+```
+
 ## 命令
 
 ```bash
 syncdash jobs                                    # 列出任务配置
 syncdash run <job> [--apply]                     # 一条龙：扫双侧→比对→(--apply)执行→刷新 archive
-syncdash gui [job]                               # 图形界面（见下）
+syncdash gui [job]                               # 旧 egui 界面（桌面版见 syncdash-desktop）
 syncdash probe                                   # 本机环境 JSON（远端探测：ssh 对面跑这个）
-syncdash scan <root> [--out t.jsonl] [--no-hash] [--exclude NAME]...
+syncdash scan <root> [--out t.jsonl] [--no-hash] [--force-rehash] [--exclude PHRASE]...
 syncdash compare --source a.jsonl --target b.jsonl \
-    [--mode mirror|sync|enrich] [--archive last.jsonl] [--resolve-newer] [--out plan.jsonl]
-syncdash apply plan.jsonl [--apply] [--source-root R] [--target-root R] [-v]
+    [--mode mirror|sync|enrich] [--archive last.jsonl] [--resolve-newer] [--case-sensitive] [--out plan.jsonl]
+syncdash apply plan.jsonl [--apply] [--verify] [--source-root R] [--target-root R] [-v]
+syncdash-desktop                                 # Tauri 桌面版（主力 GUI）
 ```
 
 ## 任务配置（参考 FFS 的"一个 .ffs_gui 一个配置"）
@@ -42,13 +56,16 @@ archive = 'C:\Users\xuanb\AppData\Roaming\syncdash\archive\flight.jsonl'   # syn
 `run <job> --apply` 成功（0 错误）且为 sync 模式时**自动刷新 archive**（冲突路径会从存档剔除，
 下次继续报冲突而不是被悄悄仲裁）。
 
-## GUI
+## GUI（桌面版 `syncdash-desktop`，Tauri v2）
 
-`syncdash gui [job]`：任务下拉 → **Compare**（后台线程扫描，不卡界面）→ 差异表
-（勾选框 + 彩色动作徽章：`-> copy` / `<- copy` / `mv` / `DEL` / `CONFLICT`，size、reason 列）
-→ 底部统计（op 数 / 已选 / 待传字节 / 冲突数）→ **Synchronize** 执行勾选项。
-conflict/note 行不可勾选，只能看。自动加载系统 CJK 字体（微软雅黑 / PingFang）。
-FFS 还有而我们暂缺的：逐行翻转方向、GUI 里编辑过滤器 —— 在 roadmap。
+FFS 形态的暗色双栏界面：左侧任务列表（模式徽章：mirror 蓝 / sync 绿 / enrich 橙）→
+**Compare**（spawn_blocking 后台跑，UI 不卡）→ 差异表：勾选框 + 彩色动作徽章
+（`→ copy` / `← copy` / `⇢ move` / `✕ delete` / `⚡ conflict`）+ path / from / size / reason →
+统计条（项数 / 已选 / 待传字节 / 冲突）→ **Synchronize** 执行勾选项，完成后**自动复比对**验证收敛。
+conflict/note 行锁定不可勾。前端零框架（Vite + 原生 TS，约 400 行）。
+
+旧 egui 界面保留在 CLI（`syncdash gui`），功能同前。
+FFS 还有而我们暂缺的：逐行翻转方向、GUI 内编辑过滤器/任务 —— 在 roadmap。
 
 - `scan` 默认写 stdout（ssh 友好：`ssh mac syncdash scan ~/Data > mac.jsonl`）。
 - `apply` **默认 dry-run**，`--apply` 才动手；删除/覆盖的文件先进本机
@@ -134,13 +151,29 @@ Win↔Mac 的 SSH 已验证可用（Mac 22 端口开着，免密只差把公钥�
 - [x] v0.1 `scan`（表+hash 缓存）、`compare`（mirror/sync/enrich + 移动检测 + archive 归因）、`apply`（本地/挂载盘，dry-run 默认，回收目录）、`probe`
 - [x] v0.2 任务配置（jobs/*.toml）、`run` 一条龙、GUI（Compare→勾选→Synchronize）、sync 成功后自动刷新 archive
 - [x] v0.2.1 FFS 语法过滤器（include/exclude 完全兼容，含单测）＋根目录心跳锁（防双机并发 apply，遗弃锁自动接管）
-- [ ] v0.3 单测覆盖 compare 分类矩阵；并行扫描；symlink 策略；GUI 逐行方向翻转；同目录 rename 合并显示
+- [x] v0.3 Tauri v2 桌面壳（参照 AlexQuant Desktop：Vite+TS 前端、builder 双平台脚本、dist 入库使 Mac 免 node 纯 cargo 构建）；
+      rigor 严谨级（quick/standard/paranoid：免hash / hash缓存 / 全量重hash+复制后校验）；NFC+大小写折叠比对键；Windows 非法路径预检
+- [ ] v0.3.x 单测覆盖 compare 分类矩阵；并行扫描；symlink 策略；GUI 逐行方向翻转、任务编辑；同目录 rename 合并显示
 - [ ] v0.4 远端：`pack` / `apply-pack`（zip+清单+双 hash+对端校验）/ ssh 传输封装
 - [ ] v0.5 多端配置文件（节点×领地×模式），领地清单与 `.ffs-sync` 标记打通
 
 ## 构建
 
+**Windows**：双击 `builder.bat`（[1] Dev HMR / [2] Desktop / [3] CLI / [4] All），或手动：
+
 ```bash
-cargo build --release        # Windows: target\release\syncdash.exe
-ssh mac "cd ~/Code/Utilities/SyncDash && cargo build --release"   # Mac 侧（仓库经 git 到位后）
+npm run build && cargo build --release -p syncdash-desktop   # 桌面版
+cargo build --release -p syncdash                            # CLI
 ```
+
+**Mac（无需 node）**：`dist/` 前端产物随 git 提供，Tauri 编译期直接嵌入，纯 cargo 出完整 GUI：
+
+```bash
+bash builder.command     # = cargo build --release -p syncdash-desktop -p syncdash
+```
+
+改了前端（typescript/、index.html）之后：在 Windows 跑一次 `npm run build` 并把 dist/ 一起提交，Mac 拉取后重编即可。
+
+**把仓库送上 Mac**（无 GitHub 远端时）：Mac 挂载了 D 盘就 `git clone /Volumes/D-AnonyD/Code/Utilities/SyncDash ~/Code/Utilities/SyncDash`；
+没挂载则从 Windows 反向推：`git -c windows.appendAtomically=false -c core.autocrlf=false clone D:\Code\Utilities\SyncDash '\\192.168.0.115\xuanbomiao\Code\Utilities\SyncDash'`
+（macOS 的 SMB 不支持 git 的原子追加写，必须关 `windows.appendAtomically`；`autocrlf=false` 保住 .command/.sh 的 LF）。
