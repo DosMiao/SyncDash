@@ -3,7 +3,7 @@ mod gui;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use syncdash::compare::{Action, Op};
-use syncdash::{apply, compare, config, filter, run, scan, table};
+use syncdash::{apply, compare, config, filter, pack, run, scan, table};
 
 #[derive(Parser)]
 #[command(name = "syncdash", version, about = "Table-driven multi-node file sync (scan -> compare -> apply)")]
@@ -88,6 +88,26 @@ enum Cmd {
         case_sensitive: bool,
         #[arg(long)]
         out: Option<PathBuf>,
+    },
+    /// 打包计划中 target 侧的操作为 tar 包（payload+计划+双 hash 清单），供对端 apply-pack
+    Pack {
+        plan: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// 覆盖计划头里的 source root
+        #[arg(long)]
+        source_root: Option<PathBuf>,
+    },
+    /// 在目标机执行包：验计划 hash → 逐文件验 hash → 执行（锁+回收+复制后校验）。默认 dry-run
+    ApplyPack {
+        pkg: PathBuf,
+        /// 覆盖计划头里的 target root
+        #[arg(long)]
+        target_root: Option<PathBuf>,
+        #[arg(long)]
+        apply: bool,
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// 执行计划。默认 dry-run，--apply 才动手
     Apply {
@@ -229,6 +249,21 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             );
             write_out(&out, |w| plan.write_to(w))?;
             Ok(if plan.header.conflict_count > 0 { 1 } else { 0 })
+        }
+        Cmd::Pack { plan, out, source_root } => {
+            let p = compare::Plan::load(&plan)?;
+            let sr = source_root.unwrap_or_else(|| PathBuf::from(&p.header.source_root));
+            let s = pack::pack(&p, &sr, &out)?;
+            println!("packed: {} op(s), {} payload file(s), {} bytes -> {}", s.ops, s.files, s.bytes, out.display());
+            Ok(0)
+        }
+        Cmd::ApplyPack { pkg, target_root, apply: do_apply, verbose } => {
+            let (done, skipped, errors) = pack::apply_pack(&pkg, target_root.as_deref(), do_apply, verbose)?;
+            println!(
+                "{}: {done} done, {skipped} skipped, {errors} error(s)",
+                if do_apply { "applied" } else { "dry-run" }
+            );
+            Ok(if errors > 0 { 1 } else { 0 })
         }
         Cmd::Apply { plan, apply: do_apply, source_root, target_root, trash, verify, verbose } => {
             let p = compare::Plan::load(&plan)?;
