@@ -294,7 +294,28 @@ fn scan_impl(
     let mut entries: Vec<Entry> = Vec::new();
     let mut hash_errors = 0u64;
 
-    let walker = walkdir::WalkDir::new(root)
+    // Windows 长路径：遍历用 \\?\ 前缀的根，所有后代路径免疫 260 字符 MAX_PATH
+    // （OneDrive 根前缀就 47 字符，深层课程目录实测撞线；撞线的目录整棵静默消失，
+    // 在 mirror 里表现为"对面成片被删"。FFS 正是靠 \\?\ 活着的）。
+    // 缓存键/快照头仍用原始 root，前缀只活在遍历与文件 I/O 里。
+    #[cfg(windows)]
+    let walk_root: std::path::PathBuf = {
+        let s = root.to_string_lossy();
+        if s.starts_with(r"\\") {
+            root.to_path_buf() // 已是 \\?\ 或 UNC（\\server\share 需 \\?\UNC\ 形态，暂不转换）
+        } else {
+            std::path::PathBuf::from(format!(r"\\?\{}", s))
+        }
+    };
+    #[cfg(not(windows))]
+    let walk_root: std::path::PathBuf = root.to_path_buf();
+
+    // walk 期的错误绝不再静默：计数 + 采样，收尾时如实喊出来
+    // （被跳过的条目在比对里等价于"该侧不存在"——这是能生成灾难计划的隐身故障）
+    let mut walk_errors = 0u64;
+    let mut walk_err_samples: Vec<String> = Vec::new();
+
+    let walker = walkdir::WalkDir::new(&walk_root)
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
@@ -334,20 +355,35 @@ fn scan_impl(
         }
         let item = match item {
             Ok(i) => i,
-            Err(_) => continue, // 无权限等：跳过但不中断
+            Err(e) => {
+                walk_errors += 1;
+                if walk_err_samples.len() < 5 {
+                    walk_err_samples.push(format!(
+                        "{}: {e}",
+                        e.path().map(|p| p.display().to_string()).unwrap_or_default()
+                    ));
+                }
+                continue;
+            }
         };
         if item.depth() == 0 {
             continue;
         }
         let rel = item
             .path()
-            .strip_prefix(root)
+            .strip_prefix(&walk_root)
             .unwrap_or(item.path())
             .to_string_lossy()
             .replace('\\', "/");
         let md = match item.metadata() {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                walk_errors += 1;
+                if walk_err_samples.len() < 5 {
+                    walk_err_samples.push(format!("{rel}: {e}"));
+                }
+                continue;
+            }
         };
         if item.file_type().is_dir() {
             if opt.filter.pass_dir(&rel).0 {
@@ -383,6 +419,22 @@ fn scan_impl(
             if let Some(pp) = &pp {
                 pp.item_done(&pending.last().unwrap().rel);
             }
+        }
+    }
+
+    if walk_errors > 0 {
+        eprintln!(
+            "warning: {walk_errors} entr(ies) under {} skipped by walk errors — they will look ABSENT on this side! samples: {}",
+            root.display(),
+            walk_err_samples.join(" | ")
+        );
+        if let Some(pp) = &pp {
+            pp.error(
+                "",
+                "walk",
+                side,
+                &format!("{walk_errors} 个条目因遍历错误被跳过（该侧将视为不存在！）样本: {}", walk_err_samples.join(" | ")),
+            );
         }
     }
 
