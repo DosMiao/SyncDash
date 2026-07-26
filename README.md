@@ -76,11 +76,30 @@ conflict/note 行锁定不可勾。前端零框架（Vite + 原生 TS，约 400 
 v0.3.2 追加：**逐行翻转方向**（点动作徽章切换，语义由核心 `reverse_op` 预计算：copy↔delete 互逆、update 换边；
 翻转行虚线边框+底色提示）、**筛选 chips**（全部/复制/更新/移动/删除/冲突，实时计数，0 项变淡——GitDash 风格）、
 **搜索框**（path/from/reason 子串）、**同步前确认单**（分类计数+字节数，删除红色高亮）、
-**比对进度事件**（扫描 source → 扫描 target → 比对中，状态栏实时显示）、**快捷键**（Ctrl/⌘+R 比对、
-Ctrl/⌘+F 搜索、Enter 同步、Esc 关弹层）、**Mac 沉浸式标题栏**（Overlay + 红绿灯让位 + 顶部拖拽条）。
+**快捷键**（Ctrl/⌘+R 比对、Ctrl/⌘+F 搜索、Enter 同步、Esc 关弹层）、**Mac 沉浸式标题栏**。
 
-旧 egui 界面保留在 CLI（`syncdash gui`），已同步支持逐行翻方向。
-FFS 还有而我们暂缺的：GUI 内编辑过滤器/任务 —— 在 roadmap。
+v0.9 "Progress & Polish"（对照 FFS 14.10 源码行为参数，计划见 plans/ffs-ui）：
+- **独立进度子窗口**（FFS 同款）：比对期显示双侧扫描的条数/字节实时计数；执行期双累积图
+  （字节+条目）、4s 滑窗速率、60s 滑窗 ETA、大字百分比 `(bytesDone+itemsDone)/(bytesTotal+itemsTotal)`、
+  已处理/剩余、当前文件、窗题百分比 + Windows 任务栏进度。
+- **Pause/Continue**（引擎自旋暂停：elapsed 冻结、RootLock 心跳继续跳，对面机器不会误判遗弃锁）、
+  **Stop = 协作取消**（块间响应；原子落盘保证终点永无半截文件、零 `.syncdash.tmp.*` 残留）、
+  **错误累积面板**（错误不中断执行——FFS 语义；windowed 构建里 stderr 会丢，错误/警告全走事件流）、
+  **Auto-close** 与 **When finished**（睡眠/关机，10 秒可取消倒计时）。
+- **Overview 聚合竖栏**（差异表左侧可折叠）：按顶层目录聚合条数/字节/占比条，点击过滤差异表，二层惰性展开；
+  **图标化统计条**（0 值置灰、非 0 加粗着色）。
+- **运行日志**：每次真实 apply 落 `logs/runs.jsonl` 索引 + 每次运行明细（定稿 op 清单+累积错误）；
+  侧栏任务行显示**上次同步**（结果色点+相对时间，超 7 天变红）；GUI 日志面板可回看历史与明细；
+  CLI `syncdash history [job] [--prune-days N]`。
+- **任务编辑器**（全字段表单：模式/根目录/严谨级/过滤器/守护闸门/远程三件套/watch，新建/编辑/二次确认删除）。
+- **值守 Watch**（定时扫描，非 inotify）：`watch_interval_secs` 秒级档＝"准实时"；hash 缓存让未变的树
+  只付 walk 成本。桌面 Watch 开关（倒计时+发现差异提醒/自动执行）；CLI `run --watch [--interval N] [--auto-apply]`。
+- **remote 任务在 GUI 里走真远程管线**（此前静默落进本地管线，经 UNC 重哈希慢一个数量级）；侧栏 ssh 徽章。
+- **egui 旧界面退役删除**（Tauri 功能齐平后按约定移除；CLI 无参数/`syncdash gui` 现在启动桌面版，
+  workspace release 构建 ~2.5min → ~56s）。
+- 引擎底座：统一 `ProgressEvent` 事件流（PhaseStart/Totals/Progress/Error/Paused/Resumed/Summary，
+  节流归 sink）；**apply 五相位执行**，Copy/Update 相位并行（`parallel`，默认 4，SMB 2-4 条流吃满上行；
+  开 delta 的 Update 留串行道防内存峰值）；DeleteDir 类内 deepest-first。
 
 - `scan` 默认写 stdout（ssh 友好：`ssh mac syncdash scan ~/Data > mac.jsonl`）。
 - `apply` **默认 dry-run**，`--apply` 才动手；删除/覆盖的文件先进本机
@@ -276,6 +295,10 @@ source 侧回拉经挂载路径直落 → archive 刷新。`gen-jobs --remote-ho
       **本地增量**（`delta`：大文件按 FastCDC 块补写，SMB 上传划算）；
       **`Action::Chmod`**（`sync_mode`：内容相同只差权限位时不重传）；
       空文件不再被乱配成"重命名"、歧义配对如实标注候选数、大小写撞名预检、扫描进度（CLI `--progress` + GUI 进度条）
+- [x] v0.9 **"Progress & Polish"——对照 FFS 14.10 的执行期体验补齐**（90 项测试）：统一进度/取消/暂停事件流底座；
+      apply 五相位并行执行（`parallel`）；独立进度子窗口（双累积图/速率/ETA/暂停/停止/When-finished）；
+      Overview 聚合竖栏＋图标统计条；运行日志＋"上次同步"；Tauri 全字段任务编辑器；值守定时扫描
+      （`watch_interval_secs`/`--watch`）；remote 任务 GUI 真远程管线；**egui 退役删除**（详见上方 GUI 一节）
 - **roadmap 全部完成**。仅存的远期方向：版本向量 P2P（见"多端"——明确非目标，除非出现绕过 hub 的直连写入）。
   数学前置件已就位：[src/vclock.rs](src/vclock.rs) 是照 syncthing `lib/protocol/vector.go` 语义重写的完整实现
   （`update` 单调性、`merge` 上确界、比较关系反对称性均有穷举验证），但**尚未接管 archive 归因**——
