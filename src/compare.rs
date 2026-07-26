@@ -207,6 +207,50 @@ fn detect_moves<'a>(
     (moves, rest_adds, rest_dels)
 }
 
+/// GUI 逐行翻方向（FFS 同款交互的语义核心）。返回 None = 该 op 不可反转（move/dir/conflict/note）。
+/// - Copy 的反向：不把文件补过去，而是删掉"多出"的那份（让持有侧向缺失侧看齐）
+/// - Update 的反向：让另一侧的内容获胜
+/// - Delete 的反向：不删，反而把它复制回对面（恢复）
+pub fn reverse_op(op: &Op) -> Option<Op> {
+    let other = match op.side {
+        Side::Source => Side::Target,
+        Side::Target => Side::Source,
+    };
+    match op.action {
+        Action::Copy => Some(Op {
+            side: other,
+            action: Action::Delete,
+            path: op.path.clone(),
+            from: None,
+            size: op.size,
+            mtime_ms: None,
+            hash: None,
+            reason: format!("flipped({})", op.reason),
+        }),
+        Action::Update => Some(Op {
+            side: other,
+            action: Action::Update,
+            path: op.path.clone(),
+            from: None,
+            size: None,
+            mtime_ms: None,
+            hash: None,
+            reason: format!("flipped({})", op.reason),
+        }),
+        Action::Delete => Some(Op {
+            side: other,
+            action: Action::Copy,
+            path: op.path.clone(),
+            from: None,
+            size: op.size,
+            mtime_ms: None,
+            hash: None,
+            reason: format!("flipped({})", op.reason),
+        }),
+        _ => None,
+    }
+}
+
 fn push_copy(ops: &mut Vec<Op>, side: Side, e: &Entry, reason: &str) {
     ops.push(Op { side, action: Action::Copy, path: e.path.clone(), from: None, size: Some(e.size), mtime_ms: Some(e.mtime_ms), hash: e.hash.clone(), reason: reason.into() });
 }
@@ -493,6 +537,122 @@ mod tests {
         let conflicts: Vec<_> = plan.ops.iter().filter(|o| o.action == Action::Conflict).collect();
         assert_eq!(conflicts.len(), 2, "aux.log and 'bad. ' segment must be flagged");
         assert!(plan.ops.iter().any(|o| o.action == Action::Copy && o.path == "ok.txt"));
+    }
+
+    // ---------- sync-with-archive 分类矩阵 ----------
+    // 状态记号：E=存在且内容 x，∅=不存在。archive = 上次同步的共识状态。
+
+    fn plan_sync(s: Vec<Entry>, t: Vec<Entry>, a: Option<Vec<Entry>>) -> Plan {
+        let s = snap("windows", s);
+        let t = snap("macos", t);
+        let a = a.map(|e| snap("windows", e));
+        compare(&s, &t, "sync", a.as_ref(), false, &CompareOptions::default())
+    }
+    fn one(plan: &Plan) -> &Op {
+        assert_eq!(plan.ops.len(), 1, "expected exactly 1 op, got: {:?}", plan.ops);
+        &plan.ops[0]
+    }
+
+    #[test]
+    fn matrix_equal_no_op() {
+        let p = plan_sync(vec![file("a", "h")], vec![file("a", "h")], Some(vec![file("a", "h")]));
+        assert_eq!(p.ops.len(), 0);
+    }
+
+    #[test]
+    fn matrix_source_changed_propagates_to_target() {
+        let p = plan_sync(vec![file("a", "h2")], vec![file("a", "h1")], Some(vec![file("a", "h1")]));
+        let op = one(&p);
+        assert_eq!((op.side.clone(), op.action.clone()), (Side::Target, Action::Update));
+    }
+
+    #[test]
+    fn matrix_target_changed_propagates_to_source() {
+        let p = plan_sync(vec![file("a", "h1")], vec![file("a", "h2")], Some(vec![file("a", "h1")]));
+        let op = one(&p);
+        assert_eq!((op.side.clone(), op.action.clone()), (Side::Source, Action::Update));
+    }
+
+    #[test]
+    fn matrix_both_changed_conflict() {
+        let p = plan_sync(vec![file("a", "h2")], vec![file("a", "h3")], Some(vec![file("a", "h1")]));
+        assert_eq!(one(&p).action, Action::Conflict);
+        assert_eq!(p.header.conflict_count, 1);
+    }
+
+    #[test]
+    fn matrix_target_deleted_propagates_deletion() {
+        // archive 有、target 没、source 未改 → source 上删除
+        let p = plan_sync(vec![file("a", "h1")], vec![], Some(vec![file("a", "h1")]));
+        let op = one(&p);
+        assert_eq!((op.side.clone(), op.action.clone()), (Side::Source, Action::Delete));
+    }
+
+    #[test]
+    fn matrix_delete_vs_edit_conflict() {
+        // target 删了它，但 source 改过 → 删改冲突，绝不静默删
+        let p = plan_sync(vec![file("a", "h2")], vec![], Some(vec![file("a", "h1")]));
+        assert_eq!(one(&p).action, Action::Conflict);
+    }
+
+    #[test]
+    fn matrix_new_on_source_copies() {
+        let p = plan_sync(vec![file("a", "h1")], vec![], Some(vec![]));
+        let op = one(&p);
+        assert_eq!((op.side.clone(), op.action.clone()), (Side::Target, Action::Copy));
+    }
+
+    #[test]
+    fn matrix_move_on_source_replayed_on_target() {
+        // source 把 a 挪成 b；target/archive 还是 a → target 上重演 move
+        let p = plan_sync(vec![file("b", "h1")], vec![file("a", "h1")], Some(vec![file("a", "h1")]));
+        let op = one(&p);
+        assert_eq!(op.action, Action::Move);
+        assert_eq!(op.side, Side::Target);
+        assert_eq!(op.from.as_deref(), Some("a"));
+        assert_eq!(op.path, "b");
+    }
+
+    #[test]
+    fn matrix_no_archive_differ_is_conflict_and_adds_flow_both_ways() {
+        let p = plan_sync(vec![file("a", "h1"), file("s", "hs")], vec![file("a", "h2"), file("t", "ht")], None);
+        assert!(p.ops.iter().any(|o| o.action == Action::Conflict && o.path == "a"));
+        assert!(p.ops.iter().any(|o| o.action == Action::Copy && o.side == Side::Target && o.path == "s"));
+        assert!(p.ops.iter().any(|o| o.action == Action::Copy && o.side == Side::Source && o.path == "t"));
+        assert!(!p.ops.iter().any(|o| o.action == Action::Delete), "no-archive sync must never delete");
+    }
+
+    #[test]
+    fn matrix_enrich_never_deletes_or_downgrades() {
+        let s = snap("windows", vec![file("only-src", "h1")]);
+        let mut old = file("shared", "h-old");
+        old.mtime_ms = 0;
+        let mut newer_on_target = file("shared", "h-new");
+        newer_on_target.mtime_ms = 999_999;
+        let t = snap("macos", vec![newer_on_target, file("only-tgt", "hx")]);
+        let s = Snapshot { header: s.header, entries: vec![s.entries[0].clone(), old] };
+        let p = compare(&s, &t, "enrich", None, false, &CompareOptions::default());
+        assert!(p.ops.iter().any(|o| o.action == Action::Copy && o.path == "only-src"));
+        assert!(!p.ops.iter().any(|o| o.action == Action::Delete));
+        assert!(!p.ops.iter().any(|o| o.action == Action::Update), "enrich must not downgrade newer target");
+    }
+
+    #[test]
+    fn reverse_op_semantics() {
+        let copy = Op { side: Side::Target, action: Action::Copy, path: "x".into(), from: None, size: Some(5), mtime_ms: Some(1), hash: None, reason: "only-in-source".into() };
+        let r = reverse_op(&copy).unwrap();
+        assert_eq!((r.side, r.action), (Side::Source, Action::Delete));
+
+        let del = Op { side: Side::Target, action: Action::Delete, path: "x".into(), from: None, size: Some(5), mtime_ms: None, hash: None, reason: "gone-from-source".into() };
+        let r = reverse_op(&del).unwrap();
+        assert_eq!((r.side, r.action), (Side::Source, Action::Copy));
+
+        let upd = Op { side: Side::Target, action: Action::Update, path: "x".into(), from: None, size: None, mtime_ms: None, hash: None, reason: "differs".into() };
+        let r = reverse_op(&upd).unwrap();
+        assert_eq!((r.side, r.action), (Side::Source, Action::Update));
+
+        let mv = Op { side: Side::Target, action: Action::Move, path: "b".into(), from: Some("a".into()), size: None, mtime_ms: None, hash: None, reason: "m".into() };
+        assert!(reverse_op(&mv).is_none());
     }
 
     #[test]

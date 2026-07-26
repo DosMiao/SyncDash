@@ -3,7 +3,7 @@
 
 use eframe::egui;
 use std::sync::{Arc, Mutex};
-use syncdash::compare::{Action, Op, Plan, Side};
+use syncdash::compare::{reverse_op, Action, Op, Plan, Side};
 use syncdash::config::{self, Job};
 use syncdash::run;
 
@@ -20,6 +20,8 @@ struct Shared {
     status: String,
     plan: Option<Plan>,
     checked: Vec<bool>,
+    /// FFS 式逐行翻方向：true = 该行执行 reverse_op 后的动作
+    flipped: Vec<bool>,
 }
 
 pub struct App {
@@ -42,6 +44,7 @@ impl App {
                 status: format!("jobs dir: {}", config::jobs_dir().display()),
                 plan: None,
                 checked: Vec::new(),
+                flipped: Vec::new(),
             })),
         }
     }
@@ -178,7 +181,7 @@ impl eframe::App for App {
             });
 
             egui::CentralPanel::default().show(ctx, |ui| {
-                let Shared { plan, checked, .. } = &mut *sh;
+                let Shared { plan, checked, flipped, .. } = &mut *sh;
                 if let Some(plan) = plan {
                     use egui_extras::{Column, TableBuilder};
                     TableBuilder::new(ui)
@@ -200,13 +203,27 @@ impl eframe::App for App {
                             body.rows(20.0, plan.ops.len(), |mut row| {
                                 let i = row.index();
                                 let op = &plan.ops[i];
+                                let is_flipped = flipped.get(i).copied().unwrap_or(false);
+                                let eff = if is_flipped { reverse_op(op) } else { None };
+                                let shown: &Op = eff.as_ref().unwrap_or(op);
                                 row.col(|ui| {
                                     let enabled = default_checked(op);
                                     ui.add_enabled(enabled, egui::Checkbox::without_text(&mut checked[i]));
                                 });
                                 row.col(|ui| {
-                                    let (txt, color) = action_badge(op);
-                                    ui.colored_label(color, txt);
+                                    // FFS 式：点动作徽章翻转方向
+                                    let (txt, color) = action_badge(shown);
+                                    let can_flip = reverse_op(op).is_some();
+                                    let mut rich = egui::RichText::new(txt).color(color);
+                                    if is_flipped {
+                                        rich = rich.underline();
+                                    }
+                                    let resp = ui.add_enabled(can_flip, egui::Button::new(rich).small().frame(false));
+                                    if can_flip {
+                                        if resp.on_hover_text("click to flip direction").clicked() {
+                                            flipped[i] = !flipped[i];
+                                        }
+                                    }
                                 });
                                 row.col(|ui| {
                                     ui.monospace(&op.path);
@@ -218,7 +235,7 @@ impl eframe::App for App {
                                     ui.label(op.size.map(human_size).unwrap_or_default());
                                 });
                                 row.col(|ui| {
-                                    ui.label(&op.reason);
+                                    ui.label(&shown.reason);
                                 });
                             });
                         });
@@ -247,6 +264,7 @@ impl eframe::App for App {
                 match res {
                     Ok(plan) => {
                         sh.checked = plan.ops.iter().map(default_checked).collect();
+                        sh.flipped = vec![false; plan.ops.len()];
                         sh.status = format!(
                             "'{name}': {} op(s), {} conflict(s). Review and press Synchronize.",
                             plan.header.op_count, plan.header.conflict_count
@@ -271,19 +289,26 @@ impl eframe::App for App {
                 let mut sh = shared.lock().unwrap();
                 let plan = sh.plan.take();
                 let checked = std::mem::take(&mut sh.checked);
+                let flipped = std::mem::take(&mut sh.flipped);
                 sh.phase = Phase::Applying;
                 sh.status = format!("synchronizing '{name}'...");
-                plan.map(|p| (p, checked))
+                plan.map(|p| (p, checked, flipped))
             };
-            if let Some((plan, checked)) = taken {
+            if let Some((plan, checked, flipped)) = taken {
                 std::thread::spawn(move || {
-                    let ops: Vec<Op> = plan
-                        .ops
-                        .iter()
-                        .zip(&checked)
-                        .filter(|(o, c)| **c && default_checked(o))
-                        .map(|(o, _)| o.clone())
-                        .collect();
+                    let mut ops: Vec<Op> = Vec::new();
+                    for (i, o) in plan.ops.iter().enumerate() {
+                        if !checked.get(i).copied().unwrap_or(false) || !default_checked(o) {
+                            continue;
+                        }
+                        if flipped.get(i).copied().unwrap_or(false) {
+                            if let Some(r) = reverse_op(o) {
+                                ops.push(r);
+                                continue;
+                            }
+                        }
+                        ops.push(o.clone());
+                    }
                     let (done, skipped, errors) = run::apply_job(&job, &plan, &ops, None, false);
                     let mut sh = shared.lock().unwrap();
                     sh.status = format!(

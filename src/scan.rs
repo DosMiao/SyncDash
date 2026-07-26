@@ -127,6 +127,19 @@ pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
             }
         });
 
+    // 阶段 1：串行遍历收集（元数据快）；阶段 2：rayon 并行哈希（FFS parallel_scan 的启示：
+    // 多小文件时瓶颈是串行 I/O）。大文件内部再用 mmap_rayon 分块，小文件用普通 mmap 免过订阅。
+    struct PendingFile {
+        rel: String,
+        abs: std::path::PathBuf,
+        size: u64,
+        mt: i64,
+        hash: Option<String>, // 缓存命中
+        file_id: Option<String>,
+        mode: Option<u32>,
+    }
+    let mut pending: Vec<PendingFile> = Vec::new();
+
     for item in walker {
         let item = match item {
             Ok(i) => i,
@@ -155,30 +168,47 @@ pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
             let size = md.len();
             let mt = mtime_ms(&md);
             let mut hash = None;
-            if opt.hash {
-                if !opt.force_rehash {
-                    if let Some((cs, cm, ch)) = cache.get(&rel) {
-                        if *cs == size && *cm == mt {
-                            hash = Some(ch.clone());
-                        }
-                    }
-                }
-                if hash.is_none() {
-                    let mut hasher = blake3::Hasher::new();
-                    match hasher.update_mmap_rayon(item.path()) {
-                        Ok(_) => hash = Some(hasher.finalize().to_hex().to_string()),
-                        Err(_) => hash_errors += 1,
+            if opt.hash && !opt.force_rehash {
+                if let Some((cs, cm, ch)) = cache.get(&rel) {
+                    if *cs == size && *cm == mt {
+                        hash = Some(ch.clone());
                     }
                 }
             }
-            entries.push(Entry { path: rel, kind: EntryKind::File, size, mtime_ms: mt, hash, file_id: file_id(&md), mode: unix_mode(&md) });
+            pending.push(PendingFile { rel, abs: item.path().to_path_buf(), size, mt, hash, file_id: file_id(&md), mode: unix_mode(&md) });
         }
+    }
+
+    let hash_err_count = std::sync::atomic::AtomicU64::new(0);
+    if opt.hash {
+        use rayon::prelude::*;
+        const BIG_FILE: u64 = 32 * 1024 * 1024;
+        pending.par_iter_mut().for_each(|p| {
+            if p.hash.is_none() {
+                let mut hasher = blake3::Hasher::new();
+                let res = if p.size >= BIG_FILE {
+                    hasher.update_mmap_rayon(&p.abs).map(|_| ())
+                } else {
+                    hasher.update_mmap(&p.abs).map(|_| ())
+                };
+                match res {
+                    Ok(_) => p.hash = Some(hasher.finalize().to_hex().to_string()),
+                    Err(_) => {
+                        hash_err_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
+    for p in pending {
+        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, file_id: p.file_id, mode: p.mode });
     }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     if opt.hash {
         save_cache(root, &entries);
     }
+    hash_errors += hash_err_count.load(std::sync::atomic::Ordering::Relaxed);
     if hash_errors > 0 {
         eprintln!("warning: {hash_errors} file(s) could not be hashed (in use / unreadable)");
     }
