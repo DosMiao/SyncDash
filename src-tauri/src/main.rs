@@ -442,6 +442,7 @@ async fn apply_job(
 }
 
 fn main() {
+    syncdash::scan::init_worker_pool();
     tauri::Builder::default()
         // 主窗关闭 → 级联销毁进度子窗；否则残留窗口让 Tauri 不退出（"app 关不掉"）
         .on_window_event(|window, event| {

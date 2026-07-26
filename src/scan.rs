@@ -28,6 +28,46 @@ fn unix_mode(_md: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
+/// 初始化全局 rayon 池（哈希工作线程）：**降优先级**——standard 扫描的 BLAKE3
+/// 刻意全核并行（让一次性成本尽快结束），但不该把整台机器压到卡顿；
+/// below-normal 优先级下满核哈希会自动给前台程序让路，空闲机器上吞吐不变。
+/// `SYNCDASH_SCAN_THREADS=N` 可再压线程数上限。CLI 与桌面启动时各调一次（幂等）。
+pub fn init_worker_pool() {
+    let mut b = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("sd-hash-{i}"));
+    if let Ok(n) = std::env::var("SYNCDASH_SCAN_THREADS") {
+        if let Ok(n) = n.parse::<usize>() {
+            if n >= 1 {
+                b = b.num_threads(n.min(64));
+            }
+        }
+    }
+    // 已经有全局池（重复调用）时 build_global 返回 Err——静默即可
+    let _ = b.start_handler(|_| lower_thread_priority()).build_global();
+}
+
+#[cfg(windows)]
+fn lower_thread_priority() {
+    // THREAD_PRIORITY_BELOW_NORMAL = -1（只降本线程，不动进程；UI 线程不受影响）
+    extern "system" {
+        fn GetCurrentThread() -> isize;
+        fn SetThreadPriority(h: isize, p: i32) -> i32;
+    }
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), -1);
+    }
+}
+#[cfg(target_os = "linux")]
+fn lower_thread_priority() {
+    // Linux 的 nice 是每线程的
+    unsafe {
+        libc::nice(3);
+    }
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn lower_thread_priority() {
+    // macOS 的 nice() 是进程级，动了会连 UI 一起降——不做
+}
+
 fn mtime_ms(md: &std::fs::Metadata) -> i64 {
     md.modified()
         .ok()

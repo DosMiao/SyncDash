@@ -287,6 +287,7 @@ fn write_out<F: Fn(&mut dyn std::io::Write) -> std::io::Result<()>>(out: &Option
 }
 
 fn main() {
+    syncdash::scan::init_worker_pool();
     let cli = Cli::parse();
     let code = match run_cli(cli) {
         Ok(c) => c,
