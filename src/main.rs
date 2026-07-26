@@ -1,7 +1,9 @@
 mod apply;
 mod compare;
 mod config;
+mod filter;
 mod gui;
+mod lock;
 mod run;
 mod scan;
 mod table;
@@ -67,7 +69,7 @@ enum Cmd {
         /// 跳过内容 hash（快，但比对退化为 size+mtime，且无法做移动检测）
         #[arg(long)]
         no_hash: bool,
-        /// 追加排除的目录名（可多次）
+        /// 追加排除（FFS 过滤器语法，如 */big_temp/ 或 */*.log，可多次）
         #[arg(long)]
         exclude: Vec<String>,
     },
@@ -198,7 +200,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
             }
-            let snap = scan::scan(&root, &scan::ScanOptions { hash: !no_hash, extra_excludes: exclude })?;
+            let snap = scan::scan(&root, &scan::ScanOptions { hash: !no_hash, filter: filter::PathFilter::build(&[], &exclude) })?;
             eprintln!(
                 "scanned {} entries in {} ms ({})",
                 snap.header.entry_count, snap.header.duration_ms, snap.header.root

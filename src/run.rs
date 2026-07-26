@@ -8,7 +8,8 @@ use crate::{apply, compare, scan};
 use std::path::Path;
 
 pub fn compare_job(job: &Job) -> std::io::Result<Plan> {
-    let opt = scan::ScanOptions { hash: !job.no_hash, extra_excludes: job.exclude.clone() };
+    let filter = crate::filter::PathFilter::build(&job.include, &job.exclude);
+    let opt = scan::ScanOptions { hash: !job.no_hash, filter };
     for (label, r) in [("source", &job.source), ("target", &job.target)] {
         if !r.is_dir() {
             return Err(std::io::Error::new(
@@ -42,7 +43,8 @@ pub fn apply_job(job: &Job, plan: &Plan, ops: &[Op], trash: Option<std::path::Pa
                 .filter(|o| o.action == Action::Conflict)
                 .map(|o| o.path.as_str())
                 .collect();
-            let opt = scan::ScanOptions { hash: !job.no_hash, extra_excludes: job.exclude.clone() };
+            let filter = crate::filter::PathFilter::build(&job.include, &job.exclude);
+            let opt = scan::ScanOptions { hash: !job.no_hash, filter };
             if let Ok(mut snap) = scan::scan(&job.source, &opt) {
                 snap.header.kind = "archive".into();
                 snap.entries.retain(|e| !conflicted.contains(e.path.as_str()));

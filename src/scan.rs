@@ -8,27 +8,6 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-const EXCLUDED_DIRS: &[&str] = &[
-    ".git", "node_modules", "target", "build", "dist", "__pycache__", ".venv", "venv",
-    "worktrees", ".Spotlight-V100", ".fseventsd", ".Trashes", "$RECYCLE.BIN",
-    "System Volume Information", ".syncdash",
-];
-const EXCLUDED_FILES: &[&str] = &[
-    ".DS_Store", "Thumbs.db", "desktop.ini", "sync.ffs_db", "sync.ffs_lock",
-];
-const EXCLUDED_PREFIXES: &[&str] = &["._"];
-const EXCLUDED_SUFFIXES: &[&str] = &[".recovery", ".status"];
-
-fn is_excluded_dir(name: &str) -> bool {
-    EXCLUDED_DIRS.iter().any(|d| d.eq_ignore_ascii_case(name))
-}
-
-fn is_excluded_file(name: &str) -> bool {
-    EXCLUDED_FILES.iter().any(|f| f.eq_ignore_ascii_case(name))
-        || EXCLUDED_PREFIXES.iter().any(|p| name.starts_with(p))
-        || EXCLUDED_SUFFIXES.iter().any(|s| name.to_ascii_lowercase().ends_with(s))
-}
-
 #[cfg(unix)]
 fn file_id(md: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -104,7 +83,8 @@ fn save_cache(root: &Path, entries: &[Entry]) {
 
 pub struct ScanOptions {
     pub hash: bool,
-    pub extra_excludes: Vec<String>,
+    /// FFS 语义的过滤器（见 filter.rs），默认排除已内置
+    pub filter: crate::filter::PathFilter,
 }
 
 pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
@@ -118,14 +98,20 @@ pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
             if e.depth() == 0 {
                 return true;
             }
+            let rel = e
+                .path()
+                .strip_prefix(root)
+                .unwrap_or(e.path())
+                .to_string_lossy()
+                .replace('\\', "/");
             if e.file_type().is_dir() {
-                !is_excluded_dir(&name) && !opt.extra_excludes.iter().any(|x| x.eq_ignore_ascii_case(&name))
+                let (pass, child_might_match) = opt.filter.pass_dir(&rel);
+                pass || child_might_match
             } else {
-                !is_excluded_file(&name)
+                opt.filter.pass_file(&rel)
             }
         });
 
@@ -148,7 +134,9 @@ pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
             Err(_) => continue,
         };
         if item.file_type().is_dir() {
-            entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None });
+            if opt.filter.pass_dir(&rel).0 {
+                entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None });
+            }
         } else if item.file_type().is_symlink() {
             entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None });
         } else {

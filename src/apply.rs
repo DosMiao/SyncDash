@@ -50,6 +50,27 @@ fn set_mtime(path: &Path, mtime_ms: i64) {
 }
 
 pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOptions) -> (u64, u64, u64) {
+    // FFS dir_lock 思路：动手前锁两侧 root（带心跳），防两台机器同时 apply 同一目录
+    let _lock_guard: Option<(crate::lock::RootLock, crate::lock::RootLock)> = if opt.dry_run {
+        None
+    } else {
+        let ls = match crate::lock::RootLock::acquire(source_root) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("cannot lock source root: {e}");
+                return (0, ops.len() as u64, 1);
+            }
+        };
+        let lt = match crate::lock::RootLock::acquire(target_root) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("cannot lock target root: {e}");
+                return (0, ops.len() as u64, 1);
+            }
+        };
+        Some((ls, lt))
+    };
+
     let trash = opt.trash.clone().unwrap_or_else(default_trash);
     let mut done = 0u64;
     let mut skipped = 0u64;

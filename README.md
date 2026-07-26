@@ -34,7 +34,8 @@ mode = "sync"              # mirror | sync | enrich
 source = 'D:\Code\Utilities\flight'
 target = '\\192.168.0.115\xuanbomiao\Code\Utilities\flight'
 archive = 'C:\Users\xuanb\AppData\Roaming\syncdash\archive\flight.jsonl'   # sync 模式
-# exclude = ["big_temp"]
+# include = ['*']                       # FFS 过滤器语法白名单（留空 = 全部）
+# exclude = ['*/big_temp/', '*/*.log']  # FFS 语法；默认垃圾/可重建排除已内置
 # no_hash = false
 ```
 
@@ -108,6 +109,19 @@ Win↔Mac 的 SSH 已验证可用（Mac 22 端口开着，免密只差把公钥�
 先并行：FFS 继续管日常，SyncDash 拿 `.ffs-sync` 领地练手（`Update-CodeSyncConfig.ps1` 的标记扫描
 将来可以直接改产 syncdash 的领地清单）。行为可信之后再接管。
 
+## 从 FFS 14.10 源码借鉴的（`.docs/FreeFileSync_14.10_Source`，GPL——按语义重写，未搬代码）
+
+- **path_filter.cpp → src/filter.rs**：过滤器语法与 FFS 完全兼容——大小写不敏感、`/` 与 `\` 通吃、
+  `*` 跨层级、`?` 不跨、尾 `/`＝目录、首 `/`＝根相对、`*/abc` 兼命中根级；无通配符路径走哈希集常数查找；
+  include 侧用"前缀可能命中"决定是否下钻（白名单能穿透中间目录的机制）。**FFS 的排除列表可原句粘进 job 配置**。
+- **dir_lock.cpp → src/lock.rs**：apply 前在两侧 root 放 `.syncdash.lock`，持锁进程每 4s 心跳刷 mtime
+  （经 SMB 对面机器可见）；发现他人锁且心跳仍在 → 拒绝执行；观察 12s 无心跳 → 判定遗弃并接管。
+  防的正是双机场景的真实风险：Win 和 Mac 同时 apply 同一目录。
+- **algorithm.cpp（记入设计，未改代码）**：FFS 的移动检测靠 db 锚点＋文件 ID＋精确 size/date
+  （注释强调"容差不得进容器谓词，破坏传递性"）；我们以内容 hash 配对证据更强，维持现状。
+  FFS 把同目录 rename 合并为单行展示——列入 v0.3。
+- **parallel_scan.cpp**：目录树并行遍历（我们目前 walkdir 串行＋单文件 rayon 哈希）——列入 v0.3。
+
 ## 算法调研来源
 
 - Unison 形式化规范与 archive 模型：[Balboa/Pierce, "What's in Unison?"](https://www.researchgate.net/publication/32205844_What's_in_Unison_A_Formal_Specification_and_Reference_Implementation_of_a_File_Synchronizer)、[Unison: A File Synchronizer and Its Specification](https://link.springer.com/chapter/10.1007/3-540-45500-0_28)、[Unison (Wikipedia)](https://en.wikipedia.org/wiki/Unison_(software))
@@ -119,7 +133,8 @@ Win↔Mac 的 SSH 已验证可用（Mac 22 端口开着，免密只差把公钥�
 
 - [x] v0.1 `scan`（表+hash 缓存）、`compare`（mirror/sync/enrich + 移动检测 + archive 归因）、`apply`（本地/挂载盘，dry-run 默认，回收目录）、`probe`
 - [x] v0.2 任务配置（jobs/*.toml）、`run` 一条龙、GUI（Compare→勾选→Synchronize）、sync 成功后自动刷新 archive
-- [ ] v0.3 单测覆盖 compare 分类矩阵；`--exclude` 支持路径模式；symlink 策略；GUI 逐行方向翻转
+- [x] v0.2.1 FFS 语法过滤器（include/exclude 完全兼容，含单测）＋根目录心跳锁（防双机并发 apply，遗弃锁自动接管）
+- [ ] v0.3 单测覆盖 compare 分类矩阵；并行扫描；symlink 策略；GUI 逐行方向翻转；同目录 rename 合并显示
 - [ ] v0.4 远端：`pack` / `apply-pack`（zip+清单+双 hash+对端校验）/ ssh 传输封装
 - [ ] v0.5 多端配置文件（节点×领地×模式），领地清单与 `.ffs-sync` 标记打通
 

@@ -13,7 +13,10 @@ pub struct Job {
     /// sync 模式的上次同步存档；apply 成功后自动刷新
     #[serde(default)]
     pub archive: Option<PathBuf>,
-    /// 追加排除的目录/文件名
+    /// include 白名单（FFS 过滤器语法；留空 = `*` 全部）
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// 追加排除（FFS 过滤器语法，如 `*/big_temp/`、`*/*.log`；默认垃圾/可重建排除已内置）
     #[serde(default)]
     pub exclude: Vec<String>,
     #[serde(default)]
@@ -72,6 +75,7 @@ mode = "mirror"            # mirror | sync | enrich
 source = 'D:\some\dir'
 target = '\\host\share\dir'
 # archive = 'C:\Users\me\AppData\Roaming\syncdash\archive\<名字>.jsonl'   # sync 模式用
-# exclude = ["big_temp"]
+# include = ['*']                       # FFS 过滤器语法白名单（留空 = 全部）
+# exclude = ['*/big_temp/', '*/*.log']  # FFS 语法；默认垃圾/可重建排除已内置
 # no_hash = false
 "#;
