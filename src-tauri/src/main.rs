@@ -322,6 +322,13 @@ fn inspect_paths(source: String, target: String) -> PathVerdict {
     v
 }
 
+/// 界面漏斗的即席掩码匹配。前端**不自己写 glob**——同一套 FFS 掩码语义
+/// 只有 filter.rs 一份实现，界面里试出来的掩码写进任务 exclude 后行为一致。
+#[tauri::command]
+fn mask_match(masks: Vec<String>, paths: Vec<String>) -> Vec<bool> {
+    syncdash::filter::mask_hits(&masks, &paths)
+}
+
 /// 在系统文件管理器里选中该路径。参数单独传给 exe，不过 shell。
 #[tauri::command]
 fn reveal(path: String) -> Result<(), String> {
@@ -577,7 +584,7 @@ fn main() {
             open_progress_window, close_progress_window, post_sync_action,
             run_history, last_syncs, run_detail,
             get_job, save_job, delete_job,
-            inspect_paths, reveal
+            inspect_paths, reveal, mask_match
         ])
         .run(tauri::generate_context!())
         .expect("error while running SyncDash");

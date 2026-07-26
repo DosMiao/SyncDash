@@ -463,3 +463,27 @@ th .sortable:hover { color: var(--text); text-decoration: underline; }
 th .sortable.on { color: var(--accent); }
 th .sortable::after { content: attr(data-dir); font-size: 9px; margin-left: 2px; }
 .counts { margin-left: auto; color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
+
+/* ---- P3：漏斗面板（定位由 JS 走 CSSOM 赋值） ---- */
+#btn-funnel { flex: none; padding: 4px 10px; font-size: 12px; }
+#btn-funnel.on { border-color: var(--green); color: var(--green); }
+#funnelpop {
+  position: fixed; z-index: 115; width: 380px; padding: 12px 14px;
+  background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.5); display: flex; flex-direction: column; gap: 8px;
+}
+.fp-head { display: flex; align-items: baseline; gap: 8px; font-size: 12px; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+.fp-row { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.fp-row > span:first-child { color: var(--dim); font-size: 11px; }
+.fp-row textarea, .fp-row input[type="number"] {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 5px; padding: 5px 8px; font-size: 12px; outline: none;
+}
+.fp-row textarea { min-height: 56px; resize: vertical; }
+.fp-row textarea:focus, .fp-row input:focus { border-color: var(--accent); }
+.fp-pair { display: flex; gap: 6px; }
+.fp-pair input { width: 100%; min-width: 0; }
+.fp-chips { display: flex; gap: 6px; }
+.fp-stat { font-size: 11px; min-height: 15px; }
+.fp-btns { display: flex; gap: 8px; justify-content: flex-end; padding-top: 4px; }
+.fp-btns .btn { padding: 5px 12px; font-size: 12px; }

@@ -109,6 +109,12 @@ let acknowledged = false;
 /// 所以一旦排序就必须切平铺，两者互斥。
 type SortKey = 'path' | 'action' | 's.size' | 's.mtime' | 't.size' | 't.mtime';
 let sort: { key: SortKey; dir: 1 | -1 } | null = null;
+/// P3 漏斗：作用于**当前比对结果**的视图过滤（不重扫）。
+/// 掩码判定回 Rust（filter::mask_hits），大小/时间是纯数值留在前端。
+interface ViewFilter { masks: string[]; minMB: number | null; maxMB: number | null; days: number | null }
+let vfilter: ViewFilter = { masks: [], minMB: null, maxMB: null, days: null };
+/// 与 plan.ops 一一对应的"被掩码命中"缓存；掩码或计划一变就作废
+let maskHit: boolean[] = [];
 
 // ---------- 小工具 ----------
 
@@ -254,12 +260,44 @@ function sortVal(i: number, key: SortKey): [number, string] {
   }
 }
 
+/// 这一行涉及的字节数与时间：两侧取较大/较新的那个（"这行牵扯到一个多大、多新的文件"）
+function rowSize(i: number): number {
+  const m = metaOf(i);
+  return Math.max(eff(i).size ?? 0, m.src?.size ?? 0, m.dst?.size ?? 0);
+}
+function rowMtime(i: number): number {
+  const m = metaOf(i);
+  return Math.max(m.src?.mtime_ms ?? 0, m.dst?.mtime_ms ?? 0);
+}
+
+/// 漏斗判定：命中掩码 = 隐藏；大小/时间在范围外 = 隐藏
+function passesFunnel(i: number): boolean {
+  if (maskHit[i]) return false;
+  const MB = 1024 * 1024;
+  if (vfilter.minMB !== null || vfilter.maxMB !== null) {
+    const sz = rowSize(i);
+    if (vfilter.minMB !== null && sz < vfilter.minMB * MB) return false;
+    if (vfilter.maxMB !== null && sz > vfilter.maxMB * MB) return false;
+  }
+  if (vfilter.days !== null) {
+    const t = rowMtime(i);
+    if (!t || Date.now() - t > vfilter.days * 86400_000) return false;
+  }
+  return true;
+}
+
+function funnelActive(): number {
+  return (vfilter.masks.length ? 1 : 0)
+    + (vfilter.minMB !== null || vfilter.maxMB !== null ? 1 : 0)
+    + (vfilter.days !== null ? 1 : 0);
+}
+
 function visibleIdx(): number[] {
   if (!plan) return [];
   const out: number[] = [];
   plan.ops.forEach((_, i) => {
     const op = eff(i);
-    if ((chips.size === 0 || chips.has(category(op))) && matchesSearch(op) && matchesOv(op)) out.push(i);
+    if ((chips.size === 0 || chips.has(category(op))) && matchesSearch(op) && matchesOv(op) && passesFunnel(i)) out.push(i);
   });
   if (sort) {
     const { key, dir } = sort;
@@ -322,8 +360,8 @@ function renderStats() {
   if (!plan) { statsEl.textContent = ''; return; }
   const cnt = { copy: 0, upd: 0, mv: 0, del: 0 };
   let bytes = 0;
-  plan.ops.forEach((_, i) => {
-    if (!checked[i]) return;
+  // 统计条口径 = 真正会执行的那一批（勾选 ∩ 可见），与确认单一致
+  finalIdx().forEach((i) => {
     const op = eff(i);
     switch (op.action) {
       case 'copy': cnt.copy++; bytes += op.size ?? 0; break;
@@ -592,7 +630,7 @@ function renderCounts() {
   const tot = plan.ops.length;
   const h = plan.header;
   const parts = [`显示 ${vis} / ${tot}`];
-  if (vis < tot) parts.push(`隐藏 ${tot - vis}`);
+  if (vis < tot) parts.push(`隐藏 ${tot - vis} 不执行`);
   parts.push(`已扫描 ${h.source_entries.toLocaleString()} ⇄ ${h.target_entries.toLocaleString()}`);
   parts.push(`相同 ${(plan.equal_count ?? 0).toLocaleString()}`);
   el.textContent = parts.join(' · ');
@@ -653,6 +691,8 @@ function renderJobs() {
       currentJob = j;
       plan = null; checked = []; flipped = []; chips.clear(); search = ''; searchEl.value = '';
       ovFilter = null; ovExpanded.clear(); sort = null;
+      vfilter = { masks: [], minMB: null, maxMB: null, days: null }; maskHit = [];
+      renderFunnelBtn();
       renderJobs();
       renderAll();
       pathEl.textContent = `${j.source}   ⇄   ${j.target}`;
@@ -684,6 +724,9 @@ async function doCompare() {
     flipped = plan.ops.map(() => false);
     chips.clear();
     ovFilter = null; ovExpanded.clear(); sort = null;
+    // 新计划 = 新的行集合，掩码缓存作废；漏斗条件本身保留（连续几轮盯同一批文件很常见）
+    await recomputeMasks();
+    renderFunnelBtn();
     renderAll();
     setStatus(
       plan.ops.length === 0
@@ -700,10 +743,22 @@ async function doCompare() {
   setBusy(false);
 }
 
+/// 最终动作集 = 勾选 ∩ 当前可见。
+/// FFS 的语义是"视图即动作集"：看不见的东西不会被执行。这也堵上了旧行为里
+/// 一个安静的坑——过去搜索框一过滤，被隐藏的行照样跟着 Synchronize 跑掉。
+function finalIdx(): number[] {
+  const vis = new Set(visibleIdx());
+  return checked.map((c, i) => (c && vis.has(i) ? i : -1)).filter((i) => i >= 0);
+}
+
 async function openConfirm() {
   if (!currentJob || !plan || busy) return;
-  const idx = checked.map((c, i) => (c ? i : -1)).filter((i) => i >= 0);
-  if (idx.length === 0) { setStatus('没有勾选任何项', 'err'); return; }
+  const idx = finalIdx();
+  const hiddenChecked = checked.filter(Boolean).length - idx.length;
+  if (idx.length === 0) {
+    setStatus(hiddenChecked > 0 ? '勾选的行全被过滤器隐藏了 —— 先清除筛选' : '没有勾选任何项', 'err');
+    return;
+  }
   const cnt = { copy: 0, update: 0, move: 0, del: 0 };
   let bytes = 0, delBytes = 0;
   for (const i of idx) {
@@ -719,6 +774,7 @@ async function openConfirm() {
     <div class="mrow"><span>移动（零重传）</span><b>${cnt.move}</b></div>
     <div class="mrow ${cnt.del ? 'danger' : ''}"><span>删除（进回收目录）</span><b>${cnt.del}</b><span class="dim">${cnt.del ? humanSize(delBytes) : ''}</span></div>
     ${flipped.some(Boolean) ? `<div class="mrow warn"><span>其中翻转方向</span><b>${flipped.filter(Boolean).length}</b></div>` : ''}
+    ${hiddenChecked > 0 ? `<div class="mrow warn"><span>被筛选隐藏，不执行</span><b>${hiddenChecked}</b><span class="dim">视图即动作集</span></div>` : ''}
   `;
   modalEl.classList.remove('hidden');
 
@@ -755,7 +811,7 @@ function escapeHtml(s: string): string {
 async function doSync() {
   modalEl.classList.add('hidden');
   if (!currentJob || !plan || busy) return;
-  const idx = checked.map((c, i) => (c ? i : -1)).filter((i) => i >= 0);
+  const idx = finalIdx();
   const finalOps = idx.map((i) => eff(i));
   setBusy(true);
   setStatus(`正在同步 '${currentJob.name}'（${finalOps.length} 项）...`);
@@ -1589,6 +1645,148 @@ function rowMenu(i: number, x: number, y: number) {
   ];
   openCtx(x, y, items);
 }
+
+// ---------- P3：漏斗（作用于当前结果的视图过滤） ----------
+//
+// 语义与 FFS 一致：**视图即动作集**——被漏斗隐藏的行不会被执行。
+// 这条在确认单里会明写，因为它改变了"勾了就一定跑"的旧直觉。
+
+const funnelPop = $('funnelpop');
+const btnFunnel = $<HTMLButtonElement>('btn-funnel');
+const fpMasks = $<HTMLTextAreaElement>('fp-masks');
+const fpMin = $<HTMLInputElement>('fp-min');
+const fpMax = $<HTMLInputElement>('fp-max');
+let maskTimer: number | null = null;
+
+function renderFunnelBtn() {
+  const n = funnelActive();
+  btnFunnel.textContent = n ? `🔻 筛选 ${n}` : '🔻 筛选';
+  btnFunnel.classList.toggle('on', n > 0);
+}
+
+/// 掩码判定走 Rust（去抖 200ms）：前端绝不自己写一份 glob，
+/// 否则界面里试通的掩码写进 exclude 后行为可能不一样。
+async function recomputeMasks() {
+  if (!plan) { maskHit = []; return; }
+  if (vfilter.masks.length === 0) {
+    maskHit = new Array(plan.ops.length).fill(false);
+    return;
+  }
+  try {
+    maskHit = await invoke<boolean[]>('mask_match', {
+      masks: vfilter.masks,
+      paths: plan.ops.map((_, i) => eff(i).path),
+    });
+  } catch (e) {
+    maskHit = new Array(plan.ops.length).fill(false);
+    setStatus(`掩码匹配失败：${e}`, 'err');
+  }
+}
+
+function scheduleMasks() {
+  if (maskTimer !== null) clearTimeout(maskTimer);
+  maskTimer = window.setTimeout(async () => {
+    vfilter.masks = fpMasks.value.split('\n').map((s) => s.trim()).filter(Boolean);
+    await recomputeMasks();
+    renderFunnelBtn();
+    renderAll();
+    renderFunnelStat();
+  }, 200);
+}
+
+function readSizeInputs() {
+  const num = (el: HTMLInputElement) => (el.value.trim() === '' ? null : Math.max(0, Number(el.value)));
+  vfilter.minMB = num(fpMin);
+  vfilter.maxMB = num(fpMax);
+  renderFunnelBtn();
+  renderAll();
+  renderFunnelStat();
+}
+
+function renderFunnelStat() {
+  const el = document.getElementById('fp-stat');
+  if (!el) return;
+  if (!plan) { el.textContent = ''; return; }
+  const shown = visibleIdx().length;
+  const hid = plan.ops.length - shown;
+  el.textContent = hid > 0
+    ? `隐藏 ${hid} 项 —— 这些行不会被执行（显示 ${shown} / ${plan.ops.length}）`
+    : `没有行被隐藏（共 ${plan.ops.length} 项）`;
+}
+
+btnFunnel.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (!funnelPop.classList.contains('hidden')) { funnelPop.classList.add('hidden'); return; }
+  fpMasks.value = vfilter.masks.join('\n');
+  fpMin.value = vfilter.minMB === null ? '' : String(vfilter.minMB);
+  fpMax.value = vfilter.maxMB === null ? '' : String(vfilter.maxMB);
+  funnelPop.classList.remove('hidden');
+  // 定位走 CSSOM（CSP nonce 下 style="" 会被拦）
+  const b = btnFunnel.getBoundingClientRect();
+  const w = funnelPop.offsetWidth;
+  funnelPop.style.left = `${Math.max(6, Math.min(b.left, window.innerWidth - w - 6))}px`;
+  funnelPop.style.top = `${b.bottom + 4}px`;
+  renderFunnelStat();
+  fpMasks.focus();
+});
+funnelPop.addEventListener('click', (e) => e.stopPropagation());
+document.addEventListener('click', () => funnelPop.classList.add('hidden'));
+fpMasks.addEventListener('input', scheduleMasks);
+fpMin.addEventListener('input', readSizeInputs);
+fpMax.addEventListener('input', readSizeInputs);
+for (const b of document.querySelectorAll<HTMLButtonElement>('#fp-days .chip')) {
+  b.addEventListener('click', () => {
+    for (const o of document.querySelectorAll('#fp-days .chip')) o.classList.remove('on');
+    b.classList.add('on');
+    vfilter.days = b.dataset.days ? Number(b.dataset.days) : null;
+    renderFunnelBtn();
+    renderAll();
+    renderFunnelStat();
+  });
+}
+$('fp-clear').addEventListener('click', async () => {
+  vfilter = { masks: [], minMB: null, maxMB: null, days: null };
+  fpMasks.value = ''; fpMin.value = ''; fpMax.value = '';
+  for (const o of document.querySelectorAll('#fp-days .chip')) o.classList.remove('on');
+  document.querySelector('#fp-days .chip')?.classList.add('on');
+  await recomputeMasks();
+  renderFunnelBtn();
+  renderAll();
+  renderFunnelStat();
+});
+$('fp-done').addEventListener('click', () => funnelPop.classList.add('hidden'));
+/// 临时掩码升格为任务的持久 exclude：同一套语法，从"这一次"变成"每一次"
+$('fp-promote').addEventListener('click', async () => {
+  if (!currentJob) { setStatus('先选一个任务', 'err'); return; }
+  const masks = fpMasks.value.split('\n').map((s) => s.trim()).filter(Boolean);
+  if (!masks.length) { setStatus('先写至少一条掩码', 'err'); return; }
+  const name = currentJob.name;
+  try {
+    const j = await invoke<JobFull>('get_job', { name });
+    const prev = [...j.exclude];
+    const add = masks.filter((m) => !prev.includes(m));
+    if (!add.length) { setStatus('这些掩码任务里都已经有了'); return; }
+    await invoke('save_job', { name, job: { ...j, exclude: [...prev, ...add] } });
+    jobs = await invoke<JobDto[]>('list_jobs');
+    currentJob = jobs.find((x) => x.name === name) ?? currentJob;
+    renderJobs();
+    funnelPop.classList.add('hidden');
+    setStatusUndo(
+      `已写进 '${name}' 的 exclude：${add.join('、')} — 下次 Compare 起在扫描阶段就剪枝`,
+      '撤销',
+      async () => {
+        const cur = await invoke<JobFull>('get_job', { name });
+        await invoke('save_job', { name, job: { ...cur, exclude: prev } });
+        jobs = await invoke<JobDto[]>('list_jobs');
+        currentJob = jobs.find((x) => x.name === name) ?? currentJob;
+        renderJobs();
+        setStatus('已撤销');
+      },
+    );
+  } catch (e) {
+    setStatus(`写入失败：${e}`, 'err');
+  }
+});
 
 // M3 Overview 折叠/清除
 const ovEl = $('overview');

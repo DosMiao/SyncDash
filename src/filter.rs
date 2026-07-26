@@ -154,6 +154,15 @@ struct MaskSet {
     folder_masks: Masks,
 }
 
+impl MaskSet {
+    fn is_empty(&self) -> bool {
+        self.file_masks.wild.is_empty()
+            && self.file_masks.plain.is_empty()
+            && self.folder_masks.wild.is_empty()
+            && self.folder_masks.plain.is_empty()
+    }
+}
+
 fn parse_phrase(phrase: &str, set: &mut MaskSet) {
     let norm = phrase.trim().to_uppercase().replace('\\', "/");
     if norm.is_empty() {
@@ -311,6 +320,33 @@ impl PathFilter {
     }
 }
 
+/// 界面"漏斗"用的即席匹配：**只按给定的掩码判定**，不掺 DEFAULT_EXCLUDES、
+/// 也不套 include 白名单——它回答的是"这条路径命中用户此刻输入的掩码了吗"，
+/// 不是"这条路径该不该同步"。
+///
+/// 判定逻辑与 `pass_file` 里的 exclude 分支逐字同源（同一个 Masks::matches），
+/// 所以界面里试出来的掩码，写进任务的 exclude 后行为一致——这是这个函数存在的
+/// 全部理由：绝不让前端再写一份 glob。
+pub fn mask_hits(masks: &[String], rels: &[String]) -> Vec<bool> {
+    let mut set = MaskSet::default();
+    for m in masks {
+        if !m.trim().is_empty() {
+            parse_phrase(m, &mut set);
+        }
+    }
+    if set.is_empty() {
+        return vec![false; rels.len()];
+    }
+    rels.iter()
+        .map(|rel| {
+            let path = rel.trim().replace('\\', "/").to_uppercase();
+            let parent = path.rfind('/').map(|i| path[..i].to_string());
+            set.file_masks.matches(&path, false)
+                || parent.as_deref().map_or(false, |pp| set.folder_masks.matches(pp, true))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +437,29 @@ mod tests {
         let pf = f(&[], &[]);
         assert!(!pf.pass_file(".syncdash-root"));
         assert!(!pf.pass_file("nested/.syncdash-root"));
+    }
+
+    #[test]
+    fn mask_hits_matches_only_the_given_masks() {
+        let m = |v: &[&str], p: &[&str]| {
+            mask_hits(
+                &v.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                &p.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        // 空掩码 = 什么都不隐藏
+        assert_eq!(m(&[], &["a/b.txt"]), vec![false]);
+        // 扩展名（右键"排除此类型"生成的形状）
+        assert_eq!(m(&["*/*.log"], &["a/x.log", "x.log", "a/x.txt"]), vec![true, true, false]);
+        // 锚定目录（右键"排除此目录"生成的形状）：只命中那一个目录，不是同名的所有目录
+        assert_eq!(
+            m(&["/a/logs/"], &["a/logs/x", "a/logs/deep/y", "b/logs/x", "a/log/x"]),
+            vec![true, true, false, false]
+        );
+        // 默认排除**不该**混进来：漏斗只回答"命中你输入的掩码了吗"
+        assert_eq!(m(&["*/*.log"], &["proj/node_modules/a.js", "proj/.git/index"]), vec![false, false]);
+        // 大小写不敏感、反斜杠等价
+        assert_eq!(m(&["*/CacheDir/"], &["z\\cachedir\\deep\\f.bin"]), vec![true]);
     }
 
     #[test]

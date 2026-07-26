@@ -38,6 +38,7 @@
       <div id="filterbar" class="hidden">
         <input id="search" class="mono" type="text" placeholder="搜索 path / from / reason   (Ctrl+F)" />
         <div id="chips"></div>
+        <button id="btn-funnel" class="btn" title="筛选：名称掩码 / 大小 / 修改时间（作用于当前结果，不重扫）">🔻 筛选</button>
         <button id="btn-fold" class="btn" title="折叠/展开全部目录组">全部折叠</button>
         <button id="btn-group" class="btn" title="切换：树状分组（按目录聚合，FFS 同款）↔ 平铺列表">树状分组</button>
         <button id="btn-pathmode" class="btn" title="切换：相对（相对比对根目录）↔ 完整路径">相对路径</button>
@@ -77,6 +78,32 @@
     </main>
   </div>
   <div id="ctxmenu" class="hidden"></div>
+  <div id="funnelpop" class="hidden">
+    <div class="fp-head">筛选当前结果<span class="dim thin">不重扫</span></div>
+    <label class="fp-row wide">
+      <span>名称掩码（FFS 语法，每行一条）</span>
+      <textarea id="fp-masks" class="mono" spellcheck="false" placeholder="*/*.log&#10;/Course/0 Mizzou Courses/.git/"></textarea>
+    </label>
+    <label class="fp-row">
+      <span>大小（MB）</span>
+      <span class="fp-pair"><input id="fp-min" type="number" step="any" min="0" placeholder="≥" /><input id="fp-max" type="number" step="any" min="0" placeholder="≤" /></span>
+    </label>
+    <div class="fp-row">
+      <span>修改时间</span>
+      <div id="fp-days" class="fp-chips">
+        <button class="chip on" data-days="">任意</button>
+        <button class="chip" data-days="1">今天</button>
+        <button class="chip" data-days="7">7 天</button>
+        <button class="chip" data-days="30">30 天</button>
+      </div>
+    </div>
+    <div id="fp-stat" class="fp-stat dim"></div>
+    <div class="fp-btns">
+      <button id="fp-clear" class="btn">清除</button>
+      <button id="fp-promote" class="btn" title="把上面的掩码写进任务的 exclude —— 下次 Compare 起在扫描阶段就剪枝">写进任务的 exclude</button>
+      <button id="fp-done" class="btn accent">完成</button>
+    </div>
+  </div>
   <div id="editmodal" class="hidden">
     <div class="sheet edsheet">
       <h3 id="ed-title">编辑任务</h3>

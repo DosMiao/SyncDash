@@ -101,6 +101,34 @@ v0.9 "Progress & Polish"（对照 FFS 14.10 源码行为参数，计划见 plans
   节流归 sink）；**apply 五相位执行**，Copy/Update 相位并行（`parallel`，默认 4，SMB 2-4 条流吃满上行；
   开 delta 的 Update 留串行道防内存峰值）；DeleteDir 类内 deepest-first。
 
+v0.9.2 "FFS parity"（对齐 FFS 里天天用、我们一个都没有的那批按钮）：
+- **目录选择器 / 拖放 / 路径历史 / 路径体检**：编辑器的两个根目录不再只能手打——
+  浏览按钮（tauri-plugin-dialog）、拖文件夹进来即填（Tauri v2 吞掉了 HTML5 drop 事件，
+  走 `onDragDropEvent` + 物理像素换算命中测试）、`<datalist>` 记最近 12 个根、
+  `inspect_paths` 实时校验（存在/是目录/两根相同/两根嵌套/有无 `.syncdash-root`）。
+- **⇄ 交换**：编辑器内一键对调；工具栏的交换会**写回 TOML** 并作废当前计划（带撤销）。
+  FFS 换的是内存里那份配置，我们的任务是磁盘上的具名文件——不落盘的话，计划头里的两个根
+  和任务文件说的就不是一回事，运行日志与 archive 刷新都会指向错误的方向。
+- **差异表右键菜单**：在资源管理器中显示（`reveal`，不过 shell）/ 复制完整或相对路径 /
+  排除此类型 `*/*.ext` / 排除此目录 `/rel/dir/`（写回任务 exclude，带撤销）/ 反向此行 /
+  只勾选此项 / 取消勾选本目录。
+- **双侧 size + 修改时间列**，两侧 mtime 差超 2s 时把较新的一侧染绿——"哪边新"此前只能
+  去 reason 里猜，冲突行更是连 size/mtime 都没有。数据来自核心库新增的只读证据层
+  `compare::evidence()`（与 `compare()` 共用 `norm_key`/`files_equal`，`Op` 结构与 plan
+  落盘格式一个字节没动）。**点表头排序**（path/action/两侧 size/两侧 mtime）——排序与树状
+  分组互斥，因为分组依赖"同目录的行在计划里连续"这条不变量。
+- **状态条计数**：`显示 X / Y · 隐藏 Z 不执行 · 已扫描 A ⇄ B · 相同 K`（FFS 的
+  "Showing 481 of 23,112"）。`source_entries`/`target_entries` 早就在 plan header 里躺着。
+- **漏斗筛选**（作用于当前结果，不重扫）：名称掩码（FFS 语法）+ 大小区间 + 时间跨度。
+  掩码判定回 Rust 的 `filter::mask_hits`——前端绝不自己写第二份 glob，界面里试通的掩码
+  写进任务 exclude 后行为才会一致。面板底部一键把临时掩码**升格**为任务的持久 exclude。
+- ⚠ **视图即动作集**：被漏斗/搜索/类别 chips 隐藏的行**不会被执行**（FFS 语义）。
+  这修正了旧行为里一个安静的坑——过去搜索框一过滤，被隐藏但仍勾着的行照样跟着
+  Synchronize 跑掉。确认单会明写"被筛选隐藏，不执行 N 项"，统计条口径同步改为
+  勾选 ∩ 可见。
+- **类别 chips 改为各自独立的开关**（可同时只看"新增+删除"），F5 / F9 = 比对 / 同步，
+  Compare 与 Synchronize 按钮加副标题直接写明当前 rigor 与 mode，旁边齿轮跳编辑器对应分组。
+
 - `scan` 默认写 stdout（ssh 友好：`ssh mac syncdash scan ~/Data > mac.jsonl`）。
 - `apply` **默认 dry-run**，`--apply` 才动手；删除/覆盖的文件先进本机
   `%LOCALAPPDATA%\syncdash\trash\<时间戳>\`（mac: `~/.cache/syncdash/trash/...`），不原地销毁。
