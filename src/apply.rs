@@ -51,6 +51,21 @@ fn set_mtime(path: &Path, mtime_ms: i64) {
     let _ = filetime::set_file_mtime(path, ft);
 }
 
+#[cfg(unix)]
+fn create_symlink(target: &str, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+#[cfg(windows)]
+fn create_symlink(target: &str, link: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+    // 文件链接失败（目标是目录/权限）再试目录链接；仍失败如实报错（Windows 需开发者模式或管理员）
+    symlink_file(target, link).or_else(|_| symlink_dir(target, link))
+}
+
+fn exists_no_follow(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok()
+}
+
 pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOptions) -> (u64, u64, u64) {
     // FFS dir_lock 思路：动手前锁两侧 root（带心跳），防两台机器同时 apply 同一目录
     let _lock_guard: Option<(crate::lock::RootLock, crate::lock::RootLock)> = if opt.dry_run {
@@ -108,11 +123,18 @@ pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOpti
             let dst = exec_root.join(to_native(&op.path));
             match op.action {
                 Action::Copy | Action::Update => {
-                    let src = other_root.join(to_native(&op.path));
                     if let Some(p) = dst.parent() {
                         std::fs::create_dir_all(p)?;
                     }
-                    if op.action == Action::Update && dst.exists() {
+                    // symlink 操作：创建链接本身，不复制内容
+                    if let Some(target) = &op.link {
+                        if exists_no_follow(&dst) {
+                            move_to_trash(&dst, &op.path, &trash)?;
+                        }
+                        return create_symlink(target, &dst);
+                    }
+                    let src = other_root.join(to_native(&op.path));
+                    if op.action == Action::Update && exists_no_follow(&dst) {
                         move_to_trash(&dst, &op.path, &trash)?;
                     }
                     std::fs::copy(&src, &dst)?;
@@ -152,7 +174,8 @@ pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOpti
                     }
                 }
                 Action::Delete => {
-                    if dst.exists() {
+                    // symlink_metadata：断链的 symlink exists() 会误报 false，这里不跟随
+                    if exists_no_follow(&dst) {
                         move_to_trash(&dst, &op.path, &trash)?;
                     }
                     Ok(())

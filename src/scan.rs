@@ -95,6 +95,8 @@ pub struct ScanOptions {
     pub hash: bool,
     /// paranoid 严谨级：无视 (size,mtime) 缓存，全部重新 hash
     pub force_rehash: bool,
+    /// symlinks="direct"：记录链接本身（指向字符串），否则忽略 symlink
+    pub symlinks_direct: bool,
     /// FFS 语义的过滤器（见 filter.rs），默认排除已内置
     pub filter: crate::filter::PathFilter,
 }
@@ -160,10 +162,15 @@ pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
         };
         if item.file_type().is_dir() {
             if opt.filter.pass_dir(&rel).0 {
-                entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None });
+                entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None, link: None });
             }
         } else if item.file_type().is_symlink() {
-            entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None });
+            if opt.symlinks_direct {
+                let target = std::fs::read_link(item.path())
+                    .ok()
+                    .map(|t| t.to_string_lossy().into_owned());
+                entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None, link: target });
+            }
         } else {
             let size = md.len();
             let mt = mtime_ms(&md);
@@ -201,7 +208,7 @@ pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
         });
     }
     for p in pending {
-        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, file_id: p.file_id, mode: p.mode });
+        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, file_id: p.file_id, mode: p.mode, link: None });
     }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));

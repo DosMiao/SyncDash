@@ -42,6 +42,9 @@ pub struct Entry {
     /// unix 权限位（八进制 mode）。SMB 传不过去 exec 位，先记录，v0.4 打包模式恢复用。
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub mode: Option<u32>,
+    /// symlink 的指向（symlinks="direct" 时记录；比对按指向字符串相等）
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub link: Option<String>,
 }
 
 pub struct Snapshot {
@@ -60,7 +63,11 @@ impl Snapshot {
 
     pub fn load(path: &Path) -> std::io::Result<Snapshot> {
         let f = std::fs::File::open(path)?;
-        let r = std::io::BufReader::new(f);
+        Self::from_reader(std::io::BufReader::new(f))
+    }
+
+    /// 从任意流解析（ssh 远程扫描的 stdout 直接喂进来）
+    pub fn from_reader(r: impl BufRead) -> std::io::Result<Snapshot> {
         let mut lines = r.lines();
         let head_line = lines
             .next()

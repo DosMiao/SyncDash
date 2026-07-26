@@ -7,6 +7,7 @@ pub mod config;
 pub mod filter;
 pub mod lock;
 pub mod pack;
+pub mod remote;
 pub mod run;
 pub mod scan;
 pub mod table;

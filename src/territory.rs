@@ -68,8 +68,15 @@ pub struct GenOutcome {
     pub path: PathBuf,
 }
 
+/// 远程管线生成参数（--remote-host 时启用）
+pub struct RemoteGen {
+    pub host: String,
+    pub root_base: String,
+    pub exe: Option<String>,
+}
+
 /// 为每个领地生成 `cs-<slug>.toml` job。target 侧路径 = target_root + 同一相对路径。
-pub fn gen_jobs(source_root: &Path, target_root: &Path, mode: &str, rigor: &str) -> std::io::Result<Vec<GenOutcome>> {
+pub fn gen_jobs(source_root: &Path, target_root: &Path, mode: &str, rigor: &str, remote: Option<&RemoteGen>) -> std::io::Result<Vec<GenOutcome>> {
     let terrs = find_territories(source_root);
     let jobs_dir = crate::config::jobs_dir();
     std::fs::create_dir_all(&jobs_dir)?;
@@ -93,6 +100,10 @@ pub fn gen_jobs(source_root: &Path, target_root: &Path, mode: &str, rigor: &str)
             no_hash: false,
             rigor: rigor.to_string(),
             case_sensitive: false,
+            symlinks: "exclude".into(),
+            remote_host: remote.map(|r| r.host.clone()),
+            remote_root: remote.map(|r| format!("{}/{}", r.root_base.trim_end_matches('/'), rel)),
+            remote_exe: remote.and_then(|r| r.exe.clone()),
         };
         let toml_text = toml::to_string_pretty(&job)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}")))?;

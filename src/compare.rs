@@ -54,6 +54,9 @@ pub struct Op {
     /// 复制/更新内容的期望 hash（paranoid 模式复制后校验用）
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub hash: Option<String>,
+    /// Some = 这是一个 symlink 操作，值为链接指向（apply 创建链接而非复制内容）
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub link: Option<String>,
     pub reason: String,
 }
 
@@ -167,10 +170,16 @@ fn win_invalid_reason(rel: &str) -> Option<String> {
     None
 }
 
+/// 移动配对。返回 (from, to, size, rename_in_place)。
+/// 配对优先级（借 FFS "同目录 rename 合并"之意）：
+///   1) 同父目录（就地改名）  2) 同文件名（整目录搬迁）  3) 任意同 hash
 fn detect_moves<'a>(
     adds: Vec<&'a Entry>,
     dels: Vec<&'a Entry>,
-) -> (Vec<(String, String, u64)>, Vec<&'a Entry>, Vec<&'a Entry>) {
+) -> (Vec<(String, String, u64, bool)>, Vec<&'a Entry>, Vec<&'a Entry>) {
+    fn parent(p: &str) -> &str {
+        p.rfind('/').map(|i| &p[..i]).unwrap_or("")
+    }
     let mut by_key: HashMap<(String, u64), Vec<&'a Entry>> = HashMap::new();
     for &d in &dels {
         if let Some(h) = &d.hash {
@@ -187,14 +196,18 @@ fn detect_moves<'a>(
                 if !cands.is_empty() {
                     let pick = cands
                         .iter()
-                        .position(|c| {
-                            std::path::Path::new(&c.path).file_name()
-                                == std::path::Path::new(&a.path).file_name()
+                        .position(|c| parent(&c.path) == parent(&a.path))
+                        .or_else(|| {
+                            cands.iter().position(|c| {
+                                std::path::Path::new(&c.path).file_name()
+                                    == std::path::Path::new(&a.path).file_name()
+                            })
                         })
                         .unwrap_or(0);
                     let c = cands.remove(pick);
                     used.insert(c.path.clone());
-                    matched = Some((c.path.clone(), a.path.clone(), a.size));
+                    let rename = parent(&c.path) == parent(&a.path);
+                    matched = Some((c.path.clone(), a.path.clone(), a.size, rename));
                 }
             }
         }
@@ -225,6 +238,7 @@ pub fn reverse_op(op: &Op) -> Option<Op> {
             size: op.size,
             mtime_ms: None,
             hash: None,
+            link: None,
             reason: format!("flipped({})", op.reason),
         }),
         Action::Update => Some(Op {
@@ -235,6 +249,7 @@ pub fn reverse_op(op: &Op) -> Option<Op> {
             size: None,
             mtime_ms: None,
             hash: None,
+            link: None,
             reason: format!("flipped({})", op.reason),
         }),
         Action::Delete => Some(Op {
@@ -245,6 +260,7 @@ pub fn reverse_op(op: &Op) -> Option<Op> {
             size: op.size,
             mtime_ms: None,
             hash: None,
+            link: None,
             reason: format!("flipped({})", op.reason),
         }),
         _ => None,
@@ -252,7 +268,7 @@ pub fn reverse_op(op: &Op) -> Option<Op> {
 }
 
 fn push_copy(ops: &mut Vec<Op>, side: Side, e: &Entry, reason: &str) {
-    ops.push(Op { side, action: Action::Copy, path: e.path.clone(), from: None, size: Some(e.size), mtime_ms: Some(e.mtime_ms), hash: e.hash.clone(), reason: reason.into() });
+    ops.push(Op { side, action: Action::Copy, path: e.path.clone(), from: None, size: Some(e.size), mtime_ms: Some(e.mtime_ms), hash: e.hash.clone(), link: None, reason: reason.into() });
 }
 
 pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option<&Snapshot>, resolve_newer: bool, copts: &CompareOptions) -> Plan {
@@ -265,10 +281,10 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
     let mut ops: Vec<Op> = Vec::new();
 
     for d in s_dups {
-        ops.push(Op { side: Side::Source, action: Action::Note, path: d, from: None, size: None, mtime_ms: None, hash: None, reason: "duplicate-after-normalization (kept first; NFC/case twin)".into() });
+        ops.push(Op { side: Side::Source, action: Action::Note, path: d, from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "duplicate-after-normalization (kept first; NFC/case twin)".into() });
     }
     for d in t_dups {
-        ops.push(Op { side: Side::Target, action: Action::Note, path: d, from: None, size: None, mtime_ms: None, hash: None, reason: "duplicate-after-normalization (kept first; NFC/case twin)".into() });
+        ops.push(Op { side: Side::Target, action: Action::Note, path: d, from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "duplicate-after-normalization (kept first; NFC/case twin)".into() });
     }
 
     match mode {
@@ -283,7 +299,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                         if !files_equal(se, te) && (mode == "mirror" || se.mtime_ms > te.mtime_ms + MTIME_SLACK_MS) {
                             let reason = if mode == "mirror" { "differs-master-wins" } else { "source-newer" };
                             // 更新写到 target 已存在的文件上：用 target 的原拼写打开，不改对方形态
-                            ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), reason: reason.into() });
+                            ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, reason: reason.into() });
                         }
                     }
                 }
@@ -299,16 +315,17 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                 } else {
                     (Vec::new(), adds, dels)
                 };
-                for (from, to, size) in moves {
-                    ops.push(Op { side: Side::Target, action: Action::Move, path: to, from: Some(from), size: Some(size), mtime_ms: None, hash: None, reason: "move-detected-by-hash".into() });
+                for (from, to, size, rename) in moves {
+                    let reason = if rename { "rename-detected-by-hash" } else { "move-detected-by-hash" };
+                    ops.push(Op { side: Side::Target, action: Action::Move, path: to, from: Some(from), size: Some(size), mtime_ms: None, hash: None, link: None, reason: reason.into() });
                 }
                 for a in rest_adds { push_copy(&mut ops, Side::Target, a, "only-in-source"); }
                 for d in rest_dels {
-                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, reason: "gone-from-source".into() });
+                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, reason: "gone-from-source".into() });
                 }
                 for (p, te) in &t_dirs {
                     if !s_dirs.contains_key(p) {
-                        ops.push(Op { side: Side::Target, action: Action::DeleteDir, path: te.path.clone(), from: None, size: None, mtime_ms: None, hash: None, reason: "dir-gone-from-source".into() });
+                        ops.push(Op { side: Side::Target, action: Action::DeleteDir, path: te.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "dir-gone-from-source".into() });
                     }
                 }
             } else {
@@ -335,20 +352,20 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                             let s_unchanged = r.map(|r| files_equal(se, r)).unwrap_or(false);
                             let t_unchanged = r.map(|r| files_equal(te, r)).unwrap_or(false);
                             if s_unchanged && !t_unchanged {
-                                ops.push(Op { side: Side::Source, action: Action::Update, path: se.path.clone(), from: None, size: Some(te.size), mtime_ms: Some(te.mtime_ms), hash: te.hash.clone(), reason: "target-changed".into() });
+                                ops.push(Op { side: Side::Source, action: Action::Update, path: se.path.clone(), from: None, size: Some(te.size), mtime_ms: Some(te.mtime_ms), hash: te.hash.clone(), link: None, reason: "target-changed".into() });
                             } else if t_unchanged && !s_unchanged {
-                                ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), reason: "source-changed".into() });
+                                ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, reason: "source-changed".into() });
                             } else {
-                                ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, reason: "both-changed".into() });
+                                ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "both-changed".into() });
                             }
                         } else if resolve_newer {
                             if se.mtime_ms >= te.mtime_ms {
-                                ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), reason: "differs-newer-wins".into() });
+                                ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, reason: "differs-newer-wins".into() });
                             } else {
-                                ops.push(Op { side: Side::Source, action: Action::Update, path: se.path.clone(), from: None, size: Some(te.size), mtime_ms: Some(te.mtime_ms), hash: te.hash.clone(), reason: "differs-newer-wins".into() });
+                                ops.push(Op { side: Side::Source, action: Action::Update, path: se.path.clone(), from: None, size: Some(te.size), mtime_ms: Some(te.mtime_ms), hash: te.hash.clone(), link: None, reason: "differs-newer-wins".into() });
                             }
                         } else {
-                            ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, reason: "differs-no-archive".into() });
+                            ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "differs-no-archive".into() });
                         }
                     }
                     None => {
@@ -357,7 +374,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                                 if files_equal(se, r) {
                                     del_on_source.push(se);
                                 } else {
-                                    ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, reason: "deleted-on-target-but-changed-on-source".into() });
+                                    ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "deleted-on-target-but-changed-on-source".into() });
                                 }
                                 continue;
                             }
@@ -376,7 +393,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                         if files_equal(te, r) {
                             del_on_target.push(te);
                         } else {
-                            ops.push(Op { side: Side::Target, action: Action::Conflict, path: te.path.clone(), from: None, size: None, mtime_ms: None, hash: None, reason: "deleted-on-source-but-changed-on-target".into() });
+                            ops.push(Op { side: Side::Target, action: Action::Conflict, path: te.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "deleted-on-source-but-changed-on-target".into() });
                         }
                         continue;
                     }
@@ -386,20 +403,22 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
 
             if has_archive && both_hashed {
                 let (mv_on_target, rest_s_adds, rest_del_t) = detect_moves(s_adds, del_on_target);
-                for (from, to, size) in mv_on_target {
-                    ops.push(Op { side: Side::Target, action: Action::Move, path: to, from: Some(from), size: Some(size), mtime_ms: None, hash: None, reason: "move-on-source-replayed".into() });
+                for (from, to, size, rename) in mv_on_target {
+                    let reason = if rename { "rename-on-source-replayed" } else { "move-on-source-replayed" };
+                    ops.push(Op { side: Side::Target, action: Action::Move, path: to, from: Some(from), size: Some(size), mtime_ms: None, hash: None, link: None, reason: reason.into() });
                 }
                 let (mv_on_source, rest_t_adds, rest_del_s) = detect_moves(t_adds, del_on_source);
-                for (from, to, size) in mv_on_source {
-                    ops.push(Op { side: Side::Source, action: Action::Move, path: to, from: Some(from), size: Some(size), mtime_ms: None, hash: None, reason: "move-on-target-replayed".into() });
+                for (from, to, size, rename) in mv_on_source {
+                    let reason = if rename { "rename-on-target-replayed" } else { "move-on-target-replayed" };
+                    ops.push(Op { side: Side::Source, action: Action::Move, path: to, from: Some(from), size: Some(size), mtime_ms: None, hash: None, link: None, reason: reason.into() });
                 }
                 for a in rest_s_adds { push_copy(&mut ops, Side::Target, a, "added-on-source"); }
                 for a in rest_t_adds { push_copy(&mut ops, Side::Source, a, "added-on-target"); }
                 for d in rest_del_t {
-                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, reason: "deleted-on-source".into() });
+                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, reason: "deleted-on-source".into() });
                 }
                 for d in rest_del_s {
-                    ops.push(Op { side: Side::Source, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, reason: "deleted-on-target".into() });
+                    ops.push(Op { side: Side::Source, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, reason: "deleted-on-target".into() });
                 }
             } else {
                 if both_hashed {
@@ -409,7 +428,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                     for a in &s_adds {
                         if let Some(h) = a.hash.as_deref() {
                             if let Some(&other) = t_only.get(h) {
-                                ops.push(Op { side: Side::Target, action: Action::Note, path: a.path.clone(), from: Some(other.to_string()), size: Some(a.size), mtime_ms: None, hash: None, reason: "possible-move-needs-archive".into() });
+                                ops.push(Op { side: Side::Target, action: Action::Note, path: a.path.clone(), from: Some(other.to_string()), size: Some(a.size), mtime_ms: None, hash: None, link: None, reason: "possible-move-needs-archive".into() });
                             }
                         }
                     }
@@ -417,14 +436,61 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                 for a in s_adds { push_copy(&mut ops, Side::Target, a, "only-in-source"); }
                 for a in t_adds { push_copy(&mut ops, Side::Source, a, "only-in-target"); }
                 for d in del_on_target {
-                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, reason: "deleted-on-source".into() });
+                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, reason: "deleted-on-source".into() });
                 }
                 for d in del_on_source {
-                    ops.push(Op { side: Side::Source, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, reason: "deleted-on-target".into() });
+                    ops.push(Op { side: Side::Source, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, reason: "deleted-on-target".into() });
                 }
             }
         }
         other => panic!("unknown mode: {other}"),
+    }
+
+    // ---------- symlink（symlinks="direct" 时两侧表里才有 Symlink 条目）----------
+    // 比对按"链接指向字符串"相等；mirror 向 master 看齐，enrich 只补缺，sync 只补缺＋差异报冲突
+    {
+        let (s_links, _) = map_of(source, EntryKind::Symlink, ci);
+        let (t_links, _) = map_of(target, EntryKind::Symlink, ci);
+        let link_op = |side: Side, action: Action, e: &Entry, reason: &str| Op {
+            side,
+            action,
+            path: e.path.clone(),
+            from: None,
+            size: None,
+            mtime_ms: None,
+            hash: None,
+            link: e.link.clone(),
+            reason: reason.into(),
+        };
+        for (p, se) in &s_links {
+            let se = *se;
+            match t_links.get(p) {
+                None => {
+                    if mode == "mirror" || mode == "enrich" || mode == "sync" {
+                        ops.push(link_op(Side::Target, Action::Copy, se, "symlink-only-in-source"));
+                    }
+                }
+                Some(&te) => {
+                    if se.link != te.link {
+                        match mode {
+                            "mirror" => ops.push(link_op(Side::Target, Action::Update, se, "symlink-differs-master-wins")),
+                            "sync" => ops.push(link_op(Side::Target, Action::Conflict, se, "symlink-differs")),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        for (p, te) in &t_links {
+            let te = *te;
+            if !s_links.contains_key(p) {
+                match mode {
+                    "mirror" => ops.push(link_op(Side::Target, Action::Delete, te, "symlink-gone-from-source")),
+                    "sync" => ops.push(link_op(Side::Source, Action::Copy, te, "symlink-only-in-target")),
+                    _ => {}
+                }
+            }
+        }
     }
 
     // Windows 侧新建路径的合法性预检：计划阶段拦下，不让 apply 执行到一半才炸
@@ -494,7 +560,7 @@ mod tests {
         }
     }
     fn file(path: &str, hash: &str) -> Entry {
-        Entry { path: path.into(), kind: EntryKind::File, size: 1, mtime_ms: 0, hash: Some(hash.into()), file_id: None, mode: None }
+        Entry { path: path.into(), kind: EntryKind::File, size: 1, mtime_ms: 0, hash: Some(hash.into()), file_id: None, mode: None, link: None }
     }
 
     #[test]
@@ -639,19 +705,19 @@ mod tests {
 
     #[test]
     fn reverse_op_semantics() {
-        let copy = Op { side: Side::Target, action: Action::Copy, path: "x".into(), from: None, size: Some(5), mtime_ms: Some(1), hash: None, reason: "only-in-source".into() };
+        let copy = Op { side: Side::Target, action: Action::Copy, path: "x".into(), from: None, size: Some(5), mtime_ms: Some(1), hash: None, link: None, reason: "only-in-source".into() };
         let r = reverse_op(&copy).unwrap();
         assert_eq!((r.side, r.action), (Side::Source, Action::Delete));
 
-        let del = Op { side: Side::Target, action: Action::Delete, path: "x".into(), from: None, size: Some(5), mtime_ms: None, hash: None, reason: "gone-from-source".into() };
+        let del = Op { side: Side::Target, action: Action::Delete, path: "x".into(), from: None, size: Some(5), mtime_ms: None, hash: None, link: None, reason: "gone-from-source".into() };
         let r = reverse_op(&del).unwrap();
         assert_eq!((r.side, r.action), (Side::Source, Action::Copy));
 
-        let upd = Op { side: Side::Target, action: Action::Update, path: "x".into(), from: None, size: None, mtime_ms: None, hash: None, reason: "differs".into() };
+        let upd = Op { side: Side::Target, action: Action::Update, path: "x".into(), from: None, size: None, mtime_ms: None, hash: None, link: None, reason: "differs".into() };
         let r = reverse_op(&upd).unwrap();
         assert_eq!((r.side, r.action), (Side::Source, Action::Update));
 
-        let mv = Op { side: Side::Target, action: Action::Move, path: "b".into(), from: Some("a".into()), size: None, mtime_ms: None, hash: None, reason: "m".into() };
+        let mv = Op { side: Side::Target, action: Action::Move, path: "b".into(), from: Some("a".into()), size: None, mtime_ms: None, hash: None, link: None, reason: "m".into() };
         assert!(reverse_op(&mv).is_none());
     }
 

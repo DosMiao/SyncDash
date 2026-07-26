@@ -27,10 +27,26 @@ pub struct Job {
     /// 默认 false（大小写不敏感匹配——NTFS/APFS 默认行为）；true 则大小写敏感
     #[serde(default)]
     pub case_sensitive: bool,
+    /// symlink 策略：exclude（默认，忽略）| direct（同步链接本身，按指向字符串比对）
+    #[serde(default = "default_symlinks")]
+    pub symlinks: String,
+    /// 远程管线（可选）：设置后 run 走 ssh —— 远端在自己盘上扫描（免 UNC 哈希慢）＋打包送达执行
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    /// 远端根路径（远端机器自己的本地路径，如 /Users/xxx/Code/...）
+    #[serde(default)]
+    pub remote_root: Option<String>,
+    /// 远端 syncdash 可执行文件路径（默认当它在 PATH 里）
+    #[serde(default)]
+    pub remote_exe: Option<String>,
 }
 
 fn default_rigor() -> String {
     "standard".into()
+}
+
+fn default_symlinks() -> String {
+    "exclude".into()
 }
 
 pub fn jobs_dir() -> PathBuf {
@@ -89,5 +105,11 @@ target = '\\host\share\dir'
 # exclude = ['*/big_temp/', '*/*.log']  # FFS 语法；默认垃圾/可重建排除已内置
 # rigor = "standard"                    # quick | standard | paranoid（复制后校验）
 # case_sensitive = false                # 默认大小写不敏感（NTFS/APFS 默认行为）
+# symlinks = "exclude"                  # exclude | direct（同步链接本身）
 # no_hash = false
+#
+# 远程管线（可选）：远端在自己盘上扫描（快），target 侧打包经 ssh 送达执行
+# remote_host = 'mac'
+# remote_root = '/Users/xxx/Code/some/dir'
+# remote_exe = '~/Code/Utilities/SyncDash/target/release/syncdash'
 "#;

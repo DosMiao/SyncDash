@@ -2,7 +2,6 @@ mod gui;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
-use syncdash::compare::{Action, Op};
 use syncdash::{apply, compare, config, filter, pack, run, scan, table, territory};
 
 #[derive(Parser)]
@@ -40,10 +39,16 @@ enum Cmd {
     Probe,
     /// 列出任务配置（%APPDATA%\syncdash\jobs\*.toml）
     Jobs,
-    /// 跑一个任务：扫双侧 → 比对 →（--apply 时）执行 + 刷新 archive
+    /// 跑任务：扫双侧 → 比对 →（--apply 时）执行 + 刷新 archive。job 配置了 remote_host 则走 ssh 远程管线
     Run {
-        /// 任务名（jobs 目录里的文件名）或 toml 路径
-        job: String,
+        /// 任务名（jobs 目录里的文件名）或 toml 路径；省略时配合 --all / --prefix
+        job: Option<String>,
+        /// 跑全部任务
+        #[arg(long)]
+        all: bool,
+        /// 只跑名字以此开头的任务（如 cs-）
+        #[arg(long)]
+        prefix: Option<String>,
         #[arg(long)]
         apply: bool,
         #[arg(short, long)]
@@ -65,6 +70,9 @@ enum Cmd {
         /// 无视 hash 缓存，全部重新 hash（paranoid）
         #[arg(long)]
         force_rehash: bool,
+        /// 记录 symlink 本身（指向字符串）；默认忽略 symlink
+        #[arg(long)]
+        symlinks_direct: bool,
         /// 追加排除（FFS 过滤器语法，如 */big_temp/ 或 */*.log，可多次）
         #[arg(long)]
         exclude: Vec<String>,
@@ -102,6 +110,15 @@ enum Cmd {
         mode: String,
         #[arg(long, default_value = "standard")]
         rigor: String,
+        /// 生成远程管线任务：ssh 主机别名（如 mac）
+        #[arg(long)]
+        remote_host: Option<String>,
+        /// 远端根路径前缀（远端本地路径，如 /Users/xxx/Code）
+        #[arg(long)]
+        remote_root_base: Option<String>,
+        /// 远端 syncdash 路径（默认当它在 PATH 里）
+        #[arg(long)]
+        remote_exe: Option<String>,
     },
     /// 打包计划中 target 侧的操作为 tar 包（payload+计划+双 hash 清单），供对端 apply-pack
     Pack {
@@ -205,38 +222,68 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Run { job, apply: do_apply, verbose } => {
-            let (name, j) = config::load(&job)?;
-            let plan = run::compare_job(&j)?;
-            eprintln!("[{name}] {} op(s), {} conflict(s)", plan.header.op_count, plan.header.conflict_count);
-            for op in &plan.ops {
-                println!("{}", serde_json::to_string(op)?);
-            }
-            if do_apply {
-                let ops: Vec<Op> = plan
-                    .ops
-                    .iter()
-                    .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
-                    .cloned()
-                    .collect();
-                let (done, skipped, errors) = run::apply_job(&j, &plan, &ops, None, verbose);
-                println!("applied: {done} done, {skipped} skipped, {errors} error(s)");
-                Ok(if errors > 0 { 1 } else { 0 })
+        Cmd::Run { job, all, prefix, apply: do_apply, verbose } => {
+            let list: Vec<(String, config::Job)> = if all || prefix.is_some() {
+                config::load_all()
+                    .into_iter()
+                    .filter(|(n, _)| prefix.as_deref().map(|p| n.starts_with(p)).unwrap_or(true))
+                    .collect()
+            } else if let Some(j) = job {
+                vec![config::load(&j)?]
             } else {
-                println!("dry-run (rerun with --apply)");
-                Ok(if plan.header.conflict_count > 0 { 1 } else { 0 })
+                eprintln!("error: give a job name, or use --all / --prefix <p>");
+                return Ok(2);
+            };
+            if list.is_empty() {
+                eprintln!("no matching jobs");
+                return Ok(2);
             }
+            let many = list.len() > 1;
+            let mut tot = (0u64, 0u64, 0u64, 0u64);
+            for (name, j) in &list {
+                let res = if j.remote_host.is_some() {
+                    run::run_remote_job(name, j, do_apply, verbose)
+                } else {
+                    run::run_local_job(name, j, do_apply, verbose)
+                };
+                match res {
+                    Ok((d, s, e, c)) => {
+                        if do_apply {
+                            println!("[{name}] applied: {d} done, {s} skipped, {e} error(s), {c} conflict(s)");
+                        }
+                        tot.0 += d;
+                        tot.1 += s;
+                        tot.2 += e;
+                        tot.3 += c;
+                    }
+                    Err(err) => {
+                        eprintln!("[{name}] FAILED: {err}");
+                        tot.2 += 1;
+                    }
+                }
+            }
+            if many {
+                println!(
+                    "== total: {} job(s), {} done, {} skipped/pending, {} error(s), {} conflict(s)",
+                    list.len(),
+                    tot.0,
+                    tot.1,
+                    tot.2,
+                    tot.3
+                );
+            }
+            Ok(if tot.2 > 0 { 1 } else { 0 })
         }
         Cmd::Gui { job } => {
             gui::run_gui(job).map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(0)
         }
-        Cmd::Scan { root, out, no_hash, force_rehash, exclude } => {
+        Cmd::Scan { root, out, no_hash, force_rehash, symlinks_direct, exclude } => {
             if !root.is_dir() {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
             }
-            let snap = scan::scan(&root, &scan::ScanOptions { hash: !no_hash, force_rehash, filter: filter::PathFilter::build(&[], &exclude) })?;
+            let snap = scan::scan(&root, &scan::ScanOptions { hash: !no_hash, force_rehash, symlinks_direct, filter: filter::PathFilter::build(&[], &exclude) })?;
             eprintln!(
                 "scanned {} entries in {} ms ({})",
                 snap.header.entry_count, snap.header.duration_ms, snap.header.root
@@ -276,8 +323,13 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::GenJobs { root, target_root, mode, rigor } => {
-            let outs = territory::gen_jobs(&root, &target_root, &mode, &rigor)?;
+        Cmd::GenJobs { root, target_root, mode, rigor, remote_host, remote_root_base, remote_exe } => {
+            let remote = remote_host.map(|h| territory::RemoteGen {
+                host: h,
+                root_base: remote_root_base.unwrap_or_default(),
+                exe: remote_exe,
+            });
+            let outs = territory::gen_jobs(&root, &target_root, &mode, &rigor, remote.as_ref())?;
             for o in &outs {
                 println!("{:<44} <- {}", o.name, o.territory);
             }
