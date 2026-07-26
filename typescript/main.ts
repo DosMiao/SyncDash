@@ -946,13 +946,17 @@ const CMP_LABEL: Record<string, string> = {
 };
 const cmpPanel = $('cmp-panel');
 const cmpRows = $('cmp-rows');
+const cmpCancelBtn = $<HTMLButtonElement>('cmp-cancel');
 let cmpActive = false;
-const cmpRate = new Map<string, { t: number; b: number }>();
+/// 速率 EMA（0.7 旧 + 0.3 新）：瞬时速率会随文件大小剧烈跳变，指数平滑后可读
+const cmpRate = new Map<string, { t: number; b: number; ema: number }>();
 
 function cmpShow() {
   cmpActive = true;
   cmpRows.innerHTML = '';
   cmpRate.clear();
+  cmpCancelBtn.disabled = false;
+  cmpCancelBtn.textContent = '✕ 取消';
   emptyEl.classList.add('hidden');
   tableEl.classList.add('hidden');
   filterBar.classList.add('hidden');
@@ -965,20 +969,33 @@ function cmpHide() {
   // 表格/空态的显隐交还给 renderTable（doCompare 的 renderAll 已调用）
 }
 
-function cmpRow(phase: string): { row: HTMLElement; detail: HTMLElement; ico: HTMLElement } {
+interface CmpRowRefs {
+  row: HTMLElement; ico: HTMLElement; bar: HTMLElement; pct: HTMLElement;
+  items: HTMLElement; bytes: HTMLElement; rate: HTMLElement;
+}
+
+/// 定宽网格行：数字全右对齐、等宽数字字体、进度条+百分比——杜绝整行来回跳变
+function cmpRow(phase: string): CmpRowRefs {
   const id = `cmp-r-${phase}`;
   let row = document.getElementById(id);
   if (!row) {
     row = document.createElement('div');
     row.id = id;
-    row.className = 'stagerow';
-    row.innerHTML = `<span class="st-ico">⟳</span><span class="st-name">${CMP_LABEL[phase] ?? phase}</span><span class="st-detail"></span>`;
+    row.className = 'stagerow cmp2';
+    row.innerHTML =
+      `<span class="st-ico">⟳</span><span class="st-name">${CMP_LABEL[phase] ?? phase}</span>` +
+      `<span class="st-bar"><i></i></span><span class="st-pct"></span>` +
+      `<span class="st-items"></span><span class="st-bytes"></span><span class="st-rate"></span>`;
     cmpRows.appendChild(row);
   }
   return {
     row,
-    detail: row.querySelector('.st-detail') as HTMLElement,
     ico: row.querySelector('.st-ico') as HTMLElement,
+    bar: row.querySelector('.st-bar > i') as HTMLElement,
+    pct: row.querySelector('.st-pct') as HTMLElement,
+    items: row.querySelector('.st-items') as HTMLElement,
+    bytes: row.querySelector('.st-bytes') as HTMLElement,
+    rate: row.querySelector('.st-rate') as HTMLElement,
   };
 }
 
@@ -990,29 +1007,39 @@ function onCmpEvent(ev: CmpEv) {
       done.classList.remove('active');
       done.classList.add('done');
       (done.querySelector('.st-ico') as HTMLElement).textContent = '✓';
+      const bar = done.querySelector('.st-bar > i') as HTMLElement | null;
+      if (bar) bar.style.width = '100%';
+      const pct = done.querySelector('.st-pct') as HTMLElement | null;
+      if (pct && pct.textContent) pct.textContent = '100%';
     }
     const r = cmpRow(ev.phase);
     r.row.classList.add('active');
-    if (ev.label) r.detail.textContent = ev.label;
+    if (ev.label) r.items.textContent = ev.label;
   } else if (ev.kind === 'progress') {
     const r = cmpRow(ev.phase);
-    const bd = ev.bytes_done ?? 0;
+    const idn = ev.items_done ?? 0, it = ev.items_total ?? 0;
+    const bd = ev.bytes_done ?? 0, bt = ev.bytes_total ?? 0;
+    r.items.textContent = it ? `${idn} / ${it} 项` : `${idn} 项`;
+    r.bytes.textContent = bt ? `${humanSize(bd) || '0 B'} / ${humanSize(bt)}` : bd ? humanSize(bd) : '';
+    const pctV = bt > 0 ? (bd / bt) * 100 : it > 0 ? (idn / it) * 100 : 0;
+    r.pct.textContent = bt > 0 || it > 0 ? `${Math.floor(pctV)}%` : '';
+    r.bar.style.width = `${pctV}%`;
     const ts = ev.ts_ms ?? Date.now();
     const prev = cmpRate.get(ev.phase);
-    let rate = '';
     if (prev && ts > prev.t) {
-      const bps = (bd - prev.b) * 1000 / (ts - prev.t);
-      if (bps > 512 * 1024) rate = ` · ${(bps / (1 << 20)).toFixed(1)} MiB/s`;
+      const inst = ((bd - prev.b) * 1000) / (ts - prev.t);
+      const ema = prev.ema > 0 ? prev.ema * 0.7 + inst * 0.3 : inst;
+      cmpRate.set(ev.phase, { t: ts, b: bd, ema });
+      r.rate.textContent = ema > 512 * 1024 ? `${(ema / (1 << 20)).toFixed(1)} MiB/s` : '';
+    } else if (!prev) {
+      cmpRate.set(ev.phase, { t: ts, b: bd, ema: 0 });
     }
-    cmpRate.set(ev.phase, { t: ts, b: bd });
-    const bt = ev.bytes_total ?? 0;
-    r.detail.textContent =
-      `${ev.items_done ?? 0}${ev.items_total ? ` / ${ev.items_total}` : ''} 项` +
-      ` · ${humanSize(bd) || '0 B'}${bt ? ` / ${humanSize(bt)}` : ''}${rate}`;
   }
 }
 
-$('cmp-cancel').addEventListener('click', () => {
+cmpCancelBtn.addEventListener('click', () => {
+  cmpCancelBtn.disabled = true;
+  cmpCancelBtn.textContent = '取消中…（等在飞的块收尾）';
   invoke('cancel_run').catch(() => {});
   setStatus('正在取消比对…');
 });

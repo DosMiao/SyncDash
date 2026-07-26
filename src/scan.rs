@@ -345,7 +345,9 @@ fn scan_impl(
         }
     }
 
-    // walk 结束即知总量（P2-6 的洞察）：条数 = 文件数；字节 = 真要读盘哈希的那部分
+    // walk 结束即知总量（P2-6 的洞察）：条数 = 文件数；字节 = 真要读盘哈希的那部分。
+    // 条数计数换挡：walk 期计的是"发现了多少"，哈希期从零重计"处理完多少"
+    // ——否则界面从哈希一开始就停在 N/N。
     if let Some(pp) = &pp {
         let bytes_to_hash: u64 = if opt.hash {
             pending.iter().filter(|p| p.hash.is_none()).map(|p| p.size).sum()
@@ -353,6 +355,7 @@ fn scan_impl(
             0
         };
         pp.set_totals(pending.len() as u64, bytes_to_hash);
+        pp.restart_items();
     }
 
     let hash_err_count = std::sync::atomic::AtomicU64::new(0);
@@ -390,6 +393,10 @@ fn scan_impl(
                     }
                 });
             }
+            // ≥32MB 的文件不再一把 mmap 哈希到底：那会让"取消"要等在飞的大文件读完
+            // （OneDrive 云占位文件还要先整只水合下载，可能一等几分钟）。
+            // 分块读环每 8MiB 一个取消/暂停检查点；少了 blake3 的文件内多核，
+            // 但外层文件级并行仍在，盘几乎总是瓶颈，吞吐差异进噪声。
             pending.par_iter_mut().for_each(|p| {
                 if let Some(pp) = &pp {
                     if pp.checkpoint().is_err() {
@@ -399,12 +406,28 @@ fn scan_impl(
                 if p.hash.is_none() {
                     let mut hasher = blake3::Hasher::new();
                     let res = if p.size >= BIG_FILE {
-                        hasher.update_mmap_rayon(&p.abs).map(|_| ())
+                        (|| -> std::io::Result<()> {
+                            use std::io::Read;
+                            let mut f = std::fs::File::open(&p.abs)?;
+                            let mut buf = vec![0u8; 8 * 1024 * 1024];
+                            loop {
+                                if let Some(pp) = &pp {
+                                    pp.checkpoint()?;
+                                }
+                                let n = f.read(&mut buf)?;
+                                if n == 0 {
+                                    break;
+                                }
+                                hasher.update(&buf[..n]);
+                            }
+                            Ok(())
+                        })()
                     } else {
                         hasher.update_mmap(&p.abs).map(|_| ())
                     };
                     match res {
                         Ok(_) => p.hash = Some(hasher.finalize().to_hex().to_string()),
+                        Err(e) if crate::progress::is_cancelled(&e) => return, // 取消不是哈希错误
                         Err(e) => {
                             hash_err_count.fetch_add(1, Ordering::Relaxed);
                             if let Some(pp) = &pp {
@@ -416,6 +439,9 @@ fn scan_impl(
                     if let Some(pp) = &pp {
                         pp.add_bytes(p.size, &p.rel);
                     }
+                }
+                if let Some(pp) = &pp {
+                    pp.item_done(&p.rel); // 哈希期的条数 = 处理完的文件数（缓存命中即刻+1）
                 }
             });
             hashing.store(false, Ordering::Relaxed);

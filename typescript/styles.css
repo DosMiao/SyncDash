@@ -407,3 +407,12 @@ tr.ingrp td.c-path:first-of-type { padding-left: 26px; }
 #btn-fold { margin-left: auto; }
 #btn-fold.hidden ~ #btn-group { margin-left: auto; }
 #btn-pathmode { margin-left: 0; }
+
+/* ---- compare 面板 v2：定宽网格 + 进度条 + 百分比（防整行跳变） ---- */
+#cmp-rows { width: min(780px, 92%); }
+#cmp-rows .stagerow.cmp2 { display: grid; grid-template-columns: 18px 104px 1fr 46px 128px 172px 84px; align-items: center; gap: 8px; }
+.cmp2 .st-bar { height: 5px; background: var(--panel3); border-radius: 3px; overflow: hidden; }
+.cmp2 .st-bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.25s linear; }
+.cmp2.done .st-bar > i { background: var(--green); }
+.cmp2 .st-pct { text-align: right; font-variant-numeric: tabular-nums; }
+.cmp2 .st-items, .cmp2 .st-bytes, .cmp2 .st-rate { text-align: right; font-variant-numeric: tabular-nums; color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; }

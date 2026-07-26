@@ -224,6 +224,11 @@ impl<'a> PhaseProgress<'a> {
         }
     }
 
+    /// 相位内换挡（scan：walk 计数的是"发现"，哈希期改计"处理完"）——清零已完成条数
+    pub fn restart_items(&self) {
+        self.items_done.store(0, Ordering::Relaxed);
+    }
+
     pub fn set_totals(&self, items: u64, bytes: u64) {
         self.items_total.store(items, Ordering::Relaxed);
         self.bytes_total.store(bytes, Ordering::Relaxed);
