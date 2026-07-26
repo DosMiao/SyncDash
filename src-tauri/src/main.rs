@@ -215,6 +215,24 @@ fn jobs_dir() -> String {
     config::jobs_dir().display().to_string()
 }
 
+/// M4：运行历史（新→旧）。job = null 时看全部
+#[tauri::command]
+fn run_history(job: Option<String>, limit: Option<usize>) -> Vec<syncdash::runlog::RunRecord> {
+    syncdash::runlog::history(job.as_deref(), limit.unwrap_or(50))
+}
+
+/// M4：每个任务最近一次运行——侧栏"上次同步"点的数据源
+#[tauri::command]
+fn last_syncs() -> std::collections::HashMap<String, syncdash::runlog::RunRecord> {
+    syncdash::runlog::latest_by_job()
+}
+
+/// M4：某次运行的明细行（原样 JSONL；行数封顶）
+#[tauri::command]
+fn run_detail(detail: String) -> Vec<String> {
+    syncdash::runlog::detail_lines(&detail, 2000)
+}
+
 /// 打开（或聚焦）独立进度子窗口。运行事件广播到所有窗口，子窗自行过滤。
 #[tauri::command]
 fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
@@ -362,9 +380,12 @@ async fn apply_job(
         }
         let (run_id, ctl) = begin_run(&st)?;
         let ctx = make_ctx(&app, run_id, ctl);
-        let out = if job.remote_host.is_some() {
-            let r = run::apply_remote_job_with(&name, &job, &full, &ops, false, acknowledged, &ctx);
-            match r {
+        // M4：每次真实 apply 落一条运行日志（Recorder 顺带把错误事件收进明细文件）
+        let t0 = std::time::Instant::now();
+        let remote = job.remote_host.is_some();
+        let rec = syncdash::runlog::Recorder::start(&name, if remote { "remote-apply" } else { "apply" }, &ctx);
+        let out = if remote {
+            match run::apply_remote_job_with(&name, &job, &full, &ops, false, acknowledged, &rec.ctx) {
                 Ok(o) => o,
                 Err(e) => {
                     end_run(&st);
@@ -372,8 +393,9 @@ async fn apply_job(
                 }
             }
         } else {
-            run::apply_job_guarded_with(&job, &full, &ops, None, false, acknowledged, &ctx)
+            run::apply_job_guarded_with(&job, &full, &ops, None, false, acknowledged, &rec.ctx)
         };
+        rec.finish(&out, &ops, t0.elapsed().as_millis() as u64);
         end_run(&st);
         Ok(ApplyDto {
             done: out.done,
@@ -392,7 +414,8 @@ fn main() {
         .manage(Arc::new(RunState::default()))
         .invoke_handler(tauri::generate_handler![
             list_jobs, jobs_dir, compare_job, preflight, apply_job, cancel_run, pause_run,
-            open_progress_window, close_progress_window, post_sync_action
+            open_progress_window, close_progress_window, post_sync_action,
+            run_history, last_syncs, run_detail
         ])
         .run(tauri::generate_context!())
         .expect("error while running SyncDash");

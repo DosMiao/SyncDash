@@ -204,8 +204,12 @@ pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackno
         .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
         .cloned()
         .collect();
-    let (done, skipped, errors) = apply_job_guarded(job, &plan, &ops, None, verbose, acknowledged);
-    Ok((done, skipped, errors, plan.header.conflict_count))
+    // M4：CLI 的 apply 也留运行日志（desktop 在壳层各自记录）
+    let t0 = std::time::Instant::now();
+    let rec = crate::runlog::Recorder::start(name, "apply", &crate::progress::RunCtx::null());
+    let out = apply_job_guarded_with(job, &plan, &ops, None, verbose, acknowledged, &rec.ctx);
+    rec.finish(&out, &ops, t0.elapsed().as_millis() as u64);
+    Ok((out.done, out.skipped, out.errors, plan.header.conflict_count))
 }
 
 /// 远程管线（v0.6 ssh 一条龙）：ssh 探测 → 远端本地扫描（stdout 收表）→ 本地扫描 → 比对
@@ -249,7 +253,10 @@ pub fn run_remote_job_with(
         .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
         .cloned()
         .collect();
-    let out = apply_remote_job_with(name, job, &plan, &ops, verbose, acknowledged, ctx)?;
+    let t0 = std::time::Instant::now();
+    let rec = crate::runlog::Recorder::start(name, "remote-apply", ctx);
+    let out = apply_remote_job_with(name, job, &plan, &ops, verbose, acknowledged, &rec.ctx)?;
+    rec.finish(&out, &ops, t0.elapsed().as_millis() as u64);
     Ok((out.done, out.skipped, out.errors, plan.header.conflict_count))
 }
 

@@ -21,6 +21,7 @@
       <header id="toolbar">
         <button id="btn-compare" class="btn primary" disabled>⟳ Compare</button>
         <button id="btn-sync" class="btn accent" disabled>▶ Synchronize</button>
+        <button id="btn-log" class="btn" title="运行日志">🗒</button>
         <span id="stats" class="stats"></span>
         <span id="spin" class="spinner hidden"></span>
       </header>
@@ -56,6 +57,17 @@
       </div>
       <footer id="status">就绪</footer>
     </main>
+  </div>
+  <div id="logmodal" class="hidden">
+    <div class="sheet logsheet">
+      <h3>运行日志 <span id="log-scope" class="dim thin"></span></h3>
+      <div id="log-list"></div>
+      <pre id="log-detail" class="hidden mono"></pre>
+      <div class="btnrow">
+        <button id="log-back" class="btn hidden">← 返回列表</button>
+        <button id="log-close" class="btn">关闭 (Esc)</button>
+      </div>
+    </div>
   </div>
   <div id="modal" class="hidden">
     <div class="sheet">

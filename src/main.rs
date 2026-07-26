@@ -189,6 +189,17 @@ enum Cmd {
         #[arg(long, default_value = "")]
         note: String,
     },
+    /// 运行历史（M4）：每次 apply 的结果一览；--prune-days N 清理旧记录
+    History {
+        /// 只看这个任务（缺省 = 全部）
+        job: Option<String>,
+        /// 最多显示多少条
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        /// 清理 N 天前的记录与明细文件
+        #[arg(long)]
+        prune_days: Option<u64>,
+    },
     /// 本机回收目录：查看 / 找回 / 清理
     Trash {
         #[command(subcommand)]
@@ -522,6 +533,41 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 );
             }
             println!("set `require_marker = true` in the job to have syncdash refuse to run without it");
+            Ok(0)
+        }
+        Cmd::History { job, limit, prune_days } => {
+            if let Some(days) = prune_days {
+                let n = syncdash::runlog::prune(days);
+                println!("pruned {n} run(s) older than {days} day(s)");
+            }
+            let rows = syncdash::runlog::history(job.as_deref(), limit);
+            if rows.is_empty() {
+                println!("no runs recorded yet (runs are logged when a job actually applies)");
+                return Ok(0);
+            }
+            let now = syncdash::table::now_ms() as i64;
+            for r in rows {
+                let age_min = (now - r.ts_ms).max(0) / 60_000;
+                let age = if age_min < 60 {
+                    format!("{age_min}m ago")
+                } else if age_min < 48 * 60 {
+                    format!("{}h ago", age_min / 60)
+                } else {
+                    format!("{}d ago", age_min / 60 / 24)
+                };
+                println!(
+                    "{:>9}  {:<20} {:<12} {:>5} done {:>4} skip {:>3} err  {:>10}  {:>7.1}s{}",
+                    age,
+                    r.job,
+                    r.kind,
+                    r.done,
+                    r.skipped,
+                    r.errors,
+                    syncdash::preflight::human_bytes(r.bytes),
+                    r.elapsed_ms as f64 / 1000.0,
+                    if r.cancelled { "  [cancelled]" } else { "" },
+                );
+            }
             Ok(0)
         }
         Cmd::Trash { cmd } => {

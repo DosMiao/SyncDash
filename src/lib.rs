@@ -13,6 +13,7 @@ pub mod preflight;
 pub mod progress;
 pub mod remote;
 pub mod run;
+pub mod runlog;
 pub mod scan;
 pub mod table;
 pub mod territory;

@@ -27,6 +27,11 @@ interface PlanDto {
   reversed: (OpDto | null)[];
 }
 interface ApplyDto { done: number; skipped: number; errors: number; bytes_copied: number; cancelled: boolean }
+interface RunRecord {
+  ts_ms: number; job: string; kind: string;
+  done: number; skipped: number; errors: number; bytes: number;
+  elapsed_ms: number; cancelled: boolean; detail?: string;
+}
 interface Progress { phase: string; detail: string; pct: number; rate: number }
 interface PreflightDto { ok: boolean; blockers: string[]; warnings: string[] }
 
@@ -65,6 +70,8 @@ let busy = false;
 /// M3 Overview：按顶层目录过滤（null = 不过滤；'(root)' = 根下散文件；'a' 或 'a/b' = 前缀）
 let ovFilter: string | null = null;
 let ovExpanded = new Set<string>();
+/// M4：任务名 → 最近一次运行
+let lastMap: Record<string, RunRecord> = {};
 /// 用户在确认单里勾了"我确认无误"（等同 CLI --i-know）；每次重新比对后归零
 let acknowledged = false;
 
@@ -343,6 +350,14 @@ function renderAll() {
   renderTable();
 }
 
+function relTime(ts: number): string {
+  const d = Date.now() - ts;
+  if (d < 60_000) return '刚刚';
+  if (d < 3600_000) return `${Math.floor(d / 60_000)} 分钟前`;
+  if (d < 86400_000) return `${Math.floor(d / 3600_000)} 小时前`;
+  return `${Math.floor(d / 86400_000)} 天前`;
+}
+
 function renderJobs() {
   jobListEl.innerHTML = '';
   for (const j of jobs) {
@@ -350,7 +365,16 @@ function renderJobs() {
     div.className = 'job' + (currentJob?.name === j.name ? ' active' : '');
     const rigor = j.rigor && j.rigor !== 'standard' ? `<span class="rigor">${j.rigor}</span>` : '';
     const remote = j.remote ? `<span class="rbadge">ssh</span>` : '';
-    div.innerHTML = `<span class="name">${j.name}</span>${remote}${rigor}<span class="mode ${j.mode}">${j.mode}</span>`;
+    // M4：上次同步行（结果色点 + 相对时间；超 7 天变红提醒）
+    const r = lastMap[j.name];
+    let sub = '';
+    if (r) {
+      const dot = r.errors > 0 ? 'err' : r.cancelled ? 'warn' : 'ok';
+      const stale = Date.now() - r.ts_ms > 7 * 86400_000 ? ' stale' : '';
+      const note = r.errors > 0 ? ` · ${r.errors} 错误` : r.cancelled ? ' · 已取消' : '';
+      sub = `<div class="jrow2${stale}"><span class="dot ${dot}">●</span>${relTime(r.ts_ms)} · ${r.done} 项${note}</div>`;
+    }
+    div.innerHTML = `<div class="jrow1"><span class="name">${j.name}</span>${remote}${rigor}<span class="mode ${j.mode}">${j.mode}</span></div>${sub}`;
     div.title = `${j.source}\n→ ${j.target}` + (j.remote ? `\nssh:${j.remote_host ?? ''}` : '');
     div.addEventListener('click', () => {
       if (busy) return;
@@ -470,6 +494,7 @@ async function doSync() {
       r.errors ? 'err' : 'ok',
     );
     setBusy(false);
+    refreshLastSyncs();
     await doCompare(false);
   } catch (e) {
     setStatus(`同步失败：${e}`, 'err');
@@ -496,6 +521,69 @@ searchEl.addEventListener('input', () => {
   renderTable();
 });
 
+// ---------- M4：运行日志面板 ----------
+
+const logModal = $('logmodal');
+const logList = $('log-list');
+const logDetail = $('log-detail');
+const logBack = $<HTMLButtonElement>('log-back');
+
+async function refreshLastSyncs() {
+  try {
+    lastMap = await invoke<Record<string, RunRecord>>('last_syncs');
+    renderJobs();
+  } catch { /* 日志缺失不致命 */ }
+}
+
+function logShowList() {
+  logDetail.classList.add('hidden');
+  logBack.classList.add('hidden');
+  logList.classList.remove('hidden');
+}
+
+async function openLogPanel() {
+  $('log-scope').textContent = currentJob ? `— ${currentJob.name}` : '— 全部任务';
+  logShowList();
+  logList.innerHTML = '<div class="logempty">加载中…</div>';
+  logModal.classList.remove('hidden');
+  try {
+    const rows = await invoke<RunRecord[]>('run_history', { job: currentJob?.name ?? null, limit: 50 });
+    logList.innerHTML = '';
+    if (rows.length === 0) {
+      logList.innerHTML = '<div class="logempty">还没有运行记录 — 任务真正执行（apply）后才会留痕</div>';
+      return;
+    }
+    for (const r of rows) {
+      const div = document.createElement('div');
+      div.className = 'logrow';
+      const dot = r.errors > 0 ? 'err' : r.cancelled ? 'warn' : 'ok';
+      div.innerHTML =
+        `<span><span class="dot ${dot}">●</span> ${relTime(r.ts_ms)}</span>` +
+        `<span>${escapeHtml(r.job)} <span class="k">${r.kind}</span></span>` +
+        `<span>${r.done} 项${r.errors ? ` · <b style="color:var(--red)">${r.errors} 错</b>` : ''}</span>` +
+        `<span>${humanSize(r.bytes) || '0 B'} · ${(r.elapsed_ms / 1000).toFixed(1)}s${r.cancelled ? ' · 已取消' : ''}</span>` +
+        `<span class="k">${r.detail ? '点击看明细 ›' : ''}</span>`;
+      if (r.detail) {
+        div.addEventListener('click', async () => {
+          const lines = await invoke<string[]>('run_detail', { detail: r.detail });
+          logDetail.textContent = lines.length ? lines.join('\n') : '(明细文件为空或已被清理)';
+          logList.classList.add('hidden');
+          logDetail.classList.remove('hidden');
+          logBack.classList.remove('hidden');
+        });
+      }
+      logList.appendChild(div);
+    }
+  } catch (e) {
+    logList.innerHTML = `<div class="logempty">读取失败：${escapeHtml(String(e))}</div>`;
+  }
+}
+
+$('btn-log').addEventListener('click', openLogPanel);
+logBack.addEventListener('click', logShowList);
+$('log-close').addEventListener('click', () => logModal.classList.add('hidden'));
+logModal.addEventListener('click', (e) => { if (e.target === logModal) logModal.classList.add('hidden'); });
+
 // M3 Overview 折叠/清除
 const ovEl = $('overview');
 ovEl.classList.toggle('collapsed', localStorage.getItem('sd.ov') !== 'open');
@@ -507,6 +595,10 @@ $('ov-clear').addEventListener('click', () => { ovFilter = null; renderAll(); })
 
 document.addEventListener('keydown', (e) => {
   const mod = e.ctrlKey || e.metaKey;
+  if (!logModal.classList.contains('hidden')) {
+    if (e.key === 'Escape') logModal.classList.add('hidden');
+    return;
+  }
   if (!modalEl.classList.contains('hidden')) {
     if (e.key === 'Escape') modalEl.classList.add('hidden');
     if (e.key === 'Enter' && !modalOk.disabled) doSync();
@@ -532,6 +624,7 @@ document.addEventListener('keydown', (e) => {
   try {
     jobs = await invoke<JobDto[]>('list_jobs');
     renderJobs();
+    refreshLastSyncs();
     $('jobsdir').textContent = await invoke<string>('jobs_dir');
     try { $('appver').textContent = 'v' + (await getVersion()); } catch { /* 权限缺省时忽略 */ }
     setStatus(jobs.length ? '选择左侧任务开始' : '没有任务 — 在 jobs 目录放 <名字>.toml');

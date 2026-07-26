@@ -286,3 +286,23 @@ tr.flip .badge { border-style: dashed; }
 .st.s-del b { color: var(--red); }
 .st.s-conf b { color: var(--purple); }
 .rbadge { font-size: 9px; padding: 1px 5px; border-radius: 6px; background: var(--panel3); color: var(--accent); border: 1px solid var(--accent); }
+
+/* ---- M4: 上次同步 + 运行日志 ---- */
+.job { flex-direction: column; align-items: stretch; gap: 2px; }
+.jrow1 { display: flex; align-items: center; gap: 6px; }
+.jrow1 .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jrow2 { font-size: 10px; color: var(--dim); display: flex; align-items: center; gap: 4px; }
+.jrow2 .dot { font-size: 8px; }
+.jrow2 .dot.ok { color: var(--green); }
+.jrow2 .dot.warn { color: var(--orange); }
+.jrow2 .dot.err { color: var(--red); }
+.jrow2.stale { color: var(--red); opacity: 0.8; }
+#logmodal { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; z-index: 90; }
+.logsheet { width: 680px; max-width: 92vw; max-height: 74vh; display: flex; flex-direction: column; }
+#log-list { overflow-y: auto; max-height: 50vh; margin: 8px 0; }
+.logrow { display: grid; grid-template-columns: 84px 1fr 92px 150px 90px; gap: 8px; padding: 6px 8px; border-radius: 5px; cursor: pointer; font-size: 12px; font-variant-numeric: tabular-nums; align-items: center; }
+.logrow:hover { background: var(--panel2); }
+.logrow .dot { font-size: 9px; }
+.logrow .k { color: var(--dim); font-size: 10px; }
+#log-detail { max-height: 50vh; overflow: auto; font-size: 11px; background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin: 8px 0; white-space: pre-wrap; word-break: break-all; }
+.logempty { color: var(--dim); padding: 18px; text-align: center; }
