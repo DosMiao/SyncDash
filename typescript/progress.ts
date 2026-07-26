@@ -15,6 +15,9 @@ type PhaseName =
 
 interface RunEv {
   run_id: number;
+  /// "compare" | "apply"——本窗口只认 apply（compare 进度在主窗原地显示；
+  /// 若不过滤，同步后的自动复核比对会把结果窗劫持成永远转圈的"比对中"）
+  purpose?: string;
   kind: 'phase_start' | 'totals' | 'progress' | 'error' | 'paused' | 'resumed' | 'summary';
   ts_ms: number;
   phase?: PhaseName;
@@ -344,6 +347,7 @@ $('cd-cancel').addEventListener('click', countdownStop);
 // ---------- 事件处理 ----------
 
 function onEvent(ev: RunEv) {
+  if (ev.purpose === 'compare') return;     // compare 归主窗面板；本窗只演 apply
   if (ev.run_id < runId) return;            // 已取消运行的迟到事件
   if (ev.run_id > runId) resetRun(ev.run_id, ev.ts_ms);
 
@@ -445,7 +449,11 @@ btnStop.addEventListener('click', async () => {
   btnStop.disabled = true;
   // 卡在暂停里点停止：先放行，取消才能被检查点看见
   if (pausedSince) { pausedSince = 0; await invoke('pause_run', { paused: false }).catch(() => {}); }
-  await invoke('cancel_run').catch(() => {});
+  const had = await invoke<boolean>('cancel_run').catch(() => false);
+  if (!had) {
+    // 没有活动运行（早已自然结束）——按钮不吊死在"正在停止…"
+    btnStop.textContent = '已结束';
+  }
 });
 
 $('errhead').addEventListener('click', () => errSec.classList.toggle('open'));
@@ -463,7 +471,12 @@ win.onCloseRequested(async (e) => {
     btnStop.textContent = '正在停止…';
     btnStop.disabled = true;
     if (pausedSince) { pausedSince = 0; await invoke('pause_run', { paused: false }).catch(() => {}); }
-    await invoke('cancel_run').catch(() => {});
+    const had = await invoke<boolean>('cancel_run').catch(() => false);
+    if (!had) {
+      // 引擎侧已无运行（Summary 丢失/早已结束）——直接放行关闭，绝不让窗口关不掉
+      running = false;
+      win.destroy().catch(() => {});
+    }
   }
 });
 

@@ -84,10 +84,13 @@ fn end_run(st: &RunState) {
 
 // ---------- 事件桥 ----------
 
-/// 发往前端的 run-progress 载荷：run_id 让前端丢弃已取消运行的迟到事件
+/// 发往前端的 run-progress 载荷：run_id 让前端丢弃已取消运行的迟到事件；
+/// purpose 区分 compare / apply——子窗口只认 apply（否则同步后的自动复核比对
+/// 会把还开着的结果窗劫持成永远转圈的"比对中"），主窗内嵌面板只认 compare。
 #[derive(Serialize, Clone)]
 struct RunEvent {
     run_id: u64,
+    purpose: &'static str,
     #[serde(flatten)]
     ev: ProgressEvent,
 }
@@ -160,6 +163,7 @@ fn legacy_shim(app: &tauri::AppHandle, ev: &ProgressEvent) {
 struct TauriSink {
     app: tauri::AppHandle,
     run_id: u64,
+    purpose: &'static str,
     last_progress_ms: AtomicU64,
 }
 
@@ -173,14 +177,14 @@ impl ProgressSink for TauriSink {
             self.last_progress_ms.store(*ts_ms, Ordering::Relaxed);
         }
         legacy_shim(&self.app, &ev);
-        let _ = self.app.emit("run-progress", RunEvent { run_id: self.run_id, ev });
+        let _ = self.app.emit("run-progress", RunEvent { run_id: self.run_id, purpose: self.purpose, ev });
     }
 }
 
-fn make_ctx(app: &tauri::AppHandle, run_id: u64, ctl: Arc<RunCtl>) -> RunCtx {
+fn make_ctx(app: &tauri::AppHandle, run_id: u64, ctl: Arc<RunCtl>, purpose: &'static str) -> RunCtx {
     RunCtx::new(
         ctl,
-        Arc::new(TauriSink { app: app.clone(), run_id, last_progress_ms: AtomicU64::new(0) }),
+        Arc::new(TauriSink { app: app.clone(), run_id, purpose, last_progress_ms: AtomicU64::new(0) }),
     )
 }
 
@@ -341,7 +345,7 @@ async fn compare_job(
     tauri::async_runtime::spawn_blocking(move || {
         let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
         let (run_id, ctl) = begin_run(&st)?;
-        let ctx = make_ctx(&app, run_id, ctl);
+        let ctx = make_ctx(&app, run_id, ctl, "compare");
         // M3：remote 任务走远程管线（远端自己盘上扫描），不再静默落进本地管线
         let r = if job.remote_host.is_some() {
             run::compare_remote_job_with(&name, &job, &ctx)
@@ -407,7 +411,7 @@ async fn apply_job(
             return Err(v.blockers.join("\n"));
         }
         let (run_id, ctl) = begin_run(&st)?;
-        let ctx = make_ctx(&app, run_id, ctl);
+        let ctx = make_ctx(&app, run_id, ctl, "apply");
         // M4：每次真实 apply 落一条运行日志（Recorder 顺带把错误事件收进明细文件）
         let t0 = std::time::Instant::now();
         let remote = job.remote_host.is_some();

@@ -847,6 +847,7 @@ logModal.addEventListener('click', (e) => { if (e.target === logModal) logModal.
 
 interface CmpEv {
   kind: string;
+  purpose?: string;
   phase?: string;
   label?: string | null;
   ts_ms?: number;
@@ -899,6 +900,7 @@ function cmpRow(phase: string): { row: HTMLElement; detail: HTMLElement; ico: HT
 
 function onCmpEvent(ev: CmpEv) {
   if (!cmpActive || !ev.phase) return;
+  if (ev.purpose && ev.purpose !== 'compare') return; // apply 的事件归子窗口
   if (ev.kind === 'phase_start') {
     for (const done of cmpRows.querySelectorAll('.stagerow.active')) {
       done.classList.remove('active');
