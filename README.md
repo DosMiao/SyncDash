@@ -206,7 +206,8 @@ source 侧回拉经挂载路径直落 → archive 刷新。`gen-jobs --remote-ho
 - [x] v0.4 远端：`pack` / `apply-pack`——tar 容器（plan.jsonl＋payload＋收尾 manifest），计划 blake3＋逐文件 blake3＋合并 hash；staging 全部验完才动 target；复用 apply 的锁/回收/复制后校验；unix mode 恢复。**Win 打包 → SMB 送包 → Mac apply-pack → 远程复扫 0 ops，真机全流程验证**
 - [x] v0.5 `territories` / `gen-jobs`：扫 `.ffs-sync` 标记为每个领地生成 `cs-<slug>.toml`（sync 模式＋自动 archive 路径）——syncdash 版 CodeSync 生成器，11 个领地实测生成；与 FFS 并行运行，切换时机由使用者定
 - [x] v0.6 `run --all`/`--prefix`；ssh 远程管线一条龙（job 配 remote_host 即启用，真机验证：dry→apply→复跑 0 ops，含 symlink）；symlink 策略 exclude/direct（按指向比对，apply 建/换/删链接本身）；同父目录 rename 优先配对（reason 区分 rename/move）；git bundle 经 SMB 更新 Mac（挂载不在线时的通道）
-- **roadmap 完成**。后续候选（按需）：GUI 任务编辑（桌面线）、Windows 作为远端（PowerShell 引号规则）、版本向量 P2P（见"多端"——当前明确非目标）、FastCDC 增量传输
+- [x] v0.7 三个"后续候选"全部落地：**Windows 作为远端**（`recv` 子命令用 Rust 原始 stdin 收包、按 probe 的 os 选 shell 方言：PowerShell 单引号翻倍＋chcp 65001 前奏＋`& 'exe'`；实测 Mac 反向驱动 Windows：8.4MB 包经 ssh stdin 落地、apply-pack 执行、复跑 0 ops）；**FastCDC 增量传输**（16K/64K/256K v2020，远端 `chunks` 出块表，≥4MB 更新只传缺失块＋重组 recipe，blob/base/成品三重 blake3；实测 8MB 改 6KB 只传 148KB，省 98.2%）；**GUI 任务编辑**（egui：New/Edit/Delete 全字段表单＋校验＋二次确认删除；`config::save_job/delete_job` 供桌面壳复用）
+- **roadmap 全部完成**。仅存的远期方向：版本向量 P2P（见"多端"——明确非目标，除非出现绕过 hub 的直连写入）
 
 ## 构建
 
