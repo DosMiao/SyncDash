@@ -13,8 +13,23 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "syncdash", version, about = "Table-driven multi-node file sync (scan -> compare -> apply)")]
 struct Cli {
+    /// 不带子命令（如双击 exe）时直接打开 GUI
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn FreeConsole() -> i32;
+}
+
+/// 双击启动时甩掉随附的控制台窗口
+fn detach_console() {
+    #[cfg(windows)]
+    unsafe {
+        FreeConsole();
+    }
 }
 
 #[derive(Clone, ValueEnum)]
@@ -117,7 +132,16 @@ fn main() {
 }
 
 fn run_cli(cli: Cli) -> std::io::Result<i32> {
-    match cli.cmd {
+    let cmd = match cli.cmd {
+        Some(c) => c,
+        None => {
+            // 双击 exe：无参数 → 直接进 GUI
+            detach_console();
+            gui::run_gui(None).map_err(|e| std::io::Error::other(e.to_string()))?;
+            return Ok(0);
+        }
+    };
+    match cmd {
         Cmd::Probe => {
             let info = serde_json::json!({
                 "app": "syncdash",
