@@ -98,17 +98,6 @@ fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn create_symlink(target: &str, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-#[cfg(windows)]
-fn create_symlink(target: &str, link: &Path) -> std::io::Result<()> {
-    use std::os::windows::fs::{symlink_dir, symlink_file};
-    // If the file link fails (target is a directory, or permissions), try a directory link; if that fails too, report it honestly (Windows needs developer mode or admin)
-    symlink_file(target, link).or_else(|_| symlink_dir(target, link))
-}
-
 fn exists_no_follow(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok()
 }
@@ -127,56 +116,80 @@ enum DirOutcome {
     Failed(std::io::Error),
 }
 
-fn try_delete_dir(dst: &Path, rel: &str, filter: Option<&crate::pipeline::filter::PathFilter>) -> DirOutcome {
-    match std::fs::remove_dir(dst) {
+fn try_delete_dir_vfs(
+    exec: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    rel: &str,
+    filter: Option<&crate::pipeline::filter::PathFilter>,
+) -> DirOutcome {
+    use crate::fs::vfs::VfsErrorKind;
+    use crate::model::table::EntryKind;
+    match exec.remove_dir(rel) {
         Ok(_) => return DirOutcome::Removed,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DirOutcome::Absent,
-        Err(e) if e.kind() != std::io::ErrorKind::DirectoryNotEmpty && e.raw_os_error() != Some(145) && e.raw_os_error() != Some(39) => {
-            // 145 = ERROR_DIR_NOT_EMPTY (Windows), 39 = ENOTEMPTY (unix).
-            // Any other error (permissions, etc.) is reported as-is
-            return DirOutcome::Failed(e);
-        }
+        Err(e) if e.kind == VfsErrorKind::NotFound => return DirOutcome::Absent,
+        Err(e) if e.kind != VfsErrorKind::NotEmpty => return DirOutcome::Failed(e.into()),
         Err(_) => {}
     }
-    // Non-empty: see what is left inside
+    // Non-empty: walk what is left (engine-side DFS, one read_dir per directory).
+    // Regular files decide deletability, exactly as the walkdir lane did; symlinks and
+    // directories go along with the tree when it is removed.
     let mut sample = Vec::new();
     let mut all_deletable = true;
     let mut count = 0usize;
-    for e in walkdir::WalkDir::new(dst).follow_links(false).min_depth(1).into_iter().flatten() {
-        if !e.file_type().is_file() {
-            continue;
-        }
-        count += 1;
-        let child_rel = format!(
-            "{}/{}",
-            rel.trim_end_matches('/'),
-            // fall back to the whole path if strip_prefix fails, as before
-            crate::foundation::path::to_rel(e.path(), dst)
-                .unwrap_or_else(|| e.path().to_string_lossy().replace('\\', "/"))
-        );
-        let deletable = filter.map(|f| f.is_deletable(&child_rel)).unwrap_or(false);
-        if !deletable {
-            all_deletable = false;
-        }
-        if sample.len() < 5 {
-            sample.push(child_rel);
-        }
-    }
-    if count == 0 {
-        // Only subdirectories left: recursively remove the empty directory tree
-        return match std::fs::remove_dir_all(dst) {
-            Ok(_) => DirOutcome::Removed,
-            Err(e) => DirOutcome::Failed(e),
+    let mut files: Vec<String> = Vec::new();
+    let mut dirs: Vec<String> = Vec::new();
+    let mut stack = vec![rel.to_string()];
+    while let Some(d) = stack.pop() {
+        let list = match exec.read_dir(&d) {
+            Ok(l) => l,
+            Err(e) if e.kind == VfsErrorKind::NotFound => continue,
+            Err(e) => return DirOutcome::Failed(e.into()),
         };
+        for e in list {
+            let child_rel = format!("{}/{}", d.trim_end_matches('/'), e.name);
+            match e.meta.kind {
+                EntryKind::Dir => {
+                    dirs.push(child_rel.clone());
+                    stack.push(child_rel);
+                }
+                EntryKind::File => {
+                    count += 1;
+                    let deletable = filter.map(|f| f.is_deletable(&child_rel)).unwrap_or(false);
+                    if !deletable {
+                        all_deletable = false;
+                    }
+                    if sample.len() < 5 {
+                        sample.push(child_rel.clone());
+                    }
+                    files.push(child_rel);
+                }
+                EntryKind::Symlink => files.push(child_rel),
+            }
+        }
     }
-    if all_deletable {
-        // Everything left is a `(?d)` deletable item / atomic-write debris → remove it along with the directory (same semantics as syncthing)
-        return match std::fs::remove_dir_all(dst) {
-            Ok(_) => DirOutcome::Removed,
-            Err(e) => DirOutcome::Failed(e),
-        };
+    if count > 0 && !all_deletable {
+        return DirOutcome::NotEmpty { sample };
     }
-    DirOutcome::NotEmpty { sample }
+    // Only deletable leftovers / only subdirectories: remove the tree, deepest first
+    for f in &files {
+        if let Err(e) = exec.remove_file(f) {
+            if e.kind != VfsErrorKind::NotFound {
+                return DirOutcome::Failed(e.into());
+            }
+        }
+    }
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
+    for d in &dirs {
+        if let Err(e) = exec.remove_dir(d) {
+            if e.kind != VfsErrorKind::NotFound {
+                return DirOutcome::Failed(e.into());
+            }
+        }
+    }
+    match exec.remove_dir(rel) {
+        Ok(_) => DirOutcome::Removed,
+        Err(e) if e.kind == VfsErrorKind::NotFound => DirOutcome::Removed,
+        Err(e) => DirOutcome::Failed(e.into()),
+    }
 }
 
 /// Delta update (P1-1 step B, opt-in).
@@ -237,16 +250,56 @@ fn update_with_delta(
 struct Shared<'a> {
     opt: &'a ApplyOptions,
     ctx: &'a RunCtx,
-    source_root: &'a Path,
-    target_root: &'a Path,
+    source: &'a std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    target: &'a std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    /// The local escape hatches, precomputed: Some = this side is a real directory and
+    /// the path-based machinery (delta, VersionWriter, OS trash, walkdir) applies.
+    source_local: Option<PathBuf>,
+    target_local: Option<PathBuf>,
     trash: PathBuf,
+    /// The in-root retention area for remote sides: `.syncdash/trash/<run_ms>` under
+    /// the executing root — originals move there by RENAME on the far side, nothing
+    /// is downloaded. Named in the preflight report before it is ever used.
+    remote_keep_rel: String,
     ver_source: Mutex<Option<crate::store::version::VersionWriter>>,
     ver_target: Mutex<Option<crate::store::version::VersionWriter>>,
+    /// Directories already ensured on each side this run (spares one round-trip per file on remote roots)
+    mkdir_memo: Mutex<std::collections::HashSet<(bool, String)>>,
     // P1-4: when the mtime the filesystem actually stored differs from the one we wanted (FAT's 2-second
     // granularity, truncation by some SMB servers), record (ondisk, intended) for the next scan to convert with,
     // instead of brute-forcing it with a ±2s tolerance. Same approach as syncthing's mtimeFS.
     mtime_fixes: Mutex<Vec<(bool, String, i64, i64)>>,
     delta_saved: AtomicU64,
+}
+
+impl<'a> Shared<'a> {
+    fn exec_other(&self, side: &Side) -> (&std::sync::Arc<dyn crate::fs::vfs::Vfs>, &std::sync::Arc<dyn crate::fs::vfs::Vfs>) {
+        match side {
+            Side::Target => (self.target, self.source),
+            Side::Source => (self.source, self.target),
+        }
+    }
+
+    fn local_of(&self, side: &Side) -> Option<&Path> {
+        match side {
+            Side::Target => self.target_local.as_deref(),
+            Side::Source => self.source_local.as_deref(),
+        }
+    }
+
+    /// Ensure a directory exists on `exec`, memoized per (side, rel).
+    fn ensure_dir(&self, side: &Side, exec: &std::sync::Arc<dyn crate::fs::vfs::Vfs>, rel: &str) -> std::io::Result<()> {
+        if rel.is_empty() {
+            return Ok(());
+        }
+        let key = (*side == Side::Source, rel.to_string());
+        if self.mkdir_memo.lock().unwrap().contains(&key) {
+            return Ok(());
+        }
+        exec.mkdir_all(rel)?;
+        self.mkdir_memo.lock().unwrap().insert(key);
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -256,114 +309,205 @@ struct Counters {
     errors: AtomicU64,
 }
 
-/// Archive the original before it is overwritten/deleted (trash or .version_syncDash)
-fn preserve(sh: &Shared, op: &Op, exec_root: &Path, dst: &Path, why: &str, newer: Option<&Path>) -> std::io::Result<()> {
-    if sh.opt.versioning {
-        let slot = if op.side == Side::Source { &sh.ver_source } else { &sh.ver_target };
-        let mut w = slot.lock().unwrap();
-        if w.is_none() {
-            *w = Some(crate::store::version::VersionWriter::begin(exec_root)?);
+/// Archive the original before it is overwritten/deleted (trash or .version_syncDash).
+/// Local sides keep the whole path-based machinery (OS trash / rdelta version store);
+/// a remote side renames the original into the in-root retention area instead —
+/// exactly what the preflight NeedsAck line promised, and never a download.
+fn preserve(
+    sh: &Shared,
+    op: &Op,
+    exec: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    why: &str,
+    newer: Option<&Path>,
+) -> std::io::Result<()> {
+    if let Some(root) = sh.local_of(&op.side) {
+        let dst = join_native(root, &op.path);
+        if sh.opt.versioning {
+            let slot = if op.side == Side::Source { &sh.ver_source } else { &sh.ver_target };
+            let mut w = slot.lock().unwrap();
+            if w.is_none() {
+                *w = Some(crate::store::version::VersionWriter::begin(root)?);
+            }
+            return w.as_mut().unwrap().preserve(&op.path, &dst, newer, why);
         }
-        w.as_mut().unwrap().preserve(&op.path, dst, newer, why)
-    } else {
-        move_to_trash(dst, &op.path, &sh.trash)
+        return move_to_trash(&dst, &op.path, &sh.trash);
     }
+    // Remote side: rename into <root>/.syncdash/trash/<run_ms>/<rel>
+    let keep_rel = format!("{}/{}", sh.remote_keep_rel, op.path);
+    if let Some(parent) = crate::foundation::path::parent(&keep_rel) {
+        sh.ensure_dir(&op.side, exec, parent)?;
+    }
+    exec.rename(&op.path, &keep_rel)?;
+    Ok(())
 }
 
-/// Execute a single op. Cancel/pause are honoured at chunk boundaries via `pp.checkpoint()`;
-/// a cancel returns Interrupted, and Staged::Drop guarantees no debris at the destination.
+/// Execute a single op through the VFS pair. Cancel/pause are honoured at chunk
+/// boundaries via `pp.checkpoint()`; a cancel returns Interrupted, and the staged
+/// write's Drop contract guarantees no debris at the destination on either backend.
 fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
-    let (exec_root, other_root) = match op.side {
-        Side::Target => (sh.target_root, sh.source_root),
-        Side::Source => (sh.source_root, sh.target_root),
-    };
-    let dst = join_native(exec_root, &op.path);
+    use crate::fs::vfs::WriteHint;
+    let (exec, other) = sh.exec_other(&op.side);
     match op.action {
         Action::Copy | Action::Update => {
-            if let Some(p) = dst.parent() {
-                std::fs::create_dir_all(p)?;
+            if let Some(parent) = crate::foundation::path::parent(&op.path) {
+                sh.ensure_dir(&op.side, exec, parent)?;
             }
             // symlink op: create the link itself, don't copy content (a link is metadata; atomic writes don't apply)
             if let Some(target) = &op.link {
-                if exists_no_follow(&dst) {
-                    preserve(sh, op, exec_root, &dst, "overwritten", None)?;
+                if exec.stat(&op.path)?.is_some() {
+                    preserve(sh, op, exec, "overwritten", None)?;
                 }
-                return create_symlink(target, &dst);
+                return Ok(exec.make_symlink(&op.path, target)?);
             }
-            let src = join_native(other_root, &op.path);
 
-            // atomic write (P0-1)
-            let mut staged = crate::fs::staged::Staged::create(&dst)?;
-            let mut used_delta = false;
-            // The expected value for post-copy verification = **the full blake3 of this copy stream** (the copy reads
-            // the whole file anyway, so hashing on the stream is free). Not op.hash — scan evidence may be only a sampled
-            // digest (`~` prefix), whereas the correctness of the write path must hold over the entire file.
-            let mut expect_hash: Option<String> = None;
-            if sh.opt.delta && op.action == Action::Update && exists_no_follow(&dst) {
-                if let Some((written, total, h)) = update_with_delta(&src, &dst, &mut staged)? {
-                    sh.delta_saved.fetch_add(total.saturating_sub(written), Ordering::Relaxed);
-                    // Progress is booked as "this file is done" (same basis as bytes_total); the bytes saved are reported separately
-                    pp.add_bytes(total, &op.path);
-                    expect_hash = Some(h);
-                    used_delta = true;
-                }
-            }
-            if !used_delta {
-                if sh.opt.verify {
-                    let mut hasher = blake3::Hasher::new();
-                    staged.copy_from(&src, &mut |chunk| {
-                        hasher.update(chunk);
-                        pp.add_bytes(chunk.len() as u64, &op.path);
-                        pp.checkpoint()
-                    })?;
-                    expect_hash = Some(hasher.finalize().to_hex().to_string());
-                } else {
-                    staged.copy_from(&src, &mut |chunk| {
-                        pp.add_bytes(chunk.len() as u64, &op.path);
-                        pp.checkpoint()
-                    })?;
-                }
-            }
-            staged.seal(sh.opt.fsync)?;
-
-            // Verification runs on the temp file: readback from disk vs the copy stream — a failure never becomes the final file
-            if sh.opt.verify {
-                if let Some(expect) = &expect_hash {
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update_mmap_rayon(staged.path())?;
-                    let got = hasher.finalize().to_hex().to_string();
-                    if &got != expect {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("write verify failed: staged readback {got} != copy stream {expect}"),
-                        ));
+            // Delta stays a both-local affair — it reads old and new into memory and
+            // patches with write_at. Preflight already disabled it otherwise; this gate
+            // is the belt to that braces.
+            let exec_local = sh.local_of(&op.side);
+            let other_local = sh.local_of(match op.side {
+                Side::Target => &Side::Source,
+                Side::Source => &Side::Target,
+            });
+            if sh.opt.delta && op.action == Action::Update {
+                if let (Some(eroot), Some(oroot)) = (exec_local, other_local) {
+                    let dst = join_native(eroot, &op.path);
+                    let src = join_native(oroot, &op.path);
+                    if exists_no_follow(&dst) {
+                        let mut staged = crate::fs::staged::Staged::create(&dst)?;
+                        if let Some((written, total, h)) = update_with_delta(&src, &dst, &mut staged)? {
+                            sh.delta_saved.fetch_add(total.saturating_sub(written), Ordering::Relaxed);
+                            pp.add_bytes(total, &op.path);
+                            staged.seal(sh.opt.fsync)?;
+                            if sh.opt.verify {
+                                let mut hasher = blake3::Hasher::new();
+                                hasher.update_mmap_rayon(staged.path())?;
+                                let got = hasher.finalize().to_hex().to_string();
+                                if got != h {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!("write verify failed: staged readback {got} != copy stream {h}"),
+                                    ));
+                                }
+                            }
+                            let intended = match op.mtime_ms {
+                                Some(mt) => {
+                                    set_mtime(staged.path(), mt);
+                                    Some(mt)
+                                }
+                                None => read_mtime_ms(&src).inspect(|mt| set_mtime(staged.path(), *mt)),
+                            };
+                            if let Some(m) = op.mode {
+                                set_mode(staged.path(), m)?;
+                            }
+                            if exists_no_follow(&dst) {
+                                preserve(sh, op, exec, "overwritten", Some(&src))?;
+                            }
+                            staged.commit()?;
+                            if let Some(want) = intended {
+                                if let Some(got) = read_mtime_ms(&dst) {
+                                    if got != want {
+                                        sh.mtime_fixes.lock().unwrap().push((op.side == Side::Source, op.path.clone(), got, want));
+                                    }
+                                }
+                            }
+                            return Ok(());
+                        }
+                        // Not delta-eligible (size caps): the staged handle drops clean, generic lane below
                     }
                 }
             }
-            // mtime / mode are set on the temp file too, so the rename lands it already in its final state
-            let intended = match op.mtime_ms {
-                Some(mt) => {
-                    set_mtime(staged.path(), mt);
-                    Some(mt)
-                }
-                None => read_mtime_ms(&src).inspect(|mt| set_mtime(staged.path(), *mt)),
-            };
-            if let Some(m) = op.mode {
-                set_mode(staged.path(), m)?;
-            }
-            // Archive the old file at the last moment before commit, so the window is a single rename
-            if exists_no_follow(&dst) {
-                preserve(sh, op, exec_root, &dst, "overwritten", Some(&src))?;
-            }
-            staged.commit()?;
 
-            // mtime readback correction (P1-4)
+            // The generic lane: stream from `other`, stage on `exec`, rename into place.
+            // The expected value for post-copy verification = **the full blake3 of this
+            // copy stream** — not op.hash, which may be only a sampled `~` digest.
+            let intended = match op.mtime_ms {
+                Some(mt) => Some(mt),
+                None => other.stat(&op.path).ok().flatten().map(|m| m.mtime_ms),
+            };
+            let hint = WriteHint { size_hint: op.size, mtime_ms: intended, mode: op.mode };
+            let mut w = exec.open_write(&op.path, &hint)?;
+            let mut src_stream = other.open_read(&op.path)?;
+            let block = src_stream.block_size().max(w.block_size()).clamp(64 * 1024, 8 * 1024 * 1024);
+            let mut buf = vec![0u8; block];
+            let mut hasher = if sh.opt.verify { Some(blake3::Hasher::new()) } else { None };
+            let mut copied = 0u64;
+            loop {
+                pp.checkpoint()?;
+                let n = std::io::Read::read(&mut src_stream, &mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                w.write(&buf[..n])?;
+                if let Some(h) = hasher.as_mut() {
+                    h.update(&buf[..n]);
+                }
+                copied += n as u64;
+                pp.add_bytes(n as u64, &op.path);
+            }
+            w.seal(sh.opt.fsync)?;
+
+            // Length reconciliation (FFS's finalize check — it has caught corrupt
+            // transfers in the wild): what the backend holds must equal what we sent
+            let staged_len = w.staged_len()?;
+            if staged_len != copied {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("staged file holds {staged_len} bytes but the copy stream carried {copied}"),
+                ));
+            }
+
+            // Verification runs on the staged file: readback vs the copy stream — a failure never becomes the final file
+            if let Some(h) = hasher {
+                let expect = h.finalize().to_hex().to_string();
+                let got = if let Some(p) = w.local_path() {
+                    let mut hh = blake3::Hasher::new();
+                    hh.update_mmap_rayon(p)?;
+                    hh.finalize().to_hex().to_string()
+                } else {
+                    let mut rs = w.open_staged_read()?;
+                    let mut hh = blake3::Hasher::new();
+                    let mut b2 = vec![0u8; block];
+                    loop {
+                        pp.checkpoint()?;
+                        let n = std::io::Read::read(&mut rs, &mut b2)?;
+                        if n == 0 {
+                            break;
+                        }
+                        hh.update(&b2[..n]);
+                    }
+                    hh.finalize().to_hex().to_string()
+                };
+                if got != expect {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("write verify failed: staged readback {got} != copy stream {expect}"),
+                    ));
+                }
+            }
+
+            // Archive the old file at the last moment before commit, so the window is a single rename
+            if exec.stat(&op.path)?.is_some() {
+                let newer = other_local.map(|r| join_native(r, &op.path));
+                preserve(sh, op, exec, "overwritten", newer.as_deref())?;
+            }
+            let report = w.commit()?;
+
+            // mtime bookkeeping (P1-4): the backend reports what actually landed
             if let Some(want) = intended {
-                if let Some(got) = read_mtime_ms(&dst) {
+                if let Some(got) = report.mtime_ondisk_ms {
                     if got != want {
                         sh.mtime_fixes.lock().unwrap().push((op.side == Side::Source, op.path.clone(), got, want));
                     }
                 }
+                if let Some(e) = report.mtime_error {
+                    // Not a copy failure (FFS's errorModTime lesson) — but never silent either
+                    pp.error(&op.path, "set_mtime", if op.side == Side::Target { "target" } else { "source" },
+                        &format!("mtime could not be set ({e}); comparison will lean on size/content for this file"));
+                }
+            }
+            if let Some(e) = report.mode_error {
+                pp.error(&op.path, "chmod", if op.side == Side::Target { "target" } else { "source" },
+                    &format!("permissions could not be set ({e})"));
             }
             Ok(())
         }
@@ -371,39 +515,52 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
             let m = op.mode.ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "chmod op without mode")
             })?;
-            set_mode(&dst, m)
+            // A plan carrying modes only arises unix↔unix; an executing side without
+            // unix modes (Windows) skips, exactly as the path lane always did
+            if exec.caps().unix_mode != crate::fs::vfs::Support::Yes {
+                return Ok(());
+            }
+            Ok(exec.set_mode(&op.path, m)?)
         }
         Action::Move => {
-            let from = join_native(exec_root, op.from.as_deref().unwrap_or_default());
-            if let Some(p) = dst.parent() {
-                std::fs::create_dir_all(p)?;
+            let from = op.from.as_deref().unwrap_or_default();
+            if let Some(parent) = crate::foundation::path::parent(&op.path) {
+                sh.ensure_dir(&op.side, exec, parent)?;
             }
-            match std::fs::rename(&from, &dst) {
+            match exec.rename(from, &op.path) {
                 Ok(_) => Ok(()),
                 Err(_) => {
-                    // Cross-volume fallback: still an atomic write, so an interruption leaves nothing half-done.
-                    // Move's bytes are not part of bytes_total, so only hook the checkpoint here, don't count bytes.
-                    let mut staged = crate::fs::staged::Staged::create(&dst)?;
-                    staged.copy_from(&from, &mut |_| pp.checkpoint())?;
-                    staged.seal(sh.opt.fsync)?;
-                    if let Some(mt) = read_mtime_ms(&from) {
-                        set_mtime(staged.path(), mt);
+                    // Cross-volume fallback: copy within the same root, still atomic.
+                    // Move's bytes are not part of bytes_total, so only the checkpoint hooks in.
+                    let intended = exec.stat(from).ok().flatten().map(|m| m.mtime_ms);
+                    let hint = WriteHint { size_hint: None, mtime_ms: intended, mode: None };
+                    let mut w = exec.open_write(&op.path, &hint)?;
+                    let mut rs = exec.open_read(from)?;
+                    let mut buf = vec![0u8; rs.block_size().clamp(64 * 1024, 8 * 1024 * 1024)];
+                    loop {
+                        pp.checkpoint()?;
+                        let n = std::io::Read::read(&mut rs, &mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        w.write(&buf[..n])?;
                     }
-                    staged.commit()?;
-                    std::fs::remove_file(&from)
+                    w.seal(sh.opt.fsync)?;
+                    let _ = w.commit()?;
+                    Ok(exec.remove_file(from)?)
                 }
             }
         }
         Action::Delete => {
-            // symlink_metadata: exists() falsely reports false for a broken symlink, so don't follow here
-            if exists_no_follow(&dst) {
-                preserve(sh, op, exec_root, &dst, "deleted", None)?;
+            // stat is lstat: a broken symlink still reports present, so it still gets preserved
+            if exec.stat(&op.path)?.is_some() {
+                preserve(sh, op, exec, "deleted", None)?;
             }
             Ok(())
         }
         Action::DeleteDir => {
             // P0-4: report by classification, no longer swallowed silently
-            match try_delete_dir(&dst, &op.path, sh.opt.filter.as_ref()) {
+            match try_delete_dir_vfs(exec, &op.path, sh.opt.filter.as_ref()) {
                 DirOutcome::Removed | DirOutcome::Absent => Ok(()),
                 DirOutcome::NotEmpty { sample } => Err(std::io::Error::new(
                     std::io::ErrorKind::DirectoryNotEmpty,
@@ -520,14 +677,32 @@ pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOpti
     apply_with(ops, source_root, target_root, opt, &RunCtx::null()).into_tuple()
 }
 
-/// v0.9 M1: the execution body with progress/cancel/pause. Five serial phases:
-/// Moves → **Copy/Update (parallel)** → Chmod → Delete → DeleteDir (deepest-first within the class).
-/// Updates with delta enabled stay in the serial lane — update_with_delta reads both the old and the new copy into memory (≤1GB cap),
-/// and 4 parallel workers × a 2GB peak is not acceptable.
+/// The path-shaped entry: wraps both roots in LocalVfs and runs the one generic lane.
+/// Kept so every existing caller (and test) works unchanged — local behaviour through
+/// the VFS lane is pinned by the whole apply test suite passing as-is.
 pub fn apply_with(
     ops: &[Op],
     source_root: &Path,
     target_root: &Path,
+    opt: &ApplyOptions,
+    ctx: &RunCtx,
+) -> ApplyOutcome {
+    let sv: std::sync::Arc<dyn crate::fs::vfs::Vfs> =
+        std::sync::Arc::new(crate::fs::vfs::local::LocalVfs::new(source_root.to_path_buf()));
+    let tv: std::sync::Arc<dyn crate::fs::vfs::Vfs> =
+        std::sync::Arc::new(crate::fs::vfs::local::LocalVfs::new(target_root.to_path_buf()));
+    apply_vfs(ops, &sv, &tv, opt, ctx)
+}
+
+/// v0.9 M1 → v0.10 VFS: the execution body with progress/cancel/pause, now over a
+/// backend pair. Five serial phases: Moves → **Copy/Update (parallel)** → Chmod →
+/// Delete → DeleteDir (deepest-first within the class). Updates with delta enabled
+/// stay in the serial lane — update_with_delta reads both copies into memory (≤1GB cap),
+/// and 4 parallel workers × a 2GB peak is not acceptable.
+pub fn apply_vfs(
+    ops: &[Op],
+    source: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    target: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     opt: &ApplyOptions,
     ctx: &RunCtx,
 ) -> ApplyOutcome {
@@ -578,17 +753,29 @@ pub fn apply_with(
         };
     }
 
+    let source_local = source.as_local().map(|p| p.to_path_buf());
+    let target_local = target.as_local().map(|p| p.to_path_buf());
+
     // The FFS dir_lock idea: lock both roots (with a heartbeat) before touching anything, so two machines cannot apply to the same directory at once.
     // Pause spins on 100ms instead of suspending and returning precisely so these two locks' heartbeat threads keep beating while paused.
+    let lock_root = |local: &Option<PathBuf>, v: &std::sync::Arc<dyn crate::fs::vfs::Vfs>| -> std::io::Result<crate::fs::lock::RootLock> {
+        match local {
+            Some(p) => crate::fs::lock::RootLock::acquire(p),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("root lock on '{}' needs the VFS lock lane (landing with the sftp write half)", v.display()),
+            )),
+        }
+    };
     let _lock_guard: (crate::fs::lock::RootLock, crate::fs::lock::RootLock) = {
-        let ls = match crate::fs::lock::RootLock::acquire(source_root) {
+        let ls = match lock_root(&source_local, source) {
             Ok(l) => l,
             Err(e) => {
                 crate::log_error!("apply", "cannot lock source root: {e}");
                 return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
             }
         };
-        let lt = match crate::fs::lock::RootLock::acquire(target_root) {
+        let lt = match lock_root(&target_local, target) {
             Ok(l) => l,
             Err(e) => {
                 crate::log_error!("apply", "cannot lock target root: {e}");
@@ -601,11 +788,19 @@ pub fn apply_with(
     let sh = Shared {
         opt,
         ctx,
-        source_root,
-        target_root,
+        source,
+        target,
+        source_local,
+        target_local,
         trash: opt.trash.clone().unwrap_or_else(default_trash),
+        remote_keep_rel: format!(
+            "{}/trash/{}",
+            crate::foundation::names::APP_DIR,
+            crate::foundation::time::now_ms()
+        ),
         ver_source: Mutex::new(None),
         ver_target: Mutex::new(None),
+        mkdir_memo: Mutex::new(std::collections::HashSet::new()),
         mtime_fixes: Mutex::new(Vec::new()),
         delta_saved: AtomicU64::new(0),
     };
@@ -660,32 +855,43 @@ pub fn apply_with(
                 tgt_fix.push((rel, ondisk, intended));
             }
         }
+        // Keyed by identity(): a local root's identity is its path string, so the
+        // pre-VFS correction files keep working; a remote root gets its own table
         if !src_fix.is_empty() {
-            crate::pipeline::scan::record_mtime_fixes(source_root, &src_fix);
+            crate::pipeline::scan::record_mtime_fixes_by_key(&sh.source.identity(), &src_fix);
         }
         if !tgt_fix.is_empty() {
-            crate::pipeline::scan::record_mtime_fixes(target_root, &tgt_fix);
+            crate::pipeline::scan::record_mtime_fixes_by_key(&sh.target.identity(), &tgt_fix);
         }
     }
     let delta_saved = sh.delta_saved.load(Ordering::Relaxed);
     if delta_saved > 0 {
         println!("delta: {} not re-written", crate::foundation::fmt::human_bytes(delta_saved));
     }
+    let any_remote_side = sh.source_local.is_none() || sh.target_local.is_none();
+    let (src_local_path, tgt_local_path) = (sh.source_local.clone(), sh.target_local.clone());
     if let Some(w) = sh.ver_source.into_inner().unwrap() {
         let side_ops: Vec<Op> = ops.iter().filter(|o| o.side == Side::Source).cloned().collect();
         if let Ok(Some(id)) = w.finish(&side_ops) {
-            println!("version saved: {} (id {id})", source_root.join(crate::foundation::names::VERSION_STORE_DIR).display());
+            if let Some(root) = &src_local_path {
+                println!("version saved: {} (id {id})", root.join(crate::foundation::names::VERSION_STORE_DIR).display());
+            }
         }
     }
     if let Some(w) = sh.ver_target.into_inner().unwrap() {
         let side_ops: Vec<Op> = ops.iter().filter(|o| o.side == Side::Target).cloned().collect();
         if let Ok(Some(id)) = w.finish(&side_ops) {
-            println!("version saved: {} (id {id})", target_root.join(crate::foundation::names::VERSION_STORE_DIR).display());
+            if let Some(root) = &tgt_local_path {
+                println!("version saved: {} (id {id})", root.join(crate::foundation::names::VERSION_STORE_DIR).display());
+            }
         }
     }
     let done = acc.done.load(Ordering::Relaxed);
     if !opt.versioning && done > 0 {
         println!("trash (deleted/overwritten files kept at): {}", sh.trash.display());
+    }
+    if done > 0 && any_remote_side {
+        println!("remote retention (originals renamed on the far side): <root>/{}", sh.remote_keep_rel);
     }
     ApplyOutcome {
         done,

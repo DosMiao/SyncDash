@@ -133,10 +133,6 @@ fn mtime_fix_file_for_key(key: &str) -> PathBuf {
     cache_dir().join(format!("{}.mtimefix.jsonl", &k.to_hex()[..16]))
 }
 
-fn mtime_fix_file_for_root(root: &Path) -> PathBuf {
-    mtime_fix_file_for_key(&root.to_string_lossy())
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MtimeFix {
     path: String,
@@ -163,15 +159,19 @@ pub fn load_mtime_fixes_by_key(key: &str) -> HashMap<String, (i64, i64)> {
 
 /// Record a batch of corrections. For a repeated path the newest one wins (on read, later lines overwrite earlier ones).
 pub fn record_mtime_fixes(root: &Path, fixes: &[(String, i64, i64)]) {
+    record_mtime_fixes_by_key(&root.to_string_lossy(), fixes)
+}
+
+pub fn record_mtime_fixes_by_key(key: &str, fixes: &[(String, i64, i64)]) {
     if fixes.is_empty() {
         return;
     }
-    let file = mtime_fix_file_for_root(root);
+    let file = mtime_fix_file_for_key(key);
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     // Merge, then rewrite wholesale: avoids appending forever
-    let mut map = load_mtime_fixes(root);
+    let mut map = load_mtime_fixes_by_key(key);
     for (p, ondisk, intended) in fixes {
         map.insert(p.clone(), (*ondisk, *intended));
     }

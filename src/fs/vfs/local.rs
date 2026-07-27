@@ -305,9 +305,12 @@ impl Vfs for LocalVfs {
         }
         #[cfg(windows)]
         {
-            // Needs developer mode or a privilege; when it fails, the error says so
+            // File link first, directory link as the fallback (the target may be a dir).
+            // Needs developer mode or a privilege; when both fail, the error says so
             // and preflight's Unknown-capability listing already warned.
-            Ok(std::os::windows::fs::symlink_file(target, self.abs(rel))?)
+            let dst = self.abs(rel);
+            Ok(std::os::windows::fs::symlink_file(target, &dst)
+                .or_else(|_| std::os::windows::fs::symlink_dir(target, &dst))?)
         }
     }
 
