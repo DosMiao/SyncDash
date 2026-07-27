@@ -76,6 +76,12 @@ enum Cmd {
     },
     /// Open the graphical interface (the Tauri desktop app; the old egui UI was retired in v0.9)
     Gui,
+    /// Print the junk exclude presets and the exact patterns each one contributes to a job's `exclude`
+    Junk {
+        /// Emit just the patterns of the given presets, one per line — pasteable straight into a job's exclude
+        #[arg(long, value_delimiter = ',')]
+        patterns: Option<Vec<String>>,
+    },
     /// Scan a directory and produce a snapshot table (JSONL, stdout by default — friendly to ssh pipes)
     Scan {
         root: PathBuf,
@@ -103,12 +109,10 @@ enum Cmd {
         /// Record the symlink itself (its target string); symlinks are ignored by default
         #[arg(long)]
         symlinks_direct: bool,
-        /// OS-junk exclude preset: auto (Win+Mac, the default) | windows | mac | off
-        #[arg(long, default_value = "auto")]
-        os_excludes: String,
-        /// Exclude dev artifacts (.git/node_modules/target…). Off by default — .git is a normal tree too
-        #[arg(long)]
-        dev_excludes: bool,
+        /// Junk presets to apply, comma-separated (`syncdash junk` lists them). `none` applies no preset —
+        /// what a job passes, since a job's own `exclude` already spells its junk rules out in full
+        #[arg(long, default_value = "windows,macos", value_delimiter = ',')]
+        junk: Vec<String>,
         /// Extra excludes (FFS filter syntax, e.g. */big_temp/ or */*.log; repeatable)
         #[arg(long)]
         exclude: Vec<String>,
@@ -158,6 +162,17 @@ enum Cmd {
         /// Path to the remote syncdash (defaults to assuming it is on PATH)
         #[arg(long)]
         remote_exe: Option<String>,
+        /// Junk presets to seed each job's `exclude` with, comma-separated (`syncdash junk` lists them;
+        /// `none` seeds nothing). The patterns are written into the job file in full — nothing is applied
+        /// on top of what the file says. Defaults to windows,macos,dev: a .ffs-sync marker means a git-kept
+        /// code tree, and two-way syncing .git corrupts the repository
+        #[arg(long, default_value = "windows,macos,dev", value_delimiter = ',')]
+        junk: Vec<String>,
+        /// Overwrite existing cs-*.toml jobs, discarding edits made to them. Off by default: a generated
+        /// job belongs to whoever edited it, and silently restoring a filter they deleted can stop data
+        /// being backed up without anyone being told
+        #[arg(long)]
+        force: bool,
     },
     /// Receive a file on stdin and write it to path (used to ship remote packages: this runs over ssh on the far side, binary-safe on both platforms)
     Recv {
@@ -635,11 +650,46 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             Ok(if tot.2 > 0 { 1 } else { 0 })
         }
         Cmd::Gui => launch_desktop(),
-        Cmd::Scan { root, out, no_hash, rigor, evidence, cache, force_rehash, fast, symlinks_direct, os_excludes, dev_excludes, exclude, progress } => {
+        Cmd::Junk { patterns } => {
+            match patterns {
+                Some(ids) => {
+                    let ids: Vec<&str> = ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                    if let Some(bad) = ids.iter().find(|id| filter::junk_preset(id).is_none()) {
+                        eprintln!("error: unknown junk preset '{bad}' — run `syncdash junk` for the list");
+                        return Ok(2);
+                    }
+                    for p in filter::expand_junk_presets(&ids) {
+                        println!("{p}");
+                    }
+                }
+                None => {
+                    println!("Junk presets — each one is a macro over a job's `exclude` list, nothing more:\n");
+                    for p in filter::JUNK_PRESETS {
+                        println!("{}{}  ({})", p.id, if p.default_on { " [on for new jobs]" } else { "" }, p.label);
+                        println!("  {}", p.hint);
+                        println!("  {}\n", p.patterns.join("  "));
+                    }
+                    println!("Apply ad hoc:  syncdash scan <root> --junk windows,macos,dev");
+                    println!("Paste into a job: syncdash junk --patterns dev");
+                }
+            }
+            Ok(0)
+        }
+        Cmd::Scan { root, out, no_hash, rigor, evidence, cache, force_rehash, fast, symlinks_direct, junk, exclude, progress } => {
             if !root.is_dir() {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
             }
+            // An unknown preset id is an error, never a silent no-op: a scan that quietly excluded less
+            // than asked is exactly the kind of near-miss that only shows up as a surprise in a plan
+            let ids: Vec<&str> = junk.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none")).collect();
+            if let Some(bad) = ids.iter().find(|id| filter::junk_preset(id).is_none()) {
+                let known: Vec<&str> = filter::JUNK_PRESETS.iter().map(|p| p.id).collect();
+                eprintln!("error: unknown junk preset '{bad}' (known: {}, or `none`)", known.join(", "));
+                return Ok(2);
+            }
+            let mut excludes = filter::expand_junk_presets(&ids);
+            excludes.extend(exclude.iter().cloned());
             // preset lays the base → detail overrides → legacy-flag compatibility overrides
             let (mut hash, mut sampled, mut use_cache) = match rigor.as_str() {
                 "quick" => (false, false, false),
@@ -661,7 +711,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             if no_hash { hash = false; }
             if fast { sampled = true; use_cache = true; }
             if force_rehash { use_cache = false; }
-            let sopt = scan::ScanOptions { hash, sampled, use_cache, symlinks_direct, filter: filter::PathFilter::build_full_opt(&[], &exclude, &[], &os_excludes, dev_excludes) };
+            let sopt = scan::ScanOptions { hash, sampled, use_cache, symlinks_direct, filter: filter::PathFilter::build(&[], &excludes) };
             let bar = |p: scan::ScanProgress| {
                 let pct = if p.bytes_total > 0 { p.bytes_done * 100 / p.bytes_total } else { 100 };
                 eprint!("\r{} {:>3}%  {}/{}  {:.1} MiB/s   ", p.phase, pct,
@@ -714,17 +764,41 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::GenJobs { root, target_root, mode, rigor, remote_host, remote_root_base, remote_exe } => {
+        Cmd::GenJobs { root, target_root, mode, rigor, remote_host, remote_root_base, remote_exe, junk, force } => {
             let remote = remote_host.map(|h| territory::RemoteGen {
                 host: h,
                 root_base: remote_root_base.unwrap_or_default(),
                 exe: remote_exe,
             });
-            let outs = territory::gen_jobs(&root, &target_root, &mode, &rigor, remote.as_ref())?;
-            for o in &outs {
-                println!("{:<44} <- {}", o.name, o.territory);
+            // An unknown preset id is refused rather than dropped: a job seeded with fewer rules than
+            // asked for is a filter that isn't what it says it is, and it would only surface as a surprise
+            let ids: Vec<String> = junk
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+                .collect();
+            if let Some(bad) = ids.iter().find(|id| filter::junk_preset(id).is_none()) {
+                let known: Vec<&str> = filter::JUNK_PRESETS.iter().map(|p| p.id).collect();
+                eprintln!("error: unknown junk preset '{bad}' (known: {}, or `none`)", known.join(", "));
+                return Ok(2);
             }
-            println!("{} job(s) written to {}", outs.len(), syncdash::foundation::dirs::jobs_dir().display());
+            let n_pat = filter::expand_junk_presets(&ids).len();
+            let opts = territory::GenOpts { mode, rigor, junk: ids.clone(), force, ..Default::default() };
+            let outs = territory::gen_jobs(&root, &target_root, &opts, remote.as_ref())?;
+            for o in &outs {
+                println!("{:<44} <- {}{}", o.name, o.territory, if o.written { "" } else { "   [kept — already exists]" });
+            }
+            let written = outs.iter().filter(|o| o.written).count();
+            let kept = outs.len() - written;
+            // State the seed rather than leaving it to be discovered: these lines are the job's entire filter
+            println!(
+                "{written} job(s) written to {} — each seeded with junk presets [{}] = {n_pat} exclude line(s), all listed in the file",
+                syncdash::foundation::dirs::jobs_dir().display(),
+                if ids.is_empty() { "none".into() } else { ids.join(", ") },
+            );
+            if kept > 0 {
+                println!("{kept} existing job(s) left untouched (their exclude lists may have been edited) — pass --force to reseed them");
+            }
             Ok(0)
         }
         Cmd::Pack { plan, out, source_root } => {
