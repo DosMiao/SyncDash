@@ -34,6 +34,8 @@ struct JobDto {
     exclude: Vec<String>,
     watch_interval_secs: Option<u64>,
     watch_auto_apply: bool,
+    /// 1:N：生效的 target 列表（单 target 任务 = 一项）。>1 时前端显示 target 选择器
+    targets: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -235,6 +237,15 @@ fn make_ctx(app: &tauri::AppHandle, run_id: u64, ctl: Arc<RunCtl>, purpose: &'st
     )
 }
 
+/// 1:N：把多 target 任务解析成"当前选中 target 的单任务视角"（引擎单管线原样复用）
+fn resolve_target(job: &config::Job, target_index: Option<usize>) -> Result<config::Job, String> {
+    job.validate_multi_target()?;
+    let list = job.target_list();
+    let idx = target_index.unwrap_or(0);
+    let t = list.get(idx).ok_or_else(|| format!("target 序号 {idx} 越界（共 {} 个）", list.len()))?;
+    Ok(job.for_target(t))
+}
+
 fn user_err(e: std::io::Error) -> String {
     if syncdash::progress::is_cancelled(&e) { "cancelled".into() } else { e.to_string() }
 }
@@ -261,6 +272,7 @@ fn list_jobs() -> Vec<JobDto> {
             exclude: j.exclude.clone(),
             watch_interval_secs: j.watch_interval_secs,
             watch_auto_apply: j.watch_auto_apply,
+            targets: j.target_list().iter().map(|t| t.display().to_string()).collect(),
         })
         .collect()
 }
@@ -504,6 +516,67 @@ fn run_detail(detail: String) -> Vec<String> {
     syncdash::runlog::detail_lines(&detail, 2000)
 }
 
+// ---------- v0.10：集中日志与 app 设置 ----------
+
+/// 运行列表。与 `run_history` 的区别：这条会把**被中断的运行**（索引里没有、
+/// 只剩目录的那些）一并补进来——崩溃那次恰恰是最该被看见的一次。
+#[tauri::command]
+fn log_runs(job: Option<String>, limit: Option<usize>) -> Vec<syncdash::runlog::RunRecord> {
+    syncdash::runlog::history_merged(job.as_deref(), limit.unwrap_or(100))
+}
+
+/// 一次运行的某份产物（which ∈ run / errors / items / plan / summary）。
+/// 行数封顶：执行清单全记，一次大同步上万行，整份塞进 IPC 会把界面卡死。
+#[tauri::command]
+fn log_artifact(run_id: String, which: String, max: Option<usize>) -> Vec<String> {
+    syncdash::runlog::artifact_lines(&run_id, &which, max.unwrap_or(5000))
+}
+
+/// 日志根目录（"打开目录"按钮把它交给已有的 `reveal`）
+#[tauri::command]
+fn log_dir_path(run_id: Option<String>) -> String {
+    let root = syncdash::runlog::logs_dir();
+    match run_id {
+        Some(id) if !id.is_empty() => root.join(id).display().to_string(),
+        _ => root.display().to_string(),
+    }
+}
+
+/// 运行之外的事件（启动、设置错误、prune、迁移）。返回最后 n 行。
+#[tauri::command]
+fn app_log_tail(n: Option<usize>) -> Vec<String> {
+    let n = n.unwrap_or(500);
+    let p = syncdash::runlog::logs_dir().join(syncdash::logging::AppLogSink::FILE);
+    let Ok(text) = std::fs::read_to_string(p) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    lines.iter().rev().take(n).rev().map(|s| s.to_string()).collect()
+}
+
+#[tauri::command]
+fn get_settings() -> syncdash::settings::AppSettings {
+    syncdash::settings::load()
+}
+
+/// 保存设置。`migrate` = 日志目录变了时把旧目录整体搬过去。
+///
+/// 迁移要在**写新配置之前**算好旧位置——写完再问就只能问到新值了。
+#[tauri::command]
+fn save_settings(
+    s: syncdash::settings::AppSettings,
+    migrate: bool,
+) -> Result<syncdash::settings::MigrateReport, String> {
+    let old_dir = syncdash::settings::load().wanted_log_dir();
+    let new_dir = s.wanted_log_dir();
+    syncdash::settings::save(&s).map_err(|e| e.to_string())?;
+    if migrate && old_dir != new_dir {
+        Ok(syncdash::settings::migrate_log_dir(&old_dir, &new_dir))
+    } else {
+        Ok(syncdash::settings::MigrateReport::default())
+    }
+}
+
 /// 打开（或聚焦）独立进度子窗口（只用于 Synchronize；compare 进度在主窗原地显示）。
 /// **必须是 async 命令**：同步命令在主线程的 IPC 里执行，而 wry 建窗要靠主事件循环
 /// 泵消息——同步建窗会让子窗导航卡死在 about:blank（整窗纯白），关闭事件也排不上队
@@ -583,13 +656,20 @@ async fn compare_job(
     state: tauri::State<'_, Arc<RunState>>,
     snaps: tauri::State<'_, Arc<SnapCache>>,
     name: String,
+    target_index: Option<usize>,
 ) -> Result<PlanDto, String> {
     let st = state.inner().clone();
     let cache = snaps.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
+        let job = resolve_target(&job, target_index)?;
         let (run_id, ctl) = begin_run(&st)?;
         let ctx = make_ctx(&app, run_id, ctl, "compare");
+        // 比对期也接管进程级日志出口：`trash`/`lock`/`scan` 里那些拿不到 ctx 的诊断
+        // 走宏经注册表，这里不装的话它们会退回 stderr——windowed 构建里等于没说。
+        let _log_guard = syncdash::logging::install(ctx.sink.clone());
+        let t0 = std::time::Instant::now();
+        let ts_ms = syncdash::table::now_ms() as i64;
         // M3：remote 任务走远程管线（远端自己盘上扫描），不再静默落进本地管线
         let r = if job.remote_host.is_some() {
             run::compare_remote_job_detailed(&name, &job, &ctx)
@@ -597,6 +677,16 @@ async fn compare_job(
             run::compare_job_detailed(&job, &ctx)
         };
         end_run(&st);
+        // compare 无副作用：只留一行索引，不建目录。watch 30s 一轮 = 一天 2880 次，
+        // 每次建目录会把日志盘冲垮。
+        syncdash::runlog::compare_summary(
+            &name,
+            if job.remote_host.is_some() { "remote-compare" } else { "compare" },
+            ts_ms,
+            r.as_ref().map(|o| o.plan.ops.len() as u64).unwrap_or(0),
+            t0.elapsed().as_millis() as u64,
+            r.as_ref().err().map(syncdash::progress::is_cancelled).unwrap_or(false),
+        );
         let out = r.map_err(user_err)?;
         let reversed = out.plan.ops.iter().map(compare::reverse_op).collect();
         // 证据层：两侧实测 size/mtime + 相等项统计。与 compare() 共用同一套
@@ -621,9 +711,10 @@ async fn compare_job(
 /// 同步前的闸门体检（磁盘空间 / 删除占比）。前端在确认单里展示结果，
 /// 让"为什么不让我同步"这句话有地方说，而不是只出现在 stderr。
 #[tauri::command]
-async fn preflight(name: String, plan: PlanDto, ops: Vec<Op>, acknowledged: bool) -> Result<PreflightDto, String> {
+async fn preflight(name: String, plan: PlanDto, ops: Vec<Op>, acknowledged: bool, target_index: Option<usize>) -> Result<PreflightDto, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
+        let job = resolve_target(&job, target_index)?;
         let full = Plan { header: plan.header.clone(), ops: plan.ops.clone() };
         let ops: Vec<Op> = ops
             .into_iter()
@@ -649,10 +740,12 @@ async fn apply_job(
     plan: PlanDto,
     ops: Vec<Op>,
     acknowledged: bool,
+    target_index: Option<usize>,
 ) -> Result<ApplyDto, String> {
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
+        let job = resolve_target(&job, target_index)?;
         let full = Plan { header: plan.header.clone(), ops: plan.ops.clone() };
         let ops: Vec<Op> = ops
             .into_iter()
@@ -672,7 +765,8 @@ async fn apply_job(
         // M4：每次真实 apply 落一条运行日志（Recorder 顺带把错误事件收进明细文件）
         let t0 = std::time::Instant::now();
         let remote = job.remote_host.is_some();
-        let rec = syncdash::runlog::Recorder::start(&name, if remote { "remote-apply" } else { "apply" }, &ctx);
+        let rec =
+            syncdash::runlog::Recorder::start(&name, if remote { "remote-apply" } else { "apply" }, &ctx, &ops);
         let out = if remote {
             match run::apply_remote_job_with(&name, &job, &full, &ops, false, acknowledged, &rec.ctx) {
                 Ok(o) => o,
@@ -684,7 +778,7 @@ async fn apply_job(
         } else {
             run::apply_job_guarded_with(&job, &full, &ops, None, false, acknowledged, &rec.ctx)
         };
-        rec.finish(&out, &ops, t0.elapsed().as_millis() as u64);
+        rec.finish(&out, t0.elapsed().as_millis() as u64);
         end_run(&st);
         Ok(ApplyDto {
             done: out.done,
@@ -700,6 +794,17 @@ async fn apply_job(
 
 fn main() {
     syncdash::scan::init_worker_pool();
+    // windowed 构建没有控制台 —— 运行之外的诊断（设置解析失败、清理、迁移）
+    // 唯一的去处就是 app.jsonl。`_log` 必须活到进程结束：写成 `let _ = …`
+    // 会当场 drop，sink 立刻被摘掉。
+    let cfg = syncdash::settings::load();
+    let _log = std::sync::Arc::new(syncdash::logging::AppLogSink::open(&cfg.resolved_log_dir(), cfg.level));
+    let _log_guard = syncdash::logging::install(_log.clone());
+    // 保留策略在启动时跑一次：执行清单是全记的，没有闸门会一直涨
+    let dropped = syncdash::runlog::prune(cfg.keep_days, cfg.max_total_mb);
+    if dropped > 0 {
+        syncdash::log_info!("app", "日志清理：移除 {dropped} 次运行的记录");
+    }
     tauri::Builder::default()
         // 主窗关闭 → 级联销毁进度子窗；否则残留窗口让 Tauri 不退出（"app 关不掉"）
         .on_window_event(|window, event| {
@@ -720,7 +825,8 @@ fn main() {
             open_progress_window, close_progress_window, post_sync_action,
             run_history, last_syncs, run_detail,
             get_job, save_job, delete_job,
-            inspect_paths, reveal, mask_match, list_same, export_csv
+            inspect_paths, reveal, mask_match, list_same, export_csv,
+            log_runs, log_artifact, log_dir_path, app_log_tail, get_settings, save_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running SyncDash");

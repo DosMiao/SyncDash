@@ -84,6 +84,14 @@ pub fn compare_job_with(job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Re
 /// 同一条管线，额外把两侧快照交出来（丢掉它们等于逼界面再扫一遍）
 pub fn compare_job_detailed(job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<CompareOutcome> {
     use crate::progress::Phase;
+    // 单管线只处理单 target：多 target 任务先经 for_target 派生（CLI run 循环 / 桌面 target 选择器）
+    job.validate_multi_target().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if job.targets.len() > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "multi-target job: resolve one target first (desktop target picker / CLI `run` loops all)",
+        ));
+    }
     let opt = scan_opts(job);
     // P0-2：root 可达性 + 挂载点标记。共享盘没挂上时 target 常常是个空目录，
     // 照常比对会产出"把对面删光"或"全量重传"的计划。
@@ -297,6 +305,25 @@ pub fn apply_job_guarded_with(
 
 /// 本地/挂载盘任务的一条龙（原 CLI run 的主体）。返回 (done, skipped, errors, conflicts)。
 pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
+    // 1:N（原始需求）：单 source → 逐 target 独立比对/独立执行。
+    // 每个 target 一份计划、一条运行日志；source 侧哈希由缓存吸收（fast 档第二个 target 起近零读）。
+    job.validate_multi_target().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let targets = job.target_list();
+    let multi = targets.len() > 1;
+    let mut tot = (0u64, 0u64, 0u64, 0u64);
+    for (i, t) in targets.iter().enumerate() {
+        let jt = job.for_target(t);
+        let label = if multi { format!("{name}[{}/{} → {}]", i + 1, targets.len(), t.display()) } else { name.to_string() };
+        let r = run_local_single(&label, &jt, do_apply, verbose, acknowledged)?;
+        tot.0 += r.0;
+        tot.1 += r.1;
+        tot.2 += r.2;
+        tot.3 += r.3;
+    }
+    Ok(tot)
+}
+
+fn run_local_single(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
     let plan = compare_job(job)?;
     crate::log_info!("run", "[{name}] {} op(s), {} conflict(s)", plan.header.op_count, plan.header.conflict_count);
     for op in &plan.ops {

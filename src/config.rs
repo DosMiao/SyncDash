@@ -10,6 +10,11 @@ pub struct Job {
     pub mode: String,
     pub source: PathBuf,
     pub target: PathBuf,
+    /// 单 source → **多 target**（原始需求的 1:N）。非空时覆盖上面的单 target：
+    /// 每个 target 独立比对/独立计划/独立执行（source 只扫一次）。
+    /// 仅 mirror/enrich——sync 的 N 向合并是版本向量领域，用成对任务表达；远程任务同样不支持多 target。
+    #[serde(default)]
+    pub targets: Vec<PathBuf>,
     /// sync 模式的上次同步存档；apply 成功后自动刷新
     #[serde(default)]
     pub archive: Option<PathBuf>,
@@ -113,6 +118,7 @@ impl Default for Job {
             mode: "mirror".into(),
             source: PathBuf::new(),
             target: PathBuf::new(),
+            targets: Vec::new(),
             archive: None,
             include: Vec::new(),
             exclude: Vec::new(),
@@ -163,6 +169,38 @@ fn default_conflict() -> String {
 }
 fn default_max_conflicts() -> i32 {
     5
+}
+
+impl Job {
+    /// 生效的 target 列表：`targets` 非空用它，否则退回单 `target`
+    pub fn target_list(&self) -> Vec<PathBuf> {
+        if self.targets.is_empty() {
+            vec![self.target.clone()]
+        } else {
+            self.targets.clone()
+        }
+    }
+
+    /// 多 target 的合法性（sync / remote 不支持 1:N——错误要在比对前就说清楚）
+    pub fn validate_multi_target(&self) -> Result<(), String> {
+        if self.targets.len() > 1 {
+            if self.mode == "sync" {
+                return Err("sync 模式不支持多 target（N 向合并需要版本向量归因）——请用成对的 sync 任务（hub-and-spoke）".into());
+            }
+            if self.remote_host.is_some() {
+                return Err("远程任务暂不支持多 target".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// 派生"单 target 视角"的任务：引擎/桌面的单管线原样复用
+    pub fn for_target(&self, t: &std::path::Path) -> Job {
+        let mut j = self.clone();
+        j.target = t.to_path_buf();
+        j.targets = Vec::new();
+        j
+    }
 }
 
 /// 严谨级的**解析结果**：预设铺底，四个明细 Option 覆盖。
