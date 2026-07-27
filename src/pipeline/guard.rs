@@ -597,6 +597,57 @@ pub fn check_delete_ratio(
 
 /// Run every gate in one pass. `source_entries` / `target_entries` come from the two snapshots.
 #[allow(clippy::too_many_arguments)]
+fn check_space_vfs(
+    label: &str,
+    v: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    need: u64,
+    min_free_pct: f64,
+    out: &mut Verdict,
+) {
+    if need == 0 {
+        return;
+    }
+    let Some((avail, total)) = v.free_space().ok().flatten() else {
+        out.warnings.push(format!("{label}: cannot determine free space on {}", v.display()));
+        return;
+    };
+    let need_padded = need.saturating_add(need / 10);
+    let reserve = if min_free_pct > 0.0 { (total as f64 * min_free_pct) as u64 } else { 0 };
+    if avail < need_padded.saturating_add(reserve) {
+        out.blockers.push(format!(
+            "{label}: not enough free space on {}: writing needs ~{} (plus {} reserve), only {} available",
+            v.display(),
+            human_bytes(need_padded),
+            human_bytes(reserve),
+            human_bytes(avail)
+        ));
+    }
+}
+
+/// `run_all` over a backend pair: the same gates, with root and space checks going
+/// through the VFS (an sftp root honestly reports "cannot determine" instead of a number).
+pub fn run_all_vfs(
+    ops: &[Op],
+    source: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    target: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    source_entries: u64,
+    target_entries: u64,
+    g: &Guards,
+) -> Verdict {
+    let mut v = Verdict { blockers: Vec::new(), warnings: Vec::new() };
+    check_root_vfs("source", source, g.require_marker, &mut v);
+    check_root_vfs("target", target, g.require_marker, &mut v);
+    if !v.ok() {
+        return v; // with a root unavailable, the later checks are meaningless
+    }
+    let st = stat_plan(ops);
+    check_space_vfs("target", target, st.target.write_bytes, g.min_free_pct, &mut v);
+    check_space_vfs("source", source, st.source.write_bytes, g.min_free_pct, &mut v);
+    check_delete_ratio("target", &st.target, target_entries, g, &mut v);
+    check_delete_ratio("source", &st.source, source_entries, g, &mut v);
+    v
+}
+
 pub fn run_all(
     ops: &[Op],
     source_root: &Path,

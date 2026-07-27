@@ -758,24 +758,16 @@ pub fn apply_vfs(
 
     // The FFS dir_lock idea: lock both roots (with a heartbeat) before touching anything, so two machines cannot apply to the same directory at once.
     // Pause spins on 100ms instead of suspending and returning precisely so these two locks' heartbeat threads keep beating while paused.
-    let lock_root = |local: &Option<PathBuf>, v: &std::sync::Arc<dyn crate::fs::vfs::Vfs>| -> std::io::Result<crate::fs::lock::RootLock> {
-        match local {
-            Some(p) => crate::fs::lock::RootLock::acquire(p),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                format!("root lock on '{}' needs the VFS lock lane (landing with the sftp write half)", v.display()),
-            )),
-        }
-    };
+    // The lock speaks the VFS: local and sftp roots get the same mutual exclusion.
     let _lock_guard: (crate::fs::lock::RootLock, crate::fs::lock::RootLock) = {
-        let ls = match lock_root(&source_local, source) {
+        let ls = match crate::fs::lock::RootLock::acquire_vfs(source) {
             Ok(l) => l,
             Err(e) => {
                 crate::log_error!("apply", "cannot lock source root: {e}");
                 return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
             }
         };
-        let lt = match lock_root(&target_local, target) {
+        let lt = match crate::fs::lock::RootLock::acquire_vfs(target) {
             Ok(l) => l,
             Err(e) => {
                 crate::log_error!("apply", "cannot lock target root: {e}");

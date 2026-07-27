@@ -799,7 +799,9 @@ async fn apply_job(
                 }
             }
         } else {
-            run::apply_job_guarded_with(&job, &full, &ops, None, false, acknowledged, &rec.ctx)
+            // Capability consent from the confirmation sheet arrives with the phrase-editor
+            // milestone; until then a degraded apply refuses, naming its reasons
+            run::apply_job_guarded_with(&job, &full, &ops, None, false, acknowledged, false, &rec.ctx)
         };
         rec.finish(&out, t0.elapsed().as_millis() as u64);
         end_run(&st);

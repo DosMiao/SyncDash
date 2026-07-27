@@ -23,8 +23,8 @@ use std::time::Duration;
 use super::error::{VfsError, VfsErrorKind, VfsResult};
 use super::spec::RemoteSpec;
 use super::{
-    CaseSense, CredentialProvider, Credentials, EntryKind, ReadStream, Support, VDirEntry, VMeta,
-    Vfs, VfsCaps, WriteHint, WriteStaged,
+    CaseSense, CommitReport, CredentialProvider, Credentials, EntryKind, ReadStream, Support,
+    VDirEntry, VMeta, Vfs, VfsCaps, WriteHint, WriteStaged,
 };
 
 use russh::keys::{known_hosts, load_secret_key, HashAlg, PrivateKeyWithHashAlg};
@@ -144,11 +144,23 @@ impl SftpBackend {
         }
     }
 
-    fn write_unsupported(&self, what: &str) -> VfsError {
-        VfsError::new(
-            VfsErrorKind::Unsupported,
-            format!("{what} on sftp roots lands with the write lane (next milestone)"),
-        )
+}
+
+/// An attributes packet that asserts NOTHING. Never use `FileAttributes::default()`
+/// for setstat: that crate's Default is `size: Some(0), uid/gid: Some(0),
+/// permissions: Some(0o777|DIR), mtime: Some(0)` — sent as-is it TRUNCATES the file
+/// to zero and clobbers its owner and mode. Found the hard way: a live apply landed
+/// every file at 0 bytes after a "successful" rename.
+fn attrs_none() -> FileAttributes {
+    FileAttributes {
+        size: None,
+        uid: None,
+        user: None,
+        gid: None,
+        group: None,
+        permissions: None,
+        atime: None,
+        mtime: None,
     }
 }
 
@@ -375,31 +387,123 @@ impl Vfs for SftpBackend {
         self.block("read_link", async move { sftp.read_link(p).await })
     }
 
-    // ---- write side: the next milestone, and says so ----
+    // ---- write side ----
 
-    fn mkdir_all(&self, _rel: &str) -> VfsResult<()> {
-        Err(self.write_unsupported("mkdir"))
+    fn mkdir_all(&self, rel: &str) -> VfsResult<()> {
+        let sftp = self.conn()?.sftp.clone();
+        let mut prefix = String::new();
+        for seg in rel.split('/').filter(|s| !s.is_empty()) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(seg);
+            let abs = self.abs(&prefix);
+            let s = sftp.clone();
+            match self.block("mkdir", async move { s.create_dir(abs).await }) {
+                Ok(()) => {}
+                Err(e) => {
+                    // v3 answers a generic Failure for "already exists" — confirm before propagating
+                    match self.stat(&prefix)? {
+                        Some(m) if m.kind == EntryKind::Dir => {}
+                        _ => return Err(e),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
-    fn open_write(&self, _rel: &str, _hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
-        Err(self.write_unsupported("writing"))
+
+    fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
+        use russh_sftp::protocol::OpenFlags;
+        let conn = self.conn()?;
+        let (parent, base) = crate::foundation::path::split_parent(rel);
+        let tmp_rel = format!(
+            "{parent}{}{base}.{}",
+            crate::foundation::names::TEMP_PREFIX,
+            std::process::id()
+        );
+        let tmp_abs = self.abs(&tmp_rel);
+        let dst_abs = self.abs(rel);
+        let sftp = conn.sftp.clone();
+        // A previous interruption may have left debris under the same name
+        {
+            let s = sftp.clone();
+            let t = tmp_abs.clone();
+            let _ = self.block("clear stale temp", async move { s.remove_file(t).await });
+        }
+        let s2 = sftp.clone();
+        let t2 = tmp_abs.clone();
+        // CREATE|EXCL: the server's own O_EXCL refuses to overwrite (the FFS reliance)
+        let file = self.block("open staged", async move {
+            s2.open_with_flags(t2, OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::EXCLUDE).await
+        })?;
+        Ok(Box::new(SftpStaged {
+            rt: self.rt.handle().clone(),
+            timeout: self.timeout,
+            sftp,
+            tmp_abs,
+            dst_abs,
+            file: Some(file),
+            hint: hint.clone(),
+            committed: false,
+        }))
     }
-    fn rename(&self, _from_rel: &str, _to_rel: &str) -> VfsResult<()> {
-        Err(self.write_unsupported("rename"))
+
+    fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
+        let sftp = self.conn()?.sftp.clone();
+        let (f, t) = (self.abs(from_rel), self.abs(to_rel));
+        // v3 semantics: refuses an existing target (declared in caps; relied upon)
+        self.block("rename", async move { sftp.rename(f, t).await })
     }
-    fn remove_file(&self, _rel: &str) -> VfsResult<()> {
-        Err(self.write_unsupported("delete"))
+
+    fn remove_file(&self, rel: &str) -> VfsResult<()> {
+        let sftp = self.conn()?.sftp.clone();
+        let p = self.abs(rel);
+        self.block("remove_file", async move { sftp.remove_file(p).await })
     }
-    fn remove_dir(&self, _rel: &str) -> VfsResult<()> {
-        Err(self.write_unsupported("delete-dir"))
+
+    fn remove_dir(&self, rel: &str) -> VfsResult<()> {
+        let sftp = self.conn()?.sftp.clone();
+        let p = self.abs(rel);
+        match self.block("remove_dir", async move { sftp.remove_dir(p).await }) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind == VfsErrorKind::Protocol => {
+                // v3's generic Failure: a non-empty directory is the overwhelmingly
+                // common cause — classify by looking, never by guessing
+                match self.read_dir_names(rel) {
+                    Ok(l) if !l.is_empty() => Err(VfsError::new(
+                        VfsErrorKind::NotEmpty,
+                        format!("directory not empty: {rel}"),
+                    )),
+                    _ => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
-    fn set_mtime(&self, _rel: &str, _mtime_ms: i64) -> VfsResult<()> {
-        Err(self.write_unsupported("set_mtime"))
+
+    fn set_mtime(&self, rel: &str, mtime_ms: i64) -> VfsResult<()> {
+        let sftp = self.conn()?.sftp.clone();
+        let p = self.abs(rel);
+        let secs = (mtime_ms / 1000) as u32;
+        // setstat by PATH, after any handle is closed — fsetstat corrupts on some
+        // servers (Synology; the FFS finding)
+        let attrs = FileAttributes { mtime: Some(secs), atime: Some(secs), ..attrs_none() };
+        self.block("set_mtime", async move { sftp.set_metadata(p, attrs).await })
     }
-    fn set_mode(&self, _rel: &str, _mode: u32) -> VfsResult<()> {
-        Err(self.write_unsupported("chmod"))
+
+    fn set_mode(&self, rel: &str, mode: u32) -> VfsResult<()> {
+        let sftp = self.conn()?.sftp.clone();
+        let p = self.abs(rel);
+        let attrs = FileAttributes { permissions: Some(mode), ..attrs_none() };
+        self.block("chmod", async move { sftp.set_metadata(p, attrs).await })
     }
-    fn make_symlink(&self, _rel: &str, _target: &str) -> VfsResult<()> {
-        Err(self.write_unsupported("symlink creation"))
+
+    fn make_symlink(&self, rel: &str, target: &str) -> VfsResult<()> {
+        let sftp = self.conn()?.sftp.clone();
+        let link = self.abs(rel);
+        let t = target.to_string();
+        self.block("symlink", async move { sftp.symlink(t, link).await })
     }
 
     fn free_space(&self) -> VfsResult<Option<(u64, u64)>> {
@@ -591,6 +695,165 @@ impl ReadStream for SftpRead {
     }
 }
 
+/// The staged write on an sftp root: temp name in the destination's own directory
+/// (server-side rename stays same-volume), opened CREATE|EXCL so the server's own
+/// O_EXCL refuses collisions, landed by unlink-then-rename (v3 rename refuses an
+/// existing target — the deliberate FFS reliance). mtime and mode go on by PATH
+/// after the rename; their failures ride the CommitReport, never fail the copy.
+struct SftpStaged {
+    rt: tokio::runtime::Handle,
+    timeout: Duration,
+    sftp: Arc<SftpSession>,
+    tmp_abs: String,
+    dst_abs: String,
+    file: Option<russh_sftp::client::fs::File>,
+    hint: WriteHint,
+    committed: bool,
+}
+
+impl SftpStaged {
+    fn block<F, T>(&self, what: &str, fut: F) -> VfsResult<T>
+    where
+        F: std::future::Future<Output = Result<T, russh_sftp::client::error::Error>>,
+    {
+        let d = self.timeout;
+        match self.rt.block_on(async { tokio::time::timeout(d, fut).await }) {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(map_sftp_err(what, e)),
+            Err(_) => Err(VfsError::new(VfsErrorKind::Transient, format!("{what} timed out after {d:?}"))),
+        }
+    }
+}
+
+impl WriteStaged for SftpStaged {
+    fn write(&mut self, buf: &[u8]) -> VfsResult<()> {
+        use tokio::io::AsyncWriteExt;
+        let d = self.timeout;
+        let f = self.file.as_mut().expect("write after seal");
+        match self.rt.block_on(async { tokio::time::timeout(d, f.write_all(buf)).await }) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(VfsError::new(VfsErrorKind::Transient, format!("sftp write failed: {e}"))),
+            Err(_) => Err(VfsError::new(VfsErrorKind::Transient, "sftp write timed out")),
+        }
+    }
+
+    fn block_size(&self) -> usize {
+        480 * 1024
+    }
+
+    fn write_at(&mut self, _off: u64, _buf: &[u8]) -> VfsResult<()> {
+        Err(VfsError::unsupported("random-access writes are not offered on sftp roots (delta is a both-local affair)"))
+    }
+
+    fn seal(&mut self, fsync: bool) -> VfsResult<()> {
+        use tokio::io::AsyncWriteExt;
+        let d = self.timeout;
+        if let Some(mut f) = self.file.take() {
+            let res = self.rt.block_on(async {
+                tokio::time::timeout(d, async {
+                    f.flush().await?;
+                    if fsync {
+                        // fsync@openssh.com — where the server lacks the extension this
+                        // fails, and per the preflight NeedsAck line that fails the file
+                        f.sync_all()
+                            .await
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    }
+                    f.shutdown().await
+                })
+                .await
+            });
+            match res {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(VfsError::new(
+                    if fsync { VfsErrorKind::Protocol } else { VfsErrorKind::Transient },
+                    format!("sealing the staged file failed: {e}"),
+                )),
+                Err(_) => Err(VfsError::new(VfsErrorKind::Transient, "seal timed out")),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    fn staged_len(&self) -> VfsResult<u64> {
+        let s = self.sftp.clone();
+        let p = self.tmp_abs.clone();
+        let a = self.block("staged_len", async move { s.symlink_metadata(p).await })?;
+        Ok(a.size.unwrap_or(0))
+    }
+
+    fn open_staged_read(&self) -> VfsResult<Box<dyn ReadStream>> {
+        let s = self.sftp.clone();
+        let p = self.tmp_abs.clone();
+        let file = self.block("open staged for read-back", async move { s.open(p).await })?;
+        Ok(Box::new(SftpRead { rt: self.rt.clone(), timeout: self.timeout, file }))
+    }
+
+    fn commit(mut self: Box<Self>) -> VfsResult<CommitReport> {
+        if self.file.is_some() {
+            self.seal(false)?;
+        }
+        // Clear the destination, then rename — v3 rename refuses an existing target,
+        // which is exactly the atomicity contract we lean on
+        {
+            let s = self.sftp.clone();
+            let dst = self.dst_abs.clone();
+            match self.block("clear destination", async move { s.remove_file(dst).await }) {
+                Ok(()) => {}
+                Err(e) if e.kind == VfsErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        {
+            let s = self.sftp.clone();
+            let (t, dst) = (self.tmp_abs.clone(), self.dst_abs.clone());
+            self.block("rename into place", async move { s.rename(t, dst).await })?;
+        }
+        self.committed = true;
+
+        let mut report = CommitReport::default();
+        if self.hint.mtime_ms.is_some() || self.hint.mode.is_some() {
+            let secs = self.hint.mtime_ms.map(|ms| (ms / 1000) as u32);
+            let attrs = FileAttributes {
+                mtime: secs,
+                atime: secs,
+                permissions: self.hint.mode,
+                ..attrs_none()
+            };
+            let s = self.sftp.clone();
+            let dst = self.dst_abs.clone();
+            if let Err(e) = self.block("setstat after rename", async move { s.set_metadata(dst, attrs).await }) {
+                report.mtime_error = Some(e);
+            } else if self.hint.mtime_ms.is_some() {
+                let s2 = self.sftp.clone();
+                let dst2 = self.dst_abs.clone();
+                if let Ok(a) = self.block("stat back", async move { s2.symlink_metadata(dst2).await }) {
+                    report.mtime_ondisk_ms = a.mtime.map(|s| s as i64 * 1000);
+                }
+            }
+        }
+        Ok(report)
+    }
+}
+
+impl Drop for SftpStaged {
+    fn drop(&mut self) {
+        if !self.committed {
+            use tokio::io::AsyncWriteExt;
+            let d = self.timeout;
+            if let Some(mut f) = self.file.take() {
+                let _ = self.rt.block_on(async { tokio::time::timeout(d, f.shutdown()).await });
+            }
+            let s = self.sftp.clone();
+            let t = self.tmp_abs.clone();
+            let _ = self
+                .rt
+                .block_on(async { tokio::time::timeout(d, async move { s.remove_file(t).await }).await });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,10 +882,9 @@ mod tests {
     }
 
     #[test]
-    fn write_side_names_its_milestone() {
+    fn write_side_still_needs_a_connection_first() {
         let b = backend("sftp://ben@host/data");
         let e = b.remove_file("x").unwrap_err();
-        assert_eq!(e.kind, VfsErrorKind::Unsupported);
-        assert!(e.detail.contains("write lane"));
+        assert_eq!(e.kind, VfsErrorKind::Transient, "unconnected is a transient state, never a judgement about files");
     }
 }

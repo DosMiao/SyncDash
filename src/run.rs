@@ -41,7 +41,8 @@ fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::obs::progress::RunC
     // The previous-generation archive: every row of the new table pushes the old hash onto the prev chain, so that
     // "one generation behind" can be told apart from "concurrent modification" (P1-3, see compare::generation_of)
     let previous = if arch_path.is_file() { Snapshot::load(arch_path).ok() } else { None };
-    if let Ok(mut snap) = scan::scan_ctx(job.source_path(), &opt, ctx, crate::model::event::Phase::Refresh) {
+    let Ok(svr) = resolve_root(&job.source) else { return };
+    if let Ok(mut snap) = scan::scan_root(&svr, &opt, ctx, crate::model::event::Phase::Refresh) {
         snap.header.kind = "archive".into();
         snap.entries.retain(|e| !conflicted.contains(e.path.as_str()));
         if let Some(prev) = &previous {
@@ -380,7 +381,7 @@ fn escalate_sampled_disagreements(
 
 /// Execute the selected ops; on complete success in sync mode, refresh the archive (conflicted paths are dropped from it, so the conflict is reported again next time).
 pub fn apply_job(job: &Job, plan: &Plan, ops: &[Op], trash: Option<std::path::PathBuf>, verbose: bool) -> (u64, u64, u64) {
-    apply_job_guarded(job, plan, ops, trash, verbose, false)
+    apply_job_guarded(job, plan, ops, trash, verbose, false, false)
 }
 
 /// Run the gates without executing — the GUI calls this before raising the confirmation sheet, so the refusal
@@ -405,8 +406,9 @@ pub fn apply_job_guarded(
     trash: Option<std::path::PathBuf>,
     verbose: bool,
     acknowledged: bool,
+    accept_caps: bool,
 ) -> (u64, u64, u64) {
-    apply_job_guarded_with(job, plan, ops, trash, verbose, acknowledged, &crate::obs::progress::RunCtx::null()).into_tuple()
+    apply_job_guarded_with(job, plan, ops, trash, verbose, acknowledged, accept_caps, &crate::obs::progress::RunCtx::null()).into_tuple()
 }
 
 /// v0.9 M1: apply orchestration with an event stream — the Apply phase (apply_with reports its own totals and
@@ -418,33 +420,85 @@ pub fn apply_job_guarded_with(
     trash: Option<std::path::PathBuf>,
     verbose: bool,
     acknowledged: bool,
+    accept_caps: bool,
     ctx: &crate::obs::progress::RunCtx,
 ) -> crate::obs::progress::ApplyOutcome {
     use crate::model::event::{Phase, ProgressEvent};
 use crate::obs::progress::ApplyOutcome;
     let t0 = std::time::Instant::now();
-    // The plan header carries the roots the comparison actually scanned (already
-    // materialized); the job is materialized again only for the archive refresh below.
-    let job = &match materialize_roots(job) {
-        Ok(j) => j,
-        Err(e) => {
-            ctx.sink.emit(ProgressEvent::Error {
-                phase: Phase::Apply,
-                ts_ms: crate::foundation::time::now_ms(),
-                path: String::new(),
-                action: "resolve-roots".into(),
-                side: "target".into(),
-                message: e.to_string(),
-            });
-            return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
-        }
+    let refuse = |action: &str, message: String| {
+        ctx.sink.emit(ProgressEvent::Error {
+            phase: Phase::Apply,
+            ts_ms: crate::foundation::time::now_ms(),
+            path: String::new(),
+            action: action.into(),
+            side: "target".into(),
+            message,
+        });
+        ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false }
     };
-    let src_root = Path::new(&plan.header.source_root);
-    let tgt_root = Path::new(&plan.header.target_root);
-    let verdict = crate::pipeline::guard::run_all(
+    let sv = match resolve_root(&job.source) {
+        Ok(v) => v,
+        Err(e) => return refuse("resolve-roots", e.to_string()),
+    };
+    let tv = match resolve_root(&job.target) {
+        Ok(v) => v,
+        Err(e) => return refuse("resolve-roots", e.to_string()),
+    };
+    // The plan must be the one made for THESE roots. The header carries the label the
+    // scan wrote: the local (possibly translated) path for local lanes, the display
+    // phrase for generic-lane roots.
+    let label = |v: &std::sync::Arc<dyn crate::fs::vfs::Vfs>| {
+        v.as_local().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| v.display())
+    };
+    if label(&sv) != plan.header.source_root || label(&tv) != plan.header.target_root {
+        return refuse(
+            "resolve-roots",
+            format!(
+                "this plan was made for '{}' → '{}' but the job resolves to '{}' → '{}' — run compare again",
+                plan.header.source_root,
+                plan.header.target_root,
+                label(&sv),
+                label(&tv)
+            ),
+        );
+    }
+    // Write-side capability report: gaps listed BEFORE anything is touched
+    {
+        use crate::model::event::LogLevel;
+        use crate::pipeline::guard::CapSeverity;
+        let q = job.write_caps_query(sv.as_local().is_some(), tv.as_local().is_some());
+        let wr = crate::pipeline::guard::cap_report_write(&q, ops, &sv.caps(), &tv.caps());
+        for i in &wr.items {
+            let lvl = match i.severity {
+                CapSeverity::Block => LogLevel::Error,
+                CapSeverity::NeedsAck => LogLevel::Warn,
+                CapSeverity::Info => LogLevel::Info,
+            };
+            ctx.log(lvl, "caps", i.render());
+        }
+        let blockers = wr.blockers();
+        if !blockers.is_empty() {
+            return refuse(
+                "caps",
+                blockers.iter().map(|i| i.render()).collect::<Vec<_>>().join("; "),
+            );
+        }
+        let acks = wr.needs_ack();
+        if !acks.is_empty() && !accept_caps {
+            return refuse(
+                "caps",
+                format!(
+                    "this apply degrades on capabilities the backends lack — rerun with --accept-caps to consent:\n  {}",
+                    acks.iter().map(|i| i.render()).collect::<Vec<_>>().join("\n  ")
+                ),
+            );
+        }
+    }
+    let verdict = crate::pipeline::guard::run_all_vfs(
         ops,
-        src_root,
-        tgt_root,
+        &sv,
+        &tv,
         plan.header.source_entries,
         plan.header.target_entries,
         &job.guards(acknowledged),
@@ -462,7 +516,7 @@ use crate::obs::progress::ApplyOutcome;
         }
         return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
     }
-    let ap = apply::apply_with(ops, src_root, tgt_root, &job.apply_opts(trash, verbose), ctx);
+    let ap = apply::apply_vfs(ops, &sv, &tv, &job.apply_opts(trash, verbose), ctx);
     // A cancelled run does not refresh the archive: the user asked to "stop now", and re-reporting conflicts next round is safe anyway
     if ap.errors == 0 && !ap.cancelled && job.mode == "sync" {
         refresh_archive_with(job, plan, ctx);
@@ -520,7 +574,7 @@ fn run_local_single(name: &str, job: &Job, do_apply: bool, verbose: bool, acknow
     // M4: the CLI's apply leaves a run log too (desktop records its own at the shell layer)
     let t0 = std::time::Instant::now();
     let rec = crate::obs::runlog::Recorder::start(name, "apply", &crate::obs::progress::RunCtx::null(), &ops);
-    let out = apply_job_guarded_with(job, &plan, &ops, None, verbose, acknowledged, &rec.ctx);
+    let out = apply_job_guarded_with(job, &plan, &ops, None, verbose, acknowledged, accept_caps, &rec.ctx);
     rec.finish(&out, t0.elapsed().as_millis() as u64);
     Ok((out.done, out.skipped, out.errors, plan.header.conflict_count))
 }
