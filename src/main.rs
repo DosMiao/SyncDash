@@ -7,7 +7,7 @@ use syncdash::{apply, compare, config, filter, pack, run, scan, table, territory
 #[derive(Parser)]
 #[command(name = "syncdash", version, about = "Table-driven multi-node file sync (scan -> compare -> apply)")]
 struct Cli {
-    /// 不带子命令（如双击 exe）时直接打开 GUI
+    /// With no subcommand (e.g. double-clicking the exe), open the GUI directly
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -18,7 +18,7 @@ extern "system" {
     fn FreeConsole() -> i32;
 }
 
-/// 双击启动时甩掉随附的控制台窗口
+/// Drop the console window that tags along when launched by double-click
 fn detach_console() {
     #[cfg(windows)]
     unsafe {
@@ -35,80 +35,80 @@ enum Mode {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 打印本机环境信息（远端探测用：ssh 对面跑这个）
+    /// Print this machine's environment info (used for remote probing: this is what runs over ssh on the far side)
     Probe,
-    /// 列出任务配置（%APPDATA%\syncdash\jobs\*.toml）
+    /// List job configs (%APPDATA%\syncdash\jobs\*.toml)
     Jobs,
-    /// 跑任务：扫双侧 → 比对 →（--apply 时）执行 + 刷新 archive。job 配置了 remote_host 则走 ssh 远程管线
+    /// Run a job: scan both sides → compare → (with --apply) execute + refresh the archive. A job with remote_host set takes the ssh remote pipeline
     Run {
-        /// 任务名（jobs 目录里的文件名）或 toml 路径；省略时配合 --all / --prefix
+        /// Job name (a filename in the jobs directory) or a toml path; omit it and use --all / --prefix
         job: Option<String>,
-        /// 跑全部任务
+        /// Run every job
         #[arg(long)]
         all: bool,
-        /// 只跑名字以此开头的任务（如 cs-）
+        /// Run only jobs whose name starts with this (e.g. cs-)
         #[arg(long)]
         prefix: Option<String>,
         #[arg(long)]
         apply: bool,
-        /// 放行"计划体检"（删除占比过高）。标记缺失/空间不足依然拦截
+        /// Allow the "plan health check" through (deletion share too high). A missing marker / insufficient space still blocks
         #[arg(long = "i-know")]
         i_know: bool,
         #[arg(short, long)]
         verbose: bool,
-        /// M6 值守：循环 比对→（有差异且自动档时）执行→睡眠。Ctrl-C 退出
+        /// M6 watch: loop compare → (on differences, in auto mode) apply → sleep. Ctrl-C to stop
         #[arg(long)]
         watch: bool,
-        /// watch 间隔秒（缺省用任务的 watch_interval_secs，其次 30）
+        /// Watch interval in seconds (defaults to the job's watch_interval_secs, then 30)
         #[arg(long)]
         interval: Option<u64>,
-        /// watch 发现差异时自动执行（等同任务里的 watch_auto_apply = true）
+        /// Apply automatically when watch finds differences (same as watch_auto_apply = true in the job)
         #[arg(long = "auto-apply")]
         auto_apply: bool,
     },
-    /// 打开图形界面（Tauri 桌面版；egui 旧界面已于 v0.9 退役）
+    /// Open the graphical interface (the Tauri desktop app; the old egui UI was retired in v0.9)
     Gui,
-    /// 扫描目录，产出快照表（JSONL，默认 stdout —— ssh 管道友好）
+    /// Scan a directory and produce a snapshot table (JSONL, stdout by default — friendly to ssh pipes)
     Scan {
         root: PathBuf,
         #[arg(long)]
         out: Option<PathBuf>,
-        /// 跳过内容 hash（快，但比对退化为 size+mtime，且无法做移动检测）
+        /// Skip content hashing (fast, but comparison degrades to size+mtime and move detection becomes impossible)
         #[arg(long)]
         no_hash: bool,
-        /// 严谨级预设：quick（0 读）| fast（采样+缓存）| standard（每轮实采样每个文件，默认）
-        /// | paranoid（每轮全读每个字节）
+        /// Rigor preset: quick (0 reads) | fast (sampling + cache) | standard (really samples every file each round, the default)
+        /// | paranoid (reads every byte each round)
         #[arg(long, default_value = "standard")]
         rigor: String,
-        /// 明细覆盖：内容证据 none | sampled | full（覆盖预设）
+        /// Detail override: content evidence none | sampled | full (overrides the preset)
         #[arg(long)]
         evidence: Option<String>,
-        /// 明细覆盖：哈希缓存 on | off（覆盖预设）
+        /// Detail override: hash cache on | off (overrides the preset)
         #[arg(long)]
         cache: Option<String>,
-        /// [兼容旧参] 无视缓存全部重读
+        /// [legacy flag] Ignore the cache and re-read everything
         #[arg(long)]
         force_rehash: bool,
-        /// [兼容旧参] 抽样+缓存（≈ --rigor fast）
+        /// [legacy flag] Sampling + cache (≈ --rigor fast)
         #[arg(long)]
         fast: bool,
-        /// 记录 symlink 本身（指向字符串）；默认忽略 symlink
+        /// Record the symlink itself (its target string); symlinks are ignored by default
         #[arg(long)]
         symlinks_direct: bool,
-        /// 系统垃圾排除预设：auto（Win+Mac，默认）| windows | mac | off
+        /// OS-junk exclude preset: auto (Win+Mac, the default) | windows | mac | off
         #[arg(long, default_value = "auto")]
         os_excludes: String,
-        /// 排除开发产物（.git/node_modules/target…）。默认关——.git 也是正常文件
+        /// Exclude dev artifacts (.git/node_modules/target…). Off by default — .git is a normal tree too
         #[arg(long)]
         dev_excludes: bool,
-        /// 追加排除（FFS 过滤器语法，如 */big_temp/ 或 */*.log，可多次）
+        /// Extra excludes (FFS filter syntax, e.g. */big_temp/ or */*.log; repeatable)
         #[arg(long)]
         exclude: Vec<String>,
-        /// 往 stderr 打哈希进度（百分比 + MiB/s）
+        /// Print hashing progress to stderr (percentage + MiB/s)
         #[arg(long)]
         progress: bool,
     },
-    /// 比对两张快照表，产出行动计划（JSONL）
+    /// Compare two snapshot tables and produce an action plan (JSONL)
     Compare {
         #[arg(long)]
         source: PathBuf,
@@ -116,23 +116,23 @@ enum Cmd {
         target: PathBuf,
         #[arg(long, value_enum, default_value = "mirror")]
         mode: Mode,
-        /// 上次同步存档（sync 模式的增删归因依据，Unison 思路）
+        /// The last sync's archive (what sync mode attributes adds and deletes against; the Unison approach)
         #[arg(long)]
         archive: Option<PathBuf>,
-        /// sync 无 archive 时，差异按"新者胜"解决（默认只报冲突）
+        /// With no archive in sync mode, resolve differences by "newer wins" (by default it only reports conflicts)
         #[arg(long)]
         resolve_newer: bool,
-        /// 大小写敏感匹配（默认不敏感——NTFS/APFS 默认行为）
+        /// Case-sensitive matching (insensitive by default — the NTFS/APFS behavior)
         #[arg(long)]
         case_sensitive: bool,
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// 列出 .ffs-sync 标记的同步领地（CodeSync 生态）
+    /// List the sync territories marked by .ffs-sync (the CodeSync ecosystem)
     Territories {
         root: PathBuf,
     },
-    /// 按 .ffs-sync 标记为每个领地生成 cs-<slug>.toml 任务（syncdash 版 CodeSync 生成器）
+    /// Generate a cs-<slug>.toml job for every .ffs-sync-marked territory (syncdash's take on the CodeSync generator)
     GenJobs {
         root: PathBuf,
         #[arg(long)]
@@ -141,61 +141,61 @@ enum Cmd {
         mode: String,
         #[arg(long, default_value = "standard")]
         rigor: String,
-        /// 生成远程管线任务：ssh 主机别名（如 mac）
+        /// Generate remote-pipeline jobs: the ssh host alias (e.g. mac)
         #[arg(long)]
         remote_host: Option<String>,
-        /// 远端根路径前缀（远端本地路径，如 /Users/xxx/Code）
+        /// Remote root path prefix (the remote's own local path, e.g. /Users/xxx/Code)
         #[arg(long)]
         remote_root_base: Option<String>,
-        /// 远端 syncdash 路径（默认当它在 PATH 里）
+        /// Path to the remote syncdash (defaults to assuming it is on PATH)
         #[arg(long)]
         remote_exe: Option<String>,
     },
-    /// 从 stdin 收一个文件写到 path（远程送包用：ssh 对面跑这个，双平台二进制级可靠）
+    /// Receive a file on stdin and write it to path (used to ship remote packages: this runs over ssh on the far side, binary-safe on both platforms)
     Recv {
         path: PathBuf,
     },
-    /// 输出指定文件的 FastCDC 分块表（增量传输用；每文件一行 JSON）
+    /// Emit the FastCDC chunk table for the given files (used for delta transfer; one JSON line per file)
     Chunks {
         #[arg(long)]
         root: PathBuf,
-        /// 相对路径，可多次
+        /// Relative path; repeatable
         #[arg(long = "file")]
         files: Vec<String>,
     },
-    /// 打包计划中 target 侧的操作为 tar 包（payload+计划+双 hash 清单），供对端 apply-pack
+    /// Pack the plan's target-side operations into a tar (payload + plan + a two-hash manifest) for the far end's apply-pack
     Pack {
         plan: PathBuf,
         #[arg(long)]
         out: PathBuf,
-        /// 覆盖计划头里的 source root
+        /// Override the source root in the plan header
         #[arg(long)]
         source_root: Option<PathBuf>,
     },
-    /// 在目标机执行包：验计划 hash → 逐文件验 hash → 执行（锁+回收+复制后校验）。默认 dry-run
+    /// Execute a package on the target machine: verify the plan hash → verify each file's hash → execute (lock + trash + verify after copy). dry-run by default
     ApplyPack {
         pkg: PathBuf,
-        /// 覆盖计划头里的 target root
+        /// Override the target root in the plan header
         #[arg(long)]
         target_root: Option<PathBuf>,
         #[arg(long)]
         apply: bool,
-        /// 成功后删除包文件（远程管线的清场步骤，免 shell 方言差异）
+        /// Delete the package file on success (the remote pipeline's cleanup step, free of shell-dialect differences)
         #[arg(long)]
         remove_pkg: bool,
-        /// 被删/被覆盖文件存进 target 的 .version_syncDash/（而非本机 trash）
+        /// Put deleted/overwritten files in target's .version_syncDash/ (instead of the local trash)
         #[arg(long)]
         versioning: bool,
         #[arg(short, long)]
         verbose: bool,
     },
-    /// 列出某 root 的版本历史（.version_syncDash）；--prune N 只保留最新 N 个
+    /// List a root's version history (.version_syncDash); --prune N keeps only the newest N
     Versions {
         root: PathBuf,
         #[arg(long)]
         prune: Option<usize>,
     },
-    /// 从版本历史找回文件（默认 dry-run；--file 可多次，不给 = 整个版本）
+    /// Recover files from the version history (dry-run by default; --file is repeatable, omit it for the whole version)
     Restore {
         root: PathBuf,
         #[arg(long)]
@@ -205,37 +205,37 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
-    /// 在 root 写下 `.syncdash-root` 挂载点标记（配 job 的 require_marker，防共享盘没挂上）
+    /// Write the `.syncdash-root` mount-point marker in root (pairs with the job's require_marker to guard against an unmounted share)
     Mark {
         root: PathBuf,
-        /// 记进标记文件的任务名（仅供人看）
+        /// Job name recorded in the marker file (for humans only)
         #[arg(long, default_value = "")]
         job: String,
         #[arg(long, default_value = "")]
         note: String,
     },
-    /// 运行历史（M4）：每次 apply 的结果一览；--prune-days N 清理旧记录
+    /// Run history (M4): an overview of every apply's outcome; --prune-days N prunes old records
     History {
-        /// 只看这个任务（缺省 = 全部）
+        /// Only this job (omit for all)
         job: Option<String>,
-        /// 最多显示多少条
+        /// Maximum number of rows to show
         #[arg(long, default_value_t = 30)]
         limit: usize,
-        /// 清理 N 天前的记录与明细文件
+        /// Prune records and detail files older than N days
         #[arg(long)]
         prune_days: Option<u64>,
     },
-    /// 集中日志（v0.10）：列运行 / 看某次的三份清单 / 清理 / 看目录在哪
+    /// Central logs (v0.10): list runs / view one run's three manifests / prune / show where the directory is
     Logs {
         #[command(subcommand)]
         cmd: LogsCmd,
     },
-    /// 本机回收目录：查看 / 找回 / 清理
+    /// The local trash: view / recover / prune
     Trash {
         #[command(subcommand)]
         cmd: TrashCmd,
     },
-    /// 执行计划。默认 dry-run，--apply 才动手
+    /// Execute a plan. dry-run by default; only --apply touches anything
     Apply {
         plan: PathBuf,
         #[arg(long)]
@@ -246,16 +246,16 @@ enum Cmd {
         target_root: Option<PathBuf>,
         #[arg(long)]
         trash: Option<PathBuf>,
-        /// 复制后重读校验 blake3（paranoid）
+        /// Re-read and verify blake3 after copying (paranoid)
         #[arg(long)]
         verify: bool,
-        /// 被删/被覆盖文件存进各 root 的 .version_syncDash/（而非本机 trash）
+        /// Put deleted/overwritten files in each root's .version_syncDash/ (instead of the local trash)
         #[arg(long)]
         versioning: bool,
-        /// 大文件按 FastCDC 块增量写入（多读一遍目标换少写很多字节；SMB 上传划算）
+        /// Write large files delta-wise in FastCDC chunks (one extra read of the target buys a lot fewer written bytes; pays off for SMB uploads)
         #[arg(long)]
         delta: bool,
-        /// 临时文件 rename 前不 fsync（快，但断电可能丢最后的写入）
+        /// Do not fsync the temp file before renaming (fast, but a power cut may lose the last writes)
         #[arg(long)]
         no_fsync: bool,
         #[arg(short, long)]
@@ -265,66 +265,66 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum LogsCmd {
-    /// 列出运行（新→旧）。**含被中断的运行**——索引里没有、只剩目录的那些
+    /// List runs (newest → oldest). **Including interrupted runs** — the ones missing from the index, with only a directory left
     List {
-        /// 只看这个任务（缺省 = 全部）
+        /// Only this job (omit for all)
         job: Option<String>,
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
-    /// 看某次运行的产物。默认看事件流
+    /// View one run's artifacts. Shows the event stream by default
     Show {
-        /// 运行 id（= 目录名，`syncdash logs list` 里那一列）
+        /// Run id (= the directory name, the column in `syncdash logs list`)
         run_id: String,
-        /// 报错清单
+        /// The error manifest
         #[arg(long)]
         errors: bool,
-        /// 执行清单（一行一 op 的实际结局）
+        /// The execution manifest (one line per op, its actual outcome)
         #[arg(long)]
         items: bool,
-        /// 计划清单（这次**打算**做什么——和执行清单一比就知道哪些没轮到）
+        /// The plan manifest (what this run **intended** to do — compare it with the execution manifest to see what never got its turn)
         #[arg(long)]
         plan: bool,
         #[arg(long, default_value_t = 5000)]
         limit: usize,
     },
-    /// 按保留策略清理（缺省读设置里的 keep_days / max_total_mb）
+    /// Prune by the retention policy (defaults come from keep_days / max_total_mb in settings)
     Prune {
         #[arg(long)]
         keep_days: Option<u64>,
         #[arg(long)]
         max_total_mb: Option<u64>,
     },
-    /// 打印日志目录位置
+    /// Print the log directory's location
     Dir,
 }
 
 #[derive(Subcommand)]
 enum TrashCmd {
-    /// 列出全部回收批次（时间、文件数、体积）
+    /// List every trash batch (time, file count, size)
     Runs,
-    /// 跨全部批次查找某个路径的历史版本（子串匹配，新的在前）
+    /// Search all batches for a path's historical versions (substring match, newest first)
     Find { pattern: String },
-    /// 找回文件到指定 root。默认 dry-run
+    /// Recover files into the given root. dry-run by default
     Restore {
         pattern: String,
         #[arg(long)]
         into: PathBuf,
-        /// 指定批次 id（默认取最新一版）
+        /// A specific batch id (defaults to the newest version)
         #[arg(long)]
         run: Option<String>,
         #[arg(long)]
         apply: bool,
     },
-    /// 按保留策略清理。默认 dry-run
+    /// Prune by the retention policy. dry-run by default
     Prune {
-        /// 超过这么多天的批次一律删（0 = 关）
+        /// Delete every batch older than this many days (0 = off)
         #[arg(long, default_value = "30")]
         keep_days: i64,
-        /// 总体积上限 GiB（0 = 关）
+        /// Total size cap in GiB (0 = off)
         #[arg(long, default_value = "10")]
         max_gib: u64,
-        /// 关闭 staggered 稀释（近期密、远期疏）
+        /// Turn off staggered thinning (dense recently, sparse further back)
         #[arg(long)]
         no_staggered: bool,
         #[arg(long)]
@@ -347,14 +347,14 @@ fn write_out<F: Fn(&mut dyn std::io::Write) -> std::io::Result<()>>(out: &Option
     }
 }
 
-/// v0.10：集中日志的 CLI 门面。读取全部走 runlog 的公开 API，
-/// 路径逃逸防护在那一层（`artifact_lines` 只收纯文件名形态的 run_id）。
+/// v0.10: the CLI facade for central logging. Every read goes through runlog's public API,
+/// which is the layer holding the path-escape guard (`artifact_lines` accepts only bare-filename-shaped run_ids).
 fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
     use syncdash::runlog;
     match cmd {
         LogsCmd::List { job, limit } => {
-            // history_merged 而非 history：被中断的运行只有目录、没有索引行，
-            // 而那恰恰是最需要被看见的一次
+            // history_merged rather than history: an interrupted run has only a directory and no index line,
+            // and that is precisely the run that most needs to be seen
             let rows = runlog::history_merged(job.as_deref(), limit);
             if rows.is_empty() {
                 println!("no runs recorded yet (runs are logged when a job actually applies)");
@@ -370,7 +370,7 @@ fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
                 } else {
                     format!("{}d ago", age_min / 60 / 24)
                 };
-                // compare 行没有目录，用 "-" 占位，肉眼一列对齐
+                // compare rows have no directory; "-" holds the slot so the column stays visually aligned
                 let state = if !r.finished {
                     "  [INTERRUPTED]"
                 } else if r.cancelled {
@@ -435,9 +435,9 @@ fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
 
 fn main() {
     syncdash::scan::init_worker_pool();
-    // CLI 有控制台：把库内诊断按原文接回 stderr——改造前的终端体验逐字不变。
-    // 必须在任何库调用之前装，且 guard 活到进程结束（`_g` 不能写成 `_`：
-    // `let _ = ...` 会当场 drop，sink 立刻被摘掉）。
+    // The CLI has a console: pipe the library's diagnostics back to stderr verbatim — the pre-refactor terminal experience, word for word.
+    // It must be installed before any library call, and the guard must live to process exit (`_g` cannot be
+    // written `_`: `let _ = ...` drops on the spot and the sink is pulled straight back out).
     let cfg = syncdash::settings::load();
     let _g = cfg.mirror_stderr.then(|| {
         syncdash::progress::install(Arc::new(syncdash::logging::StderrSink { min_level: cfg.level }))
@@ -453,8 +453,8 @@ fn main() {
     std::process::exit(code);
 }
 
-/// v0.9 M5：egui 退役后，GUI = Tauri 桌面版。找同目录的 syncdash-desktop 启动；
-/// 找不到就说清楚去哪拿，而不是无声退出。
+/// v0.9 M5: with egui retired, GUI = the Tauri desktop app. Look for syncdash-desktop next to this binary and launch it;
+/// if it isn't there, say plainly where to get it instead of exiting silently.
 fn launch_desktop() -> std::io::Result<i32> {
     let exe_name = if cfg!(windows) { "syncdash-desktop.exe" } else { "syncdash-desktop" };
     let cand = std::env::current_exe()
@@ -478,7 +478,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
     let cmd = match cli.cmd {
         Some(c) => c,
         None => {
-            // 双击 exe：无参数 → 启动 Tauri 桌面版（egui 旧界面已退役）
+            // Double-clicked exe: no arguments → launch the Tauri desktop app (the old egui UI is retired)
             detach_console();
             return launch_desktop();
         }
@@ -525,7 +525,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 eprintln!("no matching jobs");
                 return Ok(2);
             }
-            // M6 值守：hash 缓存让未变的树每拍只付 walk 成本；RootLock 防两端同时动手
+            // M6 watch: the hash cache means an unchanged tree only pays the walk each tick; RootLock stops both ends acting at once
             if watch {
                 let iv = interval
                     .or_else(|| list.iter().filter_map(|(_, j)| j.watch_interval_secs).min())
@@ -593,7 +593,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
             }
-            // 预设铺底 → 明细覆盖 → 旧旗标兼容覆盖
+            // preset lays the base → detail overrides → legacy-flag compatibility overrides
             let (mut hash, mut sampled, mut use_cache) = match rigor.as_str() {
                 "quick" => (false, false, false),
                 "fast" => (true, true, true),
@@ -762,7 +762,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
         Cmd::Logs { cmd } => run_logs(cmd),
         Cmd::History { job, limit, prune_days } => {
             if let Some(days) = prune_days {
-                // 0 = 不叠总量闸门：`--prune-days N` 的语义就是"只按天"
+                // 0 = don't stack the total-size gate: the meaning of `--prune-days N` is exactly "by days only"
                 let n = syncdash::runlog::prune(days, 0);
                 println!("pruned {n} run(s) older than {days} day(s)");
             }
