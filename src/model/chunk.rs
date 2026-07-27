@@ -50,8 +50,7 @@ pub fn chunk_bytes(data: &[u8]) -> Vec<ChunkInfo> {
 }
 
 pub fn chunk_file(root: &Path, rel: &str) -> std::io::Result<FileChunks> {
-    let native = if cfg!(windows) { rel.replace('/', "\\") } else { rel.to_string() };
-    let p = root.join(native);
+    let p = crate::foundation::path::join_native(root, rel);
     // Delta only kicks in for large files, and the memory ceiling here is the file itself; a GB-scale .mph is acceptable (one-shot, sequential read)
     let data = std::fs::read(&p)?;
     let hash = blake3::hash(&data).to_hex().to_string();

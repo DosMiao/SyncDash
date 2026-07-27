@@ -58,10 +58,6 @@ fn archive_dir() -> PathBuf {
     crate::foundation::dirs::archive_dir()
 }
 
-fn to_native(rel: &str) -> String {
-    if cfg!(windows) { rel.replace('/', "\\") } else { rel.to_string() }
-}
-
 pub struct GenOutcome {
     pub name: String,
     pub territory: String,
@@ -84,7 +80,7 @@ pub fn gen_jobs(source_root: &Path, target_root: &Path, mode: &str, rigor: &str,
     let mut out = Vec::new();
     for rel in terrs {
         let name = format!("cs-{}", slug(&rel));
-        let native = to_native(&rel);
+        let native = crate::foundation::path::to_native(&rel);
         let job = Job {
             mode: mode.to_string(),
             source: source_root.join(&native),

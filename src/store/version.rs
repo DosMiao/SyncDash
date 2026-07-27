@@ -55,9 +55,7 @@ pub struct IndexLine {
     pub bytes: u64,
 }
 
-fn to_native(rel: &str) -> String {
-    if cfg!(windows) { rel.replace('/', "\\") } else { rel.to_string() }
-}
+use crate::foundation::path::to_native;
 
 fn mtime_ms_of(md: &std::fs::Metadata) -> i64 {
     md.modified()

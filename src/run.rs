@@ -157,11 +157,6 @@ fn escalate_sampled_disagreements(
         h.update_mmap(p)?;
         Ok(h.finalize().to_hex().to_string())
     }
-    fn native(root: &Path, rel: &str) -> std::path::PathBuf {
-        let r = if cfg!(windows) { rel.replace('/', "\\") } else { rel.to_string() };
-        root.join(r)
-    }
-
     let tmap: std::collections::HashMap<&str, &crate::model::table::Entry> = t
         .entries
         .iter()
@@ -185,8 +180,8 @@ fn escalate_sampled_disagreements(
     let extra: Vec<Op> = suspects
         .par_iter()
         .filter_map(|(se, te)| {
-            let hs = full_hash(&native(&job.source, &se.path)).ok()?;
-            let ht = full_hash(&native(&job.target, &te.path)).ok()?;
+            let hs = full_hash(&crate::foundation::path::join_native(&job.source, &se.path)).ok()?;
+            let ht = full_hash(&crate::foundation::path::join_native(&job.target, &te.path)).ok()?;
             if hs == ht {
                 return None; // the digest wasn't lying: only the mtime drifted
             }
