@@ -24,6 +24,24 @@ pub struct Header {
     /// Files excluded by the filter
     #[serde(default)]
     pub excluded_files: u64,
+    /// A VFS root's self-description (None for plain local roots): protocol, display
+    /// root, mtime precision, the evidence tier this scan *actually* ran, and any
+    /// declared degradations — the snapshot must say for itself how its evidence was
+    /// gathered (the no-silent rule, landed on the table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vfs: Option<VfsNote>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct VfsNote {
+    pub protocol: String,
+    pub display_root: String,
+    pub mtime_precision_ms: u32,
+    /// "none" | "sampled" | "full" — what the scan really did (post-preflight)
+    pub evidence_effective: String,
+    /// Capabilities explicitly degraded for this run (human-readable lines from the preflight report)
+    #[serde(default)]
+    pub degraded: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

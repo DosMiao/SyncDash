@@ -87,8 +87,11 @@ fn cache_dir() -> PathBuf {
     }
 }
 
-fn cache_file_for_root(root: &Path) -> PathBuf {
-    let key = blake3::hash(root.to_string_lossy().to_lowercase().as_bytes());
+/// Cache identity: for a local root this is the root string exactly as spelled (existing
+/// cache files keep their names — pinned by a regression test); for a VFS root it is
+/// `Vfs::identity()`, so different hosts/users/protocols never share a cache.
+fn cache_file_for_key(key: &str) -> PathBuf {
+    let key = blake3::hash(key.to_lowercase().as_bytes());
     cache_dir().join(format!("{}.jsonl", &key.to_hex()[..16]))
 }
 
@@ -100,9 +103,9 @@ struct CacheLine {
     hash: String,
 }
 
-fn load_cache(root: &Path) -> HashMap<String, (u64, i64, String)> {
+fn load_cache_by_key(key: &str) -> HashMap<String, (u64, i64, String)> {
     let mut map = HashMap::new();
-    if let Ok(f) = std::fs::File::open(cache_file_for_root(root)) {
+    if let Ok(f) = std::fs::File::open(cache_file_for_key(key)) {
         for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
             if let Ok(c) = serde_json::from_str::<CacheLine>(&line) {
                 map.insert(c.path, (c.size, c.mtime_ms, c.hash));
@@ -110,6 +113,10 @@ fn load_cache(root: &Path) -> HashMap<String, (u64, i64, String)> {
         }
     }
     map
+}
+
+fn load_cache(root: &Path) -> HashMap<String, (u64, i64, String)> {
+    load_cache_by_key(&root.to_string_lossy())
 }
 
 // mtime correction table (P1-4)
@@ -121,9 +128,13 @@ fn load_cache(root: &Path) -> HashMap<String, (u64, i64, String)> {
 // file right back after writing, stores (ondisk, virtual) in its database and reports virtual from then on. Same
 // thing here, kept in the existing user cache directory, never polluting the scanned tree.
 
+fn mtime_fix_file_for_key(key: &str) -> PathBuf {
+    let k = blake3::hash(key.to_lowercase().as_bytes());
+    cache_dir().join(format!("{}.mtimefix.jsonl", &k.to_hex()[..16]))
+}
+
 fn mtime_fix_file_for_root(root: &Path) -> PathBuf {
-    let key = blake3::hash(root.to_string_lossy().to_lowercase().as_bytes());
-    cache_dir().join(format!("{}.mtimefix.jsonl", &key.to_hex()[..16]))
+    mtime_fix_file_for_key(&root.to_string_lossy())
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -135,8 +146,12 @@ struct MtimeFix {
 
 /// path -> (ondisk, intended)
 pub fn load_mtime_fixes(root: &Path) -> HashMap<String, (i64, i64)> {
+    load_mtime_fixes_by_key(&root.to_string_lossy())
+}
+
+pub fn load_mtime_fixes_by_key(key: &str) -> HashMap<String, (i64, i64)> {
     let mut map = HashMap::new();
-    if let Ok(f) = std::fs::File::open(mtime_fix_file_for_root(root)) {
+    if let Ok(f) = std::fs::File::open(mtime_fix_file_for_key(key)) {
         for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
             if let Ok(c) = serde_json::from_str::<MtimeFix>(&line) {
                 map.insert(c.path, (c.ondisk_ms, c.intended_ms));
@@ -169,8 +184,8 @@ pub fn record_mtime_fixes(root: &Path, fixes: &[(String, i64, i64)]) {
     }
 }
 
-fn save_cache(root: &Path, entries: &[Entry]) {
-    let file = cache_file_for_root(root);
+fn save_cache_by_key(key: &str, entries: &[Entry]) {
+    let file = cache_file_for_key(key);
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -270,6 +285,298 @@ pub fn scan_ctx(
     phase: crate::model::event::Phase,
 ) -> std::io::Result<Snapshot> {
     scan_impl(root, opt, None, Some((ctx, phase)))
+}
+
+/// Route a root to the right scan lane: a local (or locally-translated) root keeps the
+/// existing walkdir+mmap fast path byte-for-byte; everything else runs the generic VFS
+/// lane. Both lanes speak the same filter contract and the same exclusion accounting —
+/// the differential tests pin those numbers against each other.
+pub fn scan_root(
+    vfs: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    opt: &ScanOptions,
+    ctx: &crate::obs::progress::RunCtx,
+    phase: crate::model::event::Phase,
+) -> std::io::Result<Snapshot> {
+    match vfs.as_local() {
+        Some(root) => scan_impl(root, opt, None, Some((ctx, phase))),
+        None => scan_vfs(vfs, opt, ctx, phase),
+    }
+}
+
+fn sampled_digest_vfs(vfs: &dyn crate::fs::vfs::Vfs, rel: &str, size: u64) -> Result<String, crate::fs::vfs::VfsError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&size.to_le_bytes());
+    for off in [0u64, size / 2, size.saturating_sub(SAMPLE_CHUNK as u64)] {
+        let buf = vfs.read_range(rel, off, SAMPLE_CHUNK as u32)?;
+        hasher.update(&buf);
+    }
+    // Same windows, same size prefix, same `~` marker as the local sampled_digest —
+    // the two lanes must produce identical digests for identical content
+    Ok(format!("~{}", hasher.finalize().to_hex()))
+}
+
+fn full_hash_vfs(
+    vfs: &dyn crate::fs::vfs::Vfs,
+    rel: &str,
+    pp: &crate::obs::progress::PhaseProgress<'_>,
+) -> Result<String, crate::fs::vfs::VfsError> {
+    let mut stream = vfs.open_read(rel)?;
+    let mut hasher = blake3::Hasher::new();
+    let block = stream.block_size().clamp(64 * 1024, 8 * 1024 * 1024);
+    let mut buf = vec![0u8; block];
+    loop {
+        pp.checkpoint().map_err(crate::fs::vfs::VfsError::from)?; // cancel/pause between blocks
+        let n = std::io::Read::read(&mut stream, &mut buf).map_err(crate::fs::vfs::VfsError::from)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// The generic scan lane: engine-driven traversal over `read_dir` (pruned subtrees cost
+/// zero round-trips), then a hashing pool sized to the backend's stream budget.
+///
+/// Error discipline, and the one place it differs from the local lane on purpose:
+/// an entry-level NotFound is a scan race (counted + sampled, like local walk errors),
+/// but a directory-level Transient/Auth/Protocol failure aborts the whole scan —
+/// a half table would make the missing half read as deletions on the next compare.
+fn scan_vfs(
+    vfs: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    opt: &ScanOptions,
+    ctx: &crate::obs::progress::RunCtx,
+    phase: crate::model::event::Phase,
+) -> std::io::Result<Snapshot> {
+    use crate::fs::vfs::VfsErrorKind;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    let pp = crate::obs::progress::PhaseProgress::begin(ctx, phase, Some(vfs.display()), 0, 0);
+    let side = match phase {
+        crate::model::event::Phase::ScanTarget => "target",
+        _ => "source",
+    };
+    let started = now_ms();
+    let t0 = std::time::Instant::now();
+    let identity = vfs.identity();
+    let caps = vfs.caps();
+    let cache = if opt.hash && opt.use_cache { load_cache_by_key(&identity) } else { HashMap::new() };
+    let mtime_fixes = load_mtime_fixes_by_key(&identity);
+
+    let mut entries: Vec<Entry> = Vec::new();
+    struct PendingVfs {
+        rel: String,
+        size: u64,
+        mt: i64,
+        hash: Option<String>,
+        file_id: Option<String>,
+        mode: Option<u32>,
+    }
+    let mut pending: Vec<PendingVfs> = Vec::new();
+    let mut walk_errors = 0u64;
+    let mut walk_err_samples: Vec<String> = Vec::new();
+    let mut excl_dirs = 0u64;
+    let mut excl_files = 0u64;
+
+    // Engine-driven DFS: one read_dir round-trip per kept directory
+    let mut stack: Vec<String> = vec![String::new()];
+    while let Some(dir) = stack.pop() {
+        pp.checkpoint()?;
+        let list = match vfs.read_dir(&dir) {
+            Ok(l) => l,
+            Err(e) if e.kind == VfsErrorKind::NotFound && !dir.is_empty() => {
+                // The directory vanished between being listed and being read: a scan race,
+                // same class as a local walk error
+                walk_errors += 1;
+                if walk_err_samples.len() < 5 {
+                    walk_err_samples.push(format!("{dir}: {e}"));
+                }
+                continue;
+            }
+            Err(e) => {
+                let ioe: std::io::Error = e.into();
+                return Err(std::io::Error::new(
+                    ioe.kind(),
+                    format!(
+                        "scan of '{}' aborted at directory '{dir}': {ioe} — refusing to emit a half table (its missing subtrees would read as deletions)",
+                        vfs.display()
+                    ),
+                ));
+            }
+        };
+        for de in list {
+            let rel = if dir.is_empty() { de.name.clone() } else { format!("{dir}/{}", de.name) };
+            match de.meta.kind {
+                EntryKind::Dir => {
+                    let (pass, child_might_match) = opt.filter.pass_dir(&rel);
+                    if pass {
+                        entries.push(Entry { path: rel.clone(), kind: EntryKind::Dir, size: 0, mtime_ms: de.meta.mtime_ms, hash: None, file_id: None, mode: None, link: None, prev: None });
+                    }
+                    if pass || child_might_match {
+                        stack.push(rel);
+                    } else {
+                        excl_dirs += 1; // whole subtree pruned — and never even listed
+                    }
+                }
+                EntryKind::Symlink => {
+                    if !opt.filter.pass_file(&rel) {
+                        excl_files += 1;
+                        continue;
+                    }
+                    if opt.symlinks_direct {
+                        let target = de.meta.link.clone().or_else(|| vfs.read_link(&rel).ok());
+                        entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: de.meta.mtime_ms, hash: None, file_id: None, mode: None, link: target, prev: None });
+                    }
+                }
+                EntryKind::File => {
+                    if !opt.filter.pass_file(&rel) {
+                        excl_files += 1;
+                        continue;
+                    }
+                    let size = de.meta.size;
+                    let raw_mt = de.meta.mtime_ms;
+                    let mt = match mtime_fixes.get(&rel) {
+                        Some((ondisk, intended)) if *ondisk == raw_mt => *intended,
+                        _ => raw_mt,
+                    };
+                    let mut hash = None;
+                    if opt.hash && opt.use_cache {
+                        if let Some((cs, cm, ch)) = cache.get(&rel) {
+                            let want_sampled = opt.sampled && size >= SAMPLE_MIN;
+                            if *cs == size && *cm == mt && ch.starts_with('~') == want_sampled {
+                                hash = Some(ch.clone());
+                            }
+                        }
+                    }
+                    pending.push(PendingVfs { rel, size, mt, hash, file_id: de.meta.file_id, mode: de.meta.mode });
+                    pp.item_done(&pending.last().unwrap().rel);
+                }
+            }
+        }
+    }
+
+    if walk_errors > 0 {
+        crate::log_warn!(
+            "scan",
+            "warning: {walk_errors} entr(ies) under {} skipped by walk errors — they will look ABSENT on this side! samples: {}",
+            vfs.display(),
+            walk_err_samples.join(" | ")
+        );
+        pp.error(
+            "",
+            "walk",
+            side,
+            &format!("{walk_errors} entr(ies) skipped by walk errors (they will be treated as ABSENT on this side!) samples: {}", walk_err_samples.join(" | ")),
+        );
+    }
+
+    let bytes_to_hash: u64 = if opt.hash {
+        pending.iter().filter(|p| p.hash.is_none()).map(|p| effective_read(p.size, opt.sampled)).sum()
+    } else {
+        0
+    };
+    pp.set_totals(pending.len() as u64, bytes_to_hash);
+    pp.restart_items();
+
+    let hash_errors;
+    if opt.hash {
+        // Not rayon: the bottleneck is the network, and the width belongs to the backend
+        // (its connection budget), not to the CPU count
+        let width = caps.max_parallel_streams.clamp(1, 4);
+        let next = AtomicUsize::new(0);
+        let err_count = AtomicU64::new(0);
+        let hashes: Vec<std::sync::OnceLock<Option<String>>> =
+            pending.iter().map(|_| std::sync::OnceLock::new()).collect();
+        std::thread::scope(|sc| {
+            for _ in 0..width {
+                sc.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(p) = pending.get(i) else { break };
+                    if pp.checkpoint().is_err() {
+                        let _ = hashes[i].set(None);
+                        continue; // cancelled: drain the remaining slots empty
+                    }
+                    if p.hash.is_some() {
+                        pp.item_done(&p.rel); // cache hit: nothing to read
+                        let _ = hashes[i].set(None);
+                        continue;
+                    }
+                    let res = if opt.sampled && p.size >= SAMPLE_MIN {
+                        sampled_digest_vfs(vfs.as_ref(), &p.rel, p.size)
+                    } else {
+                        full_hash_vfs(vfs.as_ref(), &p.rel, &pp)
+                    };
+                    match res {
+                        Ok(h) => {
+                            let _ = hashes[i].set(Some(h));
+                        }
+                        Err(e) if e.kind == VfsErrorKind::Cancelled => {
+                            let _ = hashes[i].set(None);
+                            continue;
+                        }
+                        Err(e) => {
+                            err_count.fetch_add(1, Ordering::Relaxed);
+                            pp.error(&p.rel, "hash", side, &e.to_string());
+                            let _ = hashes[i].set(None);
+                        }
+                    }
+                    let eff = effective_read(p.size, opt.sampled);
+                    pp.add_bytes(eff, &p.rel);
+                    pp.item_done(&p.rel);
+                });
+            }
+        });
+        pp.checkpoint()?; // a cancellation during hashing surfaces here, honestly
+        for (p, slot) in pending.iter_mut().zip(hashes) {
+            if p.hash.is_none() {
+                p.hash = slot.into_inner().flatten();
+            }
+        }
+        hash_errors = err_count.load(Ordering::Relaxed);
+    } else {
+        hash_errors = 0;
+    }
+
+    for p in pending {
+        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, file_id: p.file_id, mode: p.mode, link: None, prev: None });
+    }
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    if opt.hash {
+        save_cache_by_key(&identity, &entries);
+    }
+    if hash_errors > 0 {
+        crate::log_warn!("scan", "warning: {hash_errors} file(s) could not be hashed (in use / unreadable)");
+    }
+
+    Ok(Snapshot {
+        header: Header {
+            schema: SCHEMA,
+            kind: "snapshot".into(),
+            root: vfs.display(),
+            host: crate::model::table::host_name(),
+            os: caps.protocol.to_string(),
+            scanned_at_ms: started,
+            duration_ms: t0.elapsed().as_millis() as u64,
+            entry_count: entries.len() as u64,
+            hashed: opt.hash,
+            excluded_dirs: excl_dirs,
+            excluded_files: excl_files,
+            vfs: Some(crate::model::table::VfsNote {
+                protocol: caps.protocol.to_string(),
+                display_root: vfs.display(),
+                mtime_precision_ms: caps.mtime_precision_ms,
+                evidence_effective: if !opt.hash {
+                    "none".into()
+                } else if opt.sampled {
+                    "sampled".into()
+                } else {
+                    "full".into()
+                },
+                degraded: Vec::new(),
+            }),
+        },
+        entries,
+    })
 }
 
 fn scan_impl(
@@ -589,7 +896,7 @@ fn scan_impl(
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     if opt.hash {
-        save_cache(root, &entries);
+        save_cache_by_key(&root.to_string_lossy(), &entries);
     }
     hash_errors += hash_err_count.load(std::sync::atomic::Ordering::Relaxed);
     if hash_errors > 0 {
@@ -609,6 +916,7 @@ fn scan_impl(
             hashed: opt.hash,
             excluded_dirs: excl_dirs.get(),
             excluded_files: excl_files.get(),
+            vfs: None,
         },
         entries,
     })
@@ -630,6 +938,17 @@ use crate::obs::progress::{is_cancelled, RunCtl, RunCtx};
             std::fs::write(root.join("sub").join(format!("f{i}.dat")), vec![i as u8; 100]).unwrap();
         }
         root
+    }
+
+    #[test]
+    fn cache_key_formula_is_pinned_to_the_pre_vfs_one() {
+        // The historical key was blake3(root_string.to_lowercase())[..16] over the root
+        // exactly as spelled. LocalVfs::identity() reproduces the root string, so every
+        // pre-VFS cache file must keep its name — this pins the formula against drift.
+        let root = r"D:\Some\Root";
+        let expected_stem = &blake3::hash(root.to_lowercase().as_bytes()).to_hex()[..16];
+        let got = cache_file_for_key(&std::path::PathBuf::from(root).to_string_lossy());
+        assert_eq!(got.file_name().unwrap().to_string_lossy(), format!("{expected_stem}.jsonl"));
     }
 
     #[test]

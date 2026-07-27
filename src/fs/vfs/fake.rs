@@ -102,8 +102,29 @@ pub struct FakeVfs {
     inner: Arc<Inner>,
 }
 
+/// Same phrase → same tree (syncthing's fakeFS cache): a test seeds files through one
+/// handle and the engine's own `open()` of the same phrase sees them. Distinct trees
+/// with *identical generated content* come from the same seed with different knobs
+/// (`fake://s` vs `fake://s?streams=2`) — the registry keys on the whole phrase, the
+/// generator only on the seed.
+static REGISTRY: std::sync::OnceLock<Mutex<HashMap<String, Arc<Inner>>>> = std::sync::OnceLock::new();
+
 impl FakeVfs {
     pub fn from_phrase(raw: &str) -> VfsResult<FakeVfs> {
+        let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let map = reg.lock().unwrap();
+            if let Some(inner) = map.get(raw) {
+                return Ok(FakeVfs { inner: inner.clone() });
+            }
+        }
+        let v = Self::parse_phrase(raw)?;
+        let mut map = reg.lock().unwrap();
+        let inner = map.entry(raw.to_string()).or_insert_with(|| v.inner.clone());
+        Ok(FakeVfs { inner: inner.clone() })
+    }
+
+    fn parse_phrase(raw: &str) -> VfsResult<FakeVfs> {
         let rest = raw
             .strip_prefix("fake://")
             .ok_or_else(|| VfsError::new(VfsErrorKind::Protocol, format!("not a fake:// phrase: {raw}")))?;
@@ -700,8 +721,10 @@ mod tests {
 
     #[test]
     fn same_seed_agrees_on_every_byte() {
-        let a = mk("fake://s1");
-        let b = mk("fake://s1");
+        // Same seed, different knob tail = two *independent* trees whose generated
+        // bytes agree — the registry keys on the whole phrase, the generator on the seed
+        let a = mk("fake://seedtest");
+        let b = mk("fake://seedtest?block_size=131072");
         a.seed_file("dir/f.bin", 100_000, 1_000);
         b.seed_file("dir/f.bin", 100_000, 1_000);
         let mut ba = Vec::new();
@@ -711,7 +734,7 @@ mod tests {
         assert_eq!(ba, bb);
         assert_eq!(ba.len(), 100_000);
         // and a different seed disagrees
-        let c = mk("fake://s2");
+        let c = mk("fake://seedtest2");
         c.seed_file("dir/f.bin", 100_000, 1_000);
         let mut bc = Vec::new();
         c.open_read("dir/f.bin").unwrap().read_to_end(&mut bc).unwrap();
@@ -719,8 +742,16 @@ mod tests {
     }
 
     #[test]
+    fn same_phrase_shares_one_tree() {
+        let a = mk("fake://sharedtree");
+        a.seed_file("x.bin", 5, 0);
+        let b = mk("fake://sharedtree");
+        assert!(b.stat("x.bin").unwrap().is_some(), "same phrase must open the same tree");
+    }
+
+    #[test]
     fn ranged_read_matches_stream() {
-        let v = mk("fake://s1");
+        let v = mk("fake://rrtest");
         v.seed_file("f.bin", 10_000, 0);
         let mut full = Vec::new();
         v.open_read("f.bin").unwrap().read_to_end(&mut full).unwrap();
@@ -761,7 +792,7 @@ mod tests {
 
     #[test]
     fn written_content_wins_over_generated() {
-        let v = mk("fake://s");
+        let v = mk("fake://writetest");
         let mut w = v.open_write("out/x.bin", &WriteHint { mtime_ms: Some(9_000), ..Default::default() }).unwrap();
         w.write(b"hello world").unwrap();
         assert_eq!(w.staged_len().unwrap(), 11);
@@ -776,7 +807,7 @@ mod tests {
 
     #[test]
     fn counters_count() {
-        let v = mk("fake://s");
+        let v = mk("fake://countertest");
         v.seed_file("a/f1", 10, 0);
         v.seed_file("a/f2", 10, 0);
         let _ = v.read_dir("a").unwrap();

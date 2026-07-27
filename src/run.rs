@@ -69,13 +69,19 @@ fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::obs::progress::RunC
 /// lives — and hands back the translated path. A genuinely remote backend has no
 /// local path; until its engine lane exists (scan M3 / apply M4) that is a loud
 /// error naming the milestone, never a silent fallback.
+/// Open + connect a root phrase to a live backend (a plain local path resolves to LocalVfs).
+pub fn resolve_root(s: &str) -> std::io::Result<std::sync::Arc<dyn crate::fs::vfs::Vfs>> {
+    let v = crate::fs::vfs::open(s, &crate::fs::vfs::cred::default_provider())?;
+    v.connect().map_err(std::io::Error::from)?;
+    Ok(v)
+}
+
 fn materialize_one(s: &str) -> std::io::Result<String> {
     use crate::fs::vfs::spec::RootSpec;
     match crate::fs::vfs::spec::parse(s) {
         RootSpec::Local(_) => Ok(s.to_string()),
         _ => {
-            let v = crate::fs::vfs::open(s, &crate::fs::vfs::cred::default_provider())?;
-            v.connect().map_err(std::io::Error::from)?;
+            let v = resolve_root(s)?;
             let p = v.as_local().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
@@ -132,13 +138,17 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx) -> st
             "multi-target job: resolve one target first (desktop target picker / CLI `run` loops all)",
         ));
     }
-    let job = &materialize_roots(job)?;
+    // Resolve both roots to live backends before anything else: local stays local, a
+    // translating backend mounts, a genuinely remote one connects — Auth/unreachable
+    // errors surface here, never mid-scan.
+    let sv = resolve_root(&job.source)?;
+    let tv = resolve_root(&job.target)?;
     let opt = scan_opts(job);
     // P0-2: root reachability + mount-point marker. When the share isn't mounted, target is often an empty directory,
     // and comparing as usual yields a plan that either "wipes the other side" or "re-sends everything".
     let mut v = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-    crate::pipeline::guard::check_root("source", job.source_path(), job.require_marker, &mut v);
-    crate::pipeline::guard::check_root("target", job.target_path(), job.require_marker, &mut v);
+    crate::pipeline::guard::check_root_vfs("source", &sv, job.require_marker, &mut v);
+    crate::pipeline::guard::check_root_vfs("target", &tv, job.require_marker, &mut v);
     for w in &v.warnings {
         // v0.10: Log{Warn} replaces the Error{action:"warning"} hack —
         // with a real level, a warning no longer has to masquerade as an "error that doesn't count"
@@ -151,8 +161,8 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx) -> st
     // OneDrive vs an external drive), so serial execution is pure queueing — in parallel, wall clock ≈ the slower side.
     // Each side emits its own PhaseStart at the same moment, so the progress panel ticks on two rows at once.
     let (s, t) = std::thread::scope(|sc| {
-        let hs = sc.spawn(|| scan::scan_ctx(job.source_path(), &opt, ctx, Phase::ScanSource));
-        let ht = sc.spawn(|| scan::scan_ctx(job.target_path(), &opt, ctx, Phase::ScanTarget));
+        let hs = sc.spawn(|| scan::scan_root(&sv, &opt, ctx, Phase::ScanSource));
+        let ht = sc.spawn(|| scan::scan_root(&tv, &opt, ctx, Phase::ScanTarget));
         (hs.join().unwrap(), ht.join().unwrap())
     });
     let (s, t) = (s?, t?);
@@ -168,11 +178,34 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx) -> st
         0,
         0,
     );
-    let copts = job.compare_opts();
+    // The no-hash equality window widens to the coarser of the two backends' declared
+    // mtime precision (an FTP LIST root thinks in minutes). Hash evidence is unaffected.
+    let mut copts = job.compare_opts();
+    copts.mtime_window_ms = copts
+        .mtime_window_ms
+        .max(sv.caps().mtime_precision_ms as i64)
+        .max(tv.caps().mtime_precision_ms as i64);
     let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
     // Disagreement escalation: in the sampled evidence tier, a file whose digests match but whose mtimes differ by >2s may not simply be ruled identical (the knob can turn this off)
     let rr = job.rigor_resolved();
-    let plan = if rr.sampled && rr.escalate { escalate_sampled_disagreements(job, plan, &s, &t, ctx) } else { plan };
+    let plan = if rr.sampled && rr.escalate {
+        match (sv.as_local(), tv.as_local()) {
+            (Some(sp), Some(tp)) => {
+                let (sp, tp) = (sp.to_path_buf(), tp.to_path_buf());
+                escalate_sampled_disagreements(job, plan, &s, &t, ctx, &sp, &tp)
+            }
+            _ => {
+                ctx.log(
+                    crate::model::event::LogLevel::Info,
+                    "compare",
+                    "escalation skipped: a root lives on a remote backend (full re-reads over the VFS arrive with the write lane)".to_string(),
+                );
+                plan
+            }
+        }
+    } else {
+        plan
+    };
     Ok(CompareOutcome { plan, source: s, target: t })
 }
 
@@ -186,6 +219,8 @@ fn escalate_sampled_disagreements(
     s: &Snapshot,
     t: &Snapshot,
     ctx: &crate::obs::progress::RunCtx,
+    src_root: &Path,
+    tgt_root: &Path,
 ) -> Plan {
     use crate::model::plan::Side;
     use crate::model::event::LogLevel;
@@ -222,8 +257,8 @@ fn escalate_sampled_disagreements(
     let extra: Vec<Op> = suspects
         .par_iter()
         .filter_map(|(se, te)| {
-            let hs = full_hash(&crate::foundation::path::join_native(job.source_path(), &se.path)).ok()?;
-            let ht = full_hash(&crate::foundation::path::join_native(job.target_path(), &te.path)).ok()?;
+            let hs = full_hash(&crate::foundation::path::join_native(src_root, &se.path)).ok()?;
+            let ht = full_hash(&crate::foundation::path::join_native(tgt_root, &te.path)).ok()?;
             if hs == ht {
                 return None; // the digest wasn't lying: only the mtime drifted
             }
@@ -843,6 +878,59 @@ mod tests {
         assert_eq!(m.source, j.source);
         assert_eq!(m.target, j.target);
         assert_eq!(m.targets, j.targets);
+    }
+
+    #[test]
+    fn fake_roots_compare_end_to_end() {
+        use crate::fs::vfs::fake::FakeVfs;
+        // Same seed, different knob tail = two independent trees whose *generated
+        // content agrees byte-for-byte* — the model of one file living on two machines.
+        let src_phrase = "fake://cmp-e2e";
+        let tgt_phrase = "fake://cmp-e2e?streams=2";
+        let sv = FakeVfs::from_phrase(src_phrase).unwrap();
+        let tv = FakeVfs::from_phrase(tgt_phrase).unwrap();
+        // identical on both sides
+        sv.seed_file("a/same.bin", 10_000, 1_000_000);
+        tv.seed_file("a/same.bin", 10_000, 1_000_000);
+        // source-only → copy; target-only → delete (mirror)
+        sv.seed_file("a/new.bin", 5_000, 1_000_000);
+        tv.seed_file("a/gone.bin", 7_000, 1_000_000);
+        // same path, different size → update
+        sv.seed_file("a/changed.bin", 9_000, 2_000_000);
+        tv.seed_file("a/changed.bin", 8_000, 1_000_000);
+        // an excluded directory on both sides must be pruned AND counted
+        sv.seed_file("skipme/x.bin", 100, 0);
+        tv.seed_file("skipme/x.bin", 100, 0);
+
+        let mut j = Job::default();
+        j.source = src_phrase.into();
+        j.target = tgt_phrase.into();
+        j.mode = "mirror".into();
+        j.rigor = "standard".into();
+        j.exclude = vec!["skipme/".into()];
+        let out = compare_job_detailed(&j, &crate::obs::progress::RunCtx::null()).unwrap();
+
+        assert_eq!(out.source.header.excluded_dirs, 1, "pruned subtree must be counted, never silent");
+        assert_eq!(out.target.header.excluded_dirs, 1);
+        assert!(out.source.header.vfs.is_some(), "a VFS root's snapshot must carry its self-description");
+        assert!(!out.source.entries.iter().any(|e| e.path.starts_with("skipme")), "pruned content must not enter the table");
+
+        let mut kinds: Vec<(String, String)> = out
+            .plan
+            .ops
+            .iter()
+            .map(|o| (format!("{:?}", o.action).to_lowercase(), o.path.clone()))
+            .collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            vec![
+                ("copy".to_string(), "a/new.bin".to_string()),
+                ("delete".to_string(), "a/gone.bin".to_string()),
+                ("update".to_string(), "a/changed.bin".to_string()),
+            ],
+            "same.bin must compare equal through generated content; the three drifts must classify"
+        );
     }
 
     #[test]

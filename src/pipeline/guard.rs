@@ -217,6 +217,48 @@ pub fn check_root(label: &str, root: &Path, require_marker: bool, v: &mut Verdic
     }
 }
 
+/// The same three-level judgement for a VFS root (syncthing's folder-marker defence):
+/// unreachable / not-a-directory → blocker; marker demanded but absent → blocker;
+/// empty and unmarked → warning. Distinguishing "the mount is not up" from "the user
+/// deleted everything" is the whole game on a network root.
+pub fn check_root_vfs(label: &str, vfs: &std::sync::Arc<dyn crate::fs::vfs::Vfs>, require_marker: bool, v: &mut Verdict) {
+    use crate::model::table::EntryKind;
+    let disp = vfs.display();
+    match vfs.stat("") {
+        Ok(Some(m)) if m.kind == EntryKind::Dir => {}
+        Ok(Some(_)) => {
+            v.blockers.push(format!("{label} root is not a directory: {disp}"));
+            return;
+        }
+        Ok(None) => {
+            v.blockers.push(format!("{label} root does not exist: {disp}"));
+            return;
+        }
+        Err(e) => {
+            v.blockers.push(format!("{label} root not accessible: {disp} ({e})"));
+            return;
+        }
+    }
+    let marker = matches!(vfs.stat(MARKER_NAME), Ok(Some(_)));
+    if require_marker && !marker {
+        v.blockers.push(format!(
+            "{label} root has no {MARKER_NAME} marker: {disp} \
+             — the share may not be mounted. Run `syncdash mark <root>` once on the real data, \
+             or set require_marker = false in the job."
+        ));
+        return;
+    }
+    if !require_marker && !marker {
+        let empty = vfs.read_dir_names("").map(|l| l.is_empty()).unwrap_or(false);
+        if empty {
+            v.warnings.push(format!(
+                "{label} root is empty and unmarked: {disp} — if this root simply isn't reachable, \
+                 stop now (enable require_marker to make this an error)"
+            ));
+        }
+    }
+}
+
 /// Space check: the writing side needs write_bytes, and must still have min_free_pct left afterwards.
 pub fn check_space(label: &str, root: &Path, need: u64, min_free_pct: f64, v: &mut Verdict) {
     if need == 0 {

@@ -226,26 +226,37 @@ mod suite {
 
     #[test]
     fn fake_backend_conforms() {
-        run_all(&mut || Arc::new(FakeVfs::from_phrase("fake://conformance").unwrap()) as Arc<dyn Vfs>);
+        // The registry maps one phrase to one shared tree, so each sub-test's fresh
+        // empty root needs a fresh phrase
+        let mut n = 0;
+        run_all(&mut || {
+            n += 1;
+            Arc::new(FakeVfs::from_phrase(&format!("fake://conformance-{n}")).unwrap()) as Arc<dyn Vfs>
+        });
     }
 
     #[test]
     fn fake_backend_conforms_with_sftp_shaped_knobs() {
         // rename refuses overwrite, second-granular mtimes — the SFTP profile
+        let mut n = 0;
         run_all(&mut || {
-            Arc::new(FakeVfs::from_phrase("fake://sftpish?no_rename_overwrite&precision_ms=1000").unwrap())
-                as Arc<dyn Vfs>
+            n += 1;
+            Arc::new(
+                FakeVfs::from_phrase(&format!("fake://sftpish-{n}?no_rename_overwrite&precision_ms=1000")).unwrap(),
+            ) as Arc<dyn Vfs>
         });
     }
 
     #[test]
     fn fake_backend_conforms_with_ftp_shaped_knobs() {
         // no ranged reads, no mtime setting, no symlinks, no read-back, minute mtimes — the LIST-only FTP profile
+        let mut n = 0;
         run_all(&mut || {
+            n += 1;
             Arc::new(
-                FakeVfs::from_phrase(
-                    "fake://ftpish?no_ranged_read&no_set_mtime&no_symlink&no_read_back&no_fsync&no_unix_mode&precision_ms=60000",
-                )
+                FakeVfs::from_phrase(&format!(
+                    "fake://ftpish-{n}?no_ranged_read&no_set_mtime&no_symlink&no_read_back&no_fsync&no_unix_mode&precision_ms=60000"
+                ))
                 .unwrap(),
             ) as Arc<dyn Vfs>
         });

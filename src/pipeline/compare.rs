@@ -916,7 +916,7 @@ mod tests {
                 schema: SCHEMA, kind: "snapshot".into(), root: "/r".into(), host: "h".into(),
                 os: os.into(), scanned_at_ms: 0, duration_ms: 0,
                 entry_count: entries.len() as u64, hashed: true,
-                excluded_dirs: 0, excluded_files: 0,
+                excluded_dirs: 0, excluded_files: 0, vfs: None,
             },
             entries,
         }
