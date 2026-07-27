@@ -85,6 +85,12 @@ enum Cmd {
         /// 记录 symlink 本身（指向字符串）；默认忽略 symlink
         #[arg(long)]
         symlinks_direct: bool,
+        /// 系统垃圾排除预设：auto（Win+Mac，默认）| windows | mac | off
+        #[arg(long, default_value = "auto")]
+        os_excludes: String,
+        /// 排除开发产物（.git/node_modules/target…）。默认关——.git 也是正常文件
+        #[arg(long)]
+        dev_excludes: bool,
         /// 追加排除（FFS 过滤器语法，如 */big_temp/ 或 */*.log，可多次）
         #[arg(long)]
         exclude: Vec<String>,
@@ -438,12 +444,12 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             Ok(if tot.2 > 0 { 1 } else { 0 })
         }
         Cmd::Gui => launch_desktop(),
-        Cmd::Scan { root, out, no_hash, force_rehash, fast, symlinks_direct, exclude, progress } => {
+        Cmd::Scan { root, out, no_hash, force_rehash, fast, symlinks_direct, os_excludes, dev_excludes, exclude, progress } => {
             if !root.is_dir() {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
             }
-            let sopt = scan::ScanOptions { hash: !no_hash, force_rehash, sampled: fast, symlinks_direct, filter: filter::PathFilter::build(&[], &exclude) };
+            let sopt = scan::ScanOptions { hash: !no_hash, force_rehash, sampled: fast, symlinks_direct, filter: filter::PathFilter::build_full_opt(&[], &exclude, &[], &os_excludes, dev_excludes) };
             let bar = |p: scan::ScanProgress| {
                 let pct = if p.bytes_total > 0 { p.bytes_done * 100 / p.bytes_total } else { 100 };
                 eprint!("\r{} {:>3}%  {}/{}  {:.1} MiB/s   ", p.phase, pct,

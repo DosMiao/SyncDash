@@ -9,7 +9,7 @@ use std::path::Path;
 
 /// 严谨级 → 扫描参数：quick（不 hash）| fast（抽样摘要）| standard（hash+缓存）| paranoid（全量重 hash）
 pub fn scan_opts(job: &Job) -> scan::ScanOptions {
-    let filter = crate::filter::PathFilter::build_full(&job.include, &job.exclude, &job.deletable);
+    let filter = crate::filter::PathFilter::build_full_opt(&job.include, &job.exclude, &job.deletable, &job.os_excludes, job.dev_excludes);
     let (hash, force_rehash, sampled) = match job.rigor.as_str() {
         "quick" => (false, false, false),
         "fast" => (true, false, true),
@@ -354,6 +354,13 @@ pub fn compare_remote_job_detailed(
         "fast" => scan_args.push("--fast".into()),
         "paranoid" => scan_args.push("--force-rehash".into()),
         _ => {}
+    }
+    if job.dev_excludes {
+        scan_args.push("--dev-excludes".into());
+    }
+    if job.os_excludes != "auto" {
+        scan_args.push("--os-excludes".into());
+        scan_args.push(job.os_excludes.clone());
     }
     for ex in &job.exclude {
         scan_args.push("--exclude".into());

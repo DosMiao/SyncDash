@@ -18,6 +18,12 @@ pub struct Header {
     pub duration_ms: u64,
     pub entry_count: u64,
     pub hashed: bool,
+    /// 被过滤器排除的目录数（其下整棵子树都没进表）——排除必须可见，绝不静默
+    #[serde(default)]
+    pub excluded_dirs: u64,
+    /// 被过滤器排除的文件数
+    #[serde(default)]
+    pub excluded_files: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

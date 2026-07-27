@@ -83,6 +83,12 @@ pub struct PlanHeader {
     pub source_entries: u64,
     #[serde(default)]
     pub target_entries: u64,
+    /// 两侧被过滤器排除的条目数（目录+文件）。排除必须可见：界面据此明示
+    /// "有多少东西没参与比对"，绝不允许"两侧一致 ✓"背后藏着被吞掉的树。
+    #[serde(default)]
+    pub source_excluded: u64,
+    #[serde(default)]
+    pub target_excluded: u64,
 }
 
 pub struct Plan {
@@ -1003,6 +1009,8 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
             conflict_count,
             source_entries: source.entries.len() as u64,
             target_entries: target.entries.len() as u64,
+            source_excluded: source.header.excluded_dirs + source.header.excluded_files,
+            target_excluded: target.header.excluded_dirs + target.header.excluded_files,
         },
         ops,
     }
@@ -1019,6 +1027,7 @@ mod tests {
                 schema: SCHEMA, kind: "snapshot".into(), root: "/r".into(), host: "h".into(),
                 os: os.into(), scanned_at_ms: 0, duration_ms: 0,
                 entry_count: entries.len() as u64, hashed: true,
+                excluded_dirs: 0, excluded_files: 0,
             },
             entries,
         }

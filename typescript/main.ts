@@ -26,7 +26,7 @@ interface OpDto {
 interface SideMeta { size: number; mtime_ms: number }
 interface RowMeta { src: SideMeta | null; dst: SideMeta | null }
 interface PlanDto {
-  header: { mode: string; source_root: string; target_root: string; op_count: number; conflict_count: number; source_entries: number; target_entries: number };
+  header: { mode: string; source_root: string; target_root: string; op_count: number; conflict_count: number; source_entries: number; target_entries: number; source_excluded?: number; target_excluded?: number };
   ops: OpDto[];
   reversed: (OpDto | null)[];
   /// 与 ops 一一对应的两侧实测 size/mtime（Rust 侧 compare::evidence 产出）
@@ -38,7 +38,7 @@ interface ApplyDto { done: number; skipped: number; errors: number; bytes_copied
 /// M5：编辑器用的完整 Job（与 Rust config::Job 的 serde 形状一一对应）
 interface JobFull {
   mode: string; source: string; target: string; archive?: string | null;
-  include: string[]; exclude: string[]; no_hash: boolean; rigor: string;
+  include: string[]; exclude: string[]; no_hash: boolean; rigor: string; os_excludes: string; dev_excludes: boolean;
   case_sensitive: boolean; symlinks: string; versioning: boolean;
   remote_host?: string | null; remote_root?: string | null; remote_exe?: string | null;
   require_marker: boolean; min_free_pct: number; max_delete_ratio: number;
@@ -636,8 +636,12 @@ function renderCounts() {
   if (vis < tot) parts.push(`隐藏 ${tot - vis} 不执行`);
   parts.push(`已扫描 ${h.source_entries.toLocaleString()} ⇄ ${h.target_entries.toLocaleString()}`);
   parts.push(`相同 ${(plan.equal_count ?? 0).toLocaleString()}`);
+  // 排除永远明示——绝不允许"两侧一致 ✓"背后藏着被过滤器吞掉的树
+  const exS = h.source_excluded ?? 0, exT = h.target_excluded ?? 0;
+  if (exS + exT > 0) parts.push(`⚠ 已排除 ${exS.toLocaleString()} ⇄ ${exT.toLocaleString()}`);
   el.textContent = parts.join(' · ');
-  el.title = `计划 ${tot} 项；两侧相同 ${(plan.equal_count ?? 0).toLocaleString()} 个文件（${humanSize(plan.equal_bytes ?? 0)}）`;
+  el.title = `计划 ${tot} 项；两侧相同 ${(plan.equal_count ?? 0).toLocaleString()} 个文件（${humanSize(plan.equal_bytes ?? 0)}）` +
+    (exS + exT > 0 ? `\n⚠ 过滤器（含内置默认排除，如 .git/node_modules）排除了 source ${exS} / target ${exT} 个条目——它们完全不参与比对与执行。要连它们一起同步：编辑任务，关掉"内置默认排除"。` : '');
 }
 
 function renderSortMarks() {
@@ -885,7 +889,9 @@ const ED_FIELDS: FSpec[] = [
   { key: 'require_marker', label: '要求 .syncdash-root 标记', kind: 'bool', group: '守护' },
   { key: 'min_free_pct', label: '最低空闲盘比例（0.01=1%）', kind: 'num' },
   { key: 'max_delete_ratio', label: '删除占比闸门（0.5=50%）', kind: 'num' },
-  { key: 'include', label: 'include（每行一条）', kind: 'lines', group: '过滤', wide: true },
+  { key: 'os_excludes', label: '系统垃圾排除预设', kind: 'select', opts: ['auto', 'windows', 'mac', 'off'], group: '过滤', hint: 'auto = Windows+Mac 两份都排（$RECYCLE.BIN / System Volume Information / .DS_Store / .Spotlight…）；跨机同步两边都要防。排除量在状态条"⚠ 已排除"明示，绝不静默' },
+  { key: 'dev_excludes', label: '排除开发产物（.git/node_modules/target/build…）', kind: 'bool', hint: '默认关——.git 也是正常文件。代码同步任务打开；数据备份/镜像盘保持关' },
+  { key: 'include', label: 'include（每行一条）', kind: 'lines', wide: true },
   { key: 'exclude', label: 'exclude（每行一条；! 开头 = 例外）', kind: 'lines', wide: true },
   { key: 'deletable', label: 'deletable（删父目录可连带删）', kind: 'lines', wide: true },
   { key: 'remote_host', label: 'ssh 主机别名', kind: 'text', group: '远程（可选）' },
@@ -898,7 +904,7 @@ const ED_FIELDS: FSpec[] = [
 function defaultJob(): JobFull {
   return {
     mode: 'mirror', source: '', target: '', archive: null,
-    include: [], exclude: [], no_hash: false, rigor: 'standard',
+    include: [], exclude: [], no_hash: false, rigor: 'standard', os_excludes: 'auto', dev_excludes: false,
     case_sensitive: false, symlinks: 'exclude', versioning: false,
     remote_host: null, remote_root: null, remote_exe: null,
     require_marker: false, min_free_pct: 0.01, max_delete_ratio: 0.5,

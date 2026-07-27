@@ -11,7 +11,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// 临时文件前缀。扫描过滤器会排除它（见 filter::DEFAULT_EXCLUDES），
+/// 临时文件前缀。扫描过滤器会排除它（见 filter::SELF_EXCLUDES，无条件生效），
 /// 因此临时文件永远不会进快照表、不会被当成待同步内容。
 pub const TEMP_PREFIX: &str = ".syncdash.tmp.";
 

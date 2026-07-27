@@ -76,6 +76,14 @@ pub struct Job {
     /// SMB/WAN 上传是净赚，对称链路打平——所以默认关，按链路自行开。
     #[serde(default)]
     pub delta: bool,
+    /// 系统垃圾排除预设：auto（Win+Mac 两份都上，默认——跨机同步两边都要防）| windows | mac | off。
+    /// 排除量永远显示在界面"⚠ 已排除"里，绝不静默
+    #[serde(default = "default_os_excludes")]
+    pub os_excludes: String,
+    /// 排除可重建开发产物（.git/node_modules/target/build/dist/venv…）。
+    /// **默认关——.git 也是正常文件**；代码同步任务显式打开（gen-jobs 生成的 cs-* 已带）
+    #[serde(default)]
+    pub dev_excludes: bool,
     /// Copy/Update 相位的并行宽度（1 = 顺序）。缺省 4；clamp 1..=16
     #[serde(default)]
     pub parallel: Option<usize>,
@@ -113,6 +121,8 @@ impl Default for Job {
             sync_mode: false,
             deletable: Vec::new(),
             delta: false,
+            os_excludes: default_os_excludes(),
+            dev_excludes: false,
             parallel: None,
             watch_interval_secs: None,
             watch_auto_apply: false,
@@ -122,6 +132,9 @@ impl Default for Job {
 
 fn default_true() -> bool {
     true
+}
+fn default_os_excludes() -> String {
+    "auto".into()
 }
 fn default_min_free() -> f64 {
     0.01
@@ -167,7 +180,7 @@ impl Job {
             verify: self.rigor == "paranoid",
             versioning: self.versioning,
             fsync: self.fsync,
-            filter: Some(crate::filter::PathFilter::build_full(&self.include, &self.exclude, &self.deletable)),
+            filter: Some(crate::filter::PathFilter::build_full_opt(&self.include, &self.exclude, &self.deletable, &self.os_excludes, self.dev_excludes)),
             delta: self.delta,
             parallel: self.parallel.unwrap_or(4).clamp(1, 16),
         }
@@ -269,6 +282,10 @@ target = '\\host\share\dir'
 # on_conflict = "report"                # report（默认，只报告）| copy（败方存 .sync-conflict 副本）| newer
 # max_conflicts = 5                     # on_conflict="copy" 时每个文件保留几份副本（-1 不限）
 # sync_mode = false                     # 同步 unix 权限位（两侧都是 unix 才有意义）
+#
+# os_excludes = "auto"                  # 系统垃圾预设：auto（Win+Mac 都排，默认）| windows | mac | off
+# dev_excludes = false                  # 排除开发产物（.git/node_modules/target…）。默认关——.git 也是正常文件；
+#                                       # 代码同步任务设 true。排除量永远显示在界面"⚠ 已排除"，绝不静默
 #
 # --- 过滤器扩展 ---
 # exclude = ['*/*.log', '!*/audit.log'] # `!` 前缀 = 例外，压过其它 exclude

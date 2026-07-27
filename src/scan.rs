@@ -315,6 +315,10 @@ fn scan_impl(
     let mut walk_errors = 0u64;
     let mut walk_err_samples: Vec<String> = Vec::new();
 
+    // 排除必须可见：剪掉的目录/文件计数进快照头，界面明示"有多少没参与比对"。
+    // （教训：默认排除静默吞掉 .git，界面还写"两侧一致 ✓"——绝不允许再发生）
+    let excl_dirs = std::cell::Cell::new(0u64);
+    let excl_files = std::cell::Cell::new(0u64);
     let walker = walkdir::WalkDir::new(&walk_root)
         .follow_links(false)
         .into_iter()
@@ -324,15 +328,23 @@ fn scan_impl(
             }
             let rel = e
                 .path()
-                .strip_prefix(root)
+                .strip_prefix(&walk_root)
                 .unwrap_or(e.path())
                 .to_string_lossy()
                 .replace('\\', "/");
             if e.file_type().is_dir() {
                 let (pass, child_might_match) = opt.filter.pass_dir(&rel);
-                pass || child_might_match
+                let keep = pass || child_might_match;
+                if !keep {
+                    excl_dirs.set(excl_dirs.get() + 1); // 整棵子树被剪
+                }
+                keep
             } else {
-                opt.filter.pass_file(&rel)
+                let keep = opt.filter.pass_file(&rel);
+                if !keep {
+                    excl_files.set(excl_files.get() + 1);
+                }
+                keep
             }
         });
 
@@ -596,6 +608,8 @@ fn scan_impl(
             duration_ms: t0.elapsed().as_millis() as u64,
             entry_count: entries.len() as u64,
             hashed: opt.hash,
+            excluded_dirs: excl_dirs.get(),
+            excluded_files: excl_files.get(),
         },
         entries,
     })

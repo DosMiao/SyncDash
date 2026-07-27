@@ -102,6 +102,8 @@ pub fn gen_jobs(source_root: &Path, target_root: &Path, mode: &str, rigor: &str,
             case_sensitive: false,
             symlinks: "exclude".into(),
             versioning: false,
+            // 代码领地：开发产物排除显式开——代码经 git 走，.git/node_modules 不参与文件同步
+            dev_excludes: true,
             remote_host: remote.map(|r| r.host.clone()),
             remote_root: remote.map(|r| format!("{}/{}", r.root_base.trim_end_matches('/'), rel)),
             remote_exe: remote.and_then(|r| r.exe.clone()),

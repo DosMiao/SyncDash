@@ -190,20 +190,34 @@ fn parse_phrase(phrase: &str, set: &mut MaskSet) {
     }
 }
 
-/// 与 CodeSync/FFS 口径一致的默认排除（垃圾 + 可重建物 + 本工具自身文件）
-pub const DEFAULT_EXCLUDES: &[&str] = &[
-    "*/.git/", "*/node_modules/", "*/target/", "*/build/", "*/dist/", "*/__pycache__/",
-    "*/.venv/", "*/venv/", "*/worktrees/", "*/.Spotlight-V100/", "*/.fseventsd/",
-    "*/.Trashes/", "*/.TemporaryItems/", "*/.DocumentRevisions-V100/", "*/$RECYCLE.BIN/",
-    "*/System Volume Information/", "*/.syncdash/", "*/.version_syncDash/",
-    "*/.DS_Store", "*/._*", "*/Thumbs.db", "*/desktop.ini",
-    "*/sync.ffs_db", "*/sync.ffs_lock", "*/.syncdash.lock",
-    "*/*.recovery", "*/*.status",
+/// 排除分层。教训（用户原话级）：**同步工具最重要的是真实性**——把 `.git` 这种正常
+/// 文件树塞进"默认排除"并静默生效，会让"两侧一致 ✓"变成谎言。因此：
+/// - `SELF_*`：本工具自身元数据，无条件排除（锁/标记/临时件/版本库参与同步会破坏自身语义）
+/// - `OS_EXCLUDES_*`：系统级垃圾，按平台预设（auto = Win+Mac 两份都上，跨机同步两边都要防；可关）
+/// - `DEV_EXCLUDES`：可重建的开发产物，**不是默认**——代码同步任务显式 `dev_excludes = true`
+/// 且无论哪档，被排除的数量都在界面"⚠ 已排除"里明示，绝不静默。
+pub const SELF_EXCLUDES: &[&str] = &[
+    "*/.syncdash/", "*/.version_syncDash/", "*/.syncdash.lock",
     // 原子落盘的中间产物：永远不该进快照表，更不该被当成待同步内容
     "*/.syncdash.tmp.*",
     // 挂载点标记：它证明的是**这一侧**的数据真的在。一旦被同步过去，
     // 没挂载的空目录也会凭空长出标记，闸门就白设了（syncthing 同样把 .stfolder 列为 internal）。
     "*/.syncdash-root",
+];
+
+pub const OS_EXCLUDES_WINDOWS: &[&str] = &[
+    "*/System Volume Information/", "*/$RECYCLE.BIN/", "*/RECYCLE?/", "*/Recovery/",
+    "*/Thumbs.db", "*/desktop.ini",
+];
+
+pub const OS_EXCLUDES_MAC: &[&str] = &[
+    "*/.Spotlight-V100/", "*/.fseventsd/", "*/.Trashes/", "*/.TemporaryItems/",
+    "*/.DocumentRevisions-V100/", "*/.DS_Store", "*/._*",
+];
+
+pub const DEV_EXCLUDES: &[&str] = &[
+    "*/.git/", "*/node_modules/", "*/target/", "*/build/", "*/dist/", "*/__pycache__/",
+    "*/.venv/", "*/venv/", "*/worktrees/", "*/sync.ffs_db", "*/sync.ffs_lock",
 ];
 
 #[derive(Clone)]
@@ -226,8 +240,21 @@ impl PathFilter {
         Self::build_full(includes, extra_excludes, &[])
     }
 
-    /// 完整构造：额外给一份 `deletable` 列表。
+    /// 完整构造（旧签名）：系统垃圾 auto、开发产物**关**——`.git` 不再是默认排除。
     pub fn build_full(includes: &[String], extra_excludes: &[String], deletables: &[String]) -> PathFilter {
+        Self::build_full_opt(includes, extra_excludes, deletables, "auto", false)
+    }
+
+    /// `os_excludes`: "auto"（Win+Mac 两份系统垃圾预设，默认）| "windows" | "mac" | "off"；
+    /// `dev_excludes`: 排除可重建开发产物（.git/node_modules/…），代码同步任务显式开。
+    /// SELF_EXCLUDES 无条件生效。
+    pub fn build_full_opt(
+        includes: &[String],
+        extra_excludes: &[String],
+        deletables: &[String],
+        os_excludes: &str,
+        dev_excludes: bool,
+    ) -> PathFilter {
         let mut inc = MaskSet::default();
         if includes.is_empty() {
             parse_phrase("*", &mut inc);
@@ -239,8 +266,31 @@ impl PathFilter {
         let mut exc = MaskSet::default();
         let mut exn = MaskSet::default();
         let mut blocks_pruning = false;
-        for p in DEFAULT_EXCLUDES {
+        for p in SELF_EXCLUDES {
             parse_phrase(p, &mut exc);
+        }
+        match os_excludes {
+            "off" => {}
+            "windows" => {
+                for p in OS_EXCLUDES_WINDOWS {
+                    parse_phrase(p, &mut exc);
+                }
+            }
+            "mac" => {
+                for p in OS_EXCLUDES_MAC {
+                    parse_phrase(p, &mut exc);
+                }
+            }
+            _ => {
+                for p in OS_EXCLUDES_WINDOWS.iter().chain(OS_EXCLUDES_MAC) {
+                    parse_phrase(p, &mut exc);
+                }
+            }
+        }
+        if dev_excludes {
+            for p in DEV_EXCLUDES {
+                parse_phrase(p, &mut exc);
+            }
         }
         for p in extra_excludes {
             match p.trim().strip_prefix('!') {
@@ -359,13 +409,28 @@ mod tests {
 
     #[test]
     fn default_excludes_work() {
+        // 新分层：默认 = SELF + OS(auto)；开发产物（.git/node_modules）**不再是默认**
         let pf = f(&[], &[]);
-        assert!(!pf.pass_file("a/.DS_Store"));
+        assert!(!pf.pass_file("a/.DS_Store"), "mac junk excluded by auto preset");
         assert!(!pf.pass_file(".DS_Store")); // 根级也被 */x 双注册命中
-        assert!(!pf.pass_dir("proj/node_modules").0);
-        assert!(!pf.pass_dir("proj/node_modules").1); // 不下钻
-        assert!(!pf.pass_file("proj/node_modules/x/y.js"));
+        assert!(!pf.pass_file("a/Thumbs.db"), "windows junk excluded by auto preset");
+        assert!(!pf.pass_file("x/.syncdash-root"), "SELF metadata always excluded");
+        assert!(pf.pass_dir("proj/.git").0, ".git is a NORMAL tree by default now");
+        assert!(pf.pass_file("proj/node_modules/x/y.js"), "dev artifacts sync by default");
         assert!(pf.pass_file("proj/src/main.rs"));
+        // dev_excludes = true：代码同步任务的显式选择
+        let pfd = PathFilter::build_full_opt(&[], &[], &[], "auto", true);
+        assert!(!pfd.pass_dir("proj/.git").0);
+        assert!(!pfd.pass_dir("proj/node_modules").0);
+        assert!(!pfd.pass_dir("proj/node_modules").1); // 不下钻
+        // os_excludes = "off"：连系统垃圾都放行，但 SELF 仍然无条件排除
+        let pfo = PathFilter::build_full_opt(&[], &[], &[], "off", false);
+        assert!(pfo.pass_file("a/Thumbs.db"));
+        assert!(!pfo.pass_file("x/.syncdash.lock"), "SELF survives os=off");
+        // 平台单选
+        let pfw = PathFilter::build_full_opt(&[], &[], &[], "windows", false);
+        assert!(!pfw.pass_file("a/Thumbs.db"));
+        assert!(pfw.pass_file("a/.DS_Store"), "windows preset leaves mac names alone");
     }
 
     #[test]
@@ -406,11 +471,11 @@ mod tests {
 
     #[test]
     fn anchored_exception_keeps_directory_pruning() {
-        // 锚定例外（以 / 开头）不影响剪枝：node_modules 依然不下钻
-        let pf = f(&[], &["!/keep/this.txt"]);
+        // 锚定例外（以 / 开头）不影响剪枝：被排除目录依然不下钻（用 dev 档拿到排除项）
+        let pf = PathFilter::build_full_opt(&[], &["!/keep/this.txt".into()], &[], "auto", true);
         assert!(!pf.pass_dir("proj/node_modules").1, "anchored ! must not disable pruning");
         // 非锚定例外会让被排除目录重新可下钻（代价换能力，与 gitignore 同样的取舍）
-        let pf2 = f(&[], &["!*/keep.txt"]);
+        let pf2 = PathFilter::build_full_opt(&[], &["!*/keep.txt".into()], &[], "auto", true);
         assert!(pf2.pass_dir("proj/node_modules").1, "unanchored ! must allow descending");
     }
 
