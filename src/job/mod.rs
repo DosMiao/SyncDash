@@ -323,6 +323,18 @@ impl Job {
         }
     }
 
+    /// The write-side capability query (see `guard::cap_report_write`)
+    pub fn write_caps_query(&self, src_local: bool, tgt_local: bool) -> crate::pipeline::guard::WriteCapsQuery {
+        crate::pipeline::guard::WriteCapsQuery {
+            fsync: self.fsync,
+            verify: self.rigor_resolved().verify_writes,
+            versioning: self.versioning,
+            delta: self.delta,
+            src_local,
+            tgt_local,
+        }
+    }
+
     pub fn guards(&self, acknowledged: bool) -> crate::pipeline::guard::Guards {
         crate::pipeline::guard::Guards {
             require_marker: self.require_marker,

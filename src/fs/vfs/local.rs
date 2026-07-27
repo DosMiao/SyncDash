@@ -312,8 +312,45 @@ impl Vfs for LocalVfs {
     }
 
     fn free_space(&self) -> VfsResult<Option<(u64, u64)>> {
-        // Wired to the real statvfs/GetDiskFreeSpaceExW when preflight moves onto the
-        // VFS (M3); the direct guard path keeps its own probe until then.
-        Ok(None)
+        Ok(disk_space(&self.root))
+    }
+}
+
+/// (available, total) in bytes. Same implementation as the guard's path-based probe —
+/// duplicated here rather than referenced because `fs` sits below `pipeline` in the
+/// layer graph and must not reach up.
+#[cfg(windows)]
+fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lp_directory_name: *const u16,
+            lp_free_bytes_available_to_caller: *mut u64,
+            lp_total_number_of_bytes: *mut u64,
+            lp_total_number_of_free_bytes: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    if ok == 0 {
+        None
+    } else {
+        Some((avail, total))
+    }
+}
+
+#[cfg(unix)]
+fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        let unit = if st.f_frsize > 0 { st.f_frsize as u64 } else { st.f_bsize as u64 };
+        Some((st.f_bavail as u64 * unit, st.f_blocks as u64 * unit))
     }
 }

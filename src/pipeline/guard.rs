@@ -411,6 +411,135 @@ pub fn cap_report_read(
     r
 }
 
+/// What the write side of a run asks of its backends (`Job::write_caps_query` builds one).
+#[derive(Clone, Copy, Debug)]
+pub struct WriteCapsQuery {
+    pub fsync: bool,
+    pub verify: bool,
+    pub versioning: bool,
+    pub delta: bool,
+    pub src_local: bool,
+    pub tgt_local: bool,
+}
+
+/// The write-side capability comparison, evaluated against the ops that will actually
+/// run. Joins the read-side report before the apply stage starts.
+pub fn cap_report_write(
+    q: &WriteCapsQuery,
+    ops: &[Op],
+    src: &crate::fs::vfs::VfsCaps,
+    tgt: &crate::fs::vfs::VfsCaps,
+) -> CapReport {
+    use crate::fs::vfs::Support;
+    let mut r = CapReport::default();
+
+    for (side, side_tag, caps, local) in [
+        (Side::Source, "source", src, q.src_local),
+        (Side::Target, "target", tgt, q.tgt_local),
+    ] {
+        let side_ops: Vec<&Op> = ops
+            .iter()
+            .filter(|o| o.side == side && !matches!(o.action, Action::Conflict | Action::Note))
+            .collect();
+        if side_ops.is_empty() {
+            continue;
+        }
+
+        // A plan the backend cannot execute in full is a plan the table would lie about
+        if caps.unix_mode == Support::No && side_ops.iter().any(|o| o.action == Action::Chmod) {
+            r.items.push(CapItem {
+                feature: "chmod ops".into(),
+                side: side_tag.into(),
+                severity: CapSeverity::Block,
+                requested: format!("{} permission change(s) from the plan", side_ops.iter().filter(|o| o.action == Action::Chmod).count()),
+                actual: "backend has no unix modes".into(),
+                effect: "the plan cannot be executed in full — refusing rather than silently dropping ops".into(),
+            });
+        }
+        if caps.symlink == Support::No && side_ops.iter().any(|o| o.link.is_some()) {
+            r.items.push(CapItem {
+                feature: "symlink ops".into(),
+                side: side_tag.into(),
+                severity: CapSeverity::Block,
+                requested: "symlink creation from the plan".into(),
+                actual: "backend cannot create symlinks".into(),
+                effect: "the plan cannot be executed in full — refusing rather than silently dropping ops".into(),
+            });
+        }
+
+        if q.fsync {
+            match caps.fsync {
+                Support::No => r.items.push(CapItem {
+                    feature: "fsync=true".into(),
+                    side: side_tag.into(),
+                    severity: CapSeverity::NeedsAck,
+                    requested: "fsync before rename".into(),
+                    actual: "backend has no fsync".into(),
+                    effect: "renamed files may not be durable across a crash on this side — continuing means accepting the server's own caching".into(),
+                }),
+                Support::Unknown => r.items.push(CapItem {
+                    feature: "fsync=true".into(),
+                    side: side_tag.into(),
+                    severity: CapSeverity::NeedsAck,
+                    requested: "fsync before rename".into(),
+                    actual: "support unknown until tried".into(),
+                    effect: "fsync is attempted per file; where the server refuses it, that file counts as failed (set fsync=false to skip the attempt)".into(),
+                }),
+                Support::Yes => {}
+            }
+        }
+
+        if q.verify && caps.read_back == Support::No {
+            r.items.push(CapItem {
+                feature: "verify_writes".into(),
+                side: side_tag.into(),
+                severity: CapSeverity::NeedsAck,
+                requested: "re-read the staged file before rename".into(),
+                actual: "backend cannot read the staged file back".into(),
+                effect: "verification degrades to the copy-stream hash plus a length reconciliation — no on-disk read-back".into(),
+            });
+        }
+
+        let destructive = side_ops
+            .iter()
+            .any(|o| matches!(o.action, Action::Delete | Action::Update | Action::Copy));
+        if destructive && !local {
+            if q.versioning {
+                r.items.push(CapItem {
+                    feature: "versioning".into(),
+                    side: side_tag.into(),
+                    severity: CapSeverity::NeedsAck,
+                    requested: "rdelta version store on this root".into(),
+                    actual: "remote backend (no local version machinery)".into(),
+                    effect: "overwritten/deleted files are kept as whole files under <root>/.syncdash/trash/<run>/ instead — recover with any file browser; rdelta history does not accrue on this side".into(),
+                });
+            } else if !caps.local_trash {
+                r.items.push(CapItem {
+                    feature: "trash".into(),
+                    side: side_tag.into(),
+                    severity: CapSeverity::NeedsAck,
+                    requested: "deleted/overwritten files into the local trash".into(),
+                    actual: "the OS trash cannot reach this root".into(),
+                    effect: "originals move into <root>/.syncdash/trash/<run>/ ON THE REMOTE side (a rename, nothing downloaded) — not this machine's recycle bin".into(),
+                });
+            }
+        }
+    }
+
+    if q.delta && !(q.src_local && q.tgt_local) {
+        r.items.push(CapItem {
+            feature: "delta".into(),
+            side: "both".into(),
+            severity: CapSeverity::NeedsAck,
+            requested: "chunk-wise delta updates".into(),
+            actual: "a root lives on a remote backend".into(),
+            effect: "delta is disabled this run — updates rewrite files in full over the link".into(),
+        });
+    }
+
+    r
+}
+
 /// Space check: the writing side needs write_bytes, and must still have min_free_pct left afterwards.
 pub fn check_space(label: &str, root: &Path, need: u64, min_free_pct: f64, v: &mut Verdict) {
     if need == 0 {
