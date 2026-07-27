@@ -12,11 +12,11 @@
 //!    它能顺带拦住过滤器写错、source/target 写反、路径打错。
 
 use crate::compare::{Action, Op, Side};
+use crate::foundation::fmt::human_bytes;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// 领地标记文件名。与 CodeSync 生态的 `.ffs-sync` 并存，互不干扰。
-pub const MARKER_NAME: &str = ".syncdash-root";
+use crate::foundation::names::MARKER_NAME;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Marker {
@@ -56,7 +56,7 @@ pub fn write_marker(root: &Path, job: &str, note: &str) -> std::io::Result<(Path
     let m = Marker {
         job: job.to_string(),
         host: crate::table::host_name(),
-        created_at_ms: crate::table::now_ms(),
+        created_at_ms: crate::foundation::time::now_ms(),
         note: note.to_string(),
     };
     std::fs::write(&p, format!("{}\n", serde_json::to_string_pretty(&m)?))?;
@@ -101,21 +101,6 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
         // f_frsize 是"片段大小"，容量统计的正确单位；为 0 时退回 f_bsize
         let unit = if st.f_frsize > 0 { st.f_frsize as u64 } else { st.f_bsize as u64 };
         Some((st.f_bavail as u64 * unit, st.f_blocks as u64 * unit))
-    }
-}
-
-pub fn human_bytes(n: u64) -> String {
-    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = n as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < U.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", U[i])
     }
 }
 
@@ -201,10 +186,10 @@ impl Verdict {
     /// 把结论打印到 stderr，返回是否放行
     pub fn report(&self, tag: &str) -> bool {
         for w in &self.warnings {
-            eprintln!("[{tag}] warning: {w}");
+            crate::log_warn!("preflight", "[{tag}] warning: {w}");
         }
         for b in &self.blockers {
-            eprintln!("[{tag}] REFUSED: {b}");
+            crate::log_error!("preflight", "[{tag}] REFUSED: {b}");
         }
         self.ok()
     }
@@ -321,6 +306,7 @@ pub fn run_all(
 mod tests {
     use super::*;
     use crate::compare::{Action, Op, Side};
+use crate::foundation::fmt::human_bytes;
 
     fn op(side: Side, action: Action, path: &str, size: Option<u64>) -> Op {
         Op {

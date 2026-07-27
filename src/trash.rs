@@ -89,12 +89,10 @@ pub fn find(needle: &str) -> Vec<Found> {
             if !e.file_type().is_file() {
                 continue;
             }
-            let rel = e
-                .path()
-                .strip_prefix(&run.dir)
-                .unwrap_or(e.path())
-                .to_string_lossy()
-                .replace('\\', "/");
+            // walkdir 是从 run.dir 往下走的，strip_prefix 不会失败；
+            // 万一失败仍退回整条路径，与此前一致
+            let rel = crate::foundation::path::to_rel(e.path(), &run.dir)
+                .unwrap_or_else(|| e.path().to_string_lossy().replace('\\', "/"));
             if needle.is_empty() || rel.to_lowercase().contains(&needle) {
                 out.push(Found {
                     run_id: run.id.clone(),
@@ -135,15 +133,14 @@ pub fn restore(
         if !seen.insert(f.rel.clone()) {
             continue;
         }
-        let native = if cfg!(windows) { f.rel.replace('/', "\\") } else { f.rel.clone() };
-        let dst = dest_root.join(native);
+        let dst = crate::foundation::path::join_native(dest_root, &f.rel);
         if dst.exists() {
-            eprintln!("skip (exists): {}", dst.display());
+            crate::log_warn!("trash", "skip (exists): {}", dst.display());
             skipped += 1;
             continue;
         }
         if dry_run {
-            println!("WOULD RESTORE  {}  <-  {} ({})", dst.display(), f.run_id, crate::preflight::human_bytes(f.size));
+            println!("WOULD RESTORE  {}  <-  {} ({})", dst.display(), f.run_id, crate::foundation::fmt::human_bytes(f.size));
             skipped += 1;
             continue;
         }
@@ -164,7 +161,7 @@ pub fn restore(
                 restored += 1;
             }
             Err(e) => {
-                eprintln!("ERR  {}: {e}", dst.display());
+                crate::log_error!("trash", "ERR  {}: {e}", dst.display());
                 errors += 1;
             }
         }
@@ -237,7 +234,7 @@ pub fn prune(r: &Retention, dry_run: bool) -> std::io::Result<(u64, u64)> {
     if runs.is_empty() {
         return Ok((0, 0));
     }
-    let now_ms = crate::table::now_ms() as i64;
+    let now_ms = crate::foundation::time::now_ms() as i64;
     let mut doomed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // 1) 超龄
@@ -285,9 +282,9 @@ pub fn prune(r: &Retention, dry_run: bool) -> std::io::Result<(u64, u64)> {
             continue;
         }
         if dry_run {
-            println!("WOULD PRUNE  {}  ({} files, {})", run.id, run.files, crate::preflight::human_bytes(run.bytes));
+            println!("WOULD PRUNE  {}  ({} files, {})", run.id, run.files, crate::foundation::fmt::human_bytes(run.bytes));
         } else if let Err(e) = std::fs::remove_dir_all(&run.dir) {
-            eprintln!("ERR  prune {}: {e}", run.dir.display());
+            crate::log_error!("trash", "ERR  prune {}: {e}", run.dir.display());
             continue;
         }
         n += 1;

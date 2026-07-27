@@ -3,7 +3,8 @@
 //! - blake3 内容 hash，带缓存：(path,size,mtime) 未变则复用上次 hash，避免每次重算几十 GB
 //! - 缓存放在本机用户缓存目录，绝不污染被扫描的目录
 
-use crate::table::{now_ms, os_name, Entry, EntryKind, Header, Snapshot, SCHEMA};
+use crate::foundation::time::now_ms;
+use crate::table::{os_name, Entry, EntryKind, Header, Snapshot, SCHEMA};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};

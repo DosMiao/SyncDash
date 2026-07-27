@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-const LOCK_NAME: &str = ".syncdash.lock";
+use crate::foundation::names::LOCK_NAME;
 const WATCH_ROUNDS: u32 = 6; // 6 × 2s = 12s 观察窗
 const HEARTBEAT_MS: u64 = 4000;
 
@@ -58,14 +58,14 @@ impl RootLock {
                 }
             }
             if !vanished {
-                eprintln!("stale lock from {holder} on {} — taking over", root.display());
+                crate::log_warn!("lock", "stale lock from {holder} on {} — taking over", root.display());
                 let _ = std::fs::remove_file(&path);
             }
         }
         let info = LockInfo {
             host: crate::table::host_name(),
             pid: std::process::id(),
-            started_ms: crate::table::now_ms(),
+            started_ms: crate::foundation::time::now_ms(),
         };
         std::fs::write(&path, serde_json::to_string(&info)?)?;
 

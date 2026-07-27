@@ -11,12 +11,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// 临时文件前缀。扫描过滤器会排除它（见 filter::SELF_EXCLUDES，无条件生效），
-/// 因此临时文件永远不会进快照表、不会被当成待同步内容。
-pub const TEMP_PREFIX: &str = ".syncdash.tmp.";
-
-/// 超过这个年龄的遗留临时文件视为上次中断的残骸，可安全清理。
-pub const TEMP_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
+use crate::foundation::names::{TEMP_LIFETIME_MS, TEMP_PREFIX};
 
 /// 文件名（不含目录）是否是我们的临时文件
 pub fn is_temp_name(file_name: &str) -> bool {
@@ -25,8 +20,7 @@ pub fn is_temp_name(file_name: &str) -> bool {
 
 /// 相对路径（'/' 分隔）的末段是否是临时文件
 pub fn is_temp_rel(rel: &str) -> bool {
-    let base = rel.rsplit('/').next().unwrap_or(rel);
-    is_temp_name(base)
+    is_temp_name(crate::foundation::path::base_name(rel))
 }
 
 /// 暂存中的写入。Drop 时若未 commit 会自动删掉临时文件，
@@ -163,8 +157,7 @@ pub fn sweep_stale_temps(root: &Path, now_ms: i64) -> u64 {
             .metadata()
             .ok()
             .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| now_ms - d.as_millis() as i64 > TEMP_LIFETIME_MS)
+            .map(|t| now_ms - crate::foundation::time::systime_ms(t) > TEMP_LIFETIME_MS)
             .unwrap_or(false);
         if age_ok && std::fs::remove_file(item.path()).is_ok() {
             n += 1;

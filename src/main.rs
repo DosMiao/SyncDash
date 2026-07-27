@@ -225,6 +225,11 @@ enum Cmd {
         #[arg(long)]
         prune_days: Option<u64>,
     },
+    /// 集中日志（v0.10）：列运行 / 看某次的三份清单 / 清理 / 看目录在哪
+    Logs {
+        #[command(subcommand)]
+        cmd: LogsCmd,
+    },
     /// 本机回收目录：查看 / 找回 / 清理
     Trash {
         #[command(subcommand)]
@@ -256,6 +261,42 @@ enum Cmd {
         #[arg(short, long)]
         verbose: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum LogsCmd {
+    /// 列出运行（新→旧）。**含被中断的运行**——索引里没有、只剩目录的那些
+    List {
+        /// 只看这个任务（缺省 = 全部）
+        job: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
+    /// 看某次运行的产物。默认看事件流
+    Show {
+        /// 运行 id（= 目录名，`syncdash logs list` 里那一列）
+        run_id: String,
+        /// 报错清单
+        #[arg(long)]
+        errors: bool,
+        /// 执行清单（一行一 op 的实际结局）
+        #[arg(long)]
+        items: bool,
+        /// 计划清单（这次**打算**做什么——和执行清单一比就知道哪些没轮到）
+        #[arg(long)]
+        plan: bool,
+        #[arg(long, default_value_t = 5000)]
+        limit: usize,
+    },
+    /// 按保留策略清理（缺省读设置里的 keep_days / max_total_mb）
+    Prune {
+        #[arg(long)]
+        keep_days: Option<u64>,
+        #[arg(long)]
+        max_total_mb: Option<u64>,
+    },
+    /// 打印日志目录位置
+    Dir,
 }
 
 #[derive(Subcommand)]
@@ -306,6 +347,92 @@ fn write_out<F: Fn(&mut dyn std::io::Write) -> std::io::Result<()>>(out: &Option
     }
 }
 
+/// v0.10：集中日志的 CLI 门面。读取全部走 runlog 的公开 API，
+/// 路径逃逸防护在那一层（`artifact_lines` 只收纯文件名形态的 run_id）。
+fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
+    use syncdash::runlog;
+    match cmd {
+        LogsCmd::List { job, limit } => {
+            // history_merged 而非 history：被中断的运行只有目录、没有索引行，
+            // 而那恰恰是最需要被看见的一次
+            let rows = runlog::history_merged(job.as_deref(), limit);
+            if rows.is_empty() {
+                println!("no runs recorded yet (runs are logged when a job actually applies)");
+                return Ok(0);
+            }
+            let now = syncdash::foundation::time::now_ms() as i64;
+            for r in &rows {
+                let age_min = (now - r.ts_ms).max(0) / 60_000;
+                let age = if age_min < 60 {
+                    format!("{age_min}m ago")
+                } else if age_min < 48 * 60 {
+                    format!("{}h ago", age_min / 60)
+                } else {
+                    format!("{}d ago", age_min / 60 / 24)
+                };
+                // compare 行没有目录，用 "-" 占位，肉眼一列对齐
+                let state = if !r.finished {
+                    "  [INTERRUPTED]"
+                } else if r.cancelled {
+                    "  [cancelled]"
+                } else {
+                    ""
+                };
+                let what = match r.ops_found {
+                    Some(n) => format!("{n:>5} found"),
+                    None => format!("{:>5} done ", r.done),
+                };
+                println!(
+                    "{:>9}  {:<28} {:<16} {:<12} {what} {:>3} err {:>3} warn  {:>10}  {:>7.1}s{state}",
+                    age,
+                    r.run_id.as_deref().unwrap_or("-"),
+                    r.job,
+                    r.kind,
+                    r.errors,
+                    r.warnings,
+                    syncdash::foundation::fmt::human_bytes(r.bytes),
+                    r.elapsed_ms as f64 / 1000.0,
+                );
+            }
+            println!("\n{} run(s) · logs at {}", rows.len(), runlog::logs_dir().display());
+            Ok(0)
+        }
+        LogsCmd::Show { run_id, errors, items, plan, limit } => {
+            let which = if errors {
+                "errors"
+            } else if items {
+                "items"
+            } else if plan {
+                "plan"
+            } else {
+                "run"
+            };
+            let lines = runlog::artifact_lines(&run_id, which, limit);
+            if lines.is_empty() {
+                eprintln!("no {which} lines for run '{run_id}' (wrong id, or that artifact is empty)");
+                return Ok(1);
+            }
+            for l in lines {
+                println!("{l}");
+            }
+            Ok(0)
+        }
+        LogsCmd::Prune { keep_days, max_total_mb } => {
+            let cfg = syncdash::settings::load();
+            let days = keep_days.unwrap_or(cfg.keep_days);
+            let cap = max_total_mb.unwrap_or(cfg.max_total_mb);
+            let n = runlog::prune(days, cap);
+            println!("pruned {n} run(s)  (keep_days={days}, max_total_mb={cap})");
+            Ok(0)
+        }
+        LogsCmd::Dir => {
+            println!("{}", runlog::logs_dir().display());
+            println!("settings: {}", syncdash::settings::settings_path().display());
+            Ok(0)
+        }
+    }
+}
+
 fn main() {
     syncdash::scan::init_worker_pool();
     // CLI 有控制台：把库内诊断按原文接回 stderr——改造前的终端体验逐字不变。
@@ -313,7 +440,7 @@ fn main() {
     // `let _ = ...` 会当场 drop，sink 立刻被摘掉）。
     let cfg = syncdash::settings::load();
     let _g = cfg.mirror_stderr.then(|| {
-        syncdash::logging::install(Arc::new(syncdash::logging::StderrSink { min_level: cfg.level }))
+        syncdash::progress::install(Arc::new(syncdash::logging::StderrSink { min_level: cfg.level }))
     });
     let cli = Cli::parse();
     let code = match run_cli(cli) {
@@ -491,8 +618,8 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             let bar = |p: scan::ScanProgress| {
                 let pct = if p.bytes_total > 0 { p.bytes_done * 100 / p.bytes_total } else { 100 };
                 eprint!("\r{} {:>3}%  {}/{}  {:.1} MiB/s   ", p.phase, pct,
-                    syncdash::preflight::human_bytes(p.bytes_done),
-                    syncdash::preflight::human_bytes(p.bytes_total), p.mib_per_s);
+                    syncdash::foundation::fmt::human_bytes(p.bytes_done),
+                    syncdash::foundation::fmt::human_bytes(p.bytes_total), p.mib_per_s);
             };
             let snap = if progress {
                 let r = scan::scan_with_progress(&root, &sopt, Some(&bar))?;
@@ -590,7 +717,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             let list = syncdash::version::list(&root)?;
             if list.is_empty() {
-                println!("no versions under {}", root.join(syncdash::version::STORE_DIR).display());
+                println!("no versions under {}", root.join(syncdash::foundation::names::VERSION_STORE_DIR).display());
             } else {
                 for v in &list {
                     println!("{}  {}  ops={} preserved={} bytes={}", v.id, v.host, v.ops, v.preserved, v.bytes);
@@ -632,6 +759,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             println!("set `require_marker = true` in the job to have syncdash refuse to run without it");
             Ok(0)
         }
+        Cmd::Logs { cmd } => run_logs(cmd),
         Cmd::History { job, limit, prune_days } => {
             if let Some(days) = prune_days {
                 // 0 = 不叠总量闸门：`--prune-days N` 的语义就是"只按天"
@@ -643,7 +771,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 println!("no runs recorded yet (runs are logged when a job actually applies)");
                 return Ok(0);
             }
-            let now = syncdash::table::now_ms() as i64;
+            let now = syncdash::foundation::time::now_ms() as i64;
             for r in rows {
                 let age_min = (now - r.ts_ms).max(0) / 60_000;
                 let age = if age_min < 60 {
@@ -661,7 +789,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     r.done,
                     r.skipped,
                     r.errors,
-                    syncdash::preflight::human_bytes(r.bytes),
+                    syncdash::foundation::fmt::human_bytes(r.bytes),
                     r.elapsed_ms as f64 / 1000.0,
                     if r.cancelled { "  [cancelled]" } else { "" },
                 );
@@ -669,7 +797,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             Ok(0)
         }
         Cmd::Trash { cmd } => {
-            use syncdash::preflight::human_bytes;
+            use syncdash::foundation::fmt::human_bytes;
             match cmd {
                 TrashCmd::Runs => {
                     let runs = syncdash::trash::list_runs();

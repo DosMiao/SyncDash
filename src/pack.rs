@@ -8,20 +8,16 @@
 //! 默认 dry-run；路径安全：拒绝绝对路径与 `..` 分量。
 
 use crate::compare::{Action, Op, Plan, PlanHeader, Side};
-use crate::table::now_ms;
+// 路径安全判定与 `rel → 本地分隔符` 的真身都在 `foundation::path`。
+// 这里此前各抄了一份（`rel_is_safe`/`to_native`），与那边逐字相同。
+use crate::chunk::RecipeStep;
+use crate::foundation::path::{is_safe_rel, to_native};
+use crate::foundation::time::now_ms;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const PACK_VERSION: u32 = 2;
-
-/// 增量重组步骤：s = "base"（从 target 现有文件取 off..off+len）| "blob"（从增量 blob 取）
-#[derive(Serialize, Deserialize, Clone)]
-pub struct RecipeStep {
-    pub s: String,
-    pub off: u64,
-    pub len: u32,
-}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PayloadEntry {
@@ -62,17 +58,6 @@ pub struct Manifest {
     pub plan_blake3: String,
     pub payload: Vec<PayloadEntry>,
     pub payload_combined_blake3: String,
-}
-
-fn rel_is_safe(rel: &str) -> bool {
-    !rel.is_empty()
-        && !rel.starts_with('/')
-        && !rel.contains(':')
-        && !rel.split('/').any(|seg| seg == ".." || seg.is_empty())
-}
-
-fn to_native(rel: &str) -> String {
-    if cfg!(windows) { rel.replace('/', "\\") } else { rel.to_string() }
 }
 
 struct HashingReader<R: Read> {
@@ -116,10 +101,10 @@ pub fn pack(plan: &Plan, source_root: &Path, out: &Path, remote_chunks: Option<&
         .collect();
     let skipped_source_side = plan.ops.iter().filter(|o| o.side == Side::Source).count();
     if skipped_source_side > 0 {
-        eprintln!("note: {skipped_source_side} source-side op(s) not packed (they run locally, not on the remote)");
+        crate::log_info!("pack", "note: {skipped_source_side} source-side op(s) not packed (they run locally, not on the remote)");
     }
     for op in &target_ops {
-        if !rel_is_safe(&op.path) || op.from.as_deref().map(|f| !rel_is_safe(f)).unwrap_or(false) {
+        if !is_safe_rel(&op.path) || op.from.as_deref().map(|f| !is_safe_rel(f)).unwrap_or(false) {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("unsafe path in plan: {}", op.path)));
         }
     }
@@ -281,7 +266,7 @@ pub fn apply_pack(
     let _ = std::fs::remove_file(&tmp_plan);
 
     for op in &plan.ops {
-        if !rel_is_safe(&op.path) || op.from.as_deref().map(|f| !rel_is_safe(f)).unwrap_or(false) {
+        if !is_safe_rel(&op.path) || op.from.as_deref().map(|f| !is_safe_rel(f)).unwrap_or(false) {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("unsafe path in package plan: {}", op.path)));
         }
     }
@@ -324,14 +309,14 @@ pub fn apply_pack(
             let name = entry.path()?.to_string_lossy().into_owned();
             let Some(rel) = name.strip_prefix("payload/") else { continue };
             let rel = rel.to_string();
-            if !rel_is_safe(&rel) {
+            if !is_safe_rel(&rel) {
                 extract_errors += 1;
-                eprintln!("ERR  unsafe payload path skipped: {rel}");
+                crate::log_error!("pack", "ERR  unsafe payload path skipped: {rel}");
                 continue;
             }
             let Some(&meta) = by_rel.get(rel.as_str()) else {
                 extract_errors += 1;
-                eprintln!("ERR  payload not in manifest: {rel}");
+                crate::log_error!("pack", "ERR  payload not in manifest: {rel}");
                 continue;
             };
             let dst = staging.join(to_native(&rel));
@@ -345,20 +330,20 @@ pub fn apply_pack(
                 let got = blake3::hash(&blob).to_hex().to_string();
                 if meta.blob_hash.as_deref() != Some(got.as_str()) {
                     extract_errors += 1;
-                    eprintln!("ERR  delta blob hash mismatch: {rel}");
+                    crate::log_error!("pack", "ERR  delta blob hash mismatch: {rel}");
                     continue;
                 }
                 let base_path = target_root.join(to_native(&rel));
                 let mut bh = blake3::Hasher::new();
                 if bh.update_mmap_rayon(&base_path).is_err() {
                     extract_errors += 1;
-                    eprintln!("ERR  delta base missing/unreadable: {rel}");
+                    crate::log_error!("pack", "ERR  delta base missing/unreadable: {rel}");
                     continue;
                 }
                 let base_hex = bh.finalize().to_hex().to_string();
                 if meta.base_hash.as_deref() != Some(base_hex.as_str()) {
                     extract_errors += 1;
-                    eprintln!("ERR  delta base changed since chunk table: {rel} — rerun to repack");
+                    crate::log_error!("pack", "ERR  delta base changed since chunk table: {rel} — rerun to repack");
                     continue;
                 }
                 use std::io::{Seek, SeekFrom};
@@ -398,7 +383,7 @@ pub fn apply_pack(
                 let final_hex = fh.finalize().to_hex().to_string();
                 if !ok || final_hex != meta.hash {
                     extract_errors += 1;
-                    eprintln!("ERR  delta reconstruction failed: {rel}");
+                    crate::log_error!("pack", "ERR  delta reconstruction failed: {rel}");
                     let _ = std::fs::remove_file(&dst);
                 } else if verbose {
                     println!("OK   delta reconstructed: {rel} (blob {} B of {} B)", blob.len(), meta.size);
@@ -422,7 +407,7 @@ pub fn apply_pack(
                     }
                 } else {
                     extract_errors += 1;
-                    eprintln!("ERR  payload hash mismatch: {rel} (manifest {} vs {got})", meta.hash);
+                    crate::log_error!("pack", "ERR  payload hash mismatch: {rel} (manifest {} vs {got})", meta.hash);
                     let _ = std::fs::remove_file(&dst);
                 }
             }

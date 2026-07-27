@@ -219,7 +219,7 @@ pub fn local_node_id() -> ShortId {
             }
         }
     }
-    let seed = format!("{}|{}|{}", crate::table::host_name(), crate::table::now_ms(), std::process::id());
+    let seed = format!("{}|{}|{}", crate::table::host_name(), crate::foundation::time::now_ms(), std::process::id());
     let h = blake3::hash(seed.as_bytes());
     let mut b = [0u8; 8];
     b.copy_from_slice(&h.as_bytes()[..8]);

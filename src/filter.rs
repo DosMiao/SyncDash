@@ -196,15 +196,6 @@ fn parse_phrase(phrase: &str, set: &mut MaskSet) {
 /// - `OS_EXCLUDES_*`：系统级垃圾，按平台预设（auto = Win+Mac 两份都上，跨机同步两边都要防；可关）
 /// - `DEV_EXCLUDES`：可重建的开发产物，**不是默认**——代码同步任务显式 `dev_excludes = true`
 /// 且无论哪档，被排除的数量都在界面"⚠ 已排除"里明示，绝不静默。
-pub const SELF_EXCLUDES: &[&str] = &[
-    "*/.syncdash/", "*/.version_syncDash/", "*/.syncdash.lock",
-    // 原子落盘的中间产物：永远不该进快照表，更不该被当成待同步内容
-    "*/.syncdash.tmp.*",
-    // 挂载点标记：它证明的是**这一侧**的数据真的在。一旦被同步过去，
-    // 没挂载的空目录也会凭空长出标记，闸门就白设了（syncthing 同样把 .stfolder 列为 internal）。
-    "*/.syncdash-root",
-];
-
 pub const OS_EXCLUDES_WINDOWS: &[&str] = &[
     "*/System Volume Information/", "*/$RECYCLE.BIN/", "*/RECYCLE?/", "*/Recovery/",
     "*/Thumbs.db", "*/desktop.ini",
@@ -266,8 +257,8 @@ impl PathFilter {
         let mut exc = MaskSet::default();
         let mut exn = MaskSet::default();
         let mut blocks_pruning = false;
-        for p in SELF_EXCLUDES {
-            parse_phrase(p, &mut exc);
+        for p in crate::foundation::names::self_excludes() {
+            parse_phrase(&p, &mut exc);
         }
         match os_excludes {
             "off" => {}
