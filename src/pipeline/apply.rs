@@ -64,12 +64,12 @@ fn move_to_trash(file: &Path, rel: &str, trash: &Path) -> std::io::Result<()> {
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p)?;
     }
-    match std::fs::rename(file, &dest) {
+    match crate::fs::rename_force(file, &dest) {
         Ok(_) => Ok(()),
         Err(_) => {
-            // Cross-volume: fall back to copy+delete
+            // Cross-volume: fall back to copy+delete (force: git objects are read-only)
             std::fs::copy(file, &dest)?;
-            std::fs::remove_file(file)
+            crate::fs::remove_file_force(file)
         }
     }
 }
@@ -624,7 +624,11 @@ fn record(sh: &Shared, op: &Op, res: std::io::Result<()>, pp: &PhaseProgress, ac
         }
         Err(e) => {
             acc.errors.fetch_add(1, Ordering::Relaxed);
-            crate::log_error!("apply", "ERR  {label}: {e}");
+            // Plain stderr for the CLI. Deliberately NOT the log_error! macro: with the
+            // desktop's sink installed, the macro line arrives as a Log{Error} event on
+            // top of the structured Error event below — the panel then counts every
+            // failure twice (observed live: 2075 real errors listed as 4150).
+            eprintln!("ERR  {label}: {e}");
             pp.error(&op.path, &format!("{:?}", op.action), side, &e.to_string());
             ledger(ItemOutcome::Failed);
             pp.item_done(&op.path);
@@ -1046,6 +1050,40 @@ mod tests {
         assert_eq!((done, errors), (1, 0));
         assert_eq!(std::fs::read(t.join("f.txt")).unwrap(), b"new");
         assert_eq!(std::fs::read(tr.join("f.txt")).unwrap(), b"old", "old version must be recoverable");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn readonly_files_delete_and_update_like_git_objects() {
+        // Git marks loose objects r--r--r--; Windows refuses to delete read-only files,
+        // which a live sync surfaced as thousands of os-error-5 Delete failures.
+        // Both the delete and the overwrite lane must clear the attribute and proceed.
+        let base = tmproot("readonly");
+        let (s, t, tr) = (base.join("s"), base.join("t"), base.join("trash"));
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::create_dir_all(&t).unwrap();
+        std::fs::write(s.join("upd.bin"), b"new").unwrap();
+        for name in ["gone.bin", "upd.bin"] {
+            let p = t.join(name);
+            std::fs::write(&p, b"old").unwrap();
+            let mut perms = std::fs::metadata(&p).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&p, perms).unwrap();
+        }
+
+        let (done, _, errors) = apply(
+            &[op(Action::Delete, "gone.bin"), op(Action::Update, "upd.bin")],
+            &s,
+            &t,
+            &opts(tr.clone()),
+        );
+        assert_eq!(errors, 0, "read-only originals must not fail the ops");
+        assert_eq!(done, 2);
+        assert!(!t.join("gone.bin").exists(), "the read-only file must really be gone");
+        assert_eq!(std::fs::read(t.join("upd.bin")).unwrap(), b"new");
+        // and both originals are still recoverable from the trash
+        assert_eq!(std::fs::read(tr.join("gone.bin")).unwrap(), b"old");
+        assert_eq!(std::fs::read(tr.join("upd.bin")).unwrap(), b"old");
         let _ = std::fs::remove_dir_all(&base);
     }
 

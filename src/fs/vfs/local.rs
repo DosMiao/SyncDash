@@ -270,7 +270,8 @@ impl Vfs for LocalVfs {
     }
 
     fn remove_file(&self, rel: &str) -> VfsResult<()> {
-        Ok(std::fs::remove_file(self.abs(rel))?)
+        // force: read-only files (git objects) must still be deletable, as on unix
+        Ok(crate::fs::remove_file_force(&self.abs(rel))?)
     }
 
     fn remove_dir(&self, rel: &str) -> VfsResult<()> {

@@ -143,18 +143,18 @@ impl VersionWriter {
                 new_hash: Some(new_hash),
                 recipe: Some(recipe),
             });
-            std::fs::remove_file(old_abs)?;
+            crate::fs::remove_file_force(old_abs)?;
         } else {
             let old_hash = if is_link { String::new() } else { hash_file(old_abs)? };
             let fp = self.vdir.join("files").join(to_native(rel));
             if let Some(par) = fp.parent() {
                 std::fs::create_dir_all(par)?;
             }
-            match std::fs::rename(old_abs, &fp) {
+            match crate::fs::rename_force(old_abs, &fp) {
                 Ok(_) => {}
                 Err(_) => {
                     std::fs::copy(old_abs, &fp)?;
-                    std::fs::remove_file(old_abs)?;
+                    crate::fs::remove_file_force(old_abs)?;
                 }
             }
             self.bytes += old_size;
