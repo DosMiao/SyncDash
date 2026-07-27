@@ -9,67 +9,7 @@
   <link rel="stylesheet" href="/typescript/styles.css" />
 </head>
 <body>
-  <div id="pwin">
-    <div id="phead">
-      <span id="pjob">SyncDash</span>
-      <span id="pphase">Waiting for a run…</span>
-      <span id="ppct">—</span>
-    </div>
-
-    <div id="stagerows"></div>
-
-    <div id="graphs">
-      <div class="gwrap">
-        <span class="gcap">Data (cumulative bytes)</span>
-        <span class="grate" id="rate-bytes"></span>
-        <canvas id="cv-bytes"></canvas>
-      </div>
-      <div class="gwrap">
-        <span class="gcap">Items (cumulative count)</span>
-        <span class="grate" id="rate-items"></span>
-        <canvas id="cv-items"></canvas>
-      </div>
-      <div id="readouts">
-        <div class="rh"></div><div class="rh">Processed</div><div class="rh">Remaining</div>
-        <div class="rh">Items</div><div id="ro-items-done">—</div><div id="ro-items-left">—</div>
-        <div class="rh">Bytes</div><div id="ro-bytes-done">—</div><div id="ro-bytes-left">—</div>
-        <div class="rh">Time</div><div id="ro-elapsed">—</div><div id="ro-eta">—</div>
-      </div>
-      <div id="curfile"></div>
-    </div>
-
-    <div id="errsec">
-      <div id="errhead">
-        <span>⚠</span>
-        <span class="cnt-err" id="cnt-err"></span>
-        <span class="cnt-warn" id="cnt-warn"></span>
-        <span class="dim errtip">Click to expand</span>
-      </div>
-      <div id="errlist"></div>
-    </div>
-
-    <div id="countdown">
-      <span id="cdtext"></span>
-      <div id="cdbar"><div id="cdfill"></div></div>
-      <button class="btn" id="cd-cancel">Cancel</button>
-    </div>
-
-    <div id="controls">
-      <button class="btn" id="btn-pause" disabled>⏸ Pause</button>
-      <button class="btn" id="btn-stop" disabled>■ Stop</button>
-      <label class="dim chkline">
-        <input type="checkbox" id="chk-autoclose" /> Auto-close when finished
-      </label>
-      <span id="wfin">
-        When finished
-        <select id="sel-wfin">
-          <option value="none">Do nothing</option>
-          <option value="sleep">Sleep</option>
-          <option value="shutdown">Shut down</option>
-        </select>
-      </span>
-    </div>
-  </div>
-  <script type="module" src="/typescript/progress.ts"></script>
+  <div id="root"></div>
+  <script type="module" src="/typescript/progress/main.tsx"></script>
 </body>
 </html>
