@@ -18,6 +18,11 @@ pub fn systime_ms(t: std::time::SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
+/// Metadata mtime → unix milliseconds (0 when the platform cannot say).
+pub fn meta_mtime_ms(md: &std::fs::Metadata) -> i64 {
+    md.modified().map(systime_ms).unwrap_or(0)
+}
+
 /// days since 1970-01-01 → (year, month, day). Howard Hinnant's `civil_from_days`.
 ///
 /// `div_euclid`/`rem_euclid` rather than hand-written branches: negative days (before 1970) must
