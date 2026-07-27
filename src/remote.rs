@@ -1,7 +1,9 @@
-//! ssh 传输原语（v0.6）。全部走 `ssh -o BatchMode=yes`（免密已配好，密码提示直接失败不挂起）。
-//! 从 Rust 直接起进程，绕开 PowerShell 5.1 的嵌套引号地狱。
-//! 注：远端命令按 POSIX shell 引号规则拼接（mac/linux 远端）；Windows 远端（默认 shell 是
-//! PowerShell）暂不支持，列入 roadmap。
+//! ssh transport primitives (v0.6). Everything goes through `ssh -o BatchMode=yes` (key auth is already set up; a password prompt fails outright instead of hanging).
+//! Processes are spawned straight from Rust, sidestepping PowerShell 5.1's nested-quoting hell.
+//! Remote commands are quoted for the dialect the far side actually runs: `RemoteShell::from_os`
+//! picks PowerShell for a Windows remote (doubling embedded single quotes) and POSIX rules otherwise.
+//! Windows-as-remote landed in v0.7; the `chcp 65001` prelude there keeps non-ASCII paths from being
+//! mangled by the OEM code page.
 
 use std::io::{Error, ErrorKind};
 use std::path::Path;
@@ -13,12 +15,12 @@ fn ssh_base(host: &str) -> Command {
     c
 }
 
-/// POSIX 单引号包裹（内嵌单引号转义为 '\''）
+/// Wrap in POSIX single quotes (an embedded single quote is escaped as '\'')
 pub fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// 远端 shell 方言：Windows 的 OpenSSH 默认 shell 是 PowerShell
+/// Remote shell dialect: OpenSSH on Windows defaults to PowerShell
 #[derive(Clone, Copy, PartialEq)]
 pub enum RemoteShell {
     Posix,
@@ -31,7 +33,7 @@ impl RemoteShell {
     }
 }
 
-/// 按远端方言引号包裹（PowerShell 单引号内嵌单引号写成 ''）
+/// Quote for the remote dialect (inside PowerShell single quotes, an embedded single quote is written '')
 pub fn shq_for(shell: RemoteShell, s: &str) -> String {
     match shell {
         RemoteShell::Posix => shq(s),
@@ -39,9 +41,9 @@ pub fn shq_for(shell: RemoteShell, s: &str) -> String {
     }
 }
 
-/// 组装远端 syncdash 调用：
-/// - posix：exe 裸放（让 ~ 展开），参数逐个 shq
-/// - powershell：`chcp 65001 >$null; & '<exe>' 参数...`（先切 UTF-8 防中文路径被 OEM 码页搅坏）
+/// Assemble the remote syncdash invocation:
+/// - posix: exe left bare (so `~` expands), every argument through shq
+/// - powershell: `chcp 65001 >$null; & '<exe>' args...` (switch to UTF-8 first, or non-ASCII paths get mangled by the OEM code page)
 pub fn remote_cmd(shell: RemoteShell, exe: &str, args: &[String]) -> String {
     match shell {
         RemoteShell::Posix => {
@@ -63,7 +65,7 @@ pub fn remote_cmd(shell: RemoteShell, exe: &str, args: &[String]) -> String {
     }
 }
 
-/// 远端执行并捕获 stdout（stderr 直通本地终端）
+/// Run remotely and capture stdout (stderr passes straight through to the local terminal)
 pub fn ssh_capture(host: &str, cmd: &str) -> std::io::Result<Vec<u8>> {
     let out = ssh_base(host).arg(cmd).stderr(Stdio::inherit()).output()?;
     if !out.status.success() {
@@ -72,14 +74,14 @@ pub fn ssh_capture(host: &str, cmd: &str) -> std::io::Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// 远端执行，stdout/stderr 直通。返回是否成功。
+/// Run remotely with stdout/stderr passed straight through. Returns whether it succeeded.
 pub fn ssh_run(host: &str, cmd: &str) -> std::io::Result<bool> {
     let status = ssh_base(host).arg(cmd).status()?;
     Ok(status.success())
 }
 
-/// 远端执行命令并把本地文件接到它的 stdin（配远端 `syncdash recv` 用：
-/// Rust 读原始字节，双平台都不经过 shell 的文本管道，二进制可靠）
+/// Run a remote command with a local file wired to its stdin (pairs with the remote `syncdash recv`:
+/// Rust reads raw bytes, so on both platforms it never crosses the shell's text pipe — binary-safe)
 pub fn ssh_run_with_stdin(host: &str, cmd: &str, stdin_file: &Path) -> std::io::Result<()> {
     let f = std::fs::File::open(stdin_file)?;
     let mut child = ssh_base(host)

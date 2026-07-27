@@ -1,24 +1,24 @@
-//! FFS 语义的路径过滤器（移植自 FreeFileSync 14.10 base/path_filter.cpp，GPL 项目——
-//! 这里是按其语义的独立重写，不是抄代码）。语法与 FFS 完全兼容：
-//!   - 大小写不敏感；'/' 与 '\' 均可
-//!   - `*` 匹配任意串（可跨路径层级），`?` 匹配单字符（不跨层级）
-//!   - 尾部 `/` 或 `/*` = 目录（含其下全部内容）；尾部 `:` = 仅文件
-//!   - 开头 `/` = 相对 root；`*/abc` 同时命中任意层级与根级的 abc
-//!   - include 侧用"前缀可能命中"（matches_begin）决定目录是否值得下钻
+//! Path filter with FFS semantics (ported from FreeFileSync 14.10 base/path_filter.cpp, a GPL
+//! project — an independent rewrite of its semantics, not copied code). Fully FFS-compatible syntax:
+//!   - case-insensitive; both '/' and '\' accepted
+//!   - `*` matches any run (may cross path levels), `?` matches one character (never crosses a level)
+//!   - trailing `/` or `/*` = directory (and everything under it); trailing `:` = files only
+//!   - leading `/` = relative to root; `*/abc` hits abc at any level and at the root alike
+//!   - the include side uses "the prefix might match" (matches_begin) to decide if a dir is worth descending into
 //!
-//! FFS 语法之外的两处**超集**扩展（借 syncthing `lib/ignore/ignore.go` 之意，
-//! 粘进来的 FFS 规则行为完全不变）：
-//!   - exclude 项以 `!` 开头 = **例外**：命中即放行，压过其它 exclude
-//!     （syncthing 的 `!` 前缀，ignore.go:372）
-//!   - `deletable` 列表 = syncthing 的 `(?d)`（ignore.go:380）：这些东西不参与同步，
-//!     但删除父目录时允许连带删掉，解开"目录里有被过滤的文件 → 永远删不掉"的死结
+//! Two **superset** extensions beyond FFS syntax (in the spirit of syncthing `lib/ignore/ignore.go`;
+//! the behavior of the FFS rules pasted in here is entirely unchanged):
+//!   - an exclude entry starting with `!` = an **exception**: a hit lets it through, overriding every other exclude
+//!     (syncthing's `!` prefix, ignore.go:372)
+//!   - the `deletable` list = syncthing's `(?d)` (ignore.go:380): these do not take part in sync,
+//!     but may be deleted along with their parent dir, breaking the "a filtered file sits in the dir → it can never be deleted" deadlock
 
 use std::collections::HashSet;
 
 #[derive(Default, Clone)]
 struct Masks {
     wild: Vec<String>,
-    plain: HashSet<String>, // 无通配符的相对路径：常数时间查找（FFS 同款优化）
+    plain: HashSet<String>, // wildcard-free relative paths: constant-time lookup (the same trick FFS uses)
 }
 
 impl Masks {
@@ -53,7 +53,7 @@ impl Masks {
         }
     }
 
-    /// path 是否命中某个 mask 的开头（还差子路径）—— 用于决定是否值得继续下钻
+    /// Does path match the start of some mask (with a sub-path still to come) — decides whether descending is worthwhile
     fn matches_begin(&self, path: &str) -> bool {
         self.wild.iter().any(|m| mask_begin_wild(path, m))
             || self.plain.iter().any(|m| {
@@ -62,7 +62,7 @@ impl Masks {
     }
 }
 
-/// FFS matchesMask 的逐字节移植：`*` 跨 '/'，`?` 不跨
+/// Byte-for-byte port of FFS matchesMask: `*` crosses '/', `?` does not
 fn matches_mask(path: &str, mask: &str, allow_parent: bool) -> bool {
     fn go(p: &[u8], m: &[u8], allow_parent: bool) -> bool {
         let mut pi = 0usize;
@@ -84,7 +84,7 @@ fn matches_mask(path: &str, mask: &str, allow_parent: bool) -> bool {
                         mi += 1;
                     }
                     if mi == m.len() {
-                        return true; // mask 以 * 结尾
+                        return true; // mask ends with *
                     }
                     let c = m[mi];
                     mi += 1;
@@ -120,7 +120,7 @@ fn matches_mask(path: &str, mask: &str, allow_parent: bool) -> bool {
     go(path.as_bytes(), mask.as_bytes(), allow_parent)
 }
 
-/// path 只匹配 mask 的开头（FFS matchesMaskBegin<true>）
+/// path matches only the beginning of mask (FFS matchesMaskBegin<true>)
 fn mask_begin_wild(path: &str, mask: &str) -> bool {
     let p = path.as_bytes();
     let m = mask.as_bytes();
@@ -136,7 +136,7 @@ fn mask_begin_wild(path: &str, mask: &str) -> bool {
             b'*' => return true,
             c => {
                 if pi >= p.len() {
-                    return c == b'/' && m.len() - mi > 1; // 要求严格子路径
+                    return c == b'/' && m.len() - mi > 1; // a strict sub-path is required
                 }
                 if p[pi] != c {
                     return false;
@@ -170,9 +170,9 @@ fn parse_phrase(phrase: &str, set: &mut MaskSet) {
     }
     fn process_tail(t: &str, set: &mut MaskSet) {
         if let Some(stripped) = t.strip_suffix(':') {
-            set.file_masks.insert(stripped); // 仅文件
+            set.file_masks.insert(stripped); // files only
         } else if t.ends_with('/') {
-            set.folder_masks.insert(t.trim_end_matches('/')); // 仅目录（含内容）
+            set.folder_masks.insert(t.trim_end_matches('/')); // directory only (contents included)
         } else if let Some(stripped) = t.strip_suffix("/*") {
             set.folder_masks.insert(stripped);
         } else {
@@ -181,21 +181,21 @@ fn parse_phrase(phrase: &str, set: &mut MaskSet) {
         }
     }
     if let Some(tail) = norm.strip_prefix('/') {
-        process_tail(tail, set); // 根相对
+        process_tail(tail, set); // root-relative
     } else {
         process_tail(&norm, set);
         if let Some(tail) = norm.strip_prefix("*/") {
-            process_tail(tail, set); // FFS 双注册：`*/abc` 也命中根级 abc
+            process_tail(tail, set); // FFS double registration: `*/abc` also hits a root-level abc
         }
     }
 }
 
-/// 排除分层。教训（用户原话级）：**同步工具最重要的是真实性**——把 `.git` 这种正常
-/// 文件树塞进"默认排除"并静默生效，会让"两侧一致 ✓"变成谎言。因此：
-/// - `SELF_*`：本工具自身元数据，无条件排除（锁/标记/临时件/版本库参与同步会破坏自身语义）
-/// - `OS_EXCLUDES_*`：系统级垃圾，按平台预设（auto = Win+Mac 两份都上，跨机同步两边都要防；可关）
-/// - `DEV_EXCLUDES`：可重建的开发产物，**不是默认**——代码同步任务显式 `dev_excludes = true`
-/// 且无论哪档，被排除的数量都在界面"⚠ 已排除"里明示，绝不静默。
+/// Exclude tiers. The lesson (in the user's own words): **truthfulness is what matters most in a sync tool** —
+/// quietly folding a normal file tree like `.git` into "default excludes" turns "both sides match ✓" into a lie. Hence:
+/// - `SELF_*`: this tool's own metadata, excluded unconditionally (letting locks/markers/temp files/the archive take part in sync would break its own semantics)
+/// - `OS_EXCLUDES_*`: OS-level junk, per-platform presets (auto = both the Win and Mac sets, since cross-machine sync must guard both ends; can be switched off)
+/// - `DEV_EXCLUDES`: rebuildable dev artefacts, **not a default** — a code-sync job opts in with `dev_excludes = true`
+/// And under every tier, the number of excluded items is spelled out in the UI's "⚠ excluded"; never silently.
 pub const OS_EXCLUDES_WINDOWS: &[&str] = &[
     "*/System Volume Information/", "*/$RECYCLE.BIN/", "*/RECYCLE?/", "*/Recovery/",
     "*/Thumbs.db", "*/desktop.ini",
@@ -215,30 +215,30 @@ pub const DEV_EXCLUDES: &[&str] = &[
 pub struct PathFilter {
     include: MaskSet,
     exclude: MaskSet,
-    /// `!` 前缀的例外：命中即放行，压过 exclude
+    /// `!`-prefixed exceptions: a hit lets it through, overriding exclude
     except: MaskSet,
-    /// syncthing `(?d)` 同义：不同步，但删父目录时可连带删
+    /// Synonym for syncthing's `(?d)`: not synced, but may be deleted along with its parent dir
     deletable: MaskSet,
-    /// 存在非锚定（不以 `/` 开头）的例外时，被排除的目录不能再剪枝——
-    /// 因为例外可能藏在里面。锚定例外（`!/a/b/keep.log`）不影响剪枝。
+    /// When an unanchored exception (one not starting with `/`) exists, excluded directories can no
+    /// longer be pruned — the exception may be hiding inside. Anchored exceptions (`!/a/b/keep.log`) do not affect pruning.
     except_blocks_pruning: bool,
 }
 
 impl PathFilter {
-    /// include 为空 → 默认 `*`；exclude = 默认列表 + 追加项。语法即 FFS 语法
-    /// （外加 `!` 例外前缀）。
+    /// Empty include → defaults to `*`; exclude = the default list + the extra entries. The syntax
+    /// is FFS syntax (plus the `!` exception prefix).
     pub fn build(includes: &[String], extra_excludes: &[String]) -> PathFilter {
         Self::build_full(includes, extra_excludes, &[])
     }
 
-    /// 完整构造（旧签名）：系统垃圾 auto、开发产物**关**——`.git` 不再是默认排除。
+    /// Full constructor (old signature): OS junk on auto, dev artefacts **off** — `.git` is no longer a default exclude.
     pub fn build_full(includes: &[String], extra_excludes: &[String], deletables: &[String]) -> PathFilter {
         Self::build_full_opt(includes, extra_excludes, deletables, "auto", false)
     }
 
-    /// `os_excludes`: "auto"（Win+Mac 两份系统垃圾预设，默认）| "windows" | "mac" | "off"；
-    /// `dev_excludes`: 排除可重建开发产物（.git/node_modules/…），代码同步任务显式开。
-    /// SELF_EXCLUDES 无条件生效。
+    /// `os_excludes`: "auto" (both the Win and Mac OS-junk presets, the default) | "windows" | "mac" | "off";
+    /// `dev_excludes`: exclude rebuildable dev artefacts (.git/node_modules/…), switched on explicitly by code-sync jobs.
+    /// SELF_EXCLUDES always applies.
     pub fn build_full_opt(
         includes: &[String],
         extra_excludes: &[String],
@@ -305,15 +305,15 @@ impl PathFilter {
         PathFilter { include: inc, exclude: exc, except: exn, deletable: del, except_blocks_pruning: blocks_pruning }
     }
 
-    /// 该路径是否命中 `!` 例外
+    /// Does this path hit a `!` exception
     fn is_excepted(&self, path_upper: &str, parent: Option<&str>) -> bool {
         self.except.file_masks.matches(path_upper, false)
             || parent.map_or(false, |pp| self.except.folder_masks.matches(pp, true))
     }
 
-    /// rel 用 '/' 分隔、不带开头分隔符
+    /// rel is '/'-separated with no leading separator
     pub fn pass_file(&self, rel: &str) -> bool {
-        // 原子写的临时文件：任何情况下都不入表（不依赖模式匹配，避免用户改 exclude 时误开）
+        // Atomic-write temp files: never enter the table under any circumstances (not driven by mask matching, so editing exclude can't let them in by accident)
         if crate::atomic::is_temp_rel(rel) {
             return false;
         }
@@ -329,12 +329,12 @@ impl PathFilter {
             || parent.map_or(false, |pp| self.include.folder_masks.matches(pp, true))
     }
 
-    /// 返回 (目录本身是否入表, 子项是否可能命中——决定要不要下钻)
+    /// Returns (does the dir itself enter the table, might a child match — decides whether to descend)
     pub fn pass_dir(&self, rel: &str) -> (bool, bool) {
         let path = rel.to_uppercase();
         let excepted = self.except.folder_masks.matches(&path, true);
         if !excepted && self.exclude.folder_masks.matches(&path, true) {
-            // 目录被排除。有非锚定例外时仍要下钻——例外可能就藏在里面。
+            // Directory excluded. With an unanchored exception we still descend — the exception may be hiding inside.
             let child = self.except_blocks_pruning
                 && (self.except.file_masks.matches_begin(&path)
                     || self.except.folder_masks.matches_begin(&path));
@@ -348,8 +348,8 @@ impl PathFilter {
         (false, child)
     }
 
-    /// syncthing `(?d)`：删除父目录时这一项可以连带删掉，不算"目录非空"的阻塞物。
-    /// 临时文件天然可删（它们就是上次中断的残骸）。
+    /// syncthing `(?d)`: this item may be removed along with its parent dir; it does not count as a "dir not empty" blocker.
+    /// Temp files are inherently deletable (they are the debris of the last interrupted run).
     pub fn is_deletable(&self, rel: &str) -> bool {
         if crate::atomic::is_temp_rel(rel) {
             return true;
@@ -361,14 +361,14 @@ impl PathFilter {
     }
 }
 
-/// 界面"漏斗"用的即席匹配：**只按给定的掩码判定**，不掺任何内置档位
-/// （SELF_/OS_/DEV_ 三档一个都不加）、
-/// 也不套 include 白名单——它回答的是"这条路径命中用户此刻输入的掩码了吗"，
-/// 不是"这条路径该不该同步"。
+/// Ad-hoc matching for the UI's "funnel": **judged by the given masks alone**, with none of the
+/// built-in tiers mixed in (not one of the three SELF_/OS_/DEV_ tiers),
+/// and no include whitelist applied either — it answers "did this path hit the mask the user just typed",
+/// not "should this path be synced".
 ///
-/// 判定逻辑与 `pass_file` 里的 exclude 分支逐字同源（同一个 Masks::matches），
-/// 所以界面里试出来的掩码，写进任务的 exclude 后行为一致——这是这个函数存在的
-/// 全部理由：绝不让前端再写一份 glob。
+/// The decision logic is word-for-word the same as the exclude branch in `pass_file` (the very same Masks::matches),
+/// so a mask tried out in the UI behaves identically once written into a job's exclude — that is the
+/// entire reason this function exists: never let the frontend write a second glob implementation.
 pub fn mask_hits(masks: &[String], rels: &[String]) -> Vec<bool> {
     let mut set = MaskSet::default();
     for m in masks {
@@ -401,25 +401,25 @@ mod tests {
 
     #[test]
     fn default_excludes_work() {
-        // 新分层：默认 = SELF + OS(auto)；开发产物（.git/node_modules）**不再是默认**
+        // New tiers: default = SELF + OS(auto); dev artefacts (.git/node_modules) are **no longer default**
         let pf = f(&[], &[]);
         assert!(!pf.pass_file("a/.DS_Store"), "mac junk excluded by auto preset");
-        assert!(!pf.pass_file(".DS_Store")); // 根级也被 */x 双注册命中
+        assert!(!pf.pass_file(".DS_Store")); // the root level is hit too, via the */x double registration
         assert!(!pf.pass_file("a/Thumbs.db"), "windows junk excluded by auto preset");
         assert!(!pf.pass_file("x/.syncdash-root"), "SELF metadata always excluded");
         assert!(pf.pass_dir("proj/.git").0, ".git is a NORMAL tree by default now");
         assert!(pf.pass_file("proj/node_modules/x/y.js"), "dev artifacts sync by default");
         assert!(pf.pass_file("proj/src/main.rs"));
-        // dev_excludes = true：代码同步任务的显式选择
+        // dev_excludes = true: the explicit choice of a code-sync job
         let pfd = PathFilter::build_full_opt(&[], &[], &[], "auto", true);
         assert!(!pfd.pass_dir("proj/.git").0);
         assert!(!pfd.pass_dir("proj/node_modules").0);
-        assert!(!pfd.pass_dir("proj/node_modules").1); // 不下钻
-        // os_excludes = "off"：连系统垃圾都放行，但 SELF 仍然无条件排除
+        assert!(!pfd.pass_dir("proj/node_modules").1); // no descending
+        // os_excludes = "off": even OS junk passes, but SELF is still excluded unconditionally
         let pfo = PathFilter::build_full_opt(&[], &[], &[], "off", false);
         assert!(pfo.pass_file("a/Thumbs.db"));
         assert!(!pfo.pass_file("x/.syncdash.lock"), "SELF survives os=off");
-        // 平台单选
+        // A single platform
         let pfw = PathFilter::build_full_opt(&[], &[], &[], "windows", false);
         assert!(!pfw.pass_file("a/Thumbs.db"));
         assert!(pfw.pass_file("a/.DS_Store"), "windows preset leaves mac names alone");
@@ -430,19 +430,19 @@ mod tests {
         let pf = f(&["/Research/proj/models/"], &[]);
         assert!(pf.pass_file("Research/proj/models/a.mph"));
         assert!(!pf.pass_file("Research/proj/src/a.java"));
-        // 中间目录不入表但要下钻
+        // Intermediate dirs don't enter the table but must be descended into
         let (pass, child) = pf.pass_dir("Research");
         assert!(!pass && child);
         let (pass, child) = pf.pass_dir("Research/proj");
         assert!(!pass && child);
         assert!(pf.pass_dir("Research/proj/models").0);
-        assert!(!pf.pass_dir("Financial").1); // 无关目录不下钻
+        assert!(!pf.pass_dir("Financial").1); // unrelated dirs are not descended into
     }
 
     #[test]
     fn wildcards_and_case() {
         let pf = f(&[], &["*/*.tmp", "*/CacheDir/"]);
-        assert!(!pf.pass_file("a/b/x.TMP")); // 大小写不敏感
+        assert!(!pf.pass_file("a/b/x.TMP")); // case-insensitive
         assert!(!pf.pass_file("z/cachedir/deep/file.bin"));
         assert!(pf.pass_file("z/cachedir2/file.bin"));
     }
@@ -451,7 +451,7 @@ mod tests {
     fn question_mark_no_sep() {
         let pf = f(&[], &["*/v?/"]);
         assert!(!pf.pass_file("a/v1/x"));
-        assert!(pf.pass_file("a/v12/x")); // ? 只吃一个字符
+        assert!(pf.pass_file("a/v12/x")); // ? eats exactly one character
     }
 
     #[test]
@@ -463,10 +463,10 @@ mod tests {
 
     #[test]
     fn anchored_exception_keeps_directory_pruning() {
-        // 锚定例外（以 / 开头）不影响剪枝：被排除目录依然不下钻（用 dev 档拿到排除项）
+        // Anchored exceptions (leading /) don't affect pruning: excluded dirs are still not descended into (the dev tier gives us an exclude to test against)
         let pf = PathFilter::build_full_opt(&[], &["!/keep/this.txt".into()], &[], "auto", true);
         assert!(!pf.pass_dir("proj/node_modules").1, "anchored ! must not disable pruning");
-        // 非锚定例外会让被排除目录重新可下钻（代价换能力，与 gitignore 同样的取舍）
+        // An unanchored exception makes excluded dirs descendable again (cost traded for capability — the same trade-off gitignore makes)
         let pf2 = PathFilter::build_full_opt(&[], &["!*/keep.txt".into()], &[], "auto", true);
         assert!(pf2.pass_dir("proj/node_modules").1, "unanchored ! must allow descending");
     }
@@ -484,13 +484,13 @@ mod tests {
         let pf = PathFilter::build_full(&[], &[], &["*/node_modules/".to_string()]);
         assert!(pf.is_deletable("proj/node_modules/x/y.js"));
         assert!(!pf.is_deletable("proj/src/main.rs"));
-        // 原子写的残骸天然可删
+        // Atomic-write debris is inherently deletable
         assert!(pf.is_deletable("proj/.syncdash.tmp.a.123"));
     }
 
     #[test]
     fn mount_marker_is_never_synced() {
-        // 标记被同步过去 = 没挂载的空目录也会长出标记 = 闸门失效
+        // If the marker gets synced across = an unmounted empty dir grows a marker too = the gate is defeated
         let pf = f(&[], &[]);
         assert!(!pf.pass_file(".syncdash-root"));
         assert!(!pf.pass_file("nested/.syncdash-root"));
@@ -504,18 +504,18 @@ mod tests {
                 &p.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             )
         };
-        // 空掩码 = 什么都不隐藏
+        // Empty masks = nothing is hidden
         assert_eq!(m(&[], &["a/b.txt"]), vec![false]);
-        // 扩展名（右键"排除此类型"生成的形状）
+        // Extension (the shape produced by right-click "exclude this type")
         assert_eq!(m(&["*/*.log"], &["a/x.log", "x.log", "a/x.txt"]), vec![true, true, false]);
-        // 锚定目录（右键"排除此目录"生成的形状）：只命中那一个目录，不是同名的所有目录
+        // Anchored directory (the shape produced by right-click "exclude this directory"): hits only that one dir, not every dir with the same name
         assert_eq!(
             m(&["/a/logs/"], &["a/logs/x", "a/logs/deep/y", "b/logs/x", "a/log/x"]),
             vec![true, true, false, false]
         );
-        // 默认排除**不该**混进来：漏斗只回答"命中你输入的掩码了吗"
+        // The default excludes must **not** be mixed in: the funnel only answers "did it hit the mask you typed"
         assert_eq!(m(&["*/*.log"], &["proj/node_modules/a.js", "proj/.git/index"]), vec![false, false]);
-        // 大小写不敏感、反斜杠等价
+        // Case-insensitive, backslash equivalent
         assert_eq!(m(&["*/CacheDir/"], &["z\\cachedir\\deep\\f.bin"]), vec![true]);
     }
 

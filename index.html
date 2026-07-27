@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -12,7 +12,7 @@
     <aside id="sidebar">
       <div class="brand" data-tauri-drag-region>Sync<span>Dash</span></div>
       <div id="joblist"></div>
-      <button id="btn-newjob" class="btn newjob">＋ 新任务</button>
+      <button id="btn-newjob" class="btn newjob">+ New job</button>
       <div id="sidefoot">
         <span id="appver" class="dim"></span>
         <span id="jobsdir" class="dim"></span>
@@ -21,67 +21,86 @@
     <main id="main">
       <header id="toolbar">
         <button id="btn-compare" class="btn primary two" disabled>
-          <span class="l1">⟳ Compare</span><span class="l2" id="cmp-variant">选择任务</span>
+          <span class="l1">⟳ Compare</span><span class="l2" id="cmp-variant">Select a job</span>
         </button>
-        <button id="btn-cmpcfg" class="btn cog" title="比对设置：严谨级 / 大小写 / symlink" disabled>⚙</button>
-        <button id="btn-sync" class="btn accent two" disabled>
-          <span class="l1">▶ Synchronize</span><span class="l2" id="sync-variant">先比对</span>
+        <button id="btn-cmpcfg" class="btn cog" title="Compare settings: rigor / case sensitivity / symlinks" disabled>⚙</button>
+        <button id="btn-sync" class="btn accent two mode-btn" disabled>
+          <span class="l1" id="sync-mode">No job selected</span><span class="l2" id="sync-variant">Compare first</span>
         </button>
-        <button id="btn-synccfg" class="btn cog" title="同步设置：模式 / 冲突策略 / 版本控制" disabled>⚙</button>
-        <button id="btn-swap" class="btn cog" title="交换 source / target（写回任务文件，需重新比对）" disabled>⇄</button>
-        <button id="btn-log" class="btn cog" title="运行日志">🗒</button>
-        <button id="btn-watch" class="btn" title="值守：按任务的 watch 间隔定时比对" disabled>⏱ Watch</button>
+        <button id="btn-synccfg" class="btn cog" title="Mode / conflict policy / versioning" disabled>⚙</button>
+        <button id="btn-log" class="btn cog" title="Run log">🗒</button>
+        <button id="btn-watch" class="btn" title="Watch: compare on the job's watch interval" disabled>⏱ Watch</button>
         <span id="stats" class="stats"></span>
         <span id="spin" class="spinner hidden"></span>
       </header>
-      <div id="pathline" class="pathline mono dim"></div>
+      <div id="pathline" class="pathline">
+        <div class="prow">
+          <span class="plabel">source</span>
+          <input id="p-source" class="mono" type="text" data-drop="1" list="sd-paths" spellcheck="false" placeholder="Select a job, then edit here" disabled />
+          <button id="p-pick-s" class="pbtn" title="Browse…" disabled>📁</button>
+          <button id="btn-swap" class="pbtn" title="Swap source / target (written back to the job file; needs a fresh compare)" disabled>⇄</button>
+          <span class="plabel">target</span>
+          <input id="p-target" class="mono" type="text" data-drop="1" list="sd-paths" spellcheck="false" disabled />
+          <button id="p-pick-t" class="pbtn" title="Browse…" disabled>📁</button>
+          <select id="target-sel" class="hidden" title="Multi-target job: pick the target to work on"></select>
+        </div>
+        <div id="p-warn" class="pwarn"></div>
+        <div id="cfgline" class="cfgline"></div>
+      </div>
+      <datalist id="sd-paths"></datalist>
       <div id="filterbar" class="hidden">
-        <input id="search" class="mono" type="text" placeholder="搜索 path / from / reason   (Ctrl+F)" />
+        <input id="search" class="mono" type="text" placeholder="Search path / from / reason   (Ctrl+F)" />
         <div id="chips"></div>
-        <button id="btn-funnel" class="btn" title="筛选：名称掩码 / 大小 / 修改时间（作用于当前结果，不重扫）">🔻 筛选</button>
-        <button id="btn-same" class="btn" title="查看两侧判定相同的文件（不重扫，读上次比对的快照）">≡ 相同</button>
-        <button id="btn-csv" class="btn" title="把当前视图导出为 CSV（UTF-8 带 BOM，Excel 直开）">⤓ CSV</button>
-        <button id="btn-fold" class="btn" title="折叠/展开全部目录组">全部折叠</button>
-        <button id="btn-group" class="btn" title="切换：树状分组（按目录聚合，FFS 同款）↔ 平铺列表">树状分组</button>
-        <button id="btn-pathmode" class="btn" title="切换：相对（相对比对根目录）↔ 完整路径">相对路径</button>
+        <button id="btn-funnel" class="btn" title="Filter: name masks / size / modified time (applies to the current results, no rescan)">🔻 Filter</button>
+        <button id="btn-same" class="btn" title="View the files judged identical on both sides (no rescan, reads the last compare's snapshot)">≡ Identical</button>
+        <button id="btn-csv" class="btn" title="Export the current view as CSV (UTF-8 with BOM, opens straight in Excel)">⤓ CSV</button>
+        <button id="btn-fold" class="btn" title="Collapse / expand all directory groups">Collapse all</button>
+        <button id="btn-group" class="btn" title="Toggle: tree groups (aggregated by directory, same as FFS) ↔ flat list">Tree groups</button>
+        <button id="btn-pathmode" class="btn" title="Toggle: relative (to the compare root) ↔ full path">Relative paths</button>
       </div>
       <div id="reviewrow">
       <aside id="overview" class="collapsed">
-        <button id="ov-toggle" title="Overview 聚合（展开/收起）">☰</button>
+        <button id="ov-toggle" title="Overview aggregation (expand / collapse)">☰</button>
         <div id="ov-body">
-          <div class="ov-head"><span>Overview</span><span id="ov-clear" title="清除过滤">✕</span></div>
+          <div class="ov-head"><span>Overview</span><span id="ov-clear" title="Clear filter">✕</span></div>
           <div id="ov-list"></div>
         </div>
       </aside>
       <div id="tablewrap">
         <div id="cmp-panel" class="hidden">
-          <div class="cmp-title">正在比对</div>
+          <div class="cmp-title">Comparing</div>
           <div id="cmp-rows"></div>
-          <button id="cmp-cancel" class="btn">✕ 取消</button>
+          <button id="cmp-cancel" class="btn">✕ Cancel</button>
         </div>
-        <div id="empty" class="empty">← 选择任务，然后 Compare（Ctrl+R）</div>
+        <div id="empty" class="empty">← Select a job, then Compare (Ctrl+R)</div>
         <div id="samepanel" class="hidden">
           <div class="sp-head">
-            <span>两侧相同的文件</span>
-            <input id="sp-q" class="mono" type="text" placeholder="过滤路径…" />
+            <span>Files identical on both sides</span>
+            <input id="sp-q" class="mono" type="text" placeholder="Filter paths…" />
             <span id="sp-count" class="dim"></span>
-            <button id="sp-close" class="btn">✕ 返回差异表</button>
+            <button id="sp-close" class="btn">✕ Back to differences</button>
           </div>
           <table id="sametable">
-            <thead><tr><th class="c-path">相对路径</th><th class="c-size">大小</th><th class="c-meta">source 时间</th><th class="c-meta">target 时间</th></tr></thead>
+            <thead><tr><th class="c-path">Relative path</th><th class="c-size">Size</th><th class="c-meta">source time</th><th class="c-meta">target time</th></tr></thead>
             <tbody id="sp-body"></tbody>
           </table>
-          <button id="sp-more" class="btn hidden">加载更多</button>
+          <button id="sp-more" class="btn hidden">Load more</button>
         </div>
         <table id="plantable" class="hidden">
+          <!-- Column widths are pinned here: the body is virtually scrolled, and auto layout recomputes
+               widths from whichever rows happen to be mounted, so the columns jump on every scroll.
+               The two w-path columns get no width and split the remaining space. -->
+          <colgroup>
+            <col class="w-chk" /><col class="w-act" /><col class="w-path" /><col class="w-meta" /><col class="w-path" /><col class="w-meta" /><col class="w-reason" />
+          </colgroup>
           <thead>
             <tr>
-              <th class="c-chk"><input type="checkbox" id="chk-head" checked title="全选/全不选（当前视图）" /></th>
-              <th class="c-act"><span class="sortable" data-sort="action">action</span> <span class="dim thin">（点徽章翻方向）</span></th>
-              <th class="c-path"><span class="sortable" data-sort="path">source 侧</span></th>
-              <th class="c-meta"><span class="sortable" data-sort="s.size">大小</span> · <span class="sortable" data-sort="s.mtime">时间</span></th>
-              <th class="c-path"><span class="sortable" data-sort="path">target 侧</span></th>
-              <th class="c-meta"><span class="sortable" data-sort="t.size">大小</span> · <span class="sortable" data-sort="t.mtime">时间</span></th>
+              <th class="c-chk"><input type="checkbox" id="chk-head" checked title="Select all / none (current view)" /></th>
+              <th class="c-act"><span class="sortable" data-sort="action">action</span> <span class="dim thin">(click a badge to flip direction)</span></th>
+              <th class="c-path"><span class="sortable" data-sort="path">source side</span></th>
+              <th class="c-meta"><span class="sortable" data-sort="s.size">Size</span> · <span class="sortable" data-sort="s.mtime">Time</span></th>
+              <th class="c-path"><span class="sortable" data-sort="path">target side</span></th>
+              <th class="c-meta"><span class="sortable" data-sort="t.size">Size</span> · <span class="sortable" data-sort="t.mtime">Time</span></th>
               <th>reason</th>
             </tr>
           </thead>
@@ -89,67 +108,82 @@
         </table>
       </div>
       </div>
-      <footer id="status"><span id="statusmsg">就绪</span><button id="btn-undo" class="linkbtn hidden"></button><span id="counts" class="counts"></span></footer>
+      <div id="logpanel" class="hidden">
+        <div class="lp-head">
+          <span class="lp-title">Log</span>
+          <select id="lp-run" title="Select a run"></select>
+          <div id="lp-views" class="lp-pills"></div>
+          <div id="lp-levels" class="lp-pills"></div>
+          <input id="lp-q" class="mono" type="text" placeholder="Search messages / paths…" />
+          <span id="lp-stat" class="dim"></span>
+          <span class="spacer"></span>
+          <button id="lp-open" class="btn" title="Open this run's folder in the file manager">📂</button>
+          <button id="lp-settings" class="btn" title="Log settings">⚙</button>
+          <button id="lp-close" class="btn" title="Collapse the log panel">✕</button>
+        </div>
+        <div id="lp-body"></div>
+      </div>
+      <footer id="status"><span id="statusmsg">Ready</span><button id="btn-undo" class="linkbtn hidden"></button><span id="counts" class="counts"></span></footer>
     </main>
+  </div>
+  <div id="setmodal" class="hidden">
+    <div class="sheet setsheet">
+      <h3>Log settings</h3>
+      <div id="set-form"></div>
+      <div id="set-note" class="thin"></div>
+      <div class="btnrow">
+        <button id="set-cancel" class="btn">Cancel (Esc)</button>
+        <button id="set-save" class="btn accent">Save</button>
+      </div>
+    </div>
   </div>
   <div id="ctxmenu" class="hidden"></div>
   <div id="funnelpop" class="hidden">
-    <div class="fp-head">筛选当前结果<span class="dim thin">不重扫</span></div>
+    <div class="fp-head">Filter current results<span class="dim thin">no rescan</span></div>
     <label class="fp-row wide">
-      <span>名称掩码（FFS 语法，每行一条）</span>
+      <span>Name masks (FFS syntax, one per line)</span>
       <textarea id="fp-masks" class="mono" spellcheck="false" placeholder="*/*.log&#10;/Course/0 Mizzou Courses/.git/"></textarea>
     </label>
     <label class="fp-row">
-      <span>大小（MB）</span>
+      <span>Size (MB)</span>
       <span class="fp-pair"><input id="fp-min" type="number" step="any" min="0" placeholder="≥" /><input id="fp-max" type="number" step="any" min="0" placeholder="≤" /></span>
     </label>
     <div class="fp-row">
-      <span>修改时间</span>
+      <span>Modified</span>
       <div id="fp-days" class="fp-chips">
-        <button class="chip on" data-days="">任意</button>
-        <button class="chip" data-days="1">今天</button>
-        <button class="chip" data-days="7">7 天</button>
-        <button class="chip" data-days="30">30 天</button>
+        <button class="chip on" data-days="">Any</button>
+        <button class="chip" data-days="1">Today</button>
+        <button class="chip" data-days="7">7 days</button>
+        <button class="chip" data-days="30">30 days</button>
       </div>
     </div>
     <div id="fp-stat" class="fp-stat dim"></div>
     <div class="fp-btns">
-      <button id="fp-clear" class="btn">清除</button>
-      <button id="fp-promote" class="btn" title="把上面的掩码写进任务的 exclude —— 下次 Compare 起在扫描阶段就剪枝">写进任务的 exclude</button>
-      <button id="fp-done" class="btn accent">完成</button>
+      <button id="fp-clear" class="btn">Clear</button>
+      <button id="fp-promote" class="btn" title="Write the masks above into the job's exclude — from the next Compare on they prune during the scan">Write to job exclude</button>
+      <button id="fp-done" class="btn accent">Done</button>
     </div>
   </div>
   <div id="editmodal" class="hidden">
     <div class="sheet edsheet">
-      <h3 id="ed-title">编辑任务</h3>
+      <h3 id="ed-title">Edit job</h3>
       <div id="ed-form"></div>
       <div class="btnrow">
-        <button id="ed-delete" class="btn danger hidden">删除任务</button>
-        <button id="ed-sched" class="btn hidden" title="复制 schtasks 命令（自己在管理员终端里执行；本程序不代为注册系统计划任务）">复制计划任务命令</button>
+        <button id="ed-delete" class="btn danger hidden">Delete job</button>
+        <button id="ed-sched" class="btn hidden" title="Copy the schtasks command (run it yourself in an admin terminal; this app does not register system scheduled tasks for you)">Copy scheduled task command</button>
         <span class="spacer"></span>
-        <button id="ed-cancel" class="btn">取消 (Esc)</button>
-        <button id="ed-save" class="btn accent">保存</button>
-      </div>
-    </div>
-  </div>
-  <div id="logmodal" class="hidden">
-    <div class="sheet logsheet">
-      <h3>运行日志 <span id="log-scope" class="dim thin"></span></h3>
-      <div id="log-list"></div>
-      <pre id="log-detail" class="hidden mono"></pre>
-      <div class="btnrow">
-        <button id="log-back" class="btn hidden">← 返回列表</button>
-        <button id="log-close" class="btn">关闭 (Esc)</button>
+        <button id="ed-cancel" class="btn">Cancel (Esc)</button>
+        <button id="ed-save" class="btn accent">Save</button>
       </div>
     </div>
   </div>
   <div id="modal" class="hidden">
     <div class="sheet">
-      <h3>确认同步</h3>
+      <h3>Confirm sync</h3>
       <div id="modal-body"></div>
       <div class="btnrow">
-        <button id="modal-cancel" class="btn">取消 (Esc)</button>
-        <button id="modal-ok" class="btn accent">执行 (Enter)</button>
+        <button id="modal-cancel" class="btn">Cancel (Esc)</button>
+        <button id="modal-ok" class="btn accent">Apply (Enter)</button>
       </div>
     </div>
   </div>

@@ -3,6 +3,6 @@ import type { SameRow } from "./SameRow";
 
 export type SamePage = { total: number, rows: Array<SameRow>, 
 /**
- * 缓存里躺的是哪个任务的快照（对不上就让界面提示重新比对）
+ * Which job's snapshot is sitting in the cache (on a mismatch the UI prompts for a fresh compare)
  */
 job: string, };

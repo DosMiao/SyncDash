@@ -1,10 +1,10 @@
-//! SyncDash 桌面壳（Tauri v2）：只做 IPC 编排，全部同步逻辑在 syncdash 核心库。
-//! - v0.9 M1：统一事件流 —— 引擎经 `run::*_with(ctx)` 发 ProgressEvent，
-//!   TauriSink 节流后以 `run-progress` 事件（带 run_id）发往前端；
-//!   旧 `progress` 事件由 shim 从 PhaseStart/Progress 合成，M2 前端落地后拆除。
-//! - 单运行互斥：RunState.active 持 RunCtl；cancel_run / pause_run 对它生效。
-//! - 每个 op 预计算 reverse_op（前端"点徽章翻方向"零逻辑漂移）
-//! - apply_job 接收前端最终定稿的 op 列表（已含翻向与勾选），重活全走 spawn_blocking
+//! SyncDash desktop shell (Tauri v2): IPC orchestration only; all sync logic lives in the syncdash core library.
+//! - v0.9 M1: unified event stream — the engine emits ProgressEvent through `run::*_with(ctx)`,
+//!   TauriSink throttles them and forwards them to the frontend as `run-progress` events (carrying run_id);
+//!   the legacy `progress` event is synthesized by a shim from PhaseStart/Progress, removed once the M2 frontend lands.
+//! - Single-run mutual exclusion: RunState.active holds a RunCtl; cancel_run / pause_run act on it.
+//! - reverse_op is precomputed for every op (zero logic drift for the frontend's "click a badge to flip direction")
+//! - apply_job receives the frontend's final op list (already flipped and checked); the heavy work all goes through spawn_blocking
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -25,7 +25,7 @@ struct JobDto {
     source: String,
     target: String,
     has_archive: bool,
-    // v0.9 M3：补齐前端需要感知的字段（remote 徽章 / versioning 标识 / 过滤器提示）
+    // v0.9 M3: fill in the fields the frontend needs to see (remote badge / versioning marker / filter hints)
     remote: bool,
     remote_host: Option<String>,
     versioning: bool,
@@ -37,7 +37,7 @@ struct JobDto {
     #[ts(type = "number | null")]
     watch_interval_secs: Option<u64>,
     watch_auto_apply: bool,
-    /// 1:N：生效的 target 列表（单 target 任务 = 一项）。>1 时前端显示 target 选择器
+    /// 1:N: the effective target list (a single-target job = one entry). When >1 the frontend shows the target selector
     targets: Vec<String>,
 }
 
@@ -46,14 +46,14 @@ struct JobDto {
 struct PlanDto {
     header: PlanHeader,
     ops: Vec<Op>,
-    /// 与 ops 一一对应：可翻方向的行给出反向 op，不可翻为 null
+    /// One entry per op: rows that can be flipped carry the reverse op, the rest are null
     reversed: Vec<Option<Op>>,
-    /// 与 ops 一一对应：两侧比对时点的实测 size/mtime（界面列与排序用）。
-    /// 走平行数组而不是往 Op 里加字段——Op 的字面量在 compare.rs 里有三十多处，
-    /// 且那会改变 plan JSONL 的落盘格式。preflight/apply 收到的 ops 形状不变。
+    /// One entry per op: the size/mtime measured on both sides at compare time (for the table columns and sorting).
+    /// A parallel array rather than extra fields on Op — Op literals appear in thirty-odd places in compare.rs,
+    /// and that would change the on-disk plan JSONL format. The op shape preflight/apply receive stays unchanged.
     #[serde(default)]
     metas: Vec<compare::RowMeta>,
-    /// 两侧判定相等的文件数/字节（"显示 X / 共 Y"的分母）
+    /// Count/bytes of the files judged equal on both sides (the denominator of "showing X of Y")
     #[serde(default)]
     #[ts(type = "number")]
     equal_count: u64,
@@ -97,14 +97,14 @@ struct PathInfo {
 struct PathVerdict {
     source: PathInfo,
     target: PathInfo,
-    /// 人话警告，编辑器直接贴在字段下面
+    /// Plain-language warnings; the editor renders them right under the field
     warnings: Vec<String>,
 }
 
-// ---------- 快照缓存（"相同项"面板的数据源） ----------
+// Snapshot cache (the data source for the "Identical" panel)
 //
-// compare 已经把两侧完整扫过一遍，丢掉快照等于逼界面为了看一眼"相同项"再扫一次。
-// 单槽缓存：每次 compare 覆盖，换任务即失效；两份快照 2 万条目量级约十几 MB。
+// compare already walked both sides in full; dropping the snapshots would force the UI to rescan just to glance at the identical items.
+// Single-slot cache: every compare overwrites it and switching jobs invalidates it; two snapshots at the 20k-entry scale run to a dozen-odd MB.
 
 struct CachedSnaps {
     job: String,
@@ -121,11 +121,11 @@ struct SamePage {
     #[ts(type = "number")]
     total: u64,
     rows: Vec<compare::SameRow>,
-    /// 缓存里躺的是哪个任务的快照（对不上就让界面提示重新比对）
+    /// Which job's snapshot is sitting in the cache (on a mismatch the UI prompts for a fresh compare)
     job: String,
 }
 
-// ---------- 运行状态（互斥 + 取消/暂停句柄） ----------
+// Run state (mutual exclusion + cancel/pause handles)
 
 #[derive(Default)]
 struct RunState {
@@ -136,7 +136,7 @@ struct RunState {
 fn begin_run(st: &RunState) -> Result<(u64, Arc<RunCtl>), String> {
     let mut g = st.active.lock().unwrap();
     if g.is_some() {
-        return Err("另一个运行正在进行——先取消它或等它结束".into());
+        return Err("Another run is already in progress — cancel it or wait for it to finish".into());
     }
     let ctl = RunCtl::new();
     *g = Some(ctl.clone());
@@ -147,11 +147,11 @@ fn end_run(st: &RunState) {
     *st.active.lock().unwrap() = None;
 }
 
-// ---------- 事件桥 ----------
+// Event bridge
 
-/// 发往前端的 run-progress 载荷：run_id 让前端丢弃已取消运行的迟到事件；
-/// purpose 区分 compare / apply——子窗口只认 apply（否则同步后的自动复核比对
-/// 会把还开着的结果窗劫持成永远转圈的"比对中"），主窗内嵌面板只认 compare。
+/// The run-progress payload sent to the frontend: run_id lets the frontend drop late events from a cancelled run;
+/// purpose separates compare from apply — the sub-window only accepts apply (otherwise the automatic re-check compare
+/// after a sync would hijack the open result window into a forever-spinning "comparing"), the main panel only accepts compare.
 #[derive(Serialize, Clone)]
 struct RunEvent {
     run_id: u64,
@@ -160,15 +160,15 @@ struct RunEvent {
     ev: ProgressEvent,
 }
 
-/// 旧状态栏事件（M2 前端落地前的过渡 shim）
+/// Legacy status-bar event (a transitional shim until the M2 frontend lands)
 #[derive(Serialize, Clone, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 struct LegacyProgress {
     phase: String,
     detail: String,
-    /// 哈希/复制阶段的完成百分比（0-100）；边界事件为 -1
+    /// Completion percentage of the hash/copy phase (0-100); boundary events use -1
     pct: i32,
-    /// 保留字段：新流里速率归前端算（4s 滑窗），shim 不再伪造
+    /// Reserved field: in the new stream the rate is computed by the frontend (4s sliding window), the shim no longer fakes it
     rate: f64,
 }
 
@@ -224,8 +224,8 @@ fn legacy_shim(app: &tauri::AppHandle, ev: &ProgressEvent) {
     }
 }
 
-/// ProgressSink → Tauri 事件。Progress 类 ≥100ms/条节流（=FFS 图表采样率），
-/// PhaseStart/Totals/Error/Paused/Resumed/Summary 直通。
+/// ProgressSink → Tauri events. Progress events are throttled to ≥100ms apiece (= the FFS chart sampling rate),
+/// PhaseStart/Totals/Error/Paused/Resumed/Summary pass straight through.
 struct TauriSink {
     app: tauri::AppHandle,
     run_id: u64,
@@ -254,12 +254,12 @@ fn make_ctx(app: &tauri::AppHandle, run_id: u64, ctl: Arc<RunCtl>, purpose: &'st
     )
 }
 
-/// 1:N：把多 target 任务解析成"当前选中 target 的单任务视角"（引擎单管线原样复用）
+/// 1:N: resolve a multi-target job into "the single-job view of the currently selected target" (the engine's single pipeline is reused as-is)
 fn resolve_target(job: &config::Job, target_index: Option<usize>) -> Result<config::Job, String> {
     job.validate_multi_target()?;
     let list = job.target_list();
     let idx = target_index.unwrap_or(0);
-    let t = list.get(idx).ok_or_else(|| format!("target 序号 {idx} 越界（共 {} 个）", list.len()))?;
+    let t = list.get(idx).ok_or_else(|| format!("target index {idx} is out of range ({} total)", list.len()))?;
     Ok(job.for_target(t))
 }
 
@@ -267,7 +267,7 @@ fn user_err(e: std::io::Error) -> String {
     if syncdash::progress::is_cancelled(&e) { "cancelled".into() } else { e.to_string() }
 }
 
-// ---------- 命令 ----------
+// Commands
 
 #[tauri::command]
 fn list_jobs() -> Vec<JobDto> {
@@ -299,40 +299,40 @@ fn jobs_dir() -> String {
     config::jobs_dir().display().to_string()
 }
 
-/// M5：编辑器读取完整 Job（list_jobs 的 DTO 只有摘要）
+/// M5: the editor reads the full Job (the list_jobs DTO is only a summary)
 #[tauri::command]
 fn get_job(name: String) -> Result<config::Job, String> {
     config::load(&name).map(|(_, j)| j).map_err(|e| e.to_string())
 }
 
-/// M5：保存任务（新建或覆盖同名 TOML）
+/// M5: save a job (create, or overwrite the TOML of the same name)
 #[tauri::command]
 fn save_job(name: String, job: config::Job) -> Result<String, String> {
     if name.trim().is_empty() {
-        return Err("任务名不能为空".into());
+        return Err("Job name cannot be empty".into());
     }
     config::save_job(name.trim(), &job).map(|p| p.display().to_string()).map_err(|e| e.to_string())
 }
 
-/// M5：删除任务配置文件（数据一个字节都不动）
+/// M5: delete the job's config file (not a single byte of data is touched)
 #[tauri::command]
 fn delete_job(name: String) -> Result<(), String> {
     config::delete_job(&name).map_err(|e| e.to_string())
 }
 
-// ---------- P1：路径体检与"在资源管理器中显示" ----------
+// P1: path health check and "show in file explorer"
 
-/// 归一化到可比较形态：小写 + 统一 '/' + 去尾分隔符。
-/// 只用于"两根是否相同/是否嵌套"的判断，不参与任何同步语义。
+/// Normalize to a comparable form: lowercase + '/' separators + no trailing separator.
+/// Used only to decide "are the two roots the same / nested"; it never affects sync semantics.
 fn norm_root(p: &str) -> String {
     let s = p.trim().replace('\\', "/").to_lowercase();
     let s = s.trim_end_matches('/');
     s.to_string()
 }
 
-/// 编辑器实时体检：路径存不存在、是不是目录、有没有挂载点标记，
-/// 以及两根之间的关系（相同 / 互相嵌套）。写错路径的代价太大，
-/// 不该等到 Compare 才在状态栏里说。
+/// Live health check for the editor: whether the path exists, whether it is a directory, whether it
+/// carries a mount-point marker, and how the two roots relate (identical / nested). A mistyped path costs
+/// too much to be reported only in the status bar once Compare runs.
 #[tauri::command]
 fn inspect_paths(source: String, target: String) -> PathVerdict {
     fn info(p: &str) -> PathInfo {
@@ -350,37 +350,37 @@ fn inspect_paths(source: String, target: String) -> PathVerdict {
     let mut v = PathVerdict { source: info(&source), target: info(&target), warnings: Vec::new() };
     let (s, t) = (source.trim(), target.trim());
     if !s.is_empty() && !v.source.exists {
-        v.warnings.push(format!("source 不存在：{s}"));
+        v.warnings.push(format!("source does not exist: {s}"));
     } else if !s.is_empty() && !v.source.is_dir {
-        v.warnings.push("source 不是目录".into());
+        v.warnings.push("source is not a directory".into());
     }
     if !t.is_empty() && !v.target.exists {
-        v.warnings.push(format!("target 不存在：{t}（首次同步会自动创建）"));
+        v.warnings.push(format!("target does not exist: {t} (it will be created on the first sync)"));
     } else if !t.is_empty() && !v.target.is_dir {
-        v.warnings.push("target 不是目录".into());
+        v.warnings.push("target is not a directory".into());
     }
     let (ns, nt) = (norm_root(s), norm_root(t));
     if !ns.is_empty() && ns == nt {
-        v.warnings.push("source 与 target 是同一个目录".into());
+        v.warnings.push("source and target are the same directory".into());
     } else if !ns.is_empty() && !nt.is_empty() {
-        // 嵌套：mirror 会把外层的内容往内层灌，再把灌进去的当成外层新增——自食其尾
+        // Nesting: mirror pours the outer contents into the inner root, then treats what it poured in as new outer content — it eats its own tail
         if nt.starts_with(&format!("{ns}/")) {
-            v.warnings.push("target 在 source 之下——嵌套的两根会自我复制".into());
+            v.warnings.push("target sits under source — nested roots copy into themselves".into());
         } else if ns.starts_with(&format!("{nt}/")) {
-            v.warnings.push("source 在 target 之下——嵌套的两根会自我复制".into());
+            v.warnings.push("source sits under target — nested roots copy into themselves".into());
         }
     }
     v
 }
 
-/// 界面漏斗的即席掩码匹配。前端**不自己写 glob**——同一套 FFS 掩码语义
-/// 只有 filter.rs 一份实现，界面里试出来的掩码写进任务 exclude 后行为一致。
+/// Ad-hoc mask matching for the UI funnel. The frontend **does not write its own glob** — the FFS mask
+/// semantics have exactly one implementation, in filter.rs, so a mask tried out in the UI behaves identically once written into the job's exclude.
 #[tauri::command]
 fn mask_match(masks: Vec<String>, paths: Vec<String>) -> Vec<bool> {
     syncdash::filter::mask_hits(&masks, &paths)
 }
 
-/// "相同项"分页。数据源是上一次 compare 留下的快照——不重扫。
+/// Pagination for the "Identical" panel. The data source is the snapshot left by the last compare — no rescan.
 #[tauri::command]
 fn list_same(
     snaps: tauri::State<'_, Arc<SnapCache>>,
@@ -391,18 +391,18 @@ fn list_same(
 ) -> Result<SamePage, String> {
     let g = snaps.0.lock().unwrap();
     let Some(c) = g.as_ref() else {
-        return Err("还没有比对结果——先 Compare".into());
+        return Err("No compare results yet — run Compare first".into());
     };
     if c.job != name {
-        return Err(format!("缓存里是 '{}' 的快照，请对 '{}' 重新 Compare", c.job, name));
+        return Err(format!("The cache holds the snapshot for '{}'; run Compare again for '{}'", c.job, name));
     }
     let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
     let (total, rows) = compare::same_page(&c.source, &c.target, &job.compare_opts(), &query, offset, limit.min(2000));
     Ok(SamePage { total, rows, job: c.job.clone() })
 }
 
-/// 导出当前视图为 CSV。转义只在这里做一次，UTF-8 **带 BOM**——
-/// 不加 BOM 的话 Excel 会按本地代码页解释，中文路径直接乱码。
+/// Export the current view as CSV. Escaping happens exactly once, here, and the output is UTF-8 **with a BOM** —
+/// without the BOM Excel interprets the file in the local code page and non-ASCII paths turn into mojibake.
 #[tauri::command]
 fn export_csv(
     path: String,
@@ -423,7 +423,7 @@ fn export_csv(
         if ms <= 0 {
             return String::new();
         }
-        // 本地时区偏移交给界面；这里落 UTC 的 ISO 形态，跨机对账不会歧义
+        // The local timezone offset is the UI's job; this writes ISO UTC so cross-machine reconciliation is unambiguous
         let secs = ms / 1000;
         let days = secs.div_euclid(86_400);
         let tod = secs.rem_euclid(86_400);
@@ -441,8 +441,8 @@ fn export_csv(
         let rel = if sep == '\\' { rel.replace('/', "\\") } else { rel.to_string() };
         format!("{r}{sep}{rel}")
     };
-    // 动作/侧别用 serde 的 snake_case 形态（见 json_token），与 plan JSONL、
-    // 事件流的字面量一致——Debug 的 PascalCase 会让 CSV 和其它出口对不上账
+    // Action/side use serde's snake_case form (see json_token), matching the literals in the plan JSONL
+    // and the event stream — Debug's PascalCase would leave the CSV out of step with every other output
     for (i, op) in ops.iter().enumerate() {
         let m = metas.get(i).cloned().unwrap_or_default();
         let on = checked.get(i).copied().unwrap_or(false);
@@ -468,13 +468,13 @@ fn export_csv(
     Ok(ops.len())
 }
 
-/// 枚举的对外字面量以 serde 为准（Action/Side 都标了 rename_all = "snake_case"），
-/// 这样 CSV 里的 delete_dir 与 plan JSONL、事件流写的是同一个词。
+/// The public literals for enums follow serde (Action/Side are both marked rename_all = "snake_case"),
+/// so delete_dir in the CSV is the same word the plan JSONL and the event stream write.
 fn json_token<T: Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_default().trim_matches('"').to_string()
 }
 
-/// days → (y, m, d)，Howard Hinnant 的 civil_from_days（无依赖）
+/// days → (y, m, d), Howard Hinnant's civil_from_days (dependency-free)
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -488,16 +488,16 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// 在系统文件管理器里选中该路径。参数单独传给 exe，不过 shell。
+/// Select the path in the system file manager. Arguments go straight to the exe, not through a shell.
 #[tauri::command]
 fn reveal(path: String) -> Result<(), String> {
     let p = std::path::Path::new(&path);
     if !p.exists() {
-        return Err(format!("路径已不存在：{path}"));
+        return Err(format!("Path no longer exists: {path}"));
     }
     #[cfg(windows)]
     {
-        // explorer 选中成功时也返回 exit 1，状态码在这里没有意义——只看能不能起进程
+        // explorer returns exit 1 even when the selection succeeds, so the status code is meaningless here — all that matters is whether the process started
         std::process::Command::new("explorer")
             .arg(format!("/select,{}", p.display()))
             .spawn()
@@ -515,41 +515,41 @@ fn reveal(path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// M4：运行历史（新→旧）。job = null 时看全部
+/// M4: run history (newest → oldest). job = null shows everything
 #[tauri::command]
 fn run_history(job: Option<String>, limit: Option<usize>) -> Vec<syncdash::runlog::RunRecord> {
     syncdash::runlog::history(job.as_deref(), limit.unwrap_or(50))
 }
 
-/// M4：每个任务最近一次运行——侧栏"上次同步"点的数据源
+/// M4: the most recent run per job — the data behind the sidebar's "last sync" dot
 #[tauri::command]
 fn last_syncs() -> std::collections::HashMap<String, syncdash::runlog::RunRecord> {
     syncdash::runlog::latest_by_job()
 }
 
-/// M4：某次运行的明细行（原样 JSONL；行数封顶）
+/// M4: the detail lines of one run (raw JSONL; line count capped)
 #[tauri::command]
 fn run_detail(detail: String) -> Vec<String> {
     syncdash::runlog::detail_lines(&detail, 2000)
 }
 
-// ---------- v0.10：集中日志与 app 设置 ----------
+// v0.10: centralized logging and app settings
 
-/// 运行列表。与 `run_history` 的区别：这条会把**被中断的运行**（索引里没有、
-/// 只剩目录的那些）一并补进来——崩溃那次恰恰是最该被看见的一次。
+/// The run list. Unlike `run_history`, this one also folds in **interrupted runs** (the ones missing
+/// from the index that left only a directory behind) — the crashed run is exactly the one worth seeing.
 #[tauri::command]
 fn log_runs(job: Option<String>, limit: Option<usize>) -> Vec<syncdash::runlog::RunRecord> {
     syncdash::runlog::history_merged(job.as_deref(), limit.unwrap_or(100))
 }
 
-/// 一次运行的某份产物（which ∈ run / errors / items / plan / summary）。
-/// 行数封顶：执行清单全记，一次大同步上万行，整份塞进 IPC 会把界面卡死。
+/// One artifact of a run (which ∈ run / errors / items / plan / summary).
+/// Line count capped: the apply manifest records everything, one large sync runs to tens of thousands of lines, and shipping all of it over IPC would freeze the UI.
 #[tauri::command]
 fn log_artifact(run_id: String, which: String, max: Option<usize>) -> Vec<String> {
     syncdash::runlog::artifact_lines(&run_id, &which, max.unwrap_or(5000))
 }
 
-/// 日志根目录（"打开目录"按钮把它交给已有的 `reveal`）
+/// The log root directory (the "open folder" button hands it to the existing `reveal`)
 #[tauri::command]
 fn log_dir_path(run_id: Option<String>) -> String {
     let root = syncdash::runlog::logs_dir();
@@ -559,7 +559,7 @@ fn log_dir_path(run_id: Option<String>) -> String {
     }
 }
 
-/// 运行之外的事件（启动、设置错误、prune、迁移）。返回最后 n 行。
+/// Events outside of a run (startup, settings errors, prune, migration). Returns the last n lines.
 #[tauri::command]
 fn app_log_tail(n: Option<usize>) -> Vec<String> {
     let n = n.unwrap_or(500);
@@ -576,9 +576,9 @@ fn get_settings() -> syncdash::settings::AppSettings {
     syncdash::settings::load()
 }
 
-/// 保存设置。`migrate` = 日志目录变了时把旧目录整体搬过去。
+/// Save settings. `migrate` = move the whole old directory over when the log directory changes.
 ///
-/// 迁移要在**写新配置之前**算好旧位置——写完再问就只能问到新值了。
+/// The old location must be resolved **before** the new config is written — ask afterwards and you only get the new value.
 #[tauri::command]
 fn save_settings(
     s: syncdash::settings::AppSettings,
@@ -594,10 +594,11 @@ fn save_settings(
     }
 }
 
-/// 打开（或聚焦）独立进度子窗口（只用于 Synchronize；compare 进度在主窗原地显示）。
-/// **必须是 async 命令**：同步命令在主线程的 IPC 里执行，而 wry 建窗要靠主事件循环
-/// 泵消息——同步建窗会让子窗导航卡死在 about:blank（整窗纯白），关闭事件也排不上队
-/// （表现为"整个 app 关不掉"）。async 命令跑在独立线程，建窗经事件循环正确代理。
+/// Open (or focus) the standalone progress sub-window (Synchronize only; compare progress is shown inline in the main window).
+/// **Must be an async command**: sync commands run on the main thread's IPC, while wry needs the main event loop
+/// to pump messages in order to create a window — creating it synchronously leaves the sub-window's navigation stuck
+/// on about:blank (an all-white window) and close events never get queued (it looks like "the whole app won't close").
+/// An async command runs on its own thread, so window creation is proxied through the event loop correctly.
 #[tauri::command]
 async fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
     use tauri::Manager;
@@ -607,7 +608,7 @@ async fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     }
     tauri::WebviewWindowBuilder::new(&app, "progress", tauri::WebviewUrl::App("progress.html".into()))
-        .title("SyncDash — 运行")
+        .title("SyncDash — Run")
         .inner_size(620.0, 500.0)
         .min_inner_size(440.0, 380.0)
         .build()
@@ -615,7 +616,7 @@ async fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 销毁进度子窗口。不是 hide：隐藏的子窗会在主窗关闭后让进程赖着不退
+/// Destroy the progress sub-window. Not hide: a hidden sub-window keeps the process alive after the main window closes
 #[tauri::command]
 async fn close_progress_window(app: tauri::AppHandle) {
     use tauri::Manager;
@@ -624,7 +625,7 @@ async fn close_progress_window(app: tauri::AppHandle) {
     }
 }
 
-/// When finished 动作（FFS 同款）：sleep / shutdown。倒计时与确认都在前端做完才调这里。
+/// When-finished action (same as FFS): sleep / shutdown. The countdown and confirmation both happen in the frontend before this is called.
 #[tauri::command]
 fn post_sync_action(kind: String) -> Result<(), String> {
     let (prog, args): (&str, Vec<&str>) = if cfg!(windows) {
@@ -643,7 +644,7 @@ fn post_sync_action(kind: String) -> Result<(), String> {
     std::process::Command::new(prog).args(&args).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// 对活动运行请求协作取消。返回是否存在活动运行。
+/// Request cooperative cancellation of the active run. Returns whether an active run existed.
 #[tauri::command]
 fn cancel_run(state: tauri::State<'_, Arc<RunState>>) -> bool {
     match state.active.lock().unwrap().as_ref() {
@@ -655,7 +656,7 @@ fn cancel_run(state: tauri::State<'_, Arc<RunState>>) -> bool {
     }
 }
 
-/// 暂停/恢复活动运行（暂停期间 elapsed 不涨、RootLock 心跳继续跳）
+/// Pause/resume the active run (elapsed stops growing while paused, the RootLock heartbeat keeps beating)
 #[tauri::command]
 fn pause_run(state: tauri::State<'_, Arc<RunState>>, paused: bool) -> bool {
     match state.active.lock().unwrap().as_ref() {
@@ -682,20 +683,20 @@ async fn compare_job(
         let job = resolve_target(&job, target_index)?;
         let (run_id, ctl) = begin_run(&st)?;
         let ctx = make_ctx(&app, run_id, ctl, "compare");
-        // 比对期也接管进程级日志出口：`trash`/`lock`/`scan` 里那些拿不到 ctx 的诊断
-        // 走宏经注册表，这里不装的话它们会退回 stderr——windowed 构建里等于没说。
+        // Take over the process-level log outlet during compare too: the diagnostics in `trash`/`lock`/`scan`
+        // that cannot reach a ctx go through the macro registry, and without installing here they fall back to stderr — in a windowed build that means never said.
         let _log_guard = syncdash::progress::install(ctx.sink.clone());
         let t0 = std::time::Instant::now();
         let ts_ms = syncdash::foundation::time::now_ms() as i64;
-        // M3：remote 任务走远程管线（远端自己盘上扫描），不再静默落进本地管线
+        // M3: remote jobs take the remote pipeline (scanning on the remote's own disk) instead of silently falling into the local one
         let r = if job.remote_host.is_some() {
             run::compare_remote_job_detailed(&name, &job, &ctx)
         } else {
             run::compare_job_detailed(&job, &ctx)
         };
         end_run(&st);
-        // compare 无副作用：只留一行索引，不建目录。watch 30s 一轮 = 一天 2880 次，
-        // 每次建目录会把日志盘冲垮。
+        // compare has no side effects: one index line, no directory. A 30s watch cycle = 2880 runs a day,
+        // and creating a directory each time would flood the log disk.
         syncdash::runlog::compare_summary(
             &name,
             if job.remote_host.is_some() { "remote-compare" } else { "compare" },
@@ -706,8 +707,8 @@ async fn compare_job(
         );
         let out = r.map_err(user_err)?;
         let reversed = out.plan.ops.iter().map(compare::reverse_op).collect();
-        // 证据层：两侧实测 size/mtime + 相等项统计。与 compare() 共用同一套
-        // norm_key/files_equal，口径不会漂移。
+        // Evidence layer: measured size/mtime on both sides + equal-item counts. It shares the same
+        // norm_key/files_equal as compare(), so the definitions cannot drift apart.
         let ev = compare::evidence(&out.source, &out.target, &out.plan, &job.compare_opts());
         let dto = PlanDto {
             header: out.plan.header,
@@ -717,7 +718,7 @@ async fn compare_job(
             equal_count: ev.equal_count,
             equal_bytes: ev.equal_bytes,
         };
-        // 快照留给"相同项"面板；单槽，下次 compare 直接覆盖
+        // Snapshots are kept for the "Identical" panel; single slot, overwritten by the next compare
         *cache.0.lock().unwrap() = Some(CachedSnaps { job: name, source: out.source, target: out.target });
         Ok(dto)
     })
@@ -725,8 +726,8 @@ async fn compare_job(
     .map_err(|e| e.to_string())?
 }
 
-/// 同步前的闸门体检（磁盘空间 / 删除占比）。前端在确认单里展示结果，
-/// 让"为什么不让我同步"这句话有地方说，而不是只出现在 stderr。
+/// Pre-sync gate checks (disk space / deletion ratio). The frontend shows the result in the confirmation sheet,
+/// so "why won't it let me sync" has somewhere to be answered instead of only appearing on stderr.
 #[tauri::command]
 async fn preflight(name: String, plan: PlanDto, ops: Vec<Op>, acknowledged: bool, target_index: Option<usize>) -> Result<PreflightDto, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -737,7 +738,7 @@ async fn preflight(name: String, plan: PlanDto, ops: Vec<Op>, acknowledged: bool
             .into_iter()
             .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
             .collect();
-        // remote 任务只有删除占比闸门（磁盘空间/marker 在远端机器上，本地查了也是错的）
+        // remote jobs only get the deletion-ratio gate (disk space/marker live on the remote machine, so checking locally would be wrong)
         let v = if job.remote_host.is_some() {
             run::preflight_remote_job(&job, &full, &ops, acknowledged)
         } else {
@@ -768,7 +769,7 @@ async fn apply_job(
             .into_iter()
             .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
             .collect();
-        // 闸门不通过时不动手，并把理由回传给界面
+        // Touch nothing when a gate fails, and hand the reason back to the UI
         let v = if job.remote_host.is_some() {
             run::preflight_remote_job(&job, &full, &ops, acknowledged)
         } else {
@@ -779,7 +780,7 @@ async fn apply_job(
         }
         let (run_id, ctl) = begin_run(&st)?;
         let ctx = make_ctx(&app, run_id, ctl, "apply");
-        // M4：每次真实 apply 落一条运行日志（Recorder 顺带把错误事件收进明细文件）
+        // M4: every real apply writes a run-log entry (the Recorder also collects error events into the detail file)
         let t0 = std::time::Instant::now();
         let remote = job.remote_host.is_some();
         let rec =
@@ -811,19 +812,19 @@ async fn apply_job(
 
 fn main() {
     syncdash::scan::init_worker_pool();
-    // windowed 构建没有控制台 —— 运行之外的诊断（设置解析失败、清理、迁移）
-    // 唯一的去处就是 app.jsonl。`_log` 必须活到进程结束：写成 `let _ = …`
-    // 会当场 drop，sink 立刻被摘掉。
+    // A windowed build has no console — the only home for diagnostics outside a run (settings parse
+    // failures, pruning, migration) is app.jsonl. `_log` must live until the process exits: writing
+    // `let _ = …` drops it on the spot and the sink is unhooked immediately.
     let cfg = syncdash::settings::load();
     let _log = std::sync::Arc::new(syncdash::logging::AppLogSink::open(&cfg.resolved_log_dir(), cfg.level));
     let _log_guard = syncdash::progress::install(_log.clone());
-    // 保留策略在启动时跑一次：执行清单是全记的，没有闸门会一直涨
+    // Retention runs once at startup: the apply manifest records everything and grows without a gate
     let dropped = syncdash::runlog::prune(cfg.keep_days, cfg.max_total_mb);
     if dropped > 0 {
-        syncdash::log_info!("app", "日志清理：移除 {dropped} 次运行的记录");
+        syncdash::log_info!("app", "Log cleanup: removed the records of {dropped} runs");
     }
     tauri::Builder::default()
-        // 主窗关闭 → 级联销毁进度子窗；否则残留窗口让 Tauri 不退出（"app 关不掉"）
+        // Main window closes → cascade-destroy the progress sub-window; a leftover window keeps Tauri from exiting ("the app won't close")
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 if window.label() == "main" {
@@ -876,13 +877,13 @@ mod tests {
         let ops = vec![Op {
             side: Side::Target,
             action: Action::DeleteDir,
-            // 逗号与双引号都在路径里——CSV 的两个经典地雷
+            // Both a comma and a double quote in the path — the two classic CSV landmines
             path: "b/y,z\"q.txt".into(),
             from: None, size: Some(20), mtime_ms: None, hash: None, link: None, mode: None,
             reason: "gone, really".into(),
         }];
-        // mtime_ms = 0 在快照里的含义是"取不到时间"（scan 拿不到 metadata 时写 0），
-        // 所以这里用真实的非零时间，别拿纪元当日期使
+        // mtime_ms = 0 means "no time available" in a snapshot (scan writes 0 when it cannot read metadata),
+        // so use real non-zero times here instead of pressing the epoch into service as a date
         let metas = vec![compare::RowMeta {
             src: Some(SideMeta { size: 10, mtime_ms: 86_400_000 }),
             dst: Some(SideMeta { size: 20, mtime_ms: 172_800_000 }),
@@ -890,17 +891,17 @@ mod tests {
         let n = export_csv(out.display().to_string(), header, ops, metas, vec![true]).unwrap();
         assert_eq!(n, 1);
         let bytes = std::fs::read(&out).unwrap();
-        // Excel 不认没有 BOM 的 UTF-8，中文路径会整列乱码
+        // Excel does not recognize UTF-8 without a BOM; non-ASCII paths turn the whole column into mojibake
         assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
         let text = String::from_utf8(bytes[3..].to_vec()).unwrap();
         let row = text.lines().nth(1).unwrap();
-        assert!(row.contains("\"b/y,z\"\"q.txt\""), "路径里的逗号与引号要按 RFC4180 转义: {row}");
+        assert!(row.contains("\"b/y,z\"\"q.txt\""), "commas and quotes in the path must be escaped per RFC4180: {row}");
         assert!(row.contains("\"gone, really\""));
-        // 枚举字面量与 plan JSONL 同源（snake_case），不是 Debug 的 PascalCase
-        assert!(row.contains(",delete_dir,target,"), "枚举应为 snake_case: {row}");
-        // 双侧 size/时间都要落地
+        // Enum literals share their source with the plan JSONL (snake_case), not Debug's PascalCase
+        assert!(row.contains(",delete_dir,target,"), "enums should be snake_case: {row}");
+        // Both sides' size/time must be written out
         assert!(row.contains(",10,1970-01-02T00:00:00Z,20,1970-01-03T00:00:00Z,"), "{row}");
-        // 缺席的一侧留空列，不补 0 也不伪造日期
+        // The absent side leaves empty columns — no zero fill, no fabricated date
         let one_sided = vec![compare::RowMeta { src: None, dst: Some(SideMeta { size: 5, mtime_ms: 86_400_000 }) }];
         let ops2 = vec![Op {
             side: Side::Target, action: Action::Delete, path: "x".into(), from: None,

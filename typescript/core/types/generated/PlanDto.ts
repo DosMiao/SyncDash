@@ -5,16 +5,16 @@ import type { RowMeta } from "./RowMeta";
 
 export type PlanDto = { header: PlanHeader, ops: Array<Op>, 
 /**
- * 与 ops 一一对应：可翻方向的行给出反向 op，不可翻为 null
+ * One entry per op: rows that can be flipped carry the reverse op, the rest are null
  */
 reversed: Array<Op | null>, 
 /**
- * 与 ops 一一对应：两侧比对时点的实测 size/mtime（界面列与排序用）。
- * 走平行数组而不是往 Op 里加字段——Op 的字面量在 compare.rs 里有三十多处，
- * 且那会改变 plan JSONL 的落盘格式。preflight/apply 收到的 ops 形状不变。
+ * One entry per op: the size/mtime measured on both sides at compare time (for the table columns and sorting).
+ * A parallel array rather than extra fields on Op — Op literals appear in thirty-odd places in compare.rs,
+ * and that would change the on-disk plan JSONL format. The op shape preflight/apply receive stays unchanged.
  */
 metas: Array<RowMeta>, 
 /**
- * 两侧判定相等的文件数/字节（"显示 X / 共 Y"的分母）
+ * Count/bytes of the files judged equal on both sides (the denominator of "showing X of Y")
  */
 equal_count: number, equal_bytes: number, };

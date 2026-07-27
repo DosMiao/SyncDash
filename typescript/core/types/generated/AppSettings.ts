@@ -3,27 +3,27 @@ import type { LogLevel } from "./LogLevel";
 
 export type AppSettings = { 
 /**
- * 空 = 默认 `<config>/logs`
+ * Empty = default `<config>/logs`
  */
 log_dir: string, 
 /**
- * 低于这个等级的 `Log` 事件不落盘
+ * `Log` events below this level are not written to disk
  */
 level: LogLevel, 
 /**
- * 超过这个天数的运行记录会被清理；0 = 不按天清
+ * Run records older than this many days get pruned; 0 = no day-based pruning
  */
 keep_days: number, 
 /**
- * 日志总量上限（MB），超了从最旧的删起；0 = 不限
+ * Total log size cap (MB); over it, the oldest go first. 0 = unlimited
  */
 max_total_mb: number, 
 /**
- * compare 运行的记录粒度：`summary`（只写索引行，不建目录）| `off`。
- * 不给 `full` 档：watch 30s 一轮 = 一天 2880 次，建目录会把日志盘冲垮。
+ * Logging granularity for compare runs: `summary` (index line only, no directory) | `off`.
+ * No `full` tier: watch on a 30s cycle = 2880 runs a day, and creating a directory each time would swamp the log disk.
  */
 log_compare: string, 
 /**
- * CLI：日志同时按原文进 stderr（保持改造前的终端体验）
+ * CLI: also mirror log lines verbatim to stderr (keeps the pre-refactor terminal experience)
  */
 mirror_stderr: boolean, };

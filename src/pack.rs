@@ -1,15 +1,15 @@
-//! v0.4 远端打包（需求 4）：
-//!   pack       —— 把计划里 target 侧的操作打成一个 tar 包：
-//!                 plan.jsonl（操作清单）+ payload/<rel>（待写入文件）+ manifest.json（收尾）
-//!                 manifest 含：计划 blake3、每个 payload 文件的 blake3/size/mtime/unix mode、
-//!                 合并 hash（按序连接各文件 hash 再 blake3）
-//!   apply-pack —— 对端执行：先验计划 hash → 逐文件提取到 staging 并验 hash →
-//!                 复用 apply::apply（锁、回收目录、复制后校验全都在）→ unix 恢复 mode
-//! 默认 dry-run；路径安全：拒绝绝对路径与 `..` 分量。
+//! v0.4 remote packing (requirement 4):
+//!   pack       —— bundle the target-side ops of a plan into one tar package:
+//!                 plan.jsonl (the op manifest) + payload/<rel> (files to write) + manifest.json (the wrap-up)
+//!                 the manifest carries: the plan's blake3, each payload file's blake3/size/mtime/unix mode,
+//!                 and a combined hash (concatenate the per-file hashes in order, then blake3)
+//!   apply-pack —— run on the far end: verify the plan hash → extract file by file into staging, verifying each hash →
+//!                 reuse apply::apply (lock, trash directory, post-copy verification all included) → restore unix mode
+//! dry-run by default; path safety: absolute paths and `..` components are rejected.
 
 use crate::compare::{Action, Op, Plan, PlanHeader, Side};
-// 路径安全判定与 `rel → 本地分隔符` 的真身都在 `foundation::path`。
-// 这里此前各抄了一份（`rel_is_safe`/`to_native`），与那边逐字相同。
+// The real path-safety check and the `rel → native separator` conversion both live in `foundation::path`.
+// This file used to carry its own copy of each (`rel_is_safe`/`to_native`), verbatim duplicates of those.
 use crate::chunk::RecipeStep;
 use crate::foundation::path::{is_safe_rel, to_native};
 use crate::foundation::time::now_ms;
@@ -24,17 +24,17 @@ pub struct PayloadEntry {
     pub rel: String,
     pub size: u64,
     pub mtime_ms: i64,
-    /// 最终整文件 blake3（重组后/提取后都按它校验）
+    /// blake3 of the final whole file (checked after reassembly and after extraction alike)
     pub hash: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub mode: Option<u32>,
-    /// "whole"（默认）| "delta"
+    /// "whole" (default) | "delta"
     #[serde(default = "default_kind")]
     pub kind: String,
-    /// delta：target 现有文件必须匹配的 blake3
+    /// delta: the blake3 the target's existing file must match
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub base_hash: Option<String>,
-    /// delta：tar 里 payload/<rel> 条目（= 增量 blob）的 blake3
+    /// delta: blake3 of the tar's payload/<rel> entry (= the delta blob)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub blob_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -86,12 +86,12 @@ pub struct PackSummary {
     pub ops: u64,
     pub files: u64,
     pub bytes: u64,
-    /// 增量传输省下的字节数（按整文件大小 − 实际打包 blob 计）
+    /// Bytes saved by delta transfer (whole-file size − the blob actually packed)
     pub delta_saved: u64,
 }
 
-/// 打包 plan 中 target 侧的操作。payload 从 source_root 读取。
-/// remote_chunks：远端现有大文件的 FastCDC 分块表（有则对 ≥4MB 的 Update 走增量）。
+/// Pack the target-side ops of a plan. Payload is read from source_root.
+/// remote_chunks: FastCDC chunk tables for the large files the remote already has (when present, Updates ≥4MB go delta).
 pub fn pack(plan: &Plan, source_root: &Path, out: &Path, remote_chunks: Option<&std::collections::HashMap<String, crate::chunk::FileChunks>>) -> std::io::Result<PackSummary> {
     let target_ops: Vec<Op> = plan
         .ops
@@ -109,7 +109,7 @@ pub fn pack(plan: &Plan, source_root: &Path, out: &Path, remote_chunks: Option<&
         }
     }
 
-    // 子计划：同 header、只含 target 侧 ops
+    // Sub-plan: same header, target-side ops only
     let sub = Plan { header: PlanHeader { op_count: target_ops.len() as u64, ..plan.header.clone() }, ops: target_ops.clone() };
     let mut plan_bytes: Vec<u8> = Vec::new();
     sub.write_to(&mut plan_bytes)?;
@@ -119,7 +119,7 @@ pub fn pack(plan: &Plan, source_root: &Path, out: &Path, remote_chunks: Option<&
     let mut tarb = tar::Builder::new(std::io::BufWriter::new(f));
     tarb.append_data(&mut tar_header(plan_bytes.len() as u64), "plan.jsonl", &plan_bytes[..])?;
 
-    // payload：Copy/Update 的内容，去重；命中 remote_chunks 的大文件走 FastCDC 增量
+    // payload: the content behind Copy/Update, deduplicated; large files that hit remote_chunks go through FastCDC delta
     let mut seen = std::collections::HashSet::new();
     let mut payload: Vec<PayloadEntry> = Vec::new();
     let mut bytes_total = 0u64;
@@ -129,7 +129,7 @@ pub fn pack(plan: &Plan, source_root: &Path, out: &Path, remote_chunks: Option<&
             continue;
         }
         if op.link.is_some() {
-            continue; // symlink 无 payload
+            continue; // a symlink has no payload
         }
         let src = source_root.join(to_native(&op.path));
         let md = std::fs::metadata(&src)?;
@@ -150,7 +150,7 @@ pub fn pack(plan: &Plan, source_root: &Path, out: &Path, remote_chunks: Option<&
 
         let base = remote_chunks.and_then(|m| m.get(&op.path)).filter(|_| size >= crate::chunk::DELTA_MIN_SIZE);
         if let Some(base) = base {
-            // 增量：本地新文件分块，与远端块表按 hash 对齐，只打包缺失块
+            // Delta: chunk the new local file, align it against the remote chunk table by hash, pack only the missing chunks
             let data = std::fs::read(&src)?;
             let hash = blake3::hash(&data).to_hex().to_string();
             let local_chunks = crate::chunk::chunk_bytes(&data);
@@ -217,7 +217,7 @@ pub fn pack(plan: &Plan, source_root: &Path, out: &Path, remote_chunks: Option<&
     Ok(PackSummary { ops: manifest.op_count, files: manifest.payload.len() as u64, bytes: bytes_total, delta_saved })
 }
 
-/// 对端执行包。dry_run=true 只校验+列出。返回 (done, skipped, errors)。
+/// Execute a package on the far end. dry_run=true only verifies and lists. Returns (done, skipped, errors).
 pub fn apply_pack(
     pkg: &Path,
     target_root_override: Option<&Path>,
@@ -225,7 +225,7 @@ pub fn apply_pack(
     verbose: bool,
     versioning: bool,
 ) -> std::io::Result<(u64, u64, u64)> {
-    // ---------- 第 1 遍：读 plan.jsonl 与 manifest.json ----------
+    // pass 1: read plan.jsonl and manifest.json
     let mut plan_bytes: Option<Vec<u8>> = None;
     let mut manifest: Option<Manifest> = None;
     {
@@ -250,7 +250,7 @@ pub fn apply_pack(
     let plan_bytes = plan_bytes.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "package has no plan.jsonl"))?;
     let manifest = manifest.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "package has no manifest.json"))?;
 
-    // 计划完整性 + 版本
+    // Plan integrity + version
     if manifest.pack_version > PACK_VERSION {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("package version {} newer than this binary supports ({PACK_VERSION}) — rebuild the remote", manifest.pack_version)));
     }
@@ -259,7 +259,7 @@ pub fn apply_pack(
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("plan hash mismatch: manifest {} vs actual {got}", manifest.plan_blake3)));
     }
 
-    // 解析计划
+    // Parse the plan
     let tmp_plan = std::env::temp_dir().join(format!("syncdash-plan-{}.jsonl", std::process::id()));
     std::fs::write(&tmp_plan, &plan_bytes)?;
     let plan = Plan::load(&tmp_plan)?;
@@ -296,7 +296,7 @@ pub fn apply_pack(
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("target root not accessible: {}", target_root.display())));
     }
 
-    // ---------- 第 2 遍：提取 payload 到 staging，并逐文件验 hash ----------
+    // pass 2: extract payload into staging, verifying each file's hash
     let staging = std::env::temp_dir().join(format!("syncdash-staging-{}-{}", std::process::id(), now_ms()));
     std::fs::create_dir_all(&staging)?;
     let by_rel: std::collections::HashMap<&str, &PayloadEntry> = manifest.payload.iter().map(|p| (p.rel.as_str(), p)).collect();
@@ -324,7 +324,7 @@ pub fn apply_pack(
                 std::fs::create_dir_all(par)?;
             }
             if meta.kind == "delta" {
-                // 增量：blob 校验 → base 校验 → 按 recipe 重组 → 成品校验
+                // Delta: verify the blob → verify the base → reassemble per the recipe → verify the result
                 let mut blob = Vec::new();
                 entry.read_to_end(&mut blob)?;
                 let got = blake3::hash(&blob).to_hex().to_string();
@@ -418,8 +418,8 @@ pub fn apply_pack(
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{extract_errors} payload file(s) failed verification — nothing applied")));
     }
 
-    // ---------- 执行：复用 apply（锁、回收目录、复制后校验） ----------
-    // 把 op 的 hash/mtime 对齐 manifest（打包时的最新状态），apply 的 verify 用它复检
+    // execute: reuse apply (lock, trash directory, post-copy verification)
+    // Align each op's hash/mtime with the manifest (the state at pack time) so apply's verify re-checks against it
     let mut ops = plan.ops.clone();
     for op in &mut ops {
         if matches!(op.action, Action::Copy | Action::Update) {
@@ -436,7 +436,7 @@ pub fn apply_pack(
         &crate::apply::ApplyOptions { dry_run: false, verbose, verify: true, versioning, ..Default::default() },
     );
 
-    // unix：恢复 exec 等权限位（SMB/打包路径上唯一会丢的属性）
+    // unix: restore the exec and other permission bits (the one attribute lost along the SMB/pack route)
     #[cfg(unix)]
     if errors == 0 {
         use std::os::unix::fs::PermissionsExt;

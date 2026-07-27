@@ -1,17 +1,17 @@
-//! 本机回收目录的保留策略与找回（P2-2）。
+//! Retention policy and recovery for the local trash directory (P2-2).
 //!
-//! `apply` 每跑一次就在 `<trash_root>/<毫秒时间戳>/` 下留一份"被删/被覆盖"的原件。
-//! 过去这些目录**从不清理**，长期使用会吃满盘，而且几百个时间戳目录里找一个文件靠运气。
+//! Every `apply` run leaves the originals it deleted/overwrote under `<trash_root>/<millisecond timestamp>/`.
+//! Those directories used to be **never cleaned up**: long-term use fills the disk, and finding one file among hundreds of timestamp directories is down to luck.
 //!
-//! 这里补三件事（语义参照 syncthing `lib/versioner/`）：
-//!   - `find`  —— 跨所有时间戳目录找同一个路径的历史版本（回收站的正确用法）
-//!   - `restore` —— 取回某一版（默认 dry-run）
-//!   - `prune` —— 按保留天数 / 总体积上限清理；可选 **staggered 稀释**
-//!     （`lib/versioner/staggered.go:47-53` 的区间表：第一小时每 30 秒留一份、
-//!      当天每小时一份、30 天内每天一份、之后每周一份）
+//! Three things are added here (semantics modelled on syncthing `lib/versioner/`):
+//!   - `find`  — locate historical versions of one path across every timestamp directory (what a trash is actually for)
+//!   - `restore` — pull one version back (dry-run by default)
+//!   - `prune` — clean up by retention days / total size cap; optional **staggered thinning**
+//!     (the interval table from `lib/versioner/staggered.go:47-53`: one copy per 30s for the first hour,
+//!      one per hour for the rest of the day, one per day within 30 days, one per week after that)
 //!
-//! 注意：`versioning = true` 的任务走的是各 root 内的 `.version_syncDash/`（见 version.rs），
-//! 与这里的本机 trash 是两条独立的路径；本模块只管本机 trash。
+//! Note: jobs with `versioning = true` go to `.version_syncDash/` inside each root instead (see version.rs),
+//! a path entirely separate from the local trash here; this module only handles the local trash.
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +28,7 @@ pub fn trash_root() -> PathBuf {
 
 #[derive(Clone, Debug)]
 pub struct Run {
-    /// 目录名（毫秒时间戳）
+    /// Directory name (millisecond timestamp)
     pub id: String,
     pub at_ms: u64,
     pub dir: PathBuf,
@@ -48,7 +48,7 @@ fn dir_stats(d: &Path) -> (u64, u64) {
     (files, bytes)
 }
 
-/// 列出全部回收批次，按时间从旧到新
+/// List every trash run, oldest to newest
 pub fn list_runs() -> Vec<Run> {
     let root = trash_root();
     let mut out = Vec::new();
@@ -72,15 +72,15 @@ pub fn list_runs() -> Vec<Run> {
 pub struct Found {
     pub run_id: String,
     pub at_ms: u64,
-    /// 回收目录里的绝对路径
+    /// Absolute path inside the trash directory
     pub stored: PathBuf,
-    /// 相对 root 的原路径（'/' 分隔）
+    /// Original path relative to the root ('/'-separated)
     pub rel: String,
     pub size: u64,
 }
 
-/// 跨全部批次查找路径含 `needle`（大小写不敏感子串）的文件。
-/// 结果按时间从新到旧——找回时你几乎总是想要最近那一版。
+/// Find files across every run whose path contains `needle` (case-insensitive substring).
+/// Results are newest-first — when restoring you almost always want the most recent version.
 pub fn find(needle: &str) -> Vec<Found> {
     let needle = needle.to_lowercase();
     let mut out = Vec::new();
@@ -89,8 +89,8 @@ pub fn find(needle: &str) -> Vec<Found> {
             if !e.file_type().is_file() {
                 continue;
             }
-            // walkdir 是从 run.dir 往下走的，strip_prefix 不会失败；
-            // 万一失败仍退回整条路径，与此前一致
+            // walkdir descends from run.dir, so strip_prefix cannot fail;
+            // should it ever fail, fall back to the whole path as before
             let rel = crate::foundation::path::to_rel(e.path(), &run.dir)
                 .unwrap_or_else(|| e.path().to_string_lossy().replace('\\', "/"));
             if needle.is_empty() || rel.to_lowercase().contains(&needle) {
@@ -108,9 +108,9 @@ pub fn find(needle: &str) -> Vec<Found> {
     out
 }
 
-/// 找回：把回收目录里的文件放回 `dest_root/<rel>`。
-/// `run_id = None` 取最新一版。默认 dry-run。
-/// 目标已存在时**不覆盖**（要覆盖请先自行挪开）——回收站的用途是找回，不是再来一次破坏。
+/// Restore: put a file from the trash back at `dest_root/<rel>`.
+/// `run_id = None` takes the newest version. Dry-run by default.
+/// An existing destination is **never overwritten** (move it aside yourself first) — a trash exists to recover things, not to destroy them a second time.
 pub fn restore(
     needle: &str,
     run_id: Option<&str>,
@@ -124,7 +124,7 @@ pub fn restore(
     if hits.is_empty() {
         return Ok((0, 0, 0));
     }
-    // 每个 rel 只取最新的一版
+    // Take only the newest version of each rel
     let mut seen = std::collections::HashSet::new();
     let mut restored = 0u64;
     let mut skipped = 0u64;
@@ -148,7 +148,7 @@ pub fn restore(
             if let Some(p) = dst.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            // 原子落盘：找回过程本身也不该留半截文件
+            // Atomic write: the restore itself must not leave a half-written file either
             let mut st = crate::atomic::Staged::create(&dst)?;
             let mut src = std::fs::File::open(&f.stored)?;
             st.write_all_from(&mut src)?;
@@ -169,15 +169,13 @@ pub fn restore(
     Ok((restored, skipped, errors))
 }
 
-// ---------- 保留策略 ----------
-
 #[derive(Clone, Copy, Debug)]
 pub struct Retention {
-    /// 超过这个天数一律删。<=0 关闭
+    /// Anything older than this many days is deleted. <=0 disables it
     pub keep_days: i64,
-    /// 全部批次总字节上限，超了从最旧的开始删。0 关闭
+    /// Total byte cap across all runs; once over, the oldest go first. 0 disables it
     pub max_bytes: u64,
-    /// 启用 staggered 稀释（比单纯按天保留聪明：近期密、远期疏）
+    /// Enable staggered thinning (smarter than plain day-based retention: dense recently, sparse further back)
     pub staggered: bool,
 }
 
@@ -187,20 +185,20 @@ impl Default for Retention {
     }
 }
 
-/// syncthing `staggered` 的区间表（`lib/versioner/staggered.go:47-53`）：
-/// (相邻两版之间至少间隔 step 秒, 该区间覆盖到 end 秒之前)
+/// syncthing's `staggered` interval table (`lib/versioner/staggered.go:47-53`):
+/// (adjacent versions must be at least step seconds apart, the interval covers everything younger than end seconds)
 const INTERVALS: [(i64, i64); 4] = [
-    (30, 3600),                    // 第一小时：每 30 秒最多留一份
-    (3600, 86_400),                // 当天：每小时一份
-    (86_400, 30 * 86_400),         // 30 天内：每天一份
-    (7 * 86_400, 365 * 86_400),    // 一年内：每周一份
+    (30, 3600),                    // first hour: at most one copy per 30s
+    (3600, 86_400),                // rest of the day: one per hour
+    (86_400, 30 * 86_400),         // within 30 days: one per day
+    (7 * 86_400, 365 * 86_400),    // within a year: one per week
 ];
 
-/// 给定各批次的**秒级**时间戳（任意顺序），返回应当删除的那些时间戳。
-/// 纯函数，便于单测——这是整个保留策略里唯一有算法含量的部分。
+/// Given each run's **second-resolution** timestamp (any order), return the timestamps that should be deleted.
+/// A pure function, so it is easy to unit-test — the only part of the retention policy with real algorithm in it.
 pub fn staggered_removals(times_secs: &[i64], now_secs: i64) -> Vec<i64> {
     let mut times: Vec<i64> = times_secs.to_vec();
-    times.sort_unstable(); // 从旧到新
+    times.sort_unstable(); // oldest to newest
     let mut remove = Vec::new();
     let mut prev_age = 0i64;
     let mut first = true;
@@ -208,18 +206,18 @@ pub fn staggered_removals(times_secs: &[i64], now_secs: i64) -> Vec<i64> {
     for t in times {
         let age = now_secs - t;
         if max_age > 0 && age > max_age {
-            remove.push(t); // 超过最大保留期
+            remove.push(t); // past the maximum retention period
             continue;
         }
         if first {
-            // 最旧的一份无条件保留，作为后续间隔判断的锚点
+            // The oldest copy is kept unconditionally; it anchors every later interval check
             prev_age = age;
             first = false;
             continue;
         }
         let step = INTERVALS.iter().find(|(_, end)| age < *end).map(|(s, _)| *s).unwrap_or(max_age);
         if prev_age - age < step {
-            // 与上一份保留者挨得太近 → 稀释掉
+            // Too close to the previously kept copy → thin it out
             remove.push(t);
             continue;
         }
@@ -228,7 +226,7 @@ pub fn staggered_removals(times_secs: &[i64], now_secs: i64) -> Vec<i64> {
     remove
 }
 
-/// 按保留策略清理。返回 (删除批次数, 释放字节)。
+/// Clean up per the retention policy. Returns (runs deleted, bytes freed).
 pub fn prune(r: &Retention, dry_run: bool) -> std::io::Result<(u64, u64)> {
     let runs = list_runs();
     if runs.is_empty() {
@@ -237,7 +235,7 @@ pub fn prune(r: &Retention, dry_run: bool) -> std::io::Result<(u64, u64)> {
     let now_ms = crate::foundation::time::now_ms() as i64;
     let mut doomed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // 1) 超龄
+    // 1) past retention age
     if r.keep_days > 0 {
         let cutoff = now_ms - r.keep_days * 86_400_000;
         for run in &runs {
@@ -247,7 +245,7 @@ pub fn prune(r: &Retention, dry_run: bool) -> std::io::Result<(u64, u64)> {
         }
     }
 
-    // 2) staggered 稀释
+    // 2) staggered thinning
     if r.staggered {
         let times: Vec<i64> = runs.iter().map(|x| (x.at_ms / 1000) as i64).collect();
         for t in staggered_removals(&times, now_ms / 1000) {
@@ -257,7 +255,7 @@ pub fn prune(r: &Retention, dry_run: bool) -> std::io::Result<(u64, u64)> {
         }
     }
 
-    // 3) 总体积上限：从最旧的开始淘汰，直到降到线下
+    // 3) total size cap: evict oldest-first until back under the line
     if r.max_bytes > 0 {
         let mut total: u64 = runs.iter().filter(|x| !doomed.contains(&x.id)).map(|x| x.bytes).sum();
         for run in runs.iter() {
@@ -270,7 +268,7 @@ pub fn prune(r: &Retention, dry_run: bool) -> std::io::Result<(u64, u64)> {
         }
     }
 
-    // 永远保留最新一批：它最可能就是刚刚那次误操作的后悔药
+    // Always keep the newest run: it is the most likely undo for the mistake you just made
     if let Some(newest) = runs.last() {
         doomed.remove(&newest.id);
     }
@@ -312,7 +310,7 @@ mod tests {
     #[test]
     fn staggered_thins_dense_recent_runs() {
         let now = 1_000_000_000;
-        // 第一小时内每 10 秒一份 → 区间要求 30 秒，应该被稀释掉大半
+        // one copy per 10s inside the first hour → the interval demands 30s, so most should be thinned out
         let times: Vec<i64> = (0..12).map(|i| now - i * 10).collect();
         let rm = staggered_removals(&times, now);
         let kept = times.len() - rm.len();
@@ -322,7 +320,7 @@ mod tests {
     #[test]
     fn staggered_keeps_well_spaced_runs() {
         let now = 1_000_000_000;
-        // 当天区间要求 1 小时间隔；这里给 2 小时间隔 → 一份都不该删
+        // the same-day interval demands 1 hour of spacing; these are 2 hours apart → nothing should be deleted
         let times: Vec<i64> = (1..10).map(|i| now - i * 2 * H).collect();
         let rm = staggered_removals(&times, now);
         assert!(rm.is_empty(), "runs spaced wider than the interval must all survive, removed {rm:?}");

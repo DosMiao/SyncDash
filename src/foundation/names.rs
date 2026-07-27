@@ -1,53 +1,53 @@
-//! SyncDash 自己写到磁盘上的所有文件名/目录名。
+//! Every file and directory name SyncDash itself writes to disk.
 //!
-//! 集中在此的原因是一条跨文件约束：`filter` 必须按名字排除这些东西，而写它们的是
-//! atomic / lock / preflight / version / runlog。名字散开时任何一处改名都会让过滤器
-//! 静默失效——`.syncdash-root` 被同步到对端后，没挂载的空目录也会长出标记，
-//! 挂载点闸门随之整个失效。
+//! They live here because of one cross-file constraint: `filter` must exclude these by name, while
+//! the writers are atomic / lock / preflight / version / runlog. With the names scattered, a rename
+//! anywhere silently disables the filter — once `.syncdash-root` is synced to the far side, an
+//! unmounted empty directory grows a marker too, and the mount-point guard fails entirely.
 
-/// 同目录临时文件前缀。真名是 `{TEMP_PREFIX}{basename}.{pid}`。
+/// Prefix for same-directory temp files. The real name is `{TEMP_PREFIX}{basename}.{pid}`.
 pub const TEMP_PREFIX: &str = ".syncdash.tmp.";
 
-/// 临时文件的存活上限，超过即视为上一次崩溃的残留。
+/// Maximum temp-file lifetime; anything older counts as debris from a previous crash.
 pub const TEMP_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
 
 
-/// 根心跳锁，防双机并发 apply。
+/// Root heartbeat lock, guards against two machines applying concurrently.
 pub const LOCK_NAME: &str = ".syncdash.lock";
 
-/// 挂载点标记（对应 syncthing 的 `.stfolder`）。配 `require_marker` 使用。
+/// Mount-point marker (syncthing's `.stfolder` equivalent). Used together with `require_marker`.
 pub const MARKER_NAME: &str = ".syncdash-root";
 
-/// 版本控制存放目录（root 内）。
+/// Versioning store directory (inside the root).
 pub const VERSION_STORE_DIR: &str = ".version_syncDash";
 
-/// 工具自留目录（缓存等）。
+/// The tool's own directory (caches and the like).
 pub const APP_DIR: &str = ".syncdash";
 
 
-/// 运行一览索引（每行一条 `RunRecord`）。
+/// Run-overview index (one `RunRecord` per line).
 pub const RUNLOG_INDEX_FILE: &str = "runs.jsonl";
 
-/// 单次运行的汇总。
+/// Summary of a single run.
 pub const RUNLOG_SUMMARY_FILE: &str = "summary.json";
 
-/// 单次运行的计划快照。
+/// Plan snapshot of a single run.
 pub const RUNLOG_PLAN_FILE: &str = "plan.jsonl";
 
-/// 事件流三份产物。
+/// The three event-stream artifacts.
 pub const RUNLOG_RUN_FILE: &str = "run.jsonl";
 pub const RUNLOG_ERRORS_FILE: &str = "errors.jsonl";
 pub const RUNLOG_ITEMS_FILE: &str = "items.jsonl";
 
-/// 进程级应用日志。
+/// Process-level application log.
 pub const APP_LOG_FILE: &str = "app.jsonl";
 
 
-/// 冲突副本中缀：`report.pdf` → `report.sync-conflict-<ts>-<host>.pdf`。
+/// Conflict-copy infix: `report.pdf` → `report.sync-conflict-<ts>-<host>.pdf`.
 pub const CONFLICT_INFIX: &str = ".sync-conflict-";
 
 
-/// 工具自身的元数据。无条件排除，任何档位都不放行。
+/// The tool's own metadata. Excluded unconditionally; no tier lets it through.
 pub fn self_excludes() -> Vec<String> {
     vec![
         format!("*/{APP_DIR}/"),
@@ -65,8 +65,8 @@ mod tests {
     #[test]
     fn self_excludes_cover_every_artifact_we_write() {
         let v = self_excludes();
-        // 这几条是「过滤器必须认得自己」的回归闸：任何一条丢了，
-        // 工具的元数据就会被当成待同步内容传到对端去。
+        // These are the regression gate for "the filter must recognize our own files": lose any one
+        // of them and the tool's metadata gets treated as syncable content and shipped to the far side.
         assert!(v.iter().any(|s| s.contains(APP_DIR)));
         assert!(v.iter().any(|s| s.contains(VERSION_STORE_DIR)));
         assert!(v.iter().any(|s| s.contains(LOCK_NAME)));
@@ -84,6 +84,6 @@ mod tests {
         let mut sorted = all.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), all.len(), "运行目录里的产物名不能撞车");
+        assert_eq!(sorted.len(), all.len(), "artifact names inside a run directory must not collide");
     }
 }

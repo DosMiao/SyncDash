@@ -1,21 +1,21 @@
-//! compare：N 表比对 → 行动计划（要求 2/3）。
-//! 模式语义：
-//!   mirror  —— source 为 master：target 补齐/更新/删除，完全向 source 看齐；
-//!              移动检测：source 独有路径与 target 独有路径按 (hash,size) 配对 → 生成 move（治 FFS 删+增）
-//!   enrich  —— 只增不删：target 缺的补上，source 较新的更新过去；不删除、不移动、不回退
-//!   sync    —— 双向。带 --archive（上次同步存档，Unison 思路）时可区分"删除 vs 新增"并
-//!              归因移动；无 archive 时退化为安全模式：双向补齐 + 差异报冲突 + 疑似移动只报告
+//! compare: N tables compared → action plan (requirement 2/3).
+//! Mode semantics:
+//!   mirror  — source is master: target is filled in/updated/deleted until it matches source exactly;
+//!             move detection: source-only paths and target-only paths paired by (hash,size) → emit move (cures FFS's delete+add)
+//!   enrich  — add only, never delete: fill in what target lacks, push over what source has newer; no deletes, no moves, no rollbacks
+//!   sync    — bidirectional. With --archive (the last sync's archive, the Unison idea) it can tell "delete vs add" apart and
+//!             attribute moves; without an archive it degrades to safe mode: fill in both ways + report differences as conflicts + suspected moves reported only
 //!
-//! 跨平台严谨性：
-//!   - 比对键 = NFC 归一化（APFS/HFS+ 会给出 NFD，Windows/Linux 惯例 NFC）＋大小写折叠
-//!     （NTFS/APFS 默认都大小写不敏感）；落盘 I/O 用各侧自己的原拼写，绝不改写对方的形态
-//!   - 一侧内部归一化后撞名（NFD/NFC 双胞胎、大小写双胞胎）→ Note 报告，保留先出现者
-//!   - 要在 Windows 侧新建的路径先做合法性预检（保留名/非法字符/尾点尾空格）→ 不合法直接标
-//!     Conflict("illegal-on-windows")，绝不执行到一半才炸
-//!   - 相等判定：双方都有 hash → 按 hash；否则 size 相等且 |Δmtime| <= 2s（FAT/SMB 时间粒度）
+//! Cross-platform rigor:
+//!   - compare key = NFC normalization (APFS/HFS+ hand out NFD, Windows/Linux use NFC by convention) + case-fold
+//!     (NTFS and APFS are both case-insensitive by default); disk I/O uses each side's own original spelling, never rewriting the other side's form
+//!   - names colliding after normalization within one side (NFD/NFC twins, case twins) → reported as a Note, the first one seen is kept
+//!   - paths to be created on the Windows side get a legality preflight first (reserved names/illegal characters/trailing dot or space) → an illegal one is marked
+//!     Conflict("illegal-on-windows") outright, never blowing up halfway through execution
+//!   - equality: both sides have a hash → go by hash; otherwise equal size and |Δmtime| <= 2s (FAT/SMB timestamp granularity)
 
-// 比对键（norm_key/fold）、时间戳、路径切分、冲突中缀的真身都在 `foundation`——
-// 这里只调用，不再各留一份抄本（`stamp` 里那段 civil_from_days 全仓曾有三份）。
+// The real implementations of the compare key (norm_key/fold), timestamps, path splitting and the conflict
+// infix all live in `foundation` — here we only call them, no private copies (that civil_from_days in `stamp` once existed in three places repo-wide).
 use crate::foundation::names::CONFLICT_INFIX;
 use crate::foundation::path::{base_name, split_ext, split_parent};
 use crate::foundation::text::{fold, norm_key, safe_host};
@@ -36,8 +36,8 @@ pub enum Action {
     Move,
     Delete,
     DeleteDir,
-    /// 只有权限位不同：不重传内容，只回写 mode
-    /// （syncthing 的 shortcutFile，`lib/model/folder_sendrecv.go:1253`）
+    /// Only the permission bits differ: don't retransmit the content, just write the mode back
+    /// (syncthing's shortcutFile, `lib/model/folder_sendrecv.go:1253`)
     Chmod,
     Conflict,
     Note,
@@ -65,13 +65,13 @@ pub struct Op {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     #[ts(type = "number | null")]
     pub mtime_ms: Option<i64>,
-    /// 复制/更新内容的期望 hash（paranoid 模式复制后校验用）
+    /// Expected hash of the copied/updated content (used by paranoid mode to verify after copying)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub hash: Option<String>,
-    /// Some = 这是一个 symlink 操作，值为链接指向（apply 创建链接而非复制内容）
+    /// Some = this is a symlink op, the value is the link target (apply creates a link instead of copying content)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub link: Option<String>,
-    /// 目标 unix 权限位。Chmod 用它作为要写入的值；Copy/Update 带上它则复制后一并回写
+    /// Target unix permission bits. Chmod uses it as the value to write; when Copy/Update carries it, it is written back right after the copy
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub mode: Option<u32>,
     pub reason: String,
@@ -93,15 +93,15 @@ pub struct PlanHeader {
     pub op_count: u64,
     #[ts(type = "number")]
     pub conflict_count: u64,
-    /// 两侧快照的条目数。计划体检（删除占比）要用，也让计划文件本身可自证规模。
+    /// Entry counts of both snapshots. Needed by the plan health check (deletion ratio), and lets the plan file attest to its own scale.
     #[serde(default)]
     #[ts(type = "number")]
     pub source_entries: u64,
     #[serde(default)]
     #[ts(type = "number")]
     pub target_entries: u64,
-    /// 两侧被过滤器排除的条目数（目录+文件）。排除必须可见：界面据此明示
-    /// "有多少东西没参与比对"，绝不允许"两侧一致 ✓"背后藏着被吞掉的树。
+    /// Entries excluded by the filter on both sides (dirs + files). Exclusion must be visible: the UI uses this to spell out
+    /// "how much did not take part in the compare" — never a swallowed tree hiding behind "both sides match ✓".
     #[serde(default)]
     #[ts(type = "number")]
     pub source_excluded: u64,
@@ -141,28 +141,28 @@ impl Plan {
     }
 }
 
-/// 冲突处理策略。默认 Report（只报告，绝不自动仲裁）——这是 SyncDash 的立身之本，
-/// 不因为对齐 syncthing 而改默认。
+/// Conflict handling policy. Default is Report (report only, never arbitrate automatically) — this is
+/// what SyncDash stands on; aligning with syncthing does not change the default.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ConflictPolicy {
-    /// 只报告，人来处理
+    /// Report only; a human handles it
     Report,
-    /// 败方改名成 `<name>.sync-conflict-<ts>-<host><ext>`，胜方落地
-    /// （syncthing `conflictName`，`lib/model/folder_sendrecv.go:2219`）
+    /// The loser is renamed to `<name>.sync-conflict-<ts>-<host><ext>`, the winner lands
+    /// (syncthing `conflictName`, `lib/model/folder_sendrecv.go:2219`)
     Copy,
-    /// mtime 新者胜，旧的直接被覆盖（不留副本）
+    /// Newer mtime wins; the older one is simply overwritten (no copy kept)
     Newer,
 }
 
 #[derive(Clone, Copy)]
 pub struct CompareOptions {
-    /// 默认 true：NTFS 与 APFS 默认都大小写不敏感
+    /// Default true: NTFS and APFS are both case-insensitive by default
     pub case_insensitive: bool,
-    /// 冲突策略
+    /// Conflict policy
     pub conflict: ConflictPolicy,
-    /// 同步 unix 权限位（两侧都是 unix 时才有意义；Win 侧无 mode，开了会一直报差异）
+    /// Sync unix permission bits (only meaningful when both sides are unix; the Win side has no mode, so enabling it would report a difference forever)
     pub sync_mode: bool,
-    /// 每个文件最多保留几份冲突副本（-1 = 不限）。仅 ConflictPolicy::Copy 有效
+    /// How many conflict copies to keep per file at most (-1 = unlimited). Only effective for ConflictPolicy::Copy
     pub max_conflicts: i32,
 }
 
@@ -177,18 +177,18 @@ impl Default for CompareOptions {
     }
 }
 
-/// 冲突副本名：`report.pdf` → `report.sync-conflict-20260726-143000-WIN01.pdf`
-/// （与 syncthing 的命名同构，便于人一眼认出，也便于双方的过滤器识别）
+/// Conflict-copy name: `report.pdf` → `report.sync-conflict-20260726-143000-WIN01.pdf`
+/// (isomorphic to syncthing's naming, so a human recognizes it at a glance and both sides' filters can spot it)
 pub fn conflict_name(path: &str, host: &str, at_ms: u64) -> String {
     let (dir, base) = split_parent(path);
-    // split_ext 只认最后一个点之后的扩展名；隐藏文件（.gitignore）整体算主干
+    // split_ext only recognizes the extension after the last dot; a hidden file (.gitignore) counts wholly as the stem
     let (stem, ext) = split_ext(base);
     let ts = stamp_compact(at_ms as i64);
     let host = safe_host(host);
     format!("{dir}{stem}{CONFLICT_INFIX}{ts}-{host}{ext}")
 }
 
-/// 冲突副本自身不该再参与同步/冲突判定（syncthing `isConflict`，:2224）
+/// A conflict copy must not itself take part in sync/conflict decisions (syncthing `isConflict`, :2224)
 pub fn is_conflict_copy(path: &str) -> bool {
     base_name(path).contains(CONFLICT_INFIX)
 }
@@ -200,9 +200,9 @@ fn files_equal(a: &Entry, b: &Entry) -> bool {
     a.size == b.size && (a.mtime_ms - b.mtime_ms).abs() <= MTIME_SLACK_MS
 }
 
-/// `e` 的内容对应 archive 条目 `r` 的第几代：
-/// `Some(0)` = 与 archive 当前记录一致，`Some(n)` = 第 n 代历史，`None` = archive 没见过。
-/// 代数越小越新——这让"落后一代"与"并发修改"能被区分开（P1-3）。
+/// Which generation of archive entry `r` the content of `e` corresponds to:
+/// `Some(0)` = matches what the archive currently records, `Some(n)` = the n-th historic generation, `None` = the archive has never seen it.
+/// The lower the generation number the newer it is — this is what lets "one generation behind" be told apart from "concurrent edit" (P1-3).
 fn generation_of(e: &Entry, r: &Entry) -> Option<usize> {
     if files_equal(e, r) {
         return Some(0);
@@ -211,7 +211,7 @@ fn generation_of(e: &Entry, r: &Entry) -> Option<usize> {
     r.prev.as_ref()?.iter().position(|x| x == h).map(|i| i + 1)
 }
 
-/// 归一键 → 条目；撞名（NFD/NFC 或大小写双胞胎）保留先出现者并记录
+/// Normalized key → entry; on a collision (NFD/NFC or case twins) the first one seen is kept and recorded
 fn map_of<'a>(snap: &'a Snapshot, kind: EntryKind, ci: bool) -> (BTreeMap<String, &'a Entry>, Vec<String>) {
     let mut m: BTreeMap<String, &Entry> = BTreeMap::new();
     let mut dups = Vec::new();
@@ -226,9 +226,9 @@ fn map_of<'a>(snap: &'a Snapshot, kind: EntryKind, ci: bool) -> (BTreeMap<String
     (m, dups)
 }
 
-// ---------- 证据层（只读，界面用；compare() 不受影响） ----------
+// Evidence layer (read-only, for the UI; compare() is unaffected)
 
-/// 比对时点某一侧的实测状态。**只供展示与排序**，apply 一个字节都不读它。
+/// One side's measured state at compare time. **For display and sorting only** — apply never reads a single byte of it.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct SideMeta {
@@ -238,7 +238,7 @@ pub struct SideMeta {
     pub mtime_ms: i64,
 }
 
-/// 与 `plan.ops[i]` 一一对应的两侧实测状态（缺席的一侧为 None）
+/// Measured state of both sides, one-to-one with `plan.ops[i]` (the absent side is None)
 #[derive(Serialize, Deserialize, Clone, Default, Debug, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct RowMeta {
@@ -248,20 +248,20 @@ pub struct RowMeta {
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Evidence {
-    /// 长度恒等于 plan.ops.len()
+    /// Length is always exactly plan.ops.len()
     pub metas: Vec<RowMeta>,
-    /// 两侧都有且判定相等的文件数 —— FFS 那句 "Showing 481 of 23,112" 的分母来源
+    /// Files present on both sides and judged equal — the source of the denominator in FFS's "Showing 481 of 23,112"
     pub equal_count: u64,
     pub equal_bytes: u64,
 }
 
-/// 计划之外的"证据"：每行两侧的实测 size/mtime + 相等项统计。
+/// "Evidence" beyond the plan: measured size/mtime of both sides per row + a count of equal items.
 ///
-/// 为什么不把这两个字段直接塞进 `Op`：`Op { .. }` 的结构体字面量在本文件里有
-/// 三十多处，加字段等于改三十多个点，还会改变 plan JSONL 的落盘格式与 CLI 行为。
-/// 这里走 `PlanDto.reversed` 同款的平行数组，`compare()` 一行不动。
+/// Why these two fields are not simply stuffed into `Op`: there are thirty-odd `Op { .. }` struct
+/// literals in this file, so adding a field means touching thirty-odd sites, and it would change the
+/// plan JSONL on-disk format and the CLI behavior. We use a parallel array like `PlanDto.reversed`, leaving `compare()` untouched.
 ///
-/// 口径与 `compare()` 共用 `norm_key` / `files_equal`，不可能漂移。
+/// The criteria share `norm_key` / `files_equal` with `compare()`, so they cannot drift.
 pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &CompareOptions) -> Evidence {
     let ci = copts.case_insensitive;
     let (s_files, _) = map_of(source, EntryKind::File, ci);
@@ -279,7 +279,7 @@ pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &Compa
         .ops
         .iter()
         .map(|op| {
-            // move 的执行侧此刻还叫 from，对面已经是 path——两侧各查各的名字
+            // On the executing side a move is still called from, on the other side it is already path — each side is looked up under its own name
             let (s_rel, t_rel) = match (&op.action, &op.side) {
                 (Action::Move, Side::Target) => (op.path.as_str(), op.from.as_deref().unwrap_or(&op.path)),
                 (Action::Move, Side::Source) => (op.from.as_deref().unwrap_or(&op.path), op.path.as_str()),
@@ -305,7 +305,7 @@ pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &Compa
     Evidence { metas, equal_count, equal_bytes }
 }
 
-/// 一条"两侧相同"的记录。计划里没有它——它不是动作，是证据。
+/// One "identical on both sides" record. It is not in the plan — it is not an action, it is evidence.
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct SameRow {
@@ -314,14 +314,14 @@ pub struct SameRow {
     pub size: u64,
     #[ts(type = "number")]
     pub mtime_ms: i64,
-    /// target 侧的时间（内容相同但时间戳可以差几毫秒——FAT/SMB 粒度）
+    /// The target side's time (content is identical but timestamps may differ by a few milliseconds — FAT/SMB granularity)
     #[ts(type = "number")]
     pub other_mtime_ms: i64,
 }
 
-/// 两侧判定相等的文件，按 source 侧路径序分页。
-/// FFS 底部那个 "22,631" 按钮的数据源：一个文件没出现在差异表里时，
-/// 你得能确认它是"相等"，而不是"根本没扫到"。
+/// Files judged equal on both sides, paged in source-side path order.
+/// The data behind FFS's "22,631" button at the bottom: when a file does not appear in the diff table,
+/// you must be able to confirm it is "equal" rather than "never scanned at all".
 pub fn same_page(
     source: &Snapshot,
     target: &Snapshot,
@@ -358,7 +358,7 @@ pub fn same_page(
     (total, out)
 }
 
-/// Windows 侧新建此相对路径是否合法（保留名 / 非法字符 / 尾点尾空格）
+/// Is creating this relative path on the Windows side legal (reserved name / illegal character / trailing dot or space)
 fn win_invalid_reason(rel: &str) -> Option<String> {
     const RESERVED: [&str; 22] = [
         "CON", "PRN", "AUX", "NUL",
@@ -383,25 +383,25 @@ fn win_invalid_reason(rel: &str) -> Option<String> {
     None
 }
 
-/// 一次移动配对的结果
+/// The result of one move pairing
 pub struct MovePair {
     pub from: String,
     pub to: String,
     pub size: u64,
-    /// 同父目录 = 就地改名（FFS "同目录 rename 合并"）
+    /// Same parent dir = rename in place (FFS's "same-directory rename merge")
     pub rename_in_place: bool,
-    /// 配对时的同内容候选个数。>1 说明 `from` 是从多个等价候选里任选的——
-    /// 结果内容仍然正确，但归因不确定，reason 里必须如实标注，不能假装确定。
+    /// Number of same-content candidates at pairing time. >1 means `from` was picked arbitrarily among equivalent candidates —
+    /// the resulting content is still correct, but the attribution is uncertain; reason must say so honestly, never feign certainty.
     pub candidates: usize,
 }
 
-/// 移动配对。配对优先级（借 FFS "同目录 rename 合并"之意）：
-///   1) 同父目录（就地改名）  2) 同文件名（整目录搬迁）  3) 任意同 hash
+/// Move pairing. Pairing priority (in the spirit of FFS's "same-directory rename merge"):
+///   1) same parent dir (rename in place)  2) same file name (whole directory relocated)  3) any same hash
 ///
-/// **空文件不参与配对**：所有零长文件的 blake3 相同，会挤进同一个桶，
-/// 把一堆互不相干的 `__init__.py` / `.gitkeep` 配成"重命名"。
-/// syncthing 在 `findRename`（`lib/model/folder.go:930-932`）第一件事就是排除
-/// `Size == 0`，我们照做。
+/// **Empty files never take part in pairing**: every zero-length file has the same blake3, so they all
+/// crowd into one bucket and a pile of unrelated `__init__.py` / `.gitkeep` get paired as "renames".
+/// The very first thing syncthing does in `findRename` (`lib/model/folder.go:930-932`) is exclude
+/// `Size == 0`; we do the same.
 fn detect_moves<'a>(
     adds: Vec<&'a Entry>,
     dels: Vec<&'a Entry>,
@@ -456,7 +456,7 @@ fn detect_moves<'a>(
     (moves, rest_adds, rest_dels)
 }
 
-/// move op 的 reason：歧义配对如实标注候选数
+/// The reason for a move op: an ambiguous pairing states the candidate count honestly
 fn move_reason(base: &str, m: &MovePair) -> String {
     if m.candidates > 1 {
         format!("{base} (ambiguous: {} identical candidates)", m.candidates)
@@ -465,10 +465,10 @@ fn move_reason(base: &str, m: &MovePair) -> String {
     }
 }
 
-/// GUI 逐行翻方向（FFS 同款交互的语义核心）。返回 None = 该 op 不可反转（move/dir/conflict/note）。
-/// - Copy 的反向：不把文件补过去，而是删掉"多出"的那份（让持有侧向缺失侧看齐）
-/// - Update 的反向：让另一侧的内容获胜
-/// - Delete 的反向：不删，反而把它复制回对面（恢复）
+/// Per-row direction flip in the GUI (the semantic core of the same interaction FFS has). Returns None = this op cannot be reversed (move/dir/conflict/note).
+/// - Reverse of Copy: instead of pushing the file over, delete the "extra" one (the side that has it falls in line with the side that lacks it)
+/// - Reverse of Update: let the other side's content win
+/// - Reverse of Delete: don't delete — copy it back to the other side instead (restore)
 pub fn reverse_op(op: &Op) -> Option<Op> {
     let other = match op.side {
         Side::Source => Side::Target,
@@ -546,7 +546,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                     Some(&te) => {
                         if !files_equal(se, te) && (mode == "mirror" || se.mtime_ms > te.mtime_ms + MTIME_SLACK_MS) {
                             let reason = if mode == "mirror" { "differs-master-wins" } else { "source-newer" };
-                            // 更新写到 target 已存在的文件上：用 target 的原拼写打开，不改对方形态
+                            // The update writes onto a file that already exists on target: open it with target's own spelling, don't rewrite the other side's form
                             ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, mode: None, reason: reason.into() });
                         }
                     }
@@ -597,11 +597,11 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                             continue;
                         }
                         if has_archive {
-                            // P1-3：不只看"是否等于 archive 当前那一代"，还看历史代。
-                            // 一侧只是**落后**（停在某个旧版本）并不是并发修改——
-                            // syncthing 用 PreviousBlocksHash 达到同样目的
-                            // （`lib/protocol/bep_fileinfo.go:200-207`）。
-                            // generation_of 返回 0 = 与 archive 当前代一致，1..n = 第 n 代历史。
+                            // P1-3: don't only ask "is it equal to the archive's current generation" — look at historic generations too.
+                            // One side merely being **behind** (stuck on some old version) is not a concurrent edit —
+                            // syncthing achieves the same thing with PreviousBlocksHash
+                            // (`lib/protocol/bep_fileinfo.go:200-207`).
+                            // generation_of returns 0 = matches the archive's current generation, 1..n = the n-th historic generation.
                             let r = arch_files.get(p).copied();
                             let sg = r.and_then(|r| generation_of(se, r));
                             let tg = r.and_then(|r| generation_of(te, r));
@@ -612,17 +612,17 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                                 ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, mode: None, reason: why.into() });
                             };
                             match (sg, tg) {
-                                // source 停在已知版本、target 是新内容 → target 改的
+                                // source sits on a known version, target has new content → target changed it
                                 (Some(_), None) => push_to_source(&mut ops, "target-changed"),
                                 (None, Some(_)) => push_to_target(&mut ops, "source-changed"),
-                                // 两侧都停在已知版本但代数不同 → 新的那一代赢，不是冲突
+                                // Both sides sit on known versions but at different generations → the newer generation wins; not a conflict
                                 (Some(a), Some(b)) if a < b => {
                                     push_to_target(&mut ops, "target-behind-by-generations")
                                 }
                                 (Some(a), Some(b)) if a > b => {
                                     push_to_source(&mut ops, "source-behind-by-generations")
                                 }
-                                // 两侧都是 archive 从未见过的内容 → 真并发修改
+                                // Neither side's content was ever seen by the archive → a genuine concurrent edit
                                 _ => ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "both-changed".into() }),
                             }
                         } else if resolve_newer {
@@ -715,8 +715,8 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
         other => panic!("unknown mode: {other}"),
     }
 
-    // ---------- symlink（symlinks="direct" 时两侧表里才有 Symlink 条目）----------
-    // 比对按"链接指向字符串"相等；mirror 向 master 看齐，enrich 只补缺，sync 只补缺＋差异报冲突
+    // symlinks (Symlink entries only exist in both tables when symlinks="direct")
+    // Compared by equality of the "link target string"; mirror falls in line with master, enrich only fills gaps, sync fills gaps + reports differences as conflicts
     {
         let (s_links, _) = map_of(source, EntryKind::Symlink, ci);
         let (t_links, _) = map_of(target, EntryKind::Symlink, ci);
@@ -763,13 +763,13 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
         }
     }
 
-    // ---------- unix 权限位（P2-4）----------
-    // 两侧都是 unix、且 job 显式开了 sync_mode 才做：Windows 侧没有 mode，
-    // 开着会每次比对都报差异。过去 mode 只记进快照表却从不参与比对，
-    // 挂载盘路径同步过去的脚本会丢 exec 位（pack 路径反而会恢复，两条路径行为不一致）。
+    // unix permission bits (P2-4)
+    // Only done when both sides are unix and the job explicitly enabled sync_mode: the Windows side has no mode,
+    // so leaving it on would report a difference on every compare. Previously mode was only recorded into the snapshot
+    // table and never took part in the compare, so scripts synced over the mounted-drive path lost their exec bit (the pack path did restore it — the two paths behaved differently).
     let both_unix = source.header.os != "windows" && target.header.os != "windows";
     if copts.sync_mode && both_unix {
-        // 1) 要复制内容的 op 顺带带上目标 mode，apply 复制完直接回写，不用多一趟
+        // 1) Ops that copy content carry the target mode along; apply writes it back right after copying, no extra pass needed
         for op in &mut ops {
             if matches!(op.action, Action::Copy | Action::Update) && op.link.is_none() {
                 let key = norm_key(&op.path, ci);
@@ -782,9 +782,10 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                 }
             }
         }
-        // 2) 内容相同、只有权限不同 → 单独一条 Chmod，绝不为了几个权限位重传文件
-        //    （syncthing 的 shortcutFile 同样思路）。sync 模式没有"谁是 master"，
-        //    权限归属无从判断，只报告不动手。
+        // 2) Same content, only permissions differ → a standalone Chmod; never retransmit a file over a few permission bits
+        //    (the same idea as syncthing's shortcutFile). sync mode has no "who is master", so
+        //    permission attribution is undecidable and the pass is skipped entirely there —
+        //    a mode-only difference produces no op and no note under sync.
         if mode == "mirror" || mode == "enrich" {
             for (p, se) in &s_files {
                 let se = *se;
@@ -812,12 +813,12 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
         }
     }
 
-    // ---------- 大小写敏感模式下的落盘撞名预检（P2-3）----------
-    // case_sensitive = true 时比对键区分大小写，但底层 NTFS/APFS 通常**不**区分：
-    // 往 target 写 `Foo.txt` 会静默覆盖已存在的 `foo.txt`。syncthing 在写入前解析
-    // 目录真名并报 CaseConflictError（`lib/fs/casefs.go:27-37`）；我们在计划阶段就拦。
+    // Write-collision preflight in case-sensitive mode (P2-3)
+    // With case_sensitive = true the compare key distinguishes case, but the underlying NTFS/APFS usually does **not**:
+    // writing `Foo.txt` to target would silently overwrite the existing `foo.txt`. syncthing resolves
+    // the directory's real name before writing and raises CaseConflictError (`lib/fs/casefs.go:27-37`); we catch it at plan time.
     if !ci {
-        // fold = foundation::text::fold，与比对键 norm_key 同一份归一化实现
+        // fold = foundation::text::fold, the very same normalization implementation the compare key norm_key uses
         let mut folded: HashMap<(bool, String), Vec<&str>> = HashMap::new();
         for (is_target, snap) in [(false, source), (true, target)] {
             for e in &snap.entries {
@@ -830,8 +831,8 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
             }
             let is_target = op.side == Side::Target;
             if let Some(existing) = folded.get(&(is_target, fold(&op.path))) {
-                // Move 的 from 就是那个"撞名"的文件时，这恰恰是一次**大小写改名**
-                // （`readme.md` → `Readme.md`），是移动检测的正确产物，不是撞名事故。
+                // When a Move's from IS that "colliding" file, this is precisely a **case rename**
+                // (`readme.md` → `Readme.md`) — the correct product of move detection, not a collision accident.
                 let from = op.from.as_deref();
                 if let Some(other) = existing.iter().find(|p| **p != op.path && Some(**p) != from) {
                     op.action = Action::Conflict;
@@ -845,11 +846,11 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
         }
     }
 
-    // ---------- 冲突策略（P1-2）----------
-    // 默认 Report：只报告，人来处理——这是 SyncDash 的立身之本，不改。
-    // Copy/Newer 是显式 opt-in，让双机日常使用时一个冲突不会把文件卡住到天荒地老。
-    // 只处理**内容冲突**（两侧都有该文件且都改过）；删改冲突与
-    // illegal-on-windows 一律保持 Report——自动仲裁"删还是留"太危险。
+    // Conflict policy (P1-2)
+    // Default Report: report only, a human handles it — this is what SyncDash stands on; unchanged.
+    // Copy/Newer are explicit opt-ins, so that in everyday two-machine use one conflict doesn't wedge a file until the end of time.
+    // Only **content conflicts** are handled (both sides have the file and both changed it); delete-vs-edit conflicts and
+    // illegal-on-windows always stay Report — automatically arbitrating "delete or keep" is too dangerous.
     if copts.conflict != ConflictPolicy::Report {
         const RESOLVABLE: [&str; 3] = ["both-changed", "differs-no-archive", "symlink-differs"];
         let now = now_ms();
@@ -858,14 +859,14 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
             if op.action != Action::Conflict || !RESOLVABLE.contains(&op.reason.as_str()) {
                 continue;
             }
-            // 冲突副本自身不再生成冲突副本（syncthing isConflict，:1863）
+            // A conflict copy never spawns another conflict copy (syncthing isConflict, :1863)
             if is_conflict_copy(&op.path) {
                 continue;
             }
             let key = norm_key(&op.path, ci);
             let (Some(&se), Some(&te)) = (s_files.get(&key), t_files.get(&key)) else { continue };
-            // mtime 新者胜；完全相同则 host 名字典序做稳定 tie-break
-            // （syncthing 用版本向量里的 device id，我们没有，用 host 等效）
+            // Newer mtime wins; on an exact tie the host name's lexicographic order is a stable tie-break
+            // (syncthing uses the device id from the version vector; we have none, so host is the equivalent)
             let source_wins = match se.mtime_ms.cmp(&te.mtime_ms) {
                 std::cmp::Ordering::Greater => true,
                 std::cmp::Ordering::Less => false,
@@ -891,7 +892,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                     reason: format!("conflict-loser-kept-as-copy ({})", op.reason),
                 });
             }
-            // 胜方内容落到败方那一侧
+            // The winner's content lands on the loser's side
             extra.push(Op {
                 side: loser_side,
                 action: Action::Update,
@@ -907,22 +908,22 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                     if copts.conflict == ConflictPolicy::Copy { "loser kept as .sync-conflict copy" } else { "loser overwritten (recoverable from trash)" }
                 ),
             });
-            // 原冲突行降级为记录，保留可审计的痕迹
+            // The original conflict row is downgraded to a note, leaving an auditable trace
             op.action = Action::Note;
             op.reason = format!("auto-resolved: {}", op.reason);
         }
         ops.extend(extra);
 
-        // max_conflicts：同一路径的冲突副本超额时删掉最老的几份
-        // （syncthing `lib/model/folder_sendrecv.go:1888-1898`）。
-        // 副本名里带时间戳，字典序即时间序。
+        // max_conflicts: when the conflict copies for one path exceed the limit, drop the oldest few
+        // (syncthing `lib/model/folder_sendrecv.go:1888-1898`).
+        // The copy name carries a timestamp, so lexicographic order is chronological order.
         if copts.conflict == ConflictPolicy::Copy && copts.max_conflicts >= 0 {
             let limit = copts.max_conflicts as usize;
             for (is_target, snap) in [(false, source), (true, target)] {
                 let mut groups: BTreeMap<String, Vec<&str>> = BTreeMap::new();
                 for e in snap.entries.iter().filter(|e| e.kind == EntryKind::File) {
                     if is_conflict_copy(&e.path) {
-                        // 归组到原始文件名：去掉 `.sync-conflict-…` 那一段
+                        // Group under the original file name: strip off the `.sync-conflict-…` part
                         if let Some(i) = e.path.find(CONFLICT_INFIX) {
                             let stem = &e.path[..i];
                             groups.entry(stem.to_string()).or_default().push(&e.path);
@@ -933,7 +934,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                     if copies.len() <= limit {
                         continue;
                     }
-                    copies.sort_unstable(); // 时间戳在名字里 → 字典序 = 时间序
+                    copies.sort_unstable(); // the timestamp is in the name → lexicographic = chronological
                     let doomed = copies.len() - limit;
                     for p in copies.into_iter().take(doomed) {
                         ops.push(Op {
@@ -954,7 +955,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
         }
     }
 
-    // Windows 侧新建路径的合法性预检：计划阶段拦下，不让 apply 执行到一半才炸
+    // Legality preflight for paths created on the Windows side: caught at plan time, so apply never blows up halfway through
     for op in &mut ops {
         if matches!(op.action, Action::Copy | Action::Move) {
             let exec_os = match op.side {
@@ -1029,14 +1030,14 @@ mod tests {
     fn file(path: &str, hash: &str) -> Entry {
         Entry { path: path.into(), kind: EntryKind::File, size: 1, mtime_ms: 0, hash: Some(hash.into()), file_id: None, mode: None, link: None, prev: None }
     }
-    /// 带 mtime 的文件（冲突仲裁按 mtime）
+    /// A file with an mtime (conflict arbitration goes by mtime)
     fn file_at(path: &str, hash: &str, mtime_ms: i64) -> Entry {
         Entry { mtime_ms, ..file(path, hash) }
     }
     fn sized(path: &str, hash: &str, size: u64) -> Entry {
         Entry { size, ..file(path, hash) }
     }
-    /// archive 条目：当前 hash + 历史代
+    /// An archive entry: current hash + historic generations
     fn arch(path: &str, hash: &str, prev: &[&str]) -> Entry {
         Entry {
             prev: if prev.is_empty() { None } else { Some(prev.iter().map(|s| s.to_string()).collect()) },
@@ -1069,12 +1070,12 @@ mod tests {
             .collect()
     }
 
-    // ---------- P2-5：空文件 / 歧义配对 ----------
+    // P2-5: empty files / ambiguous pairing
 
     #[test]
     fn empty_files_are_never_paired_as_moves() {
-        // 所有零长文件的 blake3 相同。过去它们会被配成一堆"重命名"，
-        // 结果内容虽对，归因却是编的。syncthing 在 findRename 里直接排除 Size == 0。
+        // Every zero-length file has the same blake3. They used to get paired into a pile of "renames" —
+        // the resulting content was right, but the attribution was invented. syncthing simply excludes Size == 0 in findRename.
         let e = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
         let s = snap("windows", vec![sized("new/a.py", e, 0), sized("new/b.py", e, 0)]);
         let t = snap("windows", vec![sized("old/x.py", e, 0), sized("old/y.py", e, 0)]);
@@ -1090,7 +1091,7 @@ mod tests {
 
     #[test]
     fn ambiguous_move_is_labelled_as_such() {
-        // 同内容的多个候选：配对结果内容正确，但 from 是任选的——reason 必须说实话
+        // Several candidates with the same content: the pairing's content is correct, but from is picked arbitrarily — reason must tell the truth
         let s = snap("windows", vec![sized("moved/one.bin", "h", 10)]);
         let t = snap(
             "windows",
@@ -1111,12 +1112,12 @@ mod tests {
         assert!(!mv.reason.contains("ambiguous"), "a single candidate must not be flagged: {:?}", mv.reason);
     }
 
-    // ---------- P1-3：archive 多代归因 ----------
+    // P1-3: multi-generation archive attribution
 
     #[test]
     fn a_side_that_is_merely_behind_is_not_a_conflict() {
-        // archive 已推进到 H2；source 改到 H3，target 还停在 H1（上次没同步成功）。
-        // 过去两边都 != archive 当前代 → 误报 both-changed。
+        // The archive has advanced to H2; source moved on to H3, target is still stuck at H1 (last sync didn't complete).
+        // Previously both sides != the archive's current generation → false both-changed.
         let s = snap("windows", vec![file("f.txt", "H3")]);
         let t = snap("macos", vec![file("f.txt", "H1")]);
         let a = snap("windows", vec![arch("f.txt", "H2", &["H1", "H0"])]);
@@ -1129,7 +1130,7 @@ mod tests {
 
     #[test]
     fn genuinely_novel_content_on_both_sides_is_still_a_conflict() {
-        // 两边的内容 archive 都没见过 → 这才是真并发修改，绝不能被多代逻辑放过
+        // Neither side's content was ever seen by the archive → this is the genuine concurrent edit; the multi-generation logic must never let it slip
         let s = snap("windows", vec![file("f.txt", "X")]);
         let t = snap("macos", vec![file("f.txt", "Y")]);
         let a = snap("windows", vec![arch("f.txt", "H2", &["H1", "H0"])]);
@@ -1139,7 +1140,7 @@ mod tests {
 
     #[test]
     fn newer_generation_wins_when_both_sides_are_behind() {
-        // source 停在第 1 代、target 停在第 2 代 → source 较新，向 target 传播
+        // source sits at generation 1, target at generation 2 → source is newer, propagate to target
         let s = snap("windows", vec![file("f.txt", "H1")]);
         let t = snap("macos", vec![file("f.txt", "H0")]);
         let a = snap("windows", vec![arch("f.txt", "H2", &["H1", "H0"])]);
@@ -1158,13 +1159,13 @@ mod tests {
         roll_generations(&mut fresh, &old);
         assert_eq!(fresh[0].prev.as_ref().unwrap(), &vec!["H1".to_string(), "H0".to_string()]);
 
-        // 内容没变时不该把同一个 hash 灌进历史
+        // When the content hasn't changed, the same hash must not be poured into the history
         let mut same = vec![file("f.txt", "H1")];
         roll_generations(&mut same, &old);
         assert_eq!(same[0].prev.as_ref().unwrap(), &vec!["H0".to_string()]);
     }
 
-    // ---------- P1-2：冲突副本 ----------
+    // P1-2: conflict copies
 
     #[test]
     fn conflict_policy_report_is_the_default_and_changes_nothing() {
@@ -1182,16 +1183,16 @@ mod tests {
         let opts = CompareOptions { conflict: ConflictPolicy::Copy, ..Default::default() };
         let plan = compare(&s, &t, "sync", None, false, &opts);
 
-        // 败方（target，mtime 旧）先改名留档
+        // The loser (target, older mtime) is renamed and archived first
         let mv = plan.ops.iter().find(|o| o.action == Action::Move).expect("loser must be kept");
         assert_eq!(mv.side, Side::Target);
         assert_eq!(mv.from.as_deref(), Some("doc/report.pdf"));
         assert!(mv.path.starts_with("doc/report.sync-conflict-"), "{}", mv.path);
         assert!(mv.path.ends_with(".pdf"), "extension must be preserved: {}", mv.path);
-        // 胜方内容落到 target
+        // The winner's content lands on target
         let up = plan.ops.iter().find(|o| o.action == Action::Update && o.path == "doc/report.pdf").unwrap();
         assert_eq!(up.hash.as_deref(), Some("NEW"));
-        // 原冲突行降级为可审计的 note，不再计入冲突数
+        // The original conflict row is downgraded to an auditable note and no longer counts as a conflict
         assert_eq!(plan.header.conflict_count, 0);
         assert!(plan.ops.iter().any(|o| o.action == Action::Note && o.reason.starts_with("auto-resolved")));
     }
@@ -1210,7 +1211,7 @@ mod tests {
 
     #[test]
     fn conflict_resolution_respects_the_older_side_winning() {
-        // target 更新 → 胜方是 target，副本与覆盖都发生在 source 侧
+        // target is newer → target wins; both the copy and the overwrite happen on the source side
         let s = snap_named("windows", "WIN", vec![file_at("f.txt", "OLD", 100)]);
         let t = snap_named("macos", "MAC", vec![file_at("f.txt", "NEW", 900)]);
         let opts = CompareOptions { conflict: ConflictPolicy::Copy, ..Default::default() };
@@ -1224,7 +1225,7 @@ mod tests {
 
     #[test]
     fn delete_versus_change_conflicts_are_never_auto_resolved() {
-        // "对面删了但我改了" —— 自动仲裁"删还是留"太危险，任何策略下都只报告
+        // "the other side deleted it but I changed it" — automatically arbitrating "delete or keep" is too dangerous; report only under every policy
         let s = snap_named("windows", "WIN", vec![file("f.txt", "CHANGED")]);
         let t = snap_named("macos", "MAC", Vec::new());
         let a = snap("windows", vec![file("f.txt", "ORIGINAL")]);
@@ -1240,7 +1241,7 @@ mod tests {
         assert!(n.starts_with("a/b/report.sync-conflict-"), "{n}");
         assert!(n.ends_with("-WIN-01.pdf"), "host must be sanitised and extension kept: {n}");
         assert!(is_conflict_copy(&n));
-        // 隐藏文件没有扩展名可言
+        // A hidden file has no extension to speak of
         let h = conflict_name(".gitignore", "H", 0);
         assert!(h.starts_with(".gitignore.sync-conflict-"), "{h}");
         assert!(!is_conflict_copy("a/b/normal.pdf"));
@@ -1266,7 +1267,7 @@ mod tests {
         assert!(pruned.iter().all(|p| p.contains("20260701") || p.contains("20260702")), "{pruned:?}");
     }
 
-    // ---------- P2-4：unix 权限位 ----------
+    // P2-4: unix permission bits
 
     #[test]
     fn mode_only_difference_produces_a_chmod_not_a_recopy() {
@@ -1288,10 +1289,10 @@ mod tests {
         se.mode = Some(0o755);
         let mut te = file("run.sh", "SAME");
         te.mode = Some(0o644);
-        // 默认关
+        // Off by default
         let plan = compare(&snap("macos", vec![se.clone()]), &snap("linux", vec![te.clone()]), "mirror", None, false, &CompareOptions::default());
         assert!(plan.ops.is_empty());
-        // Windows 一侧没有 mode，开了也不该报差异
+        // The Windows side has no mode, so even switched on it must not report a difference
         let opts = CompareOptions { sync_mode: true, ..Default::default() };
         let plan2 = compare(&snap("macos", vec![se]), &snap("windows", vec![te]), "mirror", None, false, &opts);
         assert!(plan2.ops.is_empty(), "{:?}", actions(&plan2));
@@ -1309,12 +1310,12 @@ mod tests {
         assert_eq!(plan.ops[0].mode, Some(0o755), "a fresh copy must land with the right bits in one step");
     }
 
-    // ---------- P2-3：大小写撞名 ----------
+    // P2-3: case collisions
 
     #[test]
     fn case_sensitive_mode_flags_a_write_that_would_clobber_a_case_twin() {
-        // case_sensitive = true 时 Foo.txt 与 foo.txt 是两个文件，
-        // 但 NTFS/APFS 上写前者会静默覆盖后者。
+        // With case_sensitive = true, Foo.txt and foo.txt are two files,
+        // but on NTFS/APFS writing the former silently overwrites the latter.
         let s = snap("windows", vec![file("Foo.txt", "A"), file("foo.txt", "B")]);
         let t = snap("windows", vec![file("foo.txt", "B")]);
         let opts = CompareOptions { case_insensitive: false, ..Default::default() };
@@ -1326,7 +1327,7 @@ mod tests {
 
     #[test]
     fn nfc_nfd_paths_match() {
-        // "café" NFC (U+00E9) vs NFD (e + U+0301)：同一文件，不该产生任何 op
+        // "café" NFC (U+00E9) vs NFD (e + U+0301): the same file, must produce no op at all
         let nfc = "caf\u{00e9}.txt";
         let nfd = "cafe\u{0301}.txt";
         let s = snap("windows", vec![file(nfc, "h1")]);
@@ -1340,7 +1341,7 @@ mod tests {
         let s = snap("windows", vec![file("Readme.md", "h1")]);
         let t = snap("macos", vec![file("readme.md", "h1")]);
         assert_eq!(compare(&s, &t, "mirror", None, false, &CompareOptions { case_insensitive: true, ..Default::default() }).ops.len(), 0);
-        // 大小写敏感时：同 hash 的大小写双胞胎被移动检测配对成一次 rename——比复制+删除更聪明
+        // Case-sensitive: case twins with the same hash get paired by move detection into a single rename — smarter than copy + delete
         let plan = compare(&s, &t, "mirror", None, false, &CompareOptions { case_insensitive: false, ..Default::default() });
         assert_eq!(plan.ops.len(), 1);
         assert_eq!(plan.ops[0].action, Action::Move);
@@ -1366,8 +1367,8 @@ mod tests {
         assert!(plan.ops.iter().any(|o| o.action == Action::Copy && o.path == "ok.txt"));
     }
 
-    // ---------- sync-with-archive 分类矩阵 ----------
-    // 状态记号：E=存在且内容 x，∅=不存在。archive = 上次同步的共识状态。
+    // sync-with-archive classification matrix
+    // State notation: E = present with content x, ∅ = absent. archive = the consensus state at the last sync.
 
     fn plan_sync(s: Vec<Entry>, t: Vec<Entry>, a: Option<Vec<Entry>>) -> Plan {
         let s = snap("windows", s);
@@ -1409,7 +1410,7 @@ mod tests {
 
     #[test]
     fn matrix_target_deleted_propagates_deletion() {
-        // archive 有、target 没、source 未改 → source 上删除
+        // The archive has it, target doesn't, source is unchanged → delete on source
         let p = plan_sync(vec![file("a", "h1")], vec![], Some(vec![file("a", "h1")]));
         let op = one(&p);
         assert_eq!((op.side.clone(), op.action.clone()), (Side::Source, Action::Delete));
@@ -1417,7 +1418,7 @@ mod tests {
 
     #[test]
     fn matrix_delete_vs_edit_conflict() {
-        // target 删了它，但 source 改过 → 删改冲突，绝不静默删
+        // target deleted it but source changed it → delete-vs-edit conflict; never delete silently
         let p = plan_sync(vec![file("a", "h2")], vec![], Some(vec![file("a", "h1")]));
         assert_eq!(one(&p).action, Action::Conflict);
     }
@@ -1431,7 +1432,7 @@ mod tests {
 
     #[test]
     fn matrix_move_on_source_replayed_on_target() {
-        // source 把 a 挪成 b；target/archive 还是 a → target 上重演 move
+        // source moved a to b; target/archive still have a → replay the move on target
         let p = plan_sync(vec![file("b", "h1")], vec![file("a", "h1")], Some(vec![file("a", "h1")]));
         let op = one(&p);
         assert_eq!(op.action, Action::Move);
@@ -1490,11 +1491,11 @@ mod tests {
         assert!(plan.ops.iter().any(|o| o.action == Action::Note && o.reason.contains("duplicate-after-normalization")));
     }
 
-    // ---------- 证据层 ----------
+    // Evidence layer
 
     #[test]
     fn evidence_reports_both_sides_and_equal_count() {
-        // same 两侧一致；upd 两侧都在但内容不同；only_s 只在 source；only_t 只在 target
+        // same: identical on both sides; upd: on both sides but with different content; only_s: source only; only_t: target only
         let s = snap("windows", vec![
             Entry { size: 10, mtime_ms: 1_000, ..file("same.txt", "h0") },
             Entry { size: 30, mtime_ms: 9_000, ..file("upd.txt", "hs") },
@@ -1507,7 +1508,7 @@ mod tests {
         ]);
         let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
         let ev = evidence(&s, &t, &plan, &CompareOptions::default());
-        assert_eq!(ev.metas.len(), plan.ops.len(), "证据数组必须与 ops 一一对应");
+        assert_eq!(ev.metas.len(), plan.ops.len(), "the evidence array must correspond one-to-one with ops");
         assert_eq!(ev.equal_count, 1);
         assert_eq!(ev.equal_bytes, 10);
 
@@ -1515,17 +1516,17 @@ mod tests {
             let i = plan.ops.iter().position(|o| o.path == name).expect(name);
             ev.metas[i].clone()
         };
-        // update 行：两侧都要有各自的实测值——今天 Op.size/mtime 只带得动 source 那一份
+        // update row: both sides need their own measured values — today Op.size/mtime can only carry source's
         let m = by("upd.txt");
         assert_eq!(m.src.unwrap().size, 30);
         assert_eq!(m.src.unwrap().mtime_ms, 9_000);
         assert_eq!(m.dst.unwrap().size, 20);
         assert_eq!(m.dst.unwrap().mtime_ms, 2_000);
-        // copy 行只有 source 侧存在
+        // copy row: only the source side exists
         let m = by("only_s.txt");
         assert_eq!(m.src.unwrap().size, 7);
         assert!(m.dst.is_none());
-        // delete 行只有 target 侧存在
+        // delete row: only the target side exists
         let m = by("only_t.txt");
         assert!(m.src.is_none());
         assert_eq!(m.dst.unwrap().size, 4);
@@ -1535,35 +1536,35 @@ mod tests {
     fn same_page_lists_only_equal_files_and_pages() {
         let mk = |n: usize, h: &str| Entry { size: n as u64, mtime_ms: n as i64 * 1000, ..file(&format!("d{}/f{n}.bin", n % 3), h) };
         let s = snap("windows", (0..10).map(|n| mk(n, "same")).collect());
-        // 后 3 个在 target 侧内容不同 → 不算相同
+        // The last 3 differ in content on the target side → not counted as equal
         let t = snap("windows", (0..10).map(|n| mk(n, if n >= 7 { "diff" } else { "same" })).collect());
         let copts = CompareOptions::default();
         let (total, rows) = same_page(&s, &t, &copts, "", 0, 100);
         assert_eq!(total, 7);
         assert_eq!(rows.len(), 7);
-        // 分页
+        // Paging
         let (total, rows) = same_page(&s, &t, &copts, "", 5, 100);
-        assert_eq!(total, 7, "total 是过滤后的总数，与分页窗口无关");
+        assert_eq!(total, 7, "total is the post-filter total, independent of the paging window");
         assert_eq!(rows.len(), 2);
         let (_t, rows) = same_page(&s, &t, &copts, "", 0, 3);
         assert_eq!(rows.len(), 3);
-        // 子串过滤（大小写不敏感）
+        // Substring filter (case-insensitive)
         let (total, rows) = same_page(&s, &t, &copts, "D1/", 0, 100);
         assert_eq!(total as usize, rows.len());
         assert!(rows.iter().all(|r| r.path.starts_with("d1/")));
-        // 两侧时间都要带出来（内容相同但时间戳可以不同）
+        // Both sides' times must be surfaced (identical content, timestamps may differ)
         assert!(rows.iter().all(|r| r.mtime_ms == r.other_mtime_ms));
     }
 
     #[test]
     fn evidence_follows_move_naming_on_each_side() {
-        // 同内容改名：source 已叫 b.bin，target 还叫 a.bin —— 两侧各查各的名字
+        // Same-content rename: source is already called b.bin, target is still a.bin — each side is looked up under its own name
         let s = snap("windows", vec![Entry { size: 42, mtime_ms: 8_000, ..file("b.bin", "hm") }]);
         let t = snap("windows", vec![Entry { size: 42, mtime_ms: 4_000, ..file("a.bin", "hm") }]);
         let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
         let i = plan.ops.iter().position(|o| o.action == Action::Move).expect("move");
         let ev = evidence(&s, &t, &plan, &CompareOptions::default());
-        assert_eq!(ev.metas[i].src.unwrap().mtime_ms, 8_000, "source 侧按新名字 b.bin 查");
-        assert_eq!(ev.metas[i].dst.unwrap().mtime_ms, 4_000, "target 侧按旧名字 a.bin 查");
+        assert_eq!(ev.metas[i].src.unwrap().mtime_ms, 8_000, "the source side is looked up under the new name b.bin");
+        assert_eq!(ev.metas[i].dst.unwrap().mtime_ms, 4_000, "the target side is looked up under the old name a.bin");
     }
 }

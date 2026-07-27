@@ -2,6 +2,6 @@
 
 export type JobDto = { name: string, mode: string, rigor: string, source: string, target: string, has_archive: boolean, remote: boolean, remote_host: string | null, versioning: boolean, delta: boolean, parallel: number | null, include: Array<string>, exclude: Array<string>, watch_interval_secs: number | null, watch_auto_apply: boolean, 
 /**
- * 1:N：生效的 target 列表（单 target 任务 = 一项）。>1 时前端显示 target 选择器
+ * 1:N: the effective target list (a single-target job = one entry). When >1 the frontend shows the target selector
  */
 targets: Array<string>, };

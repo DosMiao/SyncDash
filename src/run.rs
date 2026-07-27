@@ -1,5 +1,5 @@
-//! 任务流水线：scan 双侧 → compare（sync 自动带 archive）→ apply → 成功后刷新 archive。
-//! CLI 的 `run` 与 GUI 共用这一份逻辑。
+//! Job pipeline: scan both sides → compare (sync brings the archive along automatically) → apply → refresh the archive on success.
+//! The CLI's `run` and the GUI share this one implementation.
 
 use crate::compare::{Action, Op, Plan};
 use crate::config::Job;
@@ -7,21 +7,21 @@ use crate::table::Snapshot;
 use crate::{apply, compare, scan};
 use std::path::Path;
 
-/// 严谨级 → 扫描参数。单调阶梯：每一级 = **本轮实际读得更多**，
-/// "一致 ✓"的含义逐级从"实测元数据"升到"实测每个字节"。
-/// quick    读 0 字节（size+mtime）
-/// fast     只实读变化面的采样窗（缓存加速未变面）
-/// standard 本轮实读每个文件的采样窗（不用缓存——不是记忆，是本轮测量）
-/// paranoid 本轮实读每个文件的全部字节
+/// Rigor level → scan options. A monotone ladder: each tier = **more actually read this round**,
+/// and the meaning of "identical ✓" climbs from "metadata measured" to "every byte measured".
+/// quick    reads 0 bytes (size+mtime)
+/// fast     really reads only the sampling window of changed faces (the cache covers unchanged ones)
+/// standard really reads every file's sampling window this round (no cache — not memory, a measurement taken now)
+/// paranoid really reads every byte of every file this round
 pub fn scan_opts(job: &Job) -> scan::ScanOptions {
     let filter = crate::filter::PathFilter::build_full_opt(&job.include, &job.exclude, &job.deletable, &job.os_excludes, job.dev_excludes);
     let r = job.rigor_resolved();
     scan::ScanOptions { hash: r.hash, sampled: r.sampled, use_cache: r.use_cache, symlinks_direct: job.symlinks == "direct", filter }
 }
 
-/// sync 成功后刷新 archive：重扫 source、剔除冲突路径（冲突下次继续报，绝不被静默仲裁）。
-/// v0.9 M1：Refresh 阶段可见化——archive 重扫是个今天完全隐形的长阶段，挂上事件流与取消。
-/// 被取消只意味着冲突下轮重报，安全。
+/// Refresh the archive after a successful sync: rescan source, drop conflicted paths (a conflict keeps being reported, never silently arbitrated).
+/// v0.9 M1: make the Refresh phase visible — the archive rescan is a long phase that is completely invisible today, so wire it to the event stream and cancellation.
+/// Being cancelled only means conflicts get re-reported next round — safe.
 fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::progress::RunCtx) {
     let Some(arch_path) = &job.archive else {
         ctx.log(
@@ -38,8 +38,8 @@ fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::progress::RunCtx) {
         .map(|o| o.path.as_str())
         .collect();
     let opt = scan_opts(job);
-    // 上一代 archive：新表的每条把旧 hash 推进 prev 链，让"落后一代"能与
-    // "并发修改"区分开（P1-3，见 compare::generation_of）
+    // The previous-generation archive: every row of the new table pushes the old hash onto the prev chain, so that
+    // "one generation behind" can be told apart from "concurrent modification" (P1-3, see compare::generation_of)
     let previous = if arch_path.is_file() { Snapshot::load(arch_path).ok() } else { None };
     if let Ok(mut snap) = scan::scan_ctx(&job.source, &opt, ctx, crate::progress::Phase::Refresh) {
         snap.header.kind = "archive".into();
@@ -67,24 +67,24 @@ pub fn compare_job(job: &Job) -> std::io::Result<Plan> {
     compare_job_with(job, &crate::progress::RunCtx::null())
 }
 
-/// 比对的完整产出：计划 + 两侧快照。
-/// 桌面壳要靠快照算"证据层"（双侧 size/mtime、相同项），CLI 只要 plan。
+/// The full output of a comparison: the plan plus both snapshots.
+/// The desktop shell needs the snapshots to compute the "evidence layer" (both sides' size/mtime, identical items); the CLI only wants the plan.
 pub struct CompareOutcome {
     pub plan: Plan,
     pub source: Snapshot,
     pub target: Snapshot,
 }
 
-/// v0.9 M1：带事件流/取消的比对一条龙。src-tauri 里那份为插事件而内联复制的
-/// 第二套管线由本函数取代（撤销双份漂移）。
+/// v0.9 M1: the end-to-end comparison with an event stream and cancellation. This function replaces the second
+/// pipeline src-tauri had inlined just to emit events (undoing the two-copy drift).
 pub fn compare_job_with(job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<Plan> {
     compare_job_detailed(job, ctx).map(|o| o.plan)
 }
 
-/// 同一条管线，额外把两侧快照交出来（丢掉它们等于逼界面再扫一遍）
+/// The same pipeline, but it also hands back both snapshots (throwing them away would force the UI to scan all over again)
 pub fn compare_job_detailed(job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<CompareOutcome> {
     use crate::progress::Phase;
-    // 单管线只处理单 target：多 target 任务先经 for_target 派生（CLI run 循环 / 桌面 target 选择器）
+    // The single pipeline handles a single target only: multi-target jobs are derived through for_target first (the CLI run loop / the desktop target picker)
     job.validate_multi_target().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     if job.targets.len() > 1 {
         return Err(std::io::Error::new(
@@ -93,22 +93,22 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::progress::RunCtx) -> std::io
         ));
     }
     let opt = scan_opts(job);
-    // P0-2：root 可达性 + 挂载点标记。共享盘没挂上时 target 常常是个空目录，
-    // 照常比对会产出"把对面删光"或"全量重传"的计划。
+    // P0-2: root reachability + mount-point marker. When the share isn't mounted, target is often an empty directory,
+    // and comparing as usual yields a plan that either "wipes the other side" or "re-sends everything".
     let mut v = crate::preflight::Verdict { blockers: Vec::new(), warnings: Vec::new() };
     crate::preflight::check_root("source", &job.source, job.require_marker, &mut v);
     crate::preflight::check_root("target", &job.target, job.require_marker, &mut v);
     for w in &v.warnings {
-        // v0.10：Log{Warn} 取代 Error{action:"warning"} 那个 hack——
-        // 有了真正的等级，警告不必再伪装成"不算数的错误"
+        // v0.10: Log{Warn} replaces the Error{action:"warning"} hack —
+        // with a real level, a warning no longer has to masquerade as an "error that doesn't count"
         ctx.log(crate::progress::LogLevel::Warn, "compare", format!("warning: {w}"));
     }
     if !v.ok() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
     }
-    // 双侧并行扫描：source 与 target 几乎总在不同的盘/链路上（本地盘 vs SMB、
-    // OneDrive vs 外置盘），串行等于白白排队——并行后墙钟≈慢的一侧。
-    // 两侧各自的 PhaseStart 会同时出现，进度面板双行同时跳。
+    // Scan both sides in parallel: source and target are almost always on different disks/links (local disk vs SMB,
+    // OneDrive vs an external drive), so serial execution is pure queueing — in parallel, wall clock ≈ the slower side.
+    // Each side emits its own PhaseStart at the same moment, so the progress panel ticks on two rows at once.
     let (s, t) = std::thread::scope(|sc| {
         let hs = sc.spawn(|| scan::scan_ctx(&job.source, &opt, ctx, Phase::ScanSource));
         let ht = sc.spawn(|| scan::scan_ctx(&job.target, &opt, ctx, Phase::ScanTarget));
@@ -119,26 +119,26 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::progress::RunCtx) -> std::io
         (Some(p), "sync") if p.is_file() => Some(Snapshot::load(p)?),
         _ => None,
     };
-    // compare 本身是亚秒级 CPU 活：只报阶段边界，不做内部计数
+    // compare itself is sub-second CPU work: report the phase boundary only, no internal counting
     let _pp = crate::progress::PhaseProgress::begin(
         ctx,
         Phase::Compare,
-        Some(format!("{} × {} 条目", s.header.entry_count, t.header.entry_count)),
+        Some(format!("{} × {} entries", s.header.entry_count, t.header.entry_count)),
         0,
         0,
     );
     let copts = job.compare_opts();
     let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
-    // 分歧升级：抽样证据档里"摘要相等但 mtime 差 >2s"的文件不许直接判相等（旋钮可关）
+    // Disagreement escalation: in the sampled evidence tier, a file whose digests match but whose mtimes differ by >2s may not simply be ruled identical (the knob can turn this off)
     let rr = job.rigor_resolved();
     let plan = if rr.sampled && rr.escalate { escalate_sampled_disagreements(job, plan, &s, &t, ctx) } else { plan };
     Ok(CompareOutcome { plan, source: s, target: t })
 }
 
-/// 分歧升级规则：两份信号打架（抽样摘要说"相同"、mtime 说"动过"）时不静默采信任何一方，
-/// 把该文件**双侧升级为全量哈希**重新裁决。这把 fast/standard 的盲区从
-/// "采样窗外的一切改动"压缩到"采样窗外＋保时间戳"（≈timestomp 场景）。
-/// 升级集天然很小（正常树上接近零），逐个全量读的成本可忽略。仅本地管线（远端侧无从廉价重读）。
+/// The escalation rule: when the two signals fight (the sampled digest says "identical", mtime says "touched"), believe neither silently —
+/// **escalate that file to a full hash on both sides** and rule again. This shrinks the blind spot of fast/standard from
+/// "any change outside the sampling window" to "outside the sampling window *and* timestamp-preserving" (≈ the timestomp case).
+/// The escalation set is naturally tiny (near zero on a normal tree), so reading each one in full costs next to nothing. Local pipeline only (the remote side has no cheap way to re-read).
 fn escalate_sampled_disagreements(
     job: &Job,
     mut plan: Plan,
@@ -181,22 +181,22 @@ fn escalate_sampled_disagreements(
     if suspects.is_empty() {
         return plan;
     }
-    ctx.log(LogLevel::Info, "compare", format!("分歧升级：{} 个文件摘要相等但 mtime 差 >2s，双侧全量重验", suspects.len()));
+    ctx.log(LogLevel::Info, "compare", format!("escalation: {} file(s) with equal digests but mtime differing >2s — re-verifying both sides in full", suspects.len()));
     let extra: Vec<Op> = suspects
         .par_iter()
         .filter_map(|(se, te)| {
             let hs = full_hash(&native(&job.source, &se.path)).ok()?;
             let ht = full_hash(&native(&job.target, &te.path)).ok()?;
             if hs == ht {
-                return None; // 摘要没撒谎：只是 mtime 漂了
+                return None; // the digest wasn't lying: only the mtime drifted
             }
             let reason = "escalated: sampled digests equal, mtime differs, full hashes differ";
             match job.mode.as_str() {
-                // mirror：source 无条件赢
+                // mirror: source wins unconditionally
                 "mirror" => Some(Op { side: Side::Target, action: Action::Update, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: Some(hs), link: None, mode: None, reason: reason.into() }),
-                // sync：双边内容不同且无归因 → 如实报冲突，人来裁
+                // sync: both sides differ in content with no attribution → report the conflict honestly, a human rules
                 "sync" => Some(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: None, link: None, mode: None, reason: reason.into() }),
-                // enrich：source 严格较新才更新
+                // enrich: update only when source is strictly newer
                 _ => {
                     if se.mtime_ms > te.mtime_ms + SLACK_MS {
                         Some(Op { side: Side::Target, action: Action::Update, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: Some(hs), link: None, mode: None, reason: reason.into() })
@@ -208,7 +208,7 @@ fn escalate_sampled_disagreements(
         })
         .collect();
     if !extra.is_empty() {
-        ctx.log(LogLevel::Warn, "compare", format!("分歧升级坐实 {} 个文件内容不同（抽样窗外的改动），已补进计划", extra.len()));
+        ctx.log(LogLevel::Warn, "compare", format!("escalation confirmed {} file(s) really do differ in content (changes outside the sampling window); added to the plan", extra.len()));
         let new_conflicts = extra.iter().filter(|o| o.action == Action::Conflict).count() as u64;
         plan.header.op_count += extra.len() as u64;
         plan.header.conflict_count += new_conflicts;
@@ -217,13 +217,13 @@ fn escalate_sampled_disagreements(
     plan
 }
 
-/// 执行选中的 ops；全部成功且是 sync 模式时刷新 archive（冲突路径从存档剔除，下次继续报冲突）。
+/// Execute the selected ops; on complete success in sync mode, refresh the archive (conflicted paths are dropped from it, so the conflict is reported again next time).
 pub fn apply_job(job: &Job, plan: &Plan, ops: &[Op], trash: Option<std::path::PathBuf>, verbose: bool) -> (u64, u64, u64) {
     apply_job_guarded(job, plan, ops, trash, verbose, false)
 }
 
-/// 只跑闸门不执行——GUI 在弹确认单之前调它，把拒绝理由完整展示给人看，
-/// 而不是让理由只出现在没人看的 stderr 上。
+/// Run the gates without executing — the GUI calls this before raising the confirmation sheet, so the refusal
+/// reasons are shown to the person in full instead of landing only on a stderr nobody reads.
 pub fn preflight_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::preflight::Verdict {
     crate::preflight::run_all(
         ops,
@@ -235,8 +235,8 @@ pub fn preflight_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> 
     )
 }
 
-/// `acknowledged` = 用户显式 --i-know，只放行"计划体检"类闸门；
-/// 标记缺失与磁盘空间不足始终拦截（那是环境问题，不是判断问题）。
+/// `acknowledged` = the user passed --i-know explicitly; it only allows the "plan health check" gates through.
+/// A missing marker and insufficient disk space always block (those are environment problems, not judgement calls).
 pub fn apply_job_guarded(
     job: &Job,
     plan: &Plan,
@@ -248,8 +248,8 @@ pub fn apply_job_guarded(
     apply_job_guarded_with(job, plan, ops, trash, verbose, acknowledged, &crate::progress::RunCtx::null()).into_tuple()
 }
 
-/// v0.9 M1：带事件流的执行编排——Apply 阶段（apply_with 自报总量与逐字节进度）→
-/// Refresh 阶段 → Summary 终态。
+/// v0.9 M1: apply orchestration with an event stream — the Apply phase (apply_with reports its own totals and
+/// byte-by-byte progress) → the Refresh phase → the Summary terminal state.
 pub fn apply_job_guarded_with(
     job: &Job,
     plan: &Plan,
@@ -285,7 +285,7 @@ pub fn apply_job_guarded_with(
         return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
     }
     let ap = apply::apply_with(ops, src_root, tgt_root, &job.apply_opts(trash, verbose), ctx);
-    // 取消的运行不做 archive 刷新：用户要的是"立刻停"，且冲突下轮重报本来就安全
+    // A cancelled run does not refresh the archive: the user asked to "stop now", and re-reporting conflicts next round is safe anyway
     if ap.errors == 0 && !ap.cancelled && job.mode == "sync" {
         refresh_archive_with(job, plan, ctx);
     }
@@ -303,10 +303,10 @@ pub fn apply_job_guarded_with(
     out
 }
 
-/// 本地/挂载盘任务的一条龙（原 CLI run 的主体）。返回 (done, skipped, errors, conflicts)。
+/// End-to-end run for local/mounted-disk jobs (the body of the original CLI run). Returns (done, skipped, errors, conflicts).
 pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
-    // 1:N（原始需求）：单 source → 逐 target 独立比对/独立执行。
-    // 每个 target 一份计划、一条运行日志；source 侧哈希由缓存吸收（fast 档第二个 target 起近零读）。
+    // 1:N (the original requirement): one source → each target compared and executed independently.
+    // One plan and one run log per target; source-side hashing is absorbed by the cache (in the fast tier, near-zero reads from the second target on).
     job.validate_multi_target().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let targets = job.target_list();
     let multi = targets.len() > 1;
@@ -339,7 +339,7 @@ fn run_local_single(name: &str, job: &Job, do_apply: bool, verbose: bool, acknow
         .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
         .cloned()
         .collect();
-    // M4：CLI 的 apply 也留运行日志（desktop 在壳层各自记录）
+    // M4: the CLI's apply leaves a run log too (desktop records its own at the shell layer)
     let t0 = std::time::Instant::now();
     let rec = crate::runlog::Recorder::start(name, "apply", &crate::progress::RunCtx::null(), &ops);
     let out = apply_job_guarded_with(job, &plan, &ops, None, verbose, acknowledged, &rec.ctx);
@@ -347,15 +347,15 @@ fn run_local_single(name: &str, job: &Job, do_apply: bool, verbose: bool, acknow
     Ok((out.done, out.skipped, out.errors, plan.header.conflict_count))
 }
 
-/// 远程管线（v0.6 ssh 一条龙）：ssh 探测 → 远端本地扫描（stdout 收表）→ 本地扫描 → 比对
-/// → target 侧打包 ssh 送达 apply-pack → source 侧经挂载路径直落 → sync 成功后刷新 archive。
+/// Remote pipeline (the v0.6 end-to-end over ssh): ssh probe → remote-local scan (table collected from stdout) → local scan → compare
+/// → pack the target side and ship it over ssh to apply-pack → write the source side straight through the mounted path → refresh the archive on a successful sync.
 pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
     run_remote_job_with(name, job, do_apply, verbose, acknowledged, &crate::progress::RunCtx::null())
 }
 
-/// v0.9 M1/M3：远程管线 = 比对段 + 执行段（desktop 分两次 IPC 各自调用；CLI 在这里一条龙）。
-/// 级边界 PhaseStart、级间协作点、终态 Summary；ssh 传输内部的逐字节计数与
-/// kill-on-cancel 是明确后补（M1 步骤 8）。
+/// v0.9 M1/M3: the remote pipeline = a compare stage plus an apply stage (desktop calls each over its own IPC round; the CLI runs both end-to-end here).
+/// PhaseStart at each stage boundary, cooperation points between stages, a Summary terminal state; byte-level counting inside the
+/// ssh transfer and kill-on-cancel are explicitly deferred (M1 step 8).
 pub fn run_remote_job_with(
     name: &str,
     job: &Job,
@@ -367,7 +367,7 @@ pub fn run_remote_job_with(
     let plan = match compare_remote_job_with(name, job, ctx) {
         Ok(p) => p,
         Err(e) => {
-            // 比对段取消：终态必须可见（desktop 靠 Summary 收窗）
+            // Cancelled in the compare stage: the terminal state must still be visible (the desktop closes out on Summary)
             if crate::progress::is_cancelled(&e) {
                 emit_cancel_summary(ctx, std::time::Instant::now());
             }
@@ -415,8 +415,8 @@ fn emit_cancel_summary(ctx: &crate::progress::RunCtx, t0: std::time::Instant) {
     });
 }
 
-/// 远端连接参数（probe 的产物）。desktop 的比对/执行是两次独立 IPC，
-/// 中间不保存连接——执行段重新 probe（一次 ssh 往返，顺带就是可达性预检）。
+/// Remote connection parameters (the product of a probe). The desktop's compare and apply are two independent IPC rounds
+/// with no connection kept in between — the apply stage probes again (one ssh round trip, which doubles as a reachability preflight).
 pub struct RemoteLink {
     pub host: String,
     pub exe: String,
@@ -424,11 +424,11 @@ pub struct RemoteLink {
     pub shell: crate::remote::RemoteShell,
 }
 
-/// 阶段 1：探测可达性 + schema 一致性 + 远端 OS（决定 shell 方言）。
+/// Stage 1: probe reachability + schema agreement + the remote OS (which decides the shell dialect).
 ///
-/// 收 `ctx` 是为了 schema 不匹配那条警告：它必须在**比对期**就到达界面。
-/// 走宏经全局注册表的话，compare 期间没装 sink（只有 apply 才起 Recorder），
-/// 这条恰恰会退回 stderr——在 windowed 桌面构建里等于没说。
+/// It takes `ctx` for the sake of the schema-mismatch warning: that one has to reach the UI **during compare**.
+/// Going through the macro and the global registry, no sink is installed during compare (only apply starts a Recorder),
+/// so this line in particular would fall back to stderr — which in a windowed desktop build is the same as saying nothing.
 pub fn probe_remote(name: &str, job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<RemoteLink> {
     let host = job
         .remote_host
@@ -467,14 +467,14 @@ pub fn probe_remote(name: &str, job: &Job, ctx: &crate::progress::RunCtx) -> std
     })
 }
 
-/// v0.9 M3：远程任务的**比对段**——desktop `compare_job` 对 remote 任务直接走这里，
-/// 不再静默落进本地管线（那会经 UNC 拉数据重哈希，慢一个数量级还语义错位）。
+/// v0.9 M3: the **compare stage** of a remote job — the desktop's `compare_job` routes remote jobs straight here
+/// instead of silently dropping into the local pipeline (which would pull the data over UNC and rehash it: an order of magnitude slower, and semantically wrong).
 pub fn compare_remote_job_with(name: &str, job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<Plan> {
     compare_remote_job_detailed(name, job, ctx).map(|o| o.plan)
 }
 
-/// 远程管线的同款细节版：远端快照是经 ssh 拉回来的完整表，
-/// 证据层（双侧 size/mtime、相同项）在这里和本地任务一样能算。
+/// The same detailed variant for the remote pipeline: the remote snapshot is a complete table pulled back over ssh,
+/// so the evidence layer (both sides' size/mtime, identical items) is just as computable here as for a local job.
 pub fn compare_remote_job_detailed(
     name: &str,
     job: &Job,
@@ -483,8 +483,8 @@ pub fn compare_remote_job_detailed(
     use crate::progress::{Phase, PhaseProgress};
     let link = probe_remote(name, job, ctx)?;
 
-    // 2) 远端扫描（在远端自己的盘上哈希——比经 UNC 拉数据快得多）
-    // 远端按**解析后**的旋钮显式传参（预设名不够——明细可能被覆盖）
+    // 2) Remote scan (hashing on the remote's own disk — far faster than pulling the data over UNC)
+    // The remote is passed the **resolved** knobs explicitly (a preset name isn't enough — details may have overridden it)
     let rr = job.rigor_resolved();
     let mut scan_args: Vec<String> = vec![
         "scan".into(),
@@ -509,12 +509,12 @@ pub fn compare_remote_job_detailed(
         scan_args.push("--symlinks-direct".into());
     }
     ctx.checkpoint()?;
-    // 远端在自己盘上扫描，本地只能看到"进行中"——总量归零、label 说明白在等谁
+    // The remote scans on its own disk, so locally all we can show is "in progress" — totals zeroed, the label spells out who we are waiting on
     let _pp_rs = PhaseProgress::begin(ctx, Phase::ScanTarget, Some(format!("ssh:{} {}", link.host, link.rroot)), 0, 0);
     let table_bytes = crate::remote::ssh_capture(&link.host, &crate::remote::remote_cmd(link.shell, &link.exe, &scan_args))?;
     let t = Snapshot::from_reader(std::io::BufReader::new(&table_bytes[..]))?;
 
-    // 3) 本地扫描 + 比对（本地 source 侧同样过挂载点闸门）
+    // 3) Local scan + compare (the local source side goes through the mount-point gate too)
     let mut v = crate::preflight::Verdict { blockers: Vec::new(), warnings: Vec::new() };
     crate::preflight::check_root("source", &job.source, job.require_marker, &mut v);
     for w in &v.warnings {
@@ -531,7 +531,7 @@ pub fn compare_remote_job_detailed(
     let _pp_cmp = PhaseProgress::begin(
         ctx,
         Phase::Compare,
-        Some(format!("{} × {} 条目", s.header.entry_count, t.header.entry_count)),
+        Some(format!("{} × {} entries", s.header.entry_count, t.header.entry_count)),
         0,
         0,
     );
@@ -540,8 +540,8 @@ pub fn compare_remote_job_detailed(
     Ok(CompareOutcome { plan, source: s, target: t })
 }
 
-/// 远程任务的计划体检（desktop 确认单用）：只有删除占比闸门——
-/// 磁盘空间与 marker 在远端机器上，本地查不到也不该假装查了。
+/// The plan health check for a remote job (used by the desktop confirmation sheet): the deletion-share gate only —
+/// disk space and the marker live on the remote machine; we cannot check them locally and must not pretend we did.
 pub fn preflight_remote_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::preflight::Verdict {
     let g = job.guards(acknowledged);
     let st = crate::preflight::stat_plan(ops);
@@ -551,8 +551,8 @@ pub fn preflight_remote_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bo
     gv
 }
 
-/// v0.9 M3：远程任务的**执行段**——`ops` 是用户在差异表定稿的子集（翻向/勾选已生效）。
-/// 重新 probe → 体检 → 打包选中项 → ssh 送包 → 远端 apply-pack → source 回拉 → 刷新 → Summary。
+/// v0.9 M3: the **apply stage** of a remote job — `ops` is the subset the user finalised in the diff table (direction flips / check marks already applied).
+/// Probe again → health check → pack the selection → ship the package over ssh → remote apply-pack → pull the source side back → refresh → Summary.
 pub fn apply_remote_job_with(
     name: &str,
     job: &Job,
@@ -586,7 +586,7 @@ fn apply_remote_inner(
     use crate::compare::Side;
     use crate::progress::{ApplyOutcome, Phase, PhaseProgress, ProgressEvent};
 
-    // 计划体检：远端磁盘空间查不到，但"删掉对面一大半"这类事故本地就能拦
+    // Plan health check: remote disk space is unknowable, but an accident like "delete most of the other side" can be caught locally
     let gv = preflight_remote_job(job, plan_full, sel_ops, acknowledged);
     if !gv.report(name) {
         for b in &gv.blockers {
@@ -604,7 +604,7 @@ fn apply_remote_inner(
 
     let link = probe_remote(name, job, ctx)?;
     let (host, exe, rroot, shell) = (link.host.as_str(), link.exe.as_str(), link.rroot.as_str(), link.shell);
-    // 打包/回拉都只看定稿子集；full plan 只用于 archive 刷新（冲突路径剔除要看全量）
+    // Packing and the pull-back only look at the finalised subset; the full plan is used only for the archive refresh (dropping conflicted paths needs all of it)
     let plan = Plan { header: plan_full.header.clone(), ops: sel_ops.to_vec() };
 
     let mut done = 0u64;
@@ -612,7 +612,7 @@ fn apply_remote_inner(
     let mut errors = 0u64;
     let mut bytes_done_total = 0u64;
 
-    // 4) target 侧：（大更新先要远端块表走 FastCDC 增量）打包 → ssh 送包 → 远端 apply-pack
+    // 4) Target side: (for large updates, fetch the remote chunk table first so FastCDC delta can be used) pack → ship the package over ssh → remote apply-pack
     let has_target_ops = plan.ops.iter().any(|o| o.side == Side::Target && !matches!(o.action, Action::Conflict | Action::Note));
     if has_target_ops {
         let delta_rels: Vec<String> = plan
@@ -664,7 +664,7 @@ fn apply_remote_inner(
             }
         };
         ctx.checkpoint()?;
-        let pp_pack = PhaseProgress::begin(ctx, Phase::Pack, Some("打包 target 侧内容".into()), 0, 0);
+        let pp_pack = PhaseProgress::begin(ctx, Phase::Pack, Some("packing target-side content".into()), 0, 0);
         let tmp = std::env::temp_dir().join(format!("syncdash-remote-{}.tar", crate::foundation::time::now_ms()));
         let sum = crate::pack::pack(&plan, &job.source, &tmp, remote_chunks.as_ref())?;
         pp_pack.set_totals(sum.ops, sum.bytes);
@@ -676,7 +676,7 @@ fn apply_remote_inner(
             );
         }
         let rpkg = if shell == crate::remote::RemoteShell::PowerShell {
-            format!("syncdash-{}.tar", crate::foundation::time::now_ms()) // 相对路径 → 远端家目录
+            format!("syncdash-{}.tar", crate::foundation::time::now_ms()) // relative path → the remote home directory
         } else {
             format!("/tmp/syncdash-{}.tar", crate::foundation::time::now_ms())
         };
@@ -717,7 +717,7 @@ fn apply_remote_inner(
         }
     }
 
-    // 5) source 侧（sync 的回拉方向）：经挂载路径直读远端内容；不可达则跳过并说明
+    // 5) Source side (sync's pull-back direction): read the remote content straight through the mounted path; if it is unreachable, skip and say why
     let src_ops: Vec<Op> = plan
         .ops
         .iter()

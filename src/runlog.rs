@@ -1,20 +1,20 @@
-//! 运行日志（FFS 的 Log 列 / "Last sync" 列的数据源）。
+//! Run log (the data behind FFS's Log column / "Last sync" column).
 //!
-//! - 索引：`<log_dir>/runs.jsonl`——一行一次运行（追加式，人可读可审计）。
-//! - 明细：`<log_dir>/<YYYYMMDD-HHMMSS>-<job>-<kind>/`——每次 apply 类运行一个目录：
-//!   - `summary.json` 运行摘要（= 索引行的同一条记录，索引损坏时明细仍自解释）
-//!   - `plan.jsonl`   计划清单：这次**打算**做什么
-//!   - `run.jsonl`    事件流：叙事、阶段边界、报错
-//!   - `errors.jsonl` 报错清单：Error + 警告以上的 Log
-//!   - `items.jsonl`  执行清单：这次**实际**做成了什么（一行一 op 带结局）
-//! - compare 无副作用：只写一行索引，不建目录（watch 30s 一轮 = 一天 2880 次）。
-//! - 写日志绝不让同步失败：所有落盘都是 best-effort，失败进 stderr。
+//! - Index: `<log_dir>/runs.jsonl` — one line per run (append-only, human-readable and auditable).
+//! - Detail: `<log_dir>/<YYYYMMDD-HHMMSS>-<job>-<kind>/` — one directory per apply-class run:
+//!   - `summary.json` run summary (= the same record as the index line, so the detail still explains itself if the index is corrupt)
+//!   - `plan.jsonl`   the plan: what this run **intended** to do
+//!   - `run.jsonl`    the event stream: narration, phase boundaries, errors
+//!   - `errors.jsonl` the error detail: Error plus Log at warning level and above
+//!   - `items.jsonl`  the execution detail: what this run **actually** did (one op per line with its outcome)
+//! - compare has no side effects: one index line, no directory (a watch round every 30s = 2880 a day).
+//! - Writing logs must never fail a sync: all persistence is best-effort, failures go to stderr.
 //!
-//! v0.10 相对 v0.9 的两处要害改动：
-//! 1. **流式**：事件到达即落盘（`logging::FileSink`），不再等 `finish` 一次性写——
-//!    进程被杀时 v0.9 会丢掉整份日志。
-//! 2. **计划与执行分开**：v0.9 写进明细的是传给 apply 的**计划 ops**，
-//!    哪条成功、哪条失败、哪条 KEPT 一个字都没有。现在 plan/items 各一份。
+//! Two critical changes in v0.10 relative to v0.9:
+//! 1. **Streaming**: events are persisted as they arrive (`logging::FileSink`) instead of written in
+//!    one go at `finish` — v0.9 lost the entire log when the process was killed.
+//! 2. **Plan and execution kept apart**: what v0.9 wrote into the detail were the **planned ops**
+//!    handed to apply, with not one word on which succeeded, failed or were KEPT. Now plan and items are separate files.
 
 use crate::compare::Op;
 use crate::logging::{self, FileSink};
@@ -33,7 +33,7 @@ use crate::foundation::names::{
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct RunRecord {
-    /// 运行开始时刻（unix ms）
+    /// When the run started (unix ms)
     #[ts(type = "number")]
     pub ts_ms: i64,
     pub job: String,
@@ -50,24 +50,24 @@ pub struct RunRecord {
     #[ts(type = "number")]
     pub elapsed_ms: u64,
     pub cancelled: bool,
-    /// 运行目录名（相对 log_dir）。compare 类只有索引行、没有目录 → None
+    /// Run directory name (relative to log_dir). compare-class runs have only an index line, no directory → None
     #[serde(default)]
     pub run_id: Option<String>,
-    /// 报错清单里的警告条数（错误条数在 `errors`）
+    /// How many warnings are in the error detail (the error count is in `errors`)
     #[serde(default)]
     #[ts(type = "number")]
     pub warnings: u64,
-    /// compare 类：发现的差异条数。apply 类为 None
+    /// compare-class: how many differences were found. None for apply-class
     #[serde(default)]
     #[ts(type = "number | null")]
     pub ops_found: Option<u64>,
-    /// 运行是否走完。`start` 先写一份 `finished:false` 的摘要，`finish` 再覆盖成 true——
-    /// 中途被杀的运行在索引里没有行（`finish` 没跑到），只剩一个目录；
-    /// 靠这个字段，那个目录仍然能自己说清"我没跑完"。
-    /// 老记录默认 true：v0.9 只在 `finish` 里写记录，能写下来的都是走完的。
+    /// Whether the run went all the way through. `start` first writes a `finished:false` summary and
+    /// `finish` overwrites it with true — a run killed midway has no index line (`finish` never ran),
+    /// only a directory; this field is what lets that directory still say "I did not finish".
+    /// Old records default to true: v0.9 only wrote a record inside `finish`, so anything written did finish.
     #[serde(default = "yes")]
     pub finished: bool,
-    /// v0.9 的明细文件名。新记录不再写，但老索引里有——读取端仍认。
+    /// v0.9's detail file name. New records no longer write it, but old indexes carry it — readers still honour it.
     #[serde(default)]
     pub detail: Option<String>,
 }
@@ -88,14 +88,14 @@ fn sanitize(name: &str) -> String {
     name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
 }
 
-/// 拒绝任何能跳出 log_dir 的名字。`artifact_lines` / `detail_lines` 的入口守卫。
+/// Reject any name that could escape log_dir. The entry guard for `artifact_lines` / `detail_lines`.
 fn safe_component(s: &str) -> bool {
     !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains("..")
 }
 
 
-/// unix ms → `YYYYMMDD-HHMMSS`（UTC）。目录名要可排序，又不值得为它引 chrono/time。
-/// 本地时间的显示交给前端（`main.ts` 已有 `relTime`），数据里始终是 `ts_ms`。
+/// unix ms → `YYYYMMDD-HHMMSS` (UTC). Directory names have to sort, and that is not worth a chrono/time dependency.
+/// Rendering local time is the frontend's job (`main.ts` already has `relTime`); the data always carries `ts_ms`.
 fn stamp(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let sod = secs.rem_euclid(86_400);
@@ -104,7 +104,7 @@ fn stamp(ms: i64) -> String {
     format!("{y:04}{m:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
 
-/// days since 1970-01-01 → (year, month, day)。Howard Hinnant 的 `civil_from_days`。
+/// days since 1970-01-01 → (year, month, day). Howard Hinnant's `civil_from_days`.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
@@ -119,7 +119,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 
-/// 顺路统计报错清单的构成——summary 里"3 警告 2 错误"这句话的来源。
+/// Tallies the makeup of the error detail in passing — the source of summary's "3 warnings, 2 errors".
 #[derive(Default)]
 struct Tally {
     warnings: AtomicU64,
@@ -142,11 +142,11 @@ impl ProgressSink for TallySink {
     }
 }
 
-/// 一次 apply 类运行的记录器。
+/// Recorder for one apply-class run.
 ///
-/// `start` 把文件 sink 串进事件流**并装上进程级注册表**——后者让 `trash` / `version` /
-/// `lock` 里那些拿不到 `RunCtx` 的诊断也能落进同一个目录。
-/// `finish` 只写摘要与索引：明细在运行过程中已经落完了。
+/// `start` threads the file sink into the event stream **and installs it in the process registry** —
+/// the latter is what lets the diagnostics in `trash` / `version` / `lock`, which have no `RunCtx`, land in the same directory.
+/// `finish` only writes the summary and the index: the detail was already persisted as the run went.
 pub struct Recorder {
     pub ctx: RunCtx,
     name: String,
@@ -155,7 +155,7 @@ pub struct Recorder {
     run_id: Option<String>,
     file: Option<Arc<FileSink>>,
     tally: Arc<Tally>,
-    /// drop 时自动把注册表还原——漏摘会让下一次运行的日志串进这个目录
+    /// Restores the registry automatically on drop — leaking the guard cross-contaminates this directory with the next run's log
     _guard: Option<crate::progress::SinkGuard>,
 }
 
@@ -167,22 +167,22 @@ impl Recorder {
         let dir = cfg.resolved_log_dir().join(&run_id);
         let tally = Arc::new(Tally::default());
 
-        // 不在这里串 `progress::current()`：`RunCtx::null()` 已经把进程环境 sink
-        // （CLI 启动装的 StderrSink）带进 `base.sink` 了，再串一次就是重复输出。
+        // Do not thread `progress::current()` in here: `RunCtx::null()` already brought the process's
+        // ambient sink (the StderrSink the CLI installs at startup) into `base.sink`; threading it again duplicates output.
         let mut sinks: Vec<Arc<dyn ProgressSink>> = vec![base.sink.clone(), Arc::new(TallySink(tally.clone()))];
         let (file, run_id) = match std::fs::create_dir_all(&dir) {
             Ok(_) => {
                 write_plan(&dir, ops);
-                // 先落一份 finished:false 的摘要——这样即使进程被杀，
-                // 这个目录也能自己说清"我是谁、我没跑完"，而不是变成一堆匿名残片
+                // Write a finished:false summary up front — so even if the process is killed, this
+                // directory can still say "who I am and that I did not finish" instead of becoming anonymous debris
                 write_summary(&dir, &pending_record(name, kind, ts_ms, &run_id, ops.len() as u64));
                 let f = Arc::new(FileSink::open(&dir, cfg.level));
                 sinks.push(f.clone() as Arc<dyn ProgressSink>);
                 (Some(f), Some(run_id))
             }
             Err(e) => {
-                // 目录建不出来只丢明细，不丢同步——索引行照写
-                eprintln!("runlog: 建不出 {}：{e}", dir.display());
+                // A directory we cannot create costs us the detail, not the sync — the index line is still written
+                eprintln!("runlog: cannot create {}: {e}", dir.display());
                 (None, None)
             }
         };
@@ -201,9 +201,9 @@ impl Recorder {
         }
     }
 
-    /// best-effort 落盘；返回写好的索引记录（desktop 直接回显"上次同步"用）
+    /// Best-effort persistence; returns the index record just written (the desktop echoes it straight back as "last sync")
     pub fn finish(self, out: &ApplyOutcome, elapsed_ms: u64) -> RunRecord {
-        // 先把缓冲全落盘，再写摘要——摘要存在就意味着明细已经齐了
+        // Flush every buffer first, then write the summary — the summary existing means the detail is complete
         if let Some(f) = &self.file {
             f.flush_all();
         }
@@ -224,7 +224,7 @@ impl Recorder {
             detail: None,
         };
         if let Some(id) = &self.run_id {
-            // 覆盖 start 写下的 finished:false 占位
+            // Overwrite the finished:false placeholder written by start
             write_summary(&logs_dir().join(id), &rec);
         }
         append_index(&rec);
@@ -232,7 +232,7 @@ impl Recorder {
     }
 }
 
-/// 运行开始时的占位摘要：计划规模已知，结果全空，`finished:false`。
+/// Placeholder summary written at the start of a run: the plan size is known, the results are empty, `finished:false`.
 fn pending_record(name: &str, kind: &str, ts_ms: i64, run_id: &str, planned: u64) -> RunRecord {
     RunRecord {
         ts_ms,
@@ -256,10 +256,10 @@ fn write_summary(dir: &Path, rec: &RunRecord) {
     match serde_json::to_string_pretty(rec) {
         Ok(t) => {
             if let Err(e) = std::fs::write(dir.join(SUMMARY_FILE), t) {
-                eprintln!("runlog: 摘要写不进 {}：{e}", dir.display());
+                eprintln!("runlog: cannot write the summary into {}: {e}", dir.display());
             }
         }
-        Err(e) => eprintln!("runlog: 摘要序列化失败：{e}"),
+        Err(e) => eprintln!("runlog: summary serialization failed: {e}"),
     }
 }
 
@@ -273,7 +273,7 @@ fn write_plan(dir: &Path, ops: &[Op]) {
         w.flush()
     };
     if let Err(e) = write() {
-        eprintln!("runlog: 计划清单写失败：{e}");
+        eprintln!("runlog: writing the plan failed: {e}");
     }
 }
 
@@ -283,14 +283,14 @@ fn append_index(rec: &RunRecord) {
         writeln!(f, "{}", serde_json::to_string(rec)?)
     };
     if let Err(e) = append() {
-        eprintln!("runlog: 索引追加失败：{e}");
+        eprintln!("runlog: appending to the index failed: {e}");
     }
 }
 
-/// compare 类运行的留痕：只追加一行索引，**不建目录**。
+/// The trace a compare-class run leaves: append one index line, **no directory**.
 ///
-/// watch 模式 30s 一轮 = 一天 2880 次，每次建目录会把日志盘冲垮；
-/// 而"什么时候比过、发现多少差异"这一行本身是有价值的。
+/// A watch round every 30s = 2880 a day, and creating a directory each time would flood the log disk;
+/// the single line "when we compared and how many differences we found" is worth keeping on its own.
 pub fn compare_summary(name: &str, kind: &str, ts_ms: i64, ops_found: u64, elapsed_ms: u64, cancelled: bool) {
     if !crate::settings::load().logs_compare() {
         return;
@@ -314,7 +314,7 @@ pub fn compare_summary(name: &str, kind: &str, ts_ms: i64, ops_found: u64, elaps
 }
 
 
-/// 历史（新→旧）。job = None 时全量；损坏行跳过不炸。
+/// History (newest → oldest). job = None means everything; corrupt lines are skipped, never fatal.
 pub fn history(job: Option<&str>, limit: usize) -> Vec<RunRecord> {
     let Ok(text) = std::fs::read_to_string(index_path()) else {
         return Vec::new();
@@ -329,11 +329,12 @@ pub fn history(job: Option<&str>, limit: usize) -> Vec<RunRecord> {
     out
 }
 
-/// 历史 + **被中断的运行**（新→旧）。
+/// History plus **interrupted runs** (newest → oldest).
 ///
-/// 索引行只在 `finish` 里追加，所以进程被杀的那次运行在索引里根本不存在——
-/// 只剩一个目录。界面若只读索引，崩溃的运行就完全隐形，而那恰恰是最该被看见的一次。
-/// 这里把目录里的 `summary.json`（`start` 写的 `finished:false` 占位）补进来。
+/// The index line is only appended inside `finish`, so a run whose process was killed does not exist
+/// in the index at all — only a directory is left. A UI that reads only the index makes crashed runs
+/// completely invisible, and those are exactly the ones that most need to be seen. This merges in the
+/// directory's `summary.json` (the `finished:false` placeholder written by `start`).
 pub fn history_merged(job: Option<&str>, limit: usize) -> Vec<RunRecord> {
     let mut out = history(job, usize::MAX);
     let known: std::collections::HashSet<String> =
@@ -365,8 +366,8 @@ pub fn history_merged(job: Option<&str>, limit: usize) -> Vec<RunRecord> {
     out
 }
 
-/// 每个任务最近一次**真正执行**的运行（侧栏"上次同步"点）。
-/// compare 行不参与——它没动过任何数据，拿它当"上次同步"是撒谎。
+/// The most recent run per job that **actually executed** (the sidebar's "last sync" dot).
+/// compare lines do not count — they moved no data, and calling one "last sync" would be a lie.
 pub fn latest_by_job() -> std::collections::HashMap<String, RunRecord> {
     let mut m = std::collections::HashMap::new();
     let Ok(text) = std::fs::read_to_string(index_path()) else {
@@ -377,14 +378,14 @@ pub fn latest_by_job() -> std::collections::HashMap<String, RunRecord> {
             if r.ops_found.is_some() {
                 continue;
             }
-            m.insert(r.job.clone(), r); // 追加式文件：后写的天然更新
+            m.insert(r.job.clone(), r); // Append-only file: whatever was written later is naturally newer
         }
     }
     m
 }
 
-/// 一次运行的某份产物（原样 JSONL 行；行数封顶防爆内存）。
-/// `which` ∈ run / errors / items / plan / summary。
+/// One artifact of a run (raw JSONL lines; the line count is capped so memory cannot blow up).
+/// `which` ∈ run / errors / items / plan / summary.
 pub fn artifact_lines(run_id: &str, which: &str, max: usize) -> Vec<String> {
     if !safe_component(run_id) {
         return Vec::new();
@@ -403,8 +404,8 @@ pub fn artifact_lines(run_id: &str, which: &str, max: usize) -> Vec<String> {
     text.lines().take(max).map(|s| s.to_string()).collect()
 }
 
-/// v0.9 老记录的明细文件（平铺在 log_dir 下的单个 jsonl）。
-/// 新记录走 `artifact_lines`；这条留着让改造前的历史仍然打得开。
+/// The detail file of an old v0.9 record (a single jsonl sitting flat under log_dir).
+/// New records go through `artifact_lines`; this stays so pre-rework history still opens.
 pub fn detail_lines(detail: &str, max: usize) -> Vec<String> {
     if !safe_component(detail) {
         return Vec::new();
@@ -428,7 +429,7 @@ fn dir_size(p: &Path) -> u64 {
     n
 }
 
-/// 删一条运行记录的明细（老格式的平铺文件 / 新格式的目录）。
+/// Delete one run record's detail (the old format's flat file / the new format's directory).
 fn drop_detail(r: &RunRecord, root: &Path) {
     if let Some(id) = &r.run_id {
         if safe_component(id) {
@@ -442,17 +443,17 @@ fn drop_detail(r: &RunRecord, root: &Path) {
     }
 }
 
-/// 按天数 + 总量双条件清理。返回删掉的运行数。
+/// Retention on two conditions: age in days plus total size. Returns how many runs were deleted.
 ///
-/// `keep_days == 0` 关闭按天清；`max_total_mb == 0` 关闭按量清。
-/// 执行清单全记（一次大同步上万行）——总量闸门是它的安全带。
+/// `keep_days == 0` turns off the age rule; `max_total_mb == 0` turns off the size rule.
+/// The execution detail records everything (tens of thousands of lines for one big sync) — the size gate is its seatbelt.
 pub fn prune(keep_days: u64, max_total_mb: u64) -> u64 {
     let root = logs_dir();
     let idx = root.join(INDEX_FILE);
     let Ok(text) = std::fs::read_to_string(&idx) else {
         return 0;
     };
-    // 看不懂的行保守保留，但它们不参与体积核算
+    // Lines we cannot parse are conservatively kept, but they do not count toward the size budget
     let mut kept: Vec<(Option<RunRecord>, String)> = Vec::new();
     let mut dropped = 0u64;
     let cutoff = crate::foundation::time::now_ms() as i64 - (keep_days as i64) * 24 * 3600 * 1000;
@@ -474,7 +475,7 @@ pub fn prune(keep_days: u64, max_total_mb: u64) -> u64 {
         }
     }
 
-    // 总量闸门：还超就从最旧的删起（kept 是索引顺序 = 时间顺序）
+    // Size gate: if we are still over, delete from the oldest first (kept is in index order = chronological order)
     if max_total_mb > 0 {
         let cap = max_total_mb * 1024 * 1024;
         let mut sizes: Vec<u64> = kept
@@ -493,7 +494,7 @@ pub fn prune(keep_days: u64, max_total_mb: u64) -> u64 {
                     total = total.saturating_sub(sizes[i]);
                     sizes[i] = 0;
                     kept[i].0 = None;
-                    kept[i].1.clear(); // 标记删除
+                    kept[i].1.clear(); // Mark as deleted
                     dropped += 1;
                 }
             }
@@ -505,10 +506,10 @@ pub fn prune(keep_days: u64, max_total_mb: u64) -> u64 {
     if dropped > 0 {
         let body: String = kept.iter().map(|(_, l)| format!("{l}\n")).collect();
         if let Err(e) = std::fs::write(&idx, body) {
-            eprintln!("runlog: 索引重写失败：{e}");
+            eprintln!("runlog: rewriting the index failed: {e}");
         }
-        // 孤儿目录（崩溃留下的、索引里没有的）也扫掉。只碰早于 cutoff 的，
-        // 免得把**正在跑**的那次运行的目录删了——它还没来得及写索引行。
+        // Sweep orphan directories too (left by a crash, absent from the index). Only touch those older
+        // than the cutoff, so we do not delete the directory of a run that is **still going** — it has not written its index line yet.
         if keep_days > 0 {
             sweep_orphans(&root, &kept, cutoff);
         }
@@ -571,27 +572,27 @@ mod tests {
         let s = serde_json::to_string(&a).unwrap();
         let b: RunRecord = serde_json::from_str(&s).unwrap();
         assert_eq!((b.done, b.errors, b.warnings), (3, 1, 2));
-        // v0.9 写下的老索引行必须还能读（新字段全 serde default）
+        // Old index lines written by v0.9 must still read (every new field is a serde default)
         let old = r#"{"ts_ms":9,"job":"j","kind":"apply","done":1,"skipped":0,"errors":0,
             "bytes":0,"elapsed_ms":5,"cancelled":false,"detail":"9-j.jsonl"}"#;
         let c: RunRecord = serde_json::from_str(old).unwrap();
         assert_eq!(c.detail.as_deref(), Some("9-j.jsonl"));
         assert!(c.run_id.is_none() && c.ops_found.is_none());
-        // v0.9 只在 finish 里写记录，能写下来的都是走完的 → 老行读出来必须是 finished
-        assert!(c.finished, "老索引行没有 finished 字段，默认必须是 true");
+        // v0.9 only wrote a record inside finish, so anything written did finish → old lines must read back as finished
+        assert!(c.finished, "old index lines have no finished field; the default must be true");
     }
 
     #[test]
     fn stamp_matches_known_unix_times() {
         assert_eq!(stamp(0), "19700101-000000");
         assert_eq!(stamp(946_684_800_000), "20000101-000000"); // 2000-01-01T00:00:00Z
-        assert_eq!(stamp(1_000_000_000_000), "20010909-014640"); // 经典的十亿秒
-        assert_eq!(stamp(1_709_164_800_000), "20240229-000000"); // 闰日
+        assert_eq!(stamp(1_000_000_000_000), "20010909-014640"); // the classic billionth second
+        assert_eq!(stamp(1_709_164_800_000), "20240229-000000"); // leap day
     }
 
     #[test]
     fn stamps_sort_chronologically() {
-        // 目录名要能直接按字典序排 —— 这是不引 chrono 的全部理由
+        // Directory names must sort lexicographically as they stand — the entire reason for not pulling in chrono
         let mut v = vec![stamp(1_000_000_000_000), stamp(0), stamp(946_684_800_000)];
         v.sort();
         assert_eq!(v, vec!["19700101-000000", "20000101-000000", "20010909-014640"]);

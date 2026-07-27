@@ -2,6 +2,6 @@
 import type { SideMeta } from "./SideMeta";
 
 /**
- * 与 `plan.ops[i]` 一一对应的两侧实测状态（缺席的一侧为 None）
+ * Measured state of both sides, one-to-one with `plan.ops[i]` (the absent side is None)
  */
 export type RowMeta = { src: SideMeta | null, dst: SideMeta | null, };

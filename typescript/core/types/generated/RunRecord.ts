@@ -2,7 +2,7 @@
 
 export type RunRecord = { 
 /**
- * 运行开始时刻（unix ms）
+ * When the run started (unix ms)
  */
 ts_ms: number, job: string, 
 /**
@@ -10,25 +10,25 @@ ts_ms: number, job: string,
  */
 kind: string, done: number, skipped: number, errors: number, bytes: number, elapsed_ms: number, cancelled: boolean, 
 /**
- * 运行目录名（相对 log_dir）。compare 类只有索引行、没有目录 → None
+ * Run directory name (relative to log_dir). compare-class runs have only an index line, no directory → None
  */
 run_id: string | null, 
 /**
- * 报错清单里的警告条数（错误条数在 `errors`）
+ * How many warnings are in the error detail (the error count is in `errors`)
  */
 warnings: number, 
 /**
- * compare 类：发现的差异条数。apply 类为 None
+ * compare-class: how many differences were found. None for apply-class
  */
 ops_found: number | null, 
 /**
- * 运行是否走完。`start` 先写一份 `finished:false` 的摘要，`finish` 再覆盖成 true——
- * 中途被杀的运行在索引里没有行（`finish` 没跑到），只剩一个目录；
- * 靠这个字段，那个目录仍然能自己说清"我没跑完"。
- * 老记录默认 true：v0.9 只在 `finish` 里写记录，能写下来的都是走完的。
+ * Whether the run went all the way through. `start` first writes a `finished:false` summary and
+ * `finish` overwrites it with true — a run killed midway has no index line (`finish` never ran),
+ * only a directory; this field is what lets that directory still say "I did not finish".
+ * Old records default to true: v0.9 only wrote a record inside `finish`, so anything written did finish.
  */
 finished: boolean, 
 /**
- * v0.9 的明细文件名。新记录不再写，但老索引里有——读取端仍认。
+ * v0.9's detail file name. New records no longer write it, but old indexes carry it — readers still honour it.
  */
 detail: string | null, };

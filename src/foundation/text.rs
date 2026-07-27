@@ -1,24 +1,24 @@
-//! 路径文本归一化：全仓唯一的比对键实现。
+//! Path text normalization: the repo's one and only comparison-key implementation.
 //!
-//! 折叠 = NFC ＋（可选）大小写。NFC 不能省：macOS/APFS 默认写 NFD，少了这一步，
-//! 同一个名字在 compare 眼里和在 filter 眼里就不是同一个，NFD 路径能从 exclude 掩码
-//! 底下溜过去。
+//! Folding = NFC plus (optionally) case. NFC cannot be skipped: macOS/APFS writes NFD by default, and
+//! without that step the same name is not the same name to compare and to filter — an NFD path slips
+//! out from under the exclude mask.
 
 use unicode_normalization::UnicodeNormalization;
 
-/// 比对键：NFC 归一化 ＋（可选）大小写折叠。**只用于匹配，不用于 I/O**——
-/// 落盘永远用原始字符串，否则会在对端造出一个改了名的文件。
+/// Comparison key: NFC normalization plus (optionally) case-folding. **Matching only, never I/O** —
+/// always write the original string to disk, or you create a renamed file on the far side.
 pub fn norm_key(p: &str, case_insensitive: bool) -> String {
     let nfc: String = p.nfc().collect();
     if case_insensitive { nfc.to_uppercase() } else { nfc }
 }
 
-/// 大小写不敏感场景的折叠（等价于 `norm_key(p, true)`）。
+/// Folding for the case-insensitive case (equivalent to `norm_key(p, true)`).
 pub fn fold(p: &str) -> String {
     norm_key(p, true)
 }
 
-/// 主机名 → 可安全放进文件名的形式（非字母数字与 `-` 一律换成 `-`）。
+/// Hostname → a form safe inside a filename (anything that is not alphanumeric or `-` becomes `-`).
 pub fn safe_host(host: &str) -> String {
     host.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
@@ -29,15 +29,15 @@ pub fn safe_host(host: &str) -> String {
 mod tests {
     use super::*;
 
-    /// "é" 的两种拼写：NFC 单码位 U+00E9，NFD 是 "e" + U+0301 组合音标。
+    /// The two spellings of "é": NFC is the single code point U+00E9, NFD is "e" + the combining accent U+0301.
     const NFC_E: &str = "caf\u{00e9}.txt";
     const NFD_E: &str = "cafe\u{0301}.txt";
 
     #[test]
     fn nfd_and_nfc_spellings_fold_together() {
-        // 这条就是分歧的核心：没有 NFC 时这两个串不相等，
-        // 于是 filter 认不出 compare 认得的同一个文件
-        assert_ne!(NFC_E, NFD_E, "前提：两种拼写的字节确实不同");
+        // This is the heart of the divergence: without NFC the two strings are unequal,
+        // so filter fails to recognize the very file compare recognizes
+        assert_ne!(NFC_E, NFD_E, "premise: the two spellings really do differ byte-wise");
         assert_eq!(norm_key(NFC_E, false), norm_key(NFD_E, false));
         assert_eq!(norm_key(NFC_E, true), norm_key(NFD_E, true));
     }
@@ -50,6 +50,8 @@ mod tests {
 
     #[test]
     fn fold_matches_case_insensitive_norm_key() {
+        // The CJK entry is fixture data, not prose: it covers folding a mixed
+        // non-ASCII/ASCII string. Anglicising it would delete the coverage.
         for s in ["A/b.TXT", NFC_E, NFD_E, "", "混合Case"] {
             assert_eq!(fold(s), norm_key(s, true));
         }
@@ -59,6 +61,8 @@ mod tests {
     fn host_becomes_filename_safe() {
         assert_eq!(safe_host("WIN01"), "WIN01");
         assert_eq!(safe_host("my.host:2222"), "my-host-2222");
+        // Fixture data: the assertion is that non-ASCII host characters each collapse
+        // to '-'. An ASCII input would map to itself and assert nothing.
         assert_eq!(safe_host("主机"), "--");
     }
 }

@@ -1,5 +1,5 @@
-//! 表格式：JSONL —— 第一行是 Header，之后每行一个 Entry。
-//! 选 JSONL 的原因：可流式产出/解析（ssh 管道直接传）、可增量追加、坏一行不坏整表。
+//! Table format: JSONL —— the first line is a Header, every line after it is one Entry.
+//! Why JSONL: it streams both ways (pipe it straight over ssh), appends incrementally, and one bad line does not ruin the whole table.
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
@@ -18,10 +18,10 @@ pub struct Header {
     pub duration_ms: u64,
     pub entry_count: u64,
     pub hashed: bool,
-    /// 被过滤器排除的目录数（其下整棵子树都没进表）——排除必须可见，绝不静默
+    /// Directories excluded by the filter (their whole subtree never entered the table) — exclusions must be visible, never silent
     #[serde(default)]
     pub excluded_dirs: u64,
-    /// 被过滤器排除的文件数
+    /// Files excluded by the filter
     #[serde(default)]
     pub excluded_files: u64,
 }
@@ -35,37 +35,37 @@ pub enum EntryKind {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Entry {
-    /// 相对 root 的路径，统一 '/' 分隔（跨平台可比）
+    /// Path relative to root, always '/'-separated (comparable across platforms)
     pub path: String,
     pub kind: EntryKind,
     pub size: u64,
     pub mtime_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
-    /// unix: dev:inode；windows 暂空。仅用于同机 move 佐证，跨机靠 hash。
+    /// unix: dev:inode; empty on windows for now. Only corroborates same-machine moves; across machines we rely on hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_id: Option<String>,
-    /// unix 权限位（八进制 mode）。SMB 传不过去 exec 位，先记录，v0.4 打包模式恢复用。
+    /// unix permission bits (octal mode). SMB cannot carry the exec bit, so record it here and restore it in the v0.4 pack mode.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub mode: Option<u32>,
-    /// symlink 的指向（symlinks="direct" 时记录；比对按指向字符串相等）
+    /// symlink target (recorded when symlinks="direct"; comparison is string equality on the target)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub link: Option<String>,
-    /// **仅 archive 表使用**：这条路径更早若干代的内容 hash，最新的在前（P1-3）。
-    /// 用途：一侧的当前内容如果只是"停在某个历史版本上"，那它并没有并发修改，
-    /// 不该报 both-changed。这是 archive 模型下对版本向量的廉价近似
-    /// （syncthing 用 `PreviousBlocksHash` 达到同样目的，
-    ///  `lib/protocol/bep_fileinfo.go:200-207`）。
+    /// **archive tables only**: content hashes of this path's earlier generations, newest first (P1-3).
+    /// Why: if one side's current content is merely "parked on an older generation" it was not modified
+    /// concurrently and must not be reported as both-changed. The archive model's cheap approximation
+    /// of a vector clock (syncthing achieves the same with `PreviousBlocksHash`,
+    ///  `lib/protocol/bep_fileinfo.go:200-207`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub prev: Option<Vec<String>>,
 }
 
-/// archive 保留的历史代数。3 代足以覆盖"改了没刷存档"的常见情形，
-/// 而每条只多几十字节。
+/// How many generations of history the archive keeps. 3 covers the common "edited but never
+/// refreshed the archive" case and costs only a few dozen extra bytes per entry.
 pub const ARCHIVE_GENERATIONS: usize = 3;
 
 impl Entry {
-    /// 当前内容是否等于本条目**记录过的任一历史版本**
+    /// Whether the current content equals **any generation this entry has recorded**
     pub fn matches_any_generation(&self, hash: &str) -> bool {
         if self.hash.as_deref() == Some(hash) {
             return true;
@@ -74,14 +74,14 @@ impl Entry {
     }
 }
 
-/// 生成新一代 archive：把旧 archive 里同路径的 hash 推进 `prev` 链。
-/// `fresh` 是刚扫出来的快照（会被就地改写），`old` 是上一代 archive。
+/// Roll a new archive generation: push the old archive's hash for the same path onto the `prev` chain.
+/// `fresh` is the freshly scanned snapshot (rewritten in place); `old` is the previous archive.
 pub fn roll_generations(fresh: &mut [Entry], old: &[Entry]) {
     use std::collections::HashMap;
     let prior: HashMap<&str, &Entry> = old.iter().map(|e| (e.path.as_str(), e)).collect();
     for e in fresh.iter_mut() {
         let Some(o) = prior.get(e.path.as_str()) else { continue };
-        // 内容没变就不必新增一代，避免历史被同一个 hash 灌满
+        // Unchanged content needs no new generation — keeps the history from filling up with one repeated hash
         if o.hash.is_some() && o.hash == e.hash {
             e.prev = o.prev.clone();
             continue;
@@ -117,7 +117,7 @@ impl Snapshot {
         Self::from_reader(std::io::BufReader::new(f))
     }
 
-    /// 从任意流解析（ssh 远程扫描的 stdout 直接喂进来）
+    /// Parse from any stream (feed the stdout of a remote ssh scan straight in)
     pub fn from_reader(r: impl BufRead) -> std::io::Result<Snapshot> {
         let mut lines = r.lines();
         let head_line = lines
