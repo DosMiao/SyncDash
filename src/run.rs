@@ -74,7 +74,7 @@ fn materialize_one(s: &str) -> std::io::Result<String> {
     match crate::fs::vfs::spec::parse(s) {
         RootSpec::Local(_) => Ok(s.to_string()),
         _ => {
-            let v = crate::fs::vfs::open(s, &crate::fs::vfs::NoPrompt)?;
+            let v = crate::fs::vfs::open(s, &crate::fs::vfs::cred::default_provider())?;
             v.connect().map_err(std::io::Error::from)?;
             let p = v.as_local().ok_or_else(|| {
                 std::io::Error::new(

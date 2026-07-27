@@ -239,6 +239,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TrashCmd,
     },
+    /// Credentials for remote roots — kept in the OS store (Windows Credential Manager / macOS Keychain), never in a job file
+    Cred {
+        #[command(subcommand)]
+        cmd: CredCmd,
+    },
+    /// Network-mount housekeeping for smb:// roots
+    Net {
+        #[command(subcommand)]
+        cmd: NetCmd,
+    },
     /// Execute a plan. dry-run by default; only --apply touches anything
     Apply {
         plan: PathBuf,
@@ -265,6 +275,30 @@ enum Cmd {
         #[arg(short, long)]
         verbose: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum CredCmd {
+    /// Store the password for a remote phrase (prompts without echo; secrets never touch argv or job files)
+    Set {
+        /// The remote phrase, e.g. "smb://ben@server/share" — server+user derive the entry, the path plays no part
+        phrase: String,
+        /// Read the password from stdin instead of prompting (for scripts; beware shell history when piping)
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Remove the stored password for a phrase
+    Rm { phrase: String },
+    /// List stored credential accounts (names only — secrets stay in the OS store)
+    Ls,
+    /// Connect once and report what happened, step by step
+    Test { phrase: String },
+}
+
+#[derive(Subcommand)]
+enum NetCmd {
+    /// Release the private smb mount points this tool created (macOS; Windows sessions are device-less)
+    Umount,
 }
 
 #[derive(Subcommand)]
@@ -763,6 +797,108 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             println!("set `require_marker = true` in the job to have syncdash refuse to run without it");
             Ok(0)
         }
+        Cmd::Cred { cmd } => {
+            use syncdash::fs::vfs::cred;
+            use syncdash::fs::vfs::spec::{parse, RootSpec};
+            match cmd {
+                CredCmd::Set { phrase, stdin } => {
+                    let RootSpec::Remote(r) = parse(&phrase) else {
+                        eprintln!("not a remote phrase: {phrase} (expected scheme://user@host/...)");
+                        return Ok(2);
+                    };
+                    let Some(acc) = cred::account_for(&r) else {
+                        eprintln!("the phrase names no user — spell it scheme://user@host/... so the credential has an owner");
+                        return Ok(2);
+                    };
+                    let pw = if stdin {
+                        use std::io::Read as _;
+                        let mut s = String::new();
+                        std::io::stdin().read_to_string(&mut s)?;
+                        s
+                    } else {
+                        rpassword::prompt_password(format!("password for {acc}: "))?
+                    };
+                    let pw = pw.trim_end_matches(['\r', '\n']);
+                    if pw.is_empty() {
+                        eprintln!("empty password — nothing stored");
+                        return Ok(2);
+                    }
+                    cred::set_secret(&acc, pw).map_err(std::io::Error::from)?;
+                    println!("stored in the OS credential store: {acc}");
+                    Ok(0)
+                }
+                CredCmd::Rm { phrase } => {
+                    let RootSpec::Remote(r) = parse(&phrase) else {
+                        eprintln!("not a remote phrase: {phrase}");
+                        return Ok(2);
+                    };
+                    let Some(acc) = cred::account_for(&r) else {
+                        eprintln!("the phrase names no user");
+                        return Ok(2);
+                    };
+                    if cred::delete_secret(&acc).map_err(std::io::Error::from)? {
+                        println!("removed: {acc}");
+                    } else {
+                        println!("no entry stored for {acc}");
+                    }
+                    Ok(0)
+                }
+                CredCmd::Ls => {
+                    let accounts = cred::list_accounts();
+                    if accounts.is_empty() {
+                        println!("no stored credentials (add one with: syncdash cred set \"smb://user@host/share\")");
+                    }
+                    for a in accounts {
+                        println!("{a}");
+                    }
+                    Ok(0)
+                }
+                CredCmd::Test { phrase } => {
+                    let v = syncdash::fs::vfs::open(&phrase, &cred::default_provider()).map_err(std::io::Error::from)?;
+                    match v.connect() {
+                        Ok(()) => {
+                            println!("connected: {}", v.display());
+                            if let Some(info) = v.server_info() {
+                                println!("  {info}");
+                            }
+                            let c = v.caps();
+                            println!(
+                                "  protocol {}, mtime precision {} ms, up to {} parallel stream(s)",
+                                c.protocol, c.mtime_precision_ms, c.max_parallel_streams
+                            );
+                            Ok(0)
+                        }
+                        Err(e) => {
+                            eprintln!("connect failed: {e}");
+                            Ok(1)
+                        }
+                    }
+                }
+            }
+        }
+        Cmd::Net { cmd } => match cmd {
+            NetCmd::Umount => {
+                let rs = syncdash::fs::vfs::smb::umount_private_mounts();
+                if rs.is_empty() {
+                    if cfg!(windows) {
+                        println!("nothing to do on Windows — smb:// sessions are device-less; drop one with: net use \\\\host\\share /delete");
+                    } else {
+                        println!("no private mount points found");
+                    }
+                }
+                let mut fails = 0;
+                for (label, r) in rs {
+                    match r {
+                        Ok(()) => println!("unmounted {label}"),
+                        Err(e) => {
+                            fails += 1;
+                            eprintln!("failed to unmount {label}: {e}");
+                        }
+                    }
+                }
+                Ok(if fails > 0 { 1 } else { 0 })
+            }
+        },
         Cmd::Logs { cmd } => run_logs(cmd),
         Cmd::History { job, limit, prune_days } => {
             if let Some(days) = prune_days {

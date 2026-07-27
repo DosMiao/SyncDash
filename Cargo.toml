@@ -26,6 +26,13 @@ fastcdc = "3"
 # silently degraded into content copies). Export directory: see `.cargo/config.toml`.
 ts-rs = { version = "12", features = ["serde-compat", "no-serde-warnings"] }
 
+# OS credential store (Windows Credential Manager / macOS Keychain). Job files carry zero
+# secrets by design; the phrase derives the keyring account and this is the only place
+# passwords live at rest.
+keyring = "4"
+# No-echo password prompt for `syncdash cred set` (secrets never appear in argv or on screen)
+rpassword = "7"
+
 # statvfs (disk-space preflight). Windows goes through kernel32's GetDiskFreeSpaceExW, no extra crate needed.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

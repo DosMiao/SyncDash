@@ -24,8 +24,10 @@
 pub mod error;
 pub mod spec;
 
+pub mod cred;
 pub mod fake;
 pub mod local;
+pub mod smb;
 
 #[cfg(test)]
 pub mod conformance;
@@ -278,17 +280,20 @@ impl CredentialProvider for NoPrompt {
     }
 }
 
-/// Route a root phrase to a live backend. Local and fake roots resolve today;
-/// protocol backends land per milestone and report `Unsupported` (with the plan
-/// spelled out) until then — never a silent local fallback.
-pub fn open(phrase: &str, _creds: &dyn CredentialProvider) -> VfsResult<Arc<dyn Vfs>> {
+/// Route a root phrase to a live backend. Local, fake and smb roots resolve today;
+/// sftp/ftp land in their milestones and report `Unsupported` (with the plan spelled
+/// out) until then — never a silent local fallback.
+pub fn open(phrase: &str, creds: &Arc<dyn CredentialProvider>) -> VfsResult<Arc<dyn Vfs>> {
     match spec::parse(phrase) {
         RootSpec::Local(p) => Ok(Arc::new(local::LocalVfs::new(p))),
         RootSpec::Fake(raw) => Ok(Arc::new(fake::FakeVfs::from_phrase(&raw)?)),
+        RootSpec::Remote(r) if r.scheme == "smb" => {
+            Ok(Arc::new(smb::SmbBackend::new(r, creds.clone())?))
+        }
         RootSpec::Remote(r) => Err(VfsError::new(
             VfsErrorKind::Unsupported,
             format!(
-                "{}:// backend is not built yet (root: {}) — SMB, SFTP and FTP land in the current milestone series",
+                "{}:// backend is not built yet (root: {}) — SFTP and FTP land in the next milestones",
                 r.scheme,
                 r.display()
             ),
