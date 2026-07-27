@@ -6,6 +6,14 @@
 //!   - leading `/` = relative to root; `*/abc` hits abc at any level and at the root alike
 //!   - the include side uses "the prefix might match" (matches_begin) to decide if a dir is worth descending into
 //!
+//! Case folding goes through `foundation::text::fold`, the same NFC-then-uppercase the compare
+//! key uses, and that is not a detail. `to_uppercase` alone left the two lanes disagreeing about
+//! what a name *is*: macOS hands out NFD, a mask typed anywhere else is NFC, and the two uppercase
+//! to different strings. The mask would then match on the Windows root and miss on the macOS one —
+//! and an exclusion that applies to only one side is the shape that gets data deleted, because
+//! the excluded side looks like it simply does not have the tree, so mirror proposes removing it
+//! from the side that does. The UI meanwhile reports it as excluded on both.
+//!
 //! Two **superset** extensions beyond FFS syntax (in the spirit of syncthing `lib/ignore/ignore.go`;
 //! the behavior of the FFS rules pasted in here is entirely unchanged):
 //!   - an exclude entry starting with `!` = an **exception**: a hit lets it through, overriding every other exclude
@@ -164,7 +172,7 @@ impl MaskSet {
 }
 
 fn parse_phrase(phrase: &str, set: &mut MaskSet) {
-    let norm = phrase.trim().to_uppercase().replace('\\', "/");
+    let norm = crate::foundation::text::fold(phrase.trim()).replace('\\', "/");
     if norm.is_empty() {
         return;
     }
@@ -317,7 +325,7 @@ impl PathFilter {
         if crate::fs::staged::is_temp_rel(rel) {
             return false;
         }
-        let path = rel.to_uppercase();
+        let path = crate::foundation::text::fold(rel);
         let parent = path.rfind('/').map(|i| &path[..i]);
         if !self.is_excepted(&path, parent)
             && (self.exclude.file_masks.matches(&path, false)
@@ -331,7 +339,7 @@ impl PathFilter {
 
     /// Returns (does the dir itself enter the table, might a child match — decides whether to descend)
     pub fn pass_dir(&self, rel: &str) -> (bool, bool) {
-        let path = rel.to_uppercase();
+        let path = crate::foundation::text::fold(rel);
         let excepted = self.except.folder_masks.matches(&path, true);
         if !excepted && self.exclude.folder_masks.matches(&path, true) {
             // Directory excluded. With an unanchored exception we still descend — the exception may be hiding inside.
@@ -354,7 +362,7 @@ impl PathFilter {
         if crate::fs::staged::is_temp_rel(rel) {
             return true;
         }
-        let path = rel.to_uppercase();
+        let path = crate::foundation::text::fold(rel);
         let parent = path.rfind('/').map(|i| &path[..i]);
         self.deletable.file_masks.matches(&path, false)
             || parent.map_or(false, |pp| self.deletable.folder_masks.matches(pp, true))
@@ -381,7 +389,7 @@ pub fn mask_hits(masks: &[String], rels: &[String]) -> Vec<bool> {
     }
     rels.iter()
         .map(|rel| {
-            let path = rel.trim().replace('\\', "/").to_uppercase();
+            let path = crate::foundation::text::fold(&rel.trim().replace('\\', "/"));
             let parent = path.rfind('/').map(|i| path[..i].to_string());
             set.file_masks.matches(&path, false)
                 || parent.as_deref().map_or(false, |pp| set.folder_masks.matches(pp, true))
@@ -445,6 +453,32 @@ mod tests {
         assert!(!pf.pass_file("a/b/x.TMP")); // case-insensitive
         assert!(!pf.pass_file("z/cachedir/deep/file.bin"));
         assert!(pf.pass_file("z/cachedir2/file.bin"));
+    }
+
+    /// The filter and the compare key must agree on what a name *is*. They did not: the filter
+    /// case-folded without NFC, so a mask typed in NFC (anywhere but macOS) missed the NFD
+    /// spelling macOS hands out. An exclusion landing on only one of two roots is the shape
+    /// that deletes data — the excluded side looks like it simply lacks the tree, so mirror
+    /// proposes removing it from the side that has it, while the UI calls it excluded on both.
+    #[test]
+    fn masks_match_across_nfc_and_nfd_spellings() {
+        const NFC: &str = "Caf\u{00e9}"; // é as one code point
+        const NFD: &str = "Cafe\u{0301}"; // e + combining acute
+        assert_ne!(NFC, NFD, "premise: the two spellings differ byte-wise");
+        assert_ne!(NFC.to_uppercase(), NFD.to_uppercase(), "premise: uppercasing alone does not reconcile them");
+
+        // Mask written in NFC (a Windows or web UI user typing it)
+        let pf = PathFilter::build(&[], &[format!("*/{NFC}/")]);
+        assert!(!pf.pass_file(&format!("photos/{NFC}/a.jpg")), "the NFC spelling must be excluded");
+        assert!(
+            !pf.pass_file(&format!("photos/{NFD}/a.jpg")),
+            "the NFD spelling macOS hands out must be excluded by the very same mask"
+        );
+        assert!(!pf.pass_dir(&format!("photos/{NFD}")).0, "and the directory itself");
+
+        // ...and symmetrically, a mask typed on macOS must catch the NFC tree on Windows
+        let pf2 = PathFilter::build(&[], &[format!("*/{NFD}/")]);
+        assert!(!pf2.pass_file(&format!("photos/{NFC}/a.jpg")));
     }
 
     #[test]
