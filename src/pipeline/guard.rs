@@ -467,6 +467,19 @@ pub fn cap_report_write(
             });
         }
 
+        // The root-lock heartbeat rides set_mtime; a backend that cannot set mtimes
+        // cannot prove it is alive to the other machine — writing there is refused
+        if caps.set_mtime == Support::No && !local {
+            r.items.push(CapItem {
+                feature: "root lock".into(),
+                side: side_tag.into(),
+                severity: CapSeverity::Block,
+                requested: "a heartbeat other machines can observe".into(),
+                actual: "backend cannot set mtimes (FTP without MFMT)".into(),
+                effect: "the lock protocol cannot signal liveness — refusing to write; comparing (read-only) still works".into(),
+            });
+        }
+
         if q.fsync {
             match caps.fsync {
                 Support::No => r.items.push(CapItem {
