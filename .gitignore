@@ -2,6 +2,6 @@
 *.jsonl
 .libs
 node_modules/
-# dist/ 特意提交进 git：Mac 没有 node，Tauri 编译期直接嵌入这份预构建前端
+# dist/ is committed to git on purpose: Mac has no node, and Tauri embeds this prebuilt frontend at compile time
 src-tauri/gen/
 

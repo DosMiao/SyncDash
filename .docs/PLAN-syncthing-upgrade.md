@@ -1,514 +1,614 @@
-# SyncDash 升级计划 —— 对照 Syncthing 源码
+# SyncDash Upgrade Plan — Benchmarked Against the Syncthing Source
 
-> 生成日期：2026-07-26
-> 参照源：`.docs/syncthing`（`git clone --depth 1`，commit `119d5e72` / 2026-07-25，Go 1.25，MPL-2.0）
-> 本文只做**语义借鉴**，不搬运代码（MPL-2.0 与本项目许可不一定兼容，且 Go 的并发模型与 Rust 差异大，照抄无意义）。
+> Written: 2026-07-26
+> Reference source: `.docs/syncthing` (`git clone --depth 1`, commit `119d5e72` / 2026-07-25, Go 1.25, MPL-2.0)
+> This document only **borrows semantics**; it does not copy code (MPL-2.0 is not necessarily compatible with this project's license, and Go's concurrency model differs enough from Rust's that copying verbatim would be pointless).
 
-## 实施状态（2026-07-26 收尾）
+## Implementation status (wrapped up 2026-07-26)
 
-**P0 / P1 / P2 全部实现完毕，`cargo test --workspace` 78 项全绿，端到端真机验证通过。**
+**P0 / P1 / P2 are all implemented, `cargo test --workspace` is 78/78 green, and end-to-end verification on real hardware passed.**
 
-| 项 | 状态 | 落点 |
+| Item | Status | Where it landed |
 |---|---|---|
-| P0-1 原子落盘 | ✅ | 新 [src/atomic.rs](src/atomic.rs)（`Staged` RAII）+ [apply.rs](src/apply.rs) 全路径改写 |
-| P0-2 挂载点标记 + 计划体检 | ✅ | 新 [src/preflight.rs](src/preflight.rs)、`syncdash mark`、`require_marker` / `max_delete_ratio` / `--i-know` |
-| P0-3 磁盘空间预检 | ✅ | [preflight.rs](src/preflight.rs) `disk_space`（Win: `GetDiskFreeSpaceExW`；unix: `statvfs`）+ `min_free_pct` |
-| P0-4 目录删除分类汇报 | ✅ | [apply.rs](src/apply.rs) `try_delete_dir` / `DirOutcome` |
-| P1-1 增量传输 | ✅ | 远程 pack 路径 v0.7 已有；本增补本地/挂载盘路径（`delta`，[apply.rs](src/apply.rs) `update_with_delta`） |
-| P1-2 冲突副本 | ✅ | [compare.rs](src/compare.rs) `ConflictPolicy` / `conflict_name` / `max_conflicts` |
-| P1-3 多代 archive | ✅ | [table.rs](src/table.rs) `prev` + `roll_generations`，[compare.rs](src/compare.rs) `generation_of` |
-| P1-4 mtime 回读校正 | ✅ | [apply.rs](src/apply.rs) 回读 + [scan.rs](src/scan.rs) `record_mtime_fixes` / `load_mtime_fixes` |
-| P1-5 过滤器 `!` 取反 + deletable | ✅ | [filter.rs](src/filter.rs) `except` / `deletable` / `except_blocks_pruning` |
-| P2-1 版本向量 | ✅ 数学核心 | 新 [src/vclock.rs](src/vclock.rs)（`Vector` / `Ordering` / 节点 ID，穷举式代数性质测试） |
-| P2-2 回收站保留期 | ✅ | 新 [src/trash.rs](src/trash.rs)：`trash runs\|find\|restore\|prune` + staggered 稀释 |
-| P2-3 大小写撞名预检 | ✅ | [compare.rs](src/compare.rs) 折叠撞名 → Conflict（大小写改名不误伤） |
-| P2-4 Chmod op | ✅ | `Action::Chmod` + `sync_mode`，Copy/Update 顺带带 mode |
-| P2-5 空文件不参与配对 | ✅ | [compare.rs](src/compare.rs) `detect_moves` + `MovePair.candidates` 歧义标注 |
-| P2-6 扫描进度 | ✅ | [scan.rs](src/scan.rs) `scan_with_progress`、CLI `--progress`、Tauri 进度事件 |
+| P0-1 Atomic writes | ✅ | new [src/atomic.rs](src/atomic.rs) (`Staged` RAII) + [apply.rs](src/apply.rs) rewritten on every path |
+| P0-2 Mount-point marker + plan health check | ✅ | new [src/preflight.rs](src/preflight.rs), `syncdash mark`, `require_marker` / `max_delete_ratio` / `--i-know` |
+| P0-3 Disk space preflight | ✅ | [preflight.rs](src/preflight.rs) `disk_space` (Win: `GetDiskFreeSpaceExW`; unix: `statvfs`) + `min_free_pct` |
+| P0-4 Classified reporting for directory deletion | ✅ | [apply.rs](src/apply.rs) `try_delete_dir` / `DirOutcome` |
+| P1-1 Delta transfer | ✅ | the remote pack path already had it in v0.7; this adds the local/mounted-drive path (`delta`, [apply.rs](src/apply.rs) `update_with_delta`) |
+| P1-2 Conflict copies | ✅ | [compare.rs](src/compare.rs) `ConflictPolicy` / `conflict_name` / `max_conflicts` |
+| P1-3 Multi-generation archive | ✅ | [table.rs](src/table.rs) `prev` + `roll_generations`, [compare.rs](src/compare.rs) `generation_of` |
+| P1-4 mtime read-back correction | ✅ | [apply.rs](src/apply.rs) read-back + [scan.rs](src/scan.rs) `record_mtime_fixes` / `load_mtime_fixes` |
+| P1-5 Filter `!` negation + deletable | ✅ | [filter.rs](src/filter.rs) `except` / `deletable` / `except_blocks_pruning` |
+| P2-1 Version vectors | ✅ math core | new [src/vclock.rs](src/vclock.rs) (`Vector` / `Ordering` / node ID, exhaustive algebraic-property tests) |
+| P2-2 Trash retention | ✅ | new [src/trash.rs](src/trash.rs): `trash runs\|find\|restore\|prune` + staggered thinning |
+| P2-3 Case-collision preflight | ✅ | [compare.rs](src/compare.rs) folded collision → Conflict (case-only renames are not hit by mistake) |
+| P2-4 Chmod op | ✅ | `Action::Chmod` + `sync_mode`; Copy/Update carry mode along |
+| P2-5 Empty files excluded from pairing | ✅ | [compare.rs](src/compare.rs) `detect_moves` + `MovePair.candidates` ambiguity annotation |
+| P2-6 Scan progress | ✅ | [scan.rs](src/scan.rs) `scan_with_progress`, CLI `--progress`, Tauri progress events |
 
-**P2-1 的范围**：`vclock.rs` 是完整可用、测试充分的版本向量实现（含 `update` 单调性、`merge` 上确界、
-比较关系的反对称性穷举验证）。**但它尚未接管 archive 归因**——真 N 向要求每次 apply 后精确维护
-每个文件的向量并保证收敛，那是 v1.0 的工程，不在本轮范围内。本轮交付的是数学核心 + 节点身份，
-以及 P1-3 这个 archive 模型下的廉价近似（它已经解决了绝大多数误报冲突）。
+**Scope of P2-1**: `vclock.rs` is a complete, well-tested version-vector implementation (covering `update`
+monotonicity, `merge` as least upper bound, and exhaustive verification of the comparison relation's
+antisymmetry). **But it has not yet taken over archive attribution** — true N-way requires precisely
+maintaining every file's vector after each apply and guaranteeing convergence, which is v1.0 engineering
+and out of scope this round. What ships this round is the math core plus node identity, along with P1-3,
+the cheap approximation under the archive model (which already resolves the vast majority of
+false-positive conflicts).
 
-**两处对原计划的修正**（计划写于仓库处于 v0.5 时，实施时仓库已到 v0.8）：
-- P1-1 所说的"整文件复制"只对**本地/挂载盘**路径成立；远程 pack 管线在 v0.7 已有 FastCDC 增量。本轮补的是前者。
-- P2-2 所说的"没有版本化"不准确：v0.8 已有 `versioning` 模式（各 root 内 `.version_syncDash/`）。
-  真正缺的是**默认 trash 从不清理**，本轮补的是这个。
+**Two corrections to the original plan** (the plan was written when the repo was at v0.5; by
+implementation time it had reached v0.8):
+- P1-1's claim of "whole-file copying" holds only for the **local/mounted-drive** path; the remote pack
+  pipeline already had FastCDC deltas in v0.7. This round fills in the former.
+- P2-2's claim of "no versioning" is inaccurate: v0.8 already had a `versioning` mode
+  (`.version_syncDash/` inside each root). What was genuinely missing is that **the default trash is
+  never cleaned**, and that is what this round fills in.
 
-冒烟测试还揪出一个原计划没预见的真 bug：`.syncdash-root` 标记文件自己会被同步过去——
-那样没挂载的空目录也会凭空长出标记，闸门等于白设。已加入 `DEFAULT_EXCLUDES`
-（syncthing 同样把 `.stfolder` 列为 internal）。
+Smoke testing also turned up a real bug the original plan did not foresee: the `.syncdash-root` marker
+file gets synced across itself — so an unmounted empty directory would sprout a marker out of nowhere,
+making the gate worthless. It has been added to `DEFAULT_EXCLUDES` (syncthing likewise lists `.stfolder`
+as internal).
 
 ---
 
 ---
 
-## 0. 方法与阅读范围
+## 0. Method and reading scope
 
-实际通读/精读的 syncthing 文件（下文所有引用都指向 `.docs/syncthing/` 内的真实行号）：
+The syncthing files actually read through or read closely (every reference below points at real line
+numbers inside `.docs/syncthing/`):
 
-| 模块 | 文件 | 关心什么 |
+| Module | File | What we care about |
 |---|---|---|
-| 版本向量 | `lib/protocol/vector.go`（全文 329 行） | 真 N 向同步的数学基础 |
-| 冲突判定 | `lib/protocol/bep_fileinfo.go:190-229` | `InConflictWith` / `WinsConflict` / `PreviousBlocksHash` |
-| 相等判定 | `lib/protocol/bep_fileinfo.go:454-540` | `FileInfoComparison`（可选忽略 perms/xattr/owner/blocks） |
-| 分块 | `lib/scanner/blocks.go`（131 行）、`bep_fileinfo.go:92-102,395-412` | 块级 hash、块大小自适应 |
-| 扫描 | `lib/scanner/walk.go:300-400,615-624` | 临时文件清理、路径归一化、忽略下钻 |
-| 拉取引擎 | `lib/model/folder_sendrecv.go`（2235 行，重点 241-310 / 952-1250 / 1657-1710 / 1862-1906 / 1960-2090） | 临时文件、块复用、冲突副本、目录删除安全网 |
-| 重命名检测 | `lib/model/folder.go:929-989`（`findRename`） | 扫描期本地 rename 归因 |
-| 原子写 | `lib/osutil/atomic.go`（134 行） | temp → fsync → rename |
-| 版本化 | `lib/versioner/{trashcan,staggered,simple,util}.go` | 回收站保留期、分级稀释 |
-| 忽略语法 | `lib/ignore/ignore.go:359-400,500-560` | `!` 取反、`(?i)`、`(?d)`、`#include` |
-| 大小写 FS | `lib/fs/casefs.go:1-70` | `CaseConflictError`，写入前真名解析 |
-| mtime 虚拟化 | `lib/fs/mtimefs.go:1-80` | FAT/SMB 上写完回读、(ondisk, virtual) 双记 |
-| 健康检查 | `lib/config/folderconfiguration.go:37,63,160-196,236,360-375` | `.stfolder` 标记、`minDiskFree` |
-| 监视聚合 | `lib/watchaggregator/aggregator.go:21-25,193-260` | 防抖、`maxFiles=512` 退化全扫 |
-| 只收模式 | `lib/model/folder_recvonly.go:69-120` | `Revert` 语义 |
+| Version vectors | `lib/protocol/vector.go` (all 329 lines) | The mathematical basis of true N-way sync |
+| Conflict ruling | `lib/protocol/bep_fileinfo.go:190-229` | `InConflictWith` / `WinsConflict` / `PreviousBlocksHash` |
+| Equality ruling | `lib/protocol/bep_fileinfo.go:454-540` | `FileInfoComparison` (optionally ignores perms/xattr/owner/blocks) |
+| Blocking | `lib/scanner/blocks.go` (131 lines), `bep_fileinfo.go:92-102,395-412` | Block-level hashing, adaptive block size |
+| Scanning | `lib/scanner/walk.go:300-400,615-624` | Temp-file cleanup, path normalization, descending into ignores |
+| Pull engine | `lib/model/folder_sendrecv.go` (2235 lines; focus on 241-310 / 952-1250 / 1657-1710 / 1862-1906 / 1960-2090) | Temp files, block reuse, conflict copies, the directory-deletion safety net |
+| Rename detection | `lib/model/folder.go:929-989` (`findRename`) | Local rename attribution during scanning |
+| Atomic writes | `lib/osutil/atomic.go` (134 lines) | temp → fsync → rename |
+| Versioning | `lib/versioner/{trashcan,staggered,simple,util}.go` | Trash retention, tiered thinning |
+| Ignore syntax | `lib/ignore/ignore.go:359-400,500-560` | `!` negation, `(?i)`, `(?d)`, `#include` |
+| Case-insensitive FS | `lib/fs/casefs.go:1-70` | `CaseConflictError`, resolving the real name before writing |
+| mtime virtualization | `lib/fs/mtimefs.go:1-80` | Read back after writing on FAT/SMB, dual (ondisk, virtual) records |
+| Health checks | `lib/config/folderconfiguration.go:37,63,160-196,236,360-375` | The `.stfolder` marker, `minDiskFree` |
+| Watch aggregation | `lib/watchaggregator/aggregator.go:21-25,193-260` | Debouncing, degrading to a full scan at `maxFiles=512` |
+| Receive-only mode | `lib/model/folder_recvonly.go:69-120` | `Revert` semantics |
 
 ---
 
-## 1. 先说清楚：两者不是一类东西
+## 1. First, be clear: these are not the same kind of thing
 
-这决定了哪些能抄、哪些抄了是自残。
+This determines what can be copied and what would be self-harm to copy.
 
 | | Syncthing | SyncDash |
 |---|---|---|
-| 形态 | 常驻 daemon + Web UI，P2P 网状 | CLI + Tauri 桌面，显式触发 |
-| 传输 | 自有协议 BEP over TLS，含发现/中继/NAT 穿透 | 借道 SMB 挂载盘 / ssh / tar 包 |
-| 状态 | 每 folder 一个索引数据库（sequence / 版本向量 / 块表） | JSONL 快照表 + 可选 archive 表 |
-| 拓扑 | 真 N 向，任意设备对等 | 双边为主，1 master 对 N slave 手工展开 |
-| 冲突 | 自动落地 + `.sync-conflict-*` 副本 | 报告，不自动仲裁 |
-| 可审计 | 需要读 db / 看日志 | **计划就是一个可 diff 的文本文件** |
-| 何时动手 | 后台连续，用户看不见中间态 | **默认 dry-run，人点了才动** |
+| Form | Resident daemon + web UI, P2P mesh | CLI + Tauri desktop, explicitly triggered |
+| Transport | Its own protocol, BEP over TLS, with discovery/relay/NAT traversal | Rides on SMB mounts / ssh / tar packs |
+| State | One index database per folder (sequence / version vectors / block tables) | JSONL snapshot tables + optional archive table |
+| Topology | True N-way, any device is a peer | Mostly bilateral; 1 master to N slaves expanded by hand |
+| Conflicts | Resolved automatically + `.sync-conflict-*` copies | Reported, never arbitrated automatically |
+| Auditability | Requires reading the db / the logs | **The plan is a diffable text file** |
+| When it acts | Continuously in the background; the user never sees the intermediate state | **Dry-run by default; nothing moves until a human clicks** |
 
-**SyncDash 的核心卖点是"可预览、可审计、可管道"，这一条不能为了对齐 syncthing 而牺牲。**
-所以下面凡是要求"常驻""隐式""黑盒"的能力，一律降级为可选模式，绝不改默认行为。
-
----
-
-## 2. 差距清单
-
-### P0 —— 正确性/数据安全，应当立刻做
-
-#### P0-1. 落盘不是原子的（**真数据丢失路径**）
-
-**syncthing**：所有写入都先写 `.syncthing.tmp.<name>`，Close 时 `Sync()` → `Rename()` 到最终名
-（`lib/osutil/atomic.go:19,45-90`；temp 名由 `fs.TempName` 生成，扫描时被 `fs.IsTemporary` 跳过，
-超过 `TempLifetime` 自动清理 —— `lib/scanner/walk.go:314-320`）。
-
-**SyncDash**：[src/apply.rs:140](src/apply.rs:140) 直接 `std::fs::copy(&src, &dst)` 写进最终路径。
-
-**具体的坏结局**（不是理论风险，SMB 上大文件被打断是常态）：
-
-> sync 模式 + archive。target 上 `a.psd` 正在被 Update：旧版已进 trash（可恢复），
-> 新版写到一半断网 → target 留下一个截断文件，mtime 是新的。
-> 下一轮 compare：source 对 archive 未变（`s_unchanged=true`），target 对 archive 变了（`t_unchanged=false`）
-> → 走 [src/compare.rs:352](src/compare.rs:352) 的 `"target-changed"` 分支
-> → **生成 `Update source` —— 把截断文件反向覆盖到 source 上**。
-> 源侧那份好文件就没了（target 的旧版还在 trash 里，但没人会想到去那儿找）。
-
-**怎么改**：
-- `apply.rs` 加 `write_atomic(src, dst, mtime, expect_hash)`：
-  写 `<dir>/.syncdash.tmp.<basename>.<pid>` → （verify 时在 temp 上校验 hash）→ `set_mtime` → `fs::rename` 覆盖。
-- 同卷 rename 是原子的；跨卷不会发生（temp 与 dst 同目录）。
-- `filter.rs` 的内置排除加上 `.syncdash.tmp.*`，避免临时文件被扫进快照表。
-- 扫描时遇到 `.syncdash.tmp.*` 且 mtime 超过 24h → 顺手删掉（对齐 syncthing 的 `TempLifetime`）。
-- `pack.rs` 的 staging 已经是"全验完才动 target"，但最后一步落盘同样要走原子写。
-
-**验收**：新增测试 —— 模拟写到一半失败（注入错误的 writer），断言 dst 要么是旧内容、要么不存在，绝不是半截。
+**SyncDash's core selling point is "previewable, auditable, pipeable", and that cannot be sacrificed for
+the sake of aligning with syncthing.**
+So everything below that demands "resident", "implicit", or "black box" capability is demoted to an
+optional mode, and never changes the default behavior.
 
 ---
 
-#### P0-2. 共享盘没挂上 = 生成"删光对面"的计划（**灾难性误判**）
+## 2. Gap list
 
-**syncthing**：每个 folder 根下必须有标记目录 `.stfolder`（`DefaultMarkerName`，
-`lib/config/folderconfiguration.go:37,160-196`）；`CheckPath` 在 `:236` 校验它存在，
-不存在就把 folder 置为错误状态、**拒绝任何同步**。这条规则存在的唯一理由就是防"挂载点没挂上"。
+### P0 — correctness / data safety, to do immediately
 
-**SyncDash**：没有任何等价检查。`target = '\\192.168.0.115\xuanbomiao\...'`，
-Mac 关机或 SMB 掉线时该路径可能是空目录（或被本地自动创建）→
-mirror 模式 compare 会生成"复制全部过去"（几十 GB 白传），
-反向 job 则生成"删除 target 全部"。`run --apply` 会照做。
+#### P0-1. Writes are not atomic (**a real data-loss path**)
 
-**怎么改**：
-- 复用已有的 `.ffs-sync` 领地标记概念（[src/territory.rs:11](src/territory.rs:11)），新增 `syncdash mark <root>` 写 `.syncdash-root`（内含 job 名 + 创建时间）。
-- job 配置加 `require_marker = true`（**新 job 默认开**，老 job 兼容默认关，一个 release 后翻转）。
-- `scan` 阶段就检查：root 存在 + marker 存在 + root 非空（三选一失败就拒绝出表，而不是出一张空表）。
-- 额外护栏（syncthing 没有，但我们的显式模型很适合）：**计划体检**——
-  单次计划里 `delete` 数量 > target 总条目数的 N%（默认 50%）时，`run` 拒绝 `--apply`，要求 `--i-know`。
-  这条比 marker 更普适，能顺带拦住过滤器写错、路径打错。
+**syncthing**: every write goes to `.syncthing.tmp.<name>` first, then `Sync()` → `Rename()` to the final
+name on Close (`lib/osutil/atomic.go:19,45-90`; the temp name is generated by `fs.TempName`, skipped
+during scanning by `fs.IsTemporary`, and cleaned automatically once it exceeds `TempLifetime` —
+`lib/scanner/walk.go:314-320`).
 
-**验收**：测试 —— target 指向空目录且无 marker 时，mirror compare 返回错误而非 delete 计划。
+**SyncDash**: [src/apply.rs:140](src/apply.rs:140) calls `std::fs::copy(&src, &dst)` straight into the
+final path.
 
----
+**The concrete bad ending** (not a theoretical risk — large files getting interrupted over SMB is
+routine):
 
-#### P0-3. 没有磁盘空间预检
+> sync mode + archive. `a.psd` on target is being Updated: the old version has already gone to trash
+> (recoverable), and the new version is half-written when the network drops → target is left with a
+> truncated file whose mtime is new.
+> Next compare round: source is unchanged against archive (`s_unchanged=true`), target has changed
+> against archive (`t_unchanged=false`)
+> → takes the `"target-changed"` branch at [src/compare.rs:352](src/compare.rs:352)
+> → **emits `Update source` — writing the truncated file back over source**.
+> The good file on the source side is gone (target's old version is still in trash, but nobody would
+> think to look there).
 
-**syncthing**：`CheckAvailableSpace(req uint64)`（`lib/config/folderconfiguration.go:360-375`），
-默认 `MinDiskFree = "1 %"`（`:63`）；处理待拉取文件前查一次（`lib/model/folder_sendrecv.go:495`），
-versioner 归档前再查一次（`:1052`）。
+**The fix**:
+- Add `write_atomic(src, dst, mtime, expect_hash)` to `apply.rs`:
+  write `<dir>/.syncdash.tmp.<basename>.<pid>` → (when verifying, check the hash on the temp) →
+  `set_mtime` → `fs::rename` over the target.
+- Same-volume rename is atomic; cross-volume cannot happen (temp sits in the same directory as dst).
+- Add `.syncdash.tmp.*` to `filter.rs`'s built-in excludes so temp files are not scanned into the
+  snapshot table.
+- When scanning, delete any `.syncdash.tmp.*` older than 24h on the spot (matching syncthing's
+  `TempLifetime`).
+- `pack`'s staging is already "verify everything before touching target", but its final write to disk
+  must go through the atomic write as well.
 
-**SyncDash**：`grep -rn "free_space\|disk" src/` 无结果。计划里明明已经有每个 op 的 `size`，
-汇总一下就知道要写多少字节，却从不检查。写满目标盘的后果在 SMB 上尤其难看（对面系统盘写满）。
-
-**怎么改**：
-- 依赖 `sysinfo` 或 `fs2`（或 Windows `GetDiskFreeSpaceExW` / unix `statvfs` 各写十行，免依赖）。
-- `apply` 开始前：`需要字节 = Σ(copy/update 的 size)`，加 10% 余量 + `min_free`（默认 1%，job 可配）。
-- 不足 → 直接拒绝，报"需要 X，可用 Y，缺 Z"。
-- trash 也要算：Update/Delete 会先把旧文件挪进 trash，同卷 rename 不占空间，跨卷会。
-
----
-
-#### P0-4. 目录删不掉时静默吞掉
-
-**syncthing**：`deleteDirOnDiskHandleChildren`（`lib/model/folder_sendrecv.go:1985-2085`）
-把"删不掉"细分成四种并**分别报错**：`errDirHasToBeScanned`（有 db 不认识的东西 → 排一次扫描）、
-`errDirHasIgnored`（里面有被忽略的文件 → 永远删不掉，必须用户处理）、
-`errDirNotEmpty`（有 db 认识且合法的文件 → 状态不一致，值得警惕）、
-以及只删 `(?d)` 标记的可删除项与临时文件。
-
-**SyncDash**：[src/apply.rs:187](src/apply.rs:187) —— `Err(_) => Ok(())`，注释写着
-"非空（里面还有被排除的文件等）：保留，不视为错误"。**行为是安全的，但用户永远不知道发生了什么**：
-mirror 跑完显示 0 错误，可对面那个目录还在，下次比对又出现同一条 DeleteDir，永远收敛不了。
-
-**怎么改**：
-- 不改删除策略（继续不递归删，这是对的），改**汇报**：
-  区分 `NotFound`（真删了/本来就没有 → 静默）、`DirectoryNotEmpty`（列出前 5 个残留项名字，计入 skipped 并打印原因）、其他错误（计入 errors）。
-- 残留项如果全部命中当前 job 的 exclude → 提示"被过滤器保护，这是预期行为，可用 `--prune-excluded` 一并清理"。
-- 收敛性：`run` 结尾的自动复比对如果发现同一条 DeleteDir 再次出现，明确标注"上轮未能删除"。
+**Acceptance**: a new test — simulate a half-written failure (inject a failing writer) and assert that
+dst is either the old content or absent, never a truncated file.
 
 ---
 
-### P1 —— 高价值能力，值得排进 v0.6 / v0.7
+#### P0-2. An unmounted share = a plan that deletes everything on the other side (**catastrophic misjudgment**)
 
-#### P1-1. 块级传输（delta sync）—— 最大的性能杠杆
+**syncthing**: every folder root must contain the marker directory `.stfolder` (`DefaultMarkerName`,
+`lib/config/folderconfiguration.go:37,160-196`); `CheckPath` verifies it exists at `:236`, and if it is
+missing the folder is put into an error state and **any sync is refused**. The only reason this rule
+exists is to guard against "the mount point isn't mounted".
 
-**syncthing**：文件切成块，每块单独 SHA-256（`lib/scanner/blocks.go:42-120`）。
-块大小自适应：从 128 KiB 起翻倍到 16 MiB，目标是每文件约 `DesiredPerFileBlocks` 块
-（`lib/protocol/bep_fileinfo.go:92-102,402-412`）。
-拉取时先 `blockDiff` 算出"我已经有哪些块"，只传缺的（`folder_sendrecv.go:1132-1250`）；
-还会从**同机的其它 folder** 里找相同块直接本地复制（`copyBlockFromFolder:1435`），
-以及从上次没传完的临时文件里捡剩块（`reuseBlocks:1173-1250`）。
+**SyncDash**: no equivalent check at all. With `target = '\\192.168.0.115\xuanbomiao\...'`, that path
+may be an empty directory when the Mac is powered off or SMB drops (or be auto-created locally) →
+mirror-mode compare produces "copy everything over" (tens of GB transferred for nothing), and the
+reverse job produces "delete everything on target". `run --apply` will do exactly that.
 
-**SyncDash**：整文件复制。改一个 40 GB VM 镜像的一个扇区 → 传 40 GB。
-README 里 rsync 算法被列进"v2 备选"，但块级 hash 其实比 rsync 的滚动校验简单得多，
-而且**我们已经在扫描时读全文件算 blake3 了 —— 顺手切块几乎零额外成本**。
+**The fix**:
+- Reuse the existing `.ffs-sync` territory-marker concept ([src/territory.rs:11](src/territory.rs:11)),
+  adding `syncdash mark <root>` to write `.syncdash-root` (containing the job name + creation time).
+- Add `require_marker = true` to the job config (**on by default for new jobs**, off by default for old
+  jobs for compatibility, flipped one release later).
+- Check at the `scan` stage: root exists + marker exists + root is non-empty (if any of the three fails,
+  refuse to emit a table rather than emitting an empty one).
+- Extra guardrail (syncthing has none, but our explicit model suits it well): **plan health check** —
+  when a single plan's `delete` count exceeds N% (default 50%) of target's total entries, `run` refuses
+  `--apply` and requires `--i-know`.
+  This is more general than the marker and incidentally catches mis-written filters and mistyped paths.
 
-**怎么改**（分两步，第一步就能吃到大部分收益）：
-
-- **步骤 A（v0.6）：块清单进表**
-  - `Entry` 加两个可选字段：`bs`（块大小）、`bh`（`Vec<String>`，块 hash 列表）。
-    只对 `size >= 8 MiB` 的文件产出，避免小文件把表撑爆。
-  - 块大小自适应照抄 syncthing 的思路：`128 KiB` 起翻倍，目标每文件 ≤ 2000 块。
-  - **表体积问题**：一个 40 GB 文件按 16 MiB 块 = 2560 个 hash × 64 hex ≈ 164 KB。
-    对策：块清单**不进主表**，另存 sidecar `<table>.blocks.jsonl`（一行一个文件的块清单），
-    主表只留 `bh_ref`（sidecar 里的行号）+ `blocks_hash`（整个块列表的 blake3，用于快速判等）。
-    ssh 管道场景不需要 sidecar 时可 `--no-blocks` 关掉。
-  - hash 缓存（`scan.rs:56-90`）跟着扩展：缓存行加块清单，`(path,size,mtime)` 未变则整份复用。
-
-- **步骤 B（v0.7）：apply / pack 用上块**
-  - 本地/挂载盘：`Update` 时打开 dst，逐块比对 —— 相同则跳过，不同则 seek+写。
-    配合 P0-1 的原子写：先把 dst 复制成 temp（或用 `CopyFileRange`/`copy_file_range`/`FSCTL_DUPLICATE_EXTENTS`，
-    syncthing 的 `lib/fs/basicfs_copy_range*.go` 有全平台实现清单可参照），在 temp 上打补丁，再 rename。
-  - `pack`：payload 只装差异块 + 块偏移清单，包体积可能缩小一到两个数量级。
-    manifest 加 `base_blocks_hash`，对端 apply 前先验"我这边的基线确实是你以为的那份"，不匹配就退回整文件。
-  - 统计口径抄 syncthing 的 `blockStats`（total / reused / renamed / pulled），
-    GUI 上直接显示"实传 X MB / 逻辑 Y MB"。
-
-**验收**：40 GB 文件改 1 MB → 实传 < 32 MB；块清单 sidecar 让主表体积增长 < 5%。
+**Acceptance**: a test — when target points at an empty directory with no marker, mirror compare returns
+an error rather than a delete plan.
 
 ---
 
-#### P1-2. 冲突副本：让 sync 能自己往前走
+#### P0-3. No disk space preflight
 
-**syncthing**：冲突时不停在原地。败方被改名成
-`name.sync-conflict-20060102-150405-<DEVICEID>.ext`（`folder_sendrecv.go:2219-2222`），
-胜方正常落地。`WinsConflict`（`bep_fileinfo.go:212-229`）的仲裁顺序是：
-非 invalid > mtime 新 > 版本向量的 device id 做 tie-break。
-`MaxConflicts` 限制每个文件保留几份，超了删最老的（`:1888-1898`）；
-已经是冲突副本的文件不再产生冲突副本（`:1863`）。
+**syncthing**: `CheckAvailableSpace(req uint64)` (`lib/config/folderconfiguration.go:360-375`), with a
+default of `MinDiskFree = "1 %"` (`:63`); it checks once before processing files pending pull
+(`lib/model/folder_sendrecv.go:495`) and again before the versioner archives (`:1052`).
 
-**SyncDash**：冲突只报告（[src/compare.rs:356](src/compare.rs:356) 等），GUI 里锁定不可勾选。
-安全，但**双机日常使用时一个冲突会卡住这个文件直到人工干预**，而人往往不干预。
+**SyncDash**: `grep -rn "free_space\|disk" src/` returns nothing. The plan already carries a `size` for
+every op — summing them tells you exactly how many bytes will be written — yet it is never checked.
+Filling up the target disk looks especially bad over SMB (you fill the other machine's system drive).
 
-**怎么改**：
-- job 加 `on_conflict = "report" | "copy" | "newer"`，**默认仍是 `report`**（不改现有语义）。
-- `"copy"`：compare 产出两条 op —— 先 `Move` 败方到 `name.sync-conflict-<YYYYMMDD-HHMMSS>-<host>.ext`，
-  再 `Copy` 胜方过去。仲裁规则照抄 syncthing：mtime 新者胜，相同则 host 名字典序（我们没有 device id，用 hostname 做稳定 tie-break）。
-- 冲突副本本身要进内置排除的"不参与移动检测"名单（否则会被 detect_moves 配成 move）。
-- `max_conflicts`（默认 5，-1 = 不限，0 = 关）+ 清理最老的。
-- GUI：冲突行加一个"生成副本"按钮，等价于逐行开启一次。
-
----
-
-#### P1-3. 冲突误报太多 —— 借 `PreviousBlocksHash` 的思路
-
-**syncthing**：版本向量并发 **≠** 一定冲突。`InConflictWith`（`bep_fileinfo.go:190-208`）里有个漂亮的逃生口：
-如果新文件的 `PreviousBlocksHash` 等于我本地当前的 `BlocksHash`，
-说明**对方就是基于我这份内容改的**，不是并发修改，直接放行。
-（这正是 README 引用的 [PR#10351](https://github.com/syncthing/syncthing/pull/10351) 的改进。）
-
-**SyncDash**：archive 模型下，只要两侧都与 archive 不同就报 `both-changed`
-（[src/compare.rs:356](src/compare.rs:356)）。但有一类常见情形被误伤：
-**A 侧改了，同步过去了，但 archive 刷新失败（比如中途 Ctrl-C）** →
-下轮两侧内容其实相同…… 这个 `files_equal` 已经挡住了。
-真正被误伤的是：**A 改了 → 传到 B → B 又基于这份改了 → archive 还停在两代之前** → 报 both-changed，
-而其实是一条干净的线性历史。
-
-**怎么改**：
-- archive 表升级为**多代**：`archive.jsonl` 保留最近 K 代（默认 3）的条目 hash 集合（只存 `path → [hash]`，很小）。
-- 判定放宽：若 target 当前 hash 出现在该 path 的历史 hash 集合里 → target 只是"落在某个历史版本上"，不算并发改 → 单边传播而非冲突。
-- 这是 archive 模型下对版本向量的**廉价近似**，不需要引入 device id，成本极低。
-- 与 P2-1（真版本向量）不冲突，是它的前置台阶。
+**The fix**:
+- Depend on `sysinfo` or `fs2` (or write ten lines each for Windows `GetDiskFreeSpaceExW` / unix
+  `statvfs` and avoid the dependency).
+- Before `apply` starts: `bytes needed = Σ(size of copy/update)`, plus 10% headroom + `min_free`
+  (default 1%, configurable per job).
+- Not enough → refuse outright and report "need X, Y available, short by Z".
+- Trash counts too: Update/Delete move the old file into trash first — a same-volume rename takes no
+  space, a cross-volume one does.
 
 ---
 
-#### P1-4. mtime 精度：写完要回读
+#### P0-4. Undeletable directories are swallowed silently
 
-**syncthing**：`mtimeFS.Chtimes`（`lib/fs/mtimefs.go:68-80+`）设完时间后**立刻 stat 回来**，
-把 `(ondisk, virtual)` 一起存进 db，之后对外一律报 virtual。
-这样 FAT（2 秒粒度）、exFAT、某些 SMB 服务端的时间截断就完全不影响判等。
-比较时另有 `ModTimeWindow` 作为兜底（`bep_fileinfo.go:455`）。
+**syncthing**: `deleteDirOnDiskHandleChildren` (`lib/model/folder_sendrecv.go:1985-2085`) breaks "cannot
+delete" into four cases and **reports each separately**: `errDirHasToBeScanned` (something the db does
+not know about → queue a scan), `errDirHasIgnored` (ignored files inside → can never be deleted, the
+user must handle it), `errDirNotEmpty` (files the db knows and considers legitimate → inconsistent
+state, worth worrying about), plus deleting only the `(?d)`-marked deletable items and temp files.
 
-**SyncDash**：[src/apply.rs:49](src/apply.rs:49) `set_mtime` 后不回读，
-靠 [src/compare.rs:22](src/compare.rs:22) 的 `MTIME_SLACK_MS = 2000` 硬容差。
-在 standard/paranoid 级别有 hash 兜底所以问题不大，但 **`rigor = "quick"`（不 hash）时容差就是唯一判据**：
-2 秒容差既可能漏判（真改动在 2 秒内）也可能误判（SMB 偏移 > 2 秒）。
+**SyncDash**: [src/apply.rs:187](src/apply.rs:187) — `Err(_) => Ok(())`, with a comment reading
+"non-empty (excluded files still inside, etc.): keep it, not treated as an error". **The behavior is
+safe, but the user never learns what happened**: mirror finishes reporting 0 errors, yet that directory
+on the other side is still there, the same DeleteDir shows up again on the next compare, and it never
+converges.
 
-**怎么改**：
-- 复制后 `set_mtime` → `metadata()` 回读 → 若不等，把 `(ondisk, intended)` 记进
-  hash 缓存文件（已有的 `hashcache/*.jsonl` 加两列即可，不需要新数据库）。
-- 下次 scan 读到某文件 mtime 恰等于缓存里的 `ondisk` → 对外报 `intended`。
-- 容差保留做兜底，但可以收窄到 1s，并允许 job 配 `mtime_window`（FAT 卷设 2s，NTFS↔APFS 设 0）。
-
----
-
-#### P1-5. 过滤器加 `!` 取反
-
-**syncthing**：单一 `.stignore` 文件，前缀修饰 `!`（取反/白名单）、`(?i)`（大小写不敏感）、
-`(?d)`（该项可被删除，删父目录时不算阻塞）、`#include`（引入另一个文件）
-（`lib/ignore/ignore.go:359-400,500-560`）。规则**从上到下首个命中生效**。
-
-**SyncDash**：[src/filter.rs](src/filter.rs) 是 FFS 语义的 include/exclude 两张单。
-兼容 FFS 是个真实优势（FFS 的排除列表能原句粘过来），不该丢。
-但"排除 `*.log` **但保留** `deploy/important.log`"这类需求，两张单表达起来很别扭。
-
-**怎么改**：
-- 在 exclude 列表里支持 `!` 前缀作为**例外**（命中 `!` 规则的路径直接放行，不再看后续 exclude）。
-  这是 FFS 语法的超集，粘过来的 FFS 规则行为完全不变。
-- 借 `(?d)` 的语义：加一类 `deletable = ['*/node_modules/']`——被它命中的东西
-  不参与同步，但删父目录时**允许连带删掉**（直接解掉 P0-4 里"目录永远删不掉"的死结）。
-- `#include` 暂不做（我们的配置是 TOML，可以直接用数组拼接）。
+**The fix**:
+- Do not change the deletion policy (keep not recursing — that is correct); change the **reporting**:
+  distinguish `NotFound` (really deleted / never there → silent), `DirectoryNotEmpty` (list the first 5
+  leftover item names, count as skipped, and print the reason), and other errors (count as errors).
+- If every leftover item matches the current job's excludes → say "protected by the filter, this is
+  expected behavior; use `--prune-excluded` to clear them along with it".
+- Convergence: if the automatic re-compare at the end of `run` finds the same DeleteDir appearing again,
+  label it explicitly as "could not be deleted last round".
 
 ---
 
-### P2 —— 有价值但成本高或收益局部
+### P1 — high-value capabilities, worth scheduling into v0.6 / v0.7
 
-#### P2-1. 真 N 向：版本向量
+#### P1-1. Block-level transfer (delta sync) — the biggest performance lever
 
-**syncthing**：`lib/protocol/vector.go` 全文 300 行，实现干净得可以直接当教科书：
-- `Counter{ID: ShortID, Value: u64}`，按 ID 有序数组（不是 map，比较时双指针线性扫）。
-- `Update`：`value = max(old+1, unix_now)` —— 用时间戳保证即使计数器被回滚也单调。
-- `Compare` 返回五态 `Equal / Greater / Lesser / ConcurrentGreater / ConcurrentLesser`
-  （后两个不是真的"并发大小"，只是为了给排序一个稳定序）。
+**syncthing**: files are split into blocks, each hashed separately with SHA-256
+(`lib/scanner/blocks.go:42-120`). Block size adapts: starting at 128 KiB and doubling to 16 MiB, aiming
+for roughly `DesiredPerFileBlocks` blocks per file (`lib/protocol/bep_fileinfo.go:92-102,402-412`).
+On pull it first runs `blockDiff` to work out "which blocks I already have" and transfers only what is
+missing (`folder_sendrecv.go:1132-1250`); it also looks for identical blocks in **other folders on the
+same machine** and copies them locally (`copyBlockFromFolder:1435`), and picks up leftover blocks from
+temp files left by an unfinished transfer (`reuseBlocks:1173-1250`).
 
-**移植到 SyncDash 的代价**（这才是关键）：
-- 需要稳定的节点 ID（可以是 `hostname + 首次运行时生成的 UUID`，存本机配置）。
-- archive 要从"上次快照"升级成"带版本向量的索引库"——每个 path 一行 `(hash, size, mtime, version_vector)`。
-  仍然可以是 JSONL（保持可读可审计），但语义变了：它不再是"某次扫描的快照"，而是"我所知的全局状态"。
-- 每次成功 apply 后要更新向量，**且要区分"我改的"和"我从别人那儿收的"**（前者 `Update(me)`，后者 `Merge(peer)`）。
-- N 个节点两两比对会退化成 O(N²)；syncthing 靠 P2P gossip 解决，我们靠 hub-and-spoke 也够。
+**SyncDash**: whole-file copying. Change one sector of a 40 GB VM image → transfer 40 GB.
+The README lists the rsync algorithm as a "v2 candidate", but block-level hashing is far simpler than
+rsync's rolling checksum, and **we already read the whole file to compute blake3 during scanning —
+splitting it into blocks costs almost nothing extra**.
 
-**结论**：这是 v1.0 级别的改造，**不该在 v0.6/v0.7 做**。
-README 的判断（hub-and-spoke 先够用）是对的。真要做时，`vector.go` 的语义可以 1:1 用 Rust 重写，
-大约 200 行 + 一套 property test（`Compare` 的自反/对称/传递性质很适合 proptest）。
-前置台阶是 P1-3 的多代 archive。
+**The fix** (two steps; step one alone captures most of the benefit):
 
----
+- **Step A (v0.6): the block list goes into the table**
+  - `Entry` gains two optional fields: `bs` (block size) and `bh` (`Vec<String>`, the list of block
+    hashes). Produced only for files with `size >= 8 MiB`, to keep small files from blowing up the table.
+  - Adaptive block size follows syncthing's approach: start at `128 KiB` and double, targeting ≤ 2000
+    blocks per file.
+  - **Table size problem**: a 40 GB file at 16 MiB blocks = 2560 hashes × 64 hex ≈ 164 KB.
+    Countermeasure: the block list **does not go in the main table**; store it in the sidecar
+    `<table>.blocks.jsonl` (one line per file's block list), keeping only `bh_ref` (the line number in
+    the sidecar) + `blocks_hash` (blake3 of the whole block list, for fast equality checks) in the main
+    table. When the ssh pipe scenario does not need the sidecar, `--no-blocks` turns it off.
+  - The hash cache (`scan.rs:56-90`) extends along with it: cache lines gain the block list, and if
+    `(path,size,mtime)` is unchanged the whole thing is reused.
 
-#### P2-2. 回收站会无限膨胀
+- **Step B (v0.7): apply / pack put the blocks to use**
+  - Local/mounted drives: on `Update`, open dst and compare block by block — skip identical blocks,
+    seek+write the differing ones. Combined with P0-1's atomic write: first copy dst to a temp (or use
+    `CopyFileRange`/`copy_file_range`/`FSCTL_DUPLICATE_EXTENTS`; syncthing's
+    `lib/fs/basicfs_copy_range*.go` has a cross-platform inventory to reference), patch the temp, then
+    rename.
+  - `pack`: the payload carries only differing blocks plus a block-offset list, so pack size may shrink
+    by one to two orders of magnitude. The manifest gains `base_blocks_hash` so the far end can verify
+    "my baseline really is the one you think it is" before applying, falling back to the whole file on
+    mismatch.
+  - Copy syncthing's `blockStats` accounting (total / reused / renamed / pulled) and show "actually
+    transferred X MB / logically Y MB" directly in the GUI.
 
-**syncthing**：三种 versioner。`trashcan` 按 `cleanoutDays` 清理过期
-（`lib/versioner/trashcan.go:57-100`）；`staggered` 做**分级稀释**
-（`lib/versioner/staggered.go:47-53,63-110`）——
-第一小时每 30 秒留一份、当天每小时一份、30 天内每天一份、之后每周一份，直到 `maxAge`；
-`simple` 按份数保留。删完还会清空目录（`empty_dir_tracker.go`）。
-
-**SyncDash**：[src/apply.rs:27](src/apply.rs:27) —— `trash/<时间戳>/`，**从不清理**。
-每次 apply 一个新目录。日常跑几个月后 `%LOCALAPPDATA%\syncdash\trash\` 会很可观，
-而且几百个时间戳目录里找一个文件基本靠运气。
-
-**怎么改**：
-- job / 全局配置加 `trash_keep_days`（默认 30）、`trash_max_bytes`（默认 10 GiB）。
-- `syncdash trash list|restore|prune` 三个子命令：
-  `list <path-glob>` 跨所有时间戳目录找同一个文件的历史版本（这才是回收站的正确用法）；
-  `restore <path> [--at <ts>]`；`prune` 按上面两个上限清理，顺手删空目录。
-- `run` 结束时机会性调用一次 prune（syncthing 是定时器驱动，我们没有常驻进程，就搭在 run 上）。
-- `staggered` 的稀释算法值得直接照搬语义 —— 它比"保留 N 天"聪明得多，且实现只有 40 行。
-
----
-
-#### P2-3. 大小写不敏感 FS 的写入保护
-
-**syncthing**：`caseFilesystem` 在写入前解析目录里的真实拼写，
-发现 `Foo.txt` 与已存在的 `foo.txt` 只差大小写 → 返回 `CaseConflictError`
-（`lib/fs/casefs.go:27-37`），带 1 秒 TTL 的 LRU 目录名缓存避免每次 readdir。
-
-**SyncDash**：**比对阶段**做了大小写折叠（[src/compare.rs:121](src/compare.rs:121)，做得对），
-但 **apply 阶段**没有防护：`case_sensitive = true` 的 job 在 NTFS 上执行
-"复制 `Foo.txt`"时会静默覆盖已存在的 `foo.txt`。属于自找的边角，但确实是静默数据丢失。
-
-**怎么改**：apply 创建新文件前，若执行侧 FS 大小写不敏感（可探测：在 root 建个临时文件再用变体大小写 stat）
-且计划里同目录存在只差大小写的另一路径 → 转成 Conflict。
-成本低，加在 P0-2 的"计划体检"里一起做。
+**Acceptance**: change 1 MB in a 40 GB file → less than 32 MB actually transferred; the block-list
+sidecar keeps main-table growth under 5%.
 
 ---
 
-#### P2-4. 元数据变更没有对应的 op
+#### P1-2. Conflict copies: let sync move forward on its own
 
-**syncthing**：`shortcutFile`（`folder_sendrecv.go:1253`）——
-只有权限/mtime 变化时不传内容，只改元数据。
-`FileInfoComparison`（`bep_fileinfo.go:454-462`）允许按需忽略 perms / xattr / ownership / blocks，
-每个维度都能独立开关。
+**syncthing**: a conflict does not stall in place. The loser is renamed to
+`name.sync-conflict-20060102-150405-<DEVICEID>.ext` (`folder_sendrecv.go:2219-2222`) and the winner
+lands normally. `WinsConflict`'s (`bep_fileinfo.go:212-229`) arbitration order is: not-invalid > newer
+mtime > device id from the version vector as tie-break.
+`MaxConflicts` caps how many copies are kept per file, deleting the oldest past the cap (`:1888-1898`);
+a file that is already a conflict copy does not spawn further conflict copies (`:1863`).
 
-**SyncDash**：[src/table.rs:44](src/table.rs:44) 记了 `mode`，但
-[src/compare.rs:126](src/compare.rs:126) 的 `files_equal` 只看 hash / size / mtime —— **`mode` 记而不用**。
-Mac 上给脚本加了 exec 位，同步过去还是没有。
-（`pack` 路径会恢复 mode，挂载盘路径不会 —— 行为不一致。）
+**SyncDash**: conflicts are only reported ([src/compare.rs:356](src/compare.rs:356) and elsewhere), and
+the GUI locks the row so it cannot be checked. Safe — but **in daily two-machine use one conflict stalls
+that file until a human intervenes**, and humans often do not.
 
-**怎么改**：
-- 新增 `Action::Chmod`（携带目标 mode），仅当两侧都是 unix 且 `sync_mode = true` 时产出。
-- job 加 `sync_mode = false`（默认关，因为 Win↔Mac 场景下 Windows 侧没有 mode，开了会一直报差异）。
-- 两侧 OS 都是 unix 时可默认开。
-- 同时统一 pack 与直连两条路径的 mode 行为。
-
----
-
-#### P2-5. 空文件/同内容文件的移动配对是任意的
-
-**syncthing**：`findRename`（`lib/model/folder.go:930-932`）**第一件事就是**
-`if len(file.Blocks) == 0 || file.Size == 0 { return false }` —— 空文件不参与重命名归因。
-
-**SyncDash**：[src/compare.rs:183](src/compare.rs:183) 的 `detect_moves` 按 `(hash, size)` 建桶。
-所有空文件 size=0、blake3 相同 → 挤进同一个桶；仓库里大量相同的 `__init__.py`、`LICENSE`、`.gitkeep` 同理。
-配对结果**内容上仍然正确**（收敛没问题），但 `from` 字段是任意挑的，
-"rename-detected-by-hash" 这个 reason 就成了噪音——而计划的可读性正是 SyncDash 的立身之本。
-
-**怎么改**：桶内候选 > 1 时，若 `size == 0` 直接放弃配对（退回 copy+delete）；
-非空但多候选时，现有的"同父目录 → 同文件名 → 任意"三级优先已经够，只是要在 reason 里
-如实写成 `move-detected-by-hash (ambiguous: N candidates)`，不要假装确定。
+**The fix**:
+- Add `on_conflict = "report" | "copy" | "newer"` to the job, with **`report` still the default** (no
+  change to existing semantics).
+- `"copy"`: compare emits two ops — first `Move` the loser to
+  `name.sync-conflict-<YYYYMMDD-HHMMSS>-<host>.ext`, then `Copy` the winner over. Arbitration follows
+  syncthing: newer mtime wins, and on a tie the host name breaks it lexicographically (we have no device
+  id, so hostname is the stable tie-break).
+- Conflict copies themselves need to go on the built-in "excluded from move detection" list (otherwise
+  detect_moves will pair them as moves).
+- `max_conflicts` (default 5, -1 = unlimited, 0 = off) + cleaning up the oldest.
+- GUI: add a "make copy" button on conflict rows, equivalent to enabling it once for that row.
 
 ---
 
-#### P2-6. 扫描进度
+#### P1-3. Too many false-positive conflicts — borrow the `PreviousBlocksHash` idea
 
-**syncthing**：`ProgressTicker` + `byteCounter`，定期发 `FolderScanProgress` 事件，
-带 current/total 字节与 MiB/s（`lib/scanner/walk.go:55-62,148-200`）。
+**syncthing**: concurrent version vectors **≠** a guaranteed conflict. `InConflictWith`
+(`bep_fileinfo.go:190-208`) has a neat escape hatch: if the incoming file's `PreviousBlocksHash` equals
+my current local `BlocksHash`, then **the other side edited exactly the content I have** — that is not a
+concurrent modification, so let it through.
+(This is precisely the improvement in [PR#10351](https://github.com/syncthing/syncthing/pull/10351),
+cited in the README.)
 
-**SyncDash**：Tauri 前端有"扫描 source → 扫描 target → 比对中"三段状态，但没有百分比/速率。
-大树（几十 GB）扫描时用户不知道是卡了还是在跑。
+**SyncDash**: under the archive model, anything that differs from archive on both sides is reported as
+`both-changed` ([src/compare.rs:356](src/compare.rs:356)). But one common situation gets caught in the
+crossfire: **side A edits, it propagates across, but the archive refresh fails (say, a mid-run Ctrl-C)**
+→ next round the two sides actually hold the same content… which `files_equal` already blocks.
+The real casualty is: **A edits → propagates to B → B edits again on top of that → archive is still two
+generations back** → reported as both-changed, when it is in fact a clean linear history.
 
-**怎么改**：`scan()` 加可选 `progress: Option<&dyn Fn(ScanProgress)>`；
-阶段 1 遍历完就知道总字节数，阶段 2 的 rayon 并行哈希里用 `AtomicU64` 累加已哈希字节，
-每 500 ms 回调一次。Tauri 侧接到事件更新进度条 —— 前端已有事件通道，改动很小。
+**The fix**:
+- Upgrade the archive table to **multi-generation**: `archive.jsonl` keeps the entry hash set for the
+  last K generations (default 3) (storing only `path → [hash]`, which is tiny).
+- Relax the ruling: if target's current hash appears in that path's historical hash set → target is
+  merely "sitting on some historical version", not a concurrent edit → one-way propagation instead of a
+  conflict.
+- This is a **cheap approximation** of version vectors under the archive model; it needs no device id
+  and costs almost nothing.
+- It does not conflict with P2-1 (true version vectors) — it is the step leading up to it.
 
 ---
 
-### 明确**不抄**的
+#### P1-4. mtime precision: read back after writing
 
-| syncthing 的东西 | 为什么不抄 |
+**syncthing**: `mtimeFS.Chtimes` (`lib/fs/mtimefs.go:68-80+`) **stats the file straight back** after
+setting the time, stores `(ondisk, virtual)` together in the db, and thereafter always reports virtual
+to the outside. That way timestamp truncation on FAT (2-second granularity), exFAT, and certain SMB
+servers has no effect on equality rulings. Comparison additionally has `ModTimeWindow` as a backstop
+(`bep_fileinfo.go:455`).
+
+**SyncDash**: [src/apply.rs:49](src/apply.rs:49) does not read back after `set_mtime`, relying on the
+hard-coded `MTIME_SLACK_MS = 2000` tolerance at [src/compare.rs:22](src/compare.rs:22).
+At the standard/paranoid levels the hash is a backstop so it hardly matters, but **at
+`rigor = "quick"` (no hashing) the tolerance is the only criterion**: a 2-second tolerance can both miss
+real changes (a genuine edit within 2 seconds) and produce false ones (SMB offset > 2 seconds).
+
+**The fix**:
+- After copying, `set_mtime` → read back with `metadata()` → if they differ, record `(ondisk, intended)`
+  in the hash cache file (two extra columns in the existing `hashcache/*.jsonl` will do; no new database
+  needed).
+- On the next scan, if a file's mtime exactly equals the cached `ondisk` → report `intended` to the
+  outside.
+- Keep the tolerance as a backstop, but it can narrow to 1s, and let jobs configure `mtime_window` (2s
+  for FAT volumes, 0 for NTFS↔APFS).
+
+---
+
+#### P1-5. Add `!` negation to filters
+
+**syncthing**: a single `.stignore` file with prefix modifiers `!` (negation/allowlist), `(?i)`
+(case-insensitive), `(?d)` (this item may be deleted and does not block deleting the parent directory),
+and `#include` (pull in another file) (`lib/ignore/ignore.go:359-400,500-560`). Rules are evaluated
+**top to bottom, first match wins**.
+
+**SyncDash**: [src/filter.rs](src/filter.rs) is two FFS-semantics lists, include and exclude.
+FFS compatibility is a genuine advantage (an FFS exclude list can be pasted in verbatim) and should not
+be dropped. But a requirement like "exclude `*.log` **but keep** `deploy/important.log`" is awkward to
+express with two lists.
+
+**The fix**:
+- Support a `!` prefix in the exclude list as an **exception** (a path matching a `!` rule passes
+  straight through, ignoring any later exclude). This is a superset of FFS syntax, so pasted FFS rules
+  behave exactly as before.
+- Borrow `(?d)`'s semantics: add a `deletable = ['*/node_modules/']` category — matched items do not
+  participate in sync, but **may be deleted along with** the parent directory (which directly unties the
+  "directory can never be deleted" knot from P0-4).
+- `#include` is out of scope for now (our config is TOML, so arrays can just be concatenated).
+
+---
+
+### P2 — valuable, but expensive or narrow in payoff
+
+#### P2-1. True N-way: version vectors
+
+**syncthing**: `lib/protocol/vector.go` is 300 lines in total, clean enough to serve as a textbook
+implementation:
+- `Counter{ID: ShortID, Value: u64}`, held in an array ordered by ID (not a map; comparison is a
+  two-pointer linear scan).
+- `Update`: `value = max(old+1, unix_now)` — the timestamp guarantees monotonicity even if the counter
+  is rolled back.
+- `Compare` returns five states: `Equal / Greater / Lesser / ConcurrentGreater / ConcurrentLesser`
+  (the last two are not really "concurrent magnitude"; they exist only to give sorting a stable order).
+
+**The cost of porting it to SyncDash** (this is the crux):
+- A stable node ID is needed (could be `hostname + a UUID generated on first run`, stored in local
+  config).
+- The archive has to be upgraded from "last snapshot" to "an index carrying version vectors" — one line
+  per path, `(hash, size, mtime, version_vector)`. It can still be JSONL (staying readable and
+  auditable), but the semantics change: it is no longer "a snapshot of one scan" but "the global state
+  as I know it".
+- The vector must be updated after every successful apply, **and "I changed it" must be distinguished
+  from "I received it from someone else"** (`Update(me)` for the former, `Merge(peer)` for the latter).
+- Pairwise comparison across N nodes degenerates to O(N²); syncthing solves that with P2P gossip, and
+  hub-and-spoke is enough for us.
+
+**Conclusion**: this is a v1.0-scale change and **should not be done in v0.6/v0.7**.
+The README's judgment (hub-and-spoke is enough for now) is right. When it is actually done,
+`vector.go`'s semantics can be rewritten 1:1 in Rust — roughly 200 lines plus a property-test suite
+(`Compare`'s reflexivity/symmetry/transitivity properties suit proptest well). The step leading up to it
+is P1-3's multi-generation archive.
+
+---
+
+#### P2-2. Trash grows without bound
+
+**syncthing**: three versioners. `trashcan` cleans out expired entries by `cleanoutDays`
+(`lib/versioner/trashcan.go:57-100`); `staggered` does **tiered thinning**
+(`lib/versioner/staggered.go:47-53,63-110`) — one copy every 30 seconds for the first hour, one per hour
+for the rest of the day, one per day within 30 days, and one per week after that, up to `maxAge`;
+`simple` keeps a fixed number of copies. After deleting, it also empties the directory
+(`empty_dir_tracker.go`).
+
+**SyncDash**: [src/apply.rs:27](src/apply.rs:27) — `trash/<timestamp>/`, **never cleaned**. One new
+directory per apply. After a few months of daily runs `%LOCALAPPDATA%\syncdash\trash\` gets substantial,
+and finding one file among hundreds of timestamp directories is basically luck.
+
+**The fix**:
+- Add `trash_keep_days` (default 30) and `trash_max_bytes` (default 10 GiB) to the job / global config.
+- Three subcommands, `syncdash trash list|restore|prune`:
+  `list <path-glob>` finds the historical versions of one file across all timestamp directories (this is
+  what a trash can is actually for);
+  `restore <path> [--at <ts>]`; and `prune` cleans up against the two limits above, emptying directories
+  as it goes.
+- Call prune opportunistically once at the end of `run` (syncthing drives it from a timer; we have no
+  resident process, so it rides on run).
+- `staggered`'s thinning algorithm is worth copying semantically — it is far smarter than "keep N days",
+  and the implementation is only 40 lines.
+
+---
+
+#### P2-3. Write protection on case-insensitive filesystems
+
+**syncthing**: `caseFilesystem` resolves the real spelling in the directory before writing; if `Foo.txt`
+differs from an existing `foo.txt` only by case → it returns `CaseConflictError`
+(`lib/fs/casefs.go:27-37`), with a 1-second-TTL LRU directory-name cache to avoid a readdir every time.
+
+**SyncDash**: case folding is done **at compare time** ([src/compare.rs:121](src/compare.rs:121), and
+done correctly), but there is no protection **at apply time**: a job with `case_sensitive = true`
+running "copy `Foo.txt`" on NTFS silently overwrites the existing `foo.txt`. A self-inflicted corner
+case, but genuinely silent data loss.
+
+**The fix**: before apply creates a new file, if the executing side's filesystem is case-insensitive
+(detectable — create a temp file in root and stat it with different casing) and the plan contains another
+path in the same directory differing only by case → turn it into a Conflict.
+Cheap; fold it into P0-2's plan health check.
+
+---
+
+#### P2-4. Metadata changes have no corresponding op
+
+**syncthing**: `shortcutFile` (`folder_sendrecv.go:1253`) — when only permissions/mtime changed, it
+transfers no content and changes only the metadata.
+`FileInfoComparison` (`bep_fileinfo.go:454-462`) allows ignoring perms / xattr / ownership / blocks as
+needed, each dimension toggled independently.
+
+**SyncDash**: [src/table.rs:44](src/table.rs:44) records `mode`, but `files_equal` at
+[src/compare.rs:126](src/compare.rs:126) only looks at hash / size / mtime — **`mode` is recorded and
+never used**. Add the exec bit to a script on Mac and it still is not there after syncing.
+(The `pack` path restores mode, the mounted-drive path does not — inconsistent behavior.)
+
+**The fix**:
+- Add `Action::Chmod` (carrying the target mode), emitted only when both sides are unix and
+  `sync_mode = true`.
+- Add `sync_mode = false` to jobs (off by default, because in the Win↔Mac scenario the Windows side has
+  no mode and turning it on would report differences forever).
+- It can default to on when both operating systems are unix.
+- At the same time, unify mode behavior across the pack and direct paths.
+
+---
+
+#### P2-5. Move pairing for empty / identical-content files is arbitrary
+
+**syncthing**: **the very first thing** `findRename` (`lib/model/folder.go:930-932`) does is
+`if len(file.Blocks) == 0 || file.Size == 0 { return false }` — empty files do not participate in rename
+attribution.
+
+**SyncDash**: `detect_moves` at [src/compare.rs:183](src/compare.rs:183) buckets by `(hash, size)`.
+All empty files have size=0 and the same blake3 → they crowd into one bucket; the same goes for the many
+identical `__init__.py`, `LICENSE`, and `.gitkeep` files in a repo.
+The pairing result is **still correct content-wise** (convergence is fine), but the `from` field is
+picked arbitrarily, so the "rename-detected-by-hash" reason becomes noise — and plan readability is
+exactly what SyncDash stands on.
+
+**The fix**: when a bucket has more than one candidate, abandon pairing outright if `size == 0` (falling
+back to copy+delete); for non-empty files with multiple candidates the existing three-tier priority
+("same parent directory → same file name → arbitrary") is enough — it just has to state the truth in the
+reason as `move-detected-by-hash (ambiguous: N candidates)` instead of pretending to be certain.
+
+---
+
+#### P2-6. Scan progress
+
+**syncthing**: `ProgressTicker` + `byteCounter` periodically emit `FolderScanProgress` events carrying
+current/total bytes and MiB/s (`lib/scanner/walk.go:55-62,148-200`).
+
+**SyncDash**: the Tauri frontend has three states — "scanning source → scanning target → comparing" —
+but no percentage or rate. While scanning a large tree (tens of GB), the user cannot tell whether it is
+stuck or running.
+
+**The fix**: add an optional `progress: Option<&dyn Fn(ScanProgress)>` to `scan()`; phase 1 knows the
+total byte count once the walk finishes, and phase 2's rayon parallel hashing accumulates hashed bytes
+in an `AtomicU64`, calling back every 500 ms. The Tauri side updates the progress bar when it receives
+the event — the frontend already has an event channel, so the change is small.
+
+---
+
+### Explicitly **not** copied
+
+| What syncthing has | Why not copy it |
 |---|---|
-| BEP 协议 / TLS / 设备发现 / 中继 / NAT 穿透 | SyncDash 刻意走 ssh + SMB + tar 包。少一整个网络栈是特性不是缺陷 |
-| 常驻 daemon + Web UI + REST API | 已有 Tauri 桌面版；常驻会破坏"默认 dry-run、人点才动"的核心承诺 |
-| 索引数据库（sequence / LevelDB / SQLite） | JSONL 表可读、可 diff、可管道，是卖点。块清单用 sidecar 解决体积问题即可 |
-| 加密文件夹（`folder_recvenc.go`） | 无对应场景（内网 SMB + ssh） |
-| 文件系统监视（inotify / ReadDirectoryChangesW） | 见下 |
-| 只收文件夹的 `Revert`（`folder_recvonly.go:69`） | 我们的 mirror 模式 + 逐行翻方向已经覆盖同类需求 |
+| BEP protocol / TLS / device discovery / relay / NAT traversal | SyncDash deliberately goes through ssh + SMB + tar packs. Not having an entire network stack is a feature, not a defect |
+| Resident daemon + web UI + REST API | The Tauri desktop app already exists; a resident process would break the core promise of "dry-run by default, nothing moves until a human clicks" |
+| Index database (sequence / LevelDB / SQLite) | JSONL tables are readable, diffable, and pipeable — that is the selling point. The block-list size problem is solved with a sidecar |
+| Encrypted folders (`folder_recvenc.go`) | No matching scenario (LAN SMB + ssh) |
+| Filesystem watching (inotify / ReadDirectoryChangesW) | See below |
+| `Revert` for receive-only folders (`folder_recvonly.go:69`) | Our mirror mode + per-row direction flipping already covers the same need |
 
-**关于文件监视**：`lib/watchaggregator/aggregator.go` 的聚合策略很值得读
-（防抖、按目录合并、`maxFiles=512` / `maxFilesPerDir=128` 超了就退化为扫整个目录，`:21-25,193-260`）。
-但引入 watcher 意味着 SyncDash 变成常驻进程，与"显式触发、可预览"的定位冲突。
-**建议做法**：v0.8 加一个**可选**的 `syncdash run <job> --watch`，
-watcher 只负责**触发一次 compare 并把结果推给 GUI**，绝不自动 apply。
-这样既拿到"改完立刻看到差异"的体感，又不放弃人工确认这道闸。
-
----
-
-## 3. 版本规划
-
-> **实施结果**：下面三档（原定 v0.6 / v0.7 / v0.8）已一次性全部落地，见开头的实施状态表。
-> 保留原始分档，因为它记录了当时的**优先级判断依据**——那才是这份计划的价值所在。
-> v1.0（真 N 向）按计划**未启动**，只交付了它的数学前置件。
-
-### v0.6 —— 安全网（P0 全做完，不加新能力）
-
-- [ ] P0-1 原子写：temp + fsync + rename；`.syncdash.tmp.*` 进内置排除；过期临时文件自动清
-- [ ] P0-2 root marker（`.syncdash-root`）+ `require_marker` + 计划体检（删除占比阈值）
-- [ ] P0-3 磁盘空间预检（含 trash 跨卷的情况）
-- [ ] P0-4 DeleteDir 失败分类汇报，不再静默
-- [ ] P2-5 空文件不参与移动配对；歧义配对在 reason 里如实标注
-- [ ] P2-3 apply 阶段的大小写冲突预检（并入计划体检）
-- [ ] 回归：现有 20 项 compare 矩阵测试全绿 + 新增原子性/marker/空间三组测试
-- [ ] 真机验证：Win → SMB → Mac 全流程，含**故意中断复制**后的恢复行为
-
-**这一版一行新功能都不加，专门补数据安全。P0-1 和 P0-2 是真会丢数据/白传几十 GB 的。**
-
-### v0.7 —— 块级传输 + 冲突自动化
-
-- [ ] P1-1 步骤 A：块清单 sidecar + 自适应块大小 + hash 缓存扩展
-- [ ] P1-1 步骤 B：apply 差异块写入（配合原子写）；`pack` 只装差异块 + `base_blocks_hash` 校验
-- [ ] P1-2 冲突副本（`on_conflict` / `max_conflicts`），GUI 加"生成副本"按钮
-- [ ] P1-3 多代 archive（K=3）降低冲突误报
-- [ ] P2-6 扫描进度事件（字节数 + 速率）
-- [ ] 基准：40 GB 文件改 1 MB，实传 < 32 MB；主表体积增长 < 5%
-
-### v0.8 —— 打磨与运维
-
-- [ ] P1-4 mtime 回读校正 + 可配 `mtime_window`
-- [ ] P1-5 过滤器 `!` 取反 + `deletable` 类别
-- [ ] P2-2 回收站保留期 / 体积上限 + `trash list|restore|prune`
-- [ ] P2-4 `Action::Chmod` + 统一 pack 与直连的 mode 行为
-- [ ] 可选 `run --watch`（只触发比对，绝不自动 apply）
-- [ ] 原 roadmap 遗留：同目录 rename 合并显示、GUI 任务编辑、`run --all`、ssh 一条龙
-
-### v1.0 —— 真 N 向（大改造，独立评估后再启动）
-
-- [ ] 节点 ID + 版本向量（照 `vector.go` 语义用 Rust 重写 + proptest）
-- [ ] archive 升级为带版本向量的索引库
-- [ ] N 节点收敛性测试（模拟 3-5 节点随机改动 + 随机同步顺序，断言最终一致）
+**On file watching**: `lib/watchaggregator/aggregator.go`'s aggregation strategy is well worth reading
+(debouncing, merging by directory, and degrading to a scan of the whole directory once `maxFiles=512` /
+`maxFilesPerDir=128` is exceeded, `:21-25,193-260`).
+But introducing a watcher means SyncDash becomes a resident process, which conflicts with the
+"explicitly triggered, previewable" positioning.
+**Suggested approach**: add an **optional** `syncdash run <job> --watch` in v0.8, where the watcher only
+**triggers one compare and pushes the result to the GUI**, never applying automatically.
+That gets the "see the diff the moment you finish editing" feel without giving up the
+human-confirmation gate.
 
 ---
 
-## 4. 表结构（schema）演进
+## 3. Release plan
 
-现在 `SCHEMA = 1`（[src/table.rs:8](src/table.rs:8)）。上面的改动会动到表，规划如下：
+> **Outcome**: all three tiers below (originally v0.6 / v0.7 / v0.8) landed in one go — see the
+> implementation status table at the top.
+> The original tiering is kept because it records the **reasoning behind the priorities at the time** —
+> which is where this plan's value lies.
+> v1.0 (true N-way) was **not started**, as planned; only its mathematical prerequisite was delivered.
+
+### v0.6 — safety net (finish all of P0, add no new capability)
+
+- [ ] P0-1 atomic write: temp + fsync + rename; `.syncdash.tmp.*` into the built-in excludes; expired temp files cleaned automatically
+- [ ] P0-2 root marker (`.syncdash-root`) + `require_marker` + plan health check (delete-ratio threshold)
+- [ ] P0-3 disk space preflight (including the cross-volume trash case)
+- [ ] P0-4 classified reporting for DeleteDir failures, no longer silent
+- [ ] P2-5 empty files excluded from move pairing; ambiguous pairings annotated truthfully in the reason
+- [ ] P2-3 case-conflict preflight at apply time (folded into the plan health check)
+- [ ] Regression: the existing 20 compare-matrix tests all green + three new test groups for atomicity/marker/space
+- [ ] Real-hardware verification: the full Win → SMB → Mac flow, including recovery behavior after a **deliberately interrupted copy**
+
+**This release adds not one line of new functionality; it is purely about data safety. P0-1 and P0-2
+genuinely lose data / waste tens of GB of transfer.**
+
+### v0.7 — block-level transfer + conflict automation
+
+- [ ] P1-1 step A: block-list sidecar + adaptive block size + hash-cache extension
+- [ ] P1-1 step B: writing differing blocks in apply (together with the atomic write); `pack` carries only differing blocks + `base_blocks_hash` verification
+- [ ] P1-2 conflict copies (`on_conflict` / `max_conflicts`), plus a "make copy" button in the GUI
+- [ ] P1-3 multi-generation archive (K=3) to reduce false-positive conflicts
+- [ ] P2-6 scan progress events (byte count + rate)
+- [ ] Benchmark: change 1 MB in a 40 GB file, actual transfer < 32 MB; main table growth < 5%
+
+### v0.8 — polish and operations
+
+- [ ] P1-4 mtime read-back correction + configurable `mtime_window`
+- [ ] P1-5 filter `!` negation + the `deletable` category
+- [ ] P2-2 trash retention / size cap + `trash list|restore|prune`
+- [ ] P2-4 `Action::Chmod` + unified mode behavior across pack and direct paths
+- [ ] Optional `run --watch` (triggers a compare only, never applies automatically)
+- [ ] Carried over from the original roadmap: merged display for same-directory renames, GUI job editing, `run --all`, end-to-end ssh
+
+### v1.0 — true N-way (major rework; start only after a separate evaluation)
+
+- [ ] Node ID + version vectors (rewrite `vector.go`'s semantics in Rust + proptest)
+- [ ] Upgrade the archive to an index carrying version vectors
+- [ ] N-node convergence tests (simulate 3-5 nodes with random edits and a random sync order, assert eventual consistency)
+
+---
+
+## 4. Table schema evolution
+
+Currently `SCHEMA = 1` ([src/table.rs:8](src/table.rs:8)). The changes above touch the table; the plan
+is:
 
 ```
-schema 2（v0.7）
-  Entry  += bs: Option<u32>            块大小
-         += bh_ref: Option<u64>        块清单在 sidecar 中的行号
-         += blocks_hash: Option<String> 整个块列表的 blake3（快速判等）
-  Header += blocks_sidecar: Option<String>  sidecar 文件名
-         += node_id: String            为 v1.0 预留，现在填 hostname 即可
+schema 2 (v0.7)
+  Entry  += bs: Option<u32>             block size
+         += bh_ref: Option<u64>         line number of the block list in the sidecar
+         += blocks_hash: Option<String> blake3 of the whole block list (fast equality check)
+  Header += blocks_sidecar: Option<String>  sidecar file name
+         += node_id: String             reserved for v1.0; hostname will do for now
 
-  新文件 <table>.blocks.jsonl —— 一行一个文件：{"path":..,"bs":..,"blocks":[..]}
+  new file <table>.blocks.jsonl -- one line per file: {"path":..,"bs":..,"blocks":[..]}
 
-schema 3（v1.0）
-  archive 从 "snapshot" 变成 "index"：每行 {path, hash, size, mtime, version: Vector}
+schema 3 (v1.0)
+  archive changes from "snapshot" to "index": each line {path, hash, size, mtime, version: Vector}
 ```
 
-**兼容策略**（`pack`/`apply-pack` 跨版本尤其要紧）：
-- 读端：`schema <= 我支持的最高版本` 就接受，未知字段 serde 忽略（现有结构已有 `#[serde(default)]` 习惯，继续保持）。
-- 写端：只在双方 `probe` 都报告支持时才产出新字段 —— `probe` 已经在报 schema
-  （[src/main.rs](src/main.rs) 的 `Cmd::Probe`），扩展成报 `schema_max` 即可。
-- `apply-pack` 遇到高于自己的 schema → **明确拒绝并提示升级**，不要试图猜。
+**Compatibility strategy** (especially important for `pack`/`apply-pack` across versions):
+- Read side: accept whenever `schema <= the highest version I support`, letting serde ignore unknown
+  fields (the existing structs already follow the `#[serde(default)]` habit; keep it).
+- Write side: emit new fields only when both sides' `probe` reports support — `probe` already reports
+  schema ([src/main.rs](src/main.rs)'s `Cmd::Probe`), so extending it to report `schema_max` is enough.
+- `apply-pack` meeting a schema higher than its own → **refuse explicitly and prompt to upgrade**; do
+  not try to guess.
 
 ---
 
-## 5. 一句话优先级
+## 5. Priorities in one sentence
 
-> **v0.6 之前不要碰任何新功能。**
-> 原子写（P0-1）和挂载点检测（P0-2）各自都能造成真实的数据损失/几十 GB 白传，
-> 而两者加起来的实现量还不到一天。块级传输很诱人，但它是性能优化 —— 在一个会把
-> 截断文件反向覆盖到源侧的系统上做性能优化，顺序错了。
+> **Do not touch any new functionality before v0.6.**
+> Atomic writes (P0-1) and mount-point detection (P0-2) can each cause real data loss / tens of GB of
+> wasted transfer, and together they are less than a day of work. Block-level transfer is tempting, but
+> it is a performance optimization — and optimizing performance on a system that writes truncated files
+> back over the source is doing things in the wrong order.

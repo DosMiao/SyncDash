@@ -1,4 +1,4 @@
-# SyncDash 结构优化计划 / Codebase Refactor Plan
+# SyncDash Codebase Refactor Plan
 
 > Scope: whole app — `src/` (11.4k lines Rust), `src-tauri/` (886), `typescript/` (2.8k).
 > Method: six parallel deep-read agents over every file, plus git churn/co-change analysis.
