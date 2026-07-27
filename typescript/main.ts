@@ -1767,8 +1767,14 @@ renderModeButtons();
 
 // ---------- P1：工具栏变体副标题 + 齿轮 + 交换 ----------
 
+/// 与 config::rigor_resolved 的预设基线一一对应（quick/fast/paranoid/其余=standard 基线）。
+/// 改那边的阶梯时记得同步这里——按钮副标题是用户唯一看得见这档到底做什么的地方。
 const RIGOR_HINT: Record<string, string> = {
-  quick: '只比 size 与时间', fast: '抽样摘要', standard: '哈希 + 缓存', paranoid: '全量重哈希 + 复制后校验',
+  quick: '只比 size 与时间',
+  fast: '抽样摘要 · 吃缓存',
+  standard: '抽样摘要 · 不吃缓存 · 分歧升级',
+  paranoid: '全量哈希 · 写后校验',
+  custom: '按明细四项',
 };
 const MODE_HINT: Record<string, string> = {
   mirror: 'source 为准', sync: '双向', enrich: '只增不删',
@@ -1783,7 +1789,9 @@ const btnSwap = $<HTMLButtonElement>('btn-swap');
 /// 按钮上直接写清楚"这一下按下去会发生什么"（FFS 的 Compare/Synchronize 副标题同款）
 function renderVariants() {
   const j = currentJob;
-  $('cmp-variant').textContent = j ? `${j.rigor} · ${RIGOR_HINT[j.rigor] ?? ''}` : '选择任务';
+  // 未知档位只显示名字，不留一个吊着的 "·"（严谨级阶梯以后还会加档）
+  const rh = j ? RIGOR_HINT[j.rigor] : undefined;
+  $('cmp-variant').textContent = j ? (rh ? `${j.rigor} · ${rh}` : j.rigor) : '选择任务';
   $('sync-variant').textContent = j ? `${j.mode} · ${MODE_HINT[j.mode] ?? ''}` : '先比对';
   btnCmpCfg.disabled = !j;
   btnSyncCfg.disabled = !j;
