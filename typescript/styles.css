@@ -100,7 +100,10 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { border-color
 ::-webkit-scrollbar-thumb:hover { background: #4d5768; background-clip: padding-box; border: 3px solid transparent; }
 ::-webkit-scrollbar-track { background: transparent; }
 
-#app { display: grid; grid-template-columns: 252px 1fr; }
+/* minmax(0, 1fr), not bare 1fr: a bare 1fr track refuses to go below its content's min-content, and
+   one nowrap line (the status counts) is enough to shove the whole main column past the window edge.
+   Width pressure must resolve *inside* each row (wrap / ellipsize / scroll), never by widening the app. */
+#app { display: grid; grid-template-columns: 252px minmax(0, 1fr); }
 
 /* macOS immersive title bar: top drag strip + room for the traffic lights */
 #dragstrip { display: none; }
@@ -166,14 +169,21 @@ body.mac .brand { padding-left: 62px; padding-top: 10px; }
 
 /* ---- main ---- */
 #main { display: flex; flex-direction: column; height: 100vh; }
+/* The toolbar wraps under pressure instead of overflowing: buttons are atomic units (nowrap, no
+   shrink), so a row that no longer fits breaks between units, trailing (lower-priority) items first —
+   stats give way before Watch, Watch before the primary pair. Nothing ever overlaps or clips. */
 #toolbar {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 6px 10px;
   padding: 9px 14px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
 }
+#toolbar .btn { flex: none; }
+/* An action and its settings cog are one unit: a wrap must never strand the gear on the next row */
+.tgroup { display: flex; align-items: center; gap: 10px; flex: none; }
 .btn {
   display: inline-flex;
   align-items: center;
@@ -189,6 +199,8 @@ body.mac .brand { padding-left: 62px; padding-top: 10px; }
   line-height: var(--lh-tight);
   cursor: pointer;
   transition: background 0.12s, border-color 0.12s, transform 0.05s;
+  /* A label never wraps mid-text: a squeezed button moves to the next row whole, or not at all */
+  white-space: nowrap;
 }
 /* brightness() lifted the text along with the surface and washed the label out — hover moves the surface only */
 .btn:hover:not(:disabled) { background: var(--panel3); border-color: var(--dim2); }
@@ -198,7 +210,19 @@ body.mac .brand { padding-left: 62px; padding-top: 10px; }
 .btn.primary:hover:not(:disabled) { background: rgba(92, 171, 242, 0.22); border-color: var(--accent); }
 .btn.accent { background: var(--accent); border-color: var(--accent); color: #08121c; font-weight: 600; }
 .btn.accent:hover:not(:disabled) { background: #74b8f5; border-color: #74b8f5; }
-.stats { color: var(--dim); margin-left: auto; font-variant-numeric: tabular-nums; font-size: var(--fs-sm); }
+/* Right-aligned and wrap-tolerant: on a narrow window the whole cluster drops to its own row (still
+   right-aligned via the auto margin), and the segments reflow instead of tearing mid-number */
+.stats {
+  color: var(--dim);
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-sm);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 2px 10px;
+  min-width: 0;
+}
 .spinner {
   width: 15px; height: 15px;
   border: 2px solid var(--border-strong);
@@ -210,17 +234,24 @@ body.mac .brand { padding-left: 62px; padding-top: 10px; }
 
 .pathline { padding: 8px 14px; border-bottom: 1px solid var(--border); font-size: var(--fs-sm); }
 
-/* ---- Filter bar: search + chips (GitDash style, with counts, dimmed at 0) ---- */
+/* ---- Filter bar: search + chips (GitDash style, with counts, dimmed at 0) ----
+   Two clusters that wrap between, never through, each other: "narrow the list" (search + category
+   chips) and "tools" (.fb-actions | .fb-right). On a narrow window the bar becomes two tidy rows —
+   filtering on top, tools below with the display-mode group still right-aligned — instead of chips
+   folding into a column between fixed blocks while the right side runs off screen. */
 #filterbar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 6px 8px;
   padding: 8px 14px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
 }
 #search {
-  width: 320px;
+  flex: 1 1 220px;
+  min-width: 200px;
+  max-width: 320px;
   min-height: var(--ctl-h-sm);
   padding: 5px 10px;
   border-radius: var(--r-sm);
@@ -232,8 +263,11 @@ body.mac .brand { padding-left: 62px; padding-top: 10px; }
 }
 #search::placeholder { color: var(--dim2); }
 #search:focus { border-color: var(--accent); box-shadow: var(--ring); }
-#chips { display: flex; gap: 6px; flex-wrap: wrap; }
+#chips { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+/* View actions (funnel / identical / CSV) move as one block when the bar wraps */
+.fb-actions { display: flex; gap: 6px; flex-wrap: wrap; flex: none; }
 .chip {
+  white-space: nowrap;
   padding: 4px 12px;
   border-radius: var(--r-pill);
   border: 1px solid var(--border-strong);
@@ -250,7 +284,9 @@ body.mac .brand { padding-left: 62px; padding-top: 10px; }
 /* A count of zero is muted by color, not opacity: 0.35 alpha on top of --dim landed near 1.6:1 */
 .chip.zero { color: var(--dim2); border-color: var(--border); }
 
-#tablewrap { flex: 1; overflow: auto; }
+/* min-width 0 so the flex item can go below the table's min-width — the table then scrolls in here
+   instead of pushing the whole review row (and the app) wider than the window */
+#tablewrap { flex: 1; overflow: auto; min-width: 0; }
 .empty { display: flex; height: 100%; align-items: center; justify-content: center; color: var(--dim); font-size: var(--fs-md); }
 table { width: 100%; border-collapse: collapse; }
 thead th {
@@ -340,6 +376,7 @@ tr.flip .badge { border-style: dashed; }
 }
 .sheet {
   width: 460px;
+  max-width: 92vw;
   background: var(--panel);
   border: 1px solid var(--border-strong);
   border-radius: var(--r-lg);
@@ -363,7 +400,7 @@ tr.flip .badge { border-style: dashed; }
 
 /* ---- M3: Overview aggregation column (same as FFS, collapsible) + icon stat bar ---- */
 #reviewrow { flex: 1; display: flex; min-height: 0; }
-#overview { width: 252px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+#overview { width: 252px; flex: none; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
 #overview.collapsed { width: 28px; }
 #overview.collapsed #ov-body { display: none; }
 #ov-toggle { background: none; border: none; color: var(--dim); cursor: pointer; padding: 7px 0; font-size: var(--fs-base); }
@@ -382,7 +419,7 @@ tr.flip .badge { border-style: dashed; }
 .ovbar { height: 3px; background: var(--panel3); border-radius: 2px; margin-top: 4px; overflow: hidden; }
 .ovbar > div { height: 100%; background: var(--accent); }
 .ovchild { margin-left: 16px; }
-.st { display: inline-flex; gap: 3px; align-items: center; margin-left: 10px; font-variant-numeric: tabular-nums; }
+.st { display: inline-flex; gap: 3px; align-items: center; font-variant-numeric: tabular-nums; }
 .st.zero { opacity: 0.45; }
 .st b { font-weight: 600; }
 .st.s-copy b { color: var(--green); }
@@ -563,7 +600,7 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
 #btn-group.on { border-color: var(--accent); color: var(--accent); background: var(--accent-tint); }
 /* The display-mode group carries the auto margin, not the fold button inside it: fold is unmounted while
    a sort is active, and a margin on an element that is not there pushes nothing. */
-.fb-right { display: flex; gap: 6px; margin-left: auto; flex: none; }
+.fb-right { display: flex; gap: 6px; margin-left: auto; flex: none; flex-wrap: wrap; justify-content: flex-end; }
 
 /* Secondary toolbar controls: same token set as .btn, one step shorter and tighter so the filter row
    does not out-weigh the primary Compare / Synchronize pair above it */
@@ -579,6 +616,12 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
 .cmp2.done .st-bar > i { background: var(--green); }
 .cmp2 .st-pct { text-align: right; font-variant-numeric: tabular-nums; }
 .cmp2 .st-items, .cmp2 .st-bytes, .cmp2 .st-rate { text-align: right; font-variant-numeric: tabular-nums; color: var(--dim); font-size: var(--fs-sm); white-space: nowrap; overflow: hidden; }
+/* On a narrow window the compare rows shed bytes and rate before the progress bar collapses;
+   the item counter stays — it is the progress the bar cannot show */
+@media (max-width: 1279px) {
+  #cmp-rows .stagerow.cmp2 { grid-template-columns: 20px 112px 1fr 52px 136px; }
+  .cmp2 .st-bytes, .cmp2 .st-rate { display: none; }
+}
 
 /* ---- P1: two-line toolbar buttons / cog / swap ---- */
 .btn.two { flex-direction: column; align-items: flex-start; justify-content: center; gap: 1px; padding: 4px 16px; line-height: var(--lh-tight); }
@@ -626,12 +669,14 @@ th .sortable { cursor: pointer; user-select: none; }
 th .sortable:hover { color: var(--text); text-decoration: underline; }
 th .sortable.on { color: var(--accent); }
 th .sortable::after { content: attr(data-dir); font-size: var(--fs-micro); margin-left: 2px; }
-.counts { margin-left: auto; color: var(--dim); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
+/* Shrinkable with an ellipsis (the full line lives in the tooltip): on a narrow window the counts and
+   the status message share the squeeze instead of the right end running off screen */
+.counts { margin-left: auto; color: var(--dim); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; white-space: nowrap; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
 /* ---- P3: funnel panel (positioned by JS through the CSSOM) ---- */
 #btn-funnel.on { border-color: var(--green); color: var(--green); background: var(--green-tint); }
 #funnelpop {
-  position: fixed; z-index: 115; width: 400px; padding: 14px 16px;
+  position: fixed; z-index: 115; width: 400px; max-width: calc(100vw - 12px); padding: 14px 16px;
   background: var(--panel2); border: 1px solid var(--border-strong); border-radius: var(--r);
   box-shadow: var(--shadow-pop); display: flex; flex-direction: column; gap: 10px;
 }
@@ -653,8 +698,8 @@ th .sortable::after { content: attr(data-dir); font-size: var(--fs-micro); margi
 /* ---- P4: identical-items panel / export ---- */
 #btn-same.on { border-color: var(--green); color: var(--green); background: var(--green-tint); }
 #samepanel { display: flex; flex-direction: column; height: 100%; }
-.sp-head { display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: var(--panel); border-bottom: 1px solid var(--border); font-size: var(--fs-sm); }
-.sp-head #sp-q { width: 280px; padding: 5px 9px; border-radius: var(--r-sm); border: 1px solid var(--border-strong); background: var(--bg); color: var(--text); font-family: var(--font-mono); font-size: var(--fs-sm); outline: none; }
+.sp-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; padding: 9px 12px; background: var(--panel); border-bottom: 1px solid var(--border); font-size: var(--fs-sm); }
+.sp-head #sp-q { flex: 1 1 200px; min-width: 160px; max-width: 280px; padding: 5px 9px; border-radius: var(--r-sm); border: 1px solid var(--border-strong); background: var(--bg); color: var(--text); font-family: var(--font-mono); font-size: var(--fs-sm); outline: none; }
 .sp-head #sp-q:focus { border-color: var(--accent); box-shadow: var(--ring); }
 .sp-head #sp-count { margin-left: auto; font-variant-numeric: tabular-nums; }
 #sametable { width: 100%; border-collapse: collapse; }
@@ -666,14 +711,29 @@ th .sortable::after { content: attr(data-dir); font-size: var(--fs-micro); margi
 
 /* ---- 1:N target selector ---- */
 #pathline { display: flex; flex-direction: column; gap: 6px; }
-#target-sel { flex: none; max-width: 46%; background: var(--panel2); color: var(--text); border: 1px solid var(--accent); border-radius: var(--r-sm); padding: 3px 7px; font-size: var(--fs-sm); font-family: inherit; }
+/* Fixed cap, not a %: inside the path grid a percentage would feed back into the track sizing and
+   starve the source input; 300px fits "target 2/3: <root>" and long roots clip with the title tooltip */
+#target-sel { max-width: 300px; background: var(--panel2); color: var(--text); border: 1px solid var(--accent); border-radius: var(--r-sm); padding: 3px 7px; font-size: var(--fs-sm); font-family: inherit; }
 
 /* ---- Editable roots in the main view (same as the FFS main window: the paths are right there, Enter writes them back) ---- */
 .pathline { padding: 9px 14px; }
-.prow { display: flex; align-items: center; gap: 7px; }
-.prow .plabel { color: var(--dim2); font-size: var(--fs-micro); font-weight: 600; flex: none; text-transform: uppercase; letter-spacing: 0.6px; }
+/* The two roots are the primary content of this row. A grid, not a flex row: wide = one line with the
+   two inputs splitting the free space symmetrically; narrow = the same DOM re-flows into two lines,
+   each root getting the full width (the swap button stays on the source line). Below ~36 characters
+   per side, side-by-side paths stop being readable — that is the breakpoint, nothing magic. */
+.prow {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto minmax(0, 1fr) auto;
+  gap: 6px 7px;
+  align-items: center;
+}
+@media (max-width: 1023px) {
+  .prow { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+  #target-sel { grid-column: 2 / -1; justify-self: start; }
+}
+.prow .plabel { color: var(--dim2); font-size: var(--fs-micro); font-weight: 600; text-transform: uppercase; letter-spacing: 0.6px; }
 .prow input[type="text"] {
-  flex: 1; min-width: 0; background: var(--bg); color: var(--text);
+  min-width: 0; background: var(--bg); color: var(--text);
   border: 1px solid var(--border-strong); border-radius: var(--r-sm); padding: 5px 9px;
   font-family: var(--font-mono); font-size: var(--fs-sm); min-height: var(--ctl-h-sm); outline: none;
 }
@@ -694,7 +754,10 @@ th .sortable::after { content: attr(data-dir); font-size: var(--fs-micro); margi
   display: inline-flex; align-items: baseline; gap: 6px; padding: 3px 10px;
   background: transparent; border: 1px solid var(--border); border-radius: var(--r-pill);
   color: var(--text); font-size: var(--fs-xs); font-family: inherit; cursor: pointer; transition: border-color 0.12s, background 0.12s;
+  /* A pill wider than the row shrinks and ellipsizes its value rather than overflowing the window */
+  min-width: 0; max-width: 100%;
 }
+.cfgpill .cv { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cfgpill:hover { border-color: var(--accent); background: var(--accent-tint); }
 .cfgpill .ck { color: var(--dim); }
 .cfgpill .cv { font-variant-numeric: tabular-nums; }
@@ -710,17 +773,19 @@ th .sortable::after { content: attr(data-dir); font-size: var(--fs-micro); margi
    That requires equal row heights and column widths independent of "which rows are mounted", so the layout is pinned here:
    auto layout recomputes widths from the visible content, and the whole table's columns jump on every scroll.
    Widths track the type scale: they were sized for 11px content and are carried up with --fs-sm at 13px. */
-#plantable { table-layout: fixed; }
-#plantable col.w-chk { width: 38px; }
-#plantable col.w-act { width: 200px; }   /* sized for the "action (click a badge to flip direction)" header; the badge itself only needs 112px */
-#plantable col.w-meta { width: 178px; }  /* the width of "894.0 MB · 07-26 16:51" at --fs-sm */
-#plantable col.w-reason { width: 240px; }
-/* w-path gets no width: the two columns split the remaining space evenly (FFS two-column semantics — symmetric by design).
-   Note that td.c-path's max-width:330px does not take part in width computation under fixed layout; that rule is for #sametable. */
+/* Column widths live in PlanTable.tsx (COLW): the set and the widths change with the container width,
+   so the component owns them. w-path columns get no width and split the remaining space evenly (FFS
+   two-column semantics — symmetric by design). min-width is the floor where even the compact column
+   set stops working: below it the table holds its width and scrolls sideways instead of crushing the
+   path columns to nothing. */
+#plantable { table-layout: fixed; min-width: 560px; }
 
 /* Row height must stay constant — a wrap in any column throws off the precomputed height and rows drift out of place.
    Under fixed layout, overflow is not clipped automatically and smears into the neighboring column, so every column clips itself. */
 #plantable td.reason, #plantable tr.grp td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* c-meta too: fmtTime carries the year for older files ("2025-07-26 16:51"), which is wider than the
+   column sized for the yearless form — unclipped it smears into the neighbor (the tooltip has it all) */
+#plantable td.c-meta { overflow: hidden; text-overflow: ellipsis; }
 #plantable thead th { overflow: hidden; text-overflow: ellipsis; }
 
 /* Spacer rows only hold height: no borders, padding, zebra stripes, or hover color */

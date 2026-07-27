@@ -97,24 +97,28 @@ export function FilterBar(props: Props) {
           );
         })}
       </div>
-      <button
-        ref={funnelBtn}
-        className={'btn' + (funnelCount > 0 || funnelOpen ? ' on' : '')}
-        id="btn-funnel"
-        title="Filter: name masks / size / modified time (applies to the current results, no rescan)"
-        onClick={(e) => { e.stopPropagation(); onToggleFunnel((e.currentTarget as HTMLElement).getBoundingClientRect()); }}
-      >{funnelCount ? `🔻 Filter ${funnelCount}` : '🔻 Filter'}</button>
-      <button
-        className={'btn' + (sameOpen ? ' on' : '')}
-        id="btn-same"
-        title="View the files judged identical on both sides (no rescan, reads the last compare's snapshot)"
-        onClick={onToggleSame}
-      >≡ Identical</button>
-      <button
-        className="btn"
-        title="Export the current view as CSV (UTF-8 with BOM, opens straight in Excel)"
-        onClick={onExportCsv}
-      >⤓ CSV</button>
+      {/* One block, so a bar wrap never breaks between these three: on a narrow window they open the
+          second row together, with .fb-right still pushed to its right end */}
+      <div className="fb-actions">
+        <button
+          ref={funnelBtn}
+          className={'btn' + (funnelCount > 0 || funnelOpen ? ' on' : '')}
+          id="btn-funnel"
+          title="Filter: name masks / size / modified time (applies to the current results, no rescan)"
+          onClick={(e) => { e.stopPropagation(); onToggleFunnel((e.currentTarget as HTMLElement).getBoundingClientRect()); }}
+        >{funnelCount ? `🔻 Filter ${funnelCount}` : '🔻 Filter'}</button>
+        <button
+          className={'btn' + (sameOpen ? ' on' : '')}
+          id="btn-same"
+          title="View the files judged identical on both sides (no rescan, reads the last compare's snapshot)"
+          onClick={onToggleSame}
+        >≡ Identical</button>
+        <button
+          className="btn"
+          title="Export the current view as CSV (UTF-8 with BOM, opens straight in Excel)"
+          onClick={onExportCsv}
+        >⤓ CSV</button>
+      </div>
       {/* The display-mode group is pushed right by .fb-right rather than by a margin on the fold button:
           the fold button is absent while sorting, and an auto margin on a missing element pushes nothing. */}
       <div className="fb-right">

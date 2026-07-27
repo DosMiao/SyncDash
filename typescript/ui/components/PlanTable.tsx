@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { baseOf, dirOf, fmtTime, fullPath, humanSize } from '../../core/format';
 import { badge, canFlip, eff, metaOf, newerSide, selectable, sidePaths } from '../../core/plan';
 import { useVirtualRows } from '../hooks/useVirtualRows';
@@ -26,6 +26,39 @@ interface Props {
   onContextRow: (i: number, x: number, y: number) => void;
 }
 
+/// Responsive column policy. Width goes to information priority: the two path columns are the primary
+/// content, so everything else diets first as the container narrows — the reason column folds into the
+/// badge tooltip, the action column drops its header hint, then Size · Time drops to size-only (the
+/// full pair stays in the cell tooltip). Sized so the paths never fall under ~140px before the table's
+/// min-width kicks in and it scrolls sideways instead.
+///   full:     | 38 chk | 200 action | path | 178 size·time | path | 178 size·time | 240 reason |
+///   noreason: | 38 chk | 140 action | path | 178 size·time | path | 178 size·time |
+///   compact:  | 38 chk | 140 action | path |  96 size      | path |  96 size      |
+/// 140 = badge min-width 92 + badge padding/border 22 + cell padding 24, the floor before badges smear
+/// into the next column (fixed layout does not clip). 178 fits "894.0 MB · 07-26 16:51" at --fs-sm.
+type ColMode = 'full' | 'noreason' | 'compact';
+const COLW: Record<ColMode, (number | null)[]> = {
+  full: [38, 200, null, 178, null, 178, 240],
+  noreason: [38, 140, null, 178, null, 178],
+  compact: [38, 140, null, 96, null, 96],
+};
+const colMode = (w: number): ColMode => (w >= 1160 ? 'full' : w >= 900 ? 'noreason' : 'compact');
+
+/// The column set tracks the scroll container, not the window: collapsing the Overview pane widens the
+/// table by 224px without any window resize. Found by id for the same reason wrapRef is (not ours).
+function useWrapWidth(): number {
+  const [w, setW] = useState(1600);
+  useLayoutEffect(() => {
+    const el = document.getElementById('tablewrap');
+    if (!el) return;
+    const ro = new ResizeObserver(() => setW(el.clientWidth));
+    ro.observe(el);
+    setW(el.clientWidth);
+    return () => ro.disconnect();
+  }, []);
+  return w;
+}
+
 /// indeterminate is a DOM property with no HTML attribute, so it can only be set through a ref
 function TriCheckbox(props: { checked: boolean; indeterminate?: boolean; disabled?: boolean; title?: string; onChange: (v: boolean) => void; stopClick?: boolean }) {
   const ref = useRef<HTMLInputElement>(null);
@@ -43,13 +76,13 @@ function TriCheckbox(props: { checked: boolean; indeterminate?: boolean; disable
   );
 }
 
-function MetaCell({ sm, isNewer }: { sm: SideMeta | null; isNewer: boolean }) {
+function MetaCell({ sm, isNewer, compact }: { sm: SideMeta | null; isNewer: boolean; compact: boolean }) {
   if (!sm) return <td className="c-meta mono dim">—</td>;
   return (
     <td
       className={'c-meta mono' + (isNewer ? ' newer' : '')}
       title={`${sm.size.toLocaleString()} bytes\n${new Date(sm.mtime_ms).toLocaleString()}`}
-    >{humanSize(sm.size)} · {fmtTime(sm.mtime_ms)}</td>
+    >{compact ? humanSize(sm.size) : `${humanSize(sm.size)} · ${fmtTime(sm.mtime_ms)}`}</td>
   );
 }
 
@@ -68,6 +101,9 @@ export function PlanTable(props: Props) {
   useEffect(() => { if (wrapRef.current) wrapRef.current.scrollTop = 0; }, [resetKey]);
 
   const win = useVirtualRows(rowPlan, wrapRef, theadRef, bodyRef);
+  const mode = colMode(useWrapWidth());
+  const compact = mode === 'compact';
+  const nCols = COLW[mode].length;
 
   const selectableVisible = visible.filter((i) => selectable(eff(plan, flipped, i)));
   const allChecked = selectableVisible.length > 0 && selectableVisible.every((i) => checked[i]);
@@ -83,12 +119,11 @@ export function PlanTable(props: Props) {
 
   return (
     <table id="plantable">
-      {/* Column widths are pinned here: the body is virtually scrolled, and auto layout recomputes
-          widths from whichever rows happen to be mounted, so the columns jump on every scroll.
-          The two w-path columns get no width and split the remaining space. */}
+      {/* Column widths are pinned (via COLW): the body is virtually scrolled, and auto layout would
+          recompute widths from whichever rows happen to be mounted, so the columns would jump on every
+          scroll. The two path columns get no width and split the remaining space. */}
       <colgroup>
-        <col className="w-chk" /><col className="w-act" /><col className="w-path" /><col className="w-meta" />
-        <col className="w-path" /><col className="w-meta" /><col className="w-reason" />
+        {COLW[mode].map((w, k) => <col key={k} style={w !== null ? { width: w } : undefined} />)}
       </colgroup>
       <thead ref={theadRef}>
         <tr>
@@ -100,17 +135,22 @@ export function PlanTable(props: Props) {
             />
           </th>
           <th className="c-act">
-            <Sortable k="action">action</Sortable> <span className="dim thin">(click a badge to flip direction)</span>
+            <Sortable k="action">action</Sortable>
+            {mode === 'full' && <> <span className="dim thin">(click a badge to flip direction)</span></>}
           </th>
           <th className="c-path"><Sortable k="path">source side</Sortable></th>
-          <th className="c-meta"><Sortable k="s.size">Size</Sortable> · <Sortable k="s.mtime">Time</Sortable></th>
+          <th className="c-meta">
+            <Sortable k="s.size">Size</Sortable>{!compact && <> · <Sortable k="s.mtime">Time</Sortable></>}
+          </th>
           <th className="c-path"><Sortable k="path">target side</Sortable></th>
-          <th className="c-meta"><Sortable k="t.size">Size</Sortable> · <Sortable k="t.mtime">Time</Sortable></th>
-          <th>reason</th>
+          <th className="c-meta">
+            <Sortable k="t.size">Size</Sortable>{!compact && <> · <Sortable k="t.mtime">Time</Sortable></>}
+          </th>
+          {mode === 'full' && <th>reason</th>}
         </tr>
       </thead>
       <tbody ref={bodyRef}>
-        {win.padTop > 0 && <tr className="vspacer"><td colSpan={7} style={{ height: win.padTop }} /></tr>}
+        {win.padTop > 0 && <tr className="vspacer"><td colSpan={nCols} style={{ height: win.padTop }} /></tr>}
         {rowPlan.slice(win.from, win.to).map((spec, k) => {
           // Zebra striping keys off the real row index, not :nth-child — otherwise the stripes flip as
           // the window scrolls
@@ -138,7 +178,7 @@ export function PlanTable(props: Props) {
                     onChange={(v) => onToggleMany(sel, v)}
                   />
                 </td>
-                <td colSpan={6} title={`${plan.header.source_root}\n${plan.header.target_root}\n… ${label}`}>
+                <td colSpan={nCols - 1} title={`${plan.header.source_root}\n${plan.header.target_root}\n… ${label}`}>
                   <span className="gchev">{folded ? '▸' : '▾'}</span>{' '}
                   <span className="gdir mono">{label}</span>
                   <span className="gmeta">{spec.items.length} items{bytes ? ` · ${humanSize(bytes)}` : ''}</span>
@@ -182,19 +222,23 @@ export function PlanTable(props: Props) {
               <td className="c-act">
                 <span
                   className={'badge ' + b.cls + (flippable ? ' flippable' : '')}
-                  title={flippable ? 'Click to reverse the direction (click again to restore)' : undefined}
+                  // With the reason column folded away, the badge tooltip carries the reason instead
+                  title={[
+                    mode !== 'full' ? op.reason : '',
+                    flippable ? 'Click to reverse the direction (click again to restore)' : '',
+                  ].filter(Boolean).join('\n') || undefined}
                   onClick={flippable ? () => onFlip(i) : undefined}
                 >{b.text}</span>
               </td>
               {pathCell(sp, plan.header.source_root)}
-              <MetaCell sm={m.src} isNewer={newer === 's'} />
+              <MetaCell sm={m.src} isNewer={newer === 's'} compact={compact} />
               {pathCell(tp, plan.header.target_root)}
-              <MetaCell sm={m.dst} isNewer={newer === 't'} />
-              <td className="reason">{op.reason}</td>
+              <MetaCell sm={m.dst} isNewer={newer === 't'} compact={compact} />
+              {mode === 'full' && <td className="reason">{op.reason}</td>}
             </tr>
           );
         })}
-        {win.padBottom > 0 && <tr className="vspacer"><td colSpan={7} style={{ height: win.padBottom }} /></tr>}
+        {win.padBottom > 0 && <tr className="vspacer"><td colSpan={nCols} style={{ height: win.padBottom }} /></tr>}
       </tbody>
     </table>
   );

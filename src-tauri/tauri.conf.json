@@ -22,6 +22,7 @@
         "width": 1280,
         "height": 760,
         "minWidth": 860,
+        "minHeight": 560,
         "center": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
