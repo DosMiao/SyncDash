@@ -1,10 +1,10 @@
 //! Job pipeline: scan both sides → compare (sync brings the archive along automatically) → apply → refresh the archive on success.
 //! The CLI's `run` and the GUI share this one implementation.
 
-use crate::compare::{Action, Op, Plan};
-use crate::config::Job;
-use crate::table::Snapshot;
-use crate::{apply, compare, scan};
+use crate::model::plan::{Action, Op, Plan};
+use crate::job::Job;
+use crate::model::table::Snapshot;
+use crate::pipeline::{apply, compare, scan};
 use std::path::Path;
 
 /// Rigor level → scan options. A monotone ladder: each tier = **more actually read this round**,
@@ -14,7 +14,7 @@ use std::path::Path;
 /// standard really reads every file's sampling window this round (no cache — not memory, a measurement taken now)
 /// paranoid really reads every byte of every file this round
 pub fn scan_opts(job: &Job) -> scan::ScanOptions {
-    let filter = crate::filter::PathFilter::build_full_opt(&job.include, &job.exclude, &job.deletable, &job.os_excludes, job.dev_excludes);
+    let filter = crate::pipeline::filter::PathFilter::build_full_opt(&job.include, &job.exclude, &job.deletable, &job.os_excludes, job.dev_excludes);
     let r = job.rigor_resolved();
     scan::ScanOptions { hash: r.hash, sampled: r.sampled, use_cache: r.use_cache, symlinks_direct: job.symlinks == "direct", filter }
 }
@@ -22,10 +22,10 @@ pub fn scan_opts(job: &Job) -> scan::ScanOptions {
 /// Refresh the archive after a successful sync: rescan source, drop conflicted paths (a conflict keeps being reported, never silently arbitrated).
 /// v0.9 M1: make the Refresh phase visible — the archive rescan is a long phase that is completely invisible today, so wire it to the event stream and cancellation.
 /// Being cancelled only means conflicts get re-reported next round — safe.
-fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::progress::RunCtx) {
+fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::obs::progress::RunCtx) {
     let Some(arch_path) = &job.archive else {
         ctx.log(
-            crate::progress::LogLevel::Warn,
+            crate::model::event::LogLevel::Warn,
             "run",
             "hint: sync job without `archive` — add one so deletions/moves can be attributed next time",
         );
@@ -41,11 +41,11 @@ fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::progress::RunCtx) {
     // The previous-generation archive: every row of the new table pushes the old hash onto the prev chain, so that
     // "one generation behind" can be told apart from "concurrent modification" (P1-3, see compare::generation_of)
     let previous = if arch_path.is_file() { Snapshot::load(arch_path).ok() } else { None };
-    if let Ok(mut snap) = scan::scan_ctx(&job.source, &opt, ctx, crate::progress::Phase::Refresh) {
+    if let Ok(mut snap) = scan::scan_ctx(&job.source, &opt, ctx, crate::model::event::Phase::Refresh) {
         snap.header.kind = "archive".into();
         snap.entries.retain(|e| !conflicted.contains(e.path.as_str()));
         if let Some(prev) = &previous {
-            crate::table::roll_generations(&mut snap.entries, &prev.entries);
+            crate::model::table::roll_generations(&mut snap.entries, &prev.entries);
         }
         if let Some(dir) = arch_path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -54,7 +54,7 @@ fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::progress::RunCtx) {
             let mut w = std::io::BufWriter::new(f);
             if snap.write_to(&mut w).is_ok() {
                 ctx.log(
-                    crate::progress::LogLevel::Info,
+                    crate::model::event::LogLevel::Info,
                     "run",
                     format!("archive refreshed: {}", arch_path.display()),
                 );
@@ -64,7 +64,7 @@ fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::progress::RunCtx) {
 }
 
 pub fn compare_job(job: &Job) -> std::io::Result<Plan> {
-    compare_job_with(job, &crate::progress::RunCtx::null())
+    compare_job_with(job, &crate::obs::progress::RunCtx::null())
 }
 
 /// The full output of a comparison: the plan plus both snapshots.
@@ -77,13 +77,13 @@ pub struct CompareOutcome {
 
 /// v0.9 M1: the end-to-end comparison with an event stream and cancellation. This function replaces the second
 /// pipeline src-tauri had inlined just to emit events (undoing the two-copy drift).
-pub fn compare_job_with(job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<Plan> {
+pub fn compare_job_with(job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<Plan> {
     compare_job_detailed(job, ctx).map(|o| o.plan)
 }
 
 /// The same pipeline, but it also hands back both snapshots (throwing them away would force the UI to scan all over again)
-pub fn compare_job_detailed(job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<CompareOutcome> {
-    use crate::progress::Phase;
+pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<CompareOutcome> {
+    use crate::model::event::Phase;
     // The single pipeline handles a single target only: multi-target jobs are derived through for_target first (the CLI run loop / the desktop target picker)
     job.validate_multi_target().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     if job.targets.len() > 1 {
@@ -95,13 +95,13 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::progress::RunCtx) -> std::io
     let opt = scan_opts(job);
     // P0-2: root reachability + mount-point marker. When the share isn't mounted, target is often an empty directory,
     // and comparing as usual yields a plan that either "wipes the other side" or "re-sends everything".
-    let mut v = crate::preflight::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-    crate::preflight::check_root("source", &job.source, job.require_marker, &mut v);
-    crate::preflight::check_root("target", &job.target, job.require_marker, &mut v);
+    let mut v = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
+    crate::pipeline::guard::check_root("source", &job.source, job.require_marker, &mut v);
+    crate::pipeline::guard::check_root("target", &job.target, job.require_marker, &mut v);
     for w in &v.warnings {
         // v0.10: Log{Warn} replaces the Error{action:"warning"} hack —
         // with a real level, a warning no longer has to masquerade as an "error that doesn't count"
-        ctx.log(crate::progress::LogLevel::Warn, "compare", format!("warning: {w}"));
+        ctx.log(crate::model::event::LogLevel::Warn, "compare", format!("warning: {w}"));
     }
     if !v.ok() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
@@ -120,7 +120,7 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::progress::RunCtx) -> std::io
         _ => None,
     };
     // compare itself is sub-second CPU work: report the phase boundary only, no internal counting
-    let _pp = crate::progress::PhaseProgress::begin(
+    let _pp = crate::obs::progress::PhaseProgress::begin(
         ctx,
         Phase::Compare,
         Some(format!("{} × {} entries", s.header.entry_count, t.header.entry_count)),
@@ -144,11 +144,11 @@ fn escalate_sampled_disagreements(
     mut plan: Plan,
     s: &Snapshot,
     t: &Snapshot,
-    ctx: &crate::progress::RunCtx,
+    ctx: &crate::obs::progress::RunCtx,
 ) -> Plan {
-    use crate::compare::Side;
-    use crate::progress::LogLevel;
-    use crate::table::EntryKind;
+    use crate::model::plan::Side;
+    use crate::model::event::LogLevel;
+    use crate::model::table::EntryKind;
     use rayon::prelude::*;
     const SLACK_MS: i64 = 2000;
 
@@ -162,13 +162,13 @@ fn escalate_sampled_disagreements(
         root.join(r)
     }
 
-    let tmap: std::collections::HashMap<&str, &crate::table::Entry> = t
+    let tmap: std::collections::HashMap<&str, &crate::model::table::Entry> = t
         .entries
         .iter()
         .filter(|e| e.kind == EntryKind::File)
         .map(|e| (e.path.as_str(), e))
         .collect();
-    let suspects: Vec<(&crate::table::Entry, &crate::table::Entry)> = s
+    let suspects: Vec<(&crate::model::table::Entry, &crate::model::table::Entry)> = s
         .entries
         .iter()
         .filter(|e| e.kind == EntryKind::File)
@@ -224,8 +224,8 @@ pub fn apply_job(job: &Job, plan: &Plan, ops: &[Op], trash: Option<std::path::Pa
 
 /// Run the gates without executing — the GUI calls this before raising the confirmation sheet, so the refusal
 /// reasons are shown to the person in full instead of landing only on a stderr nobody reads.
-pub fn preflight_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::preflight::Verdict {
-    crate::preflight::run_all(
+pub fn preflight_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::pipeline::guard::Verdict {
+    crate::pipeline::guard::run_all(
         ops,
         Path::new(&plan.header.source_root),
         Path::new(&plan.header.target_root),
@@ -245,7 +245,7 @@ pub fn apply_job_guarded(
     verbose: bool,
     acknowledged: bool,
 ) -> (u64, u64, u64) {
-    apply_job_guarded_with(job, plan, ops, trash, verbose, acknowledged, &crate::progress::RunCtx::null()).into_tuple()
+    apply_job_guarded_with(job, plan, ops, trash, verbose, acknowledged, &crate::obs::progress::RunCtx::null()).into_tuple()
 }
 
 /// v0.9 M1: apply orchestration with an event stream — the Apply phase (apply_with reports its own totals and
@@ -257,13 +257,14 @@ pub fn apply_job_guarded_with(
     trash: Option<std::path::PathBuf>,
     verbose: bool,
     acknowledged: bool,
-    ctx: &crate::progress::RunCtx,
-) -> crate::progress::ApplyOutcome {
-    use crate::progress::{ApplyOutcome, Phase, ProgressEvent};
+    ctx: &crate::obs::progress::RunCtx,
+) -> crate::obs::progress::ApplyOutcome {
+    use crate::model::event::{Phase, ProgressEvent};
+use crate::obs::progress::ApplyOutcome;
     let t0 = std::time::Instant::now();
     let src_root = Path::new(&plan.header.source_root);
     let tgt_root = Path::new(&plan.header.target_root);
-    let verdict = crate::preflight::run_all(
+    let verdict = crate::pipeline::guard::run_all(
         ops,
         src_root,
         tgt_root,
@@ -341,7 +342,7 @@ fn run_local_single(name: &str, job: &Job, do_apply: bool, verbose: bool, acknow
         .collect();
     // M4: the CLI's apply leaves a run log too (desktop records its own at the shell layer)
     let t0 = std::time::Instant::now();
-    let rec = crate::runlog::Recorder::start(name, "apply", &crate::progress::RunCtx::null(), &ops);
+    let rec = crate::obs::runlog::Recorder::start(name, "apply", &crate::obs::progress::RunCtx::null(), &ops);
     let out = apply_job_guarded_with(job, &plan, &ops, None, verbose, acknowledged, &rec.ctx);
     rec.finish(&out, t0.elapsed().as_millis() as u64);
     Ok((out.done, out.skipped, out.errors, plan.header.conflict_count))
@@ -350,7 +351,7 @@ fn run_local_single(name: &str, job: &Job, do_apply: bool, verbose: bool, acknow
 /// Remote pipeline (the v0.6 end-to-end over ssh): ssh probe → remote-local scan (table collected from stdout) → local scan → compare
 /// → pack the target side and ship it over ssh to apply-pack → write the source side straight through the mounted path → refresh the archive on a successful sync.
 pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
-    run_remote_job_with(name, job, do_apply, verbose, acknowledged, &crate::progress::RunCtx::null())
+    run_remote_job_with(name, job, do_apply, verbose, acknowledged, &crate::obs::progress::RunCtx::null())
 }
 
 /// v0.9 M1/M3: the remote pipeline = a compare stage plus an apply stage (desktop calls each over its own IPC round; the CLI runs both end-to-end here).
@@ -362,20 +363,20 @@ pub fn run_remote_job_with(
     do_apply: bool,
     verbose: bool,
     acknowledged: bool,
-    ctx: &crate::progress::RunCtx,
+    ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<(u64, u64, u64, u64)> {
     let plan = match compare_remote_job_with(name, job, ctx) {
         Ok(p) => p,
         Err(e) => {
             // Cancelled in the compare stage: the terminal state must still be visible (the desktop closes out on Summary)
-            if crate::progress::is_cancelled(&e) {
+            if crate::obs::progress::is_cancelled(&e) {
                 emit_cancel_summary(ctx, std::time::Instant::now());
             }
             return Err(e);
         }
     };
     ctx.log(
-        crate::progress::LogLevel::Info,
+        crate::model::event::LogLevel::Info,
         "run",
         format!(
             "[{name}] {} op(s), {} conflict(s)  (remote pipeline via ssh)",
@@ -396,14 +397,14 @@ pub fn run_remote_job_with(
         .cloned()
         .collect();
     let t0 = std::time::Instant::now();
-    let rec = crate::runlog::Recorder::start(name, "remote-apply", ctx, &ops);
+    let rec = crate::obs::runlog::Recorder::start(name, "remote-apply", ctx, &ops);
     let out = apply_remote_job_with(name, job, &plan, &ops, verbose, acknowledged, &rec.ctx)?;
     rec.finish(&out, t0.elapsed().as_millis() as u64);
     Ok((out.done, out.skipped, out.errors, plan.header.conflict_count))
 }
 
-fn emit_cancel_summary(ctx: &crate::progress::RunCtx, t0: std::time::Instant) {
-    ctx.sink.emit(crate::progress::ProgressEvent::Summary {
+fn emit_cancel_summary(ctx: &crate::obs::progress::RunCtx, t0: std::time::Instant) {
+    ctx.sink.emit(crate::model::event::ProgressEvent::Summary {
         ts_ms: crate::foundation::time::now_ms(),
         done: 0,
         skipped: 0,
@@ -421,7 +422,7 @@ pub struct RemoteLink {
     pub host: String,
     pub exe: String,
     pub rroot: String,
-    pub shell: crate::remote::RemoteShell,
+    pub shell: crate::transfer::remote::RemoteShell,
 }
 
 /// Stage 1: probe reachability + schema agreement + the remote OS (which decides the shell dialect).
@@ -429,7 +430,7 @@ pub struct RemoteLink {
 /// It takes `ctx` for the sake of the schema-mismatch warning: that one has to reach the UI **during compare**.
 /// Going through the macro and the global registry, no sink is installed during compare (only apply starts a Recorder),
 /// so this line in particular would fall back to stderr — which in a windowed desktop build is the same as saying nothing.
-pub fn probe_remote(name: &str, job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<RemoteLink> {
+pub fn probe_remote(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<RemoteLink> {
     let host = job
         .remote_host
         .as_deref()
@@ -439,23 +440,23 @@ pub fn probe_remote(name: &str, job: &Job, ctx: &crate::progress::RunCtx) -> std
         .remote_root
         .as_deref()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "remote_root required for remote jobs"))?;
-    let probe = crate::remote::ssh_capture(host, &format!("{exe} probe"))?;
+    let probe = crate::transfer::remote::ssh_capture(host, &format!("{exe} probe"))?;
     let pv: serde_json::Value = serde_json::from_slice(&probe)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad probe output: {e}")))?;
-    if pv["schema"].as_u64() != Some(crate::table::SCHEMA as u64) {
+    if pv["schema"].as_u64() != Some(crate::model::table::SCHEMA as u64) {
         ctx.log(
-            crate::progress::LogLevel::Warn,
+            crate::model::event::LogLevel::Warn,
             "remote",
             format!(
                 "[{name}] warning: remote schema {} != local {} — rebuild the remote binary",
                 pv["schema"],
-                crate::table::SCHEMA
+                crate::model::table::SCHEMA
             ),
         );
     }
     let remote_os = pv["os"].as_str().unwrap_or("").to_string();
     ctx.log(
-        crate::progress::LogLevel::Info,
+        crate::model::event::LogLevel::Info,
         "remote",
         format!("[{name}] remote {}: {} {}", host, remote_os, pv["arch"].as_str().unwrap_or("?")),
     );
@@ -463,13 +464,13 @@ pub fn probe_remote(name: &str, job: &Job, ctx: &crate::progress::RunCtx) -> std
         host: host.to_string(),
         exe: exe.to_string(),
         rroot: rroot.to_string(),
-        shell: crate::remote::RemoteShell::from_os(&remote_os),
+        shell: crate::transfer::remote::RemoteShell::from_os(&remote_os),
     })
 }
 
 /// v0.9 M3: the **compare stage** of a remote job — the desktop's `compare_job` routes remote jobs straight here
 /// instead of silently dropping into the local pipeline (which would pull the data over UNC and rehash it: an order of magnitude slower, and semantically wrong).
-pub fn compare_remote_job_with(name: &str, job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<Plan> {
+pub fn compare_remote_job_with(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<Plan> {
     compare_remote_job_detailed(name, job, ctx).map(|o| o.plan)
 }
 
@@ -478,9 +479,10 @@ pub fn compare_remote_job_with(name: &str, job: &Job, ctx: &crate::progress::Run
 pub fn compare_remote_job_detailed(
     name: &str,
     job: &Job,
-    ctx: &crate::progress::RunCtx,
+    ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<CompareOutcome> {
-    use crate::progress::{Phase, PhaseProgress};
+    use crate::model::event::Phase;
+use crate::obs::progress::PhaseProgress;
     let link = probe_remote(name, job, ctx)?;
 
     // 2) Remote scan (hashing on the remote's own disk — far faster than pulling the data over UNC)
@@ -511,14 +513,14 @@ pub fn compare_remote_job_detailed(
     ctx.checkpoint()?;
     // The remote scans on its own disk, so locally all we can show is "in progress" — totals zeroed, the label spells out who we are waiting on
     let _pp_rs = PhaseProgress::begin(ctx, Phase::ScanTarget, Some(format!("ssh:{} {}", link.host, link.rroot)), 0, 0);
-    let table_bytes = crate::remote::ssh_capture(&link.host, &crate::remote::remote_cmd(link.shell, &link.exe, &scan_args))?;
+    let table_bytes = crate::transfer::remote::ssh_capture(&link.host, &crate::transfer::remote::remote_cmd(link.shell, &link.exe, &scan_args))?;
     let t = Snapshot::from_reader(std::io::BufReader::new(&table_bytes[..]))?;
 
     // 3) Local scan + compare (the local source side goes through the mount-point gate too)
-    let mut v = crate::preflight::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-    crate::preflight::check_root("source", &job.source, job.require_marker, &mut v);
+    let mut v = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
+    crate::pipeline::guard::check_root("source", &job.source, job.require_marker, &mut v);
     for w in &v.warnings {
-        ctx.log(crate::progress::LogLevel::Warn, "compare", format!("[{name}] warning: {w}"));
+        ctx.log(crate::model::event::LogLevel::Warn, "compare", format!("[{name}] warning: {w}"));
     }
     if !v.ok() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
@@ -542,12 +544,12 @@ pub fn compare_remote_job_detailed(
 
 /// The plan health check for a remote job (used by the desktop confirmation sheet): the deletion-share gate only —
 /// disk space and the marker live on the remote machine; we cannot check them locally and must not pretend we did.
-pub fn preflight_remote_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::preflight::Verdict {
+pub fn preflight_remote_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::pipeline::guard::Verdict {
     let g = job.guards(acknowledged);
-    let st = crate::preflight::stat_plan(ops);
-    let mut gv = crate::preflight::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-    crate::preflight::check_delete_ratio("target", &st.target, plan.header.target_entries, &g, &mut gv);
-    crate::preflight::check_delete_ratio("source", &st.source, plan.header.source_entries, &g, &mut gv);
+    let st = crate::pipeline::guard::stat_plan(ops);
+    let mut gv = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
+    crate::pipeline::guard::check_delete_ratio("target", &st.target, plan.header.target_entries, &g, &mut gv);
+    crate::pipeline::guard::check_delete_ratio("source", &st.source, plan.header.source_entries, &g, &mut gv);
     gv
 }
 
@@ -560,12 +562,12 @@ pub fn apply_remote_job_with(
     ops: &[Op],
     verbose: bool,
     acknowledged: bool,
-    ctx: &crate::progress::RunCtx,
-) -> std::io::Result<crate::progress::ApplyOutcome> {
+    ctx: &crate::obs::progress::RunCtx,
+) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
     let t0 = std::time::Instant::now();
     let r = apply_remote_inner(name, job, plan, ops, verbose, acknowledged, ctx, t0);
     if let Err(e) = &r {
-        if crate::progress::is_cancelled(e) {
+        if crate::obs::progress::is_cancelled(e) {
             emit_cancel_summary(ctx, t0);
         }
     }
@@ -580,11 +582,12 @@ fn apply_remote_inner(
     sel_ops: &[Op],
     verbose: bool,
     acknowledged: bool,
-    ctx: &crate::progress::RunCtx,
+    ctx: &crate::obs::progress::RunCtx,
     t0: std::time::Instant,
-) -> std::io::Result<crate::progress::ApplyOutcome> {
-    use crate::compare::Side;
-    use crate::progress::{ApplyOutcome, Phase, PhaseProgress, ProgressEvent};
+) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
+    use crate::model::plan::Side;
+    use crate::model::event::{Phase, ProgressEvent};
+use crate::obs::progress::{ApplyOutcome, PhaseProgress};
 
     // Plan health check: remote disk space is unknowable, but an accident like "delete most of the other side" can be caught locally
     let gv = preflight_remote_job(job, plan_full, sel_ops, acknowledged);
@@ -622,7 +625,7 @@ fn apply_remote_inner(
                 o.side == Side::Target
                     && o.action == Action::Update
                     && o.link.is_none()
-                    && o.size.map(|s| s >= crate::chunk::DELTA_MIN_SIZE).unwrap_or(false)
+                    && o.size.map(|s| s >= crate::model::chunk::DELTA_MIN_SIZE).unwrap_or(false)
             })
             .map(|o| o.path.clone())
             .collect();
@@ -634,7 +637,7 @@ fn apply_remote_inner(
                 args.push("--file".into());
                 args.push(r.clone());
             }
-            match crate::remote::ssh_capture(host, &crate::remote::remote_cmd(shell, exe, &args)) {
+            match crate::transfer::remote::ssh_capture(host, &crate::transfer::remote::remote_cmd(shell, exe, &args)) {
                 Ok(bytes) => {
                     let mut m = std::collections::HashMap::new();
                     for line in String::from_utf8_lossy(&bytes).lines() {
@@ -642,12 +645,12 @@ fn apply_remote_inner(
                         if line.is_empty() {
                             continue;
                         }
-                        if let Ok(fc) = serde_json::from_str::<crate::chunk::FileChunks>(line) {
+                        if let Ok(fc) = serde_json::from_str::<crate::model::chunk::FileChunks>(line) {
                             m.insert(fc.rel.clone(), fc);
                         }
                     }
                     ctx.log(
-                        crate::progress::LogLevel::Info,
+                        crate::model::event::LogLevel::Info,
                         "delta",
                         format!("[{name}] delta: got chunk tables for {} large file(s)", m.len()),
                     );
@@ -655,7 +658,7 @@ fn apply_remote_inner(
                 }
                 Err(e) => {
                     ctx.log(
-                        crate::progress::LogLevel::Warn,
+                        crate::model::event::LogLevel::Warn,
                         "delta",
                         format!("[{name}] delta disabled (chunk request failed: {e})"),
                     );
@@ -666,16 +669,16 @@ fn apply_remote_inner(
         ctx.checkpoint()?;
         let pp_pack = PhaseProgress::begin(ctx, Phase::Pack, Some("packing target-side content".into()), 0, 0);
         let tmp = std::env::temp_dir().join(format!("syncdash-remote-{}.tar", crate::foundation::time::now_ms()));
-        let sum = crate::pack::pack(&plan, &job.source, &tmp, remote_chunks.as_ref())?;
+        let sum = crate::transfer::pack::pack(&plan, &job.source, &tmp, remote_chunks.as_ref())?;
         pp_pack.set_totals(sum.ops, sum.bytes);
         if sum.delta_saved > 0 {
             ctx.log(
-                crate::progress::LogLevel::Info,
+                crate::model::event::LogLevel::Info,
                 "pack",
                 format!("[{name}] packed {} B, delta saved {} B", sum.bytes, sum.delta_saved),
             );
         }
-        let rpkg = if shell == crate::remote::RemoteShell::PowerShell {
+        let rpkg = if shell == crate::transfer::remote::RemoteShell::PowerShell {
             format!("syncdash-{}.tar", crate::foundation::time::now_ms()) // relative path → the remote home directory
         } else {
             format!("/tmp/syncdash-{}.tar", crate::foundation::time::now_ms())
@@ -683,8 +686,8 @@ fn apply_remote_inner(
         ctx.checkpoint()?;
         let tar_len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
         let pp_ship = PhaseProgress::begin(ctx, Phase::Ship, Some(format!("→ ssh:{host}")), 1, tar_len);
-        let recv_cmd = crate::remote::remote_cmd(shell, exe, &["recv".into(), rpkg.clone()]);
-        let ship = crate::remote::ssh_run_with_stdin(host, &recv_cmd, &tmp);
+        let recv_cmd = crate::transfer::remote::remote_cmd(shell, exe, &["recv".into(), rpkg.clone()]);
+        let ship = crate::transfer::remote::ssh_run_with_stdin(host, &recv_cmd, &tmp);
         let _ = std::fs::remove_file(&tmp);
         ship?;
         pp_ship.add_bytes(tar_len, &rpkg);
@@ -700,12 +703,12 @@ fn apply_remote_inner(
         if verbose {
             ap_args.push("-v".into());
         }
-        let ok = crate::remote::ssh_run(host, &crate::remote::remote_cmd(shell, exe, &ap_args))?;
+        let ok = crate::transfer::remote::ssh_run(host, &crate::transfer::remote::remote_cmd(shell, exe, &ap_args))?;
         if ok {
             done += sum.ops;
         } else {
             errors += 1;
-            ctx.log(crate::progress::LogLevel::Error, "remote", format!("[{name}] remote apply-pack reported failure"));
+            ctx.log(crate::model::event::LogLevel::Error, "remote", format!("[{name}] remote apply-pack reported failure"));
             ctx.sink.emit(ProgressEvent::Error {
                 phase: Phase::Apply,
                 ts_ms: crate::foundation::time::now_ms(),
@@ -726,7 +729,7 @@ fn apply_remote_inner(
         .collect();
     if !src_ops.is_empty() {
         if job.target.is_dir() {
-            let out = crate::apply::apply_with(
+            let out = crate::pipeline::apply::apply_with(
                 &src_ops,
                 &job.source,
                 &job.target,
@@ -740,7 +743,7 @@ fn apply_remote_inner(
         } else {
             skipped += src_ops.len() as u64;
             ctx.log(
-                crate::progress::LogLevel::Warn,
+                crate::model::event::LogLevel::Warn,
                 "remote",
                 format!(
                     "[{name}] {} source-side op(s) skipped: mounted target '{}' not accessible (pull direction needs the SMB mount)",
