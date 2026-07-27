@@ -4,7 +4,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct Job {
     /// mirror | sync | enrich
     pub mode: String,
@@ -21,7 +22,11 @@ pub struct Job {
     /// include 白名单（FFS 过滤器语法；留空 = `*` 全部）
     #[serde(default)]
     pub include: Vec<String>,
-    /// 追加排除（FFS 过滤器语法，如 `*/big_temp/`、`*/*.log`；默认垃圾/可重建排除已内置）
+    /// 追加排除（FFS 过滤器语法，如 `big_temp/`、`*.log`，前缀 `*` 表示任意层级；
+    /// 默认垃圾/可重建排除已内置）。
+    ///
+    /// 掩码里的星号-斜杠序列不写进本行：ts-rs 会把这段文档原样搬进生成的 JSDoc，
+    /// 那两个字符会提前终止注释块，产出语法非法的 .ts。
     #[serde(default)]
     pub exclude: Vec<String>,
     #[serde(default)]
@@ -103,9 +108,11 @@ pub struct Job {
     pub dev_excludes: bool,
     /// Copy/Update 相位的并行宽度（1 = 顺序）。缺省 4；clamp 1..=16
     #[serde(default)]
+    #[ts(type = "number | null")]
     pub parallel: Option<usize>,
     /// M6 定时扫描：每 N 秒自动比对（None = 关闭）。秒级档＝"准实时"；UNC 目标建议 ≥30
     #[serde(default)]
+    #[ts(type = "number | null")]
     pub watch_interval_secs: Option<u64>,
     /// watch 发现差异时自动执行（默认 false = 只提醒不动手）
     #[serde(default)]

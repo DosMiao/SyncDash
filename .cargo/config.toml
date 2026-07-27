@@ -1,0 +1,12 @@
+# 跟踪进 git 的项目级配置——保持机器无关。机器相关的覆盖（target-dir 重定向之类）
+# 走环境变量（CARGO_TARGET_DIR）或 $CARGO_HOME/config.toml，不要写进这个文件。
+
+# ts-rs 把 `export_to` 解析成相对于 TS_RS_EXPORT_DIR 的路径，默认是
+# `<crate manifest dir>/bindings`。本仓有两个 crate 且深度不同
+# （`.` 与 `src-tauri`），默认值会让两边导到不同的地方去。
+#
+# 这里把基准钉死在**工作区根**（relative = true 是相对于本文件所在的
+# `.cargo/` 的父目录，即仓库根），于是两个 crate 的 `export_to` 都从
+# `<repo>/bindings` 起算，统一写进 `typescript/core/types/generated/`。
+[env]
+TS_RS_EXPORT_DIR = { value = "bindings", relative = true }

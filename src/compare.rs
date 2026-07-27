@@ -14,14 +14,21 @@
 //!     Conflict("illegal-on-windows")，绝不执行到一半才炸
 //!   - 相等判定：双方都有 hash → 按 hash；否则 size 相等且 |Δmtime| <= 2s（FAT/SMB 时间粒度）
 
-use crate::table::{now_ms, Entry, EntryKind, Snapshot};
+// 比对键（norm_key/fold）、时间戳、路径切分、冲突中缀的真身都在 `foundation`——
+// 这里只调用，不再各留一份抄本（`stamp` 里那段 civil_from_days 全仓曾有三份）。
+use crate::foundation::names::CONFLICT_INFIX;
+use crate::foundation::path::{base_name, split_ext, split_parent};
+use crate::foundation::text::{fold, norm_key, safe_host};
+use crate::foundation::time::stamp_compact;
+use crate::foundation::time::now_ms;
+use crate::table::{Entry, EntryKind, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use unicode_normalization::UnicodeNormalization;
 
 pub const MTIME_SLACK_MS: i64 = 2000;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     Copy,
@@ -36,14 +43,16 @@ pub enum Action {
     Note,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
     Source,
     Target,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct Op {
     pub side: Side,
     pub action: Action,
@@ -51,8 +60,10 @@ pub struct Op {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[ts(type = "number | null")]
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[ts(type = "number | null")]
     pub mtime_ms: Option<i64>,
     /// 复制/更新内容的期望 hash（paranoid 模式复制后校验用）
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -66,28 +77,36 @@ pub struct Op {
     pub reason: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct PlanHeader {
     pub schema: u32,
     pub kind: String,
     pub mode: String,
+    #[ts(type = "number")]
     pub generated_at_ms: u64,
     pub source_root: String,
     pub source_host: String,
     pub target_root: String,
     pub target_host: String,
+    #[ts(type = "number")]
     pub op_count: u64,
+    #[ts(type = "number")]
     pub conflict_count: u64,
     /// 两侧快照的条目数。计划体检（删除占比）要用，也让计划文件本身可自证规模。
     #[serde(default)]
+    #[ts(type = "number")]
     pub source_entries: u64,
     #[serde(default)]
+    #[ts(type = "number")]
     pub target_entries: u64,
     /// 两侧被过滤器排除的条目数（目录+文件）。排除必须可见：界面据此明示
     /// "有多少东西没参与比对"，绝不允许"两侧一致 ✓"背后藏着被吞掉的树。
     #[serde(default)]
+    #[ts(type = "number")]
     pub source_excluded: u64,
     #[serde(default)]
+    #[ts(type = "number")]
     pub target_excluded: u64,
 }
 
@@ -161,50 +180,17 @@ impl Default for CompareOptions {
 /// 冲突副本名：`report.pdf` → `report.sync-conflict-20260726-143000-WIN01.pdf`
 /// （与 syncthing 的命名同构，便于人一眼认出，也便于双方的过滤器识别）
 pub fn conflict_name(path: &str, host: &str, at_ms: u64) -> String {
-    let (dir, base) = match path.rfind('/') {
-        Some(i) => (&path[..=i], &path[i + 1..]),
-        None => ("", path),
-    };
-    // 只认最后一个点之后的扩展名；隐藏文件（.gitignore）不当作扩展名
-    let (stem, ext) = match base.rfind('.') {
-        Some(i) if i > 0 => (&base[..i], &base[i..]),
-        _ => (base, ""),
-    };
-    let safe_host: String = host
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
-        .collect();
-    format!("{dir}{stem}.sync-conflict-{}-{safe_host}{ext}", stamp(at_ms))
+    let (dir, base) = split_parent(path);
+    // split_ext 只认最后一个点之后的扩展名；隐藏文件（.gitignore）整体算主干
+    let (stem, ext) = split_ext(base);
+    let ts = stamp_compact(at_ms as i64);
+    let host = safe_host(host);
+    format!("{dir}{stem}{CONFLICT_INFIX}{ts}-{host}{ext}")
 }
 
 /// 冲突副本自身不该再参与同步/冲突判定（syncthing `isConflict`，:2224）
 pub fn is_conflict_copy(path: &str) -> bool {
-    path.rsplit('/').next().unwrap_or(path).contains(".sync-conflict-")
-}
-
-/// UTC 时间戳 YYYYMMDD-HHMMSS（不引入 chrono：只需要一个稳定可读的标签）
-fn stamp(ms: u64) -> String {
-    let secs = (ms / 1000) as i64;
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
-    // 民用历法换算（Howard Hinnant 的 civil_from_days）
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{:04}{:02}{:02}-{:02}{:02}{:02}", y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60)
-}
-
-/// 比对键：NFC 归一化 ＋（可选）大小写折叠。只用于匹配，不用于 I/O。
-fn norm_key(p: &str, ci: bool) -> String {
-    let nfc: String = p.nfc().collect();
-    if ci { nfc.to_uppercase() } else { nfc }
+    base_name(path).contains(CONFLICT_INFIX)
 }
 
 fn files_equal(a: &Entry, b: &Entry) -> bool {
@@ -243,14 +229,18 @@ fn map_of<'a>(snap: &'a Snapshot, kind: EntryKind, ci: bool) -> (BTreeMap<String
 // ---------- 证据层（只读，界面用；compare() 不受影响） ----------
 
 /// 比对时点某一侧的实测状态。**只供展示与排序**，apply 一个字节都不读它。
-#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct SideMeta {
+    #[ts(type = "number")]
     pub size: u64,
+    #[ts(type = "number")]
     pub mtime_ms: i64,
 }
 
 /// 与 `plan.ops[i]` 一一对应的两侧实测状态（缺席的一侧为 None）
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct RowMeta {
     pub src: Option<SideMeta>,
     pub dst: Option<SideMeta>,
@@ -316,12 +306,16 @@ pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &Compa
 }
 
 /// 一条"两侧相同"的记录。计划里没有它——它不是动作，是证据。
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct SameRow {
     pub path: String,
+    #[ts(type = "number")]
     pub size: u64,
+    #[ts(type = "number")]
     pub mtime_ms: i64,
     /// target 侧的时间（内容相同但时间戳可以差几毫秒——FAT/SMB 粒度）
+    #[ts(type = "number")]
     pub other_mtime_ms: i64,
 }
 
@@ -823,7 +817,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
     // 往 target 写 `Foo.txt` 会静默覆盖已存在的 `foo.txt`。syncthing 在写入前解析
     // 目录真名并报 CaseConflictError（`lib/fs/casefs.go:27-37`）；我们在计划阶段就拦。
     if !ci {
-        let fold = |p: &str| -> String { p.nfc().collect::<String>().to_uppercase() };
+        // fold = foundation::text::fold，与比对键 norm_key 同一份归一化实现
         let mut folded: HashMap<(bool, String), Vec<&str>> = HashMap::new();
         for (is_target, snap) in [(false, source), (true, target)] {
             for e in &snap.entries {
@@ -929,7 +923,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                 for e in snap.entries.iter().filter(|e| e.kind == EntryKind::File) {
                     if is_conflict_copy(&e.path) {
                         // 归组到原始文件名：去掉 `.sync-conflict-…` 那一段
-                        if let Some(i) = e.path.find(".sync-conflict-") {
+                        if let Some(i) = e.path.find(CONFLICT_INFIX) {
                             let stem = &e.path[..i];
                             groups.entry(stem.to_string()).or_default().push(&e.path);
                         }
