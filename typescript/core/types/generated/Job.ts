@@ -2,6 +2,12 @@
 
 export type Job = { 
 /**
+ * Job-file schema version. A file written before the junk presets became part of `exclude`
+ * carries no `schema` key, deserializes as 1, and is migrated on load — see `migrate_v1_junk_presets`.
+ * `save_job` always stamps the current version, because a file we just wrote is by definition current.
+ */
+schema: number, 
+/**
  * mirror | sync | enrich
  */
 mode: string, 
@@ -26,8 +32,12 @@ archive: string | null,
  */
 include: Array<string>, 
 /**
- * Extra excludes (FFS filter syntax, e.g. `big_temp/`, `*.log`; a leading `*` means any depth;
- * the default junk / rebuildable excludes are already built in).
+ * Excludes (FFS filter syntax, e.g. `big_temp/`, `*.log`; a leading `*` means any depth;
+ * a leading `!` makes the line an exception).
+ *
+ * **This is the whole exclude policy** apart from the tool's own metadata. The junk presets
+ * (Windows / macOS / Developer / …) write their patterns into this very list, so what the editor
+ * shows here is what the filter does — there is no second set of rules applied behind it.
  *
  * Do not put a mask's star-slash sequence on this line: ts-rs copies this doc verbatim into the
  * generated JSDoc, and those two characters would end the comment block early, yielding invalid .ts.
@@ -118,16 +128,6 @@ deletable: Array<string>,
  * A net win on SMB/WAN uploads, a wash on symmetric links — hence off by default, enable it per link.
  */
 delta: boolean, 
-/**
- * OS-junk exclude preset: auto (both the Win and Mac sets, the default — cross-machine syncs must guard both) | windows | mac | off.
- * The excluded count always shows in the UI's "⚠ Excluded", never silently
- */
-os_excludes: string, 
-/**
- * Exclude rebuildable dev artifacts (.git/node_modules/target/build/dist/venv…).
- * **Off by default — .git is a normal tree too**; code-sync jobs turn it on explicitly (the cs-* jobs from gen-jobs already do)
- */
-dev_excludes: boolean, 
 /**
  * Parallel width for the Copy/Update phase (1 = sequential). Defaults to 4; clamped to 1..=16
  */

@@ -14,7 +14,7 @@ use std::path::Path;
 /// standard really reads every file's sampling window this round (no cache — not memory, a measurement taken now)
 /// paranoid really reads every byte of every file this round
 pub fn scan_opts(job: &Job) -> scan::ScanOptions {
-    let filter = crate::pipeline::filter::PathFilter::build_full_opt(&job.include, &job.exclude, &job.deletable, &job.os_excludes, job.dev_excludes);
+    let filter = crate::pipeline::filter::PathFilter::build_full(&job.include, &job.exclude, &job.deletable);
     let r = job.rigor_resolved();
     scan::ScanOptions { hash: r.hash, sampled: r.sampled, use_cache: r.use_cache, symlinks_direct: job.symlinks == "direct", filter }
 }
@@ -734,13 +734,11 @@ use crate::obs::progress::PhaseProgress;
         "--cache".into(),
         (if rr.use_cache { "on" } else { "off" }).into(),
     ];
-    if job.dev_excludes {
-        scan_args.push("--dev-excludes".into());
-    }
-    if job.os_excludes != "auto" {
-        scan_args.push("--os-excludes".into());
-        scan_args.push(job.os_excludes.clone());
-    }
+    // `--junk none`: the job's `exclude` already carries every junk pattern it wants, so letting the
+    // remote add its own CLI default on top would make the two sides filter differently — and a rule
+    // that applies to only one root is the shape that gets a tree proposed for deletion.
+    scan_args.push("--junk".into());
+    scan_args.push("none".into());
     for ex in &job.exclude {
         scan_args.push("--exclude".into());
         scan_args.push(ex.clone());

@@ -12,6 +12,12 @@ use std::path::PathBuf;
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct Job {
+    /// Job-file schema version. A file written before the junk presets became part of `exclude`
+    /// carries no `schema` key, deserializes as 1, and is migrated on load — see `migrate_v1_junk_presets`.
+    /// `save_job` always stamps the current version, because a file we just wrote is by definition current.
+    #[serde(default = "default_schema")]
+    #[ts(type = "number")]
+    pub schema: u32,
     /// mirror | sync | enrich
     pub mode: String,
     /// Root phrase: a local path, or `scheme://…` for a VFS root (sftp/ftp/ftps/smb).
@@ -30,8 +36,12 @@ pub struct Job {
     /// include allowlist (FFS filter syntax; empty = `*`, everything)
     #[serde(default)]
     pub include: Vec<String>,
-    /// Extra excludes (FFS filter syntax, e.g. `big_temp/`, `*.log`; a leading `*` means any depth;
-    /// the default junk / rebuildable excludes are already built in).
+    /// Excludes (FFS filter syntax, e.g. `big_temp/`, `*.log`; a leading `*` means any depth;
+    /// a leading `!` makes the line an exception).
+    ///
+    /// **This is the whole exclude policy** apart from the tool's own metadata. The junk presets
+    /// (Windows / macOS / Developer / …) write their patterns into this very list, so what the editor
+    /// shows here is what the filter does — there is no second set of rules applied behind it.
     ///
     /// Do not put a mask's star-slash sequence on this line: ts-rs copies this doc verbatim into the
     /// generated JSDoc, and those two characters would end the comment block early, yielding invalid .ts.
@@ -106,14 +116,6 @@ pub struct Job {
     /// A net win on SMB/WAN uploads, a wash on symmetric links — hence off by default, enable it per link.
     #[serde(default)]
     pub delta: bool,
-    /// OS-junk exclude preset: auto (both the Win and Mac sets, the default — cross-machine syncs must guard both) | windows | mac | off.
-    /// The excluded count always shows in the UI's "⚠ Excluded", never silently
-    #[serde(default = "default_os_excludes")]
-    pub os_excludes: String,
-    /// Exclude rebuildable dev artifacts (.git/node_modules/target/build/dist/venv…).
-    /// **Off by default — .git is a normal tree too**; code-sync jobs turn it on explicitly (the cs-* jobs from gen-jobs already do)
-    #[serde(default)]
-    pub dev_excludes: bool,
     /// Parallel width for the Copy/Update phase (1 = sequential). Defaults to 4; clamped to 1..=16
     #[serde(default)]
     #[ts(type = "number | null")]
@@ -130,13 +132,21 @@ pub struct Job {
 impl Default for Job {
     fn default() -> Self {
         Job {
+            // SCHEMA, **not** `default_schema()`: those two mean opposite things and conflating them is
+            // a live bug. `default_schema()` answers "this file has no schema key, so it predates the
+            // presets — migrate it"; a Job built here and now is current by construction. Getting this
+            // wrong made every job written straight to TOML (gen-jobs) come back through the v1
+            // migration on load and silently acquire preset patterns nobody selected.
+            schema: SCHEMA,
             mode: "mirror".into(),
             source: String::new(),
             target: String::new(),
             targets: Vec::new(),
             archive: None,
             include: Vec::new(),
-            exclude: Vec::new(),
+            // A new job is born with the default-on junk presets already **written out** in exclude,
+            // which is what `os_excludes = "auto"` used to mean invisibly
+            exclude: crate::pipeline::filter::default_junk_patterns(),
             no_hash: false,
             rigor: default_rigor(),
             evidence: None,
@@ -158,8 +168,6 @@ impl Default for Job {
             sync_mode: false,
             deletable: Vec::new(),
             delta: false,
-            os_excludes: default_os_excludes(),
-            dev_excludes: false,
             parallel: None,
             watch_interval_secs: None,
             watch_auto_apply: false,
@@ -170,8 +178,12 @@ impl Default for Job {
 fn default_true() -> bool {
     true
 }
-fn default_os_excludes() -> String {
-    "auto".into()
+/// Current job-file schema. Bump when a load-time migration is added, and give the migration a
+/// `schema < N` guard — the version is what tells "the user deleted this rule" apart from
+/// "this file predates the rule", which no amount of inspecting the contents can.
+pub const SCHEMA: u32 = 2;
+fn default_schema() -> u32 {
+    1 // no `schema` key in the file = written before versioning existed = needs the v1 migration
 }
 fn default_min_free() -> f64 {
     0.01
@@ -368,7 +380,7 @@ impl Job {
             verify: self.rigor_resolved().verify_writes,
             versioning: self.versioning,
             fsync: self.fsync,
-            filter: Some(crate::pipeline::filter::PathFilter::build_full_opt(&self.include, &self.exclude, &self.deletable, &self.os_excludes, self.dev_excludes)),
+            filter: Some(crate::pipeline::filter::PathFilter::build_full(&self.include, &self.exclude, &self.deletable)),
             delta: self.delta,
             parallel: self.parallel.unwrap_or(4).clamp(1, 16),
         }
@@ -383,25 +395,95 @@ fn default_symlinks() -> String {
     "exclude".into()
 }
 
-pub fn load(name_or_path: &str) -> std::io::Result<(String, Job)> {
+/// A job name (looked up in the jobs directory) or a direct path to a `.toml`, resolved to the file.
+pub fn resolve_path(name_or_path: &str) -> std::io::Result<PathBuf> {
     let p = PathBuf::from(name_or_path);
-    let path = if p.is_file() {
-        p
-    } else {
-        let cand = crate::foundation::dirs::jobs_dir().join(format!("{name_or_path}.toml"));
-        if !cand.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("job not found: {name_or_path} (looked at {})", cand.display()),
-            ));
-        }
-        cand
-    };
+    if p.is_file() {
+        return Ok(p);
+    }
+    let cand = crate::foundation::dirs::jobs_dir().join(format!("{name_or_path}.toml"));
+    if !cand.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("job not found: {name_or_path} (looked at {})", cand.display()),
+        ));
+    }
+    Ok(cand)
+}
+
+/// The schema a job file declares **as it sits on disk**, before `load` migrates it.
+///
+/// `load` returns the migrated job, so by then the difference has been erased — but a v1 file's junk
+/// rules have just been materialized into `exclude`, and anything showing that list has to be able to
+/// say those lines are not in the file yet. A file with no `schema` key predates versioning: v1.
+pub fn file_schema(name_or_path: &str) -> std::io::Result<u32> {
+    #[derive(Deserialize)]
+    struct OnlySchema {
+        #[serde(default = "default_schema")]
+        schema: u32,
+    }
+    let path = resolve_path(name_or_path)?;
+    let text = std::fs::read_to_string(&path)?;
+    let parsed: OnlySchema = toml::from_str(&text)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad job file {}: {e}", path.display())))?;
+    Ok(parsed.schema)
+}
+
+pub fn load(name_or_path: &str) -> std::io::Result<(String, Job)> {
+    let path = resolve_path(name_or_path)?;
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let text = std::fs::read_to_string(&path)?;
-    let job: Job = toml::from_str(&text)
+    let mut job: Job = toml::from_str(&text)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad job file {}: {e}", path.display())))?;
+    if job.schema < SCHEMA {
+        migrate_v1_junk_presets(&mut job, &text);
+    }
     Ok((name, job))
+}
+
+/// The keys a v1 job file used to express junk exclusion. Read once, on load, and never written again.
+#[derive(Deserialize)]
+struct LegacyJunkKeys {
+    /// "auto" (Windows + macOS) | "windows" | "mac" | "off" — absent meant "auto"
+    #[serde(default = "legacy_os_excludes_default")]
+    os_excludes: String,
+    #[serde(default)]
+    dev_excludes: bool,
+}
+
+fn legacy_os_excludes_default() -> String {
+    "auto".into()
+}
+
+/// v1 → v2: junk exclusion moves out of `os_excludes`/`dev_excludes` and into `exclude`, where it is visible.
+///
+/// The expansion is exactly what the old built-in tiers matched, prepended to whatever the user had
+/// already written, so a migrated job filters **identically** to before — a migration that quietly widens
+/// or narrows a filter is how a sync tool starts proposing deletions nobody asked for.
+///
+/// The `schema` guard is doing real work: without it there is no way to tell a v2 job whose owner
+/// deliberately deleted `*/.DS_Store` from a v1 job that never listed it, and every load would helpfully
+/// put the rule back.
+fn migrate_v1_junk_presets(job: &mut Job, text: &str) {
+    use crate::pipeline::filter::{expand_junk_presets, same_exclude_entry};
+    let legacy: LegacyJunkKeys = toml::from_str(text).unwrap_or(LegacyJunkKeys {
+        os_excludes: legacy_os_excludes_default(),
+        dev_excludes: false,
+    });
+    let mut ids: Vec<&str> = match legacy.os_excludes.trim() {
+        "off" => vec![],
+        "windows" => vec!["windows"],
+        "mac" => vec!["macos"], // the preset id is spelled out in full; the old key said "mac"
+        _ => vec!["windows", "macos"],
+    };
+    if legacy.dev_excludes {
+        ids.push("dev");
+    }
+    let mut merged = expand_junk_presets(ids);
+    merged.retain(|p| !job.exclude.iter().any(|e| same_exclude_entry(e, p)));
+    merged.append(&mut job.exclude);
+    job.exclude = merged;
+    job.schema = SCHEMA;
 }
 
 pub fn load_all() -> Vec<(String, Job)> {
@@ -424,6 +506,10 @@ pub fn load_all() -> Vec<(String, Job)> {
 pub fn save_job(name: &str, job: &Job) -> std::io::Result<PathBuf> {
     let dir = crate::foundation::dirs::jobs_dir();
     std::fs::create_dir_all(&dir)?;
+    // Stamp the version here rather than trusting the caller: a file written by this build is current
+    // by construction, and a stale `schema` on the way in would make the next load re-run the v1
+    // migration and re-add preset patterns the user had just deleted.
+    let job = &Job { schema: SCHEMA, ..job.clone() };
     let text = toml::to_string_pretty(job)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}")))?;
     let path = dir.join(format!("{name}.toml"));
@@ -436,12 +522,16 @@ pub fn delete_job(name: &str) -> std::io::Result<()> {
 }
 
 pub const SAMPLE: &str = r#"# %APPDATA%\syncdash\jobs\<name>.toml — one file, one job
+schema = 2                 # job-file schema; a file without it is migrated on load (junk presets -> exclude)
 mode = "mirror"            # mirror | sync | enrich
 source = 'D:\some\dir'
 target = '\\host\share\dir'
 # archive = 'C:\Users\me\AppData\Roaming\syncdash\archive\<name>.jsonl'   # for sync mode
 # include = ['*']                       # FFS filter-syntax allowlist (empty = everything)
-# exclude = ['*/big_temp/', '*/*.log']  # FFS syntax; the default junk/rebuildable excludes are built in
+# exclude = ['*/big_temp/', '*/*.log']  # FFS syntax. The ONLY exclude policy besides this tool's own metadata —
+#                                       # junk presets (Windows/macOS/Linux/Developer/IDE/Office/sync tools) write
+#                                       # their patterns straight into this list, so it always reads as what runs.
+#                                       # `syncdash junk` prints the presets; `syncdash scan --junk <ids>` applies them ad hoc
 # rigor = "standard"                    # shortcut preset: quick | fast | standard | paranoid | custom
 # --- rigor detail knobs (a value here overrides the preset's axis; the UI writes them all explicitly) ---
 # evidence = "sampled"                  # content evidence: none (0 reads) | sampled (256KB each at head/middle/tail) | full (whole file)
@@ -466,10 +556,6 @@ target = '\\host\share\dir'
 # max_conflicts = 5                     # with on_conflict="copy", how many copies to keep per file (-1 = unlimited)
 # sync_mode = false                     # sync unix permission bits (only meaningful when both sides are unix)
 #
-# os_excludes = "auto"                  # OS-junk preset: auto (both Win and Mac, the default) | windows | mac | off
-# dev_excludes = false                  # exclude dev artifacts (.git/node_modules/target…). Off by default — .git is a normal tree too;
-#                                       # set true for code-sync jobs. The excluded count always shows in the UI's "⚠ Excluded", never silently
-#
 # --- filter extensions ---
 # exclude = ['*/*.log', '!*/audit.log'] # a `!` prefix = exception, beats every other exclude
 # deletable = ['*/node_modules/']       # not synced, but may go along when a parent directory is deleted (syncthing's (?d))
@@ -487,6 +573,136 @@ target = '\\host\share\dir'
 # remote_root = '/Users/xxx/Code/some/dir'
 # remote_exe = '~/Code/Utilities/SyncDash/target/release/syncdash'
 "#;
+
+/// The v1 → v2 migration. Its one job is to be a **behavioural no-op**: whatever a job file used to
+/// exclude via `os_excludes`/`dev_excludes`, it must still exclude — now spelled out where it can be read.
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::pipeline::filter::{expand_junk_presets, PathFilter};
+
+    fn load_text(tag: &str, text: &str) -> Job {
+        let p = std::env::temp_dir().join(format!("syncdash-job-{tag}-{}.toml", crate::foundation::time::now_ms()));
+        std::fs::write(&p, text).unwrap();
+        let (_, j) = load(&p.to_string_lossy()).unwrap();
+        let _ = std::fs::remove_file(&p);
+        j
+    }
+
+    const HEAD: &str = "mode = 'mirror'\nsource = 'S'\ntarget = 'T'\n";
+
+    #[test]
+    fn legacy_presets_land_in_exclude_and_filter_identically() {
+        // os_excludes = "auto" + dev_excludes = true, the shape `gen-jobs` wrote for every cs-* job
+        let j = load_text("auto-dev", &format!("{HEAD}os_excludes = 'auto'\ndev_excludes = true\n"));
+        assert_eq!(j.schema, SCHEMA);
+        assert_eq!(j.exclude, expand_junk_presets(["windows", "macos", "dev"]));
+        let pf = PathFilter::build(&j.include, &j.exclude);
+        assert!(!pf.pass_file("a/Thumbs.db"));
+        assert!(!pf.pass_file("a/.DS_Store"));
+        assert!(!pf.pass_dir("proj/.git").0);
+
+        // A file that never mentioned the key: absent meant "auto", so it must still mean Windows + macOS
+        let j = load_text("implicit", HEAD);
+        assert_eq!(j.exclude, expand_junk_presets(["windows", "macos"]));
+
+        // …and "off" meant off. Migrating it into a non-empty list would be inventing a rule.
+        let j = load_text("off", &format!("{HEAD}os_excludes = 'off'\n"));
+        assert!(j.exclude.is_empty());
+
+        // The old key spelled macOS "mac"; the preset id is "macos". The rules must survive the rename.
+        let j = load_text("mac", &format!("{HEAD}os_excludes = 'mac'\n"));
+        assert_eq!(j.exclude, expand_junk_presets(["macos"]));
+        assert!(!PathFilter::build(&[], &j.exclude).pass_file("a/.DS_Store"));
+        assert!(PathFilter::build(&[], &j.exclude).pass_file("a/Thumbs.db"), "'mac' must not drag Windows in");
+    }
+
+    #[test]
+    fn migration_keeps_the_users_own_lines_and_never_duplicates() {
+        let j = load_text(
+            "mixed",
+            // Single-quoted TOML is literal — this reaches the job as one backslash, the Windows spelling
+            &format!("{HEAD}os_excludes = 'windows'\nexclude = ['*/big_temp/', '*\\Thumbs.db', '!*/keep.log']\n"),
+        );
+        // The user had already written Thumbs.db by hand (backslash, different case): one line, not two
+        assert_eq!(j.exclude.iter().filter(|e| e.to_lowercase().contains("thumbs.db")).count(), 1);
+        // Their own entries survive, in their own order, after the preset block
+        assert!(j.exclude.contains(&"*/big_temp/".to_string()));
+        assert!(j.exclude.contains(&"!*/keep.log".to_string()));
+        let pf = PathFilter::build(&[], &j.exclude);
+        assert!(!pf.pass_file("x/big_temp/f"));
+        assert!(pf.pass_file("x/keep.log"), "the ! exception must survive the migration");
+    }
+
+    /// The regression this whole version field exists to prevent: once migrated, a user who deletes a
+    /// preset line must find it still gone next time. A load that "helpfully" restores it is a filter
+    /// that silently disagrees with what the editor shows.
+    #[test]
+    fn a_v2_job_is_never_re_migrated() {
+        let j = load_text("v2", &format!("schema = 2\n{HEAD}exclude = ['*/only_this/']\n"));
+        assert_eq!(j.exclude, vec!["*/only_this/".to_string()], "v2 files are taken at their word");
+        let j = load_text("v2-empty", &format!("schema = 2\n{HEAD}"));
+        assert!(j.exclude.is_empty(), "an empty exclude in a v2 file means empty");
+    }
+
+    /// A Job built in memory and written straight to TOML — which is what `gen-jobs` does, bypassing
+    /// `save_job` — must come back exactly as written. It did not: `Job::default()` stamped the *legacy*
+    /// schema, so every generated job was re-migrated on load and quietly grew preset patterns its author
+    /// never chose. Exclusions appearing on their own is the failure mode this whole design is against.
+    #[test]
+    fn a_job_written_straight_to_toml_round_trips_untouched() {
+        assert_eq!(Job::default().schema, SCHEMA, "a Job built by current code is current-shape");
+        let j = Job {
+            source: "S".into(),
+            target: "T".into(),
+            exclude: vec!["*/only_mine/".into()],
+            ..Default::default()
+        };
+        let p = std::env::temp_dir().join(format!("syncdash-job-rt-{}.toml", crate::foundation::time::now_ms()));
+        std::fs::write(&p, toml::to_string_pretty(&j).unwrap()).unwrap();
+        let (_, back) = load(&p.to_string_lossy()).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(back.exclude, j.exclude, "no rule may appear that the author did not write");
+        assert_eq!(back.schema, SCHEMA);
+    }
+
+    /// `save_job` stamps the current schema itself. If it trusted a caller-supplied version, a frontend
+    /// that omitted the field would round-trip a v2 job back to v1 and the next load would re-add presets.
+    #[test]
+    fn saving_stamps_the_current_schema() {
+        let stale = Job { schema: 1, exclude: vec!["*/mine/".into()], ..Default::default() };
+        let text = toml::to_string_pretty(&Job { schema: SCHEMA, ..stale.clone() }).unwrap();
+        assert!(text.contains("schema = 2"));
+        // …and the migration would have fired on the stale one, which is exactly what stamping prevents
+        let j = load_text("stale", &format!("schema = 1\n{HEAD}exclude = ['*/mine/']\n"));
+        assert!(j.exclude.len() > 1, "premise: schema 1 does trigger the migration");
+    }
+
+    /// `file_schema` reports the file, not the loaded job — that difference is the whole point of it.
+    /// The editor uses it to say "these exclude lines came from the migration and are not in the file
+    /// yet"; if it reported the migrated value it would always say nothing had happened.
+    #[test]
+    fn file_schema_reports_the_file_not_the_migrated_job() {
+        let write = |tag: &str, text: &str| {
+            let p = std::env::temp_dir().join(format!("syncdash-fs-{tag}-{}.toml", crate::foundation::time::now_ms()));
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+
+        // A v1 file: on disk it is 1, while the job load hands back is already migrated to 2
+        let p = write("v1", &format!("{HEAD}os_excludes = 'auto'\n"));
+        assert_eq!(file_schema(&p.to_string_lossy()).unwrap(), 1, "no schema key = v1");
+        assert_eq!(load(&p.to_string_lossy()).unwrap().1.schema, SCHEMA, "…but the loaded job is migrated");
+        let _ = std::fs::remove_file(&p);
+
+        // A v2 file says so, and there is nothing to announce
+        let p = write("v2", &format!("schema = 2\n{HEAD}"));
+        assert_eq!(file_schema(&p.to_string_lossy()).unwrap(), SCHEMA);
+        let _ = std::fs::remove_file(&p);
+
+        assert!(file_schema("no-such-job-exists-here").is_err(), "a missing file is an error, not a version");
+    }
+}
 
 #[cfg(test)]
 mod rigor_tests {
