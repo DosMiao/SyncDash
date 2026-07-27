@@ -63,6 +63,46 @@ fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::obs::progress::RunC
     }
 }
 
+/// Resolve one root phrase to something the engine's local lanes can touch.
+/// Local paths pass through untouched. A backend that *translates* to a local path
+/// (smb:// → UNC / mount point) connects first — that is where mount orchestration
+/// lives — and hands back the translated path. A genuinely remote backend has no
+/// local path; until its engine lane exists (scan M3 / apply M4) that is a loud
+/// error naming the milestone, never a silent fallback.
+fn materialize_one(s: &str) -> std::io::Result<String> {
+    use crate::fs::vfs::spec::RootSpec;
+    match crate::fs::vfs::spec::parse(s) {
+        RootSpec::Local(_) => Ok(s.to_string()),
+        _ => {
+            let v = crate::fs::vfs::open(s, &crate::fs::vfs::NoPrompt)?;
+            v.connect().map_err(std::io::Error::from)?;
+            let p = v.as_local().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!(
+                        "root '{}' lives on a remote backend — its engine lane is not wired up yet",
+                        v.display()
+                    ),
+                )
+            })?;
+            Ok(p.to_string_lossy().into_owned())
+        }
+    }
+}
+
+/// The job with every root phrase materialized (see `materialize_one`). Runs once at
+/// each public entrance; everything downstream — scan, guards, plan headers, apply,
+/// escalation — keeps seeing plain local paths exactly as before.
+pub fn materialize_roots(job: &Job) -> std::io::Result<Job> {
+    let mut j = job.clone();
+    j.source = materialize_one(&job.source)?;
+    j.target = materialize_one(&job.target)?;
+    for t in j.targets.iter_mut() {
+        *t = materialize_one(t)?;
+    }
+    Ok(j)
+}
+
 pub fn compare_job(job: &Job) -> std::io::Result<Plan> {
     compare_job_with(job, &crate::obs::progress::RunCtx::null())
 }
@@ -92,6 +132,7 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx) -> st
             "multi-target job: resolve one target first (desktop target picker / CLI `run` loops all)",
         ));
     }
+    let job = &materialize_roots(job)?;
     let opt = scan_opts(job);
     // P0-2: root reachability + mount-point marker. When the share isn't mounted, target is often an empty directory,
     // and comparing as usual yields a plan that either "wipes the other side" or "re-sends everything".
@@ -258,6 +299,22 @@ pub fn apply_job_guarded_with(
     use crate::model::event::{Phase, ProgressEvent};
 use crate::obs::progress::ApplyOutcome;
     let t0 = std::time::Instant::now();
+    // The plan header carries the roots the comparison actually scanned (already
+    // materialized); the job is materialized again only for the archive refresh below.
+    let job = &match materialize_roots(job) {
+        Ok(j) => j,
+        Err(e) => {
+            ctx.sink.emit(ProgressEvent::Error {
+                phase: Phase::Apply,
+                ts_ms: crate::foundation::time::now_ms(),
+                path: String::new(),
+                action: "resolve-roots".into(),
+                side: "target".into(),
+                message: e.to_string(),
+            });
+            return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
+        }
+    };
     let src_root = Path::new(&plan.header.source_root);
     let tgt_root = Path::new(&plan.header.target_root);
     let verdict = crate::pipeline::guard::run_all(
@@ -770,4 +827,33 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         bytes_copied: bytes_done_total,
         cancelled: ctx.ctl.cancelled(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn materialize_passes_local_roots_through_untouched() {
+        let mut j = Job::default();
+        j.source = r"D:\some\dir".into();
+        j.target = r"\\host\share\dir".into();
+        j.targets = vec![r"E:\other".into(), "/Users/x/dir".into()];
+        let m = materialize_roots(&j).unwrap();
+        assert_eq!(m.source, j.source);
+        assert_eq!(m.target, j.target);
+        assert_eq!(m.targets, j.targets);
+    }
+
+    #[test]
+    fn materialize_refuses_backends_without_a_lane_loudly() {
+        let mut j = Job::default();
+        j.source = r"D:\some\dir".into();
+        j.target = "sftp://ben@host/data".into();
+        let e = materialize_roots(&j).unwrap_err();
+        assert!(e.to_string().contains("sftp"), "error must name the backend: {e}");
+        // and an unknown scheme is a hard error, never a silent local path
+        j.target = "sfpt://typo/data".into();
+        assert!(materialize_roots(&j).is_err());
+    }
 }
