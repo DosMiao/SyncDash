@@ -7,20 +7,20 @@ description = "SyncDash desktop shell (Tauri v2) over the syncdash core library"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
-# custom-protocol 是"加载内置 dist"的开关：没有它，release 构建也会去连
-# devUrl(localhost:5173) —— 表现为整窗 ERR_CONNECTION_REFUSED 空白页。
-# `tauri build` 会自动传；我们用裸 cargo build，必须放进 default。
+# custom-protocol is the "load the bundled dist" switch: without it even a release build goes to
+# devUrl(localhost:5173) — which shows up as a whole-window ERR_CONNECTION_REFUSED blank page.
+# `tauri build` passes it automatically; we use bare cargo build, so it has to be in default.
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
 tauri = { version = "2", features = [] }
-# 原生目录/文件选择器。JS 侧不装 @tauri-apps/plugin-dialog——那个包只是
-# `invoke('plugin:dialog|open', {options})` 的薄包装，直接用现成的 api.invoke 调即可。
+# Native directory/file picker. The JS side does not install @tauri-apps/plugin-dialog — that package
+# is only a thin wrapper over `invoke('plugin:dialog|open', {options})`; call it via the existing api.invoke.
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 syncdash = { path = ".." }
-# 前端类型由 Rust 生成，导出目录见工作区根的 `.cargo/config.toml`。
+# Frontend types are generated from Rust; export directory: see `.cargo/config.toml` at the workspace root.
 ts-rs = { version = "12", features = ["serde-compat", "no-serde-warnings"] }

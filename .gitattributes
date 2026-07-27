@@ -1,16 +1,16 @@
-# 仓库里一律存 LF。没有这份声明时 core.autocrlf=true 会想把工作区换成 CRLF，
-# 而生成器（Script/gen-types.mjs）与各编辑器写出来的是 LF——结果 typescript/core/types/generated/
-# 下 23 个文件在提交之后仍然永远显示为 modified，且 `git diff` 是空的。
+# Everything is stored as LF in this repo. Without this declaration core.autocrlf=true wants to flip
+# the working tree to CRLF, while the generator (Script/gen-types.mjs) and every editor write LF — so
+# the 23 files under typescript/core/types/generated/ stay modified forever after commit, with an empty `git diff`.
 * text=auto eol=lf
 
-# Mac 构建脚本必须是 LF，否则 bash 读到 \r 会报 command not found
+# Mac build scripts must be LF, otherwise bash hits a \r and reports command not found
 *.command text eol=lf
 *.sh      text eol=lf
 
-# Windows 批处理需要 CRLF
+# Windows batch files need CRLF
 *.bat text eol=crlf
 
-# 二进制：不做任何行尾/文本处理
+# Binary: no line-ending or text processing at all
 *.png   binary
 *.ico   binary
 *.tar   binary

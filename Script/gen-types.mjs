@@ -1,18 +1,18 @@
 #!/usr/bin/env node
-// Rust → TypeScript 类型生成的唯一入口。
+// The single entry point for Rust → TypeScript type generation.
 //
 //   node Script/gen-types.mjs
 //
-// 两步：
-//   1. `cargo test export_bindings` —— ts-rs 的导出发生在测试里（见各类型上的
-//      `#[ts(export, export_to = ...)]`），导出目录由 `.cargo/config.toml` 的
-//      TS_RS_EXPORT_DIR 钉在工作区根。
-//   2. 净化产物 —— ts-rs 把 Rust 的文档注释原样搬进 JSDoc，而本仓大量文档在讲
-//      FFS 过滤器语法（`*/big_temp/`、`*/*.log`）。那个字面的 `*/` 会**提前终止**
-//      JSDoc 块，生成语法不合法的 .ts。这里把块内的 `*/` 转义成 `*\/`
-//      （JSDoc 里照样显示成 `*/`，但不再终止块）。
+// Two steps:
+//   1. `cargo test export_bindings` — ts-rs exports from inside tests (see the
+//      `#[ts(export, export_to = ...)]` on each type); the export directory is pinned at the
+//      workspace root by TS_RS_EXPORT_DIR in `.cargo/config.toml`.
+//   2. Sanitise the output — ts-rs copies Rust doc comments verbatim into JSDoc, and a lot of the
+//      docs here describe FFS filter syntax (`*/big_temp/`, `*/*.log`). That literal `*/`
+//      **terminates the JSDoc block early**, producing syntactically invalid .ts. This escapes
+//      in-block `*/` to `*\/` (JSDoc still renders it as `*/`, but it no longer ends the block).
 //
-// 不要手改 typescript/core/types/generated/ 下的任何文件。
+// Never hand-edit anything under typescript/core/types/generated/.
 
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -26,8 +26,8 @@ function run(args) {
   execFileSync("cargo", args, { cwd: repoRoot, stdio: "inherit" });
 }
 
-// 转义文档块内部的星-斜杠序列；真正的终止行（整行只有那两个字符）保持原样。
-// 这个函数的注释本身刻意用行注释——写成块注释就会踩到它要修的那个坑。
+// Escape star-slash sequences inside a doc block; the real terminator line (those two characters alone) is left as is.
+// This function's own comment is deliberately a line comment — as a block comment it would hit the very bug it fixes.
 function sanitize(text) {
   const out = [];
   let inDoc = false;
@@ -55,7 +55,7 @@ function sanitize(text) {
 console.log("[1/2] cargo test export_bindings …");
 run(["test", "--workspace", "--quiet", "export_bindings"]);
 
-console.log("[2/2] 净化生成产物 …");
+console.log("[2/2] sanitising generated output …");
 let touched = 0;
 for (const name of readdirSync(genDir)) {
   if (!name.endsWith(".ts")) continue;
@@ -65,7 +65,7 @@ for (const name of readdirSync(genDir)) {
   if (after !== before) {
     writeFileSync(p, after);
     touched++;
-    console.log(`      修正 ${name}`);
+    console.log(`      fixed ${name}`);
   }
 }
-console.log(`完成：${readdirSync(genDir).filter((f) => f.endsWith(".ts")).length} 个类型，${touched} 个需要净化。`);
+console.log(`done: ${readdirSync(genDir).filter((f) => f.endsWith(".ts")).length} types, ${touched} needed sanitising.`);
