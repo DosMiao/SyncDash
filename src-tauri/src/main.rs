@@ -308,6 +308,36 @@ fn get_job(name: String) -> Result<job::Job, String> {
     job::load(&name).map(|(_, j)| j).map_err(|e| e.to_string())
 }
 
+/// What a brand-new job starts from, including the default-on junk presets already materialized into
+/// `exclude`. The editor asks for this instead of keeping its own copy: a hand-written mirror of
+/// `Job::default()` is a second source of truth for engine policy, and it had already drifted — an empty
+/// exclude list where the engine seeds thirteen patterns, which would have created new jobs with no junk
+/// protection at all.
+#[tauri::command]
+fn default_job() -> job::Job {
+    job::Job::default()
+}
+
+/// The `schema` recorded in the job file **as it sits on disk**, next to the version this build writes.
+/// `get_job` returns the migrated job, so by then the difference is gone — but the editor is showing
+/// exclude lines the file does not contain yet, and it has to be able to say so.
+/// The two differing means the v1 junk keys were expanded into `exclude` on load.
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+struct JobFileSchemaDto {
+    #[ts(type = "number")]
+    on_disk: u32,
+    #[ts(type = "number")]
+    current: u32,
+}
+
+#[tauri::command]
+fn job_file_schema(name: String) -> Result<JobFileSchemaDto, String> {
+    job::file_schema(&name)
+        .map(|on_disk| JobFileSchemaDto { on_disk, current: job::SCHEMA })
+        .map_err(|e| e.to_string())
+}
+
 /// M5: save a job (create, or overwrite the TOML of the same name)
 #[tauri::command]
 fn save_job(name: String, job: job::Job) -> Result<String, String> {
@@ -413,6 +443,33 @@ fn inspect_paths(source: String, target: String) -> PathVerdict {
 #[tauri::command]
 fn mask_match(masks: Vec<String>, paths: Vec<String>) -> Vec<bool> {
     syncdash::pipeline::filter::mask_hits(&masks, &paths)
+}
+
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+struct JunkPresetDto {
+    id: String,
+    label: String,
+    hint: String,
+    patterns: Vec<String>,
+    default_on: bool,
+}
+
+/// The junk presets, patterns and all. The frontend **does not carry its own copy of these lists** —
+/// the editor's checkboxes write literally what the engine would have applied, which is the whole
+/// reason a checkbox can now be trusted to describe what a job excludes.
+#[tauri::command]
+fn junk_presets() -> Vec<JunkPresetDto> {
+    syncdash::pipeline::filter::JUNK_PRESETS
+        .iter()
+        .map(|p| JunkPresetDto {
+            id: p.id.to_string(),
+            label: p.label.to_string(),
+            hint: p.hint.to_string(),
+            patterns: p.patterns.iter().map(|s| s.to_string()).collect(),
+            default_on: p.default_on,
+        })
+        .collect()
 }
 
 /// Pagination for the "Identical" panel. The data source is the snapshot left by the last compare — no rescan.
@@ -883,8 +940,8 @@ fn main() {
             list_jobs, jobs_dir, compare_job, preflight, apply_job, cancel_run, pause_run,
             open_progress_window, close_progress_window, post_sync_action,
             run_history, last_syncs, run_detail,
-            get_job, save_job, delete_job,
-            inspect_paths, reveal, mask_match, list_same, export_csv,
+            get_job, default_job, job_file_schema, save_job, delete_job,
+            inspect_paths, reveal, mask_match, junk_presets, list_same, export_csv,
             log_runs, log_artifact, log_dir_path, app_log_tail, get_settings, save_settings
         ])
         .run(tauri::generate_context!())
