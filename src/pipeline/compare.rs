@@ -275,25 +275,52 @@ fn name_rules_of(h: &Header) -> NameRules {
     }
 }
 
-/// Why this relative path cannot be created faithfully on a Windows-semantics root.
+/// How badly a Windows-semantics root handles this path. Ordered by blast radius.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WinNameFault {
+    /// The path does not address the file it names. **Every** operation touching this root
+    /// is unsafe, deletes and reads included — not just creation.
+    Mangled,
+    /// Creating it fails outright. Reading or deleting is moot: such a file cannot be there.
+    Rejected,
+    /// Creating, reading and deleting all work; other Windows software cannot cope.
+    Unusable,
+}
+
+/// Why this relative path cannot be handled faithfully on a Windows-semantics root.
 ///
-/// Every case here is refused, but they fail in three genuinely different ways and the reason
-/// text says which — a plan that claims "illegal" for a name Windows would in fact accept is
-/// the same kind of lie as a silent exclusion. All three classes were measured on Win11 26200
-/// through the same std calls the engine uses:
+/// The three faults differ in blast radius and the reason text says which — a plan that claims
+/// "illegal" for a name Windows would in fact accept is the same kind of lie as a silent
+/// exclusion. All three were measured on Win11 26200 through the same std calls the engine uses:
 ///
-/// - **rejected**: `< > " | ? *` and control chars — the write really does fail (os error 123).
-/// - **mangled**: the dangerous class, because the write *succeeds* and lands somewhere else.
+/// - **Rejected**: `< > " | ? *` and control chars — the write really does fail (os error 123).
+/// - **Mangled**: the dangerous class, because the operation *succeeds* against the wrong file.
 ///   `report:2024.pdf` writes into an NTFS alternate data stream: `write` returns `Ok`, and
-///   `read_dir` then lists only `report`. The name is gone, the bytes are hidden on another
-///   file, and every later compare re-copies it forever. A trailing dot or space is stripped
-///   by path normalization, so `trail.` and `trail ` both become `trail` — two distinct source
-///   files collapsing onto one target file, which is outright data loss.
-/// - **unusable**: reserved device names. These are *not* rejected — `CON`, `com1`, `nul.txt.jpg`
+///   `read_dir` then lists only `report`. A trailing dot or space is stripped by path
+///   normalization, so `trail.` and `trail ` both resolve to `trail`. This is not only a
+///   creation hazard: scanning walks from a `\\?\`-prefixed root, which suppresses that
+///   normalization, so the scan *can* see a literal `trail.` that the apply lane then cannot
+///   address. Measured end to end — applying a delete of rel `trail.` removed `trail`,
+///   returned `Ok`, and left `trail.` sitting there for the next round to find again.
+/// - **Unusable**: reserved device names. These are *not* rejected — `CON`, `com1`, `nul.txt.jpg`
 ///   all wrote, read, listed and deleted cleanly, because std addresses files through `\\?\`
-///   verbatim paths (and Windows 11 relaxed the rule besides). We still refuse them, as
-///   FreeFileSync and syncthing do, because Explorer, cmd and most Win32 software cannot open
-///   or delete such a file afterwards — but the reason must not claim Windows forbade it.
+///   verbatim paths (and Windows 11 relaxed the rule besides). We still refuse to create them,
+///   as FreeFileSync and syncthing do, because Explorer, cmd and most Win32 software cannot
+///   open or delete such a file afterwards — but the reason must not claim Windows forbade it,
+///   and a *delete* of one is perfectly safe to carry out.
+fn win_name_fault(rel: &str) -> Option<(WinNameFault, String)> {
+    win_invalid_reason(rel).map(|r| {
+        let fault = if r.starts_with("mangled") {
+            WinNameFault::Mangled
+        } else if r.starts_with("rejected") {
+            WinNameFault::Rejected
+        } else {
+            WinNameFault::Unusable
+        };
+        (fault, r)
+    })
+}
+
 fn win_invalid_reason(rel: &str) -> Option<String> {
     // COM0/LPT0 are absent from the Microsoft list but Explorer treats them as reserved too
     // (syncthing carries the same two extras, with the same note).
@@ -908,27 +935,55 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
         }
     }
 
-    // Legality preflight for paths created on a Windows-semantics side: caught at plan time, so
-    // apply never blows up (or worse, silently succeeds into the wrong file) halfway through.
+    // Name-legality preflight, caught at plan time so apply never blows up — or worse, quietly
+    // succeeds against the wrong file — halfway through.
+    //
+    // Scope is deliberately wider than "the path being created". A `Mangled` path does not
+    // address the file it names, so *reading* the source is just as wrong as writing the
+    // target, and a delete of it removes a different file while reporting success. So each op
+    // is checked against every root it touches: the executing side always, and the reading
+    // side too whenever content moves.
     let mut unknown_rule_notes: Vec<(Side, String, String)> = Vec::new();
     for op in &mut ops {
-        if matches!(op.action, Action::Copy | Action::Move) {
-            let rules = match op.side {
-                Side::Target => name_rules_of(&target.header),
-                Side::Source => name_rules_of(&source.header),
-            };
-            let Some(r) = win_invalid_reason(&op.path) else { continue };
-            match rules {
-                NameRules::Windows => {
-                    op.action = Action::Conflict;
-                    op.reason = format!("illegal-on-windows: {r}");
-                }
-                // We cannot see the far server's OS over SFTP/FTP. Refusing would be wrong (the
-                // name is perfectly legal if it is Linux) and staying quiet would be worse, so
-                // the plan carries the warning and the op proceeds.
-                NameRules::Unknown => unknown_rule_notes.push((op.side.clone(), op.path.clone(), r)),
-                NameRules::Posix => {}
+        let (exec_rules, other_rules) = match op.side {
+            Side::Target => (name_rules_of(&target.header), name_rules_of(&source.header)),
+            Side::Source => (name_rules_of(&source.header), name_rules_of(&target.header)),
+        };
+        // Only Copy/Move bring a *new* name into existence. An Update means the file is
+        // already sitting there and is addressable, so refusing it over a reserved name would
+        // strand it un-synced forever — the same reasoning that lets a delete of one proceed.
+        let creates = matches!(op.action, Action::Copy | Action::Move);
+        let reads_other = matches!(op.action, Action::Copy | Action::Update);
+
+        // `from` is the pre-move spelling and lives on the executing side too
+        let candidates = [Some(op.path.as_str()), op.from.as_deref()];
+        let mut verdict: Option<(bool, String)> = None; // (refuse, reason)
+        for path in candidates.into_iter().flatten() {
+            let Some((fault, r)) = win_name_fault(path) else { continue };
+            // Which roots does this fault actually endanger for this op?
+            let exec_hit = exec_rules == NameRules::Windows
+                && (fault == WinNameFault::Mangled || creates);
+            let read_hit = reads_other && other_rules == NameRules::Windows && fault == WinNameFault::Mangled;
+            if exec_hit || read_hit {
+                let where_ = if read_hit && !exec_hit { "reading side" } else { "executing side" };
+                verdict = Some((true, format!("{r} ({where_})")));
+                break;
             }
+            // Unknown-OS roots: never refuse (the name may be perfectly legal there), never
+            // stay quiet either.
+            let exec_unknown = exec_rules == NameRules::Unknown && (fault == WinNameFault::Mangled || creates);
+            let read_unknown = reads_other && other_rules == NameRules::Unknown && fault == WinNameFault::Mangled;
+            if (exec_unknown || read_unknown) && verdict.is_none() {
+                verdict = Some((false, r));
+            }
+        }
+        match verdict {
+            Some((true, reason)) => {
+                op.action = Action::Conflict;
+                op.reason = format!("illegal-on-windows: {reason}");
+            }
+            Some((false, reason)) => unknown_rule_notes.push((op.side.clone(), op.path.clone(), reason)),
+            None => {}
         }
     }
     for (side, path, r) in unknown_rule_notes {
@@ -942,7 +997,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
             hash: None,
             link: None,
             mode: None,
-            reason: format!("name-risk-on-unknown-server: {r} — this root's OS cannot be determined over its protocol, so the write is attempted as planned"),
+            reason: format!("name-risk-on-unknown-server: {r} — this root's OS cannot be determined over its protocol, so the operation is attempted as planned"),
         });
     }
 
@@ -1338,6 +1393,42 @@ mod tests {
         assert!(why("trail.").contains("truncated to 'trail'"), "{}", why("trail."));
         assert!(why("notes/CON").contains("reserved device name"), "{}", why("notes/CON"));
         assert!(why("a?b.txt").contains("refuses the character"), "{}", why("a?b.txt"));
+    }
+
+    /// Deleting a mangled name is the worst case of all, because it *succeeds* against the
+    /// wrong file. Measured: applying a delete of rel `trail.` removed `trail`, returned Ok,
+    /// and left `trail.` standing — so the next round finds it again, forever, having eaten an
+    /// innocent neighbour on the way. A delete must therefore be refused too, which the
+    /// Copy/Move-only gate did not do.
+    #[test]
+    fn a_mangled_name_is_refused_for_deletes_as_well_as_creates() {
+        // mirror: target has files the source does not → deletions on the Windows target
+        let s = snap("macos", vec![]);
+        let t = snap("windows", vec![file("trail.", "h1"), file("keep:me.txt", "h2"), file("CON", "h3")]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+
+        let by_path = |p: &str| plan.ops.iter().find(|o| o.path == p).map(|o| (o.action.clone(), o.reason.clone()));
+        let (a, why) = by_path("trail.").expect("trail. must appear");
+        assert_eq!(a, Action::Conflict, "a delete that would hit a different file must be refused: {why}");
+        assert!(why.contains("truncated to 'trail'"), "{why}");
+        let (a, _) = by_path("keep:me.txt").expect("the colon case must appear");
+        assert_eq!(a, Action::Conflict, "a colon path does not address the file it names");
+
+        // A reserved device name is addressable — std deletes it cleanly, so the delete stands.
+        let (a, _) = by_path("CON").expect("CON must appear");
+        assert_eq!(a, Action::Delete, "refusing to delete a reserved name would strand it forever");
+    }
+
+    /// The source root is the one being *read*. A mangled path there reads a different file,
+    /// so the copy would land the wrong bytes under the right name on a perfectly healthy target.
+    #[test]
+    fn a_mangled_name_on_the_reading_side_is_refused_too() {
+        let s = snap("windows", vec![file("trail.", "h1")]);
+        let t = snap("linux", vec![]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        let op = plan.ops.iter().find(|o| o.path == "trail.").expect("the op must exist");
+        assert_eq!(op.action, Action::Conflict, "reason was: {}", op.reason);
+        assert!(op.reason.contains("reading side"), "the message must say which root is at fault: {}", op.reason);
     }
 
     /// SFTP/FTP cannot tell us the server's OS. Refusing a name that is perfectly legal on
