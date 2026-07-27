@@ -16,14 +16,22 @@
 
 ```
 SyncDash/
-├─ src/                 syncdash 核心库（scan/compare/apply/filter/lock/…）+ CLI bin（含旧 egui 界面）
+├─ src/                 syncdash 核心库 + CLI bin
+│   └─ foundation/      L0 地基层（fmt/time/path/text/names）：零 crate 内依赖，谁都能用
 ├─ src-tauri/           Tauri v2 桌面壳：薄 IPC 层（list_jobs / compare_job / apply_job）
 ├─ typescript/          前端（Vite + 原生 TS，无框架）：main.ts + styles.css
+│   └─ core/types/generated/   ts-rs 从 Rust 结构体生成的线上类型 —— 不要手改
+├─ Script/gen-types.mjs 类型生成入口（`npm run gen:types`）
 ├─ index.html           前端入口
 ├─ dist/                前端构建产物 —— 特意提交进 git（Mac 无 node，见"构建"）
 ├─ builder.bat          Windows 构建菜单（Dev / Desktop / CLI / All）
 └─ builder.command      Mac 构建脚本（纯 cargo）
 ```
+
+依赖分层：`foundation` → `table/chunk/atomic` → `progress/logging/runlog/settings` →
+`filter/scan/compare/apply/pack/preflight/…` → `config/run` → 两个外壳。
+依赖只向下，无环（Tarjan 校验）。**不设 re-export 桶**：调用方写全路径，
+`foundation::fmt::human_bytes` 而不是 `preflight::human_bytes`。
 
 ## 命令
 
@@ -33,7 +41,7 @@ syncdash run <job> [--apply] [--i-know]          # 一条龙：扫双侧→比�
 syncdash run --all | --prefix cs- [--apply]      # 批量跑（hub-and-spoke 多端的引擎）
 syncdash territories <root>                      # 列出 .ffs-sync 领地
 syncdash gen-jobs <root> --target-root R [--remote-host mac --remote-root-base /Users/x/Code]
-syncdash gui [job]                               # 旧 egui 界面（桌面版见 syncdash-desktop）
+syncdash gui                                     # 启动桌面版（等同直接跑 syncdash-desktop）
 syncdash probe                                   # 本机环境 JSON（远端探测：ssh 对面跑这个）
 syncdash scan <root> [--out t.jsonl] [--no-hash] [--force-rehash] [--symlinks-direct] [--progress] [--exclude PHRASE]...
 syncdash compare --source a.jsonl --target b.jsonl \
@@ -41,6 +49,10 @@ syncdash compare --source a.jsonl --target b.jsonl \
 syncdash apply plan.jsonl [--apply] [--verify] [--delta] [--no-fsync] [--source-root R] [--target-root R] [-v]
 syncdash mark <root> [--job NAME]                # 打 .syncdash-root 挂载点标记（配 require_marker）
 syncdash trash runs|find <pat>|restore <pat> --into R|prune   # 本机回收目录：查看/找回/清理
+syncdash logs list [job] [--limit N]             # 运行一览（含被中断的运行）
+syncdash logs show <run-id> [--errors|--items|--plan]   # 某次运行的四份产物
+syncdash logs prune [--keep-days N] [--max-total-mb N]  # 按保留策略清理
+syncdash logs dir                                # 日志目录 / 设置文件在哪
 syncdash pack plan.jsonl --out pkg.tar           # 打包 target 侧操作（payload+计划+双 hash 清单）
 syncdash apply-pack pkg.tar [--apply] [-v]       # 对端：验 hash→提取→执行（锁/回收/校验全带）
 syncdash-desktop                                 # Tauri 桌面版（主力 GUI）
@@ -64,6 +76,50 @@ archive = 'C:\Users\xuanb\AppData\Roaming\syncdash\archive\flight.jsonl'   # syn
 
 `run <job> --apply` 成功（0 错误）且为 sync 模式时**自动刷新 archive**（冲突路径会从存档剔除，
 下次继续报冲突而不是被悄悄仲裁）。
+
+## 日志（v0.10）
+
+一条统一的诊断链路：引擎的叙事、逐条失败、逐条执行结果全走 `progress::ProgressSink`
+这一条已有的事件总线，末端挂文件 sink。**不引 tracing/log** —— 再叠一套 facade
+只会让同一件事有两个出口。
+
+```
+<log_dir>/                                  # 默认 <config>/logs，可在设置里改
+├─ runs.jsonl                               # 索引：一行一次运行
+├─ app.jsonl                                # 运行之外的事件（启动/清理/迁移/设置错误）
+└─ 20260727-002612-demo-apply/              # 每次 apply 一个目录（compare 只写索引行）
+   ├─ summary.json    运行摘要（start 时先写 finished:false，finish 时覆盖）
+   ├─ plan.jsonl      计划清单：这次**打算**做什么
+   ├─ run.jsonl       事件流：叙事、阶段边界、报错
+   ├─ errors.jsonl    报错清单：Error + 警告以上的 Log
+   └─ items.jsonl     执行清单：一行一 op 的**实际结局**（ok/failed/kept/cancelled）
+```
+
+三件事是这一版的要害：
+
+- **流式落盘**。事件到达即写（每 64 行或报错/阶段边界 flush）。v0.9 是 `finish()` 时
+  一次性写，进程被杀就整份丢失。现在硬杀一次 4000 文件的同步，`plan.jsonl` 完整、
+  `items.jsonl` 留下已完成的部分、`summary.json` 的 `finished:false` 说明它没跑完。
+- **计划与执行分开**。v0.9 写进明细的是传给 apply 的计划 ops——哪条成功、哪条失败、
+  哪条因非空目录被保留，一个字都没有。两份一比就知道哪些 op 根本没轮到。
+- **桌面版第一次真的看得见**。`src-tauri` 是 windowed 构建，没有控制台；库内 32 处
+  `eprintln!`（"远端 schema 不匹配"、"delta disabled"、"stale lock 接管"、
+  "source-side op(s) skipped"）过去说了等于没说。现在它们是 `Log` 事件，进日志面板。
+
+`println!` **一处都没动**：`remote::ssh_capture` 读远端 `syncdash scan` 的 stdout 拿
+快照表，stdout 是数据线缆不是日志。
+
+设置在 `<config>/settings.toml`（桌面版日志面板的 ⚙ 里可改）：
+
+```toml
+log_dir = ""             # 空 = 默认 <config>/logs；改了保存时旧目录整体迁移
+level = "info"           # info | warn | error
+keep_days = 30           # 0 = 不按天清
+max_total_mb = 512       # 0 = 不限（执行清单全记，这是它的安全带）
+log_compare = "summary"  # summary = 只写一行索引不建目录 | off
+                         # 不给 full 档：值守 30s 一轮 = 一天 2880 次
+mirror_stderr = true     # CLI 同时按原文进 stderr（终端体验与改造前逐字一致）
+```
 
 ## GUI（桌面版 `syncdash-desktop`，Tauri v2）
 
