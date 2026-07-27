@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Log level. Division of labour with the `Error` event: `Error` is a structured **single-op failure**
+/// Log level. Division of labor with the `Error` event: `Error` is a structured **single-op failure**
 /// (carrying path/action/side, naturally a line in the error detail), `Log` is pipeline narration
 /// (remote probe results, delta downgrades, lock takeover…) — the sink for those in-library `eprintln!`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ts_rs::TS)]
@@ -114,7 +114,7 @@ pub enum ProgressEvent {
         scope: String,
         message: String,
     },
-    /// What actually became of one op (a line of the execution detail). Division of labour with `Progress`:
+    /// What actually became of one op (a line of the execution detail). Division of labor with `Progress`:
     /// Progress is "where are we" (throttling drops frames), ItemResult is "did this one make it" (not one may be lost).
     ItemResult {
         #[ts(type = "number")]

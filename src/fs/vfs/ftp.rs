@@ -608,7 +608,7 @@ impl WriteStaged for FtpStaged {
             let conn = guard
                 .as_mut()
                 .ok_or_else(|| VfsError::new(VfsErrorKind::Transient, "connection lost before commit"))?;
-            // Clear the destination (server rename-overwrite behaviour varies — never rely on it)
+            // Clear the destination (server rename-overwrite behavior varies — never rely on it)
             match conn.stream.rm(&self.dst_abs) {
                 Ok(()) => {}
                 Err(e) => {

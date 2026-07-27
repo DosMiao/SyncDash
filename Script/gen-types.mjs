@@ -7,7 +7,7 @@
 //   1. `cargo test export_bindings` — ts-rs exports from inside tests (see the
 //      `#[ts(export, export_to = ...)]` on each type); the export directory is pinned at the
 //      workspace root by TS_RS_EXPORT_DIR in `.cargo/config.toml`.
-//   2. Sanitise the output — ts-rs copies Rust doc comments verbatim into JSDoc, and a lot of the
+//   2. Sanitize the output — ts-rs copies Rust doc comments verbatim into JSDoc, and a lot of the
 //      docs here describe FFS filter syntax (`*/big_temp/`, `*/*.log`). That literal `*/`
 //      **terminates the JSDoc block early**, producing syntactically invalid .ts. This escapes
 //      in-block `*/` to `*\/` (JSDoc still renders it as `*/`, but it no longer ends the block).
@@ -55,7 +55,7 @@ function sanitize(text) {
 console.log("[1/2] cargo test export_bindings …");
 run(["test", "--workspace", "--quiet", "export_bindings"]);
 
-console.log("[2/2] sanitising generated output …");
+console.log("[2/2] sanitizing generated output …");
 let touched = 0;
 for (const name of readdirSync(genDir)) {
   if (!name.endsWith(".ts")) continue;
@@ -68,4 +68,4 @@ for (const name of readdirSync(genDir)) {
     console.log(`      fixed ${name}`);
   }
 }
-console.log(`done: ${readdirSync(genDir).filter((f) => f.endsWith(".ts")).length} types, ${touched} needed sanitising.`);
+console.log(`done: ${readdirSync(genDir).filter((f) => f.endsWith(".ts")).length} types, ${touched} needed sanitizing.`);

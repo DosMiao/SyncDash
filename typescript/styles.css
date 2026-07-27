@@ -577,10 +577,10 @@ th .sortable::after { content: attr(data-dir); font-size: 9px; margin-left: 2px;
    Note that td.c-path's max-width:330px does not take part in width computation under fixed layout; that rule is for #sametable. */
 
 /* Row height must stay constant — a wrap in any column throws off the precomputed height and rows drift out of place.
-   Under fixed layout, overflow is not clipped automatically and smears into the neighbouring column, so every column clips itself. */
+   Under fixed layout, overflow is not clipped automatically and smears into the neighboring column, so every column clips itself. */
 #plantable td.reason, #plantable tr.grp td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #plantable thead th { overflow: hidden; text-overflow: ellipsis; }
 
-/* Spacer rows only hold height: no borders, padding, zebra stripes, or hover colour */
+/* Spacer rows only hold height: no borders, padding, zebra stripes, or hover color */
 #plantable tr.vspacer, #plantable tr.vspacer:hover { background: none; }
 #plantable tr.vspacer td { padding: 0; border: 0; }

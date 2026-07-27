@@ -273,7 +273,7 @@ impl Inner {
         Ok(())
     }
 
-    /// Resolve a rel against the tree, honouring case-insensitivity.
+    /// Resolve a rel against the tree, honoring case-insensitivity.
     fn resolve(&self, nodes: &HashMap<String, FNode>, rel: &str) -> Option<String> {
         if nodes.contains_key(rel) {
             return Some(rel.to_string());
@@ -366,7 +366,7 @@ impl WriteStaged for FakeStaged {
 
     fn seal(&mut self, fsync: bool) -> VfsResult<()> {
         if fsync && self.inner.knobs.no_fsync {
-            // The last line of defence: preflight should have routed around this.
+            // The last line of defense: preflight should have routed around this.
             return Err(VfsError::unsupported("fsync requested but this root has none"));
         }
         Ok(())

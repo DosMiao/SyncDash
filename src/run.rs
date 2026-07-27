@@ -398,7 +398,7 @@ pub fn preflight_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> 
 }
 
 /// `acknowledged` = the user passed --i-know explicitly; it only allows the "plan health check" gates through.
-/// A missing marker and insufficient disk space always block (those are environment problems, not judgement calls).
+/// A missing marker and insufficient disk space always block (those are environment problems, not judgment calls).
 pub fn apply_job_guarded(
     job: &Job,
     plan: &Plan,

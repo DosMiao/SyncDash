@@ -230,7 +230,7 @@ pub trait Vfs: Send + Sync {
     // -------- write side --------
     fn mkdir_all(&self, rel: &str) -> VfsResult<()>;
     fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>>;
-    /// Pure rename inside the root. Overwrite behaviour is whatever
+    /// Pure rename inside the root. Overwrite behavior is whatever
     /// `caps().rename_overwrite` declares; the engine clears the target first when
     /// it needs the overwrite semantics.
     fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()>;

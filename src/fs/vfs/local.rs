@@ -3,7 +3,7 @@
 //! `as_local()` returns the root, which routes scan down the existing
 //! walkdir+mmap fast path — this impl is what the *generic* engine lanes use, and
 //! its write side deliberately wraps the very same `Staged` the direct lane uses,
-//! so local behaviour cannot drift between lanes.
+//! so local behavior cannot drift between lanes.
 
 use std::path::{Path, PathBuf};
 

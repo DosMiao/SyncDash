@@ -68,7 +68,7 @@ pub struct RunRecord {
     /// Old records default to true: v0.9 only wrote a record inside `finish`, so anything written did finish.
     #[serde(default = "yes")]
     pub finished: bool,
-    /// v0.9's detail file name. New records no longer write it, but old indexes carry it — readers still honour it.
+    /// v0.9's detail file name. New records no longer write it, but old indexes carry it — readers still honor it.
     #[serde(default)]
     pub detail: Option<String>,
 }

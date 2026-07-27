@@ -51,7 +51,7 @@ mod tests {
     #[test]
     fn fold_matches_case_insensitive_norm_key() {
         // The CJK entry is fixture data, not prose: it covers folding a mixed
-        // non-ASCII/ASCII string. Anglicising it would delete the coverage.
+        // non-ASCII/ASCII string. Anglicizing it would delete the coverage.
         for s in ["A/b.TXT", NFC_E, NFD_E, "", "混合Case"] {
             assert_eq!(fold(s), norm_key(s, true));
         }

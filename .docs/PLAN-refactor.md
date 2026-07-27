@@ -464,7 +464,7 @@ white-screens the app.**
 ### Phase 7 — CSS and docs
 
 Split `styles.css` into `tokens.css` + per-panel files. Extend the token set — there are 12 custom
-properties, all colour; no tokens for spacing, radius, font-size, or z-index (bare integers
+properties, all color; no tokens for spacing, radius, font-size, or z-index (bare integers
 scattered: 2, 50, 95, 100, 115, 120). Fix the five self-overriding blocks and the two undefined
 tokens (`--fg` at :314 has no fallback and silently fails; `--mono` at :317 is saved by its fallback).
 

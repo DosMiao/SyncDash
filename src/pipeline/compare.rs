@@ -52,7 +52,7 @@ pub struct CompareOptions {
     pub max_conflicts: i32,
     /// The no-hash equality window on mtime, in ms. Defaults to MTIME_SLACK_MS (FAT/SMB granularity);
     /// a remote backend with coarser timestamps (FTP LIST = minutes) widens it to its declared precision.
-    /// Only the *hashless* judgement uses it — content evidence always wins over timestamps.
+    /// Only the *hashless* judgment uses it — content evidence always wins over timestamps.
     pub mtime_window_ms: i64,
 }
 
@@ -984,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_move_is_labelled_as_such() {
+    fn ambiguous_move_is_labeled_as_such() {
         // Several candidates with the same content: the pairing's content is correct, but from is picked arbitrarily — reason must tell the truth
         let s = snap("windows", vec![sized("moved/one.bin", "h", 10)]);
         let t = snap(
@@ -1133,7 +1133,7 @@ mod tests {
     fn conflict_names_are_well_formed() {
         let n = conflict_name("a/b/report.pdf", "WIN 01", 1_769_000_000_000);
         assert!(n.starts_with("a/b/report.sync-conflict-"), "{n}");
-        assert!(n.ends_with("-WIN-01.pdf"), "host must be sanitised and extension kept: {n}");
+        assert!(n.ends_with("-WIN-01.pdf"), "host must be sanitized and extension kept: {n}");
         assert!(is_conflict_copy(&n));
         // A hidden file has no extension to speak of
         let h = conflict_name(".gitignore", "H", 0);

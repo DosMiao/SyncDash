@@ -341,7 +341,7 @@ fn preserve(
     Ok(())
 }
 
-/// Execute a single op through the VFS pair. Cancel/pause are honoured at chunk
+/// Execute a single op through the VFS pair. Cancel/pause are honored at chunk
 /// boundaries via `pp.checkpoint()`; a cancel returns Interrupted, and the staged
 /// write's Drop contract guarantees no debris at the destination on either backend.
 fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
@@ -682,7 +682,7 @@ pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOpti
 }
 
 /// The path-shaped entry: wraps both roots in LocalVfs and runs the one generic lane.
-/// Kept so every existing caller (and test) works unchanged — local behaviour through
+/// Kept so every existing caller (and test) works unchanged — local behavior through
 /// the VFS lane is pinned by the whole apply test suite passing as-is.
 pub fn apply_with(
     ops: &[Op],
@@ -1257,7 +1257,7 @@ use crate::obs::progress::{RunCtl, RunCtx};
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Cancel mid-copy of a big file: honoured between chunks, no half file at the destination, zero .syncdash.tmp debris
+    /// Cancel mid-copy of a big file: honored between chunks, no half file at the destination, zero .syncdash.tmp debris
     #[test]
     fn cancel_mid_copy_leaves_no_debris() {
         let base = tmproot("cancel");

@@ -1,10 +1,10 @@
-//! The SMB backend, translation flavour: an `smb://` phrase resolves to a path the
+//! The SMB backend, translation flavor: an `smb://` phrase resolves to a path the
 //! OS's own SMB client serves — UNC on Windows, an smbfs mount point on macOS — and
 //! everything else delegates to `LocalVfs` on that path. `as_local()` then routes the
 //! whole engine down the existing fast lanes, inheriting every already-fixed local
-//! behaviour (atomic staging, mtime correction, mmap hashing) for free.
+//! behavior (atomic staging, mtime correction, mmap hashing) for free.
 //!
-//! Division of labour against plain UNC (which keeps working untouched):
+//! Division of labor against plain UNC (which keeps working untouched):
 //! `\\server\share` = "use my current login, mounting is my problem";
 //! `smb://user@server/share` = "SyncDash owns credentials and mount orchestration,
 //! and says out loud what it did". Every connect step lands in the error detail or

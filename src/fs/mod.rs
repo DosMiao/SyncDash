@@ -14,7 +14,7 @@ use std::path::Path;
 
 /// `remove_file`, clearing the read-only attribute on a PermissionDenied retry.
 ///
-/// Git marks loose objects `r--r--r--`, and Windows (plus SMB servers honouring the
+/// Git marks loose objects `r--r--r--`, and Windows (plus SMB servers honoring the
 /// DOS attribute) refuses to delete such files — a real sync against a `.git`-carrying
 /// tree failed thousands of deletes with os error 5 exactly this way. Both reference
 /// projects carry this fallback (syncthing `Remove`: chmod 0600 then retry; FFS

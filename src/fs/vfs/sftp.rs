@@ -111,7 +111,7 @@ impl SftpBackend {
         }
     }
 
-    /// The FFS defence, verbatim: a NoSuchFile answer is only *confirmed* absence
+    /// The FFS defense, verbatim: a NoSuchFile answer is only *confirmed* absence
     /// after the parent directory has been listed and really does not carry the name.
     /// A listing that still shows it — or that cannot be obtained — is `Transient`.
     fn confirm_absent(&self, rel: &str) -> VfsResult<()> {
@@ -885,6 +885,6 @@ mod tests {
     fn write_side_still_needs_a_connection_first() {
         let b = backend("sftp://ben@host/data");
         let e = b.remove_file("x").unwrap_err();
-        assert_eq!(e.kind, VfsErrorKind::Transient, "unconnected is a transient state, never a judgement about files");
+        assert_eq!(e.kind, VfsErrorKind::Transient, "unconnected is a transient state, never a judgment about files");
     }
 }

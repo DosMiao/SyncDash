@@ -19,7 +19,7 @@ pub fn human_bytes(n: u64) -> String {
 ///
 /// Before consolidation this expression was written out in 6 places, and **each had a different
 /// zero-denominator fallback**: `src-tauri` fell back to -1, the CLI to 100, the frontend to 0.
-/// Standardised on 0: "no total" should read as "not started yet", not "complete".
+/// Standardized on 0: "no total" should read as "not started yet", not "complete".
 pub fn pct(done: u64, total: u64) -> u64 {
     if total == 0 { 0 } else { (done.min(total) * 100) / total }
 }

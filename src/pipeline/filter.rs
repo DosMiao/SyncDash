@@ -194,7 +194,7 @@ fn parse_phrase(phrase: &str, set: &mut MaskSet) {
 /// quietly folding a normal file tree like `.git` into "default excludes" turns "both sides match ✓" into a lie. Hence:
 /// - `SELF_*`: this tool's own metadata, excluded unconditionally (letting locks/markers/temp files/the archive take part in sync would break its own semantics)
 /// - `OS_EXCLUDES_*`: OS-level junk, per-platform presets (auto = both the Win and Mac sets, since cross-machine sync must guard both ends; can be switched off)
-/// - `DEV_EXCLUDES`: rebuildable dev artefacts, **not a default** — a code-sync job opts in with `dev_excludes = true`
+/// - `DEV_EXCLUDES`: rebuildable dev artifacts, **not a default** — a code-sync job opts in with `dev_excludes = true`
 /// And under every tier, the number of excluded items is spelled out in the UI's "⚠ excluded"; never silently.
 pub const OS_EXCLUDES_WINDOWS: &[&str] = &[
     "*/System Volume Information/", "*/$RECYCLE.BIN/", "*/RECYCLE?/", "*/Recovery/",
@@ -231,13 +231,13 @@ impl PathFilter {
         Self::build_full(includes, extra_excludes, &[])
     }
 
-    /// Full constructor (old signature): OS junk on auto, dev artefacts **off** — `.git` is no longer a default exclude.
+    /// Full constructor (old signature): OS junk on auto, dev artifacts **off** — `.git` is no longer a default exclude.
     pub fn build_full(includes: &[String], extra_excludes: &[String], deletables: &[String]) -> PathFilter {
         Self::build_full_opt(includes, extra_excludes, deletables, "auto", false)
     }
 
     /// `os_excludes`: "auto" (both the Win and Mac OS-junk presets, the default) | "windows" | "mac" | "off";
-    /// `dev_excludes`: exclude rebuildable dev artefacts (.git/node_modules/…), switched on explicitly by code-sync jobs.
+    /// `dev_excludes`: exclude rebuildable dev artifacts (.git/node_modules/…), switched on explicitly by code-sync jobs.
     /// SELF_EXCLUDES always applies.
     pub fn build_full_opt(
         includes: &[String],
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn default_excludes_work() {
-        // New tiers: default = SELF + OS(auto); dev artefacts (.git/node_modules) are **no longer default**
+        // New tiers: default = SELF + OS(auto); dev artifacts (.git/node_modules) are **no longer default**
         let pf = f(&[], &[]);
         assert!(!pf.pass_file("a/.DS_Store"), "mac junk excluded by auto preset");
         assert!(!pf.pass_file(".DS_Store")); // the root level is hit too, via the */x double registration

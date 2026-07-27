@@ -29,6 +29,6 @@ ops_found: number | null,
  */
 finished: boolean, 
 /**
- * v0.9's detail file name. New records no longer write it, but old indexes carry it — readers still honour it.
+ * v0.9's detail file name. New records no longer write it, but old indexes carry it — readers still honor it.
  */
 detail: string | null, };

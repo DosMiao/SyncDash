@@ -125,7 +125,7 @@ fn index_remove(account: &str) {
 /// (keyfile, agent) pass through, the password comes from the OS store when present.
 /// It never prompts and never invents — a backend that still lacks a required secret
 /// raises `Auth` naming `syncdash cred set "<phrase>"` as the remedy, which is exactly
-/// the behaviour a headless/watch run needs.
+/// the behavior a headless/watch run needs.
 pub struct KeyringProvider;
 
 impl CredentialProvider for KeyringProvider {
