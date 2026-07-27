@@ -27,6 +27,7 @@ pub mod spec;
 pub mod cred;
 pub mod fake;
 pub mod local;
+pub mod sftp;
 pub mod smb;
 
 #[cfg(test)]
@@ -290,10 +291,13 @@ pub fn open(phrase: &str, creds: &Arc<dyn CredentialProvider>) -> VfsResult<Arc<
         RootSpec::Remote(r) if r.scheme == "smb" => {
             Ok(Arc::new(smb::SmbBackend::new(r, creds.clone())?))
         }
+        RootSpec::Remote(r) if r.scheme == "sftp" => {
+            Ok(Arc::new(sftp::SftpBackend::new(r, creds.clone())))
+        }
         RootSpec::Remote(r) => Err(VfsError::new(
             VfsErrorKind::Unsupported,
             format!(
-                "{}:// backend is not built yet (root: {}) — SFTP and FTP land in the next milestones",
+                "{}:// backend is not built yet (root: {}) — FTP lands in its milestone",
                 r.scheme,
                 r.display()
             ),

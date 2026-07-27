@@ -32,6 +32,12 @@ ts-rs = { version = "12", features = ["serde-compat", "no-serde-warnings"] }
 keyring = "4"
 # No-echo password prompt for `syncdash cred set` (secrets never appear in argv or on screen)
 rpassword = "7"
+# SFTP backend: pure-Rust SSH (no OpenSSL, no perl — this machine's MSVC 2019 cannot
+# build aws-lc, hence the ring backend). Reads OpenSSH-format keys natively, which the
+# libssh2/WinCNG route could not. tokio stays private to the backend: the trait is sync.
+russh = { version = "0.62.4", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "2.3.0"
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "io-util", "time"] }
 
 # statvfs (disk-space preflight). Windows goes through kernel32's GetDiskFreeSpaceExW, no extra crate needed.
 [target.'cfg(unix)'.dependencies]

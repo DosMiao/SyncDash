@@ -1055,12 +1055,14 @@ mod tests {
     }
 
     #[test]
-    fn materialize_refuses_backends_without_a_lane_loudly() {
+    fn materialize_refuses_backends_without_a_local_lane_loudly() {
         let mut j = Job::default();
         j.source = r"D:\some\dir".into();
-        j.target = "sftp://ben@host/data".into();
+        // fake:// connects fine but has no local path — the write path must refuse it
+        // (the apply lanes still run on real paths until the VFS write lane lands)
+        j.target = "fake://materialize-test".into();
         let e = materialize_roots(&j).unwrap_err();
-        assert!(e.to_string().contains("sftp"), "error must name the backend: {e}");
+        assert!(e.to_string().contains("remote backend"), "{e}");
         // and an unknown scheme is a hard error, never a silent local path
         j.target = "sfpt://typo/data".into();
         assert!(materialize_roots(&j).is_err());
