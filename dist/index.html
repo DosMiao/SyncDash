@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SyncDash</title>
-  <script type="module" crossorigin src="/assets/main-DR563lk5.js"></script>
+  <script type="module" crossorigin src="/assets/main-l1cysN8K.js"></script>
   <link rel="modulepreload" crossorigin href="/assets/window-CipEQFgh.js">
   <link rel="stylesheet" crossorigin href="/assets/window-CWb_Bm47.css">
 </head>
@@ -91,8 +91,34 @@
         </table>
       </div>
       </div>
+      <div id="logpanel" class="hidden">
+        <div class="lp-head">
+          <span class="lp-title">日志</span>
+          <select id="lp-run" title="选择一次运行"></select>
+          <div id="lp-views" class="lp-pills"></div>
+          <div id="lp-levels" class="lp-pills"></div>
+          <input id="lp-q" class="mono" type="text" placeholder="搜索消息 / 路径…" />
+          <span id="lp-stat" class="dim"></span>
+          <span class="spacer"></span>
+          <button id="lp-open" class="btn" title="在文件管理器里打开这次运行的目录">📂</button>
+          <button id="lp-settings" class="btn" title="日志设置">⚙</button>
+          <button id="lp-close" class="btn" title="收起日志面板">✕</button>
+        </div>
+        <div id="lp-body"></div>
+      </div>
       <footer id="status"><span id="statusmsg">就绪</span><button id="btn-undo" class="linkbtn hidden"></button><span id="counts" class="counts"></span></footer>
     </main>
+  </div>
+  <div id="setmodal" class="hidden">
+    <div class="sheet setsheet">
+      <h3>日志设置</h3>
+      <div id="set-form"></div>
+      <div id="set-note" class="thin"></div>
+      <div class="btnrow">
+        <button id="set-cancel" class="btn">取消 (Esc)</button>
+        <button id="set-save" class="btn accent">保存</button>
+      </div>
+    </div>
   </div>
   <div id="ctxmenu" class="hidden"></div>
   <div id="funnelpop" class="hidden">

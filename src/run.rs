@@ -7,16 +7,21 @@ use crate::table::Snapshot;
 use crate::{apply, compare, scan};
 use std::path::Path;
 
-/// 严谨级 → 扫描参数：quick（不 hash）| fast（抽样摘要）| standard（hash+缓存）| paranoid（全量重 hash）
+/// 严谨级 → 扫描参数。单调阶梯：每一级 = **本轮实际读得更多**，
+/// "一致 ✓"的含义逐级从"实测元数据"升到"实测每个字节"。
+/// quick    读 0 字节（size+mtime）
+/// fast     只实读变化面的采样窗（缓存加速未变面）
+/// standard 本轮实读每个文件的采样窗（不用缓存——不是记忆，是本轮测量）
+/// paranoid 本轮实读每个文件的全部字节
 pub fn scan_opts(job: &Job) -> scan::ScanOptions {
     let filter = crate::filter::PathFilter::build_full_opt(&job.include, &job.exclude, &job.deletable, &job.os_excludes, job.dev_excludes);
-    let (hash, force_rehash, sampled) = match job.rigor.as_str() {
+    let (hash, sampled, use_cache) = match job.rigor.as_str() {
         "quick" => (false, false, false),
-        "fast" => (true, false, true),
-        "paranoid" => (true, true, false),
-        _ => (true, false, false),
+        "fast" => (true, true, true),
+        "paranoid" => (true, false, false),
+        _ => (true, true, false), // standard
     };
-    scan::ScanOptions { hash: hash && !job.no_hash, force_rehash, sampled, symlinks_direct: job.symlinks == "direct", filter }
+    scan::ScanOptions { hash: hash && !job.no_hash, sampled, use_cache, symlinks_direct: job.symlinks == "direct", filter }
 }
 
 /// sync 成功后刷新 archive：重扫 source、剔除冲突路径（冲突下次继续报，绝不被静默仲裁）。
@@ -24,7 +29,11 @@ pub fn scan_opts(job: &Job) -> scan::ScanOptions {
 /// 被取消只意味着冲突下轮重报，安全。
 fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::progress::RunCtx) {
     let Some(arch_path) = &job.archive else {
-        eprintln!("hint: sync job without `archive` — add one so deletions/moves can be attributed next time");
+        ctx.log(
+            crate::progress::LogLevel::Warn,
+            "run",
+            "hint: sync job without `archive` — add one so deletions/moves can be attributed next time",
+        );
         return;
     };
     let conflicted: std::collections::HashSet<&str> = plan
@@ -49,7 +58,11 @@ fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::progress::RunCtx) {
         if let Ok(f) = std::fs::File::create(arch_path) {
             let mut w = std::io::BufWriter::new(f);
             if snap.write_to(&mut w).is_ok() {
-                eprintln!("archive refreshed: {}", arch_path.display());
+                ctx.log(
+                    crate::progress::LogLevel::Info,
+                    "run",
+                    format!("archive refreshed: {}", arch_path.display()),
+                );
             }
         }
     }
@@ -83,16 +96,9 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::progress::RunCtx) -> std::io
     crate::preflight::check_root("source", &job.source, job.require_marker, &mut v);
     crate::preflight::check_root("target", &job.target, job.require_marker, &mut v);
     for w in &v.warnings {
-        eprintln!("warning: {w}");
-        // windowed 桌面构建里 stderr 会丢——警告也走事件流（action 区分，不算 errors 计数）
-        ctx.sink.emit(crate::progress::ProgressEvent::Error {
-            phase: Phase::ScanSource,
-            ts_ms: crate::table::now_ms(),
-            path: String::new(),
-            action: "warning".into(),
-            side: "source".into(),
-            message: w.clone(),
-        });
+        // v0.10：Log{Warn} 取代 Error{action:"warning"} 那个 hack——
+        // 有了真正的等级，警告不必再伪装成"不算数的错误"
+        ctx.log(crate::progress::LogLevel::Warn, "compare", format!("warning: {w}"));
     }
     if !v.ok() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
@@ -120,7 +126,91 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::progress::RunCtx) -> std::io
     );
     let copts = job.compare_opts();
     let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
+    // 分歧升级：抽样证据档（fast/standard）里"摘要相等但 mtime 差 >2s"的文件不许直接判相等
+    let plan = if opt.sampled { escalate_sampled_disagreements(job, plan, &s, &t, ctx) } else { plan };
     Ok(CompareOutcome { plan, source: s, target: t })
+}
+
+/// 分歧升级规则：两份信号打架（抽样摘要说"相同"、mtime 说"动过"）时不静默采信任何一方，
+/// 把该文件**双侧升级为全量哈希**重新裁决。这把 fast/standard 的盲区从
+/// "采样窗外的一切改动"压缩到"采样窗外＋保时间戳"（≈timestomp 场景）。
+/// 升级集天然很小（正常树上接近零），逐个全量读的成本可忽略。仅本地管线（远端侧无从廉价重读）。
+fn escalate_sampled_disagreements(
+    job: &Job,
+    mut plan: Plan,
+    s: &Snapshot,
+    t: &Snapshot,
+    ctx: &crate::progress::RunCtx,
+) -> Plan {
+    use crate::compare::Side;
+    use crate::progress::LogLevel;
+    use crate::table::EntryKind;
+    use rayon::prelude::*;
+    const SLACK_MS: i64 = 2000;
+
+    fn full_hash(p: &Path) -> std::io::Result<String> {
+        let mut h = blake3::Hasher::new();
+        h.update_mmap(p)?;
+        Ok(h.finalize().to_hex().to_string())
+    }
+    fn native(root: &Path, rel: &str) -> std::path::PathBuf {
+        let r = if cfg!(windows) { rel.replace('/', "\\") } else { rel.to_string() };
+        root.join(r)
+    }
+
+    let tmap: std::collections::HashMap<&str, &crate::table::Entry> = t
+        .entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::File)
+        .map(|e| (e.path.as_str(), e))
+        .collect();
+    let suspects: Vec<(&crate::table::Entry, &crate::table::Entry)> = s
+        .entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::File)
+        .filter_map(|se| tmap.get(se.path.as_str()).map(|te| (se, *te)))
+        .filter(|(se, te)| match (&se.hash, &te.hash) {
+            (Some(a), Some(b)) => a.starts_with('~') && a == b && (se.mtime_ms - te.mtime_ms).abs() > SLACK_MS,
+            _ => false,
+        })
+        .collect();
+    if suspects.is_empty() {
+        return plan;
+    }
+    ctx.log(LogLevel::Info, "compare", format!("分歧升级：{} 个文件摘要相等但 mtime 差 >2s，双侧全量重验", suspects.len()));
+    let extra: Vec<Op> = suspects
+        .par_iter()
+        .filter_map(|(se, te)| {
+            let hs = full_hash(&native(&job.source, &se.path)).ok()?;
+            let ht = full_hash(&native(&job.target, &te.path)).ok()?;
+            if hs == ht {
+                return None; // 摘要没撒谎：只是 mtime 漂了
+            }
+            let reason = "escalated: sampled digests equal, mtime differs, full hashes differ";
+            match job.mode.as_str() {
+                // mirror：source 无条件赢
+                "mirror" => Some(Op { side: Side::Target, action: Action::Update, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: Some(hs), link: None, mode: None, reason: reason.into() }),
+                // sync：双边内容不同且无归因 → 如实报冲突，人来裁
+                "sync" => Some(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: None, link: None, mode: None, reason: reason.into() }),
+                // enrich：source 严格较新才更新
+                _ => {
+                    if se.mtime_ms > te.mtime_ms + SLACK_MS {
+                        Some(Op { side: Side::Target, action: Action::Update, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: Some(hs), link: None, mode: None, reason: reason.into() })
+                    } else {
+                        None
+                    }
+                }
+            }
+        })
+        .collect();
+    if !extra.is_empty() {
+        ctx.log(LogLevel::Warn, "compare", format!("分歧升级坐实 {} 个文件内容不同（抽样窗外的改动），已补进计划", extra.len()));
+        let new_conflicts = extra.iter().filter(|o| o.action == Action::Conflict).count() as u64;
+        plan.header.op_count += extra.len() as u64;
+        plan.header.conflict_count += new_conflicts;
+        plan.ops.extend(extra);
+    }
+    plan
 }
 
 /// 执行选中的 ops；全部成功且是 sync 模式时刷新 archive（冲突路径从存档剔除，下次继续报冲突）。
@@ -212,7 +302,7 @@ pub fn apply_job_guarded_with(
 /// 本地/挂载盘任务的一条龙（原 CLI run 的主体）。返回 (done, skipped, errors, conflicts)。
 pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
     let plan = compare_job(job)?;
-    eprintln!("[{name}] {} op(s), {} conflict(s)", plan.header.op_count, plan.header.conflict_count);
+    crate::log_info!("run", "[{name}] {} op(s), {} conflict(s)", plan.header.op_count, plan.header.conflict_count);
     for op in &plan.ops {
         println!("{}", serde_json::to_string(op)?);
     }
@@ -228,9 +318,9 @@ pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackno
         .collect();
     // M4：CLI 的 apply 也留运行日志（desktop 在壳层各自记录）
     let t0 = std::time::Instant::now();
-    let rec = crate::runlog::Recorder::start(name, "apply", &crate::progress::RunCtx::null());
+    let rec = crate::runlog::Recorder::start(name, "apply", &crate::progress::RunCtx::null(), &ops);
     let out = apply_job_guarded_with(job, &plan, &ops, None, verbose, acknowledged, &rec.ctx);
-    rec.finish(&out, &ops, t0.elapsed().as_millis() as u64);
+    rec.finish(&out, t0.elapsed().as_millis() as u64);
     Ok((out.done, out.skipped, out.errors, plan.header.conflict_count))
 }
 
@@ -261,7 +351,14 @@ pub fn run_remote_job_with(
             return Err(e);
         }
     };
-    eprintln!("[{name}] {} op(s), {} conflict(s)  (remote pipeline via ssh)", plan.header.op_count, plan.header.conflict_count);
+    ctx.log(
+        crate::progress::LogLevel::Info,
+        "run",
+        format!(
+            "[{name}] {} op(s), {} conflict(s)  (remote pipeline via ssh)",
+            plan.header.op_count, plan.header.conflict_count
+        ),
+    );
     for op in &plan.ops {
         println!("{}", serde_json::to_string(op)?);
     }
@@ -276,9 +373,9 @@ pub fn run_remote_job_with(
         .cloned()
         .collect();
     let t0 = std::time::Instant::now();
-    let rec = crate::runlog::Recorder::start(name, "remote-apply", ctx);
+    let rec = crate::runlog::Recorder::start(name, "remote-apply", ctx, &ops);
     let out = apply_remote_job_with(name, job, &plan, &ops, verbose, acknowledged, &rec.ctx)?;
-    rec.finish(&out, &ops, t0.elapsed().as_millis() as u64);
+    rec.finish(&out, t0.elapsed().as_millis() as u64);
     Ok((out.done, out.skipped, out.errors, plan.header.conflict_count))
 }
 
@@ -304,8 +401,12 @@ pub struct RemoteLink {
     pub shell: crate::remote::RemoteShell,
 }
 
-/// 阶段 1：探测可达性 + schema 一致性 + 远端 OS（决定 shell 方言）
-pub fn probe_remote(name: &str, job: &Job) -> std::io::Result<RemoteLink> {
+/// 阶段 1：探测可达性 + schema 一致性 + 远端 OS（决定 shell 方言）。
+///
+/// 收 `ctx` 是为了 schema 不匹配那条警告：它必须在**比对期**就到达界面。
+/// 走宏经全局注册表的话，compare 期间没装 sink（只有 apply 才起 Recorder），
+/// 这条恰恰会退回 stderr——在 windowed 桌面构建里等于没说。
+pub fn probe_remote(name: &str, job: &Job, ctx: &crate::progress::RunCtx) -> std::io::Result<RemoteLink> {
     let host = job
         .remote_host
         .as_deref()
@@ -319,10 +420,22 @@ pub fn probe_remote(name: &str, job: &Job) -> std::io::Result<RemoteLink> {
     let pv: serde_json::Value = serde_json::from_slice(&probe)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad probe output: {e}")))?;
     if pv["schema"].as_u64() != Some(crate::table::SCHEMA as u64) {
-        eprintln!("[{name}] warning: remote schema {} != local {} — rebuild the remote binary", pv["schema"], crate::table::SCHEMA);
+        ctx.log(
+            crate::progress::LogLevel::Warn,
+            "remote",
+            format!(
+                "[{name}] warning: remote schema {} != local {} — rebuild the remote binary",
+                pv["schema"],
+                crate::table::SCHEMA
+            ),
+        );
     }
     let remote_os = pv["os"].as_str().unwrap_or("").to_string();
-    eprintln!("[{name}] remote {}: {} {}", host, remote_os, pv["arch"].as_str().unwrap_or("?"));
+    ctx.log(
+        crate::progress::LogLevel::Info,
+        "remote",
+        format!("[{name}] remote {}: {} {}", host, remote_os, pv["arch"].as_str().unwrap_or("?")),
+    );
     Ok(RemoteLink {
         host: host.to_string(),
         exe: exe.to_string(),
@@ -345,16 +458,10 @@ pub fn compare_remote_job_detailed(
     ctx: &crate::progress::RunCtx,
 ) -> std::io::Result<CompareOutcome> {
     use crate::progress::{Phase, PhaseProgress};
-    let link = probe_remote(name, job)?;
+    let link = probe_remote(name, job, ctx)?;
 
     // 2) 远端扫描（在远端自己的盘上哈希——比经 UNC 拉数据快得多）
-    let mut scan_args: Vec<String> = vec!["scan".into(), link.rroot.clone()];
-    match job.rigor.as_str() {
-        "quick" => scan_args.push("--no-hash".into()),
-        "fast" => scan_args.push("--fast".into()),
-        "paranoid" => scan_args.push("--force-rehash".into()),
-        _ => {}
-    }
+    let mut scan_args: Vec<String> = vec!["scan".into(), link.rroot.clone(), "--rigor".into(), job.rigor.clone()];
     if job.dev_excludes {
         scan_args.push("--dev-excludes".into());
     }
@@ -379,15 +486,7 @@ pub fn compare_remote_job_detailed(
     let mut v = crate::preflight::Verdict { blockers: Vec::new(), warnings: Vec::new() };
     crate::preflight::check_root("source", &job.source, job.require_marker, &mut v);
     for w in &v.warnings {
-        eprintln!("[{name}] warning: {w}");
-        ctx.sink.emit(crate::progress::ProgressEvent::Error {
-            phase: Phase::ScanSource,
-            ts_ms: crate::table::now_ms(),
-            path: String::new(),
-            action: "warning".into(),
-            side: "source".into(),
-            message: w.clone(),
-        });
+        ctx.log(crate::progress::LogLevel::Warn, "compare", format!("[{name}] warning: {w}"));
     }
     if !v.ok() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
@@ -471,7 +570,7 @@ fn apply_remote_inner(
         return Ok(ApplyOutcome { done: 0, skipped: sel_ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false });
     }
 
-    let link = probe_remote(name, job)?;
+    let link = probe_remote(name, job, ctx)?;
     let (host, exe, rroot, shell) = (link.host.as_str(), link.exe.as_str(), link.rroot.as_str(), link.shell);
     // 打包/回拉都只看定稿子集；full plan 只用于 archive 刷新（冲突路径剔除要看全量）
     let plan = Plan { header: plan_full.header.clone(), ops: sel_ops.to_vec() };
@@ -515,11 +614,19 @@ fn apply_remote_inner(
                             m.insert(fc.rel.clone(), fc);
                         }
                     }
-                    eprintln!("[{name}] delta: got chunk tables for {} large file(s)", m.len());
+                    ctx.log(
+                        crate::progress::LogLevel::Info,
+                        "delta",
+                        format!("[{name}] delta: got chunk tables for {} large file(s)", m.len()),
+                    );
                     Some(m)
                 }
                 Err(e) => {
-                    eprintln!("[{name}] delta disabled (chunk request failed: {e})");
+                    ctx.log(
+                        crate::progress::LogLevel::Warn,
+                        "delta",
+                        format!("[{name}] delta disabled (chunk request failed: {e})"),
+                    );
                     None
                 }
             }
@@ -530,7 +637,11 @@ fn apply_remote_inner(
         let sum = crate::pack::pack(&plan, &job.source, &tmp, remote_chunks.as_ref())?;
         pp_pack.set_totals(sum.ops, sum.bytes);
         if sum.delta_saved > 0 {
-            eprintln!("[{name}] packed {} B, delta saved {} B", sum.bytes, sum.delta_saved);
+            ctx.log(
+                crate::progress::LogLevel::Info,
+                "pack",
+                format!("[{name}] packed {} B, delta saved {} B", sum.bytes, sum.delta_saved),
+            );
         }
         let rpkg = if shell == crate::remote::RemoteShell::PowerShell {
             format!("syncdash-{}.tar", crate::table::now_ms()) // 相对路径 → 远端家目录
@@ -562,7 +673,7 @@ fn apply_remote_inner(
             done += sum.ops;
         } else {
             errors += 1;
-            eprintln!("[{name}] remote apply-pack reported failure");
+            ctx.log(crate::progress::LogLevel::Error, "remote", format!("[{name}] remote apply-pack reported failure"));
             ctx.sink.emit(ProgressEvent::Error {
                 phase: Phase::Apply,
                 ts_ms: crate::table::now_ms(),
@@ -596,10 +707,14 @@ fn apply_remote_inner(
             bytes_done_total += out.bytes_copied;
         } else {
             skipped += src_ops.len() as u64;
-            eprintln!(
-                "[{name}] {} source-side op(s) skipped: mounted target '{}' not accessible (pull direction needs the SMB mount)",
-                src_ops.len(),
-                job.target.display()
+            ctx.log(
+                crate::progress::LogLevel::Warn,
+                "remote",
+                format!(
+                    "[{name}] {} source-side op(s) skipped: mounted target '{}' not accessible (pull direction needs the SMB mount)",
+                    src_ops.len(),
+                    job.target.display()
+                ),
             );
         }
     }

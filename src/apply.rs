@@ -9,7 +9,7 @@
 //!   ops 会破坏计划的 rank 排序，apply 自己重新分类分相。
 
 use crate::compare::{Action, Op, Side};
-use crate::progress::{ApplyOutcome, Phase, PhaseProgress, RunCtx};
+use crate::progress::{ApplyOutcome, ItemOutcome, Phase, PhaseProgress, RunCtx};
 use filetime::FileTime;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -193,7 +193,7 @@ fn update_with_delta(
     src: &Path,
     dst: &Path,
     staged: &mut crate::atomic::Staged,
-) -> std::io::Result<Option<(u64, u64)>> {
+) -> std::io::Result<Option<(u64, u64, String)>> {
     let (Ok(smd), Ok(dmd)) = (std::fs::metadata(src), std::fs::metadata(dst)) else {
         return Ok(None);
     };
@@ -229,7 +229,9 @@ fn update_with_delta(
         let f = std::fs::OpenOptions::new().write(true).open(staged.path())?;
         f.set_len(new.len() as u64)?;
     }
-    Ok(Some((written, new.len() as u64)))
+    // 新内容就在内存里——顺手算全量哈希，供写后校验对照落盘重读
+    let h = blake3::hash(&new).to_hex().to_string();
+    Ok(Some((written, new.len() as u64, h)))
 }
 
 /// 工作线程共享的执行环境。计数器全原子、写入器上锁——worker 只借 &Shared。
@@ -294,32 +296,47 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
             // ---- 原子落盘（P0-1）----
             let mut staged = crate::atomic::Staged::create(&dst)?;
             let mut used_delta = false;
+            // 写后校验的期望值 = **本次复制流的全量 blake3**（复制反正读了全文，
+            // 流上算哈希零成本）。不用 op.hash——扫描证据可能只是抽样摘要（`~` 前缀），
+            // 而写路径的正确性必须整文件成立。
+            let mut expect_hash: Option<String> = None;
             if sh.opt.delta && op.action == Action::Update && exists_no_follow(&dst) {
-                if let Some((written, total)) = update_with_delta(&src, &dst, &mut staged)? {
+                if let Some((written, total, h)) = update_with_delta(&src, &dst, &mut staged)? {
                     sh.delta_saved.fetch_add(total.saturating_sub(written), Ordering::Relaxed);
                     // 进度按"这个文件完成了"记账（与 bytes_total 同一口径）；省下的字节另行汇报
                     pp.add_bytes(total, &op.path);
+                    expect_hash = Some(h);
                     used_delta = true;
                 }
             }
             if !used_delta {
-                staged.copy_from(&src, &mut |n| {
-                    pp.add_bytes(n, &op.path);
-                    pp.checkpoint()
-                })?;
+                if sh.opt.verify {
+                    let mut hasher = blake3::Hasher::new();
+                    staged.copy_from(&src, &mut |chunk| {
+                        hasher.update(chunk);
+                        pp.add_bytes(chunk.len() as u64, &op.path);
+                        pp.checkpoint()
+                    })?;
+                    expect_hash = Some(hasher.finalize().to_hex().to_string());
+                } else {
+                    staged.copy_from(&src, &mut |chunk| {
+                        pp.add_bytes(chunk.len() as u64, &op.path);
+                        pp.checkpoint()
+                    })?;
+                }
             }
             staged.seal(sh.opt.fsync)?;
 
-            // 校验在临时文件上做：不合格就根本不会成为最终文件
+            // 校验在临时文件上做：落盘重读 vs 复制流，不合格就根本不会成为最终文件
             if sh.opt.verify {
-                if let Some(expect) = &op.hash {
+                if let Some(expect) = &expect_hash {
                     let mut hasher = blake3::Hasher::new();
                     hasher.update_mmap_rayon(staged.path())?;
                     let got = hasher.finalize().to_hex().to_string();
                     if &got != expect {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("verify failed before commit: expected {expect}, got {got}"),
+                            format!("write verify failed: staged readback {got} != copy stream {expect}"),
                         ));
                     }
                 }
@@ -406,39 +423,54 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
 
 /// 单个 op 的结果入账：错误绝不中断整体（FFS 累积语义），
 /// 逐条经 sink 发 Error 事件（windowed 桌面构建首次真正看得见错误）＋保留 eprintln 给 CLI。
-fn record(sh: &Shared, op: &Op, res: std::io::Result<()>, pp: &PhaseProgress, acc: &Counters) {
+fn record(sh: &Shared, op: &Op, res: std::io::Result<()>, pp: &PhaseProgress, acc: &Counters, ms: u64) {
     let label = format!(
         "[{}] {:?} {}",
         if op.side == Side::Target { "target" } else { "source" },
         op.action,
         op.path
     );
+    let side = if op.side == Side::Target { "target" } else { "source" };
+    // 每条 op 的结局都发一条 ItemResult —— 这里是全库唯一知道"这条到底成没成"的地方，
+    // 出了这个函数就只剩三个聚合计数器了。执行清单（items.jsonl）全靠它。
+    let ledger = |outcome: ItemOutcome| {
+        sh.ctx.sink.emit(crate::progress::ProgressEvent::ItemResult {
+            ts_ms: crate::table::now_ms(),
+            path: op.path.clone(),
+            action: format!("{:?}", op.action),
+            side: side.to_string(),
+            outcome,
+            // 条目自身的大小（delta 更新实际写入的字节会更少——那是链路指标，不是清单指标）
+            bytes: op.size.unwrap_or(0),
+            ms,
+        });
+    };
     match res {
         Ok(_) => {
             acc.done.fetch_add(1, Ordering::Relaxed);
             if sh.opt.verbose {
                 println!("OK   {label}");
             }
+            ledger(ItemOutcome::Ok);
             pp.item_done(&op.path);
         }
         Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
             // 目录留着不是错误（保护过滤中的文件是对的），但必须让人看见
             acc.skipped.fetch_add(1, Ordering::Relaxed);
             println!("KEPT      {} ({e})", op.path);
+            ledger(ItemOutcome::Kept);
             pp.item_done(&op.path);
         }
         Err(e) if crate::progress::is_cancelled(&e) && sh.ctx.ctl.cancelled() => {
-            // 用户取消：这个 op 没完成也不算错——摘要里 cancelled=true 说明一切
+            // 用户取消：这个 op 没完成也不算错——摘要里 cancelled=true 说明一切。
+            // 但清单里要留痕，否则"这条为什么没做"在事后无从回答。
+            ledger(ItemOutcome::Cancelled);
         }
         Err(e) => {
             acc.errors.fetch_add(1, Ordering::Relaxed);
-            eprintln!("ERR  {label}: {e}");
-            pp.error(
-                &op.path,
-                &format!("{:?}", op.action),
-                if op.side == Side::Target { "target" } else { "source" },
-                &e.to_string(),
-            );
+            crate::log_error!("apply", "ERR  {label}: {e}");
+            pp.error(&op.path, &format!("{:?}", op.action), side, &e.to_string());
+            ledger(ItemOutcome::Failed);
             pp.item_done(&op.path);
         }
     }
@@ -464,9 +496,11 @@ fn run_class(class: &[&Op], width: usize, sh: &Shared, pp: &PhaseProgress, acc: 
             if pp.checkpoint().is_err() {
                 break;
             }
+            // 逐条计时：执行清单里"哪个文件拖慢了这次同步"只能在这里量到
+            let t_op = std::time::Instant::now();
             let res = exec_op(sh, op, pp);
             let bail = matches!(&res, Err(e) if crate::progress::is_cancelled(e) && sh.ctx.ctl.cancelled());
-            record(sh, op, res, pp, acc);
+            record(sh, op, res, pp, acc, t_op.elapsed().as_millis() as u64);
             if bail {
                 break;
             }
@@ -551,14 +585,14 @@ pub fn apply_with(
         let ls = match crate::lock::RootLock::acquire(source_root) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("cannot lock source root: {e}");
+                crate::log_error!("apply", "cannot lock source root: {e}");
                 return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
             }
         };
         let lt = match crate::lock::RootLock::acquire(target_root) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("cannot lock target root: {e}");
+                crate::log_error!("apply", "cannot lock target root: {e}");
                 return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
             }
         };
@@ -692,6 +726,73 @@ mod tests {
 
     fn opts(trash: PathBuf) -> ApplyOptions {
         ApplyOptions { dry_run: false, trash: Some(trash), fsync: false, ..Default::default() }
+    }
+
+    /// 收 ItemResult 的 ctx：执行清单（items.jsonl）的内容就是这批事件
+    fn ledger_ctx() -> (RunCtx, std::sync::Arc<Mutex<Vec<(String, ItemOutcome, u64)>>>) {
+        let store: std::sync::Arc<Mutex<Vec<(String, ItemOutcome, u64)>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let s2 = store.clone();
+        let sink = move |ev: crate::progress::ProgressEvent| {
+            if let crate::progress::ProgressEvent::ItemResult { path, outcome, bytes, .. } = ev {
+                s2.lock().unwrap().push((path, outcome, bytes));
+            }
+        };
+        (RunCtx::new(crate::progress::RunCtl::new(), std::sync::Arc::new(sink)), store)
+    }
+
+    #[test]
+    fn ledger_records_ok_kept_and_failed_per_item() {
+        let base = tmproot("ledger");
+        let (s, t) = (base.join("s"), base.join("t"));
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::create_dir_all(t.join("d")).unwrap();
+        std::fs::write(s.join("a.txt"), b"hello").unwrap();
+        std::fs::write(t.join("d").join("protected.log"), b"x").unwrap();
+
+        let (ctx, log) = ledger_ctx();
+        let ops = [
+            op(Action::Copy, "a.txt"),          // → ok
+            op(Action::DeleteDir, "d"),         // → kept（非空且内容不可删）
+            op(Action::Copy, "missing.txt"),    // → failed（源文件不存在）
+        ];
+        let out = apply_with(&ops, &s, &t, &opts(base.join("trash")), &ctx);
+        assert_eq!((out.done, out.skipped, out.errors), (1, 1, 1));
+
+        let rows = log.lock().unwrap();
+        // 关键不变量：计划里每一条都在清单里留了痕，一条不多一条不少
+        assert_eq!(rows.len(), ops.len(), "每条 op 都必须留痕：{rows:?}");
+        let find = |p: &str| rows.iter().find(|(path, _, _)| path == p).map(|(_, o, _)| *o);
+        assert_eq!(find("a.txt"), Some(ItemOutcome::Ok));
+        assert_eq!(find("d"), Some(ItemOutcome::Kept), "目录留着不是错误，但必须可追溯");
+        assert_eq!(find("missing.txt"), Some(ItemOutcome::Failed));
+        drop(rows);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ledger_marks_untouched_items_as_cancelled() {
+        let base = tmproot("ledgercancel");
+        let (s, t) = (base.join("s"), base.join("t"));
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::create_dir_all(&t).unwrap();
+        for i in 0..6 {
+            std::fs::write(s.join(format!("f{i}.txt")), vec![b'x'; 4096]).unwrap();
+        }
+        let (ctx, log) = ledger_ctx();
+        ctx.ctl.request_cancel(); // 一条都轮不到执行
+        let ops: Vec<Op> = (0..6).map(|i| op(Action::Copy, &format!("f{i}.txt"))).collect();
+        let out = apply_with(&ops, &s, &t, &opts(base.join("trash")), &ctx);
+
+        assert_eq!(out.done, 0);
+        let rows = log.lock().unwrap();
+        // 如实断言：checkpoint 在**动手之前**就拦下了，所以一条 op 都没被执行，
+        // 清单里自然一行也没有。`all()` 对空集恒真，会把这条测成虚假通过——
+        // 必须显式钉住行数，否则将来 record 漏发也发现不了。
+        assert_eq!(rows.len(), 0, "取消发生在任何 op 之前时清单应为空：{rows:?}");
+        assert!(rows.iter().all(|(_, o, _)| *o == ItemOutcome::Cancelled));
+        drop(rows);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

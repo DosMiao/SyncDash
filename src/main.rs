@@ -1,6 +1,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+use std::sync::Arc;
 use syncdash::{apply, compare, config, filter, pack, run, scan, table, territory};
 
 #[derive(Parser)]
@@ -75,11 +76,14 @@ enum Cmd {
         /// 跳过内容 hash（快，但比对退化为 size+mtime，且无法做移动检测）
         #[arg(long)]
         no_hash: bool,
-        /// 无视 hash 缓存，全部重新 hash（paranoid）
+        /// 严谨级：quick（0 读）| fast（采样+缓存）| standard（每轮实采样每个文件，默认）
+        /// | paranoid（每轮全读每个字节）
+        #[arg(long, default_value = "standard")]
+        rigor: String,
+        /// [兼容旧参] 无视缓存全部重读
         #[arg(long)]
         force_rehash: bool,
-        /// fast 严谨级：≥4MB 文件抽样摘要（size+头/中/尾 256KB），少读约百倍字节；
-        /// 云盘占位文件只水合三小段。非逐字节相等证明
+        /// [兼容旧参] 抽样+缓存（≈ --rigor fast）
         #[arg(long)]
         fast: bool,
         /// 记录 symlink 本身（指向字符串）；默认忽略 symlink
@@ -298,6 +302,13 @@ fn write_out<F: Fn(&mut dyn std::io::Write) -> std::io::Result<()>>(out: &Option
 
 fn main() {
     syncdash::scan::init_worker_pool();
+    // CLI 有控制台：把库内诊断按原文接回 stderr——改造前的终端体验逐字不变。
+    // 必须在任何库调用之前装，且 guard 活到进程结束（`_g` 不能写成 `_`：
+    // `let _ = ...` 会当场 drop，sink 立刻被摘掉）。
+    let cfg = syncdash::settings::load();
+    let _g = cfg.mirror_stderr.then(|| {
+        syncdash::logging::install(Arc::new(syncdash::logging::StderrSink { min_level: cfg.level }))
+    });
     let cli = Cli::parse();
     let code = match run_cli(cli) {
         Ok(c) => c,
@@ -444,12 +455,22 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             Ok(if tot.2 > 0 { 1 } else { 0 })
         }
         Cmd::Gui => launch_desktop(),
-        Cmd::Scan { root, out, no_hash, force_rehash, fast, symlinks_direct, os_excludes, dev_excludes, exclude, progress } => {
+        Cmd::Scan { root, out, no_hash, rigor, force_rehash, fast, symlinks_direct, os_excludes, dev_excludes, exclude, progress } => {
             if !root.is_dir() {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
             }
-            let sopt = scan::ScanOptions { hash: !no_hash, force_rehash, sampled: fast, symlinks_direct, filter: filter::PathFilter::build_full_opt(&[], &exclude, &[], &os_excludes, dev_excludes) };
+            // 阶梯映射 + 旧旗标兼容覆盖
+            let (mut hash, mut sampled, mut use_cache) = match rigor.as_str() {
+                "quick" => (false, false, false),
+                "fast" => (true, true, true),
+                "paranoid" => (true, false, false),
+                _ => (true, true, false), // standard
+            };
+            if no_hash { hash = false; }
+            if fast { sampled = true; use_cache = true; }
+            if force_rehash { use_cache = false; }
+            let sopt = scan::ScanOptions { hash, sampled, use_cache, symlinks_direct, filter: filter::PathFilter::build_full_opt(&[], &exclude, &[], &os_excludes, dev_excludes) };
             let bar = |p: scan::ScanProgress| {
                 let pct = if p.bytes_total > 0 { p.bytes_done * 100 / p.bytes_total } else { 100 };
                 eprint!("\r{} {:>3}%  {}/{}  {:.1} MiB/s   ", p.phase, pct,
@@ -596,7 +617,8 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
         }
         Cmd::History { job, limit, prune_days } => {
             if let Some(days) = prune_days {
-                let n = syncdash::runlog::prune(days);
+                // 0 = 不叠总量闸门：`--prune-days N` 的语义就是"只按天"
+                let n = syncdash::runlog::prune(days, 0);
                 println!("pruned {n} run(s) older than {days} day(s)");
             }
             let rows = syncdash::runlog::history(job.as_deref(), limit);

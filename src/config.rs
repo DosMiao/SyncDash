@@ -177,7 +177,9 @@ impl Job {
             dry_run: false,
             trash,
             verbose,
-            verify: self.rigor == "paranoid",
+            // 写后校验属于 standard 及以上：T4（传输损坏）是最吓人的静默故障，
+            // 校验成本上界 = 本轮传输量，日常档花得起
+            verify: matches!(self.rigor.as_str(), "standard" | "paranoid"),
             versioning: self.versioning,
             fsync: self.fsync,
             filter: Some(crate::filter::PathFilter::build_full_opt(&self.include, &self.exclude, &self.deletable, &self.os_excludes, self.dev_excludes)),

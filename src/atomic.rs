@@ -85,10 +85,12 @@ impl Staged {
     /// （进度计数＋取消/暂停检查点挂这里）。on_chunk 返回 Err 即中止：
     /// Drop 清掉临时文件，最终路径纹丝不动。
     /// 同一个环同时服务：字节级进度（M1）、原子落盘（P0-1）、将来的 write_at 增量（P1-1B）。
+    /// 回调拿到的是**本块字节**（不只是长度）：写后校验要对"复制流的全量哈希"验证——
+    /// 复制本来就读了全文，流上顺手算哈希零成本，且与扫描证据深度（可能只是抽样）解耦。
     pub fn copy_from(
         &mut self,
         src: &Path,
-        on_chunk: &mut dyn FnMut(u64) -> std::io::Result<()>,
+        on_chunk: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
     ) -> std::io::Result<u64> {
         use std::io::Read;
         let f = self
@@ -105,7 +107,7 @@ impl Staged {
             }
             f.write_all(&buf[..n])?;
             total += n as u64;
-            on_chunk(n as u64)?;
+            on_chunk(&buf[..n])?;
         }
         Ok(total)
     }
@@ -257,7 +259,7 @@ mod tests {
         {
             let mut s = Staged::create(&dst).unwrap();
             let mut seen = 0u64;
-            let total = s.copy_from(&src, &mut |n| { seen += n; Ok(()) }).unwrap();
+            let total = s.copy_from(&src, &mut |c| { seen += c.len() as u64; Ok(()) }).unwrap();
             assert_eq!(total, 3 * 1024 * 1024 + 123);
             assert_eq!(seen, total);
             s.seal(false).unwrap();

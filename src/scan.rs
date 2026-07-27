@@ -190,13 +190,14 @@ fn save_cache(root: &Path, entries: &[Entry]) {
 
 pub struct ScanOptions {
     pub hash: bool,
-    /// paranoid 严谨级：无视 (size,mtime) 缓存，全部重新 hash
-    pub force_rehash: bool,
-    /// fast 严谨级：≥4MB 的文件不读全文，抽样摘要（size + 头/中/尾各 256KB 的 blake3，
-    /// 值带 `~` 前缀与全量哈希严格隔离）。比 quick 多一层内容防线（截断、头尾/多数
-    /// 原地修改、采样区 bitrot 全能抓），比 standard 少读约百倍字节；
-    /// 云盘占位文件只水合三小段而不是整只下载。语义上不是逐字节相等证明。
+    /// 抽样证据：≥4MB 的文件不读全文，抽样摘要（size + 头/中/尾各 256KB 的 blake3，
+    /// 值带 `~` 前缀与全量哈希严格隔离）；<4MB 全量。云盘占位文件只水合三小段。
+    /// 语义上不是逐字节相等证明——分歧升级规则（摘要同而 mtime 异 → 全量重验）兜底。
     pub sampled: bool,
+    /// 是否信 (path,size,mtime) 缓存。**阶梯的关键轴**：
+    /// fast = true（只实读变化面，未变面是缓存记忆）；
+    /// standard/paranoid = false（本轮实读每个文件——"一致 ✓"是本轮实测，不是记忆）。
+    pub use_cache: bool,
     /// symlinks="direct"：记录链接本身（指向字符串），否则忽略 symlink
     pub symlinks_direct: bool,
     /// FFS 语义的过滤器（见 filter.rs），默认排除已内置
@@ -418,7 +419,7 @@ fn scan_impl(
                 _ => raw_mt,
             };
             let mut hash = None;
-            if opt.hash && !opt.force_rehash {
+            if opt.hash && opt.use_cache {
                 if let Some((cs, cm, ch)) = cache.get(&rel) {
                     // 缓存值按模式隔离：`~` 前缀 = 抽样摘要，绝不能顶替全量哈希（反之亦然）
                     let want_sampled = opt.sampled && size >= SAMPLE_MIN;
@@ -435,7 +436,8 @@ fn scan_impl(
     }
 
     if walk_errors > 0 {
-        eprintln!(
+        crate::log_warn!(
+            "scan",
             "warning: {walk_errors} entr(ies) under {} skipped by walk errors — they will look ABSENT on this side! samples: {}",
             root.display(),
             walk_err_samples.join(" | ")
@@ -594,7 +596,7 @@ fn scan_impl(
     }
     hash_errors += hash_err_count.load(std::sync::atomic::Ordering::Relaxed);
     if hash_errors > 0 {
-        eprintln!("warning: {hash_errors} file(s) could not be hashed (in use / unreadable)");
+        crate::log_warn!("scan", "warning: {hash_errors} file(s) could not be hashed (in use / unreadable)");
     }
 
     Ok(Snapshot {
@@ -659,7 +661,7 @@ mod ctx_tests {
         ScanOptions {
             hash: true,
             sampled: false,
-            force_rehash: true, // 测试不吃缓存
+            use_cache: false, // 测试不吃缓存
             symlinks_direct: false,
             filter: crate::filter::PathFilter::build(&[], &[]),
         }

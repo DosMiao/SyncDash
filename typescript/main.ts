@@ -50,7 +50,16 @@ interface RunRecord {
   ts_ms: number; job: string; kind: string;
   done: number; skipped: number; errors: number; bytes: number;
   elapsed_ms: number; cancelled: boolean; detail?: string;
+  // v0.10：run_id = 运行目录名（compare 类没有目录 → null）；
+  // finished = false 表示这次运行被中断（进程被杀，finish 没跑到）
+  run_id?: string | null; warnings?: number; ops_found?: number | null; finished?: boolean;
 }
+interface AppSettings {
+  log_dir: string; level: 'info' | 'warn' | 'error';
+  keep_days: number; max_total_mb: number;
+  log_compare: string; mirror_stderr: boolean;
+}
+interface MigrateReport { moved: number; skipped: number; failed: number; messages: string[] }
 interface Progress { phase: string; detail: string; pct: number; rate: number }
 interface PreflightDto { ok: boolean; blockers: string[]; warnings: string[] }
 interface PathInfo { exists: boolean; is_dir: boolean; has_marker: boolean }
@@ -1212,12 +1221,42 @@ btnWatch.addEventListener('click', () => {
   setStatus(`⏱ 值守已开启：每 ${iv}s 比对一次（hash 缓存让未变的树只付 walk 成本）${currentJob.watch_auto_apply ? ' · 自动执行' : ''}`);
 });
 
-// ---------- M4：运行日志面板 ----------
+// ---------- v0.10：主窗内嵌日志控制台 ----------
+//
+// 取代 M4 那个"把 JSONL 倒进 <pre>"的 modal。三份产物各一个视图：
+//   事件（run.jsonl）· 报错（errors.jsonl）· 执行（items.jsonl）· 计划（plan.jsonl）
+// 计划视图不是摆设：被中断的运行 items 里没有的那些行，只有跟计划对比才看得出来。
 
-const logModal = $('logmodal');
-const logList = $('log-list');
-const logDetail = $('log-detail');
-const logBack = $<HTMLButtonElement>('log-back');
+type LogView = 'run' | 'errors' | 'items' | 'plan';
+type LogLevel = 'info' | 'warn' | 'error';
+
+/** 一条已解析的日志行——四种产物归一到这个形状后共用一个渲染器 */
+interface LogRow {
+  ts: number;
+  level: LogLevel;
+  scope: string;
+  text: string;
+  /** 搜索时连路径一起匹配 */
+  hay: string;
+}
+
+const lpEl = $('logpanel');
+const lpBody = $('lp-body');
+const lpRun = $<HTMLSelectElement>('lp-run');
+const lpQ = $<HTMLInputElement>('lp-q');
+const lpStat = $('lp-stat');
+
+const LP_VIEWS: [LogView, string][] = [
+  ['run', '事件'], ['errors', '报错'], ['items', '执行'], ['plan', '计划'],
+];
+const LP_LEVELS: [LogLevel | 'all', string][] = [
+  ['all', '全部'], ['info', '信息'], ['warn', '警告'], ['error', '报错'],
+];
+
+let lpView: LogView = 'run';
+let lpLevel: LogLevel | 'all' = 'all';
+let lpRuns: RunRecord[] = [];
+let lpRows: LogRow[] = [];
 
 async function refreshLastSyncs() {
   try {
@@ -1226,54 +1265,280 @@ async function refreshLastSyncs() {
   } catch { /* 日志缺失不致命 */ }
 }
 
-function logShowList() {
-  logDetail.classList.add('hidden');
-  logBack.classList.add('hidden');
-  logList.classList.remove('hidden');
+function hms(ts: number): string {
+  const d = new Date(ts);
+  const p = (n: number, w = 2) => String(n).padStart(w, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
 }
 
-async function openLogPanel() {
-  $('log-scope').textContent = currentJob ? `— ${currentJob.name}` : '— 全部任务';
-  logShowList();
-  logList.innerHTML = '<div class="logempty">加载中…</div>';
-  logModal.classList.remove('hidden');
-  try {
-    const rows = await invoke<RunRecord[]>('run_history', { job: currentJob?.name ?? null, limit: 50 });
-    logList.innerHTML = '';
-    if (rows.length === 0) {
-      logList.innerHTML = '<div class="logempty">还没有运行记录 — 任务真正执行（apply）后才会留痕</div>';
-      return;
+/** 一次运行在下拉里的样子。被中断的那次要一眼认出来——它恰恰是最该看的一次。 */
+function runLabel(r: RunRecord): string {
+  const when = new Date(r.ts_ms).toLocaleString();
+  if (r.ops_found != null) return `${when}  ${r.job}  比对 · 发现 ${r.ops_found} 项`;
+  const bad = r.errors ? ` · ${r.errors} 错` : '';
+  const warn = r.warnings ? ` · ${r.warnings} 警告` : '';
+  const state = r.finished === false ? ' · ⚠ 被中断' : r.cancelled ? ' · 已取消' : '';
+  return `${when}  ${r.job}  ${r.done} 项${bad}${warn}${state}`;
+}
+
+/** JSONL 一行 → LogRow。认不出来的行原样显示，绝不吞掉。 */
+function parseLogLine(raw: string, view: LogView): LogRow | null {
+  let v: Record<string, unknown>;
+  try { v = JSON.parse(raw); } catch { return { ts: 0, level: 'info', scope: '?', text: raw, hay: raw }; }
+  const ts = Number(v.ts_ms ?? 0);
+  if (view === 'plan') {
+    const op = v.op as Record<string, unknown> | undefined;
+    if (!op) return null;
+    const t = `${op.action}  ${op.path}  (${op.side}) ${op.reason ?? ''}`;
+    return { ts: Number(op.mtime_ms ?? 0), level: 'info', scope: '计划', text: t, hay: t };
+  }
+  switch (v.kind) {
+    case 'log':
+      return { ts, level: (v.level as LogLevel) ?? 'info', scope: String(v.scope ?? ''), text: String(v.message ?? ''), hay: String(v.message ?? '') };
+    case 'error': {
+      const t = `${v.action} ${v.path} (${v.side})：${v.message}`;
+      return { ts, level: 'error', scope: String(v.phase ?? 'apply'), text: t, hay: t };
     }
-    for (const r of rows) {
-      const div = document.createElement('div');
-      div.className = 'logrow';
-      const dot = r.errors > 0 ? 'err' : r.cancelled ? 'warn' : 'ok';
-      div.innerHTML =
-        `<span><span class="dot ${dot}">●</span> ${relTime(r.ts_ms)}</span>` +
-        `<span>${escapeHtml(r.job)} <span class="k">${r.kind}</span></span>` +
-        `<span>${r.done} 项${r.errors ? ` · <b style="color:var(--red)">${r.errors} 错</b>` : ''}</span>` +
-        `<span>${humanSize(r.bytes) || '0 B'} · ${(r.elapsed_ms / 1000).toFixed(1)}s${r.cancelled ? ' · 已取消' : ''}</span>` +
-        `<span class="k">${r.detail ? '点击看明细 ›' : ''}</span>`;
-      if (r.detail) {
-        div.addEventListener('click', async () => {
-          const lines = await invoke<string[]>('run_detail', { detail: r.detail });
-          logDetail.textContent = lines.length ? lines.join('\n') : '(明细文件为空或已被清理)';
-          logList.classList.add('hidden');
-          logDetail.classList.remove('hidden');
-          logBack.classList.remove('hidden');
-        });
-      }
-      logList.appendChild(div);
+    case 'item_result': {
+      const oc = String(v.outcome);
+      const lvl: LogLevel = oc === 'failed' ? 'error' : oc === 'ok' ? 'info' : 'warn';
+      const t = `${OUTCOME[oc] ?? oc}  ${v.action} ${v.path}  ${humanSize(Number(v.bytes)) || '0 B'}${Number(v.ms) ? ` · ${v.ms}ms` : ''}`;
+      return { ts, level: lvl, scope: String(v.side ?? ''), text: t, hay: String(v.path ?? '') };
     }
-  } catch (e) {
-    logList.innerHTML = `<div class="logempty">读取失败：${escapeHtml(String(e))}</div>`;
+    case 'phase_start':
+      return { ts, level: 'info', scope: '阶段', text: `▶ ${v.phase}${v.label ? `  ${v.label}` : ''}`, hay: String(v.label ?? '') };
+    case 'summary': {
+      const t = `■ 完成：${v.done} 执行，${v.skipped} 跳过，${v.errors} 错误 · ${humanSize(Number(v.bytes_done)) || '0 B'} · ${((Number(v.elapsed_ms)) / 1000).toFixed(1)}s${v.cancelled ? ' · 已取消' : ''}`;
+      return { ts, level: Number(v.errors) ? 'error' : 'info', scope: '终态', text: t, hay: t };
+    }
+    default:
+      return { ts, level: 'info', scope: String(v.kind ?? '?'), text: raw, hay: raw };
   }
 }
 
-$('btn-log').addEventListener('click', openLogPanel);
-logBack.addEventListener('click', logShowList);
-$('log-close').addEventListener('click', () => logModal.classList.add('hidden'));
-logModal.addEventListener('click', (e) => { if (e.target === logModal) logModal.classList.add('hidden'); });
+const OUTCOME: Record<string, string> = {
+  ok: '✓ 成功', failed: '✗ 失败', kept: '⊘ 保留', cancelled: '■ 未执行',
+};
+
+function lpPills() {
+  const views = $('lp-views');
+  views.innerHTML = '';
+  for (const [v, label] of LP_VIEWS) {
+    const b = document.createElement('button');
+    b.className = 'lp-pill' + (v === lpView ? ' on' : '');
+    b.textContent = label;
+    b.addEventListener('click', () => { lpView = v; lpPills(); lpLoadView(); });
+    views.appendChild(b);
+  }
+  const lv = $('lp-levels');
+  lv.innerHTML = '';
+  for (const [l, label] of LP_LEVELS) {
+    const n = l === 'all' ? lpRows.length : lpRows.filter((r) => r.level === l).length;
+    const b = document.createElement('button');
+    b.className = 'lp-pill' + (l === lpLevel ? ' on' : '') + (l !== 'all' ? ` lv-${l}` : '');
+    b.textContent = `${label} ${n}`;
+    b.addEventListener('click', () => { lpLevel = l; lpPills(); lpRender(); });
+    lv.appendChild(b);
+  }
+}
+
+function lpRender() {
+  const q = lpQ.value.trim().toLowerCase();
+  const rows = lpRows.filter((r) => (lpLevel === 'all' || r.level === lpLevel) && (!q || r.hay.toLowerCase().includes(q) || r.text.toLowerCase().includes(q)));
+  lpBody.innerHTML = '';
+  if (rows.length === 0) {
+    lpBody.innerHTML = `<div class="logempty">${lpRows.length ? '没有匹配的行' : '这份产物是空的'}</div>`;
+    lpStat.textContent = `0 / ${lpRows.length}`;
+    return;
+  }
+  // 大清单直接建 DOM 会卡；执行清单动辄上万行，先封顶再说
+  const CAP = 3000;
+  const frag = document.createDocumentFragment();
+  for (const r of rows.slice(0, CAP)) {
+    const d = document.createElement('div');
+    d.className = `lp-row lv-${r.level}`;
+    d.innerHTML =
+      `<span class="lp-t">${r.ts ? hms(r.ts) : ''}</span>` +
+      `<span class="lp-l">${LEVEL_CN[r.level]}</span>` +
+      `<span class="lp-s">${escapeHtml(r.scope)}</span>` +
+      `<span class="lp-m">${escapeHtml(r.text)}</span>`;
+    frag.appendChild(d);
+  }
+  lpBody.appendChild(frag);
+  if (rows.length > CAP) {
+    const more = document.createElement('div');
+    more.className = 'logempty';
+    more.textContent = `只显示前 ${CAP} 行（共 ${rows.length}）—— 用搜索缩小范围，或点 📂 打开原始文件`;
+    lpBody.appendChild(more);
+  }
+  lpStat.textContent = `${rows.length} / ${lpRows.length}`;
+}
+
+const LEVEL_CN: Record<LogLevel, string> = { info: '信息', warn: '警告', error: '报错' };
+
+async function lpLoadView() {
+  const r = lpRuns[lpRun.selectedIndex];
+  lpRows = [];
+  if (!r) { lpPills(); lpRender(); return; }
+  if (!r.run_id) {
+    // compare 类只留了一行索引，没有目录——说清楚为什么这里是空的
+    lpBody.innerHTML = '<div class="logempty">比对运行只记摘要，不留明细目录（值守每 30s 一轮，建目录会把日志盘冲垮）</div>';
+    lpStat.textContent = '';
+    lpPills();
+    return;
+  }
+  lpBody.innerHTML = '<div class="logempty">加载中…</div>';
+  try {
+    const lines = await invoke<string[]>('log_artifact', { runId: r.run_id, which: lpView });
+    lpRows = lines.map((l) => parseLogLine(l, lpView)).filter((x): x is LogRow => x !== null);
+  } catch (e) {
+    lpBody.innerHTML = `<div class="logempty">读取失败：${escapeHtml(String(e))}</div>`;
+    return;
+  }
+  lpPills();
+  lpRender();
+}
+
+async function lpLoadRuns() {
+  try {
+    lpRuns = await invoke<RunRecord[]>('log_runs', { job: currentJob?.name ?? null, limit: 100 });
+  } catch (e) {
+    lpBody.innerHTML = `<div class="logempty">读取运行列表失败：${escapeHtml(String(e))}</div>`;
+    return;
+  }
+  lpRun.innerHTML = '';
+  for (const r of lpRuns) {
+    const o = document.createElement('option');
+    o.textContent = runLabel(r);
+    lpRun.appendChild(o);
+  }
+  if (lpRuns.length === 0) {
+    lpBody.innerHTML = '<div class="logempty">还没有运行记录 — 任务执行（Synchronize）后才会留痕</div>';
+    lpStat.textContent = '';
+    lpPills();
+    return;
+  }
+  await lpLoadView();
+}
+
+async function openLogPanel() {
+  lpEl.classList.remove('hidden');
+  await lpLoadRuns();
+}
+
+$('btn-log').addEventListener('click', () => {
+  if (lpEl.classList.contains('hidden')) openLogPanel();
+  else lpEl.classList.add('hidden');
+});
+$('lp-close').addEventListener('click', () => lpEl.classList.add('hidden'));
+lpRun.addEventListener('change', lpLoadView);
+lpQ.addEventListener('input', lpRender);
+$('lp-open').addEventListener('click', async () => {
+  const r = lpRuns[lpRun.selectedIndex];
+  try {
+    const p = await invoke<string>('log_dir_path', { runId: r?.run_id ?? null });
+    await invoke('reveal', { path: p });
+  } catch (e) {
+    setStatus(`打开目录失败：${e}`, 'err');
+  }
+});
+
+// ---------- v0.10：日志设置（复用任务编辑器那套 schema 驱动表单） ----------
+
+const setModal = $('setmodal');
+const setForm = $('set-form');
+
+/// 简单表单构建器：只认 text / dir / num / bool / select 五种。
+/// 没有复用 edBuild —— 那边已经长出任务编辑器专用的部件（路径 datalist、
+/// source⇄target 对调、双根体检框），套过来只会把两边都拖住。
+/// 共用的是 FSpec 类型与 .ed-field/.ed-group 那套样式，视觉上仍是同一个东西。
+function buildForm(host: HTMLElement, fields: FSpec[], vals: Record<string, unknown>) {
+  host.innerHTML = '';
+  for (const f of fields) {
+    if (f.group) {
+      const g = document.createElement('div');
+      g.className = 'ed-group';
+      g.textContent = f.group;
+      host.appendChild(g);
+    }
+    const wrap = document.createElement('label');
+    wrap.className = 'ed-field' + (f.wide ? ' wide' : '') + (f.kind === 'bool' ? ' ed-check' : '');
+    const v = vals[f.key];
+    let inner: string;
+    if (f.kind === 'select') {
+      inner = `<span>${f.label}</span><select data-k="${f.key}">` +
+        f.opts!.map((o) => `<option${o === v ? ' selected' : ''}>${o}</option>`).join('') + '</select>';
+    } else if (f.kind === 'bool') {
+      inner = `<input type="checkbox" data-k="${f.key}"${v ? ' checked' : ''}/><span>${f.label}</span>`;
+    } else if (f.kind === 'num') {
+      inner = `<span>${f.label}</span><input type="number" step="any" data-k="${f.key}" value="${v ?? ''}"/>`;
+    } else if (f.kind === 'dir') {
+      inner = `<span>${f.label}</span><div class="pathrow">` +
+        `<input type="text" data-k="${f.key}" value="${escapeHtml(String(v ?? ''))}" spellcheck="false"/>` +
+        `<button type="button" class="pbtn" data-pick="dir" data-for="${f.key}" title="浏览…">📁</button></div>`;
+    } else {
+      inner = `<span>${f.label}</span><input type="text" data-k="${f.key}" value="${escapeHtml(String(v ?? ''))}" spellcheck="false"/>`;
+    }
+    if (f.hint) inner += `<span class="thin">${f.hint}</span>`;
+    wrap.innerHTML = inner;
+    host.appendChild(wrap);
+  }
+  for (const b of host.querySelectorAll<HTMLButtonElement>('button[data-pick]')) {
+    b.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const el = host.querySelector<HTMLInputElement>(`[data-k="${b.dataset.for}"]`);
+      if (!el) return;
+      const p = await pickPath({ directory: true, title: '选择日志目录', defaultPath: el.value.trim() });
+      if (p) el.value = p;
+    });
+  }
+}
+
+function collectForm(host: HTMLElement, fields: FSpec[]): Record<string, unknown> {
+  const kind = new Map(fields.map((f) => [f.key, f.kind]));
+  const out: Record<string, unknown> = {};
+  for (const el of host.querySelectorAll<HTMLElement>('[data-k]')) {
+    const k = (el as HTMLElement).dataset.k!;
+    if (el instanceof HTMLInputElement && el.type === 'checkbox') out[k] = el.checked;
+    else if (kind.get(k) === 'num') out[k] = Number((el as HTMLInputElement).value.trim() || 0);
+    else out[k] = (el as HTMLInputElement | HTMLSelectElement).value.trim();
+  }
+  return out;
+}
+
+const SET_FIELDS: FSpec[] = [
+  { key: 'log_dir', label: '日志目录（留空 = 默认 %APPDATA%\\syncdash\\logs）', kind: 'dir', wide: true, group: '位置' },
+  { key: 'level', label: '记录等级', kind: 'select', opts: ['info', 'warn', 'error'], hint: '低于该等级的叙事不落盘；报错清单不受影响', group: '内容' },
+  { key: 'log_compare', label: '比对运行', kind: 'select', opts: ['summary', 'off'], hint: 'summary = 只记一行摘要不建目录（值守每 30s 一轮，建目录会把盘冲垮）' },
+  { key: 'mirror_stderr', label: 'CLI 同时输出到终端', kind: 'bool' },
+  { key: 'keep_days', label: '保留天数（0 = 不按天清）', kind: 'num', group: '保留' },
+  { key: 'max_total_mb', label: '总量上限 MB（0 = 不限）', kind: 'num', hint: '执行清单全记，一次大同步上万行——总量闸门是它的安全带' },
+];
+
+async function openSettings() {
+  let s: AppSettings;
+  try { s = await invoke<AppSettings>('get_settings'); } catch (e) { setStatus(`读取设置失败：${e}`, 'err'); return; }
+  buildForm(setForm, SET_FIELDS, s as unknown as Record<string, unknown>);
+  $('set-note').textContent = '改动日志目录后保存，旧目录会整体搬到新位置（跨盘时自动退化为复制+删除）。';
+  setModal.classList.remove('hidden');
+}
+
+$('lp-settings').addEventListener('click', openSettings);
+$('set-cancel').addEventListener('click', () => setModal.classList.add('hidden'));
+setModal.addEventListener('click', (e) => { if (e.target === setModal) setModal.classList.add('hidden'); });
+$('set-save').addEventListener('click', async () => {
+  const s = collectForm(setForm, SET_FIELDS) as unknown as AppSettings;
+  try {
+    const rep = await invoke<MigrateReport>('save_settings', { s, migrate: true });
+    setModal.classList.add('hidden');
+    const moved = rep.moved ? `，已迁移 ${rep.moved} 项` : '';
+    const failed = rep.failed ? `，${rep.failed} 项失败` : '';
+    setStatus(`日志设置已保存${moved}${failed}`, rep.failed ? 'err' : 'ok');
+    if (!lpEl.classList.contains('hidden')) lpLoadRuns();
+  } catch (e) {
+    setStatus(`保存设置失败：${e}`, 'err');
+  }
+});
 
 // ---------- v0.9.1：主窗内嵌 compare 进度面板（数据源 = run-progress 事件流） ----------
 
@@ -1920,8 +2185,13 @@ document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') editModal.classList.add('hidden');
     return;
   }
-  if (!logModal.classList.contains('hidden')) {
-    if (e.key === 'Escape') logModal.classList.add('hidden');
+  if (!setModal.classList.contains('hidden')) {
+    if (e.key === 'Escape') setModal.classList.add('hidden');
+    return;
+  }
+  // 日志面板是内嵌的，不是模态：Esc 收起它，但不拦截其它快捷键
+  if (e.key === 'Escape' && !lpEl.classList.contains('hidden')) {
+    lpEl.classList.add('hidden');
     return;
   }
   if (!modalEl.classList.contains('hidden')) {
