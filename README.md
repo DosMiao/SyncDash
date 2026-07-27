@@ -16,22 +16,41 @@ Why not just keep using FFS / rsync / Unison:
 
 ```
 SyncDash/
-├─ src/                 syncdash core library + CLI bin
-│   └─ foundation/      L0 bedrock layer (fmt/time/path/text/names): zero in-crate deps, usable by anyone
-├─ src-tauri/           Tauri v2 desktop shell: thin IPC layer (list_jobs / compare_job / apply_job)
-├─ typescript/          frontend (Vite + plain TS, no framework): main.ts + styles.css
-│   └─ core/types/generated/   wire types ts-rs generates from the Rust structs — do not hand-edit
-├─ Script/gen-types.mjs type generation entry point (`npm run gen:types`)
-├─ index.html           frontend entry point
-├─ dist/                frontend build output — deliberately committed to git (no node on Mac, see "Build")
-├─ builder.bat          Windows build menu (Dev / Desktop / CLI / All)
-└─ builder.command      Mac build script (pure cargo)
+├─ src/                       syncdash core library + CLI bin — one directory per layer
+│   ├─ foundation/            L0  fmt · time · path · text · names · dirs   (zero in-crate deps)
+│   ├─ model/                 L0  plan · event · table · chunk · vclock     (vocabulary, no I/O)
+│   ├─ fs/                    L0  staged (atomic write) · lock
+│   ├─ store/                 L1  settings · trash · version
+│   ├─ obs/                   L1  progress · logging · runlog
+│   ├─ pipeline/              L2  scan · compare · apply · filter · guard
+│   ├─ transfer/              L2  remote · pack
+│   ├─ job/                   L3  the Job schema · territory
+│   ├─ run.rs                 L3  the orchestrator
+│   └─ main.rs                L4  CLI bin
+├─ src-tauri/                 L4  Tauri v2 desktop shell: thin IPC layer
+├─ typescript/                frontend (Vite + plain TS, no framework)
+│   └─ core/types/generated/  wire types ts-rs generates from the Rust structs — do not hand-edit
+├─ Script/gen-types.mjs       type generation entry point (`npm run gen:types`)
+├─ index.html                 frontend entry point
+├─ dist/                      frontend build output — deliberately committed to git (no node on Mac, see "Build")
+├─ builder.bat                Windows build menu (Dev / Desktop / CLI / All)
+└─ builder.command            Mac build script (pure cargo)
 ```
 
-Dependency ladder: `foundation` → `table/chunk/atomic` → `progress/logging/runlog/settings` →
-`filter/scan/compare/apply/pack/preflight/…` → `config/run` → the two shells.
-Dependencies point downward only, no cycles (verified with Tarjan). **No re-export hub**: callers write the
-full path, `foundation::fmt::human_bytes` rather than `preflight::human_bytes`.
+Dependencies point **downward only**, and this is checked rather than asserted: Tarjan over the
+comment-stripped sources reports no strongly-connected component larger than one and no edge pointing
+up the ladder.
+
+Two shape rules: a **single-file domain stays flat at its parent** (`transfer/remote.rs`, `run.rs`) —
+only a multi-file domain earns a directory, because nesting for its own sake only lengthens paths. And
+**no re-export hubs**: every `mod.rs` carries real content and callers write the full path
+(`foundation::fmt::human_bytes`), since a barrel erases who depends on whom, which is the one thing
+this layering exists to keep visible.
+
+`model` holds vocabulary while the engines that produce it live in `pipeline` and `obs`. That split is
+what makes the graph acyclic: `store::version` and `obs::runlog` both persist ops and `store::settings`
+needs `LogLevel`, so leaving those types inside their engines forced service modules to reach up into
+the domain layer for a struct definition.
 
 Language: code, identifiers, comments and UI text are all English (same convention as AlexQuant Desktop).
 Two exceptions are deliberate and must survive future sweeps — `foundation/text.rs` keeps two CJK strings as
