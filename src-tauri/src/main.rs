@@ -16,7 +16,8 @@ use syncdash::progress::{Phase, ProgressEvent, ProgressSink, RunCtl, RunCtx};
 use syncdash::{config, run};
 use tauri::Emitter;
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 struct JobDto {
     name: String,
     mode: String,
@@ -29,16 +30,19 @@ struct JobDto {
     remote_host: Option<String>,
     versioning: bool,
     delta: bool,
+    #[ts(type = "number | null")]
     parallel: Option<usize>,
     include: Vec<String>,
     exclude: Vec<String>,
+    #[ts(type = "number | null")]
     watch_interval_secs: Option<u64>,
     watch_auto_apply: bool,
     /// 1:N：生效的 target 列表（单 target 任务 = 一项）。>1 时前端显示 target 选择器
     targets: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 struct PlanDto {
     header: PlanHeader,
     ops: Vec<Op>,
@@ -51,35 +55,45 @@ struct PlanDto {
     metas: Vec<compare::RowMeta>,
     /// 两侧判定相等的文件数/字节（"显示 X / 共 Y"的分母）
     #[serde(default)]
+    #[ts(type = "number")]
     equal_count: u64,
     #[serde(default)]
+    #[ts(type = "number")]
     equal_bytes: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 struct ApplyDto {
+    #[ts(type = "number")]
     done: u64,
+    #[ts(type = "number")]
     skipped: u64,
+    #[ts(type = "number")]
     errors: u64,
+    #[ts(type = "number")]
     bytes_copied: u64,
     cancelled: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 struct PreflightDto {
     ok: bool,
     blockers: Vec<String>,
     warnings: Vec<String>,
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 struct PathInfo {
     exists: bool,
     is_dir: bool,
     has_marker: bool,
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 struct PathVerdict {
     source: PathInfo,
     target: PathInfo,
@@ -101,8 +115,10 @@ struct CachedSnaps {
 #[derive(Default)]
 struct SnapCache(Mutex<Option<CachedSnaps>>);
 
-#[derive(Serialize)]
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 struct SamePage {
+    #[ts(type = "number")]
     total: u64,
     rows: Vec<compare::SameRow>,
     /// 缓存里躺的是哪个任务的快照（对不上就让界面提示重新比对）
@@ -145,7 +161,8 @@ struct RunEvent {
 }
 
 /// 旧状态栏事件（M2 前端落地前的过渡 shim）
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 struct LegacyProgress {
     phase: String,
     detail: String,
@@ -195,8 +212,8 @@ fn legacy_shim(app: &tauri::AppHandle, ev: &ProgressEvent) {
                     phase: legacy_phase(*phase).into(),
                     detail: format!(
                         "{} / {}",
-                        syncdash::preflight::human_bytes(*bytes_done),
-                        syncdash::preflight::human_bytes(*bytes_total)
+                        syncdash::foundation::fmt::human_bytes(*bytes_done),
+                        syncdash::foundation::fmt::human_bytes(*bytes_total)
                     ),
                     pct,
                     rate: 0.0,
@@ -667,9 +684,9 @@ async fn compare_job(
         let ctx = make_ctx(&app, run_id, ctl, "compare");
         // 比对期也接管进程级日志出口：`trash`/`lock`/`scan` 里那些拿不到 ctx 的诊断
         // 走宏经注册表，这里不装的话它们会退回 stderr——windowed 构建里等于没说。
-        let _log_guard = syncdash::logging::install(ctx.sink.clone());
+        let _log_guard = syncdash::progress::install(ctx.sink.clone());
         let t0 = std::time::Instant::now();
-        let ts_ms = syncdash::table::now_ms() as i64;
+        let ts_ms = syncdash::foundation::time::now_ms() as i64;
         // M3：remote 任务走远程管线（远端自己盘上扫描），不再静默落进本地管线
         let r = if job.remote_host.is_some() {
             run::compare_remote_job_detailed(&name, &job, &ctx)
@@ -799,7 +816,7 @@ fn main() {
     // 会当场 drop，sink 立刻被摘掉。
     let cfg = syncdash::settings::load();
     let _log = std::sync::Arc::new(syncdash::logging::AppLogSink::open(&cfg.resolved_log_dir(), cfg.level));
-    let _log_guard = syncdash::logging::install(_log.clone());
+    let _log_guard = syncdash::progress::install(_log.clone());
     // 保留策略在启动时跑一次：执行清单是全记的，没有闸门会一直涨
     let dropped = syncdash::runlog::prune(cfg.keep_days, cfg.max_total_mb);
     if dropped > 0 {
@@ -854,6 +871,7 @@ mod tests {
             source_root: r"D:\S".into(), source_host: "h".into(),
             target_root: r"E:\T".into(), target_host: "h".into(),
             op_count: 1, conflict_count: 0, source_entries: 1, target_entries: 1,
+            source_excluded: 0, target_excluded: 0,
         };
         let ops = vec![Op {
             side: Side::Target,
@@ -893,6 +911,7 @@ mod tests {
             source_root: "/s".into(), source_host: "h".into(),
             target_root: "/t".into(), target_host: "h".into(),
             op_count: 1, conflict_count: 0, source_entries: 1, target_entries: 1,
+            source_excluded: 0, target_excluded: 0,
         };
         export_csv(out.display().to_string(), h2, ops2, one_sided, vec![false]).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();

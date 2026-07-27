@@ -11,11 +11,38 @@
 //! - 与并行线 P2-6（scan_with_progress/ScanProgress）的关系：本模块是其超集；
 //!   闭包 blanket impl 让 `Fn(ProgressEvent)` 直接当 sink 用，旧回调形态由 scan 侧桥接。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// 日志等级。与 `Error` 事件的分工：`Error` 是结构化的**单条 op 失败**
+/// （带 path/action/side，天然就是报错清单的行），`Log` 是管线叙事
+/// （远端探测结果、delta 降级、锁接管…）——库内那些 `eprintln!` 的去处。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// 一条 op 的实际结局——执行清单（items.jsonl）的核心字段。
+/// 今天这个信息只活在 `apply::record` 的四个分支里，出了那个函数就没了。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[serde(rename_all = "lowercase")]
+pub enum ItemOutcome {
+    Ok,
+    /// 目录非空所以留着（保护过滤中的文件是对的，但必须留痕）
+    Kept,
+    /// 用户取消，这条没轮到
+    Cancelled,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "kebab-case")]
 pub enum Phase {
     ScanSource,
@@ -29,49 +56,105 @@ pub enum Phase {
     Refresh,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProgressEvent {
     /// 进入阶段。totals 为 0 = 尚未知。label = 人类语境（root 路径、ssh:host…）
     PhaseStart {
         phase: Phase,
+        #[ts(type = "number")]
         ts_ms: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        #[ts(type = "number")]
         items_total: u64,
+        #[ts(type = "number")]
         bytes_total: u64,
     },
     /// 阶段中期精化总量（scan：walk 结束、哈希开始前）
-    Totals { phase: Phase, ts_ms: u64, items_total: u64, bytes_total: u64 },
+    Totals {
+        phase: Phase,
+        #[ts(type = "number")]
+        ts_ms: u64,
+        #[ts(type = "number")]
+        items_total: u64,
+        #[ts(type = "number")]
+        bytes_total: u64,
+    },
     /// 计数快照。文件边界/块边界都会发；sink 负责节流
     Progress {
         phase: Phase,
+        #[ts(type = "number")]
         ts_ms: u64,
+        #[ts(type = "number")]
         items_done: u64,
+        #[ts(type = "number")]
         items_total: u64,
+        #[ts(type = "number")]
         bytes_done: u64,
+        #[ts(type = "number")]
         bytes_total: u64,
         current_path: String,
     },
     /// 一条失败记录（错误绝不中断执行——FFS 累积语义；windowed 桌面构建靠它首次看见错误）
     Error {
         phase: Phase,
+        #[ts(type = "number")]
         ts_ms: u64,
         path: String,
         action: String,
         side: String,
         message: String,
     },
-    Paused { ts_ms: u64 },
-    Resumed { ts_ms: u64, paused_ms: u64 },
+    /// 管线叙事。`scope` = 模块名（run / pack / lock…），面板按它分组与筛选。
+    /// windowed 桌面构建里 stderr 无处可去，这条是那些话唯一的出口。
+    Log {
+        #[ts(type = "number")]
+        ts_ms: u64,
+        level: LogLevel,
+        scope: String,
+        message: String,
+    },
+    /// 一条 op 的实际结局（执行清单的行）。与 `Progress` 的分工：
+    /// Progress 是"到哪了"（会被节流丢帧），ItemResult 是"这条成没成"（一条都不能丢）。
+    ItemResult {
+        #[ts(type = "number")]
+        ts_ms: u64,
+        path: String,
+        action: String,
+        side: String,
+        outcome: ItemOutcome,
+        #[ts(type = "number")]
+        bytes: u64,
+        #[ts(type = "number")]
+        ms: u64,
+    },
+    Paused {
+        #[ts(type = "number")]
+        ts_ms: u64,
+    },
+    Resumed {
+        #[ts(type = "number")]
+        ts_ms: u64,
+        #[ts(type = "number")]
+        paused_ms: u64,
+    },
     /// apply 类运行的终态摘要
     Summary {
+        #[ts(type = "number")]
         ts_ms: u64,
+        #[ts(type = "number")]
         done: u64,
+        #[ts(type = "number")]
         skipped: u64,
+        #[ts(type = "number")]
         errors: u64,
+        #[ts(type = "number")]
         bytes_done: u64,
+        #[ts(type = "number")]
         elapsed_ms: u64,
+        #[ts(type = "number")]
         paused_ms: u64,
         cancelled: bool,
     },
@@ -90,6 +173,50 @@ impl ProgressSink for NullSink {
 impl<F: Fn(ProgressEvent) + Send + Sync> ProgressSink for F {
     fn emit(&self, ev: ProgressEvent) {
         self(ev)
+    }
+}
+
+//
+// 注册表存的是 `Arc<dyn ProgressSink>`，而 `ProgressSink` 是本模块的 trait——
+// 所以它归这里。此前它住在 logging.rs，于是 `RunCtx::null()` 要回头
+// `use crate::progress::current()`，而 logging 又 `use crate::progress::{...}`：
+// 两个模块互相依赖，事件词汇表永远没法独立编译。挪过来之后 logging 单向向下。
+
+type Slot = std::sync::RwLock<Option<Arc<dyn ProgressSink>>>;
+static CURRENT: std::sync::OnceLock<Slot> = std::sync::OnceLock::new();
+
+fn slot() -> &'static Slot {
+    CURRENT.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// 装上"当前运行"的 sink；guard 落地时自动摘除并还原上一个。
+///
+/// **必须是 RAII**：漏摘会让下一次运行的日志串进上一个运行的目录。
+/// 桌面有 `RunState.active` 单运行互斥、CLI `run --all` 顺序执行，
+/// 所以进程级单槽本身是安全的。
+#[must_use = "guard 一落地 sink 就被摘除——必须绑到运行的生命周期上"]
+pub struct SinkGuard {
+    prev: Option<Arc<dyn ProgressSink>>,
+}
+
+/// 当前接管者（若有）。`runlog::Recorder` 用它把**已有的**去处串进自己的
+/// MultiSink——运行期的文件捕获是**叠加**，不是替换：CLI 在进程启动装的
+/// StderrSink 必须在 apply 期间继续说话。
+pub fn current() -> Option<Arc<dyn ProgressSink>> {
+    slot().read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub fn install(sink: Arc<dyn ProgressSink>) -> SinkGuard {
+    let mut g = slot().write().unwrap_or_else(|e| e.into_inner());
+    let prev = g.take();
+    *g = Some(sink);
+    SinkGuard { prev }
+}
+
+impl Drop for SinkGuard {
+    fn drop(&mut self) {
+        let mut g = slot().write().unwrap_or_else(|e| e.into_inner());
+        *g = self.prev.take();
     }
 }
 
@@ -137,12 +264,27 @@ pub struct RunCtx {
 }
 
 impl RunCtx {
-    /// 无 UI 场景：不取消、不暂停、事件进黑洞——旧签名薄壳全用它
+    /// 无 UI 场景：不取消、不暂停——旧签名薄壳全用它。
+    ///
+    /// 事件进黑洞，但**诊断不进**：sink 取进程当前的环境去处（CLI 启动装的
+    /// StderrSink），没装才退回 NullSink。"没有界面"不等于"不用说话"——
+    /// 之前这里硬写 NullSink，CLI 比对期的挂载点警告就是这么丢的。
     pub fn null() -> RunCtx {
-        RunCtx { ctl: RunCtl::new(), sink: Arc::new(NullSink) }
+        RunCtx { ctl: RunCtl::new(), sink: current().unwrap_or_else(|| Arc::new(NullSink)) }
     }
     pub fn new(ctl: Arc<RunCtl>, sink: Arc<dyn ProgressSink>) -> RunCtx {
         RunCtx { ctl, sink }
+    }
+
+    /// 发一条管线叙事。拿得到 ctx 的地方直接用它；拿不到的（trash / version / lock）
+    /// 走 `logging::log_*!` 宏经进程级注册表落到同一条总线。
+    pub fn log(&self, level: LogLevel, scope: &str, message: impl Into<String>) {
+        self.sink.emit(ProgressEvent::Log {
+            ts_ms: crate::foundation::time::now_ms(),
+            level,
+            scope: scope.to_string(),
+            message: message.into(),
+        });
     }
 
     /// 协作点：取消 → Err(Interrupted)；暂停 → 100ms 小睡循环（Paused/Resumed CAS 去重发射）。
@@ -154,8 +296,8 @@ impl RunCtx {
         }
         if ctl.paused.load(Ordering::Relaxed) {
             if !ctl.pause_announced.swap(true, Ordering::SeqCst) {
-                ctl.paused_since_ms.store(crate::table::now_ms(), Ordering::SeqCst);
-                self.sink.emit(ProgressEvent::Paused { ts_ms: crate::table::now_ms() });
+                ctl.paused_since_ms.store(crate::foundation::time::now_ms(), Ordering::SeqCst);
+                self.sink.emit(ProgressEvent::Paused { ts_ms: crate::foundation::time::now_ms() });
             }
             while ctl.paused.load(Ordering::Relaxed) {
                 if ctl.cancel.load(Ordering::Relaxed) {
@@ -166,11 +308,11 @@ impl RunCtx {
             if ctl.pause_announced.swap(false, Ordering::SeqCst) {
                 let since = ctl.paused_since_ms.swap(0, Ordering::SeqCst);
                 if since > 0 {
-                    let dur = crate::table::now_ms().saturating_sub(since);
+                    let dur = crate::foundation::time::now_ms().saturating_sub(since);
                     ctl.paused_total_ms.fetch_add(dur, Ordering::SeqCst);
                 }
                 self.sink.emit(ProgressEvent::Resumed {
-                    ts_ms: crate::table::now_ms(),
+                    ts_ms: crate::foundation::time::now_ms(),
                     paused_ms: ctl.paused_total_ms.load(Ordering::SeqCst),
                 });
             }
@@ -209,7 +351,7 @@ impl<'a> PhaseProgress<'a> {
     pub fn begin(ctx: &'a RunCtx, phase: Phase, label: Option<String>, items_total: u64, bytes_total: u64) -> Self {
         ctx.sink.emit(ProgressEvent::PhaseStart {
             phase,
-            ts_ms: crate::table::now_ms(),
+            ts_ms: crate::foundation::time::now_ms(),
             label,
             items_total,
             bytes_total,
@@ -234,7 +376,7 @@ impl<'a> PhaseProgress<'a> {
         self.bytes_total.store(bytes, Ordering::Relaxed);
         self.ctx.sink.emit(ProgressEvent::Totals {
             phase: self.phase,
-            ts_ms: crate::table::now_ms(),
+            ts_ms: crate::foundation::time::now_ms(),
             items_total: items,
             bytes_total: bytes,
         });
@@ -243,7 +385,7 @@ impl<'a> PhaseProgress<'a> {
     fn snapshot(&self, current: &str) -> ProgressEvent {
         ProgressEvent::Progress {
             phase: self.phase,
-            ts_ms: crate::table::now_ms(),
+            ts_ms: crate::foundation::time::now_ms(),
             items_done: self.items_done.load(Ordering::Relaxed),
             items_total: self.items_total.load(Ordering::Relaxed),
             bytes_done: self.bytes_done.load(Ordering::Relaxed),
@@ -265,7 +407,7 @@ impl<'a> PhaseProgress<'a> {
     pub fn error(&self, path: &str, action: &str, side: &str, message: &str) {
         self.ctx.sink.emit(ProgressEvent::Error {
             phase: self.phase,
-            ts_ms: crate::table::now_ms(),
+            ts_ms: crate::foundation::time::now_ms(),
             path: path.to_string(),
             action: action.to_string(),
             side: side.to_string(),

@@ -6,27 +6,39 @@ import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 
-interface JobDto {
-  name: string; mode: string; rigor: string; source: string; target: string; has_archive: boolean;
-  remote: boolean; remote_host?: string; versioning: boolean; delta: boolean; parallel?: number;
-  include: string[]; exclude: string[];
-  watch_interval_secs?: number; watch_auto_apply: boolean;
-}
-interface OpDto {
-  side: 'source' | 'target';
-  action: 'copy' | 'update' | 'move' | 'delete' | 'delete_dir' | 'chmod' | 'conflict' | 'note';
-  path: string;
-  from?: string;
-  size?: number;
-  mtime_ms?: number;
-  hash?: string;
-  mode?: number;
-  reason: string;
-}
-interface SideMeta { size: number; mtime_ms: number }
-interface RowMeta { src: SideMeta | null; dst: SideMeta | null }
+// ---------- 线上类型：由 Rust 生成，不要手写 ----------
+//
+// 这一整块此前是手抄的镜像。手抄已经漂移出真 bug：
+//   · `OpDto` 漏了 `link` —— symlink 操作会静默退化成内容复制
+//   · 内联的 header 只有 14 个字段里的 9 个，缺的 5 个在 Rust 侧**没有 serde default**，
+//     即反序列化时是必填；plan 会被回传给 preflight / apply_job
+// 现在改由 ts-rs 从 Rust 结构体生成（`cargo test export_bindings` 刷新），
+// 字段对不上就是编译错误，不再是运行时的 undefined。
+import type { Op } from './core/types/generated/Op';
+import type { Side } from './core/types/generated/Side';
+import type { Action } from './core/types/generated/Action';
+import type { PlanHeader } from './core/types/generated/PlanHeader';
+import type { SideMeta } from './core/types/generated/SideMeta';
+import type { RowMeta } from './core/types/generated/RowMeta';
+import type { JobDto } from './core/types/generated/JobDto';
+import type { ApplyDto } from './core/types/generated/ApplyDto';
+import type { PreflightDto } from './core/types/generated/PreflightDto';
+import type { PathInfo } from './core/types/generated/PathInfo';
+import type { PathVerdict } from './core/types/generated/PathVerdict';
+import type { RunRecord } from './core/types/generated/RunRecord';
+import type { AppSettings } from './core/types/generated/AppSettings';
+import type { MigrateReport } from './core/types/generated/MigrateReport';
+import type { LegacyProgress } from './core/types/generated/LegacyProgress';
+import type { Job as JobFull } from './core/types/generated/Job';
+
+// 本地别名：沿用前端既有称呼，避免一次性改 200 处引用。
+type OpDto = Op;
+type Progress = LegacyProgress;
+
+/// `compare_job` 的返回。Rust 侧同名 DTO 也已生成（PlanDto.ts），
+/// 但那边 `header` 是 `PlanHeader` 引用，这里保持结构一致即可。
 interface PlanDto {
-  header: { mode: string; source_root: string; target_root: string; op_count: number; conflict_count: number; source_entries: number; target_entries: number; source_excluded?: number; target_excluded?: number };
+  header: PlanHeader;
   ops: OpDto[];
   reversed: (OpDto | null)[];
   /// 与 ops 一一对应的两侧实测 size/mtime（Rust 侧 compare::evidence 产出）
@@ -34,38 +46,6 @@ interface PlanDto {
   equal_count: number;
   equal_bytes: number;
 }
-interface ApplyDto { done: number; skipped: number; errors: number; bytes_copied: number; cancelled: boolean }
-/// M5：编辑器用的完整 Job（与 Rust config::Job 的 serde 形状一一对应）
-interface JobFull {
-  mode: string; source: string; target: string; archive?: string | null;
-  include: string[]; exclude: string[]; no_hash: boolean; rigor: string;
-  evidence?: string | null; use_cache?: boolean | null; escalate?: boolean | null; verify_writes?: boolean | null;
-  os_excludes: string; dev_excludes: boolean;
-  case_sensitive: boolean; symlinks: string; versioning: boolean;
-  remote_host?: string | null; remote_root?: string | null; remote_exe?: string | null;
-  require_marker: boolean; min_free_pct: number; max_delete_ratio: number;
-  fsync: boolean; on_conflict: string; max_conflicts: number; sync_mode: boolean;
-  deletable: string[]; delta: boolean; parallel?: number | null;
-  watch_interval_secs?: number | null; watch_auto_apply: boolean;
-}
-interface RunRecord {
-  ts_ms: number; job: string; kind: string;
-  done: number; skipped: number; errors: number; bytes: number;
-  elapsed_ms: number; cancelled: boolean; detail?: string;
-  // v0.10：run_id = 运行目录名（compare 类没有目录 → null）；
-  // finished = false 表示这次运行被中断（进程被杀，finish 没跑到）
-  run_id?: string | null; warnings?: number; ops_found?: number | null; finished?: boolean;
-}
-interface AppSettings {
-  log_dir: string; level: 'info' | 'warn' | 'error';
-  keep_days: number; max_total_mb: number;
-  log_compare: string; mirror_stderr: boolean;
-}
-interface MigrateReport { moved: number; skipped: number; failed: number; messages: string[] }
-interface Progress { phase: string; detail: string; pct: number; rate: number }
-interface PreflightDto { ok: boolean; blockers: string[]; warnings: string[] }
-interface PathInfo { exists: boolean; is_dir: boolean; has_marker: boolean }
-interface PathVerdict { source: PathInfo; target: PathInfo; warnings: string[] }
 
 type Chip = 'all' | 'copy' | 'update' | 'move' | 'delete' | 'conflict';
 const CHIPS: [Chip, string][] = [
@@ -80,11 +60,54 @@ const chkHead = $<HTMLInputElement>('chk-head');
 const statsEl = $('stats');
 const spinEl = $('spin');
 const pathEl = $('pathline');
+const pSource = $<HTMLInputElement>('p-source');
+const pTarget = $<HTMLInputElement>('p-target');
+const targetSel = $<HTMLSelectElement>('target-sel');
+/// 1:N：当前操作的 target 序号（随任务切换归零）
+let selTarget = 0;
+
+/// 主界面的两个根目录是**可编辑的**（FFS 同款）：改完回车/失焦即写回任务 TOML。
+/// 不做"内存里改一改"——计划头里的两个根一旦和任务文件说的不一致，
+/// 运行日志与 archive 刷新就会指向错误的方向。
+function renderPathline() {
+  const j = currentJob;
+  if (!j) {
+    pSource.value = ''; pTarget.value = '';
+    for (const el of [pSource, pTarget]) { el.disabled = true; el.classList.remove('good', 'bad'); }
+    ($('p-pick-s') as HTMLButtonElement).disabled = true;
+    ($('p-pick-t') as HTMLButtonElement).disabled = true;
+    targetSel.classList.add('hidden');
+    $('p-warn').innerHTML = '';
+    $('cfgline').innerHTML = '';
+    return;
+  }
+  const ts = j.targets && j.targets.length ? j.targets : [j.target];
+  if (selTarget >= ts.length) selTarget = 0;
+  pSource.value = j.source;
+  pTarget.value = ts[selTarget];
+  pSource.disabled = busy; pTarget.disabled = busy;
+  ($('p-pick-s') as HTMLButtonElement).disabled = busy;
+  ($('p-pick-t') as HTMLButtonElement).disabled = busy;
+  pSource.title = j.source;
+  pTarget.title = ts[selTarget];
+  if (ts.length > 1) {
+    targetSel.innerHTML = ts
+      .map((t, i) => `<option value="${i}"${i === selTarget ? ' selected' : ''}>target ${i + 1}/${ts.length}：${escapeHtml(t)}</option>`)
+      .join('');
+    targetSel.classList.remove('hidden');
+  } else {
+    targetSel.classList.add('hidden');
+  }
+  scheduleVerdict('main', pSource, pTarget, $('p-warn'));
+}
 const filterBar = $('filterbar');
 const searchEl = $<HTMLInputElement>('search');
 const chipsEl = $('chips');
 const tableEl = $('plantable');
 const bodyEl = $('planbody');
+/// 差异表的滚动容器（虚拟滚动要读它的 scrollTop/clientHeight）
+const wrapEl = $('tablewrap');
+const theadEl = tableEl.querySelector('thead') as HTMLElement;
 const emptyEl = $('empty');
 const statusEl = $('status');
 const statusMsgEl = $('statusmsg');
@@ -102,6 +125,8 @@ let flipped: boolean[] = [];
 /// 空集 = 不过滤（对应"全部"高亮）
 let chips = new Set<Chip>();
 let search = '';
+/// 搜索框防抖（见 searchEl 的 input 监听）
+let searchTimer: number | null = null;
 let busy = false;
 /// M3 Overview：按顶层目录过滤（null = 不过滤；'(root)' = 根下散文件；'a' 或 'a/b' = 前缀）
 let ovFilter: string | null = null;
@@ -257,17 +282,19 @@ function metaOf(i: number): RowMeta {
   return plan?.metas?.[i] ?? { src: null, dst: null };
 }
 
-/// 排序取值。缺席的一侧排在最后（不管升降序），免得"没有的东西"抢占视线
-function sortVal(i: number, key: SortKey): [number, string] {
+/// 排序取值 [缺席标记, 数值键, 文本键]。缺席的一侧排在最后（不管升降序），
+/// 免得"没有的东西"抢占视线。数值键直接比数值——原先把 size/mtime 补零成
+/// 20 位字符串再比，比较器每调一次就新建两个串，几千行排一趟是十几万次分配
+function sortVal(i: number, key: SortKey): [number, number, string] {
   const op = eff(i);
   const m = metaOf(i);
   switch (key) {
-    case 'path': return [0, op.path.toLowerCase()];
-    case 'action': return [0, op.action];
-    case 's.size': return [m.src ? 0 : 1, String(m.src?.size ?? 0).padStart(20, '0')];
-    case 's.mtime': return [m.src ? 0 : 1, String(m.src?.mtime_ms ?? 0).padStart(20, '0')];
-    case 't.size': return [m.dst ? 0 : 1, String(m.dst?.size ?? 0).padStart(20, '0')];
-    case 't.mtime': return [m.dst ? 0 : 1, String(m.dst?.mtime_ms ?? 0).padStart(20, '0')];
+    case 'path': return [0, 0, op.path.toLowerCase()];
+    case 'action': return [0, 0, op.action];
+    case 's.size': return [m.src ? 0 : 1, m.src?.size ?? 0, ''];
+    case 's.mtime': return [m.src ? 0 : 1, m.src?.mtime_ms ?? 0, ''];
+    case 't.size': return [m.dst ? 0 : 1, m.dst?.size ?? 0, ''];
+    case 't.mtime': return [m.dst ? 0 : 1, m.dst?.mtime_ms ?? 0, ''];
   }
 }
 
@@ -303,21 +330,36 @@ function funnelActive(): number {
     + (vfilter.days !== null ? 1 : 0);
 }
 
+/// visibleIdx 是一次全表扫描（可能还带排序），而一次 renderTable 下游要问它
+/// 四遍：表体、表头三态勾选、统计条（finalIdx）、计数条。缓存只活在一次渲染
+/// 之内——renderTable / renderAll 开头一律作废，所以过滤条件绝不可能读到隔夜结果。
+let visCache: number[] | null = null;
+function invalidateVis() { visCache = null; }
+
 function visibleIdx(): number[] {
+  return visCache ?? (visCache = computeVisible());
+}
+
+function computeVisible(): number[] {
   if (!plan) return [];
+  const n = plan.ops.length;
   const out: number[] = [];
-  plan.ops.forEach((_, i) => {
+  for (let i = 0; i < n; i++) {
     const op = eff(i);
     if ((chips.size === 0 || chips.has(category(op))) && matchesSearch(op) && matchesOv(op) && passesFunnel(i)) out.push(i);
-  });
+  }
   if (sort) {
     const { key, dir } = sort;
-    out.sort((a, b) => {
-      const [ma, va] = sortVal(a, key);
-      const [mb, vb] = sortVal(b, key);
-      if (ma !== mb) return ma - mb; // 缺席恒排后
-      return va < vb ? -dir : va > vb ? dir : a - b;
-    });
+    // 排序键先算一遍存下来：比较器要被调用 n·log n 次，键在里面现算就是
+    // 几十万次 eff()/metaOf() + 字符串分配
+    const miss = new Int8Array(n), num = new Float64Array(n);
+    const str: string[] = new Array(n);
+    for (const i of out) { const [a, b, c] = sortVal(i, key); miss[i] = a; num[i] = b; str[i] = c; }
+    out.sort((a, b) =>
+      (miss[a] - miss[b])                                            // 缺席恒排后，不随升降序翻
+      || (num[a] - num[b]) * dir
+      || (str[a] < str[b] ? -dir : str[a] > str[b] ? dir : 0)
+      || a - b);                                                     // 平手保持计划原序
   }
   return out;
 }
@@ -392,6 +434,8 @@ function renderStats() {
     seg('s-conf', '⚡', plan.header.conflict_count, '冲突') +
     `<span class="st${bytes === 0 ? ' zero' : ''}" title="待传字节">Σ<b>${humanSize(bytes) || '0 B'}</b></span>` +
     (flips ? `<span class="st" title="翻转方向">⇄<b>${flips}</b></span>` : '');
+  // 执行按钮小字里的"N 项"= 真正会执行的那一批，跟统计条同源
+  renderVariants();
 }
 
 /// M3：Overview——按顶层目录聚合（条数/字节/占比条），点击过滤差异表，chevron 惰性展开二层
@@ -494,7 +538,7 @@ function buildRow(i: number, groupDir: string | null): HTMLTableRowElement {
     span.title = '点按翻转方向（再点恢复）';
     span.addEventListener('click', () => {
       flipped[i] = !flipped[i];
-      renderAll();
+      renderAll(true);
     });
   }
   tdAct.appendChild(span);
@@ -568,7 +612,7 @@ function buildGroupRow(dir: string, items: number[]): HTMLTableRowElement {
   cb.addEventListener('click', (e) => e.stopPropagation());
   cb.addEventListener('change', () => {
     for (const i of selectableItems) checked[i] = cb.checked;
-    renderTable();
+    renderTable(true);
   });
   tdChk.appendChild(cb);
 
@@ -587,30 +631,136 @@ function buildGroupRow(dir: string, items: number[]): HTMLTableRowElement {
     if (collapsedDirs.has(dir)) collapsedDirs.delete(dir);
     else collapsedDirs.add(dir);
     renderModeButtons();
-    renderTable();
+    renderTable(true);
   });
   return tr;
 }
 
 let lastGroupDirs: string[] = [];
 
-function renderTable() {
+// ---------- 表体虚拟滚动 ----------
+// 一行差异 = <tr> + 7 个 <td> + 勾选框 + 徽章 ≈ 10 个节点、3 个监听器。几千行
+// 全量塞进已经在文档里的 <table>，光建节点加反复重算 auto 列宽就是十几秒——
+// 而切 chip、敲一下搜索框、折一个目录都要重来一遍。所以只挂视口里的那一屏，
+// 上下各补一个占位行把滚动条撑到真实高度：渲染成本从 O(全表) 降到 O(一屏)。
+
+type RowSpec =
+  | { kind: 'grp'; dir: string; items: number[] }
+  | { kind: 'row'; i: number; groupDir: string | null };
+
+const OVERSCAN = 8;               // 视口上下各多挂几行，快滚时不露白
+let rowPlan: RowSpec[] = [];      // 当前视图该显示哪些行（含目录组头），已排好序
+let rowTop = new Float64Array(1); // 前缀和：rowTop[k] = 第 k 行顶端偏移；rowTop[n] = 总高
+let hRow = 29, hGrp = 31;         // 行高，首帧实测后回填（padding/字号改了会自动跟上）
+let winFrom = -1, winTo = -1;     // 已挂载的窗口 [from, to)
+let remeasuring = false;
+
+function layoutRows() {
+  const n = rowPlan.length;
+  if (rowTop.length < n + 1) rowTop = new Float64Array(n + 1);
+  let y = 0;
+  for (let k = 0; k < n; k++) { rowTop[k] = y; y += rowPlan[k].kind === 'grp' ? hGrp : hRow; }
+  rowTop[n] = y;
+  winFrom = winTo = -1; // 高度重排过，已挂的窗口一律作废
+}
+
+/// 二分：最后一个顶端 ≤ y 的行
+function rowAt(y: number): number {
+  let lo = 0, hi = rowPlan.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (rowTop[mid] <= y) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+/// 占位行。高度只能走 CSSOM 赋值——style="" 属性会被 Tauri 注入 nonce 后的 CSP 拦掉
+function spacerRow(h: number): HTMLTableRowElement {
+  const tr = document.createElement('tr');
+  tr.className = 'vspacer';
+  const td = document.createElement('td');
+  td.colSpan = 7;
+  td.style.height = `${h}px`;
+  tr.appendChild(td);
+  return tr;
+}
+
+/// 把视口对应的那段行挂上去。force = 行计划刚变过，窗口没动也要重建
+function mountWindow(force = false) {
+  const n = rowPlan.length;
+  if (n === 0) { bodyEl.replaceChildren(); winFrom = winTo = -1; return; }
+  // tbody 在滚动内容里的起点 = 吸顶表头的高度（表格上方那几个面板都是 display:none）
+  const top = Math.max(0, wrapEl.scrollTop - theadEl.offsetHeight);
+  const from = Math.max(0, rowAt(top) - OVERSCAN);
+  const to = Math.min(n, rowAt(top + wrapEl.clientHeight) + 1 + OVERSCAN);
+  if (!force && from === winFrom && to === winTo) return;
+
+  const frag = document.createDocumentFragment();
+  if (from > 0) frag.appendChild(spacerRow(rowTop[from]));
+  for (let k = from; k < to; k++) {
+    const s = rowPlan[k];
+    const tr = s.kind === 'grp' ? buildGroupRow(s.dir, s.items) : buildRow(s.i, s.groupDir);
+    // 斑马纹按真实行号算，不能再交给 :nth-child——窗口一滚条纹就整体翻个面
+    if (k % 2) tr.classList.add('alt');
+    frag.appendChild(tr);
+  }
+  if (to < n) frag.appendChild(spacerRow(rowTop[n] - rowTop[to]));
+  bodyEl.replaceChildren(frag);
+  winFrom = from; winTo = to;
+
+  // 首帧是按估计行高排的版，落地后拿实测值校一次（只校一次，免得来回抖）
+  if (force && !remeasuring && measureRows()) {
+    remeasuring = true;
+    layoutRows();
+    mountWindow(true);
+    remeasuring = false;
+  }
+}
+
+/// 实测两种行高，和当前假设不符就返回 true
+function measureRows(): boolean {
+  let changed = false;
+  const r = bodyEl.querySelector('tr:not(.vspacer):not(.grp)') as HTMLElement | null;
+  const g = bodyEl.querySelector('tr.grp') as HTMLElement | null;
+  if (r?.offsetHeight && Math.abs(r.offsetHeight - hRow) > 0.5) { hRow = r.offsetHeight; changed = true; }
+  if (g?.offsetHeight && Math.abs(g.offsetHeight - hGrp) > 0.5) { hGrp = g.offsetHeight; changed = true; }
+  return changed;
+}
+
+let scrollPending = false;
+wrapEl.addEventListener('scroll', () => {
+  if (scrollPending || rowPlan.length === 0 || tableEl.classList.contains('hidden')) return;
+  scrollPending = true;
+  requestAnimationFrame(() => { scrollPending = false; mountWindow(); });
+}, { passive: true });
+window.addEventListener('resize', () => {
+  if (rowPlan.length && !tableEl.classList.contains('hidden')) mountWindow(true);
+});
+
+/// keepScroll：折目录、勾选这类原地操作留在当前位置；换过滤条件才回到顶部
+function renderTable(keepScroll = false) {
   // 相同项模式独占表格区域，显隐归 sameShow 管——否则点一下 chip 就会把差异表
   // 重新显示出来，两张表叠在一起
   if (sameOpen()) return;
-  bodyEl.innerHTML = '';
+  invalidateVis();
   const has = !!plan && plan.ops.length > 0;
   filterBar.classList.toggle('hidden', !has);
   tableEl.classList.toggle('hidden', !has);
   emptyEl.classList.toggle('hidden', has);
-  if (!plan) { emptyEl.textContent = '← 选择任务，然后 Compare（Ctrl+R）'; return; }
-  if (plan.ops.length === 0) { emptyEl.textContent = '✓ 两侧一致，没有需要同步的内容'; return; }
+  if (!has) {
+    rowPlan = [];
+    bodyEl.replaceChildren();
+    emptyEl.textContent = plan ? '✓ 两侧一致，没有需要同步的内容' : '← 选择任务，然后 Compare（Ctrl+R）';
+    return;
+  }
 
   const vis = visibleIdx();
+  // 这一趟只排"显示哪些行"，一个节点都不建——DOM 由 mountWindow 按视口挂
+  rowPlan = [];
   // 排序中一律平铺：分组靠"同目录的行在计划里连续"这条不变量，排完就没有了
   if (!grouped || sort) {
     lastGroupDirs = [];
-    for (const i of vis) bodyEl.appendChild(buildRow(i, null));
+    for (const i of vis) rowPlan.push({ kind: 'row', i, groupDir: null });
   } else {
     // 连续同目录成组（计划本身按 walk 序，过滤后依然是连续子序列）
     const groups: { dir: string; items: number[] }[] = [];
@@ -621,12 +771,15 @@ function renderTable() {
     }
     lastGroupDirs = [...new Set(groups.map((g) => g.dir))];
     for (const g of groups) {
-      bodyEl.appendChild(buildGroupRow(g.dir, g.items));
+      rowPlan.push({ kind: 'grp', dir: g.dir, items: g.items });
       if (!collapsedDirs.has(g.dir)) {
-        for (const i of g.items) bodyEl.appendChild(buildRow(i, g.dir));
+        for (const i of g.items) rowPlan.push({ kind: 'row', i, groupDir: g.dir });
       }
     }
   }
+  layoutRows();
+  if (!keepScroll) wrapEl.scrollTop = 0;
+  mountWindow(true);
   syncHeadCheckbox();
   renderStats();
   renderCounts();
@@ -668,10 +821,11 @@ function syncHeadCheckbox() {
   chkHead.checked = vis.length > 0 && vis.every((i) => checked[i]);
 }
 
-function renderAll() {
+function renderAll(keepScroll = false) {
+  invalidateVis();
   renderChips();
   renderOverview();
-  renderTable();
+  renderTable(keepScroll);
 }
 
 function relTime(ts: number): string {
@@ -707,13 +861,17 @@ function renderJobs() {
     div.addEventListener('click', () => {
       if (busy) return;
       currentJob = j;
+      // 搜索框的防抖计时器也得掐掉，否则换任务后它还会拿旧输入回来重排一次
+      if (searchTimer !== null) { clearTimeout(searchTimer); searchTimer = null; }
       plan = null; checked = []; flipped = []; chips.clear(); search = ''; searchEl.value = '';
       ovFilter = null; ovExpanded.clear(); sort = null;
       vfilter = { masks: [], minMB: null, maxMB: null, days: null }; maskHit = [];
       renderFunnelBtn();
       renderJobs();
       renderAll();
-      pathEl.textContent = `${j.source}   ⇄   ${j.target}`;
+      selTarget = 0;
+      renderPathline();
+      renderConfigLine();
       btnCompare.disabled = false;
       btnSync.disabled = true;
       btnWatch.disabled = false;
@@ -738,7 +896,7 @@ async function doCompare() {
   try {
     acknowledged = false;
     modalOk.disabled = false;
-    plan = await invoke<PlanDto>('compare_job', { name: currentJob.name });
+    plan = await invoke<PlanDto>('compare_job', { name: currentJob.name, targetIndex: selTarget });
     checked = plan.ops.map((op) => selectable(op));
     flipped = plan.ops.map(() => false);
     chips.clear();
@@ -801,7 +959,7 @@ async function openConfirm() {
   // 而不是等执行时才在看不见的 stderr 里出现
   try {
     const pf = await invoke<PreflightDto>('preflight', {
-      name: currentJob.name, plan, ops: idx.map((i) => eff(i)), acknowledged: acknowledged,
+      name: currentJob.name, plan, ops: idx.map((i) => eff(i)), acknowledged: acknowledged, targetIndex: selTarget,
     });
     for (const w of pf.warnings) {
       modalBody.innerHTML += `<div class="mrow warn"><span>提醒</span><span class="dim">${escapeHtml(w)}</span></div>`;
@@ -837,7 +995,7 @@ async function doSync() {
   // 同步期的子窗去留归它自己的 Auto-close / When-finished，主窗不收
   invoke('open_progress_window').catch(() => {});
   try {
-    const r = await invoke<ApplyDto>('apply_job', { name: currentJob.name, plan, ops: finalOps, acknowledged });
+    const r = await invoke<ApplyDto>('apply_job', { name: currentJob.name, plan, ops: finalOps, acknowledged, targetIndex: selTarget });
     setStatus(
       r.cancelled
         ? `已停止：${r.done} 执行后取消 — 复核中...`
@@ -864,12 +1022,17 @@ modalEl.addEventListener('click', (e) => { if (e.target === modalEl) modalEl.cla
 chkHead.addEventListener('change', () => {
   const vis = visibleIdx();
   for (const i of vis) if (selectable(eff(i))) checked[i] = chkHead.checked;
-  renderTable();
+  renderTable(true);
 });
 
+/// 几千行的表，每敲一键就重排一遍视图太重——和相同项面板的过滤框同一个节奏
 searchEl.addEventListener('input', () => {
-  search = searchEl.value.trim();
-  renderTable();
+  if (searchTimer !== null) clearTimeout(searchTimer);
+  searchTimer = window.setTimeout(() => {
+    searchTimer = null;
+    search = searchEl.value.trim();
+    renderTable();
+  }, 150);
 });
 
 // ---------- M5：任务编辑器（schema 驱动，字段与 config::Job 对齐） ----------
@@ -886,6 +1049,7 @@ const ED_FIELDS: FSpec[] = [
   { key: 'mode', label: '模式', kind: 'select', opts: ['mirror', 'sync', 'enrich'] },
   { key: 'source', label: 'source 根目录', kind: 'dir', wide: true },
   { key: 'target', label: 'target 根目录', kind: 'dir', wide: true },
+  { key: 'targets', label: '多 target（每行一个根目录；非空则覆盖上面的单 target）', kind: 'lines', wide: true, hint: '1:N：单 source 逐个镜像/enrich 到多个 target，各自独立计划与日志。sync 模式不支持（用成对任务）' },
   { key: 'archive', label: 'archive 存档文件（sync 模式）', kind: 'file', hint: '留空 = 无；建议 %APPDATA%\\syncdash\\archives\\<名>.jsonl', wide: true },
   { key: 'rigor', label: '严谨级（快捷预设）', kind: 'select', opts: ['quick', 'fast', 'standard', 'paranoid', 'custom'], hint: '预设=一键设置下面四项明细；手动改任一项自动变 custom。阶梯：每级本轮实际读得更多' },
   { key: 'evidence', label: '· 内容证据', kind: 'select', opts: ['none', 'sampled', 'full'], hint: 'none=0读只看元数据 | sampled=size+头/中/尾各256KB | full=全量BLAKE3' },
@@ -918,7 +1082,7 @@ const ED_FIELDS: FSpec[] = [
 
 function defaultJob(): JobFull {
   return {
-    mode: 'mirror', source: '', target: '', archive: null,
+    mode: 'mirror', source: '', target: '', targets: [], archive: null,
     include: [], exclude: [], no_hash: false, rigor: 'standard',
     evidence: 'sampled', use_cache: false, escalate: true, verify_writes: true,
     os_excludes: 'auto', dev_excludes: false,
@@ -953,6 +1117,19 @@ async function pickPath(opts: { directory?: boolean; save?: boolean; title: stri
   }
 }
 
+/// 路径历史走原生 datalist（键盘可用、零自定义弹层）。挂在文档级：
+/// 编辑器和主界面的路径行都要能用，不能只在编辑器打开时才存在。
+function refreshPathDatalist() {
+  const dl = document.getElementById('sd-paths');
+  if (!dl) return;
+  dl.innerHTML = '';
+  for (const p of pathHistory()) {
+    const o = document.createElement('option');
+    o.value = p;
+    dl.appendChild(o);
+  }
+}
+
 const HIST_KEY = 'sd.pathhist';
 function pathHistory(): string[] {
   try { return JSON.parse(localStorage.getItem(HIST_KEY) ?? '[]') as string[]; } catch { return []; }
@@ -968,16 +1145,21 @@ function edInput(key: string): HTMLInputElement | null {
   return edForm.querySelector<HTMLInputElement>(`input[data-k="${key}"]`);
 }
 
-let verdictTimer: number | null = null;
+const verdictTimers: Record<string, number> = {};
 /// 路径体检（去抖）：存不存在、是不是目录、两根是否相同/嵌套。
 /// 写错根目录的代价太大，不该等到 Compare 才知道。
-function scheduleVerdict() {
-  if (verdictTimer !== null) clearTimeout(verdictTimer);
-  verdictTimer = window.setTimeout(async () => {
-    const box = document.getElementById('ed-verdict');
+/// 编辑器与主界面的路径行共用这一份——两处的判定必须一模一样。
+function scheduleVerdict(
+  key: string,
+  sEl: HTMLInputElement | null,
+  tEl: HTMLInputElement | null,
+  box: HTMLElement | null,
+) {
+  if (verdictTimers[key]) clearTimeout(verdictTimers[key]);
+  verdictTimers[key] = window.setTimeout(async () => {
     if (!box) return;
-    const s = edInput('source')?.value ?? '';
-    const t = edInput('target')?.value ?? '';
+    const s = sEl?.value ?? '';
+    const t = tEl?.value ?? '';
     if (!s && !t) { box.innerHTML = ''; return; }
     try {
       const v = await invoke<PathVerdict>('inspect_paths', { source: s, target: t });
@@ -986,8 +1168,8 @@ function scheduleVerdict() {
         el.classList.toggle('bad', !!val.trim() && !info.is_dir);
         el.classList.toggle('good', info.is_dir);
       };
-      mark(edInput('source'), v.source, s);
-      mark(edInput('target'), v.target, t);
+      mark(sEl, v.source, s);
+      mark(tEl, v.target, t);
       const marks = [
         v.source.has_marker ? 'source 有 .syncdash-root 标记' : '',
         v.target.has_marker ? 'target 有 .syncdash-root 标记' : '',
@@ -998,18 +1180,11 @@ function scheduleVerdict() {
     } catch { /* 体检失败不该挡住编辑 */ }
   }, 300);
 }
+const edVerdict = () => scheduleVerdict('ed', edInput('source'), edInput('target'), document.getElementById('ed-verdict'));
 
 function edBuild(j: JobFull, name: string) {
   edForm.innerHTML = '';
-  // 路径历史走原生 datalist：键盘可用、零自定义弹层代码
-  const dl = document.createElement('datalist');
-  dl.id = 'sd-paths';
-  for (const p of pathHistory()) {
-    const o = document.createElement('option');
-    o.value = p;
-    dl.appendChild(o);
-  }
-  edForm.appendChild(dl);
+  refreshPathDatalist();
   for (const f of ED_FIELDS) {
     if (f.group) {
       const g = document.createElement('div');
@@ -1072,7 +1247,7 @@ function wireEditorPaths() {
       if (!p) return;
       el.value = p;
       if (isDir) pushHistory(p);
-      scheduleVerdict();
+      edVerdict();
     });
   }
   const sw = edForm.querySelector<HTMLButtonElement>('button[data-swap]');
@@ -1084,13 +1259,13 @@ function wireEditorPaths() {
       const tmp = s.value;
       s.value = t.value;
       t.value = tmp;
-      scheduleVerdict();
+      edVerdict();
     });
   }
   for (const el of edForm.querySelectorAll<HTMLInputElement>('input[data-drop]')) {
-    el.addEventListener('input', scheduleVerdict);
+    el.addEventListener('input', () => edVerdict());
   }
-  scheduleVerdict();
+  edVerdict();
 }
 
 /// 预设 → 四个明细旋钮的映射（与 Rust config::rigor_resolved 一字对齐）
@@ -1206,7 +1381,8 @@ $('ed-save').addEventListener('click', async () => {
     // 改的就是当前选中的任务时，工具栏副标题与路径行要跟着变
     if (currentJob?.name === c.name) {
       currentJob = jobs.find((x) => x.name === c.name) ?? currentJob;
-      pathEl.textContent = `${currentJob.source}   ⇄   ${currentJob.target}`;
+      renderPathline();
+      renderConfigLine();
       renderVariants();
     }
     setStatus(`已保存 '${c.name}'`, 'ok');
@@ -1258,7 +1434,7 @@ async function watchTick() {
       setStatus(`⏱ 值守发现 ${finalOps.length} 项差异 — 自动执行中…`);
       setBusy(true);
       try {
-        const r = await invoke<ApplyDto>('apply_job', { name: currentJob.name, plan, ops: finalOps, acknowledged: false });
+        const r = await invoke<ApplyDto>('apply_job', { name: currentJob.name, plan, ops: finalOps, acknowledged: false, targetIndex: selTarget });
         setStatus(`⏱ 自动同步完成：${r.done} 执行，${r.errors} 错误`, r.errors ? 'err' : 'ok');
         refreshLastSyncs();
       } catch (e) {
@@ -1718,6 +1894,17 @@ cmpCancelBtn.addEventListener('click', () => {
   setStatus('正在取消比对…');
 });
 
+// 1:N target 切换：换 target = 换比对对象，旧计划作废
+targetSel.addEventListener('change', () => {
+  selTarget = Number(targetSel.value) || 0;
+  plan = null;
+  btnSync.disabled = true;
+  renderAll();
+  renderPathline();
+  const t = (currentJob?.targets ?? [])[selTarget] ?? '';
+  setStatus(`已切换 target → ${t} — 重新 Compare（Ctrl+R）`);
+});
+
 // 显示模式：树状分组 / 折叠 / 路径模式（选择均记住）
 const btnPathMode = $<HTMLButtonElement>('btn-pathmode');
 const btnGroup = $<HTMLButtonElement>('btn-group');
@@ -1792,13 +1979,25 @@ function renderVariants() {
   // 未知档位只显示名字，不留一个吊着的 "·"（严谨级阶梯以后还会加档）
   const rh = j ? RIGOR_HINT[j.rigor] : undefined;
   $('cmp-variant').textContent = j ? (rh ? `${j.rigor} · ${rh}` : j.rigor) : '选择任务';
-  $('sync-variant').textContent = j ? `${j.mode} · ${MODE_HINT[j.mode] ?? ''}` : '先比对';
+
+  // 执行按钮的信息层级：大字是**模式**，小字才是动作。
+  // 理由有二：① 决定"会发生什么"的是模式，不是那个永远不变的动词；
+  // ② 我们自己就有一个模式叫 sync，按钮再写 Synchronize 等于把动作和模式撞在
+  //    一起——而且 mirror 根本不是同步，是单向镜像，那个词在这里是错的。
+  const modeEl = $('sync-mode');
+  modeEl.textContent = j ? j.mode.toUpperCase() : '未选任务';
+  modeEl.className = 'l1 m-' + (j ? j.mode : 'none');
+  const n = plan ? finalIdx().length : 0;
+  $('sync-variant').textContent = j
+    ? `执行${plan ? ` ${n} 项` : ''} · ${MODE_HINT[j.mode] ?? ''}`
+    : '先比对';
   btnCmpCfg.disabled = !j;
   btnSyncCfg.disabled = !j;
   btnSwap.disabled = !j || busy;
   if (j) {
     btnCmpCfg.title = `比对设置：严谨级 ${j.rigor} / 大小写 / symlink`;
-    btnSyncCfg.title = `同步设置：模式 ${j.mode}${j.versioning ? ' / 版本控制开' : ''}`;
+    btnSync.title = `${j.mode}：${MODE_HINT[j.mode] ?? ''}${j.versioning ? ' · 版本控制开' : ''}`;
+    btnSyncCfg.title = `模式 / 冲突策略 / 版本控制`;
     btnSwap.title = `交换：${j.source} ⇄ ${j.target}（写回任务文件）`;
   }
 }
@@ -1827,7 +2026,7 @@ btnSwap.addEventListener('click', async () => {
     ovFilter = null; ovExpanded.clear();
     renderJobs();
     renderAll();
-    pathEl.textContent = `${currentJob!.source}   ⇄   ${currentJob!.target}`;
+    renderPathline();
     btnSync.disabled = true;
     renderVariants();
     setStatusUndo(`已交换 '${name}' 的两个根 — 重新 Compare（Ctrl+R）`, '撤销交换', async () => {
@@ -1836,7 +2035,7 @@ btnSwap.addEventListener('click', async () => {
       jobs = await invoke<JobDto[]>('list_jobs');
       currentJob = jobs.find((x) => x.name === name) ?? currentJob;
       renderJobs();
-      pathEl.textContent = `${currentJob!.source}   ⇄   ${currentJob!.target}`;
+      renderPathline();
       renderVariants();
       setStatus(`已还原 '${name}' 的两个根`);
     });
@@ -1845,16 +2044,115 @@ btnSwap.addEventListener('click', async () => {
   }
 });
 
+// ---------- 主界面的可编辑根目录 + 配置速览（FFS 主窗同款） ----------
+
+/// 把主界面改动过的根写回任务 TOML。改根 = 当前计划作废，所以一并清掉。
+/// 多 target 任务只改当前选中的那一个。
+async function saveRootFromMain(which: 'source' | 'target', value: string) {
+  if (!currentJob) return;
+  const name = currentJob.name;
+  const v = value.trim();
+  if (!v) { renderPathline(); return; }
+  try {
+    const j = await invoke<JobFull>('get_job', { name });
+    const ts = j.targets && j.targets.length ? [...j.targets] : [j.target];
+    const before = which === 'source' ? j.source : ts[selTarget];
+    if (before === v) return; // 没变就不写盘，免得每次失焦都刷 mtime
+    const next: JobFull = which === 'source'
+      ? { ...j, source: v }
+      : { ...j, target: selTarget === 0 ? v : j.target, targets: ts.map((t, i) => (i === selTarget ? v : t)) };
+    await invoke('save_job', { name, job: next });
+    pushHistory(v);
+    refreshPathDatalist();
+    jobs = await invoke<JobDto[]>('list_jobs');
+    currentJob = jobs.find((x) => x.name === name) ?? currentJob;
+    plan = null; checked = []; flipped = [];
+    btnSync.disabled = true;
+    renderJobs();
+    renderAll();
+    renderPathline();
+    renderVariants();
+    setStatusUndo(`已改 ${which} → ${v} — 重新 Compare（Ctrl+R）`, '撤销', async () => {
+      const cur = await invoke<JobFull>('get_job', { name });
+      const back: JobFull = which === 'source'
+        ? { ...cur, source: before }
+        : { ...cur, target: selTarget === 0 ? before : cur.target, targets: (cur.targets ?? []).map((t, i) => (i === selTarget ? before : t)) };
+      await invoke('save_job', { name, job: back });
+      jobs = await invoke<JobDto[]>('list_jobs');
+      currentJob = jobs.find((x) => x.name === name) ?? currentJob;
+      renderJobs();
+      renderPathline();
+      setStatus(`已还原 ${which}`);
+    });
+  } catch (e) {
+    setStatus(`写回任务失败：${e}`, 'err');
+    renderPathline();
+  }
+}
+
+for (const [el, which] of [[pSource, 'source'], [pTarget, 'target']] as [HTMLInputElement, 'source' | 'target'][]) {
+  // change 只在回车或失焦时触发——不会边打字边写盘
+  el.addEventListener('change', () => saveRootFromMain(which, el.value));
+  el.addEventListener('input', () => scheduleVerdict('main', pSource, pTarget, $('p-warn')));
+  el.addEventListener('keydown', (e) => { if (e.key === 'Escape') { renderPathline(); el.blur(); } });
+}
+for (const [id, which] of [['p-pick-s', 'source'], ['p-pick-t', 'target']] as [string, 'source' | 'target'][]) {
+  $(id).addEventListener('click', async () => {
+    const el = which === 'source' ? pSource : pTarget;
+    const p = await pickPath({ directory: true, title: `选择 ${which} 目录`, defaultPath: el.value.trim() });
+    if (!p) return;
+    el.value = p;
+    await saveRootFromMain(which, p);
+  });
+}
+
+/// 主界面的配置速览：只放"会改变结果"的那几项，每一颗点开就跳到编辑器对应分组。
+/// 数据用 get_job 拉完整 Job——不扩 JobDto，免得和别处的改动抢同一个结构体。
+let cfgJob: JobFull | null = null;
+async function renderConfigLine() {
+  const box = document.getElementById('cfgline');
+  if (!box) return;
+  if (!currentJob) { box.innerHTML = ''; cfgJob = null; return; }
+  try {
+    cfgJob = await invoke<JobFull>('get_job', { name: currentJob.name });
+  } catch { box.innerHTML = ''; return; }
+  const j = cfgJob;
+  const pct = (v: number) => `${Math.round(v * 100)}%`;
+  const pills: [string, string, string][] = [
+    // [标签, 值, 编辑器分组]
+    ['过滤', `排除 ${j.exclude.length}${j.include.length ? ` · 白名单 ${j.include.length}` : ''} · 系统 ${j.os_excludes ?? 'auto'} · 开发产物 ${j.dev_excludes ? '排除' : '同步'}`, '过滤'],
+    ['冲突', j.on_conflict + (j.on_conflict === 'copy' ? ` ≤${j.max_conflicts}` : ''), '行为'],
+    ['版本控制', j.versioning ? '开（各 root 留历史）' : '关（删除进本机回收目录）', '行为'],
+    ['闸门', `删除 ≤${pct(j.max_delete_ratio)} · 空闲 ≥${pct(j.min_free_pct)}${j.require_marker ? ' · 要标记' : ''}`, '守护'],
+    ['值守', j.watch_interval_secs ? `${j.watch_interval_secs}s${j.watch_auto_apply ? ' · 自动执行' : ''}` : '关', '值守（Watch）'],
+  ];
+  if (j.mode === 'sync') pills.push(['archive', j.archive ? '已配' : '未配（删除/移动无法归因）', '基本']);
+  if (j.remote_host) pills.push(['远程', `ssh ${j.remote_host}`, '远程（可选）']);
+  box.innerHTML = pills
+    .map(([k, v, g]) =>
+      `<button class="cfgpill" data-group="${escapeHtml(g)}" title="点开编辑器的「${escapeHtml(g)}」分组">` +
+      `<span class="ck">${escapeHtml(k)}</span><span class="cv">${escapeHtml(v)}</span></button>`)
+    .join('');
+  for (const b of box.querySelectorAll<HTMLButtonElement>('.cfgpill')) {
+    b.addEventListener('click', () => { if (currentJob) openEditor(currentJob.name, b.dataset.group); });
+  }
+}
+
 // ---------- P1：拖放目录到路径框 ----------
 //
 // Tauri v2 的 dragDropEnabled 默认开着，webview 里的 HTML5 drop 事件是收不到的——
 // 必须走 onDragDropEvent，且 payload.position 是**物理像素**，要自己换算成 CSS 像素。
 
+/// 编辑器开着时只认编辑器里的字段，否则认主界面那两个根——两处都能拖
+function dropZone(): HTMLInputElement[] {
+  const root = editModal.classList.contains('hidden') ? pathEl : edForm;
+  return [...root.querySelectorAll<HTMLInputElement>('input[data-drop]')].filter((el) => !el.disabled);
+}
+
 function dropTargetAt(px: number, py: number): HTMLInputElement | null {
-  if (editModal.classList.contains('hidden')) return null;
   const r = window.devicePixelRatio || 1;
   const x = px / r, y = py / r;
-  for (const el of edForm.querySelectorAll<HTMLInputElement>('input[data-drop]')) {
+  for (const el of dropZone()) {
     const b = el.getBoundingClientRect();
     if (x >= b.left && x <= b.right && y >= b.top && y <= b.bottom) return el;
   }
@@ -1862,7 +2160,7 @@ function dropTargetAt(px: number, py: number): HTMLInputElement | null {
 }
 
 function clearDropHint() {
-  for (const el of edForm.querySelectorAll<HTMLInputElement>('input[data-drop]')) el.classList.remove('dropon');
+  for (const el of document.querySelectorAll<HTMLInputElement>('input[data-drop]')) el.classList.remove('dropon');
 }
 
 async function wireDragDrop() {
@@ -1893,8 +2191,11 @@ async function wireDragDrop() {
       } catch { /* 拿不到就按原样填 */ }
       el.value = v;
       pushHistory(v);
-      scheduleVerdict();
-      setStatus(`已填入：${v}`);
+      refreshPathDatalist();
+      // 拖到主界面那两个根上 = 直接改任务（和手打回车同一条路）；编辑器里则等保存
+      if (el === pSource) await saveRootFromMain('source', v);
+      else if (el === pTarget) await saveRootFromMain('target', v);
+      else { edVerdict(); setStatus(`已填入：${v}`); }
     })();
   });
 }
@@ -1989,9 +2290,9 @@ function rowMenu(i: number, x: number, y: number) {
     { label: ext ? `排除此类型 */*.${ext}` : '排除此类型（无扩展名）', disabled: !ext || !currentJob, run: () => addExclude(`*/*.${ext}`) },
     { label: dir ? `排除此目录 /${dir}/` : '排除此目录（已在根下）', disabled: !dir || !currentJob, run: () => addExclude(`/${dir}/`) },
     { sep: true, label: '' },
-    { label: flipped[i] ? '恢复原方向' : '反向此行', disabled: !canFlip, run: () => { flipped[i] = !flipped[i]; renderAll(); } },
-    { label: '只勾选此项', run: () => { checked = checked.map((_, k) => k === i && selectable(eff(k))); renderTable(); } },
-    { label: `取消勾选本目录（${sameDir.length}）`, disabled: sameDir.length === 0, run: () => { for (const k of sameDir) checked[k] = false; renderTable(); } },
+    { label: flipped[i] ? '恢复原方向' : '反向此行', disabled: !canFlip, run: () => { flipped[i] = !flipped[i]; renderAll(true); } },
+    { label: '只勾选此项', run: () => { checked = checked.map((_, k) => k === i && selectable(eff(k))); renderTable(true); } },
+    { label: `取消勾选本目录（${sameDir.length}）`, disabled: sameDir.length === 0, run: () => { for (const k of sameDir) checked[k] = false; renderTable(true); } },
   ];
   openCtx(x, y, items);
 }
