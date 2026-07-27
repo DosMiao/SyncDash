@@ -13,12 +13,10 @@
 //! 反向补丁：用 FastCDC 把"旧文件"表达为"新文件里已有的块 + blob 里的旧独有块"。
 //! restore 时要求当前文件 hash == 记录的 new_hash，重组后校验 old_hash —— 三重保险。
 
-use crate::pack::RecipeStep;
+use crate::chunk::RecipeStep;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-pub const STORE_DIR: &str = ".version_syncDash";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PreservedEntry {
@@ -86,8 +84,8 @@ pub struct VersionWriter {
 
 impl VersionWriter {
     pub fn begin(root: &Path) -> std::io::Result<VersionWriter> {
-        let id = format!("{}-{}", crate::table::now_ms(), std::process::id());
-        let vdir = root.join(STORE_DIR).join(&id);
+        let id = format!("{}-{}", crate::foundation::time::now_ms(), std::process::id());
+        let vdir = root.join(crate::foundation::names::VERSION_STORE_DIR).join(&id);
         std::fs::create_dir_all(&vdir)?;
         Ok(VersionWriter { root: root.to_path_buf(), vdir, id, entries: Vec::new(), bytes: 0 })
     }
@@ -193,7 +191,7 @@ impl VersionWriter {
         }
         let manifest = VersionManifest {
             id: self.id.clone(),
-            ts_ms: crate::table::now_ms(),
+            ts_ms: crate::foundation::time::now_ms(),
             host: crate::table::host_name(),
             entries: self.entries.clone(),
         };
@@ -209,14 +207,14 @@ impl VersionWriter {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.root.join(STORE_DIR).join("index.jsonl"))?;
+            .open(self.root.join(crate::foundation::names::VERSION_STORE_DIR).join("index.jsonl"))?;
         writeln!(f, "{}", serde_json::to_string(&idx)?)?;
         Ok(Some(self.id))
     }
 }
 
 pub fn list(root: &Path) -> std::io::Result<Vec<IndexLine>> {
-    let p = root.join(STORE_DIR).join("index.jsonl");
+    let p = root.join(crate::foundation::names::VERSION_STORE_DIR).join("index.jsonl");
     let mut out = Vec::new();
     if let Ok(text) = std::fs::read_to_string(&p) {
         for line in text.lines() {
@@ -235,10 +233,10 @@ pub fn prune(root: &Path, keep: usize) -> std::io::Result<Vec<String>> {
     let n = all.len().saturating_sub(keep);
     let drop: Vec<IndexLine> = all.drain(..n).collect();
     for d in &drop {
-        let _ = std::fs::remove_dir_all(root.join(STORE_DIR).join(&d.id));
+        let _ = std::fs::remove_dir_all(root.join(crate::foundation::names::VERSION_STORE_DIR).join(&d.id));
     }
     // 重写 index
-    let idx_path = root.join(STORE_DIR).join("index.jsonl");
+    let idx_path = root.join(crate::foundation::names::VERSION_STORE_DIR).join("index.jsonl");
     let mut f = std::fs::File::create(&idx_path)?;
     for l in &all {
         writeln!(f, "{}", serde_json::to_string(l)?)?;
@@ -249,10 +247,10 @@ pub fn prune(root: &Path, keep: usize) -> std::io::Result<Vec<String>> {
 /// 恢复：把某版本保存的文件放回原位（当前占位内容先进本机 trash）。
 /// files 为空 = 全部；dry_run 只列出。返回 (restored, skipped, errors)。
 pub fn restore(root: &Path, version: &str, files: &[String], dry_run: bool) -> std::io::Result<(u64, u64, u64)> {
-    let vdir = root.join(STORE_DIR).join(version);
+    let vdir = root.join(crate::foundation::names::VERSION_STORE_DIR).join(version);
     let mani: VersionManifest = serde_json::from_slice(&std::fs::read(vdir.join("manifest.json"))?)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad manifest: {e}")))?;
-    let trash = std::env::temp_dir().join(format!("syncdash-restore-displaced-{}", crate::table::now_ms()));
+    let trash = std::env::temp_dir().join(format!("syncdash-restore-displaced-{}", crate::foundation::time::now_ms()));
     let mut restored = 0u64;
     let mut skipped = 0u64;
     let mut errors = 0u64;
@@ -329,7 +327,7 @@ pub fn restore(root: &Path, version: &str, files: &[String], dry_run: bool) -> s
             }
             Err(err) => {
                 errors += 1;
-                eprintln!("ERR  restore {}: {err}", e.rel);
+                crate::log_error!("version", "ERR  restore {}: {err}", e.rel);
             }
         }
     }

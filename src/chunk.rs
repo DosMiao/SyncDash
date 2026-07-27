@@ -26,6 +26,19 @@ pub struct FileChunks {
     pub chunks: Vec<ChunkInfo>,
 }
 
+/// 增量重组步骤：s = "base"（从接收侧现有文件取 off..off+len）| "blob"（从增量 blob 取）。
+///
+/// 住在这里而不是 `pack`：它描述的是「怎么用分块拼回一个文件」，是分块的语义，
+/// 跟 tar 容器无关。此前它定义在 `pack.rs`，于是版本库 `version.rs` 为了这一个类型
+/// `use crate::chunk::RecipeStep`——而 `pack` 又 `use crate::apply`，`apply` 又用
+/// `version`：三个模块绕成一个环。挪到这个零依赖的叶子上，环就断了。
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RecipeStep {
+    pub s: String,
+    pub off: u64,
+    pub len: u32,
+}
+
 pub fn chunk_bytes(data: &[u8]) -> Vec<ChunkInfo> {
     let mut out = Vec::new();
     for c in fastcdc::v2020::FastCDC::new(data, MIN, AVG, MAX) {

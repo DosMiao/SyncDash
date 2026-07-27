@@ -275,7 +275,7 @@ pub fn apply_job_guarded_with(
         for b in &verdict.blockers {
             ctx.sink.emit(ProgressEvent::Error {
                 phase: Phase::Apply,
-                ts_ms: crate::table::now_ms(),
+                ts_ms: crate::foundation::time::now_ms(),
                 path: String::new(),
                 action: "preflight".into(),
                 side: "target".into(),
@@ -291,7 +291,7 @@ pub fn apply_job_guarded_with(
     }
     let out = ApplyOutcome { cancelled: ctx.ctl.cancelled(), ..ap };
     ctx.sink.emit(ProgressEvent::Summary {
-        ts_ms: crate::table::now_ms(),
+        ts_ms: crate::foundation::time::now_ms(),
         done: out.done,
         skipped: out.skipped,
         errors: out.errors,
@@ -404,7 +404,7 @@ pub fn run_remote_job_with(
 
 fn emit_cancel_summary(ctx: &crate::progress::RunCtx, t0: std::time::Instant) {
     ctx.sink.emit(crate::progress::ProgressEvent::Summary {
-        ts_ms: crate::table::now_ms(),
+        ts_ms: crate::foundation::time::now_ms(),
         done: 0,
         skipped: 0,
         errors: 0,
@@ -592,7 +592,7 @@ fn apply_remote_inner(
         for b in &gv.blockers {
             ctx.sink.emit(ProgressEvent::Error {
                 phase: Phase::Apply,
-                ts_ms: crate::table::now_ms(),
+                ts_ms: crate::foundation::time::now_ms(),
                 path: String::new(),
                 action: "preflight".into(),
                 side: "target".into(),
@@ -665,7 +665,7 @@ fn apply_remote_inner(
         };
         ctx.checkpoint()?;
         let pp_pack = PhaseProgress::begin(ctx, Phase::Pack, Some("打包 target 侧内容".into()), 0, 0);
-        let tmp = std::env::temp_dir().join(format!("syncdash-remote-{}.tar", crate::table::now_ms()));
+        let tmp = std::env::temp_dir().join(format!("syncdash-remote-{}.tar", crate::foundation::time::now_ms()));
         let sum = crate::pack::pack(&plan, &job.source, &tmp, remote_chunks.as_ref())?;
         pp_pack.set_totals(sum.ops, sum.bytes);
         if sum.delta_saved > 0 {
@@ -676,9 +676,9 @@ fn apply_remote_inner(
             );
         }
         let rpkg = if shell == crate::remote::RemoteShell::PowerShell {
-            format!("syncdash-{}.tar", crate::table::now_ms()) // 相对路径 → 远端家目录
+            format!("syncdash-{}.tar", crate::foundation::time::now_ms()) // 相对路径 → 远端家目录
         } else {
-            format!("/tmp/syncdash-{}.tar", crate::table::now_ms())
+            format!("/tmp/syncdash-{}.tar", crate::foundation::time::now_ms())
         };
         ctx.checkpoint()?;
         let tar_len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
@@ -708,7 +708,7 @@ fn apply_remote_inner(
             ctx.log(crate::progress::LogLevel::Error, "remote", format!("[{name}] remote apply-pack reported failure"));
             ctx.sink.emit(ProgressEvent::Error {
                 phase: Phase::Apply,
-                ts_ms: crate::table::now_ms(),
+                ts_ms: crate::foundation::time::now_ms(),
                 path: rpkg.clone(),
                 action: "apply-pack".into(),
                 side: "target".into(),
@@ -755,7 +755,7 @@ fn apply_remote_inner(
         refresh_archive_with(job, plan_full, ctx);
     }
     ctx.sink.emit(ProgressEvent::Summary {
-        ts_ms: crate::table::now_ms(),
+        ts_ms: crate::foundation::time::now_ms(),
         done,
         skipped,
         errors,

@@ -9,6 +9,7 @@
 //!   ops 会破坏计划的 rank 排序，apply 自己重新分类分相。
 
 use crate::compare::{Action, Op, Side};
+use crate::foundation::path::join_native;
 use crate::progress::{ApplyOutcome, ItemOutcome, Phase, PhaseProgress, RunCtx};
 use filetime::FileTime;
 use std::path::{Path, PathBuf};
@@ -54,15 +55,11 @@ impl Default for ApplyOptions {
 }
 
 fn default_trash() -> PathBuf {
-    crate::trash::trash_root().join(crate::table::now_ms().to_string())
-}
-
-fn to_native(rel: &str) -> String {
-    if cfg!(windows) { rel.replace('/', "\\") } else { rel.to_string() }
+    crate::trash::trash_root().join(crate::foundation::time::now_ms().to_string())
 }
 
 fn move_to_trash(file: &Path, rel: &str, trash: &Path) -> std::io::Result<()> {
-    let dest = trash.join(to_native(rel));
+    let dest = join_native(trash, rel);
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p)?;
     }
@@ -81,14 +78,11 @@ fn set_mtime(path: &Path, mtime_ms: i64) {
     let _ = filetime::set_file_mtime(path, ft);
 }
 
+/// 读文件 mtime（unix 毫秒）。None 只表示"读不到"（metadata/modified 失败），
+/// 调用方靠它决定"那就不设 mtime"；换算本身交给 `foundation::time::systime_ms`。
 fn read_mtime_ms(path: &Path) -> Option<i64> {
-    std::fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_millis() as i64)
+    let t = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(crate::foundation::time::systime_ms(t))
 }
 
 #[cfg(unix)]
@@ -153,7 +147,9 @@ fn try_delete_dir(dst: &Path, rel: &str, filter: Option<&crate::filter::PathFilt
         let child_rel = format!(
             "{}/{}",
             rel.trim_end_matches('/'),
-            e.path().strip_prefix(dst).unwrap_or(e.path()).to_string_lossy().replace('\\', "/")
+            // strip_prefix 失败时退回整条路径，与此前一致
+            crate::foundation::path::to_rel(e.path(), dst)
+                .unwrap_or_else(|| e.path().to_string_lossy().replace('\\', "/"))
         );
         let deletable = filter.map(|f| f.is_deletable(&child_rel)).unwrap_or(false);
         if !deletable {
@@ -278,7 +274,7 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
         Side::Target => (sh.target_root, sh.source_root),
         Side::Source => (sh.source_root, sh.target_root),
     };
-    let dst = exec_root.join(to_native(&op.path));
+    let dst = join_native(exec_root, &op.path);
     match op.action {
         Action::Copy | Action::Update => {
             if let Some(p) = dst.parent() {
@@ -291,7 +287,7 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
                 }
                 return create_symlink(target, &dst);
             }
-            let src = other_root.join(to_native(&op.path));
+            let src = join_native(other_root, &op.path);
 
             // ---- 原子落盘（P0-1）----
             let mut staged = crate::atomic::Staged::create(&dst)?;
@@ -375,7 +371,7 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
             set_mode(&dst, m)
         }
         Action::Move => {
-            let from = exec_root.join(to_native(op.from.as_deref().unwrap_or_default()));
+            let from = join_native(exec_root, op.from.as_deref().unwrap_or_default());
             if let Some(p) = dst.parent() {
                 std::fs::create_dir_all(p)?;
             }
@@ -435,7 +431,7 @@ fn record(sh: &Shared, op: &Op, res: std::io::Result<()>, pp: &PhaseProgress, ac
     // 出了这个函数就只剩三个聚合计数器了。执行清单（items.jsonl）全靠它。
     let ledger = |outcome: ItemOutcome| {
         sh.ctx.sink.emit(crate::progress::ProgressEvent::ItemResult {
-            ts_ms: crate::table::now_ms(),
+            ts_ms: crate::foundation::time::now_ms(),
             path: op.path.clone(),
             action: format!("{:?}", op.action),
             side: side.to_string(),
@@ -670,18 +666,18 @@ pub fn apply_with(
     }
     let delta_saved = sh.delta_saved.load(Ordering::Relaxed);
     if delta_saved > 0 {
-        println!("delta: {} not re-written", crate::preflight::human_bytes(delta_saved));
+        println!("delta: {} not re-written", crate::foundation::fmt::human_bytes(delta_saved));
     }
     if let Some(w) = sh.ver_source.into_inner().unwrap() {
         let side_ops: Vec<Op> = ops.iter().filter(|o| o.side == Side::Source).cloned().collect();
         if let Ok(Some(id)) = w.finish(&side_ops) {
-            println!("version saved: {} (id {id})", source_root.join(crate::version::STORE_DIR).display());
+            println!("version saved: {} (id {id})", source_root.join(crate::foundation::names::VERSION_STORE_DIR).display());
         }
     }
     if let Some(w) = sh.ver_target.into_inner().unwrap() {
         let side_ops: Vec<Op> = ops.iter().filter(|o| o.side == Side::Target).cloned().collect();
         if let Ok(Some(id)) = w.finish(&side_ops) {
-            println!("version saved: {} (id {id})", target_root.join(crate::version::STORE_DIR).display());
+            println!("version saved: {} (id {id})", target_root.join(crate::foundation::names::VERSION_STORE_DIR).display());
         }
     }
     let done = acc.done.load(Ordering::Relaxed);
