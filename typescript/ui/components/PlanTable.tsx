@@ -123,8 +123,11 @@ export function PlanTable(props: Props) {
             let bytes = 0;
             for (const i of spec.items) bytes += eff(plan, flipped, i).size ?? 0;
             const label = spec.dir === '' ? '(root)' : spec.dir;
+            // Keyed by the group's first plan index, not the dir: grouping is by contiguous runs, so
+            // the same dir can appear as several group rows, and duplicate keys make React orphan
+            // fibers as the virtual window slides — their <tr>s pile up in the DOM as frozen ghosts
             return (
-              <tr key={`g:${spec.dir}`} className="grp" onClick={() => onFoldDir(spec.dir)}>
+              <tr key={`g:${spec.items[0]}`} className="grp" onClick={() => onFoldDir(spec.dir)}>
                 <td className="c-chk">
                   <TriCheckbox
                     checked={sel.length > 0 && nChecked === sel.length}
