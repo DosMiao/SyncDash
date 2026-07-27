@@ -28,10 +28,14 @@ SyncDash/
 │   ├─ run.rs                 L3  the orchestrator
 │   └─ main.rs                L4  CLI bin
 ├─ src-tauri/                 L4  Tauri v2 desktop shell: thin IPC layer
-├─ typescript/                frontend (Vite + plain TS, no framework)
-│   └─ core/types/generated/  wire types ts-rs generates from the Rust structs — do not hand-edit
+├─ typescript/                frontend (Vite + React 19; styling is a hand-written CSS token layer, no UI library)
+│   ├─ core/                  framework-free domain + IPC; components never call invoke() directly
+│   │   └─ types/generated/   wire types ts-rs generates from the Rust structs — do not hand-edit
+│   ├─ ui/                    main window: App.tsx owns session state, components/ render, hooks/ isolate effects
+│   ├─ progress/              the run sub-window (own entry point; run state lives in a ref, see its header)
+│   └─ styles.css             the whole design token layer — every size and color in the app resolves here
 ├─ Script/gen-types.mjs       type generation entry point (`npm run gen:types`)
-├─ index.html                 frontend entry point
+├─ index.html                 main-window entry point (the sub-window's is progress.html)
 ├─ dist/                      frontend build output — deliberately committed to git (no node on Mac, see "Build")
 ├─ builder.bat                Windows build menu (Dev / Desktop / CLI / All)
 └─ builder.command            Mac build script (pure cargo)
@@ -56,8 +60,10 @@ Language: code, identifiers, comments and UI text are all English (same conventi
 Two exceptions are deliberate and must survive future sweeps — `foundation/text.rs` keeps two CJK strings as
 **test fixtures** (`safe_host("主机") == "--"` asserts that non-ASCII host characters each collapse to `-`;
 an ASCII input would map to itself and assert nothing), and `typescript/styles.css` keeps the
-`"Microsoft YaHei", "PingFang SC"` font fallbacks, which is what renders CJK **file paths** from the user's
-filesystem in the diff table. Spelling is en-US.
+`"Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC"` fallbacks in `--font-ui`, which is what renders CJK
+**file paths** from the user's filesystem in the diff table. They sit at the *end* of that stack deliberately:
+Office installs Segoe UI on macOS and every Mac has PingFang, so a CJK face placed early would capture Latin
+text on the other platform. Spelling is en-US.
 
 ## Commands
 
@@ -66,10 +72,11 @@ syncdash jobs                                    # List the job configs
 syncdash run <job> [--apply] [--i-know]          # End to end: scan both sides → compare → gates → (--apply) apply → refresh archive
 syncdash run --all | --prefix cs- [--apply]      # Batch run (the engine behind hub-and-spoke multi-endpoint)
 syncdash territories <root>                      # List .ffs-sync territories
-syncdash gen-jobs <root> --target-root R [--remote-host mac --remote-root-base /Users/x/Code]
+syncdash gen-jobs <root> --target-root R [--junk ids] [--force] [--remote-host mac --remote-root-base /Users/x/Code]
+syncdash junk [--patterns ids]                   # The junk exclude presets, and the exact patterns each writes into a job's exclude
 syncdash gui                                     # Launch the desktop app (same as running syncdash-desktop directly)
 syncdash probe                                   # Local environment as JSON (remote probing: ssh the far side and run this)
-syncdash scan <root> [--out t.jsonl] [--no-hash] [--force-rehash] [--symlinks-direct] [--progress] [--exclude PHRASE]...
+syncdash scan <root> [--out t.jsonl] [--no-hash] [--force-rehash] [--symlinks-direct] [--progress] [--junk ids] [--exclude PHRASE]...
 syncdash compare --source a.jsonl --target b.jsonl \
     [--mode mirror|sync|enrich] [--archive last.jsonl] [--resolve-newer] [--case-sensitive] [--out plan.jsonl]
 syncdash apply plan.jsonl [--apply] [--verify] [--delta] [--no-fsync] [--source-root R] [--target-root R] [-v]
@@ -89,12 +96,15 @@ syncdash-desktop                                 # Tauri desktop app (the main G
 One TOML per job, kept in `%APPDATA%\syncdash\jobs\` (mac: `~/.config/syncdash/jobs/`):
 
 ```toml
+schema = 2                 # job-file schema; a file without it is migrated on load (junk presets -> exclude)
 mode = "sync"              # mirror | sync | enrich
 source = 'D:\Code\Utilities\flight'
 target = '\\192.168.0.115\xuanbomiao\Code\Utilities\flight'
 archive = 'C:\Users\xuanb\AppData\Roaming\syncdash\archive\flight.jsonl'   # sync mode
 # include = ['*']                       # FFS filter-syntax allowlist (empty = everything)
-# exclude = ['*/big_temp/', '*/*.log']  # FFS syntax; the default junk/rebuildable excludes are built in
+# exclude = ['*/big_temp/', '*/*.log']  # FFS syntax. THE WHOLE exclude policy besides this tool's own metadata:
+#                                       # junk presets write their patterns straight into this list, so it always
+#                                       # reads as what runs. `syncdash junk` prints them.
 # rigor = "standard"                    # quick | fast (sampled digest) | standard | paranoid (see "Rigor levels")
 # case_sensitive = false                # case-insensitive by default (the NTFS/APFS default behavior)
 # no_hash = false
@@ -156,7 +166,10 @@ An FFS-shaped dark two-pane UI: the job list on the left (mode badges: mirror bl
 action badge (`→ copy` / `← copy` / `⇢ move` / `✕ delete` / `⚡ conflict`) + path / from / size / reason →
 stats bar (items / selected / bytes to transfer / conflicts) → **Synchronize** applies the checked rows and
 **re-compares automatically** afterwards to verify convergence. conflict/note rows are locked and cannot be
-checked. Zero-framework frontend (Vite + plain TS, about 400 lines).
+checked. Frontend: Vite + React 19, styled by the hand-written token layer in `typescript/styles.css` — no UI
+or styling library. Every size and color resolves through that one file, with a hard floor of 11px type and
+4.5:1 contrast; the whole window scales through the webview's own zoom (Ctrl +/-/0), not a font knob, so
+borders and layout scale with the text.
 
 Added in v0.3.2: **per-row direction flip** (click the action badge to toggle; the semantics are precomputed by the
 core's `reverse_op`: copy↔delete are inverses, update swaps sides; a flipped row gets a dashed border and a tinted

@@ -1,0 +1,120 @@
+// Mutable run state for the progress window, plus the rate/ETA maths.
+//
+// Deliberately a plain mutable object rather than React state: events arrive up to ten times a second
+// and the sample series reaches thousands of entries. The window re-renders on its own cadence (500 ms
+// for the readouts, 100 ms for the graphs), which is where FFS puts the throttle.
+
+export type PhaseName =
+  | 'scan-source' | 'scan-target' | 'compare' | 'apply'
+  | 'pack' | 'ship' | 'verify' | 'refresh';
+
+export const PHASE_LABEL: Record<PhaseName, string> = {
+  'scan-source': 'Scan source',
+  'scan-target': 'Scan target',
+  'compare': 'Compare',
+  'apply': 'Sync',
+  'pack': 'Pack',
+  'ship': 'Transfer',
+  'verify': 'Verify',
+  'refresh': 'Refresh archive',
+};
+
+export interface RunEv {
+  run_id: number;
+  /// "compare" | "apply" — this window only accepts apply (compare progress is shown inline in the main
+  /// window; without the filter, the automatic re-check compare after a sync would hijack the result
+  /// window into a forever-spinning "comparing")
+  purpose?: string;
+  kind: 'phase_start' | 'totals' | 'progress' | 'error' | 'log' | 'item_result' | 'paused' | 'resumed' | 'summary';
+  /// kind='log' only: info | warn | error
+  level?: 'info' | 'warn' | 'error';
+  /// kind='log' only: module name (run / pack / lock…)
+  scope?: string;
+  ts_ms: number;
+  phase?: PhaseName;
+  label?: string | null;
+  items_total?: number;
+  bytes_total?: number;
+  items_done?: number;
+  bytes_done?: number;
+  current_path?: string;
+  path?: string;
+  action?: string;
+  side?: string;
+  message?: string;
+  paused_ms?: number;
+  done?: number;
+  skipped?: number;
+  errors?: number;
+  elapsed_ms?: number;
+  cancelled?: boolean;
+}
+
+/// t = active milliseconds (paused time removed)
+export interface Sample { t: number; b: number; i: number }
+
+export interface StageRow { phase: PhaseName; detail: string; active: boolean; done: boolean; cancelled?: boolean }
+export interface ErrRow { path: string; action: string; side: string; message: string; warning: boolean }
+
+export interface RunState {
+  runId: number;
+  running: boolean;
+  /// ts of the first event in this run
+  t0: number;
+  /// authoritative total from the engine (refreshed by Resumed/Summary)
+  pausedMs: number;
+  /// start of the current pause (local estimate)
+  pausedSince: number;
+  phase: PhaseName | null;
+  /// has entered apply/pack/ship → graph mode
+  applying: boolean;
+  totals: { items: number; bytes: number };
+  dones: { items: number; bytes: number };
+  samples: Sample[];
+  currentPath: string;
+  stages: StageRow[];
+  errors: ErrRow[];
+  summary: RunEv | null;
+  closeAfterStop: boolean;
+}
+
+export function newRunState(id = -1, ts = 0): RunState {
+  return {
+    runId: id, running: id >= 0, t0: ts,
+    pausedMs: 0, pausedSince: 0,
+    phase: null, applying: false,
+    totals: { items: 0, bytes: 0 },
+    dones: { items: 0, bytes: 0 },
+    samples: [], currentPath: '',
+    stages: [], errors: [],
+    summary: null, closeAfterStop: false,
+  };
+}
+
+export function activeNow(s: RunState): number {
+  const now = Date.now();
+  const livePause = s.pausedSince ? now - s.pausedSince : 0;
+  return Math.max(0, now - s.t0 - s.pausedMs - livePause);
+}
+
+export function percent(s: RunState): number {
+  const denom = s.totals.bytes + s.totals.items;
+  if (denom <= 0) return 0;
+  return Math.min(100, (s.dones.bytes + s.dones.items) * 100 / denom);
+}
+
+/// Differencing the sample series over a sliding window. When the window is not yet full, use the actual
+/// span (same as FFS) rather than reporting nothing.
+export function windowRate(s: RunState, windowMs: number): { bps: number; ips: number } | null {
+  const { samples } = s;
+  if (samples.length < 2) return null;
+  const last = samples[samples.length - 1];
+  const cut = last.t - windowMs;
+  let base = samples[0];
+  for (let k = samples.length - 2; k >= 0; k--) {
+    if (samples[k].t <= cut) { base = samples[k]; break; }
+  }
+  const dt = last.t - base.t;
+  if (dt < 200) return null;
+  return { bps: (last.b - base.b) * 1000 / dt, ips: (last.i - base.i) * 1000 / dt };
+}
