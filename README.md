@@ -37,7 +37,7 @@ SyncDash/
 ├─ Script/gen-types.mjs       type generation entry point (`npm run gen:types`)
 ├─ index.html                 main-window entry point (the sub-window's is progress.html)
 ├─ dist/                      frontend build output — deliberately committed to git (no node on Mac, see "Build")
-├─ builder.bat                Windows build menu (Dev / Desktop / CLI / All)
+├─ builder.bat                Windows build menu (Dev / Desktop / CLI / All, plus run and kill/unlock/clean)
 └─ builder.command            Mac build script (pure cargo)
 ```
 
@@ -543,6 +543,18 @@ strategy is worth reading, but adopting it means going resident).
 npm run build && cargo build --release -p syncdash-desktop   # desktop app
 cargo build --release -p syncdash                            # CLI
 ```
+
+The menu carries a second row as well: `[R]` launches the desktop executable already built, `[5]` and `[6]` kill a
+running instance and then wait for its file locks to clear, and `[7]` runs `cargo clean` over the workspace — which
+does **not** touch `dist/`, that being a committed artifact the Mac cannot regenerate. Each phase is timed and each
+artifact is printed as a ctrl-clickable link with its size.
+
+**Every build frees the binary it is about to write first**, which is not politeness but a requirement: cargo links
+straight over `target\release\syncdash-desktop.exe`, so an app left open ends the build at the link step with
+`Access is denied. (os error 5)`. The two binaries are handled differently, though. The desktop shell is killed
+without asking — it is a viewer over the library and relaunches in a second. A running `syncdash.exe` is only
+reported, and killing it takes an explicit *y*: the CLI can be halfway through an `apply`, holding the root
+heartbeat lock and writing files, and a failed build is much the cheaper of the two outcomes.
 
 **Mac (no node required)**: the `dist/` frontend output ships with git and Tauri embeds it at compile time, so
 pure cargo produces the complete GUI:
