@@ -350,17 +350,49 @@ fn inspect_paths(source: String, target: String) -> PathVerdict {
             has_marker: is_dir && syncdash::pipeline::guard::has_marker(path),
         }
     }
+    // A remote phrase is not a local path: filesystem probes would cry wolf. Say what
+    // it is instead; connectivity is Compare's job (or `syncdash caps "<phrase>"`).
+    let phrase_note = |raw: &str| -> Option<String> {
+        use syncdash::fs::vfs::spec::{parse, RootSpec};
+        match parse(raw) {
+            RootSpec::Remote(r) => Some(format!(
+                "{}:// root — checked live at Compare{}",
+                r.scheme,
+                if r.scheme == "smb" { "; recommend require_marker = true (an unmounted share must never look like an empty directory)" } else { "" }
+            )),
+            RootSpec::Fake(_) => Some("in-memory test root (fake://)".into()),
+            RootSpec::UnknownScheme { scheme, .. } => {
+                Some(format!("UNKNOWN scheme '{scheme}://' — this will be refused, never treated as a local path"))
+            }
+            RootSpec::Local(_) => None,
+        }
+    };
     let mut v = PathVerdict { source: info(&source), target: info(&target), warnings: Vec::new() };
     let (s, t) = (source.trim(), target.trim());
-    if !s.is_empty() && !v.source.exists {
-        v.warnings.push(format!("source does not exist: {s}"));
-    } else if !s.is_empty() && !v.source.is_dir {
-        v.warnings.push("source is not a directory".into());
+    let (s_note, t_note) = (phrase_note(s), phrase_note(t));
+    if let Some(n) = &s_note {
+        v.source.exists = true;
+        v.source.is_dir = true;
+        v.warnings.push(format!("source: {n}"));
     }
-    if !t.is_empty() && !v.target.exists {
-        v.warnings.push(format!("target does not exist: {t} (it will be created on the first sync)"));
-    } else if !t.is_empty() && !v.target.is_dir {
-        v.warnings.push("target is not a directory".into());
+    if let Some(n) = &t_note {
+        v.target.exists = true;
+        v.target.is_dir = true;
+        v.warnings.push(format!("target: {n}"));
+    }
+    if s_note.is_none() {
+        if !s.is_empty() && !v.source.exists {
+            v.warnings.push(format!("source does not exist: {s}"));
+        } else if !s.is_empty() && !v.source.is_dir {
+            v.warnings.push("source is not a directory".into());
+        }
+    }
+    if t_note.is_none() {
+        if !t.is_empty() && !v.target.exists {
+            v.warnings.push(format!("target does not exist: {t} (it will be created on the first sync)"));
+        } else if !t.is_empty() && !v.target.is_dir {
+            v.warnings.push("target is not a directory".into());
+        }
     }
     let (ns, nt) = (norm_root(s), norm_root(t));
     if !ns.is_empty() && ns == nt {
@@ -678,6 +710,7 @@ async fn compare_job(
     snaps: tauri::State<'_, Arc<SnapCache>>,
     name: String,
     target_index: Option<usize>,
+    accept_caps: Option<bool>,
 ) -> Result<PlanDto, String> {
     let st = state.inner().clone();
     let cache = snaps.inner().clone();
@@ -695,9 +728,9 @@ async fn compare_job(
         let r = if job.remote_host.is_some() {
             run::compare_remote_job_detailed(&name, &job, &ctx)
         } else {
-            // Capability consent from the desktop confirmation sheet arrives with the
-            // phrase-editor milestone; until then a degraded run refuses, with the reason
-            run::compare_job_detailed(&job, &ctx, false)
+            // A degraded run without consent refuses with the NeedsAck lines; the
+            // frontend shows them and re-invokes with accept_caps=true if the user agrees
+            run::compare_job_detailed(&job, &ctx, accept_caps.unwrap_or(false))
         };
         end_run(&st);
         // compare has no side effects: one index line, no directory. A 30s watch cycle = 2880 runs a day,
@@ -764,6 +797,7 @@ async fn apply_job(
     ops: Vec<Op>,
     acknowledged: bool,
     target_index: Option<usize>,
+    accept_caps: Option<bool>,
 ) -> Result<ApplyDto, String> {
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -799,9 +833,9 @@ async fn apply_job(
                 }
             }
         } else {
-            // Capability consent from the confirmation sheet arrives with the phrase-editor
-            // milestone; until then a degraded apply refuses, naming its reasons
-            run::apply_job_guarded_with(&job, &full, &ops, None, false, acknowledged, false, &rec.ctx)
+            // A degraded apply without consent refuses with the NeedsAck lines; the
+            // frontend shows them and re-invokes with accept_caps=true if the user agrees
+            run::apply_job_guarded_with(&job, &full, &ops, None, false, acknowledged, accept_caps.unwrap_or(false), &rec.ctx)
         };
         rec.finish(&out, t0.elapsed().as_millis() as u64);
         end_run(&st);

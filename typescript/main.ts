@@ -119,6 +119,31 @@ const modalOk = $('modal-ok') as HTMLButtonElement;
 let jobs: JobDto[] = [];
 let currentJob: JobDto | null = null;
 let plan: PlanDto | null = null;
+/// Capability-degradation consent, per job, per session. A remote backend that lacks
+/// something the job asks for (fsync, sampled reads, a reachable trash…) makes the
+/// engine REFUSE with the exact list; consent here re-invokes with acceptCaps=true.
+/// Never persisted: each session sees the list at least once.
+const capsConsent = new Set<string>();
+
+/// invoke(), plus the capability-consent round-trip: on the engine's refusal (its
+/// message carries the --accept-caps lines), show the list verbatim and retry once
+/// if the user agrees.
+async function invokeWithCapsConsent<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
+  const name = String(args.name ?? '');
+  try {
+    return await invoke<T>(cmd, { ...args, acceptCaps: capsConsent.has(name) });
+  } catch (e) {
+    const msg = String(e);
+    if (!msg.includes('--accept-caps')) throw e;
+    const lines = msg.split('\n').slice(1).join('\n').trim();
+    const ok = window.confirm(
+      `This job degrades on capabilities the remote backend lacks:\n\n${lines}\n\nProceed anyway? (Applies to '${name}' for this session.)`,
+    );
+    if (!ok) throw e;
+    capsConsent.add(name);
+    return await invoke<T>(cmd, { ...args, acceptCaps: true });
+  }
+}
 let checked: boolean[] = [];
 let flipped: boolean[] = [];
 /// Category filter: the three big buttons at the bottom of FFS are **independent toggles**, not a radio group.
@@ -898,7 +923,7 @@ async function doCompare() {
   try {
     acknowledged = false;
     modalOk.disabled = false;
-    plan = await invoke<PlanDto>('compare_job', { name: currentJob.name, targetIndex: selTarget });
+    plan = await invokeWithCapsConsent<PlanDto>('compare_job', { name: currentJob.name, targetIndex: selTarget });
     checked = plan.ops.map((op) => selectable(op));
     flipped = plan.ops.map(() => false);
     chips.clear();
@@ -997,7 +1022,7 @@ async function doSync() {
   // Whether the progress window stays during a sync is its own Auto-close / When-finished business; the main window doesn't touch it
   invoke('open_progress_window').catch(() => {});
   try {
-    const r = await invoke<ApplyDto>('apply_job', { name: currentJob.name, plan, ops: finalOps, acknowledged, targetIndex: selTarget });
+    const r = await invokeWithCapsConsent<ApplyDto>('apply_job', { name: currentJob.name, plan, ops: finalOps, acknowledged, targetIndex: selTarget });
     setStatus(
       r.cancelled
         ? `Stopped: cancelled after ${r.done} run — re-checking...`
@@ -1436,7 +1461,10 @@ async function watchTick() {
       setStatus(`⏱ Watch found ${finalOps.length} differences — running automatically…`);
       setBusy(true);
       try {
-        const r = await invoke<ApplyDto>('apply_job', { name: currentJob.name, plan, ops: finalOps, acknowledged: false, targetIndex: selTarget });
+        // Watch never grants capability consent by itself — it only reuses consent the
+        // user already gave interactively this session (a degraded run must never
+        // start on a timer without a human having seen the list)
+        const r = await invoke<ApplyDto>('apply_job', { name: currentJob.name, plan, ops: finalOps, acknowledged: false, targetIndex: selTarget, acceptCaps: capsConsent.has(currentJob.name) });
         setStatus(`⏱ Auto-sync done: ${r.done} run, ${r.errors} errors`, r.errors ? 'err' : 'ok');
         refreshLastSyncs();
       } catch (e) {
