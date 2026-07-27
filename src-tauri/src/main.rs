@@ -695,7 +695,9 @@ async fn compare_job(
         let r = if job.remote_host.is_some() {
             run::compare_remote_job_detailed(&name, &job, &ctx)
         } else {
-            run::compare_job_detailed(&job, &ctx)
+            // Capability consent from the desktop confirmation sheet arrives with the
+            // phrase-editor milestone; until then a degraded run refuses, with the reason
+            run::compare_job_detailed(&job, &ctx, false)
         };
         end_run(&st);
         // compare has no side effects: one index line, no directory. A 30s watch cycle = 2880 runs a day,

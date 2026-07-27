@@ -113,6 +113,33 @@ pub fn compare_job(job: &Job) -> std::io::Result<Plan> {
     compare_job_with(job, &crate::obs::progress::RunCtx::null())
 }
 
+/// One connected backend's capability sheet, rendered for `syncdash caps`.
+pub fn describe_root(phrase: &str) -> std::io::Result<String> {
+    use std::fmt::Write as _;
+    let v = resolve_root(phrase)?;
+    let c = v.caps();
+    let mut out = String::new();
+    let _ = writeln!(out, "root:      {}", v.display());
+    let _ = writeln!(out, "identity:  {}", v.identity());
+    if let Some(info) = v.server_info() {
+        let _ = writeln!(out, "server:    {info}");
+    }
+    let _ = writeln!(out, "protocol:  {}", c.protocol);
+    let _ = writeln!(out, "local lane: {}", if v.as_local().is_some() { "yes (fast path)" } else { "no (generic VFS lane)" });
+    let _ = writeln!(out, "mtime precision: {} ms", c.mtime_precision_ms);
+    let cap = |s: crate::fs::vfs::Support| match s {
+        crate::fs::vfs::Support::Yes => "yes",
+        crate::fs::vfs::Support::No => "NO",
+        crate::fs::vfs::Support::Unknown => "unknown",
+    };
+    let _ = writeln!(out, "set_mtime {}  fsync {}  rename_overwrite {}  ranged_read {}  write_at {}",
+        cap(c.set_mtime), cap(c.fsync), cap(c.rename_overwrite), cap(c.ranged_read), cap(c.write_at));
+    let _ = writeln!(out, "unix_mode {}  symlink {}  file_id {}  free_space {}  read_back {}",
+        cap(c.unix_mode), cap(c.symlink), cap(c.file_id), cap(c.free_space), cap(c.read_back));
+    let _ = write!(out, "parallel streams: up to {}", c.max_parallel_streams);
+    Ok(out)
+}
+
 /// The full output of a comparison: the plan plus both snapshots.
 /// The desktop shell needs the snapshots to compute the "evidence layer" (both sides' size/mtime, identical items); the CLI only wants the plan.
 pub struct CompareOutcome {
@@ -124,11 +151,13 @@ pub struct CompareOutcome {
 /// v0.9 M1: the end-to-end comparison with an event stream and cancellation. This function replaces the second
 /// pipeline src-tauri had inlined just to emit events (undoing the two-copy drift).
 pub fn compare_job_with(job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<Plan> {
-    compare_job_detailed(job, ctx).map(|o| o.plan)
+    compare_job_detailed(job, ctx, false).map(|o| o.plan)
 }
 
 /// The same pipeline, but it also hands back both snapshots (throwing them away would force the UI to scan all over again)
-pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<CompareOutcome> {
+/// `accept_caps` = the user consented (--accept-caps / a ticked confirmation box) to the
+/// NeedsAck lines of the capability report. Without consent a degraded run refuses to start.
+pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx, accept_caps: bool) -> std::io::Result<CompareOutcome> {
     use crate::model::event::Phase;
     // The single pipeline handles a single target only: multi-target jobs are derived through for_target first (the CLI run loop / the desktop target picker)
     job.validate_multi_target().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -143,7 +172,7 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx) -> st
     // errors surface here, never mid-scan.
     let sv = resolve_root(&job.source)?;
     let tv = resolve_root(&job.target)?;
-    let opt = scan_opts(job);
+    let mut opt = scan_opts(job);
     // P0-2: root reachability + mount-point marker. When the share isn't mounted, target is often an empty directory,
     // and comparing as usual yields a plan that either "wipes the other side" or "re-sends everything".
     let mut v = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
@@ -157,6 +186,54 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx) -> st
     if !v.ok() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
     }
+    // The no-hash equality window widens to the coarser of the two backends' declared
+    // mtime precision (an FTP LIST root thinks in minutes). Hash evidence is unaffected.
+    let mut copts = job.compare_opts();
+    copts.mtime_window_ms = copts
+        .mtime_window_ms
+        .max(sv.caps().mtime_precision_ms as i64)
+        .max(tv.caps().mtime_precision_ms as i64);
+    // The capability report: every gap between what the job asks and what the backends
+    // can give is listed BEFORE any scanning — blockers refuse, NeedsAck lines demand
+    // explicit consent, Info lines go to the log. Nothing degrades silently.
+    let q = job.read_caps_query(copts.mtime_window_ms, sv.as_local().is_some(), tv.as_local().is_some());
+    let caps_report = crate::pipeline::guard::cap_report_read(&q, &sv.caps(), &tv.caps());
+    {
+        use crate::model::event::LogLevel;
+        use crate::pipeline::guard::CapSeverity;
+        for i in &caps_report.items {
+            let lvl = match i.severity {
+                CapSeverity::Block => LogLevel::Error,
+                CapSeverity::NeedsAck => LogLevel::Warn,
+                CapSeverity::Info => LogLevel::Info,
+            };
+            ctx.log(lvl, "caps", i.render());
+        }
+        let blockers = caps_report.blockers();
+        if !blockers.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                blockers.iter().map(|i| i.render()).collect::<Vec<_>>().join("; "),
+            ));
+        }
+        let acks = caps_report.needs_ack();
+        if !acks.is_empty() && !accept_caps {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "this run degrades on capabilities the backends lack — rerun with --accept-caps to consent:\n  {}",
+                    acks.iter().map(|i| i.render()).collect::<Vec<_>>().join("\n  ")
+                ),
+            ));
+        }
+    }
+    // Joint tier adjustment: a `~` sampled digest can only ever match another sampled
+    // digest, so when either side cannot sample, BOTH sides read in full — a one-sided
+    // upgrade would make identical files look different (a false positive, the exact
+    // kind of lie this tool exists to not tell).
+    if opt.sampled && !(sv.caps().ranged_read.yes() && tv.caps().ranged_read.yes()) {
+        opt.sampled = false;
+    }
     // Scan both sides in parallel: source and target are almost always on different disks/links (local disk vs SMB,
     // OneDrive vs an external drive), so serial execution is pure queueing — in parallel, wall clock ≈ the slower side.
     // Each side emits its own PhaseStart at the same moment, so the progress panel ticks on two rows at once.
@@ -165,7 +242,26 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx) -> st
         let ht = sc.spawn(|| scan::scan_root(&tv, &opt, ctx, Phase::ScanTarget));
         (hs.join().unwrap(), ht.join().unwrap())
     });
-    let (s, t) = (s?, t?);
+    let (mut s, mut t) = (s?, t?);
+    // The consented degradations ride on the snapshot itself — a table must say how its
+    // evidence was gathered
+    {
+        use crate::pipeline::guard::CapSeverity;
+        let lines_for = |side: &str| {
+            caps_report
+                .items
+                .iter()
+                .filter(|i| i.severity != CapSeverity::Info && (i.side == side || i.side == "both"))
+                .map(|i| i.render())
+                .collect::<Vec<_>>()
+        };
+        if let Some(n) = s.header.vfs.as_mut() {
+            n.degraded = lines_for("source");
+        }
+        if let Some(n) = t.header.vfs.as_mut() {
+            n.degraded = lines_for("target");
+        }
+    }
     let archive = match (&job.archive, job.mode.as_str()) {
         (Some(p), "sync") if p.is_file() => Some(Snapshot::load(p)?),
         _ => None,
@@ -178,13 +274,6 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx) -> st
         0,
         0,
     );
-    // The no-hash equality window widens to the coarser of the two backends' declared
-    // mtime precision (an FTP LIST root thinks in minutes). Hash evidence is unaffected.
-    let mut copts = job.compare_opts();
-    copts.mtime_window_ms = copts
-        .mtime_window_ms
-        .max(sv.caps().mtime_precision_ms as i64)
-        .max(tv.caps().mtime_precision_ms as i64);
     let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
     // Disagreement escalation: in the sampled evidence tier, a file whose digests match but whose mtimes differ by >2s may not simply be ruled identical (the knob can turn this off)
     let rr = job.rigor_resolved();
@@ -393,7 +482,7 @@ use crate::obs::progress::ApplyOutcome;
 }
 
 /// End-to-end run for local/mounted-disk jobs (the body of the original CLI run). Returns (done, skipped, errors, conflicts).
-pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
+pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool, accept_caps: bool) -> std::io::Result<(u64, u64, u64, u64)> {
     // 1:N (the original requirement): one source → each target compared and executed independently.
     // One plan and one run log per target; source-side hashing is absorbed by the cache (in the fast tier, near-zero reads from the second target on).
     job.validate_multi_target().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -403,7 +492,7 @@ pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackno
     for (i, t) in targets.iter().enumerate() {
         let jt = job.for_target(t);
         let label = if multi { format!("{name}[{}/{} → {t}]", i + 1, targets.len()) } else { name.to_string() };
-        let r = run_local_single(&label, &jt, do_apply, verbose, acknowledged)?;
+        let r = run_local_single(&label, &jt, do_apply, verbose, acknowledged, accept_caps)?;
         tot.0 += r.0;
         tot.1 += r.1;
         tot.2 += r.2;
@@ -412,8 +501,8 @@ pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackno
     Ok(tot)
 }
 
-fn run_local_single(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
-    let plan = compare_job(job)?;
+fn run_local_single(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool, accept_caps: bool) -> std::io::Result<(u64, u64, u64, u64)> {
+    let plan = compare_job_detailed(job, &crate::obs::progress::RunCtx::null(), accept_caps)?.plan;
     crate::log_info!("run", "[{name}] {} op(s), {} conflict(s)", plan.header.op_count, plan.header.conflict_count);
     for op in &plan.ops {
         println!("{}", serde_json::to_string(op)?);
@@ -908,7 +997,7 @@ mod tests {
         j.mode = "mirror".into();
         j.rigor = "standard".into();
         j.exclude = vec!["skipme/".into()];
-        let out = compare_job_detailed(&j, &crate::obs::progress::RunCtx::null()).unwrap();
+        let out = compare_job_detailed(&j, &crate::obs::progress::RunCtx::null(), false).unwrap();
 
         assert_eq!(out.source.header.excluded_dirs, 1, "pruned subtree must be counted, never silent");
         assert_eq!(out.target.header.excluded_dirs, 1);
@@ -931,6 +1020,38 @@ mod tests {
             ],
             "same.bin must compare equal through generated content; the three drifts must classify"
         );
+    }
+
+    #[test]
+    fn degraded_caps_demand_consent_and_land_on_the_table() {
+        use crate::fs::vfs::fake::FakeVfs;
+        let src_phrase = "fake://acktest";
+        let tgt_phrase = "fake://acktest?no_ranged_read";
+        let sv = FakeVfs::from_phrase(src_phrase).unwrap();
+        let tv = FakeVfs::from_phrase(tgt_phrase).unwrap();
+        // Big enough that the sampled tier would sample (≥4MB), identical on both sides
+        sv.seed_file("big.bin", 5 * 1024 * 1024, 1_000);
+        tv.seed_file("big.bin", 5 * 1024 * 1024, 1_000);
+        let mut j = Job::default();
+        j.source = src_phrase.into();
+        j.target = tgt_phrase.into();
+        j.mode = "mirror".into();
+        j.rigor = "fast".into(); // sampled tier
+
+        // Without consent: refuse, naming the flag
+        let e = match compare_job_detailed(&j, &crate::obs::progress::RunCtx::null(), false) {
+            Err(e) => e,
+            Ok(_) => panic!("a degraded run must refuse without consent"),
+        };
+        assert!(e.to_string().contains("--accept-caps"), "{e}");
+
+        // With consent: BOTH sides upgrade to full (a one-sided upgrade would make the
+        // identical file look different), the table says so, and the plan stays empty
+        let out = compare_job_detailed(&j, &crate::obs::progress::RunCtx::null(), true).unwrap();
+        assert_eq!(out.source.header.vfs.as_ref().unwrap().evidence_effective, "full");
+        assert_eq!(out.target.header.vfs.as_ref().unwrap().evidence_effective, "full");
+        assert!(!out.target.header.vfs.as_ref().unwrap().degraded.is_empty(), "the consented degradation must ride on the snapshot");
+        assert_eq!(out.plan.ops.len(), 0, "identical content must not produce ops after the joint upgrade");
     }
 
     #[test]

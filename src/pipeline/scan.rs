@@ -360,6 +360,10 @@ fn scan_vfs(
     let t0 = std::time::Instant::now();
     let identity = vfs.identity();
     let caps = vfs.caps();
+    // A backend without ranged reads cannot sample — the tier upgrades to full reads.
+    // Never silent: preflight already put a NeedsAck line in front of the user, and the
+    // snapshot's VfsNote records the tier that actually ran.
+    let sampled = opt.sampled && caps.ranged_read.yes();
     let cache = if opt.hash && opt.use_cache { load_cache_by_key(&identity) } else { HashMap::new() };
     let mtime_fixes = load_mtime_fixes_by_key(&identity);
 
@@ -442,7 +446,7 @@ fn scan_vfs(
                     let mut hash = None;
                     if opt.hash && opt.use_cache {
                         if let Some((cs, cm, ch)) = cache.get(&rel) {
-                            let want_sampled = opt.sampled && size >= SAMPLE_MIN;
+                            let want_sampled = sampled && size >= SAMPLE_MIN;
                             if *cs == size && *cm == mt && ch.starts_with('~') == want_sampled {
                                 hash = Some(ch.clone());
                             }
@@ -471,7 +475,7 @@ fn scan_vfs(
     }
 
     let bytes_to_hash: u64 = if opt.hash {
-        pending.iter().filter(|p| p.hash.is_none()).map(|p| effective_read(p.size, opt.sampled)).sum()
+        pending.iter().filter(|p| p.hash.is_none()).map(|p| effective_read(p.size, sampled)).sum()
     } else {
         0
     };
@@ -501,7 +505,7 @@ fn scan_vfs(
                         let _ = hashes[i].set(None);
                         continue;
                     }
-                    let res = if opt.sampled && p.size >= SAMPLE_MIN {
+                    let res = if sampled && p.size >= SAMPLE_MIN {
                         sampled_digest_vfs(vfs.as_ref(), &p.rel, p.size)
                     } else {
                         full_hash_vfs(vfs.as_ref(), &p.rel, &pp)
@@ -520,7 +524,7 @@ fn scan_vfs(
                             let _ = hashes[i].set(None);
                         }
                     }
-                    let eff = effective_read(p.size, opt.sampled);
+                    let eff = effective_read(p.size, sampled);
                     pp.add_bytes(eff, &p.rel);
                     pp.item_done(&p.rel);
                 });
@@ -567,7 +571,7 @@ fn scan_vfs(
                 mtime_precision_ms: caps.mtime_precision_ms,
                 evidence_effective: if !opt.hash {
                     "none".into()
-                } else if opt.sampled {
+                } else if sampled {
                     "sampled".into()
                 } else {
                     "full".into()

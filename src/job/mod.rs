@@ -308,6 +308,21 @@ impl Job {
         r
     }
 
+    /// The read-side capability query (window already widened to the coarser backend)
+    pub fn read_caps_query(&self, window_ms: i64, src_local: bool, tgt_local: bool) -> crate::pipeline::guard::ReadCapsQuery {
+        let rr = self.rigor_resolved();
+        crate::pipeline::guard::ReadCapsQuery {
+            hash: rr.hash,
+            sampled: rr.sampled,
+            escalate: rr.escalate,
+            symlinks_direct: self.symlinks == "direct",
+            min_free_pct: self.min_free_pct,
+            window_ms,
+            src_local,
+            tgt_local,
+        }
+    }
+
     pub fn guards(&self, acknowledged: bool) -> crate::pipeline::guard::Guards {
         crate::pipeline::guard::Guards {
             require_marker: self.require_marker,

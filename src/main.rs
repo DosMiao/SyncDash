@@ -58,6 +58,10 @@ enum Cmd {
         /// Allow the "plan health check" through (deletion share too high). A missing marker / insufficient space still blocks
         #[arg(long = "i-know")]
         i_know: bool,
+        /// Consent to the capability degradations a remote backend forces (each one is listed first).
+        /// Separate from --i-know on purpose: two different risks, two separate nods
+        #[arg(long = "accept-caps")]
+        accept_caps: bool,
         #[arg(short, long)]
         verbose: bool,
         /// M6 watch: loop compare → (on differences, in auto mode) apply → sleep. Ctrl-C to stop
@@ -248,6 +252,11 @@ enum Cmd {
     Net {
         #[command(subcommand)]
         cmd: NetCmd,
+    },
+    /// Connect to a root and print its full capability sheet (what preflight will reason from)
+    Caps {
+        /// A root phrase: a local path, smb://…, sftp://…, ftp://…
+        phrase: String,
     },
     /// Execute a plan. dry-run by default; only --apply touches anything
     Apply {
@@ -547,7 +556,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Run { job, all, prefix, apply: do_apply, i_know, verbose, watch, interval, auto_apply } => {
+        Cmd::Run { job, all, prefix, apply: do_apply, i_know, accept_caps, verbose, watch, interval, auto_apply } => {
             let list: Vec<(String, job::Job)> = if all || prefix.is_some() {
                 job::load_all()
                     .into_iter()
@@ -576,7 +585,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                         let res = if j.remote_host.is_some() {
                             run::run_remote_job(name, j, auto, verbose, i_know)
                         } else {
-                            run::run_local_job(name, j, auto, verbose, i_know)
+                            run::run_local_job(name, j, auto, verbose, i_know, accept_caps)
                         };
                         match res {
                             Ok((d, _s, e, c)) if d + e + c > 0 => {
@@ -595,7 +604,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 let res = if j.remote_host.is_some() {
                     run::run_remote_job(name, j, do_apply, verbose, i_know)
                 } else {
-                    run::run_local_job(name, j, do_apply, verbose, i_know)
+                    run::run_local_job(name, j, do_apply, verbose, i_know, accept_caps)
                 };
                 match res {
                     Ok((d, s, e, c)) => {
@@ -797,6 +806,16 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             println!("set `require_marker = true` in the job to have syncdash refuse to run without it");
             Ok(0)
         }
+        Cmd::Caps { phrase } => match run::describe_root(&phrase) {
+            Ok(sheet) => {
+                println!("{sheet}");
+                Ok(0)
+            }
+            Err(e) => {
+                eprintln!("connect failed: {e}");
+                Ok(1)
+            }
+        },
         Cmd::Cred { cmd } => {
             use syncdash::fs::vfs::cred;
             use syncdash::fs::vfs::spec::{parse, RootSpec};
