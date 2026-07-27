@@ -608,15 +608,20 @@ fn scan_impl(
     // (the OneDrive root prefix alone is 47 chars; deep course directories were measured hitting the limit, and a directory
     // that hits it vanishes silently along with its whole tree — in mirror mode that reads as "the other side got mass-deleted".
     // \\?\ is exactly what keeps FFS alive). The cache key and snapshot header keep the original root; the prefix lives only in the walk and in file I/O.
+    //
+    // **The prefix must not be pasted on by hand.** `\\?\` turns off Win32 path parsing, which means
+    // '/' stops being a separator and '.' / '..' stop resolving — so the string that names a healthy
+    // directory stops naming anything. Measured with the release binary on one 5-file tree: spelled
+    // with backslashes it scanned 5 entries; spelled with forward slashes, or with a `..` in it, the
+    // very same directory scanned **0**, because the root read failed and the loop simply counted a
+    // walk error. A 0-entry source snapshot is not a degraded result — under mirror it means delete
+    // everything on the far side. `canonicalize` returns an already-verbatim path (and the
+    // `\\?\UNC\server\share` form for shares, which the hand-rolled version could not produce), so it
+    // gives the same MAX_PATH immunity without inventing an unreadable spelling. If it fails we walk
+    // the root as given: std applies the long-path prefix internally anyway.
     #[cfg(windows)]
-    let walk_root: std::path::PathBuf = {
-        let s = root.to_string_lossy();
-        if s.starts_with(r"\\") {
-            root.to_path_buf() // already \\?\ or UNC (\\server\share needs the \\?\UNC\ form; not converted for now)
-        } else {
-            std::path::PathBuf::from(format!(r"\\?\{}", s))
-        }
-    };
+    let walk_root: std::path::PathBuf =
+        std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     #[cfg(not(windows))]
     let walk_root: std::path::PathBuf = root.to_path_buf();
 
@@ -677,6 +682,21 @@ fn scan_impl(
         }
         let item = match item {
             Ok(i) => i,
+            // A failure at depth 0 is the root itself being unreadable, and it must never be
+            // downgraded to "this root has no entries". That snapshot is structurally valid and
+            // says the tree is empty, so mirror reads it as "delete everything on the far side" —
+            // the warning line scrolls past and the plan is a catastrophe. This is the same stance
+            // scan_vfs already takes for a directory-level failure: refuse to emit a table rather
+            // than emit one whose missing half reads as deletions.
+            Err(e) if e.depth() == 0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "scan of '{}' could not read the root itself: {e} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
+                        root.display()
+                    ),
+                ));
+            }
             Err(e) => {
                 walk_errors += 1;
                 if walk_err_samples.len() < 5 {
@@ -984,6 +1004,52 @@ use crate::obs::progress::{is_cancelled, RunCtl, RunCtx};
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same directory must scan the same no matter how its root is spelled. It did not:
+    /// the hand-pasted `\\?\` prefix turned off Win32 path parsing, so a root written with
+    /// forward slashes or containing `..` named nothing, and the scan reported an empty tree —
+    /// which mirror reads as "delete everything on the far side".
+    #[test]
+    fn equivalent_root_spellings_scan_identically() {
+        let root = std::env::temp_dir().join(format!("syncdash-spell-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        for i in 0..5 {
+            std::fs::write(root.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let base = root.to_string_lossy().into_owned();
+        let baseline = scan(&root, &ScanOptions { hash: false, ..opts() }).unwrap().entries.len();
+        assert_eq!(baseline, 6, "5 files + 1 dir");
+
+        let spellings = [
+            base.replace('\\', "/"),
+            format!("{base}{}sub{}..", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR),
+            format!("{base}{}", std::path::MAIN_SEPARATOR),
+            format!("{base}{}.", std::path::MAIN_SEPARATOR),
+        ];
+        for s in spellings {
+            let got = scan(Path::new(&s), &ScanOptions { hash: false, ..opts() })
+                .unwrap_or_else(|e| panic!("scanning {s:?} failed: {e}"));
+            assert_eq!(
+                got.entries.len(),
+                baseline,
+                "{s:?} names the same directory and must produce the same table"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ...and when the root genuinely cannot be read, the answer is an error, never a snapshot
+    /// that claims the tree is empty.
+    #[test]
+    fn an_unreadable_root_is_an_error_not_an_empty_table() {
+        let missing = std::env::temp_dir().join(format!("syncdash-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        match scan(&missing, &ScanOptions { hash: false, ..opts() }) {
+            Ok(s) => panic!("a missing root scanned as a {}-entry tree instead of erroring", s.entries.len()),
+            Err(e) => assert!(e.to_string().contains("refusing to report it as an empty tree"), "{e}"),
+        }
     }
 
     fn mk_tree(tag: &str, n: usize) -> PathBuf {
