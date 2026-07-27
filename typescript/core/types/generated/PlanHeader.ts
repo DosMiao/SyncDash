@@ -2,11 +2,11 @@
 
 export type PlanHeader = { schema: number, kind: string, mode: string, generated_at_ms: number, source_root: string, source_host: string, target_root: string, target_host: string, op_count: number, conflict_count: number, 
 /**
- * 两侧快照的条目数。计划体检（删除占比）要用，也让计划文件本身可自证规模。
+ * Entry counts of both snapshots. Needed by the plan health check (deletion ratio), and lets the plan file attest to its own scale.
  */
 source_entries: number, target_entries: number, 
 /**
- * 两侧被过滤器排除的条目数（目录+文件）。排除必须可见：界面据此明示
- * "有多少东西没参与比对"，绝不允许"两侧一致 ✓"背后藏着被吞掉的树。
+ * Entries excluded by the filter on both sides (dirs + files). Exclusion must be visible: the UI uses this to spell out
+ * "how much did not take part in the compare" — never a swallowed tree hiding behind "both sides match ✓".
  */
 source_excluded: number, target_excluded: number, };

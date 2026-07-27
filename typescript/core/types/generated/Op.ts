@@ -4,14 +4,14 @@ import type { Side } from "./Side";
 
 export type Op = { side: Side, action: Action, path: string, from?: string | null, size?: number | null, mtime_ms?: number | null, 
 /**
- * 复制/更新内容的期望 hash（paranoid 模式复制后校验用）
+ * Expected hash of the copied/updated content (used by paranoid mode to verify after copying)
  */
 hash?: string | null, 
 /**
- * Some = 这是一个 symlink 操作，值为链接指向（apply 创建链接而非复制内容）
+ * Some = this is a symlink op, the value is the link target (apply creates a link instead of copying content)
  */
 link?: string | null, 
 /**
- * 目标 unix 权限位。Chmod 用它作为要写入的值；Copy/Update 带上它则复制后一并回写
+ * Target unix permission bits. Chmod uses it as the value to write; when Copy/Update carries it, it is written back right after the copy
  */
 mode?: number | null, reason: string, };

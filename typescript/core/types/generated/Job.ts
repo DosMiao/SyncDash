@@ -6,131 +6,131 @@ export type Job = {
  */
 mode: string, source: string, target: string, 
 /**
- * 单 source → **多 target**（原始需求的 1:N）。非空时覆盖上面的单 target：
- * 每个 target 独立比对/独立计划/独立执行（source 只扫一次）。
- * 仅 mirror/enrich——sync 的 N 向合并是版本向量领域，用成对任务表达；远程任务同样不支持多 target。
+ * One source → **many targets** (the original 1:N requirement). Non-empty overrides the single target above:
+ * each target gets its own comparison, its own plan, its own execution (source is scanned once).
+ * mirror/enrich only — sync's N-way merge is version-vector territory, express it as paired jobs; remote jobs don't support multiple targets either.
  */
 targets: Array<string>, 
 /**
- * sync 模式的上次同步存档；apply 成功后自动刷新
+ * Archive of the last sync, for sync mode; refreshed automatically after a successful apply
  */
 archive: string | null, 
 /**
- * include 白名单（FFS 过滤器语法；留空 = `*` 全部）
+ * include allowlist (FFS filter syntax; empty = `*`, everything)
  */
 include: Array<string>, 
 /**
- * 追加排除（FFS 过滤器语法，如 `big_temp/`、`*.log`，前缀 `*` 表示任意层级；
- * 默认垃圾/可重建排除已内置）。
+ * Extra excludes (FFS filter syntax, e.g. `big_temp/`, `*.log`; a leading `*` means any depth;
+ * the default junk / rebuildable excludes are already built in).
  *
- * 掩码里的星号-斜杠序列不写进本行：ts-rs 会把这段文档原样搬进生成的 JSDoc，
- * 那两个字符会提前终止注释块，产出语法非法的 .ts。
+ * Do not put a mask's star-slash sequence on this line: ts-rs copies this doc verbatim into the
+ * generated JSDoc, and those two characters would end the comment block early, yielding invalid .ts.
  */
 exclude: Array<string>, no_hash: boolean, 
 /**
- * 严谨级**快捷预设**：quick | fast | standard | paranoid | custom。
- * 预设只是下面四个明细旋钮的宏；明细字段有值时**覆盖**预设对应轴（UI 保存时四项全显式落盘）。
+ * Rigor-level **shortcut preset**: quick | fast | standard | paranoid | custom.
+ * A preset is just a macro over the four detail knobs below; a detail field with a value **overrides** the preset's matching axis (the UI writes all four explicitly on save).
  */
 rigor: string, 
 /**
- * 内容证据：none（0 读，只看元数据）| sampled（采样窗：size+头/中/尾各 256KB）| full（全量 BLAKE3）
+ * Content evidence: none (0 reads, metadata only) | sampled (sampling window: size + 256KB each at head/middle/tail) | full (whole-file BLAKE3)
  */
 evidence: string | null, 
 /**
- * 是否信 (path,size,mtime) 哈希缓存（未变面直接用上次结果，不实读）
+ * Whether to trust the (path,size,mtime) hash cache (unchanged faces reuse last round's result instead of really reading)
  */
 use_cache: boolean | null, 
 /**
- * 分歧升级：抽样摘要相等但 |Δmtime|>2s → 双侧全量重验再裁决（仅 evidence=sampled 时有意义）
+ * Disagreement escalation: sampled digests equal but |Δmtime|>2s → re-verify both sides in full before ruling (only meaningful with evidence=sampled)
  */
 escalate: boolean | null, 
 /**
- * 写后校验：复制流全量 blake3 vs 落盘重读，不合格不 rename
+ * Verify after write: full blake3 of the copy stream vs a re-read from disk; no rename unless they match
  */
 verify_writes: boolean | null, 
 /**
- * 默认 false（大小写不敏感匹配——NTFS/APFS 默认行为）；true 则大小写敏感
+ * Default false (case-insensitive matching — the NTFS/APFS default); true makes matching case-sensitive
  */
 case_sensitive: boolean, 
 /**
- * symlink 策略：exclude（默认，忽略）| direct（同步链接本身，按指向字符串比对）
+ * symlink policy: exclude (default, ignore) | direct (sync the link itself, compared by its target string)
  */
 symlinks: string, 
 /**
- * 版本控制（可选）：true 时被删/被覆盖文件存进各 root 的 .version_syncDash/（历史随数据走），
- * 配 `syncdash versions` / `syncdash restore` 查看与找回；false 走本机 trash
+ * Versioning (optional): when true, deleted/overwritten files go into each root's .version_syncDash/ (history travels with the data),
+ * paired with `syncdash versions` / `syncdash restore` to browse and recover; false uses the local trash
  */
 versioning: boolean, 
 /**
- * 远程管线（可选）：设置后 run 走 ssh —— 远端在自己盘上扫描（免 UNC 哈希慢）＋打包送达执行
+ * Remote pipeline (optional): once set, run goes over ssh — the remote scans on its own disk (no slow hashing over UNC) plus ship-the-package execution
  */
 remote_host: string | null, 
 /**
- * 远端根路径（远端机器自己的本地路径，如 /Users/xxx/Code/...）
+ * Remote root path (the remote machine's own local path, e.g. /Users/xxx/Code/...)
  */
 remote_root: string | null, 
 /**
- * 远端 syncdash 可执行文件路径（默认当它在 PATH 里）
+ * Path to the remote syncdash executable (defaults to assuming it is on PATH)
  */
 remote_exe: string | null, 
 /**
- * 要求两侧 root 都有 `.syncdash-root` 标记才动手（防 SMB 共享盘没挂上就把对面当空目录）。
- * 新任务建议开；`syncdash mark <root>` 打标记。
+ * Require a `.syncdash-root` marker on both roots before touching anything (so an unmounted SMB share isn't treated as an empty directory).
+ * Recommended for new jobs; `syncdash mark <root>` writes the marker.
  */
 require_marker: boolean, 
 /**
- * 至少保留的空闲磁盘比例（0.01 = 1%）。0 关闭
+ * Minimum free-disk ratio to keep (0.01 = 1%). 0 disables
  */
 min_free_pct: number, 
 /**
- * 单侧删除条目占比超过它就拒绝执行（0.5 = 50%）。0 或 >=1 关闭。
- * 过滤器写错、source/target 写反、共享盘没挂上，长得都跟这个一模一样。
+ * Refuse to run when one side's share of deleted entries exceeds this (0.5 = 50%). 0 or >=1 disables.
+ * A wrong filter, swapped source/target, and an unmounted share all look exactly like this.
  */
 max_delete_ratio: number, 
 /**
- * 临时文件 rename 前 fsync。默认开；SMB 上嫌慢可关（自担风险）
+ * fsync the temp file before renaming. On by default; turn it off if SMB makes it too slow (at your own risk)
  */
 fsync: boolean, 
 /**
- * 冲突策略：report（默认，只报告）| copy（败方存成 .sync-conflict 副本）| newer（新者直接覆盖）
+ * Conflict policy: report (default, report only) | copy (the loser is kept as a .sync-conflict copy) | newer (the newer one just overwrites)
  */
 on_conflict: string, 
 /**
- * on_conflict = "copy" 时每个文件最多保留几份冲突副本（-1 = 不限）
+ * With on_conflict = "copy", the most conflict copies to keep per file (-1 = unlimited)
  */
 max_conflicts: number, 
 /**
- * 同步 unix 权限位（两侧都是 unix 才有意义）
+ * Sync unix permission bits (only meaningful when both sides are unix)
  */
 sync_mode: boolean, 
 /**
- * 这些路径不参与同步，但删除父目录时可连带删掉（syncthing 的 `(?d)`）
+ * These paths don't take part in the sync, but may be removed along with a parent directory (syncthing's `(?d)`)
  */
 deletable: Array<string>, 
 /**
- * 本地/挂载盘的增量更新：多读一遍目标换少写很多字节。
- * SMB/WAN 上传是净赚，对称链路打平——所以默认关，按链路自行开。
+ * Delta updates for local/mounted disks: one extra read of the target buys a lot fewer written bytes.
+ * A net win on SMB/WAN uploads, a wash on symmetric links — hence off by default, enable it per link.
  */
 delta: boolean, 
 /**
- * 系统垃圾排除预设：auto（Win+Mac 两份都上，默认——跨机同步两边都要防）| windows | mac | off。
- * 排除量永远显示在界面"⚠ 已排除"里，绝不静默
+ * OS-junk exclude preset: auto (both the Win and Mac sets, the default — cross-machine syncs must guard both) | windows | mac | off.
+ * The excluded count always shows in the UI's "⚠ Excluded", never silently
  */
 os_excludes: string, 
 /**
- * 排除可重建开发产物（.git/node_modules/target/build/dist/venv…）。
- * **默认关——.git 也是正常文件**；代码同步任务显式打开（gen-jobs 生成的 cs-* 已带）
+ * Exclude rebuildable dev artifacts (.git/node_modules/target/build/dist/venv…).
+ * **Off by default — .git is a normal tree too**; code-sync jobs turn it on explicitly (the cs-* jobs from gen-jobs already do)
  */
 dev_excludes: boolean, 
 /**
- * Copy/Update 相位的并行宽度（1 = 顺序）。缺省 4；clamp 1..=16
+ * Parallel width for the Copy/Update phase (1 = sequential). Defaults to 4; clamped to 1..=16
  */
 parallel: number | null, 
 /**
- * M6 定时扫描：每 N 秒自动比对（None = 关闭）。秒级档＝"准实时"；UNC 目标建议 ≥30
+ * M6 scheduled scan: compare automatically every N seconds (None = off). Second-level intervals = "near real-time"; use ≥30 for UNC targets
  */
 watch_interval_secs: number | null, 
 /**
- * watch 发现差异时自动执行（默认 false = 只提醒不动手）
+ * Apply automatically when watch finds differences (default false = notify only, touch nothing)
  */
 watch_auto_apply: boolean, };

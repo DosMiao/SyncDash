@@ -3,6 +3,6 @@ import type { PathInfo } from "./PathInfo";
 
 export type PathVerdict = { source: PathInfo, target: PathInfo, 
 /**
- * 人话警告，编辑器直接贴在字段下面
+ * Plain-language warnings; the editor renders them right under the field
  */
 warnings: Array<string>, };

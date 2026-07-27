@@ -2,6 +2,6 @@
 
 export type MigrateReport = { moved: number, skipped: number, failed: number, 
 /**
- * 人话说明，界面直接贴出来
+ * Plain-language explanation, pasted straight into the UI
  */
 messages: Array<string>, };

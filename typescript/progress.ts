@@ -1,9 +1,9 @@
-// SyncDash 进度子窗口（v0.9 M2，FFS 同款行为参数）：
-// - 速率 = 4s 滑窗，ETA = 60s 滑窗，读数 500ms 刷新，重绘 100ms
-// - 百分比 = (bytesDone + itemsDone) / (bytesTotal + itemsTotal)（FFS 同式）
-// - 暂停不计入 elapsed；停止=协作取消（完成当前块后收手，终点绝无半截文件）
-// - 错误累积不中断；Auto-close 与 When-finished（睡眠/关机，10s 可取消倒计时）
-// 数据源：Rust TauriSink 广播的 `run-progress` 事件（≥100ms/条已节流，带 run_id）。
+// SyncDash progress sub-window (v0.9 M2, FFS-equivalent behavior parameters):
+// - rate = 4s sliding window, ETA = 60s sliding window, readouts refresh every 500ms, redraw every 100ms
+// - percentage = (bytesDone + itemsDone) / (bytesTotal + itemsTotal) (same formula as FFS)
+// - paused time is excluded from elapsed; Stop = cooperative cancel (stops after the current chunk, so the end state never leaves a half-written file)
+// - errors accumulate without interrupting; Auto-close and When-finished (sleep/shut down, 10s cancellable countdown)
+// Data source: the `run-progress` event broadcast by the Rust TauriSink (throttled to ≥100ms apiece, carries run_id).
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -15,10 +15,14 @@ type PhaseName =
 
 interface RunEv {
   run_id: number;
-  /// "compare" | "apply"——本窗口只认 apply（compare 进度在主窗原地显示；
-  /// 若不过滤，同步后的自动复核比对会把结果窗劫持成永远转圈的"比对中"）
+  /// "compare" | "apply" — this window only accepts apply (compare progress is shown inline in the main window;
+  /// without the filter, the automatic re-check compare after a sync would hijack the result window into a forever-spinning "comparing")
   purpose?: string;
-  kind: 'phase_start' | 'totals' | 'progress' | 'error' | 'paused' | 'resumed' | 'summary';
+  kind: 'phase_start' | 'totals' | 'progress' | 'error' | 'log' | 'item_result' | 'paused' | 'resumed' | 'summary';
+  /// kind='log' only: info | warn | error
+  level?: 'info' | 'warn' | 'error';
+  /// kind='log' only: module name (run / pack / lock…)
+  scope?: string;
   ts_ms: number;
   phase?: PhaseName;
   label?: string | null;
@@ -40,30 +44,30 @@ interface RunEv {
 }
 
 const PHASE_LABEL: Record<PhaseName, string> = {
-  'scan-source': '扫描 source',
-  'scan-target': '扫描 target',
-  'compare': '比对',
-  'apply': '同步',
-  'pack': '打包',
-  'ship': '传输',
-  'verify': '校验',
-  'refresh': '刷新存档',
+  'scan-source': 'Scan source',
+  'scan-target': 'Scan target',
+  'compare': 'Compare',
+  'apply': 'Sync',
+  'pack': 'Pack',
+  'ship': 'Transfer',
+  'verify': 'Verify',
+  'refresh': 'Refresh archive',
 };
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const win = getCurrentWindow();
 
-// ---------- 运行状态 ----------
+// Run state
 
-interface Sample { t: number; b: number; i: number } // t = 活动毫秒（去除暂停）
+interface Sample { t: number; b: number; i: number } // t = active milliseconds (paused time removed)
 
 let runId = -1;
 let running = false;
-let t0 = 0;                       // 本次运行首事件 ts
-let pausedMs = 0;                 // 引擎权威累计（Resumed/Summary 刷新）
-let pausedSince = 0;              // 正在暂停时的起点（本地估算）
+let t0 = 0;                       // ts of the first event in this run
+let pausedMs = 0;                 // authoritative total from the engine (refreshed by Resumed/Summary)
+let pausedSince = 0;              // start of the current pause (local estimate)
 let phase: PhaseName | null = null;
-let applying = false;            // 进入过 apply/pack/ship → 图表模式
+let applying = false;            // has entered apply/pack/ship → graph mode
 let totals = { items: 0, bytes: 0 };
 let dones = { items: 0, bytes: 0 };
 let samples: Sample[] = [];
@@ -98,14 +102,14 @@ function resetRun(id: number, ts: number) {
   countdownStop();
   pwin.classList.remove('applying');
   btnPause.disabled = false;
-  btnPause.textContent = '⏸ 暂停';
+  btnPause.textContent = '⏸ Pause';
   btnStop.disabled = false;
-  btnStop.textContent = '■ 停止';
+  btnStop.textContent = '■ Stop';
   pctEl.className = '';
   renderReadouts();
 }
 
-// ---------- DOM ----------
+// DOM
 
 const pwin = $('pwin');
 const jobEl = $('pjob');
@@ -161,13 +165,13 @@ function ht(ms: number): string {
   return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}` : `${m}:${String(ss).padStart(2, '0')}`;
 }
 
-// ---------- 速率 / ETA（滑窗对样本序列做差） ----------
+// Rate / ETA (differencing the sample series over a sliding window)
 
 function windowRate(windowMs: number): { bps: number; ips: number } | null {
   if (samples.length < 2) return null;
   const last = samples[samples.length - 1];
   const cut = last.t - windowMs;
-  // 从尾部找第一个 <= cut 的样本；样本最老不足窗口时用最老的（FFS 同款“窗口未满用实际跨度”）
+  // walk back from the tail for the first sample <= cut; if the oldest sample is younger than the window, use it (same as FFS: "when the window is not full, use the actual span")
   let base = samples[0];
   for (let k = samples.length - 2; k >= 0; k--) {
     if (samples[k].t <= cut) { base = samples[k]; break; }
@@ -183,7 +187,7 @@ function percent(): number {
   return Math.min(100, (dones.bytes + dones.items) * 100 / denom);
 }
 
-// ---------- 图表 ----------
+// Graphs
 
 function drawGraph(cv: HTMLCanvasElement, key: 'b' | 'i', total: number) {
   const ctx = cv.getContext('2d');
@@ -201,7 +205,7 @@ function drawGraph(cv: HTMLCanvasElement, key: 'b' | 'i', total: number) {
 
   const now = activeNow();
   const lastV = samples.length ? samples[samples.length - 1][key] : 0;
-  // ETA 终点参与 x 轴：完成估计落在图右侧（FFS 楔形的降级版：虚线标记）
+  // the ETA endpoint takes part in the x axis: the completion estimate sits at the right edge (a simplified FFS wedge: a dashed marker)
   const r = windowRate(60000);
   const rate = key === 'b' ? r?.bps ?? 0 : r?.ips ?? 0;
   const remain = Math.max(0, total - lastV);
@@ -211,19 +215,19 @@ function drawGraph(cv: HTMLCanvasElement, key: 'b' | 'i', total: number) {
   const X = (t: number) => t / xMax * (w - 8) + 4;
   const Y = (v: number) => h - 6 - v / yMax * (h - 16);
 
-  // 网格
+  // grid
   ctx.strokeStyle = cBorder; ctx.lineWidth = 1;
   for (let g = 1; g <= 3; g++) {
     const y = 6 + (h - 12) * g / 4;
     ctx.beginPath(); ctx.moveTo(2, y); ctx.lineTo(w - 2, y); ctx.stroke();
   }
-  // 总量虚线
+  // dashed line for the total
   if (total > 0) {
     ctx.setLineDash([4, 3]); ctx.strokeStyle = cDim;
     ctx.beginPath(); ctx.moveTo(2, Y(total)); ctx.lineTo(w - 2, Y(total)); ctx.stroke();
     ctx.setLineDash([]);
   }
-  // 累积曲线 + 填充（样本 >300 时步进抽稀）
+  // cumulative curve + fill (decimated by a step once there are >300 samples)
   if (samples.length > 1) {
     const step = Math.max(1, Math.floor(samples.length / 300));
     ctx.beginPath(); ctx.moveTo(X(0), Y(0));
@@ -233,7 +237,7 @@ function drawGraph(cv: HTMLCanvasElement, key: 'b' | 'i', total: number) {
     ctx.lineTo(X(samples[samples.length - 1].t), Y(0)); ctx.closePath();
     ctx.fillStyle = cAccent + '33'; ctx.fill();
   }
-  // now 竖线 + 预计完成虚线
+  // "now" vertical line + estimated-completion dashed line
   ctx.strokeStyle = cDim;
   ctx.beginPath(); ctx.moveTo(X(now), 4); ctx.lineTo(X(now), h - 4); ctx.stroke();
   if (etaMs > 0) {
@@ -243,7 +247,7 @@ function drawGraph(cv: HTMLCanvasElement, key: 'b' | 'i', total: number) {
   }
 }
 
-// ---------- 渲染 ----------
+// Render
 
 let lastReadout = 0;
 
@@ -252,15 +256,15 @@ function renderReadouts() {
   const paused = pausedSince > 0;
   if (summary) {
     const s = summary;
-    pctEl.textContent = s.cancelled ? '已停止' : `${Math.round(percent())}%`;
+    pctEl.textContent = s.cancelled ? 'Stopped' : `${Math.round(percent())}%`;
     pctEl.className = s.cancelled ? 'err' : (s.errors ? 'err' : 'ok');
     phaseEl.textContent = s.cancelled
-      ? `已取消 — ${s.done} 执行，${s.skipped} 跳过`
-      : `完成 — ${s.done} 执行，${s.skipped} 跳过，${s.errors} 错误 · ${hb(s.bytes_done ?? 0)} · ${ht(s.elapsed_ms ?? 0)}`;
+      ? `Cancelled — ${s.done} applied, ${s.skipped} skipped`
+      : `Done — ${s.done} applied, ${s.skipped} skipped, ${s.errors} errors · ${hb(s.bytes_done ?? 0)} · ${ht(s.elapsed_ms ?? 0)}`;
   } else if (running) {
     pctEl.textContent = applying ? `${Math.round(pct)}%` : '…';
     pctEl.className = paused ? 'paused' : '';
-    phaseEl.textContent = (paused ? '⏸ 已暂停 — ' : '') + (phase ? PHASE_LABEL[phase] : '');
+    phaseEl.textContent = (paused ? '⏸ Paused — ' : '') + (phase ? PHASE_LABEL[phase] : '');
   }
   $('ro-items-done').textContent = `${dones.items} / ${totals.items}`;
   $('ro-items-left').textContent = `${Math.max(0, totals.items - dones.items)}`;
@@ -271,22 +275,22 @@ function renderReadouts() {
   if (summary) {
     $('ro-eta').textContent = '—';
   } else if (r && totals.bytes > 0 && r.bps > 1) {
-    $('ro-eta').textContent = ht(Math.max(0, totals.bytes - dones.bytes) / r.bps * 1000) + ' 剩余';
+    $('ro-eta').textContent = ht(Math.max(0, totals.bytes - dones.bytes) / r.bps * 1000) + ' remaining';
   } else if (r && totals.items > 0 && r.ips > 0.01) {
-    $('ro-eta').textContent = ht(Math.max(0, totals.items - dones.items) / r.ips * 1000) + ' 剩余';
+    $('ro-eta').textContent = ht(Math.max(0, totals.items - dones.items) / r.ips * 1000) + ' remaining';
   } else {
-    $('ro-eta').textContent = '估算中…';
+    $('ro-eta').textContent = 'Estimating…';
   }
   const r4 = windowRate(4000);
   rateBytesEl.textContent = r4 ? `${(r4.bps / (1 << 20)).toFixed(2)} MiB/s` : '';
-  rateItemsEl.textContent = r4 ? `${r4.ips.toFixed(0)} 项/s` : '';
+  rateItemsEl.textContent = r4 ? `${r4.ips.toFixed(0)} items/s` : '';
   curfileEl.textContent = currentPath ? `‎${currentPath}` : '';
   curfileEl.title = currentPath;
 
-  // 窗题 + 任务栏（失败静默：mac 无任务栏进度）
+  // window title + taskbar (fails silently: macOS has no taskbar progress)
   const title = summary
-    ? (summary.cancelled ? '已停止 — SyncDash' : `完成 — SyncDash`)
-    : applying ? `${Math.round(pct)}% — SyncDash` : `${phase ? PHASE_LABEL[phase] : '运行'} — SyncDash`;
+    ? (summary.cancelled ? 'Stopped — SyncDash' : `Done — SyncDash`)
+    : applying ? `${Math.round(pct)}% — SyncDash` : `${phase ? PHASE_LABEL[phase] : 'Running'} — SyncDash`;
   win.setTitle(title).catch(() => {});
   if (summary) {
     win.setProgressBar({ status: ProgressBarStatus.None }).catch(() => {});
@@ -302,13 +306,15 @@ function renderErrors() {
   const ne = errors.filter((e) => !e.warning).length;
   const nw = errors.length - ne;
   errSec.classList.toggle('show', errors.length > 0);
-  cntErr.textContent = ne ? `${ne} 个错误` : '';
-  cntWarn.textContent = nw ? `${nw} 个提醒` : '';
+  cntErr.textContent = ne ? `${ne} errors` : '';
+  cntWarn.textContent = nw ? `${nw} warnings` : '';
   errList.innerHTML = '';
   for (const e of errors) {
     const d = document.createElement('div');
     d.className = 'erow' + (e.warning ? ' warn' : '');
-    d.innerHTML = `<span class="epath mono">${escapeHtml(e.path || e.action)}</span> <span class="emsg">[${e.action}/${e.side}] ${escapeHtml(e.message)}</span>`;
+    // narrative entries (kind=log) have no path/side — don't render an empty slot like "[scope/] msg"
+    const tag = e.side ? `[${e.action}/${e.side}] ` : `[${e.action}] `;
+    d.innerHTML = `<span class="epath mono">${escapeHtml(e.path)}</span> <span class="emsg">${tag}${escapeHtml(e.message)}</span>`;
     errList.appendChild(d);
   }
 }
@@ -317,7 +323,7 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 }
 
-// ---------- When finished 倒计时 ----------
+// When finished countdown
 
 let cdTimer: number | null = null;
 
@@ -329,11 +335,11 @@ function countdownStop() {
 function countdownStart(kind: string) {
   let left = 10;
   cdEl.classList.add('show');
-  cdText.textContent = `${left} 秒后${kind === 'sleep' ? '睡眠' : '关机'}`;
+  cdText.textContent = `${kind === 'sleep' ? 'Sleep' : 'Shut down'} in ${left}s`;
   cdFill.style.width = '100%';
   cdTimer = window.setInterval(() => {
     left -= 1;
-    cdText.textContent = `${left} 秒后${kind === 'sleep' ? '睡眠' : '关机'}`;
+    cdText.textContent = `${kind === 'sleep' ? 'Sleep' : 'Shut down'} in ${left}s`;
     cdFill.style.width = `${left * 10}%`;
     if (left <= 0) {
       countdownStop();
@@ -344,17 +350,17 @@ function countdownStart(kind: string) {
 
 $('cd-cancel').addEventListener('click', countdownStop);
 
-// ---------- 事件处理 ----------
+// Event handling
 
 function onEvent(ev: RunEv) {
-  if (ev.purpose === 'compare') return;     // compare 归主窗面板；本窗只演 apply
-  if (ev.run_id < runId) return;            // 已取消运行的迟到事件
+  if (ev.purpose === 'compare') return;     // compare belongs to the main-window panel; this window only shows apply
+  if (ev.run_id < runId) return;            // late event from an already-cancelled run
   if (ev.run_id > runId) resetRun(ev.run_id, ev.ts_ms);
 
   switch (ev.kind) {
     case 'phase_start': {
       const p = ev.phase!;
-      // 上一阶段的行画上勾
+      // tick off the previous phase's row
       if (phase && phase !== p) {
         const prev = stageRows.get(phase);
         if (prev) { prev.row.classList.remove('active'); prev.row.classList.add('done'); prev.ico.textContent = '✓'; }
@@ -381,7 +387,7 @@ function onEvent(ev: RunEv) {
       const r = stageRow(ev.phase!);
       const it = ev.items_total ?? 0, bt = ev.bytes_total ?? 0;
       r.detail.textContent =
-        `${ev.items_done ?? 0}${it ? ` / ${it}` : ''} 项 · ${hb(ev.bytes_done ?? 0)}${bt ? ` / ${hb(bt)}` : ''}`;
+        `${ev.items_done ?? 0}${it ? ` / ${it}` : ''} items · ${hb(ev.bytes_done ?? 0)}${bt ? ` / ${hb(bt)}` : ''}`;
       if (ev.phase === 'apply') {
         dones = { items: ev.items_done ?? 0, bytes: ev.bytes_done ?? 0 };
         totals = { items: ev.items_total ?? totals.items, bytes: ev.bytes_total ?? totals.bytes };
@@ -398,21 +404,32 @@ function onEvent(ev: RunEv) {
       });
       renderErrors();
       break;
+    // v0.10: pipeline narrative. info stays out of this panel (it would drown the real problems),
+    // only warn/error get in — they used to go to stderr only, which in a windowed build means never said at all.
+    case 'log':
+      if (ev.level === 'warn' || ev.level === 'error') {
+        errors.push({
+          path: '', action: ev.scope ?? 'log', side: '',
+          message: ev.message ?? '', warning: ev.level === 'warn',
+        });
+        renderErrors();
+      }
+      break;
     case 'paused':
       pausedSince = Date.now();
-      btnPause.textContent = '▶ 继续';
+      btnPause.textContent = '▶ Continue';
       break;
     case 'resumed':
       pausedSince = 0;
       pausedMs = ev.paused_ms ?? pausedMs;
-      btnPause.textContent = '⏸ 暂停';
+      btnPause.textContent = '⏸ Pause';
       break;
     case 'summary': {
       summary = ev;
       running = false;
       pausedSince = 0;
       pausedMs = ev.paused_ms ?? pausedMs;
-      // 终态时把 dones 顶到位（丢帧节流可能吞掉最后一条 Progress）
+      // push dones to completion in the final state (throttling can swallow the last Progress event)
       if (!ev.cancelled && (ev.errors ?? 0) === 0 && totals.bytes + totals.items > 0) {
         dones = { items: totals.items, bytes: totals.bytes };
         samples.push({ t: activeNow(), b: dones.bytes, i: dones.items });
@@ -435,24 +452,24 @@ function onEvent(ev: RunEv) {
   }
 }
 
-// ---------- 控件 ----------
+// Controls
 
 btnPause.addEventListener('click', async () => {
   const wantPause = pausedSince === 0;
-  btnPause.textContent = wantPause ? '▶ 继续' : '⏸ 暂停';   // 乐观切换，事件到达后校准
+  btnPause.textContent = wantPause ? '▶ Continue' : '⏸ Pause';   // optimistic toggle, corrected once the event arrives
   if (wantPause) pausedSince = Date.now(); else { pausedSince = 0; }
   await invoke('pause_run', { paused: wantPause }).catch(() => {});
 });
 
 btnStop.addEventListener('click', async () => {
-  btnStop.textContent = '正在停止…';
+  btnStop.textContent = 'Stopping…';
   btnStop.disabled = true;
-  // 卡在暂停里点停止：先放行，取消才能被检查点看见
+  // Stop pressed while paused: resume first, otherwise the cancel never reaches a checkpoint
   if (pausedSince) { pausedSince = 0; await invoke('pause_run', { paused: false }).catch(() => {}); }
   const had = await invoke<boolean>('cancel_run').catch(() => false);
   if (!had) {
-    // 没有活动运行（早已自然结束）——按钮不吊死在"正在停止…"
-    btnStop.textContent = '已结束';
+    // no active run (it already finished on its own) — don't leave the button stuck on "Stopping…"
+    btnStop.textContent = 'Finished';
   }
 });
 
@@ -463,29 +480,29 @@ chkAutoclose.addEventListener('change', () => localStorage.setItem('sd.autoclose
 selWfin.value = localStorage.getItem('sd.whenfin') ?? 'none';
 selWfin.addEventListener('change', () => localStorage.setItem('sd.whenfin', selWfin.value));
 
-// 关闭钮 = FFS 语义：运行中先协作取消，Summary 到了再走
+// Close button = FFS semantics: while running, cooperatively cancel first and leave once Summary arrives
 win.onCloseRequested(async (e) => {
   if (running && !summary) {
     e.preventDefault();
     closeAfterStop = true;
-    btnStop.textContent = '正在停止…';
+    btnStop.textContent = 'Stopping…';
     btnStop.disabled = true;
     if (pausedSince) { pausedSince = 0; await invoke('pause_run', { paused: false }).catch(() => {}); }
     const had = await invoke<boolean>('cancel_run').catch(() => false);
     if (!had) {
-      // 引擎侧已无运行（Summary 丢失/早已结束）——直接放行关闭，绝不让窗口关不掉
+      // nothing running on the engine side (Summary lost / already finished) — let the close through; never leave the window unclosable
       running = false;
       win.destroy().catch(() => {});
     }
   }
 });
 
-// ---------- 初始化 ----------
+// Init
 
 (async function init() {
   if (navigator.userAgent.includes('Macintosh')) document.body.classList.add('mac');
   await listen<RunEv>('run-progress', (e) => onEvent(e.payload));
-  // 100ms 重绘节拍；数字读数 500ms 一跳（FFS 同款分频）
+  // 100ms redraw tick; the numeric readouts step every 500ms (same divider as FFS)
   setInterval(() => {
     if (runId < 0) return;
     if (applying) {

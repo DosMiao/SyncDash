@@ -1,4 +1,4 @@
-/* SyncDash — FFS 形态的暗色主题 v2 */
+/* SyncDash — dark theme in the FFS shape, v2 */
 :root {
   --bg: #14161b;
   --panel: #1b1e25;
@@ -35,7 +35,7 @@ body {
 
 #app { display: grid; grid-template-columns: 232px 1fr; }
 
-/* mac 沉浸式标题栏：顶部拖拽条 + 给红绿灯让位 */
+/* macOS immersive title bar: top drag strip + room for the traffic lights */
 #dragstrip { display: none; }
 body.mac #dragstrip {
   display: block;
@@ -130,7 +130,7 @@ body.mac .brand { padding-left: 62px; padding-top: 10px; }
 
 .pathline { padding: 6px 14px; border-bottom: 1px solid var(--border); font-size: 11px; }
 
-/* ---- 筛选条：搜索 + chips（GitDash 风格，带计数，0 变淡） ---- */
+/* ---- Filter bar: search + chips (GitDash style, with counts, dimmed at 0) ---- */
 #filterbar {
   display: flex;
   align-items: center;
@@ -180,7 +180,9 @@ thead th {
   white-space: nowrap;
 }
 tbody td { padding: 4px 10px; border-bottom: 1px solid #1e222a; }
-tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.015); }
+/* Zebra striping is applied by JS as .alt using the real row index: under virtual scrolling
+   :nth-child counts "which row in the window", so the whole pattern flips on every scroll */
+tbody tr.alt { background: rgba(255, 255, 255, 0.015); }
 tbody tr:hover { background: var(--panel2); }
 tbody tr.off { opacity: 0.4; }
 tbody tr.flip td { background: rgba(58, 143, 217, 0.06); }
@@ -223,7 +225,7 @@ tr.flip .badge { border-style: dashed; }
 #status.err { color: var(--red); }
 #status.ok { color: var(--green); }
 
-/* ---- 确认弹层 ---- */
+/* ---- Confirmation overlay ---- */
 #modal {
   position: fixed;
   inset: 0;
@@ -256,7 +258,7 @@ tr.flip .badge { border-style: dashed; }
 .mrow.warn b { color: var(--accent); }
 .btnrow { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
 
-/* ---- M3: Overview 聚合竖栏（FFS 同款，可折叠） + 图标统计条 ---- */
+/* ---- M3: Overview aggregation column (same as FFS, collapsible) + icon stat bar ---- */
 #reviewrow { flex: 1; display: flex; min-height: 0; }
 #overview { width: 232px; background: var(--panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
 #overview.collapsed { width: 26px; }
@@ -287,7 +289,7 @@ tr.flip .badge { border-style: dashed; }
 .st.s-conf b { color: var(--purple); }
 .rbadge { font-size: 9px; padding: 1px 5px; border-radius: 6px; background: var(--panel3); color: var(--accent); border: 1px solid var(--accent); }
 
-/* ---- M4: 上次同步 + 运行日志 ---- */
+/* ---- M4: last sync + run log ---- */
 .job { flex-direction: column; align-items: stretch; gap: 2px; }
 .jrow1 { display: flex; align-items: center; gap: 6px; }
 .jrow1 .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -297,17 +299,36 @@ tr.flip .badge { border-style: dashed; }
 .jrow2 .dot.warn { color: var(--orange); }
 .jrow2 .dot.err { color: var(--red); }
 .jrow2.stale { color: var(--red); opacity: 0.8; }
-#logmodal { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; z-index: 90; }
-.logsheet { width: 680px; max-width: 92vw; max-height: 74vh; display: flex; flex-direction: column; }
-#log-list { overflow-y: auto; max-height: 50vh; margin: 8px 0; }
-.logrow { display: grid; grid-template-columns: 84px 1fr 92px 150px 90px; gap: 8px; padding: 6px 8px; border-radius: 5px; cursor: pointer; font-size: 12px; font-variant-numeric: tabular-nums; align-items: center; }
-.logrow:hover { background: var(--panel2); }
-.logrow .dot { font-size: 9px; }
-.logrow .k { color: var(--dim); font-size: 10px; }
-#log-detail { max-height: 50vh; overflow: auto; font-size: 11px; background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin: 8px 0; white-space: pre-wrap; word-break: break-all; }
 .logempty { color: var(--dim); padding: 18px; text-align: center; }
 
-/* ---- M5: 任务编辑器 + M6 watch ---- */
+/* ---- v0.10: log console embedded in the main window (same shape as #cmp-panel, not a modal) ---- */
+#logpanel { flex: none; height: 38vh; min-height: 180px; display: flex; flex-direction: column;
+  border-top: 1px solid var(--border); background: var(--panel); }
+.lp-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.lp-title { font-size: 12px; color: var(--dim); letter-spacing: 1px; }
+.lp-head select { max-width: 320px; font-size: 11px; }
+.lp-head input { flex: 0 1 200px; font-size: 11px; }
+.lp-head .spacer { flex: 1; }
+.lp-pills { display: flex; gap: 3px; }
+.lp-pill { background: none; border: 1px solid var(--border); color: var(--dim); border-radius: 4px;
+  padding: 2px 9px; font-size: 11px; cursor: pointer; }
+.lp-pill:hover { background: var(--panel2); }
+.lp-pill.on { background: var(--panel2); color: var(--fg); border-color: var(--dim); }
+.lp-pill.lv-warn.on { color: var(--orange); border-color: var(--orange); }
+.lp-pill.lv-error.on { color: var(--red); border-color: var(--red); }
+#lp-body { flex: 1; overflow: auto; font-family: var(--mono, monospace); font-size: 11px; }
+.lp-row { display: grid; grid-template-columns: 84px 40px 66px 1fr; gap: 8px; padding: 2px 10px;
+  align-items: baseline; font-variant-numeric: tabular-nums; }
+.lp-row:hover { background: var(--panel2); }
+.lp-row .lp-t, .lp-row .lp-s { color: var(--dim); }
+.lp-row .lp-m { white-space: pre-wrap; word-break: break-all; }
+.lp-row.lv-warn .lp-l, .lp-row.lv-warn .lp-m { color: var(--orange); }
+.lp-row.lv-error .lp-l, .lp-row.lv-error .lp-m { color: var(--red); }
+.setsheet { width: 620px; max-width: 92vw; max-height: 82vh; display: flex; flex-direction: column; }
+#set-form { overflow-y: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; padding: 8px 2px; }
+#set-note { color: var(--dim); padding: 6px 2px; }
+
+/* ---- M5: job editor + M6 watch ---- */
 .newjob { margin: 0 2px; }
 .jedit { background: none; border: none; color: var(--dim); cursor: pointer; font-size: 11px; padding: 0 2px; flex: none; }
 .jedit:hover { color: var(--accent); }
@@ -327,8 +348,8 @@ tr.flip .badge { border-style: dashed; }
 .btn.danger:hover { background: rgba(217,58,58,0.12); }
 #btn-watch.on { background: var(--green); border-color: var(--green); color: #fff; }
 
-/* ---- M2 进度子窗口（原 progress.html 内联块外移：Tauri 注入 CSP nonce 后
-       'unsafe-inline' 失效，内联 <style> 会被整块拦掉 → 白屏） ---- */
+/* ---- M2 progress sub-window (moved out of the inline block in progress.html: once Tauri injects
+       a CSP nonce, 'unsafe-inline' stops applying and inline <style> is blocked wholesale → blank screen) ---- */
 #pwin { display: flex; flex-direction: column; height: 100vh; padding: 12px 14px; gap: 8px; }
 #phead { display: flex; align-items: baseline; gap: 10px; }
 #pjob { font-size: 15px; font-weight: 600; }
@@ -383,18 +404,18 @@ tr.flip .badge { border-style: dashed; }
 #cdfill { height: 100%; background: var(--orange); width: 100%; transition: width 1s linear; }
 .spacer { flex: 1; }
 
-/* ---- 左右双路径列 + 显示模式切换 ---- */
+/* ---- Dual left/right path columns + display mode toggle ---- */
 td.c-path { max-width: 330px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #btn-pathmode { margin-left: auto; flex: none; padding: 4px 10px; font-size: 12px; }
 
-/* ---- v0.9.1: 主窗内嵌 compare 进度面板 ---- */
+/* ---- v0.9.1: compare progress panel embedded in the main window ---- */
 #cmp-panel { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; }
 #cmp-panel .cmp-title { color: var(--dim); font-size: 13px; letter-spacing: 1px; }
 #cmp-rows { display: flex; flex-direction: column; gap: 8px; width: min(560px, 82%); }
 #cmp-rows .stagerow { background: var(--panel); }
 #cmp-panel .btn { padding: 5px 16px; font-size: 12px; }
 
-/* ---- 树状分组显示（FFS 分组行语义） ---- */
+/* ---- Tree grouping display (FFS group-row semantics) ---- */
 tr.grp { background: var(--panel2); cursor: pointer; user-select: none; }
 tr.grp:hover { background: var(--panel3); }
 tr.grp td { padding: 5px 8px; border-top: 1px solid var(--border); font-size: 12px; }
@@ -408,7 +429,7 @@ tr.ingrp td.c-path:first-of-type { padding-left: 26px; }
 #btn-fold.hidden ~ #btn-group { margin-left: auto; }
 #btn-pathmode { margin-left: 0; }
 
-/* ---- compare 面板 v2：定宽网格 + 进度条 + 百分比（防整行跳变） ---- */
+/* ---- Compare panel v2: fixed-width grid + progress bar + percentage (keeps whole rows from jumping) ---- */
 #cmp-rows { width: min(780px, 92%); }
 #cmp-rows .stagerow.cmp2 { display: grid; grid-template-columns: 18px 104px 1fr 46px 128px 172px 84px; align-items: center; gap: 8px; }
 .cmp2 .st-bar { height: 5px; background: var(--panel3); border-radius: 3px; overflow: hidden; }
@@ -417,19 +438,19 @@ tr.ingrp td.c-path:first-of-type { padding-left: 26px; }
 .cmp2 .st-pct { text-align: right; font-variant-numeric: tabular-nums; }
 .cmp2 .st-items, .cmp2 .st-bytes, .cmp2 .st-rate { text-align: right; font-variant-numeric: tabular-nums; color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; }
 
-/* ---- P1：工具栏两行按钮 / 齿轮 / 交换 ---- */
+/* ---- P1: two-line toolbar buttons / cog / swap ---- */
 .btn.two { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; padding: 5px 16px; line-height: 1.2; }
 .btn.two .l1 { font-size: 13px; }
 .btn.two .l2 { font-size: 10px; opacity: 0.75; font-weight: 400; }
 .btn.cog { padding: 7px 9px; font-size: 13px; flex: none; }
 
-/* ---- P1：状态栏撤销 ---- */
+/* ---- P1: status bar undo ---- */
 #status { display: flex; align-items: center; gap: 12px; }
 #statusmsg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; min-width: 0; }
 .linkbtn { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 12px; text-decoration: underline; padding: 0; flex: none; }
 .linkbtn:hover { filter: brightness(1.3); }
 
-/* ---- P1：编辑器路径行（浏览 / 交换 / 拖放 / 体检） ---- */
+/* ---- P1: editor path row (browse / swap / drag-drop / health check) ---- */
 .pathrow { display: flex; gap: 6px; align-items: stretch; }
 .pathrow input[type="text"] { flex: 1; min-width: 0; }
 .pbtn { background: var(--panel3); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 0 10px; cursor: pointer; font-size: 13px; flex: none; }
@@ -441,7 +462,7 @@ tr.ingrp td.c-path:first-of-type { padding-left: 26px; }
 .ed-verdict .vwarn { color: var(--orange); }
 .ed-verdict .vok { color: var(--green); opacity: 0.85; }
 
-/* ---- P1：右键菜单（定位由 JS 走 CSSOM 赋值——CSP nonce 下 style="" 会被拦） ---- */
+/* ---- P1: context menu (positioned by JS through the CSSOM — under a CSP nonce, style="" is blocked) ---- */
 #ctxmenu {
   position: fixed; z-index: 120; min-width: 208px; padding: 4px 0;
   background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
@@ -454,7 +475,7 @@ tr.ingrp td.c-path:first-of-type { padding-left: 26px; }
 .ctxitem.danger { color: var(--red); }
 .ctxsep { height: 1px; background: var(--border); margin: 4px 0; }
 
-/* ---- P2：双侧 size/时间列 + 表头排序 + 状态条计数 ---- */
+/* ---- P2: size/time columns on both sides + sortable headers + status bar counts ---- */
 .c-meta { width: 138px; text-align: right; white-space: nowrap; }
 td.c-meta { color: var(--dim); font-size: 11px; }
 td.c-meta.newer { color: var(--green); }
@@ -464,7 +485,7 @@ th .sortable.on { color: var(--accent); }
 th .sortable::after { content: attr(data-dir); font-size: 9px; margin-left: 2px; }
 .counts { margin-left: auto; color: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
 
-/* ---- P3：漏斗面板（定位由 JS 走 CSSOM 赋值） ---- */
+/* ---- P3: funnel panel (positioned by JS through the CSSOM) ---- */
 #btn-funnel { flex: none; padding: 4px 10px; font-size: 12px; }
 #btn-funnel.on { border-color: var(--green); color: var(--green); }
 #funnelpop {
@@ -488,7 +509,7 @@ th .sortable::after { content: attr(data-dir); font-size: 9px; margin-left: 2px;
 .fp-btns { display: flex; gap: 8px; justify-content: flex-end; padding-top: 4px; }
 .fp-btns .btn { padding: 5px 12px; font-size: 12px; }
 
-/* ---- P4：相同项面板 / 导出 ---- */
+/* ---- P4: identical-items panel / export ---- */
 #btn-same, #btn-csv { flex: none; padding: 4px 10px; font-size: 12px; }
 #btn-same.on { border-color: var(--green); color: var(--green); }
 #samepanel { display: flex; flex-direction: column; height: 100%; }
@@ -503,3 +524,63 @@ th .sortable::after { content: attr(data-dir); font-size: 9px; margin-left: 2px;
 #sametable tr:hover { background: var(--panel2); }
 #sametable td.c-meta.drift { color: var(--orange); }
 #sp-more { margin: 10px auto; padding: 5px 20px; font-size: 12px; }
+
+/* ---- 1:N target selector ---- */
+#pathline { display: flex; flex-direction: column; gap: 5px; }
+#target-sel { flex: none; max-width: 46%; background: var(--panel2); color: var(--text); border: 1px solid var(--accent); border-radius: 4px; padding: 2px 6px; font-size: 11px; font-family: inherit; }
+
+/* ---- Editable roots in the main view (same as the FFS main window: the paths are right there, Enter writes them back) ---- */
+.pathline { padding: 7px 14px; }
+.prow { display: flex; align-items: center; gap: 6px; }
+.prow .plabel { color: var(--dim); font-size: 10px; flex: none; text-transform: uppercase; letter-spacing: 0.4px; }
+.prow input[type="text"] {
+  flex: 1; min-width: 0; background: var(--panel2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 5px; padding: 4px 8px; font-size: 11px; outline: none;
+}
+.prow input[type="text"]:focus { border-color: var(--accent); }
+.prow input.good { border-color: rgba(53,176,74,0.45); }
+.prow input.bad { border-color: var(--red); }
+.prow input.dropon { border-color: var(--accent); background: rgba(58,143,217,0.12); }
+.prow input:disabled { opacity: 0.5; }
+.prow .pbtn { padding: 3px 8px; font-size: 12px; }
+.pwarn { display: flex; flex-direction: column; gap: 1px; font-size: 10px; padding-left: 2px; }
+.pwarn .vwarn { color: var(--orange); }
+.pwarn .vok { color: var(--green); opacity: 0.8; }
+
+/* ---- Config overview in the main view: clicking a pill jumps to that group in the editor ---- */
+.cfgline { display: flex; flex-wrap: wrap; gap: 6px; }
+.cfgpill {
+  display: inline-flex; align-items: baseline; gap: 5px; padding: 2px 9px;
+  background: transparent; border: 1px solid var(--border); border-radius: 10px;
+  color: var(--text); font-size: 10px; font-family: inherit; cursor: pointer; transition: border-color 0.12s;
+}
+.cfgpill:hover { border-color: var(--accent); }
+.cfgpill .ck { color: var(--dim); }
+.cfgpill .cv { font-variant-numeric: tabular-nums; }
+
+/* ---- Apply button: the large text is the mode, the action drops to small text ---- */
+.btn.two.mode-btn .l1 { font-size: 15px; font-weight: 600; letter-spacing: 1.2px; }
+.btn.two.mode-btn .l2 { opacity: 0.9; }
+.btn.accent .l1.m-mirror, .btn.accent .l1.m-sync, .btn.accent .l1.m-enrich { color: #fff; }
+.btn.accent:disabled .l1 { color: var(--dim); }
+
+/* ---- Virtual scrolling for the difference table ----
+   Only the screenful of rows in the viewport is mounted; spacer rows above and below stretch the scrollbar to the real height.
+   That requires equal row heights and column widths independent of "which rows are mounted", so the layout is pinned here:
+   auto layout recomputes widths from the visible content, and the whole table's columns jump on every scroll. */
+#plantable { table-layout: fixed; }
+#plantable col.w-chk { width: 34px; }
+#plantable col.w-act { width: 178px; }   /* sized for the "action (click a badge to flip direction)" header; the badge itself only needs 96px */
+#plantable col.w-meta { width: 152px; }  /* the width of "894.0 MB · 07-26 16:51" */
+#plantable col.w-reason { width: 210px; }
+/* w-path gets no width: the two columns split the remaining space evenly (FFS two-column semantics — symmetric by design).
+   Note that td.c-path's max-width:330px does not take part in width computation under fixed layout; that rule is for #sametable. */
+
+/* Row height must stay constant — a wrap in any column throws off the precomputed height and rows drift out of place.
+   Under fixed layout, overflow is not clipped automatically and smears into the neighbouring column, so every column clips itself. */
+#plantable td.reason, #plantable tr.grp td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#plantable thead th { overflow: hidden; text-overflow: ellipsis; }
+
+/* Spacer rows only hold height: no borders, padding, zebra stripes, or hover colour */
+#plantable tr.vspacer, #plantable tr.vspacer:hover { background: none; }
+#plantable tr.vspacer td { padding: 0; border: 0; }
