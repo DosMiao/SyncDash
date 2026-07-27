@@ -1,6 +1,6 @@
 /target
 *.jsonl
-.docs
+.libs
 node_modules/
 # dist/ 特意提交进 git：Mac 没有 node，Tauri 编译期直接嵌入这份预构建前端
 src-tauri/gen/
