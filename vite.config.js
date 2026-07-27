@@ -17,6 +17,14 @@ export default defineConfig({
         // v0.9 M2: standalone progress sub-window (same as FFS) — the second entry point
         progress: fileURLToPath(new URL('./progress.html', import.meta.url)),
       },
+      // No content hash in filenames: dist/ is committed, and a hash would turn every
+      // frontend edit into an add/delete pair plus an index.html churn. Cache busting buys
+      // nothing here — Tauri serves these from the binary over tauri://, not over HTTP.
+      output: {
+        entryFileNames: 'assets/[name].js',
+        chunkFileNames: 'assets/[name].js',
+        assetFileNames: 'assets/[name].[ext]',
+      },
     },
   },
 });
