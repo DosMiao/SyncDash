@@ -82,6 +82,21 @@ impl std::error::Error for VfsError {
 impl From<std::io::Error> for VfsError {
     fn from(e: std::io::Error) -> VfsError {
         use std::io::ErrorKind as K;
+        // Windows raw codes that std leaves as `Uncategorized` — measured, not assumed:
+        // a file held with share_mode(0) (what Word, Excel, Outlook and a running .exe do)
+        // fails delete, rename *and* read with kind()==Uncategorized, raw 32. Left in the
+        // default arm it lands in `Io`, i.e. "a real local failure"; it is in fact the most
+        // common transient condition on Windows and succeeds on the next run. 1314 is the
+        // symlink privilege, which is not transient but is a specific, actionable refusal.
+        #[cfg(windows)]
+        if let Some((kind, hint)) = match e.raw_os_error() {
+            Some(32) => Some((VfsErrorKind::Transient, "file is open in another program (sharing violation); it will be retried on the next run")),
+            Some(33) => Some((VfsErrorKind::Transient, "a byte range of the file is locked by another program; it will be retried on the next run")),
+            Some(1314) => Some((VfsErrorKind::PermissionDenied, "creating symlinks needs Windows Developer Mode or an elevated process (SeCreateSymbolicLinkPrivilege)")),
+            _ => None,
+        } {
+            return VfsError { kind, detail: format!("{e} — {hint}"), source: Some(Box::new(e)) };
+        }
         let kind = match e.kind() {
             K::NotFound => VfsErrorKind::NotFound,
             K::PermissionDenied => VfsErrorKind::PermissionDenied,
@@ -143,6 +158,29 @@ mod tests {
         assert_eq!(io.kind(), std::io::ErrorKind::Interrupted);
         let v2: VfsError = std::io::Error::new(std::io::ErrorKind::Interrupted, "stop").into();
         assert_eq!(v2.kind, VfsErrorKind::Cancelled);
+    }
+
+    /// The single most common Windows sync failure: an open Office document / running binary.
+    /// std hands it back as `Uncategorized`, so only the raw code identifies it.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_held_open_by_another_program_is_transient_not_io() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = std::env::temp_dir().join(format!("syncdash-share-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("locked.txt");
+        std::fs::write(&p, b"data").unwrap();
+        let _hold = std::fs::OpenOptions::new().read(true).share_mode(0).open(&p).unwrap();
+
+        let io = std::fs::remove_file(&p).expect_err("an exclusively-held file cannot be deleted");
+        assert_eq!(io.raw_os_error(), Some(32), "premise: ERROR_SHARING_VIOLATION");
+        assert_ne!(io.kind(), std::io::ErrorKind::PermissionDenied, "premise: std does not classify it");
+        let v: VfsError = io.into();
+        assert_eq!(v.kind, VfsErrorKind::Transient);
+        assert!(v.detail.contains("another program"), "{}", v.detail);
+
+        drop(_hold);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

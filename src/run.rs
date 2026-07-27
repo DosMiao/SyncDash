@@ -128,6 +128,13 @@ pub fn describe_root(phrase: &str) -> std::io::Result<String> {
     let _ = writeln!(out, "protocol:  {}", c.protocol);
     let _ = writeln!(out, "local lane: {}", if v.as_local().is_some() { "yes (fast path)" } else { "no (generic VFS lane)" });
     let _ = writeln!(out, "mtime precision: {} ms", c.mtime_precision_ms);
+    let _ = writeln!(out, "name rules: {}{}", c.name_rules.as_str(), match c.name_rules {
+        crate::fs::vfs::NameRules::Windows =>
+            "  (no <>:\"|?*, no trailing dot or space, no reserved device names — such paths are refused at plan time)",
+        crate::fs::vfs::NameRules::Posix => "",
+        crate::fs::vfs::NameRules::Unknown =>
+            "  (this protocol does not reveal the server's OS — risky names are warned about, not refused)",
+    });
     let cap = |s: crate::fs::vfs::Support| match s {
         crate::fs::vfs::Support::Yes => "yes",
         crate::fs::vfs::Support::No => "NO",

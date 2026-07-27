@@ -576,6 +576,7 @@ fn scan_vfs(
                 } else {
                     "full".into()
                 },
+                name_rules: caps.name_rules.as_str().into(),
                 degraded: Vec::new(),
             }),
         },

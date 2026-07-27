@@ -39,6 +39,11 @@ pub struct VfsNote {
     pub mtime_precision_ms: u32,
     /// "none" | "sampled" | "full" — what the scan really did (post-preflight)
     pub evidence_effective: String,
+    /// "windows" | "posix" | "unknown" — the naming rules writes to this root must satisfy.
+    /// `Header.os` cannot answer this for a VFS root: it carries the protocol name there, and
+    /// even when it carries an OS it is the *scanning* machine's, not the root's.
+    #[serde(default)]
+    pub name_rules: String,
     /// Capabilities explicitly degraded for this run (human-readable lines from the preflight report)
     #[serde(default)]
     pub degraded: Vec<String>,

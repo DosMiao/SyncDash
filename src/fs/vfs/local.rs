@@ -186,6 +186,9 @@ impl Vfs for LocalVfs {
             read_back: Support::Yes,
             local_trash: true,
             case_sensitivity: CaseSense::Unknown,
+            // Whatever this process's own path layer enforces. SMB inherits this deliberately:
+            // a Windows client gets Win32 name parsing even when the share is served by Samba.
+            name_rules: super::NameRules::host(),
             max_parallel_streams: 16,
         }
     }
@@ -266,7 +269,8 @@ impl Vfs for LocalVfs {
     }
 
     fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
-        Ok(std::fs::rename(self.abs(from_rel), self.abs(to_rel))?)
+        // force: an SMB server mapping unix modes can refuse to move a read-only source
+        Ok(crate::fs::rename_force(&self.abs(from_rel), &self.abs(to_rel))?)
     }
 
     fn remove_file(&self, rel: &str) -> VfsResult<()> {
@@ -275,7 +279,9 @@ impl Vfs for LocalVfs {
     }
 
     fn remove_dir(&self, rel: &str) -> VfsResult<()> {
-        Ok(std::fs::remove_dir(self.abs(rel))?)
+        // force: a directory carrying the Windows read-only attribute is refused by
+        // RemoveDirectory just as a read-only file is refused by DeleteFile
+        Ok(crate::fs::remove_dir_force(&self.abs(rel))?)
     }
 
     fn set_mtime(&self, rel: &str, mtime_ms: i64) -> VfsResult<()> {

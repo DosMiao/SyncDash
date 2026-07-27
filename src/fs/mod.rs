@@ -39,6 +39,30 @@ pub fn remove_file_force(p: &Path) -> std::io::Result<()> {
     }
 }
 
+/// `remove_dir`, clearing the read-only attribute on a PermissionDenied retry.
+///
+/// The directory half of [`remove_file_force`], and it is a distinct case: on Windows the
+/// read-only attribute on a *directory* is nominally a "this folder is customized" flag, but
+/// `RemoveDirectory` still refuses it. Measured on Win11 26200: `remove_dir` over an empty
+/// directory carrying the attribute fails with `PermissionDenied` (os error 5), the same
+/// wording users saw on the read-only file case.
+///
+/// (`std::fs::remove_dir_all` needs no such helper — it clears the attribute itself, verified
+/// over a tree holding both a read-only file and a read-only directory.)
+pub fn remove_dir_force(p: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let Ok(md) = std::fs::symlink_metadata(p) else { return Err(e) };
+            let mut perms = md.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(p, perms)?;
+            std::fs::remove_dir(p)
+        }
+        r => r,
+    }
+}
+
 /// `rename`, with the same read-only-clearing retry on the source (NTFS moves
 /// read-only files fine, but an SMB server mapping unix modes may refuse).
 pub fn rename_force(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -56,5 +80,64 @@ pub fn rename_force(from: &Path, to: &Path) -> std::io::Result<()> {
             }
         }
         r => r,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set_ro(p: &Path, ro: bool) {
+        let mut perms = std::fs::metadata(p).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(ro);
+        std::fs::set_permissions(p, perms).unwrap();
+    }
+
+    /// The directory counterpart of the read-only file failure. On Windows the retry really
+    /// fires (plain `remove_dir` returns os error 5 here); on unix the first call already
+    /// succeeds, so this asserts the behavior rather than the mechanism on both.
+    #[test]
+    fn a_read_only_directory_can_still_be_removed() {
+        let base = std::env::temp_dir().join(format!("syncdash-rodir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let d = base.join("locked-dir");
+        std::fs::create_dir_all(&d).unwrap();
+        set_ro(&d, true);
+
+        #[cfg(windows)]
+        {
+            let e = std::fs::remove_dir(&d).expect_err("premise: Windows refuses a read-only directory");
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        remove_dir_force(&d).expect("force removal must succeed");
+        assert!(!d.exists());
+
+        // A non-empty directory must still report NotEmpty rather than being force-emptied
+        let full = base.join("full");
+        std::fs::create_dir_all(&full).unwrap();
+        std::fs::write(full.join("x"), b"x").unwrap();
+        assert!(remove_dir_force(&full).is_err(), "force must not turn into a recursive delete");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The read-only file case, at the primitive level (the apply-lane regression test covers
+    /// the same ground end to end through trash and versioning).
+    #[test]
+    fn a_read_only_file_can_still_be_removed_and_renamed() {
+        let base = std::env::temp_dir().join(format!("syncdash-rofile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let a = base.join("a.txt");
+        std::fs::write(&a, b"git-loose-object").unwrap();
+        set_ro(&a, true);
+        let moved = base.join("b.txt");
+        rename_force(&a, &moved).expect("rename must survive the read-only source");
+        remove_file_force(&moved).expect("removal must survive the read-only attribute");
+        assert!(!moved.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

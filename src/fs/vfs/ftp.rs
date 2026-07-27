@@ -201,6 +201,8 @@ impl Vfs for FtpBackend {
             read_back: Support::Yes, // a full re-download — honest, and verify's cost on this backend
             local_trash: false,
             case_sensitivity: CaseSense::Unknown,
+            // SYST hints at the server OS but lies often enough not to be evidence.
+            name_rules: super::NameRules::Unknown,
             max_parallel_streams: 1, // one control connection, operations serialize
         }
     }

@@ -91,6 +91,46 @@ pub enum CaseSense {
     Unknown,
 }
 
+/// Which naming rules a write to this root is subject to.
+///
+/// **This is a property of the path layer the write travels through, not of the far machine.**
+/// A Windows client writing to a Linux Samba box still gets Win32 parsing — `a:b` turns into an
+/// alternate-data-stream write on the client side before a single packet leaves. So the SMB
+/// backend, which delegates through the local OS, reports the *client's* rules, while SFTP and
+/// FTP speak their own path syntax to a server whose OS we cannot see and report `Unknown`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameRules {
+    /// Reserved device names; no `< > : " | ? *`; no trailing dot or space.
+    Windows,
+    /// Anything except `/` and NUL.
+    Posix,
+    /// Not knowable from here. The engine warns instead of refusing, and says which.
+    Unknown,
+}
+
+impl NameRules {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NameRules::Windows => "windows",
+            NameRules::Posix => "posix",
+            NameRules::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(s: &str) -> NameRules {
+        match s {
+            "windows" => NameRules::Windows,
+            "posix" => NameRules::Posix,
+            _ => NameRules::Unknown,
+        }
+    }
+
+    /// What a root reached through this process's own path layer is subject to.
+    pub fn host() -> NameRules {
+        if cfg!(windows) { NameRules::Windows } else { NameRules::Posix }
+    }
+}
+
 /// What a backend can do. Authoritative only after `connect()` — FTP learns MFMT/MLSD
 /// from FEAT, SFTP learns fsync@openssh.com from the extension list.
 #[derive(Clone, Debug)]
@@ -120,6 +160,9 @@ pub struct VfsCaps {
     /// root's preserve area is a rename inside the root instead).
     pub local_trash: bool,
     pub case_sensitivity: CaseSense,
+    /// Naming rules writes to this root must satisfy. Drives the plan-time legality
+    /// preflight; `Unknown` downgrades that from a refusal to a visible warning.
+    pub name_rules: NameRules,
     /// Ceiling for concurrent streams the backend is comfortable with (pool width,
     /// scan hash width, apply copy width all clamp to it).
     pub max_parallel_streams: usize,

@@ -267,6 +267,8 @@ impl Vfs for SftpBackend {
             read_back: Support::Yes,
             local_trash: false,
             case_sensitivity: CaseSense::Unknown,
+            // The server may well be Windows OpenSSH; the banner does not prove it either way.
+            name_rules: super::NameRules::Unknown,
             max_parallel_streams: 4,
         }
     }

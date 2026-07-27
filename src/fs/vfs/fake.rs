@@ -51,6 +51,9 @@ struct Knobs {
     latency_ms: u64,
     precision_ms: u32,
     insens: bool,
+    /// Report Windows naming rules, so the plan-time legality preflight can be exercised
+    /// from a unix test run.
+    win_names: bool,
     no_ranged_read: bool,
     no_set_mtime: bool,
     no_fsync: bool,
@@ -72,6 +75,7 @@ impl Default for Knobs {
             latency_ms: 0,
             precision_ms: 1,
             insens: false,
+            win_names: false,
             no_ranged_read: false,
             no_set_mtime: false,
             no_fsync: false,
@@ -142,6 +146,7 @@ impl FakeVfs {
                 "latency_ms" => k.latency_ms = val.parse().unwrap_or(0),
                 "precision_ms" => k.precision_ms = val.parse().unwrap_or(1).max(1),
                 "insens" => k.insens = true,
+                "win_names" => k.win_names = true,
                 "no_ranged_read" => k.no_ranged_read = true,
                 "no_set_mtime" => k.no_set_mtime = true,
                 "no_fsync" => k.no_fsync = true,
@@ -440,6 +445,7 @@ impl Vfs for FakeVfs {
             read_back: no(k.no_read_back),
             local_trash: false,
             case_sensitivity: if k.insens { CaseSense::Insensitive } else { CaseSense::Sensitive },
+            name_rules: if k.win_names { super::NameRules::Windows } else { super::NameRules::Posix },
             max_parallel_streams: k.streams,
         }
     }

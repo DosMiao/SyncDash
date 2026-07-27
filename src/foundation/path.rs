@@ -56,11 +56,20 @@ pub fn sep_of(root: &str) -> char {
 ///
 /// For unpacking and other "the plan came from the far side" cases: rejects absolute paths, drive
 /// letters, `..` traversal and empty segments.
+///
+/// **Segments are split on `\` as well as `/`, and that is the whole point.** A rel is
+/// nominally `/`-separated, but `to_native` turns it into a Windows path and `Path::join`
+/// then honors `\` as a separator too — so splitting on `/` alone let `..\..\x` through as
+/// one innocent-looking segment and wrote outside the root. Measured, not theorized:
+/// `is_safe_rel(r"..\SIBLING.txt")` returned true and the write landed in the root's parent.
+/// Splitting on both separators costs nothing on unix, where a backslash is an ordinary
+/// filename character: `my\file.txt` still passes, because neither segment is `..`.
 pub fn is_safe_rel(rel: &str) -> bool {
     !rel.is_empty()
         && !rel.starts_with('/')
+        && !rel.starts_with('\\')
         && !rel.contains(':')
-        && !rel.split('/').any(|seg| seg == ".." || seg.is_empty())
+        && rel.split(['/', '\\']).all(|seg| !seg.is_empty() && seg != ".." && seg != ".")
 }
 
 #[cfg(test)]
@@ -94,6 +103,20 @@ mod tests {
         assert!(!is_safe_rel("a/../../etc"), "traversal");
         assert!(!is_safe_rel("a//b"), "empty segment");
         assert!(!is_safe_rel(".."));
+    }
+
+    #[test]
+    fn backslash_traversal_is_refused() {
+        // Verified escape before the fix: each of these passed the `/`-only split, and on Windows
+        // `join_native` then wrote the file outside the sync root.
+        assert!(!is_safe_rel(r"..\SIBLING.txt"), "bare backslash traversal");
+        assert!(!is_safe_rel(r"a\..\..\ESCAPED.txt"), "backslash traversal behind a segment");
+        assert!(!is_safe_rel(r"a/b\..\..\..\ESC2.txt"), "mixed separators");
+        assert!(!is_safe_rel(r"\server\share\x"), "leading backslash (UNC-shaped)");
+        assert!(!is_safe_rel(r"a\.\b"), "single-dot segment");
+        // A backslash is a legal filename character on unix and must stay syncable: no
+        // segment here is `..`, so the name passes as an ordinary (if ugly) file name.
+        assert!(is_safe_rel(r"my\file.txt"));
     }
 
     #[test]

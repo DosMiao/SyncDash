@@ -21,7 +21,8 @@ use crate::foundation::path::{base_name, split_ext, split_parent};
 use crate::foundation::text::{fold, norm_key, safe_host};
 use crate::foundation::time::stamp_compact;
 use crate::foundation::time::now_ms;
-use crate::model::table::{Entry, EntryKind, Snapshot};
+use crate::fs::vfs::NameRules;
+use crate::model::table::{Entry, EntryKind, Header, Snapshot};
 use crate::model::plan::{Action, Op, Plan, PlanHeader, Side, MTIME_SLACK_MS};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -251,26 +252,78 @@ pub fn same_page(
     (total, out)
 }
 
-/// Is creating this relative path on the Windows side legal (reserved name / illegal character / trailing dot or space)
+/// The naming rules writes to this snapshot's root are subject to.
+///
+/// A VFS root's `Header.os` is the *protocol* ("smb", "sftp", "ftp"), so the old
+/// `header.os == "windows"` gate silently skipped every remote root — including `smb://`,
+/// which is precisely where Win32 name parsing does apply, because the local client performs
+/// it before anything reaches the wire. Plain local roots have no `VfsNote` and keep answering
+/// from `os`, so their behavior is unchanged.
+fn name_rules_of(h: &Header) -> NameRules {
+    match &h.vfs {
+        Some(v) if !v.name_rules.is_empty() => NameRules::parse(&v.name_rules),
+        // Snapshots written before this field existed, and plain local roots.
+        _ => {
+            if h.os == "windows" {
+                NameRules::Windows
+            } else if h.vfs.is_some() {
+                NameRules::Unknown
+            } else {
+                NameRules::Posix
+            }
+        }
+    }
+}
+
+/// Why this relative path cannot be created faithfully on a Windows-semantics root.
+///
+/// Every case here is refused, but they fail in three genuinely different ways and the reason
+/// text says which — a plan that claims "illegal" for a name Windows would in fact accept is
+/// the same kind of lie as a silent exclusion. All three classes were measured on Win11 26200
+/// through the same std calls the engine uses:
+///
+/// - **rejected**: `< > " | ? *` and control chars — the write really does fail (os error 123).
+/// - **mangled**: the dangerous class, because the write *succeeds* and lands somewhere else.
+///   `report:2024.pdf` writes into an NTFS alternate data stream: `write` returns `Ok`, and
+///   `read_dir` then lists only `report`. The name is gone, the bytes are hidden on another
+///   file, and every later compare re-copies it forever. A trailing dot or space is stripped
+///   by path normalization, so `trail.` and `trail ` both become `trail` — two distinct source
+///   files collapsing onto one target file, which is outright data loss.
+/// - **unusable**: reserved device names. These are *not* rejected — `CON`, `com1`, `nul.txt.jpg`
+///   all wrote, read, listed and deleted cleanly, because std addresses files through `\\?\`
+///   verbatim paths (and Windows 11 relaxed the rule besides). We still refuse them, as
+///   FreeFileSync and syncthing do, because Explorer, cmd and most Win32 software cannot open
+///   or delete such a file afterwards — but the reason must not claim Windows forbade it.
 fn win_invalid_reason(rel: &str) -> Option<String> {
-    const RESERVED: [&str; 22] = [
+    // COM0/LPT0 are absent from the Microsoft list but Explorer treats them as reserved too
+    // (syncthing carries the same two extras, with the same note).
+    const RESERVED: [&str; 24] = [
         "CON", "PRN", "AUX", "NUL",
-        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     for seg in rel.split('/') {
         if seg.is_empty() {
             continue;
         }
-        if seg.ends_with('.') || seg.ends_with(' ') {
-            return Some(format!("'{seg}' ends with dot/space"));
+        if let Some(stripped) = seg.strip_suffix('.').or_else(|| seg.strip_suffix(' ')) {
+            return Some(format!(
+                "mangled: '{seg}' would be silently truncated to '{stripped}' and could overwrite a different file"
+            ));
+        }
+        if seg.contains(':') {
+            return Some(format!(
+                "mangled: '{seg}' would be written into an alternate data stream — the write reports success, but the name disappears from the directory"
+            ));
+        }
+        if let Some(c) = seg.chars().find(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*' | '\\') || (*c as u32) < 0x20) {
+            return Some(format!("rejected: Windows refuses the character {c:?} in '{seg}'"));
         }
         let base = seg.split('.').next().unwrap_or("").to_ascii_uppercase();
         if RESERVED.contains(&base.as_str()) {
-            return Some(format!("reserved device name '{seg}'"));
-        }
-        if let Some(c) = seg.chars().find(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\\') || (*c as u32) < 0x20) {
-            return Some(format!("invalid character {c:?} in '{seg}'"));
+            return Some(format!(
+                "unusable: '{seg}' is a reserved device name — it can be created, but Explorer and most Windows programs cannot open or delete it afterwards"
+            ));
         }
     }
     None
@@ -661,7 +714,13 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
     // Only done when both sides are unix and the job explicitly enabled sync_mode: the Windows side has no mode,
     // so leaving it on would report a difference on every compare. Previously mode was only recorded into the snapshot
     // table and never took part in the compare, so scripts synced over the mounted-drive path lost their exec bit (the pack path did restore it — the two paths behaved differently).
-    let both_unix = source.header.os != "windows" && target.header.os != "windows";
+    // Same trap as the name-legality gate: `header.os` is the protocol on a VFS root, so a
+    // comparison against "windows" read `smb` as unix and offered to sync mode bits onto an
+    // NTFS share. Ask the naming/semantics field instead, and treat Unknown as "do not".
+    // (Unknown stays in: an SFTP root does carry unix modes, we just cannot name its OS.
+    // What must come out is a Windows-semantics root, which has no mode bits to write.)
+    let both_unix = name_rules_of(&source.header) != NameRules::Windows
+        && name_rules_of(&target.header) != NameRules::Windows;
     if copts.sync_mode && both_unix {
         // 1) Ops that copy content carry the target mode along; apply writes it back right after copying, no extra pass needed
         for op in &mut ops {
@@ -849,20 +908,42 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
         }
     }
 
-    // Legality preflight for paths created on the Windows side: caught at plan time, so apply never blows up halfway through
+    // Legality preflight for paths created on a Windows-semantics side: caught at plan time, so
+    // apply never blows up (or worse, silently succeeds into the wrong file) halfway through.
+    let mut unknown_rule_notes: Vec<(Side, String, String)> = Vec::new();
     for op in &mut ops {
         if matches!(op.action, Action::Copy | Action::Move) {
-            let exec_os = match op.side {
-                Side::Target => target.header.os.as_str(),
-                Side::Source => source.header.os.as_str(),
+            let rules = match op.side {
+                Side::Target => name_rules_of(&target.header),
+                Side::Source => name_rules_of(&source.header),
             };
-            if exec_os == "windows" {
-                if let Some(r) = win_invalid_reason(&op.path) {
+            let Some(r) = win_invalid_reason(&op.path) else { continue };
+            match rules {
+                NameRules::Windows => {
                     op.action = Action::Conflict;
                     op.reason = format!("illegal-on-windows: {r}");
                 }
+                // We cannot see the far server's OS over SFTP/FTP. Refusing would be wrong (the
+                // name is perfectly legal if it is Linux) and staying quiet would be worse, so
+                // the plan carries the warning and the op proceeds.
+                NameRules::Unknown => unknown_rule_notes.push((op.side.clone(), op.path.clone(), r)),
+                NameRules::Posix => {}
             }
         }
+    }
+    for (side, path, r) in unknown_rule_notes {
+        ops.push(Op {
+            side,
+            action: Action::Note,
+            path,
+            from: None,
+            size: None,
+            mtime_ms: None,
+            hash: None,
+            link: None,
+            mode: None,
+            reason: format!("name-risk-on-unknown-server: {r} — this root's OS cannot be determined over its protocol, so the write is attempted as planned"),
+        });
     }
 
     let rank = |o: &Op| match o.action {
@@ -941,6 +1022,20 @@ mod tests {
     fn snap_named(os: &str, host: &str, entries: Vec<Entry>) -> Snapshot {
         let mut s = snap(os, entries);
         s.header.host = host.into();
+        s
+    }
+    /// A snapshot of a VFS root: `header.os` carries the *protocol*, and the naming rules
+    /// live in the VfsNote — exactly the shape `scan_vfs` writes.
+    fn snap_vfs(protocol: &str, name_rules: &str, entries: Vec<Entry>) -> Snapshot {
+        let mut s = snap(protocol, entries);
+        s.header.vfs = Some(crate::model::table::VfsNote {
+            protocol: protocol.into(),
+            display_root: "/r".into(),
+            mtime_precision_ms: 1,
+            evidence_effective: "full".into(),
+            name_rules: name_rules.into(),
+            degraded: Vec::new(),
+        });
         s
     }
     fn actions(plan: &Plan) -> Vec<(&str, &str)> {
@@ -1217,6 +1312,55 @@ mod tests {
         let c = plan.ops.iter().find(|o| o.path == "Foo.txt").expect("Foo.txt must be planned somehow");
         assert_eq!(c.action, Action::Conflict, "{:?}", c.reason);
         assert!(c.reason.contains("case-collision"), "{}", c.reason);
+    }
+
+    /// The gap that shipped: `smb://` roots record `header.os = "smb"`, so the
+    /// `os == "windows"` gate skipped them — while the SMB backend delegates through the
+    /// local Win32 path layer, which is precisely where these names get mangled.
+    #[test]
+    fn windows_name_check_fires_on_an_smb_root_not_just_a_local_windows_one() {
+        let bad = vec![
+            file("report:2024.pdf", "h1"),
+            file("trail.", "h2"),
+            file("notes/CON", "h3"),
+            file("a?b.txt", "h4"),
+        ];
+        let s = snap("macos", bad.clone());
+        let t = snap_vfs("smb", "windows", vec![]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        let refused: Vec<_> = plan.ops.iter().filter(|o| o.action == Action::Conflict).collect();
+        assert_eq!(refused.len(), 4, "every one must be refused, got {:?}", actions(&plan));
+        assert!(plan.ops.iter().all(|o| o.action != Action::Copy), "nothing may be copied");
+
+        // The reason must classify the failure honestly — the three modes are not the same risk
+        let why = |p: &str| refused.iter().find(|o| o.path == p).unwrap().reason.clone();
+        assert!(why("report:2024.pdf").contains("alternate data stream"), "{}", why("report:2024.pdf"));
+        assert!(why("trail.").contains("truncated to 'trail'"), "{}", why("trail."));
+        assert!(why("notes/CON").contains("reserved device name"), "{}", why("notes/CON"));
+        assert!(why("a?b.txt").contains("refuses the character"), "{}", why("a?b.txt"));
+    }
+
+    /// SFTP/FTP cannot tell us the server's OS. Refusing a name that is perfectly legal on
+    /// Linux would be wrong; saying nothing would be worse. The op proceeds, with a Note.
+    #[test]
+    fn unknown_server_rules_warn_instead_of_refusing() {
+        let s = snap("macos", vec![file("report:2024.pdf", "h1")]);
+        let t = snap_vfs("sftp", "unknown", vec![]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        assert!(plan.ops.iter().any(|o| o.action == Action::Copy && o.path == "report:2024.pdf"));
+        let note = plan.ops.iter().find(|o| o.action == Action::Note).expect("a warning must exist");
+        assert!(note.reason.contains("name-risk-on-unknown-server"), "{}", note.reason);
+    }
+
+    /// A posix target must not inherit any of this: colons and reserved names are ordinary
+    /// file names there, and the plan says so by staying silent.
+    #[test]
+    fn posix_targets_keep_names_windows_would_reject() {
+        let s = snap("macos", vec![file("report:2024.pdf", "h1"), file("CON", "h2")]);
+        let t = snap("linux", vec![]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        assert_eq!(plan.ops.iter().filter(|o| o.action == Action::Copy).count(), 2);
+        assert!(plan.ops.iter().all(|o| o.action != Action::Note && o.action != Action::Conflict));
     }
 
     #[test]
