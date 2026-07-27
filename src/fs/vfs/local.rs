@@ -221,7 +221,21 @@ impl Vfs for LocalVfs {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(self.abs(rel))? {
             let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
+            // A name that is not valid Unicode has no faithful rel: `to_string_lossy` would
+            // substitute U+FFFD, and that spelling points at a different (nonexistent) file.
+            // Skip it loudly rather than hand the engine a name it cannot act on. Scanning a
+            // local or SMB root does not come through here (`as_local` sends it down the
+            // walkdir lane, which counts these into the snapshot's walk errors) — this is the
+            // directory-deletion probe, where a skipped entry makes remove_dir fail as
+            // NotEmpty and the directory is honestly reported as kept.
+            let Some(name) = entry.file_name().to_str().map(|s| s.to_owned()) else {
+                crate::log_warn!(
+                    "vfs",
+                    "skipping '{}': name is not valid Unicode on this platform",
+                    entry.path().to_string_lossy()
+                );
+                continue;
+            };
             // lstat semantics, and a file vanishing between listing and stat is a scan race, not an error
             let md = match std::fs::symlink_metadata(entry.path()) {
                 Ok(md) => md,

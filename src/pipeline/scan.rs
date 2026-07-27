@@ -691,12 +691,25 @@ fn scan_impl(
         if item.depth() == 0 {
             continue;
         }
-        let rel = item
-            .path()
-            .strip_prefix(&walk_root)
-            .unwrap_or(item.path())
-            .to_string_lossy()
-            .replace('\\', "/");
+        let raw_rel = item.path().strip_prefix(&walk_root).unwrap_or(item.path());
+        // A name that is not valid Unicode must not enter the table. `to_string_lossy` would
+        // hand back U+FFFD in its place, and that lossy spelling is a different path: apply
+        // would join it against the root, miss the real file, and (in mirror) the original
+        // would read as "absent on this side" forever. Linux and Samba shares hand out such
+        // names routinely — a tree carried over from a legacy encoding is the usual source.
+        // Route it into the walk-error channel, which already says out loud what a skipped
+        // entry costs, rather than inventing a spelling nobody can act on.
+        let Some(rel) = raw_rel.to_str() else {
+            walk_errors += 1;
+            if walk_err_samples.len() < 5 {
+                walk_err_samples.push(format!(
+                    "{}: name is not valid Unicode on this platform — skipped rather than recorded under a substituted spelling",
+                    raw_rel.to_string_lossy()
+                ));
+            }
+            continue;
+        };
+        let rel = rel.replace('\\', "/");
         let md = match item.metadata() {
             Ok(m) => m,
             Err(e) => {
@@ -934,6 +947,44 @@ mod ctx_tests {
 use crate::obs::progress::{is_cancelled, RunCtl, RunCtx};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
+
+    /// A name the filesystem accepts but Unicode does not. Recording it through
+    /// `to_string_lossy` would put `b<U+FFFD>c` in the table — a path that resolves to
+    /// nothing, so apply would miss the real file and mirror would read the original as a
+    /// deletion. It must be skipped and counted, never spelled differently.
+    #[test]
+    fn a_name_that_is_not_valid_unicode_is_skipped_not_substituted() {
+        let root = std::env::temp_dir().join(format!("syncdash-wtf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("good.txt"), b"ok").unwrap();
+
+        #[cfg(windows)]
+        let bad: std::ffi::OsString = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x0062, 0xD800, 0x0063]) // b<lone surrogate>c
+        };
+        #[cfg(unix)]
+        let bad: std::ffi::OsString = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![b'b', 0xFF, b'c'])
+        };
+        assert!(bad.to_str().is_none(), "premise: the name is not valid Unicode");
+        if std::fs::write(root.join(&bad), b"x").is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            return; // this filesystem refuses the name outright, which is also fine
+        }
+
+        let snap = scan(&root, &ScanOptions { hash: false, ..opts() }).unwrap();
+        let paths: Vec<&str> = snap.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["good.txt"], "the unrepresentable name must not enter the table");
+        assert!(
+            !paths.iter().any(|p| p.contains('\u{FFFD}')),
+            "a substituted spelling is worse than an omission: it points at a file that does not exist"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn mk_tree(tag: &str, n: usize) -> PathBuf {
         let root = std::env::temp_dir().join(format!("syncdash-scanctx-{tag}-{}", std::process::id()));
