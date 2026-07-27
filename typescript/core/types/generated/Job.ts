@@ -4,11 +4,17 @@ export type Job = {
 /**
  * mirror | sync | enrich
  */
-mode: string, source: string, target: string, 
+mode: string, 
+/**
+ * Root phrase: a local path, or `scheme://…` for a VFS root (sftp/ftp/ftps/smb).
+ * Plain strings so a phrase survives serde untouched; `vfs::spec::parse` routes it.
+ * Serialized form is identical to the old PathBuf fields — existing job files load as-is.
+ */
+source: string, target: string, 
 /**
  * One source → **many targets** (the original 1:N requirement). Non-empty overrides the single target above:
  * each target gets its own comparison, its own plan, its own execution (source is scanned once).
- * mirror/enrich only — sync's N-way merge is version-vector territory, express it as paired jobs; remote jobs don't support multiple targets either.
+ * mirror/enrich only — sync's N-way merge is version-vector territory, express it as paired jobs; ssh-peer jobs don't support multiple targets either.
  */
 targets: Array<string>, 
 /**

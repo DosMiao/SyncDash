@@ -50,6 +50,10 @@ pub struct CompareOptions {
     pub sync_mode: bool,
     /// How many conflict copies to keep per file at most (-1 = unlimited). Only effective for ConflictPolicy::Copy
     pub max_conflicts: i32,
+    /// The no-hash equality window on mtime, in ms. Defaults to MTIME_SLACK_MS (FAT/SMB granularity);
+    /// a remote backend with coarser timestamps (FTP LIST = minutes) widens it to its declared precision.
+    /// Only the *hashless* judgement uses it — content evidence always wins over timestamps.
+    pub mtime_window_ms: i64,
 }
 
 impl Default for CompareOptions {
@@ -59,6 +63,7 @@ impl Default for CompareOptions {
             conflict: ConflictPolicy::Report,
             sync_mode: false,
             max_conflicts: 5,
+            mtime_window_ms: MTIME_SLACK_MS,
         }
     }
 }
@@ -79,18 +84,18 @@ pub fn is_conflict_copy(path: &str) -> bool {
     base_name(path).contains(CONFLICT_INFIX)
 }
 
-fn files_equal(a: &Entry, b: &Entry) -> bool {
+fn files_equal(a: &Entry, b: &Entry, win_ms: i64) -> bool {
     if let (Some(ha), Some(hb)) = (&a.hash, &b.hash) {
         return ha == hb;
     }
-    a.size == b.size && (a.mtime_ms - b.mtime_ms).abs() <= MTIME_SLACK_MS
+    a.size == b.size && (a.mtime_ms - b.mtime_ms).abs() <= win_ms
 }
 
 /// Which generation of archive entry `r` the content of `e` corresponds to:
 /// `Some(0)` = matches what the archive currently records, `Some(n)` = the n-th historic generation, `None` = the archive has never seen it.
 /// The lower the generation number the newer it is — this is what lets "one generation behind" be told apart from "concurrent edit" (P1-3).
-fn generation_of(e: &Entry, r: &Entry) -> Option<usize> {
-    if files_equal(e, r) {
+fn generation_of(e: &Entry, r: &Entry, win_ms: i64) -> Option<usize> {
+    if files_equal(e, r, win_ms) {
         return Some(0);
     }
     let h = e.hash.as_deref()?;
@@ -150,6 +155,7 @@ pub struct Evidence {
 /// The criteria share `norm_key` / `files_equal` with `compare()`, so they cannot drift.
 pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &CompareOptions) -> Evidence {
     let ci = copts.case_insensitive;
+    let win = copts.mtime_window_ms;
     let (s_files, _) = map_of(source, EntryKind::File, ci);
     let (t_files, _) = map_of(target, EntryKind::File, ci);
     let (s_dirs, _) = map_of(source, EntryKind::Dir, ci);
@@ -182,7 +188,7 @@ pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &Compa
     let mut equal_bytes = 0u64;
     for (k, se) in &s_files {
         if let Some(te) = t_files.get(k) {
-            if files_equal(se, te) {
+            if files_equal(se, te, win) {
                 equal_count += 1;
                 equal_bytes += se.size;
             }
@@ -217,6 +223,7 @@ pub fn same_page(
     limit: usize,
 ) -> (u64, Vec<SameRow>) {
     let ci = copts.case_insensitive;
+    let win = copts.mtime_window_ms;
     let (s_files, _) = map_of(source, EntryKind::File, ci);
     let (t_files, _) = map_of(target, EntryKind::File, ci);
     let q = query.trim().to_lowercase();
@@ -224,7 +231,7 @@ pub fn same_page(
     let mut out = Vec::new();
     for (k, se) in &s_files {
         let Some(te) = t_files.get(k) else { continue };
-        if !files_equal(se, te) {
+        if !files_equal(se, te, win) {
             continue;
         }
         if !q.is_empty() && !se.path.to_lowercase().contains(&q) {
@@ -407,6 +414,7 @@ fn push_copy(ops: &mut Vec<Op>, side: Side, e: &Entry, reason: &str) {
 
 pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option<&Snapshot>, resolve_newer: bool, copts: &CompareOptions) -> Plan {
     let ci = copts.case_insensitive;
+    let win = copts.mtime_window_ms;
     let (s_files, s_dups) = map_of(source, EntryKind::File, ci);
     let (t_files, t_dups) = map_of(target, EntryKind::File, ci);
     let (s_dirs, _) = map_of(source, EntryKind::Dir, ci);
@@ -430,7 +438,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                 match t_files.get(p) {
                     None => adds.push(se),
                     Some(&te) => {
-                        if !files_equal(se, te) && (mode == "mirror" || se.mtime_ms > te.mtime_ms + MTIME_SLACK_MS) {
+                        if !files_equal(se, te, win) && (mode == "mirror" || se.mtime_ms > te.mtime_ms + win) {
                             let reason = if mode == "mirror" { "differs-master-wins" } else { "source-newer" };
                             // The update writes onto a file that already exists on target: open it with target's own spelling, don't rewrite the other side's form
                             ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, mode: None, reason: reason.into() });
@@ -479,7 +487,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                 let se = *se;
                 match t_files.get(p) {
                     Some(&te) => {
-                        if files_equal(se, te) {
+                        if files_equal(se, te, win) {
                             continue;
                         }
                         if has_archive {
@@ -489,8 +497,8 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                             // (`lib/protocol/bep_fileinfo.go:200-207`).
                             // generation_of returns 0 = matches the archive's current generation, 1..n = the n-th historic generation.
                             let r = arch_files.get(p).copied();
-                            let sg = r.and_then(|r| generation_of(se, r));
-                            let tg = r.and_then(|r| generation_of(te, r));
+                            let sg = r.and_then(|r| generation_of(se, r, win));
+                            let tg = r.and_then(|r| generation_of(te, r, win));
                             let push_to_source = |ops: &mut Vec<Op>, why: &str| {
                                 ops.push(Op { side: Side::Source, action: Action::Update, path: se.path.clone(), from: None, size: Some(te.size), mtime_ms: Some(te.mtime_ms), hash: te.hash.clone(), link: None, mode: None, reason: why.into() });
                             };
@@ -524,7 +532,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                     None => {
                         if has_archive {
                             if let Some(&r) = arch_files.get(p) {
-                                if files_equal(se, r) {
+                                if files_equal(se, r, win) {
                                     del_on_source.push(se);
                                 } else {
                                     ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-target-but-changed-on-source".into() });
@@ -543,7 +551,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                 }
                 if has_archive {
                     if let Some(&r) = arch_files.get(p) {
-                        if files_equal(te, r) {
+                        if files_equal(te, r, win) {
                             del_on_target.push(te);
                         } else {
                             ops.push(Op { side: Side::Target, action: Action::Conflict, path: te.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-source-but-changed-on-target".into() });
@@ -676,7 +684,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
             for (p, se) in &s_files {
                 let se = *se;
                 if let Some(&te) = t_files.get(p) {
-                    if files_equal(se, te) && se.mode.is_some() && se.mode != te.mode {
+                    if files_equal(se, te, win) && se.mode.is_some() && se.mode != te.mode {
                         ops.push(Op {
                             side: Side::Target,
                             action: Action::Chmod,

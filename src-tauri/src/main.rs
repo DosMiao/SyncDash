@@ -280,8 +280,8 @@ fn list_jobs() -> Vec<JobDto> {
             name,
             mode: j.mode.clone(),
             rigor: j.rigor.clone(),
-            source: j.source.display().to_string(),
-            target: j.target.display().to_string(),
+            source: j.source.clone(),
+            target: j.target.clone(),
             has_archive: j.archive.is_some(),
             remote: j.remote_host.is_some(),
             remote_host: j.remote_host.clone(),
@@ -292,7 +292,7 @@ fn list_jobs() -> Vec<JobDto> {
             exclude: j.exclude.clone(),
             watch_interval_secs: j.watch_interval_secs,
             watch_auto_apply: j.watch_auto_apply,
-            targets: j.target_list().iter().map(|t| t.display().to_string()).collect(),
+            targets: j.target_list(),
         })
         .collect()
 }

@@ -83,12 +83,12 @@ pub fn gen_jobs(source_root: &Path, target_root: &Path, mode: &str, rigor: &str,
         let native = crate::foundation::path::to_native(&rel);
         let job = Job {
             mode: mode.to_string(),
-            source: source_root.join(&native),
+            source: source_root.join(&native).to_string_lossy().into_owned(),
             // target_root may be UNC or posix — join each side with its own separator
             target: if target_root.to_string_lossy().contains('/') && !target_root.to_string_lossy().contains('\\') {
-                PathBuf::from(format!("{}/{}", target_root.to_string_lossy().trim_end_matches('/'), rel))
+                format!("{}/{}", target_root.to_string_lossy().trim_end_matches('/'), rel)
             } else {
-                target_root.join(&native)
+                target_root.join(&native).to_string_lossy().into_owned()
             },
             archive: if mode == "sync" { Some(archive_dir().join(format!("{name}.jsonl"))) } else { None },
             include: Vec::new(),

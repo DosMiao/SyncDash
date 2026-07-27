@@ -14,13 +14,16 @@ use std::path::PathBuf;
 pub struct Job {
     /// mirror | sync | enrich
     pub mode: String,
-    pub source: PathBuf,
-    pub target: PathBuf,
+    /// Root phrase: a local path, or `scheme://…` for a VFS root (sftp/ftp/ftps/smb).
+    /// Plain strings so a phrase survives serde untouched; `vfs::spec::parse` routes it.
+    /// Serialized form is identical to the old PathBuf fields — existing job files load as-is.
+    pub source: String,
+    pub target: String,
     /// One source → **many targets** (the original 1:N requirement). Non-empty overrides the single target above:
     /// each target gets its own comparison, its own plan, its own execution (source is scanned once).
-    /// mirror/enrich only — sync's N-way merge is version-vector territory, express it as paired jobs; remote jobs don't support multiple targets either.
+    /// mirror/enrich only — sync's N-way merge is version-vector territory, express it as paired jobs; ssh-peer jobs don't support multiple targets either.
     #[serde(default)]
-    pub targets: Vec<PathBuf>,
+    pub targets: Vec<String>,
     /// Archive of the last sync, for sync mode; refreshed automatically after a successful apply
     #[serde(default)]
     pub archive: Option<PathBuf>,
@@ -128,8 +131,8 @@ impl Default for Job {
     fn default() -> Self {
         Job {
             mode: "mirror".into(),
-            source: PathBuf::new(),
-            target: PathBuf::new(),
+            source: String::new(),
+            target: String::new(),
             targets: Vec::new(),
             archive: None,
             include: Vec::new(),
@@ -184,8 +187,18 @@ fn default_max_conflicts() -> i32 {
 }
 
 impl Job {
+    /// The source root as a filesystem path (valid for local roots; VFS roots go through `vfs::open`)
+    pub fn source_path(&self) -> &std::path::Path {
+        std::path::Path::new(&self.source)
+    }
+
+    /// The target root as a filesystem path (valid for local roots; VFS roots go through `vfs::open`)
+    pub fn target_path(&self) -> &std::path::Path {
+        std::path::Path::new(&self.target)
+    }
+
     /// The effective target list: `targets` when non-empty, otherwise fall back to the single `target`
-    pub fn target_list(&self) -> Vec<PathBuf> {
+    pub fn target_list(&self) -> Vec<String> {
         if self.targets.is_empty() {
             vec![self.target.clone()]
         } else {
@@ -193,23 +206,51 @@ impl Job {
         }
     }
 
-    /// Validity of multiple targets (sync / remote do not support 1:N — the error must be clear before comparing)
+    /// Validity of the job's shape (multi-target rules + root phrases — the error must be clear before comparing)
     pub fn validate_multi_target(&self) -> Result<(), String> {
         if self.targets.len() > 1 {
             if self.mode == "sync" {
                 return Err("sync mode does not support multiple targets (N-way merge needs version-vector attribution) — use paired sync jobs instead (hub-and-spoke)".into());
             }
             if self.remote_host.is_some() {
-                return Err("remote jobs do not support multiple targets yet".into());
+                return Err("ssh-peer jobs do not support multiple targets yet".into());
             }
+        }
+        self.validate_roots()
+    }
+
+    /// Root-phrase sanity: unknown `xyz://` schemes are refused (never silently local),
+    /// and a VFS root cannot be combined with the ssh smart-peer pipeline — they are
+    /// different transports and mixing them would leave it ambiguous who owns the target.
+    pub fn validate_roots(&self) -> Result<(), String> {
+        use crate::fs::vfs::spec::{parse, RootSpec};
+        let mut any_remote = false;
+        for (label, s) in std::iter::once(("source", &self.source))
+            .chain(std::iter::once(("target", &self.target)))
+            .chain(self.targets.iter().map(|t| ("targets", t)))
+        {
+            match parse(s) {
+                RootSpec::UnknownScheme { scheme, .. } => {
+                    return Err(format!(
+                        "{label} '{s}': unknown scheme '{scheme}://' — refusing to treat it as a local path (known: sftp, ftp, ftps, smb)"
+                    ));
+                }
+                RootSpec::Remote(_) | RootSpec::Fake(_) => any_remote = true,
+                RootSpec::Local(_) => {}
+            }
+        }
+        if any_remote && self.remote_host.is_some() {
+            return Err(
+                "a job cannot use both a VFS root (scheme:// phrase) and the ssh smart-peer pipeline (remote_host) — pick one transport".into(),
+            );
         }
         Ok(())
     }
 
     /// Derive a "single-target view" of the job: the engine's / desktop's single pipeline is reused as-is
-    pub fn for_target(&self, t: &std::path::Path) -> Job {
+    pub fn for_target(&self, t: &str) -> Job {
         let mut j = self.clone();
-        j.target = t.to_path_buf();
+        j.target = t.to_string();
         j.targets = Vec::new();
         j
     }
@@ -286,6 +327,8 @@ impl Job {
             },
             sync_mode: self.sync_mode,
             max_conflicts: self.max_conflicts,
+            // Widened to max(source, target) backend precision once the roots resolve through the VFS (M3)
+            mtime_window_ms: crate::model::plan::MTIME_SLACK_MS,
         }
     }
 

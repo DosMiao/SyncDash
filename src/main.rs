@@ -508,7 +508,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 println!("no jobs in {}\n\nsample job file:\n{}", syncdash::foundation::dirs::jobs_dir().display(), job::SAMPLE);
             } else {
                 for (name, j) in jobs {
-                    println!("{:<24} {:<7} {}  ->  {}", name, j.mode, j.source.display(), j.target.display());
+                    println!("{:<24} {:<7} {}  ->  {}", name, j.mode, j.source, j.target);
                 }
             }
             Ok(0)

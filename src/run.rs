@@ -41,7 +41,7 @@ fn refresh_archive_with(job: &Job, plan: &Plan, ctx: &crate::obs::progress::RunC
     // The previous-generation archive: every row of the new table pushes the old hash onto the prev chain, so that
     // "one generation behind" can be told apart from "concurrent modification" (P1-3, see compare::generation_of)
     let previous = if arch_path.is_file() { Snapshot::load(arch_path).ok() } else { None };
-    if let Ok(mut snap) = scan::scan_ctx(&job.source, &opt, ctx, crate::model::event::Phase::Refresh) {
+    if let Ok(mut snap) = scan::scan_ctx(job.source_path(), &opt, ctx, crate::model::event::Phase::Refresh) {
         snap.header.kind = "archive".into();
         snap.entries.retain(|e| !conflicted.contains(e.path.as_str()));
         if let Some(prev) = &previous {
@@ -96,8 +96,8 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx) -> st
     // P0-2: root reachability + mount-point marker. When the share isn't mounted, target is often an empty directory,
     // and comparing as usual yields a plan that either "wipes the other side" or "re-sends everything".
     let mut v = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-    crate::pipeline::guard::check_root("source", &job.source, job.require_marker, &mut v);
-    crate::pipeline::guard::check_root("target", &job.target, job.require_marker, &mut v);
+    crate::pipeline::guard::check_root("source", job.source_path(), job.require_marker, &mut v);
+    crate::pipeline::guard::check_root("target", job.target_path(), job.require_marker, &mut v);
     for w in &v.warnings {
         // v0.10: Log{Warn} replaces the Error{action:"warning"} hack —
         // with a real level, a warning no longer has to masquerade as an "error that doesn't count"
@@ -110,8 +110,8 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx) -> st
     // OneDrive vs an external drive), so serial execution is pure queueing — in parallel, wall clock ≈ the slower side.
     // Each side emits its own PhaseStart at the same moment, so the progress panel ticks on two rows at once.
     let (s, t) = std::thread::scope(|sc| {
-        let hs = sc.spawn(|| scan::scan_ctx(&job.source, &opt, ctx, Phase::ScanSource));
-        let ht = sc.spawn(|| scan::scan_ctx(&job.target, &opt, ctx, Phase::ScanTarget));
+        let hs = sc.spawn(|| scan::scan_ctx(job.source_path(), &opt, ctx, Phase::ScanSource));
+        let ht = sc.spawn(|| scan::scan_ctx(job.target_path(), &opt, ctx, Phase::ScanTarget));
         (hs.join().unwrap(), ht.join().unwrap())
     });
     let (s, t) = (s?, t?);
@@ -150,7 +150,8 @@ fn escalate_sampled_disagreements(
     use crate::model::event::LogLevel;
     use crate::model::table::EntryKind;
     use rayon::prelude::*;
-    const SLACK_MS: i64 = 2000;
+    // The same no-hash window compare uses — a backend with coarser mtimes widens both together
+    let slack_ms: i64 = job.compare_opts().mtime_window_ms;
 
     fn full_hash(p: &Path) -> std::io::Result<String> {
         let mut h = blake3::Hasher::new();
@@ -169,7 +170,7 @@ fn escalate_sampled_disagreements(
         .filter(|e| e.kind == EntryKind::File)
         .filter_map(|se| tmap.get(se.path.as_str()).map(|te| (se, *te)))
         .filter(|(se, te)| match (&se.hash, &te.hash) {
-            (Some(a), Some(b)) => a.starts_with('~') && a == b && (se.mtime_ms - te.mtime_ms).abs() > SLACK_MS,
+            (Some(a), Some(b)) => a.starts_with('~') && a == b && (se.mtime_ms - te.mtime_ms).abs() > slack_ms,
             _ => false,
         })
         .collect();
@@ -180,8 +181,8 @@ fn escalate_sampled_disagreements(
     let extra: Vec<Op> = suspects
         .par_iter()
         .filter_map(|(se, te)| {
-            let hs = full_hash(&crate::foundation::path::join_native(&job.source, &se.path)).ok()?;
-            let ht = full_hash(&crate::foundation::path::join_native(&job.target, &te.path)).ok()?;
+            let hs = full_hash(&crate::foundation::path::join_native(job.source_path(), &se.path)).ok()?;
+            let ht = full_hash(&crate::foundation::path::join_native(job.target_path(), &te.path)).ok()?;
             if hs == ht {
                 return None; // the digest wasn't lying: only the mtime drifted
             }
@@ -193,7 +194,7 @@ fn escalate_sampled_disagreements(
                 "sync" => Some(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: None, link: None, mode: None, reason: reason.into() }),
                 // enrich: update only when source is strictly newer
                 _ => {
-                    if se.mtime_ms > te.mtime_ms + SLACK_MS {
+                    if se.mtime_ms > te.mtime_ms + slack_ms {
                         Some(Op { side: Side::Target, action: Action::Update, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: Some(hs), link: None, mode: None, reason: reason.into() })
                     } else {
                         None
@@ -309,7 +310,7 @@ pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackno
     let mut tot = (0u64, 0u64, 0u64, 0u64);
     for (i, t) in targets.iter().enumerate() {
         let jt = job.for_target(t);
-        let label = if multi { format!("{name}[{}/{} → {}]", i + 1, targets.len(), t.display()) } else { name.to_string() };
+        let label = if multi { format!("{name}[{}/{} → {t}]", i + 1, targets.len()) } else { name.to_string() };
         let r = run_local_single(&label, &jt, do_apply, verbose, acknowledged)?;
         tot.0 += r.0;
         tot.1 += r.1;
@@ -513,14 +514,14 @@ use crate::obs::progress::PhaseProgress;
 
     // 3) Local scan + compare (the local source side goes through the mount-point gate too)
     let mut v = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-    crate::pipeline::guard::check_root("source", &job.source, job.require_marker, &mut v);
+    crate::pipeline::guard::check_root("source", job.source_path(), job.require_marker, &mut v);
     for w in &v.warnings {
         ctx.log(crate::model::event::LogLevel::Warn, "compare", format!("[{name}] warning: {w}"));
     }
     if !v.ok() {
         return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
     }
-    let s = scan::scan_ctx(&job.source, &scan_opts(job), ctx, Phase::ScanSource)?;
+    let s = scan::scan_ctx(job.source_path(), &scan_opts(job), ctx, Phase::ScanSource)?;
     let archive = match (&job.archive, job.mode.as_str()) {
         (Some(p), "sync") if p.is_file() => Some(Snapshot::load(p)?),
         _ => None,
@@ -664,7 +665,7 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         ctx.checkpoint()?;
         let pp_pack = PhaseProgress::begin(ctx, Phase::Pack, Some("packing target-side content".into()), 0, 0);
         let tmp = std::env::temp_dir().join(format!("syncdash-remote-{}.tar", crate::foundation::time::now_ms()));
-        let sum = crate::transfer::pack::pack(&plan, &job.source, &tmp, remote_chunks.as_ref())?;
+        let sum = crate::transfer::pack::pack(&plan, job.source_path(), &tmp, remote_chunks.as_ref())?;
         pp_pack.set_totals(sum.ops, sum.bytes);
         if sum.delta_saved > 0 {
             ctx.log(
@@ -723,11 +724,11 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         .cloned()
         .collect();
     if !src_ops.is_empty() {
-        if job.target.is_dir() {
+        if job.target_path().is_dir() {
             let out = crate::pipeline::apply::apply_with(
                 &src_ops,
-                &job.source,
-                &job.target,
+                job.source_path(),
+                job.target_path(),
                 &job.apply_opts(None, verbose),
                 ctx,
             );
@@ -743,7 +744,7 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
                 format!(
                     "[{name}] {} source-side op(s) skipped: mounted target '{}' not accessible (pull direction needs the SMB mount)",
                     src_ops.len(),
-                    job.target.display()
+                    job.target
                 ),
             );
         }
