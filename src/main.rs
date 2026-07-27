@@ -2,7 +2,11 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
-use syncdash::{apply, compare, config, filter, pack, run, scan, table, territory};
+use syncdash::job::{self, territory};
+use syncdash::model::table;
+use syncdash::pipeline::{apply, compare, filter, scan};
+use syncdash::run;
+use syncdash::transfer::pack;
 
 #[derive(Parser)]
 #[command(name = "syncdash", version, about = "Table-driven multi-node file sync (scan -> compare -> apply)")]
@@ -350,7 +354,7 @@ fn write_out<F: Fn(&mut dyn std::io::Write) -> std::io::Result<()>>(out: &Option
 /// v0.10: the CLI facade for central logging. Every read goes through runlog's public API,
 /// which is the layer holding the path-escape guard (`artifact_lines` accepts only bare-filename-shaped run_ids).
 fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
-    use syncdash::runlog;
+    use syncdash::obs::runlog;
     match cmd {
         LogsCmd::List { job, limit } => {
             // history_merged rather than history: an interrupted run has only a directory and no index line,
@@ -418,7 +422,7 @@ fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
             Ok(0)
         }
         LogsCmd::Prune { keep_days, max_total_mb } => {
-            let cfg = syncdash::settings::load();
+            let cfg = syncdash::store::settings::load();
             let days = keep_days.unwrap_or(cfg.keep_days);
             let cap = max_total_mb.unwrap_or(cfg.max_total_mb);
             let n = runlog::prune(days, cap);
@@ -427,20 +431,20 @@ fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
         }
         LogsCmd::Dir => {
             println!("{}", runlog::logs_dir().display());
-            println!("settings: {}", syncdash::settings::settings_path().display());
+            println!("settings: {}", syncdash::store::settings::settings_path().display());
             Ok(0)
         }
     }
 }
 
 fn main() {
-    syncdash::scan::init_worker_pool();
+    syncdash::pipeline::scan::init_worker_pool();
     // The CLI has a console: pipe the library's diagnostics back to stderr verbatim — the pre-refactor terminal experience, word for word.
     // It must be installed before any library call, and the guard must live to process exit (`_g` cannot be
     // written `_`: `let _ = ...` drops on the spot and the sink is pulled straight back out).
-    let cfg = syncdash::settings::load();
+    let cfg = syncdash::store::settings::load();
     let _g = cfg.mirror_stderr.then(|| {
-        syncdash::progress::install(Arc::new(syncdash::logging::StderrSink { min_level: cfg.level }))
+        syncdash::obs::progress::install(Arc::new(syncdash::obs::logging::StderrSink { min_level: cfg.level }))
     });
     let cli = Cli::parse();
     let code = match run_cli(cli) {
@@ -493,15 +497,15 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 "arch": std::env::consts::ARCH,
                 "host": table::host_name(),
                 "exe": std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned()),
-                "jobs_dir": config::jobs_dir().to_string_lossy().into_owned(),
+                "jobs_dir": syncdash::foundation::dirs::jobs_dir().to_string_lossy().into_owned(),
             });
             println!("{}", serde_json::to_string_pretty(&info)?);
             Ok(0)
         }
         Cmd::Jobs => {
-            let jobs = config::load_all();
+            let jobs = job::load_all();
             if jobs.is_empty() {
-                println!("no jobs in {}\n\nsample job file:\n{}", config::jobs_dir().display(), config::SAMPLE);
+                println!("no jobs in {}\n\nsample job file:\n{}", syncdash::foundation::dirs::jobs_dir().display(), job::SAMPLE);
             } else {
                 for (name, j) in jobs {
                     println!("{:<24} {:<7} {}  ->  {}", name, j.mode, j.source.display(), j.target.display());
@@ -510,13 +514,13 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             Ok(0)
         }
         Cmd::Run { job, all, prefix, apply: do_apply, i_know, verbose, watch, interval, auto_apply } => {
-            let list: Vec<(String, config::Job)> = if all || prefix.is_some() {
-                config::load_all()
+            let list: Vec<(String, job::Job)> = if all || prefix.is_some() {
+                job::load_all()
                     .into_iter()
                     .filter(|(n, _)| prefix.as_deref().map(|p| n.starts_with(p)).unwrap_or(true))
                     .collect()
             } else if let Some(j) = job {
-                vec![config::load(&j)?]
+                vec![job::load(&j)?]
             } else {
                 eprintln!("error: give a job name, or use --all / --prefix <p>");
                 return Ok(2);
@@ -677,11 +681,11 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             for o in &outs {
                 println!("{:<44} <- {}", o.name, o.territory);
             }
-            println!("{} job(s) written to {}", outs.len(), config::jobs_dir().display());
+            println!("{} job(s) written to {}", outs.len(), syncdash::foundation::dirs::jobs_dir().display());
             Ok(0)
         }
         Cmd::Pack { plan, out, source_root } => {
-            let p = compare::Plan::load(&plan)?;
+            let p = syncdash::model::plan::Plan::load(&plan)?;
             let sr = source_root.unwrap_or_else(|| PathBuf::from(&p.header.source_root));
             let s = pack::pack(&p, &sr, &out, None)?;
             println!("packed: {} op(s), {} payload file(s), {} bytes -> {}", s.ops, s.files, s.bytes, out.display());
@@ -700,7 +704,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             let stdout = std::io::stdout();
             let mut w = std::io::BufWriter::new(stdout.lock());
             for rel in &files {
-                match syncdash::chunk::chunk_file(&root, rel) {
+                match syncdash::model::chunk::chunk_file(&root, rel) {
                     Ok(fc) => {
                         use std::io::Write;
                         writeln!(w, "{}", serde_json::to_string(&fc)?)?;
@@ -712,10 +716,10 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
         }
         Cmd::Versions { root, prune } => {
             if let Some(keep) = prune {
-                let dropped = syncdash::version::prune(&root, keep)?;
+                let dropped = syncdash::store::version::prune(&root, keep)?;
                 println!("pruned {} version(s), kept newest {keep}", dropped.len());
             }
-            let list = syncdash::version::list(&root)?;
+            let list = syncdash::store::version::list(&root)?;
             if list.is_empty() {
                 println!("no versions under {}", root.join(syncdash::foundation::names::VERSION_STORE_DIR).display());
             } else {
@@ -726,7 +730,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             Ok(0)
         }
         Cmd::Restore { root, version, files, apply: do_apply } => {
-            let (restored, skipped, errors) = syncdash::version::restore(&root, &version, &files, !do_apply)?;
+            let (restored, skipped, errors) = syncdash::store::version::restore(&root, &version, &files, !do_apply)?;
             println!(
                 "{}: {restored} restored, {skipped} skipped, {errors} error(s)",
                 if do_apply { "restore" } else { "dry-run (rerun with --apply)" }
@@ -745,11 +749,11 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             Ok(if errors > 0 { 1 } else { 0 })
         }
         Cmd::Mark { root, job, note } => {
-            let (path, created) = syncdash::preflight::write_marker(&root, &job, &note)?;
+            let (path, created) = syncdash::pipeline::guard::write_marker(&root, &job, &note)?;
             if created {
                 println!("marked: {}", path.display());
             } else {
-                let m = syncdash::preflight::read_marker(&root);
+                let m = syncdash::pipeline::guard::read_marker(&root);
                 println!(
                     "already marked: {}{}",
                     path.display(),
@@ -763,10 +767,10 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
         Cmd::History { job, limit, prune_days } => {
             if let Some(days) = prune_days {
                 // 0 = don't stack the total-size gate: the meaning of `--prune-days N` is exactly "by days only"
-                let n = syncdash::runlog::prune(days, 0);
+                let n = syncdash::obs::runlog::prune(days, 0);
                 println!("pruned {n} run(s) older than {days} day(s)");
             }
-            let rows = syncdash::runlog::history(job.as_deref(), limit);
+            let rows = syncdash::obs::runlog::history(job.as_deref(), limit);
             if rows.is_empty() {
                 println!("no runs recorded yet (runs are logged when a job actually applies)");
                 return Ok(0);
@@ -800,9 +804,9 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             use syncdash::foundation::fmt::human_bytes;
             match cmd {
                 TrashCmd::Runs => {
-                    let runs = syncdash::trash::list_runs();
+                    let runs = syncdash::store::trash::list_runs();
                     if runs.is_empty() {
-                        println!("no trash runs under {}", syncdash::trash::trash_root().display());
+                        println!("no trash runs under {}", syncdash::store::trash::trash_root().display());
                     }
                     let mut total = 0u64;
                     for r in &runs {
@@ -815,7 +819,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     Ok(0)
                 }
                 TrashCmd::Find { pattern } => {
-                    let hits = syncdash::trash::find(&pattern);
+                    let hits = syncdash::store::trash::find(&pattern);
                     for h in &hits {
                         println!("{:<16} {:>10}  {}", h.run_id, human_bytes(h.size), h.rel);
                     }
@@ -823,7 +827,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     Ok(0)
                 }
                 TrashCmd::Restore { pattern, into, run, apply: do_apply } => {
-                    let (r, s, e) = syncdash::trash::restore(&pattern, run.as_deref(), &into, !do_apply)?;
+                    let (r, s, e) = syncdash::store::trash::restore(&pattern, run.as_deref(), &into, !do_apply)?;
                     println!(
                         "{}: {r} restored, {s} skipped, {e} error(s)",
                         if do_apply { "restore" } else { "dry-run (rerun with --apply)" }
@@ -831,12 +835,12 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     Ok(if e > 0 { 1 } else { 0 })
                 }
                 TrashCmd::Prune { keep_days, max_gib, no_staggered, apply: do_apply } => {
-                    let ret = syncdash::trash::Retention {
+                    let ret = syncdash::store::trash::Retention {
                         keep_days,
                         max_bytes: max_gib * 1024 * 1024 * 1024,
                         staggered: !no_staggered,
                     };
-                    let (n, freed) = syncdash::trash::prune(&ret, !do_apply)?;
+                    let (n, freed) = syncdash::store::trash::prune(&ret, !do_apply)?;
                     println!(
                         "{}: {n} run(s), {} freed",
                         if do_apply { "pruned" } else { "dry-run (rerun with --apply)" },
@@ -847,7 +851,7 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
         }
         Cmd::Apply { plan, apply: do_apply, source_root, target_root, trash, verify, versioning, delta, no_fsync, verbose } => {
-            let p = compare::Plan::load(&plan)?;
+            let p = syncdash::model::plan::Plan::load(&plan)?;
             let sr = source_root.unwrap_or_else(|| PathBuf::from(&p.header.source_root));
             let tr = target_root.unwrap_or_else(|| PathBuf::from(&p.header.target_root));
             for (name, r) in [("source", &sr), ("target", &tr)] {

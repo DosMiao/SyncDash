@@ -1,0 +1,1456 @@
+//! compare: N tables compared → action plan (requirement 2/3).
+//! Mode semantics:
+//!   mirror  — source is master: target is filled in/updated/deleted until it matches source exactly;
+//!             move detection: source-only paths and target-only paths paired by (hash,size) → emit move (cures FFS's delete+add)
+//!   enrich  — add only, never delete: fill in what target lacks, push over what source has newer; no deletes, no moves, no rollbacks
+//!   sync    — bidirectional. With --archive (the last sync's archive, the Unison idea) it can tell "delete vs add" apart and
+//!             attribute moves; without an archive it degrades to safe mode: fill in both ways + report differences as conflicts + suspected moves reported only
+//!
+//! Cross-platform rigor:
+//!   - compare key = NFC normalization (APFS/HFS+ hand out NFD, Windows/Linux use NFC by convention) + case-fold
+//!     (NTFS and APFS are both case-insensitive by default); disk I/O uses each side's own original spelling, never rewriting the other side's form
+//!   - names colliding after normalization within one side (NFD/NFC twins, case twins) → reported as a Note, the first one seen is kept
+//!   - paths to be created on the Windows side get a legality preflight first (reserved names/illegal characters/trailing dot or space) → an illegal one is marked
+//!     Conflict("illegal-on-windows") outright, never blowing up halfway through execution
+//!   - equality: both sides have a hash → go by hash; otherwise equal size and |Δmtime| <= 2s (FAT/SMB timestamp granularity)
+
+// The real implementations of the compare key (norm_key/fold), timestamps, path splitting and the conflict
+// infix all live in `foundation` — here we only call them, no private copies (that civil_from_days in `stamp` once existed in three places repo-wide).
+use crate::foundation::names::CONFLICT_INFIX;
+use crate::foundation::path::{base_name, split_ext, split_parent};
+use crate::foundation::text::{fold, norm_key, safe_host};
+use crate::foundation::time::stamp_compact;
+use crate::foundation::time::now_ms;
+use crate::model::table::{Entry, EntryKind, Snapshot};
+use crate::model::plan::{Action, Op, Plan, PlanHeader, Side, MTIME_SLACK_MS};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+
+/// Conflict handling policy. Default is Report (report only, never arbitrate automatically) — this is
+/// what SyncDash stands on; aligning with syncthing does not change the default.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ConflictPolicy {
+    /// Report only; a human handles it
+    Report,
+    /// The loser is renamed to `<name>.sync-conflict-<ts>-<host><ext>`, the winner lands
+    /// (syncthing `conflictName`, `lib/model/folder_sendrecv.go:2219`)
+    Copy,
+    /// Newer mtime wins; the older one is simply overwritten (no copy kept)
+    Newer,
+}
+
+#[derive(Clone, Copy)]
+pub struct CompareOptions {
+    /// Default true: NTFS and APFS are both case-insensitive by default
+    pub case_insensitive: bool,
+    /// Conflict policy
+    pub conflict: ConflictPolicy,
+    /// Sync unix permission bits (only meaningful when both sides are unix; the Win side has no mode, so enabling it would report a difference forever)
+    pub sync_mode: bool,
+    /// How many conflict copies to keep per file at most (-1 = unlimited). Only effective for ConflictPolicy::Copy
+    pub max_conflicts: i32,
+}
+
+impl Default for CompareOptions {
+    fn default() -> Self {
+        CompareOptions {
+            case_insensitive: true,
+            conflict: ConflictPolicy::Report,
+            sync_mode: false,
+            max_conflicts: 5,
+        }
+    }
+}
+
+/// Conflict-copy name: `report.pdf` → `report.sync-conflict-20260726-143000-WIN01.pdf`
+/// (isomorphic to syncthing's naming, so a human recognizes it at a glance and both sides' filters can spot it)
+pub fn conflict_name(path: &str, host: &str, at_ms: u64) -> String {
+    let (dir, base) = split_parent(path);
+    // split_ext only recognizes the extension after the last dot; a hidden file (.gitignore) counts wholly as the stem
+    let (stem, ext) = split_ext(base);
+    let ts = stamp_compact(at_ms as i64);
+    let host = safe_host(host);
+    format!("{dir}{stem}{CONFLICT_INFIX}{ts}-{host}{ext}")
+}
+
+/// A conflict copy must not itself take part in sync/conflict decisions (syncthing `isConflict`, :2224)
+pub fn is_conflict_copy(path: &str) -> bool {
+    base_name(path).contains(CONFLICT_INFIX)
+}
+
+fn files_equal(a: &Entry, b: &Entry) -> bool {
+    if let (Some(ha), Some(hb)) = (&a.hash, &b.hash) {
+        return ha == hb;
+    }
+    a.size == b.size && (a.mtime_ms - b.mtime_ms).abs() <= MTIME_SLACK_MS
+}
+
+/// Which generation of archive entry `r` the content of `e` corresponds to:
+/// `Some(0)` = matches what the archive currently records, `Some(n)` = the n-th historic generation, `None` = the archive has never seen it.
+/// The lower the generation number the newer it is — this is what lets "one generation behind" be told apart from "concurrent edit" (P1-3).
+fn generation_of(e: &Entry, r: &Entry) -> Option<usize> {
+    if files_equal(e, r) {
+        return Some(0);
+    }
+    let h = e.hash.as_deref()?;
+    r.prev.as_ref()?.iter().position(|x| x == h).map(|i| i + 1)
+}
+
+/// Normalized key → entry; on a collision (NFD/NFC or case twins) the first one seen is kept and recorded
+fn map_of<'a>(snap: &'a Snapshot, kind: EntryKind, ci: bool) -> (BTreeMap<String, &'a Entry>, Vec<String>) {
+    let mut m: BTreeMap<String, &Entry> = BTreeMap::new();
+    let mut dups = Vec::new();
+    for e in snap.entries.iter().filter(|e| e.kind == kind) {
+        let k = norm_key(&e.path, ci);
+        if m.contains_key(&k) {
+            dups.push(e.path.clone());
+        } else {
+            m.insert(k, e);
+        }
+    }
+    (m, dups)
+}
+
+// Evidence layer (read-only, for the UI; compare() is unaffected)
+
+/// One side's measured state at compare time. **For display and sorting only** — apply never reads a single byte of it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub struct SideMeta {
+    #[ts(type = "number")]
+    pub size: u64,
+    #[ts(type = "number")]
+    pub mtime_ms: i64,
+}
+
+/// Measured state of both sides, one-to-one with `plan.ops[i]` (the absent side is None)
+#[derive(Serialize, Deserialize, Clone, Default, Debug, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub struct RowMeta {
+    pub src: Option<SideMeta>,
+    pub dst: Option<SideMeta>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct Evidence {
+    /// Length is always exactly plan.ops.len()
+    pub metas: Vec<RowMeta>,
+    /// Files present on both sides and judged equal — the source of the denominator in FFS's "Showing 481 of 23,112"
+    pub equal_count: u64,
+    pub equal_bytes: u64,
+}
+
+/// "Evidence" beyond the plan: measured size/mtime of both sides per row + a count of equal items.
+///
+/// Why these two fields are not simply stuffed into `Op`: there are thirty-odd `Op { .. }` struct
+/// literals in this file, so adding a field means touching thirty-odd sites, and it would change the
+/// plan JSONL on-disk format and the CLI behavior. We use a parallel array like `PlanDto.reversed`, leaving `compare()` untouched.
+///
+/// The criteria share `norm_key` / `files_equal` with `compare()`, so they cannot drift.
+pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &CompareOptions) -> Evidence {
+    let ci = copts.case_insensitive;
+    let (s_files, _) = map_of(source, EntryKind::File, ci);
+    let (t_files, _) = map_of(target, EntryKind::File, ci);
+    let (s_dirs, _) = map_of(source, EntryKind::Dir, ci);
+    let (t_dirs, _) = map_of(target, EntryKind::Dir, ci);
+
+    let meta = |e: &Entry| SideMeta { size: e.size, mtime_ms: e.mtime_ms };
+    let look = |files: &BTreeMap<String, &Entry>, dirs: &BTreeMap<String, &Entry>, rel: &str| -> Option<SideMeta> {
+        let k = norm_key(rel, ci);
+        files.get(&k).or_else(|| dirs.get(&k)).map(|e| meta(e))
+    };
+
+    let metas = plan
+        .ops
+        .iter()
+        .map(|op| {
+            // On the executing side a move is still called from, on the other side it is already path — each side is looked up under its own name
+            let (s_rel, t_rel) = match (&op.action, &op.side) {
+                (Action::Move, Side::Target) => (op.path.as_str(), op.from.as_deref().unwrap_or(&op.path)),
+                (Action::Move, Side::Source) => (op.from.as_deref().unwrap_or(&op.path), op.path.as_str()),
+                _ => (op.path.as_str(), op.path.as_str()),
+            };
+            RowMeta {
+                src: look(&s_files, &s_dirs, s_rel),
+                dst: look(&t_files, &t_dirs, t_rel),
+            }
+        })
+        .collect();
+
+    let mut equal_count = 0u64;
+    let mut equal_bytes = 0u64;
+    for (k, se) in &s_files {
+        if let Some(te) = t_files.get(k) {
+            if files_equal(se, te) {
+                equal_count += 1;
+                equal_bytes += se.size;
+            }
+        }
+    }
+    Evidence { metas, equal_count, equal_bytes }
+}
+
+/// One "identical on both sides" record. It is not in the plan — it is not an action, it is evidence.
+#[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub struct SameRow {
+    pub path: String,
+    #[ts(type = "number")]
+    pub size: u64,
+    #[ts(type = "number")]
+    pub mtime_ms: i64,
+    /// The target side's time (content is identical but timestamps may differ by a few milliseconds — FAT/SMB granularity)
+    #[ts(type = "number")]
+    pub other_mtime_ms: i64,
+}
+
+/// Files judged equal on both sides, paged in source-side path order.
+/// The data behind FFS's "22,631" button at the bottom: when a file does not appear in the diff table,
+/// you must be able to confirm it is "equal" rather than "never scanned at all".
+pub fn same_page(
+    source: &Snapshot,
+    target: &Snapshot,
+    copts: &CompareOptions,
+    query: &str,
+    offset: usize,
+    limit: usize,
+) -> (u64, Vec<SameRow>) {
+    let ci = copts.case_insensitive;
+    let (s_files, _) = map_of(source, EntryKind::File, ci);
+    let (t_files, _) = map_of(target, EntryKind::File, ci);
+    let q = query.trim().to_lowercase();
+    let mut total = 0u64;
+    let mut out = Vec::new();
+    for (k, se) in &s_files {
+        let Some(te) = t_files.get(k) else { continue };
+        if !files_equal(se, te) {
+            continue;
+        }
+        if !q.is_empty() && !se.path.to_lowercase().contains(&q) {
+            continue;
+        }
+        total += 1;
+        let idx = (total - 1) as usize;
+        if idx >= offset && out.len() < limit {
+            out.push(SameRow {
+                path: se.path.clone(),
+                size: se.size,
+                mtime_ms: se.mtime_ms,
+                other_mtime_ms: te.mtime_ms,
+            });
+        }
+    }
+    (total, out)
+}
+
+/// Is creating this relative path on the Windows side legal (reserved name / illegal character / trailing dot or space)
+fn win_invalid_reason(rel: &str) -> Option<String> {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    for seg in rel.split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        if seg.ends_with('.') || seg.ends_with(' ') {
+            return Some(format!("'{seg}' ends with dot/space"));
+        }
+        let base = seg.split('.').next().unwrap_or("").to_ascii_uppercase();
+        if RESERVED.contains(&base.as_str()) {
+            return Some(format!("reserved device name '{seg}'"));
+        }
+        if let Some(c) = seg.chars().find(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\\') || (*c as u32) < 0x20) {
+            return Some(format!("invalid character {c:?} in '{seg}'"));
+        }
+    }
+    None
+}
+
+/// The result of one move pairing
+pub struct MovePair {
+    pub from: String,
+    pub to: String,
+    pub size: u64,
+    /// Same parent dir = rename in place (FFS's "same-directory rename merge")
+    pub rename_in_place: bool,
+    /// Number of same-content candidates at pairing time. >1 means `from` was picked arbitrarily among equivalent candidates —
+    /// the resulting content is still correct, but the attribution is uncertain; reason must say so honestly, never feign certainty.
+    pub candidates: usize,
+}
+
+/// Move pairing. Pairing priority (in the spirit of FFS's "same-directory rename merge"):
+///   1) same parent dir (rename in place)  2) same file name (whole directory relocated)  3) any same hash
+///
+/// **Empty files never take part in pairing**: every zero-length file has the same blake3, so they all
+/// crowd into one bucket and a pile of unrelated `__init__.py` / `.gitkeep` get paired as "renames".
+/// The very first thing syncthing does in `findRename` (`lib/model/folder.go:930-932`) is exclude
+/// `Size == 0`; we do the same.
+fn detect_moves<'a>(
+    adds: Vec<&'a Entry>,
+    dels: Vec<&'a Entry>,
+) -> (Vec<MovePair>, Vec<&'a Entry>, Vec<&'a Entry>) {
+    fn parent(p: &str) -> &str {
+        p.rfind('/').map(|i| &p[..i]).unwrap_or("")
+    }
+    let eligible = |e: &Entry| e.size > 0 && e.hash.is_some() && !is_conflict_copy(&e.path);
+    let mut by_key: HashMap<(String, u64), Vec<&'a Entry>> = HashMap::new();
+    for &d in &dels {
+        if eligible(d) {
+            by_key.entry((d.hash.clone().unwrap(), d.size)).or_default().push(d);
+        }
+    }
+    let mut moves = Vec::new();
+    let mut rest_adds = Vec::new();
+    let mut used: HashSet<String> = HashSet::new();
+    for a in adds {
+        let mut matched = None;
+        if eligible(a) {
+            if let Some(cands) = by_key.get_mut(&(a.hash.clone().unwrap(), a.size)) {
+                if !cands.is_empty() {
+                    let n = cands.len();
+                    let pick = cands
+                        .iter()
+                        .position(|c| parent(&c.path) == parent(&a.path))
+                        .or_else(|| {
+                            cands.iter().position(|c| {
+                                std::path::Path::new(&c.path).file_name()
+                                    == std::path::Path::new(&a.path).file_name()
+                            })
+                        })
+                        .unwrap_or(0);
+                    let c = cands.remove(pick);
+                    used.insert(c.path.clone());
+                    matched = Some(MovePair {
+                        rename_in_place: parent(&c.path) == parent(&a.path),
+                        from: c.path.clone(),
+                        to: a.path.clone(),
+                        size: a.size,
+                        candidates: n,
+                    });
+                }
+            }
+        }
+        match matched {
+            Some(m) => moves.push(m),
+            None => rest_adds.push(a),
+        }
+    }
+    let rest_dels = dels.into_iter().filter(|d| !used.contains(&d.path)).collect();
+    (moves, rest_adds, rest_dels)
+}
+
+/// The reason for a move op: an ambiguous pairing states the candidate count honestly
+fn move_reason(base: &str, m: &MovePair) -> String {
+    if m.candidates > 1 {
+        format!("{base} (ambiguous: {} identical candidates)", m.candidates)
+    } else {
+        base.to_string()
+    }
+}
+
+/// Per-row direction flip in the GUI (the semantic core of the same interaction FFS has). Returns None = this op cannot be reversed (move/dir/conflict/note).
+/// - Reverse of Copy: instead of pushing the file over, delete the "extra" one (the side that has it falls in line with the side that lacks it)
+/// - Reverse of Update: let the other side's content win
+/// - Reverse of Delete: don't delete — copy it back to the other side instead (restore)
+pub fn reverse_op(op: &Op) -> Option<Op> {
+    let other = match op.side {
+        Side::Source => Side::Target,
+        Side::Target => Side::Source,
+    };
+    match op.action {
+        Action::Copy => Some(Op {
+            side: other,
+            action: Action::Delete,
+            path: op.path.clone(),
+            from: None,
+            size: op.size,
+            mtime_ms: None,
+            hash: None,
+            link: None,
+            mode: None,
+            reason: format!("flipped({})", op.reason),
+        }),
+        Action::Update => Some(Op {
+            side: other,
+            action: Action::Update,
+            path: op.path.clone(),
+            from: None,
+            size: None,
+            mtime_ms: None,
+            hash: None,
+            link: None,
+            mode: None,
+            reason: format!("flipped({})", op.reason),
+        }),
+        Action::Delete => Some(Op {
+            side: other,
+            action: Action::Copy,
+            path: op.path.clone(),
+            from: None,
+            size: op.size,
+            mtime_ms: None,
+            hash: None,
+            link: None,
+            mode: None,
+            reason: format!("flipped({})", op.reason),
+        }),
+        _ => None,
+    }
+}
+
+fn push_copy(ops: &mut Vec<Op>, side: Side, e: &Entry, reason: &str) {
+    ops.push(Op { side, action: Action::Copy, path: e.path.clone(), from: None, size: Some(e.size), mtime_ms: Some(e.mtime_ms), hash: e.hash.clone(), link: None, mode: None, reason: reason.into() });
+}
+
+pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option<&Snapshot>, resolve_newer: bool, copts: &CompareOptions) -> Plan {
+    let ci = copts.case_insensitive;
+    let (s_files, s_dups) = map_of(source, EntryKind::File, ci);
+    let (t_files, t_dups) = map_of(target, EntryKind::File, ci);
+    let (s_dirs, _) = map_of(source, EntryKind::Dir, ci);
+    let (t_dirs, _) = map_of(target, EntryKind::Dir, ci);
+    let both_hashed = source.header.hashed && target.header.hashed;
+    let mut ops: Vec<Op> = Vec::new();
+
+    for d in s_dups {
+        ops.push(Op { side: Side::Source, action: Action::Note, path: d, from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "duplicate-after-normalization (kept first; NFC/case twin)".into() });
+    }
+    for d in t_dups {
+        ops.push(Op { side: Side::Target, action: Action::Note, path: d, from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "duplicate-after-normalization (kept first; NFC/case twin)".into() });
+    }
+
+    match mode {
+        "mirror" | "enrich" => {
+            let mut adds: Vec<&Entry> = Vec::new();
+            let mut dels: Vec<&Entry> = Vec::new();
+            for (p, se) in &s_files {
+                let se = *se;
+                match t_files.get(p) {
+                    None => adds.push(se),
+                    Some(&te) => {
+                        if !files_equal(se, te) && (mode == "mirror" || se.mtime_ms > te.mtime_ms + MTIME_SLACK_MS) {
+                            let reason = if mode == "mirror" { "differs-master-wins" } else { "source-newer" };
+                            // The update writes onto a file that already exists on target: open it with target's own spelling, don't rewrite the other side's form
+                            ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, mode: None, reason: reason.into() });
+                        }
+                    }
+                }
+            }
+            if mode == "mirror" {
+                for (p, te) in &t_files {
+                    if !s_files.contains_key(p) {
+                        dels.push(*te);
+                    }
+                }
+                let (moves, rest_adds, rest_dels) = if both_hashed {
+                    detect_moves(adds, dels)
+                } else {
+                    (Vec::new(), adds, dels)
+                };
+                for m in moves {
+                    let base = if m.rename_in_place { "rename-detected-by-hash" } else { "move-detected-by-hash" };
+                    let reason = move_reason(base, &m);
+                    ops.push(Op { side: Side::Target, action: Action::Move, path: m.to, from: Some(m.from), size: Some(m.size), mtime_ms: None, hash: None, link: None, mode: None, reason });
+                }
+                for a in rest_adds { push_copy(&mut ops, Side::Target, a, "only-in-source"); }
+                for d in rest_dels {
+                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, mode: None, reason: "gone-from-source".into() });
+                }
+                for (p, te) in &t_dirs {
+                    if !s_dirs.contains_key(p) {
+                        ops.push(Op { side: Side::Target, action: Action::DeleteDir, path: te.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "dir-gone-from-source".into() });
+                    }
+                }
+            } else {
+                for a in adds { push_copy(&mut ops, Side::Target, a, "only-in-source"); }
+            }
+        }
+        "sync" => {
+            let (arch_files, _) = archive.map(|a| map_of(a, EntryKind::File, ci)).unwrap_or_default();
+            let has_archive = archive.is_some();
+            let mut s_adds: Vec<&Entry> = Vec::new();
+            let mut t_adds: Vec<&Entry> = Vec::new();
+            let mut del_on_target: Vec<&Entry> = Vec::new();
+            let mut del_on_source: Vec<&Entry> = Vec::new();
+
+            for (p, se) in &s_files {
+                let se = *se;
+                match t_files.get(p) {
+                    Some(&te) => {
+                        if files_equal(se, te) {
+                            continue;
+                        }
+                        if has_archive {
+                            // P1-3: don't only ask "is it equal to the archive's current generation" — look at historic generations too.
+                            // One side merely being **behind** (stuck on some old version) is not a concurrent edit —
+                            // syncthing achieves the same thing with PreviousBlocksHash
+                            // (`lib/protocol/bep_fileinfo.go:200-207`).
+                            // generation_of returns 0 = matches the archive's current generation, 1..n = the n-th historic generation.
+                            let r = arch_files.get(p).copied();
+                            let sg = r.and_then(|r| generation_of(se, r));
+                            let tg = r.and_then(|r| generation_of(te, r));
+                            let push_to_source = |ops: &mut Vec<Op>, why: &str| {
+                                ops.push(Op { side: Side::Source, action: Action::Update, path: se.path.clone(), from: None, size: Some(te.size), mtime_ms: Some(te.mtime_ms), hash: te.hash.clone(), link: None, mode: None, reason: why.into() });
+                            };
+                            let push_to_target = |ops: &mut Vec<Op>, why: &str| {
+                                ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, mode: None, reason: why.into() });
+                            };
+                            match (sg, tg) {
+                                // source sits on a known version, target has new content → target changed it
+                                (Some(_), None) => push_to_source(&mut ops, "target-changed"),
+                                (None, Some(_)) => push_to_target(&mut ops, "source-changed"),
+                                // Both sides sit on known versions but at different generations → the newer generation wins; not a conflict
+                                (Some(a), Some(b)) if a < b => {
+                                    push_to_target(&mut ops, "target-behind-by-generations")
+                                }
+                                (Some(a), Some(b)) if a > b => {
+                                    push_to_source(&mut ops, "source-behind-by-generations")
+                                }
+                                // Neither side's content was ever seen by the archive → a genuine concurrent edit
+                                _ => ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "both-changed".into() }),
+                            }
+                        } else if resolve_newer {
+                            if se.mtime_ms >= te.mtime_ms {
+                                ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, mode: None, reason: "differs-newer-wins".into() });
+                            } else {
+                                ops.push(Op { side: Side::Source, action: Action::Update, path: se.path.clone(), from: None, size: Some(te.size), mtime_ms: Some(te.mtime_ms), hash: te.hash.clone(), link: None, mode: None, reason: "differs-newer-wins".into() });
+                            }
+                        } else {
+                            ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "differs-no-archive".into() });
+                        }
+                    }
+                    None => {
+                        if has_archive {
+                            if let Some(&r) = arch_files.get(p) {
+                                if files_equal(se, r) {
+                                    del_on_source.push(se);
+                                } else {
+                                    ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-target-but-changed-on-source".into() });
+                                }
+                                continue;
+                            }
+                        }
+                        s_adds.push(se);
+                    }
+                }
+            }
+            for (p, te) in &t_files {
+                let te = *te;
+                if s_files.contains_key(p) {
+                    continue;
+                }
+                if has_archive {
+                    if let Some(&r) = arch_files.get(p) {
+                        if files_equal(te, r) {
+                            del_on_target.push(te);
+                        } else {
+                            ops.push(Op { side: Side::Target, action: Action::Conflict, path: te.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-source-but-changed-on-target".into() });
+                        }
+                        continue;
+                    }
+                }
+                t_adds.push(te);
+            }
+
+            if has_archive && both_hashed {
+                let (mv_on_target, rest_s_adds, rest_del_t) = detect_moves(s_adds, del_on_target);
+                for m in mv_on_target {
+                    let base = if m.rename_in_place { "rename-on-source-replayed" } else { "move-on-source-replayed" };
+                    let reason = move_reason(base, &m);
+                    ops.push(Op { side: Side::Target, action: Action::Move, path: m.to, from: Some(m.from), size: Some(m.size), mtime_ms: None, hash: None, link: None, mode: None, reason });
+                }
+                let (mv_on_source, rest_t_adds, rest_del_s) = detect_moves(t_adds, del_on_source);
+                for m in mv_on_source {
+                    let base = if m.rename_in_place { "rename-on-target-replayed" } else { "move-on-target-replayed" };
+                    let reason = move_reason(base, &m);
+                    ops.push(Op { side: Side::Source, action: Action::Move, path: m.to, from: Some(m.from), size: Some(m.size), mtime_ms: None, hash: None, link: None, mode: None, reason });
+                }
+                for a in rest_s_adds { push_copy(&mut ops, Side::Target, a, "added-on-source"); }
+                for a in rest_t_adds { push_copy(&mut ops, Side::Source, a, "added-on-target"); }
+                for d in rest_del_t {
+                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-source".into() });
+                }
+                for d in rest_del_s {
+                    ops.push(Op { side: Side::Source, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-target".into() });
+                }
+            } else {
+                if both_hashed {
+                    let t_only: HashMap<&str, &str> = t_adds.iter()
+                        .filter_map(|e| e.hash.as_deref().map(|h| (h, e.path.as_str())))
+                        .collect();
+                    for a in &s_adds {
+                        if let Some(h) = a.hash.as_deref() {
+                            if let Some(&other) = t_only.get(h) {
+                                ops.push(Op { side: Side::Target, action: Action::Note, path: a.path.clone(), from: Some(other.to_string()), size: Some(a.size), mtime_ms: None, hash: None, link: None, mode: None, reason: "possible-move-needs-archive".into() });
+                            }
+                        }
+                    }
+                }
+                for a in s_adds { push_copy(&mut ops, Side::Target, a, "only-in-source"); }
+                for a in t_adds { push_copy(&mut ops, Side::Source, a, "only-in-target"); }
+                for d in del_on_target {
+                    ops.push(Op { side: Side::Target, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-source".into() });
+                }
+                for d in del_on_source {
+                    ops.push(Op { side: Side::Source, action: Action::Delete, path: d.path.clone(), from: None, size: Some(d.size), mtime_ms: None, hash: None, link: None, mode: None, reason: "deleted-on-target".into() });
+                }
+            }
+        }
+        other => panic!("unknown mode: {other}"),
+    }
+
+    // symlinks (Symlink entries only exist in both tables when symlinks="direct")
+    // Compared by equality of the "link target string"; mirror falls in line with master, enrich only fills gaps, sync fills gaps + reports differences as conflicts
+    {
+        let (s_links, _) = map_of(source, EntryKind::Symlink, ci);
+        let (t_links, _) = map_of(target, EntryKind::Symlink, ci);
+        let link_op = |side: Side, action: Action, e: &Entry, reason: &str| Op {
+            side,
+            action,
+            path: e.path.clone(),
+            from: None,
+            size: None,
+            mtime_ms: None,
+            hash: None,
+            link: e.link.clone(),
+            mode: None,
+            reason: reason.into(),
+        };
+        for (p, se) in &s_links {
+            let se = *se;
+            match t_links.get(p) {
+                None => {
+                    if mode == "mirror" || mode == "enrich" || mode == "sync" {
+                        ops.push(link_op(Side::Target, Action::Copy, se, "symlink-only-in-source"));
+                    }
+                }
+                Some(&te) => {
+                    if se.link != te.link {
+                        match mode {
+                            "mirror" => ops.push(link_op(Side::Target, Action::Update, se, "symlink-differs-master-wins")),
+                            "sync" => ops.push(link_op(Side::Target, Action::Conflict, se, "symlink-differs")),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        for (p, te) in &t_links {
+            let te = *te;
+            if !s_links.contains_key(p) {
+                match mode {
+                    "mirror" => ops.push(link_op(Side::Target, Action::Delete, te, "symlink-gone-from-source")),
+                    "sync" => ops.push(link_op(Side::Source, Action::Copy, te, "symlink-only-in-target")),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // unix permission bits (P2-4)
+    // Only done when both sides are unix and the job explicitly enabled sync_mode: the Windows side has no mode,
+    // so leaving it on would report a difference on every compare. Previously mode was only recorded into the snapshot
+    // table and never took part in the compare, so scripts synced over the mounted-drive path lost their exec bit (the pack path did restore it — the two paths behaved differently).
+    let both_unix = source.header.os != "windows" && target.header.os != "windows";
+    if copts.sync_mode && both_unix {
+        // 1) Ops that copy content carry the target mode along; apply writes it back right after copying, no extra pass needed
+        for op in &mut ops {
+            if matches!(op.action, Action::Copy | Action::Update) && op.link.is_none() {
+                let key = norm_key(&op.path, ci);
+                let from_entry = match op.side {
+                    Side::Target => s_files.get(&key),
+                    Side::Source => t_files.get(&key),
+                };
+                if let Some(e) = from_entry {
+                    op.mode = e.mode;
+                }
+            }
+        }
+        // 2) Same content, only permissions differ → a standalone Chmod; never retransmit a file over a few permission bits
+        //    (the same idea as syncthing's shortcutFile). sync mode has no "who is master", so
+        //    permission attribution is undecidable and the pass is skipped entirely there —
+        //    a mode-only difference produces no op and no note under sync.
+        if mode == "mirror" || mode == "enrich" {
+            for (p, se) in &s_files {
+                let se = *se;
+                if let Some(&te) = t_files.get(p) {
+                    if files_equal(se, te) && se.mode.is_some() && se.mode != te.mode {
+                        ops.push(Op {
+                            side: Side::Target,
+                            action: Action::Chmod,
+                            path: te.path.clone(),
+                            from: None,
+                            size: None,
+                            mtime_ms: None,
+                            hash: None,
+                            link: None,
+                            mode: se.mode,
+                            reason: format!(
+                                "mode-differs-master-wins ({:04o} -> {:04o})",
+                                te.mode.unwrap_or(0),
+                                se.mode.unwrap_or(0)
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Write-collision preflight in case-sensitive mode (P2-3)
+    // With case_sensitive = true the compare key distinguishes case, but the underlying NTFS/APFS usually does **not**:
+    // writing `Foo.txt` to target would silently overwrite the existing `foo.txt`. syncthing resolves
+    // the directory's real name before writing and raises CaseConflictError (`lib/fs/casefs.go:27-37`); we catch it at plan time.
+    if !ci {
+        // fold = foundation::text::fold, the very same normalization implementation the compare key norm_key uses
+        let mut folded: HashMap<(bool, String), Vec<&str>> = HashMap::new();
+        for (is_target, snap) in [(false, source), (true, target)] {
+            for e in &snap.entries {
+                folded.entry((is_target, fold(&e.path))).or_default().push(&e.path);
+            }
+        }
+        for op in &mut ops {
+            if !matches!(op.action, Action::Copy | Action::Move) {
+                continue;
+            }
+            let is_target = op.side == Side::Target;
+            if let Some(existing) = folded.get(&(is_target, fold(&op.path))) {
+                // When a Move's from IS that "colliding" file, this is precisely a **case rename**
+                // (`readme.md` → `Readme.md`) — the correct product of move detection, not a collision accident.
+                let from = op.from.as_deref();
+                if let Some(other) = existing.iter().find(|p| **p != op.path && Some(**p) != from) {
+                    op.action = Action::Conflict;
+                    op.reason = format!(
+                        "case-collision: writing '{}' would overwrite existing '{other}' on a \
+                         case-insensitive filesystem (set case_sensitive = false, or rename one side)",
+                        op.path
+                    );
+                }
+            }
+        }
+    }
+
+    // Conflict policy (P1-2)
+    // Default Report: report only, a human handles it — this is what SyncDash stands on; unchanged.
+    // Copy/Newer are explicit opt-ins, so that in everyday two-machine use one conflict doesn't wedge a file until the end of time.
+    // Only **content conflicts** are handled (both sides have the file and both changed it); delete-vs-edit conflicts and
+    // illegal-on-windows always stay Report — automatically arbitrating "delete or keep" is too dangerous.
+    if copts.conflict != ConflictPolicy::Report {
+        const RESOLVABLE: [&str; 3] = ["both-changed", "differs-no-archive", "symlink-differs"];
+        let now = now_ms();
+        let mut extra: Vec<Op> = Vec::new();
+        for op in &mut ops {
+            if op.action != Action::Conflict || !RESOLVABLE.contains(&op.reason.as_str()) {
+                continue;
+            }
+            // A conflict copy never spawns another conflict copy (syncthing isConflict, :1863)
+            if is_conflict_copy(&op.path) {
+                continue;
+            }
+            let key = norm_key(&op.path, ci);
+            let (Some(&se), Some(&te)) = (s_files.get(&key), t_files.get(&key)) else { continue };
+            // Newer mtime wins; on an exact tie the host name's lexicographic order is a stable tie-break
+            // (syncthing uses the device id from the version vector; we have none, so host is the equivalent)
+            let source_wins = match se.mtime_ms.cmp(&te.mtime_ms) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => source.header.host <= target.header.host,
+            };
+            let (winner, loser, loser_side, loser_host) = if source_wins {
+                (se, te, Side::Target, target.header.host.as_str())
+            } else {
+                (te, se, Side::Source, source.header.host.as_str())
+            };
+            if copts.conflict == ConflictPolicy::Copy {
+                let kept = conflict_name(&loser.path, loser_host, now);
+                extra.push(Op {
+                    side: loser_side.clone(),
+                    action: Action::Move,
+                    path: kept.clone(),
+                    from: Some(loser.path.clone()),
+                    size: Some(loser.size),
+                    mtime_ms: Some(loser.mtime_ms),
+                    hash: loser.hash.clone(),
+                    link: None,
+                    mode: None,
+                    reason: format!("conflict-loser-kept-as-copy ({})", op.reason),
+                });
+            }
+            // The winner's content lands on the loser's side
+            extra.push(Op {
+                side: loser_side,
+                action: Action::Update,
+                path: loser.path.clone(),
+                from: None,
+                size: Some(winner.size),
+                mtime_ms: Some(winner.mtime_ms),
+                hash: winner.hash.clone(),
+                link: winner.link.clone(),
+                mode: None,
+                reason: format!(
+                    "conflict-resolved-newer-wins ({})",
+                    if copts.conflict == ConflictPolicy::Copy { "loser kept as .sync-conflict copy" } else { "loser overwritten (recoverable from trash)" }
+                ),
+            });
+            // The original conflict row is downgraded to a note, leaving an auditable trace
+            op.action = Action::Note;
+            op.reason = format!("auto-resolved: {}", op.reason);
+        }
+        ops.extend(extra);
+
+        // max_conflicts: when the conflict copies for one path exceed the limit, drop the oldest few
+        // (syncthing `lib/model/folder_sendrecv.go:1888-1898`).
+        // The copy name carries a timestamp, so lexicographic order is chronological order.
+        if copts.conflict == ConflictPolicy::Copy && copts.max_conflicts >= 0 {
+            let limit = copts.max_conflicts as usize;
+            for (is_target, snap) in [(false, source), (true, target)] {
+                let mut groups: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+                for e in snap.entries.iter().filter(|e| e.kind == EntryKind::File) {
+                    if is_conflict_copy(&e.path) {
+                        // Group under the original file name: strip off the `.sync-conflict-…` part
+                        if let Some(i) = e.path.find(CONFLICT_INFIX) {
+                            let stem = &e.path[..i];
+                            groups.entry(stem.to_string()).or_default().push(&e.path);
+                        }
+                    }
+                }
+                for (_stem, mut copies) in groups {
+                    if copies.len() <= limit {
+                        continue;
+                    }
+                    copies.sort_unstable(); // the timestamp is in the name → lexicographic = chronological
+                    let doomed = copies.len() - limit;
+                    for p in copies.into_iter().take(doomed) {
+                        ops.push(Op {
+                            side: if is_target { Side::Target } else { Side::Source },
+                            action: Action::Delete,
+                            path: p.to_string(),
+                            from: None,
+                            size: None,
+                            mtime_ms: None,
+                            hash: None,
+                            link: None,
+                            mode: None,
+                            reason: format!("conflict-copy-over-limit (max_conflicts = {limit})"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Legality preflight for paths created on the Windows side: caught at plan time, so apply never blows up halfway through
+    for op in &mut ops {
+        if matches!(op.action, Action::Copy | Action::Move) {
+            let exec_os = match op.side {
+                Side::Target => target.header.os.as_str(),
+                Side::Source => source.header.os.as_str(),
+            };
+            if exec_os == "windows" {
+                if let Some(r) = win_invalid_reason(&op.path) {
+                    op.action = Action::Conflict;
+                    op.reason = format!("illegal-on-windows: {r}");
+                }
+            }
+        }
+    }
+
+    let rank = |o: &Op| match o.action {
+        Action::Move => 0,
+        Action::Copy | Action::Update => 1,
+        Action::Chmod => 2,
+        Action::Delete => 3,
+        Action::DeleteDir => 4,
+        Action::Conflict | Action::Note => 5,
+    };
+    ops.sort_by(|a, b| {
+        rank(a).cmp(&rank(b)).then_with(|| {
+            if a.action == Action::DeleteDir {
+                b.path.matches('/').count().cmp(&a.path.matches('/').count())
+            } else {
+                a.path.cmp(&b.path)
+            }
+        })
+    });
+
+    let conflict_count = ops.iter().filter(|o| o.action == Action::Conflict).count() as u64;
+    Plan {
+        header: PlanHeader {
+            schema: crate::model::table::SCHEMA,
+            kind: "plan".into(),
+            mode: mode.into(),
+            generated_at_ms: now_ms(),
+            source_root: source.header.root.clone(),
+            source_host: source.header.host.clone(),
+            target_root: target.header.root.clone(),
+            target_host: target.header.host.clone(),
+            op_count: ops.len() as u64,
+            conflict_count,
+            source_entries: source.entries.len() as u64,
+            target_entries: target.entries.len() as u64,
+            source_excluded: source.header.excluded_dirs + source.header.excluded_files,
+            target_excluded: target.header.excluded_dirs + target.header.excluded_files,
+        },
+        ops,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::table::{Header, SCHEMA};
+
+    fn snap(os: &str, entries: Vec<Entry>) -> Snapshot {
+        Snapshot {
+            header: Header {
+                schema: SCHEMA, kind: "snapshot".into(), root: "/r".into(), host: "h".into(),
+                os: os.into(), scanned_at_ms: 0, duration_ms: 0,
+                entry_count: entries.len() as u64, hashed: true,
+                excluded_dirs: 0, excluded_files: 0,
+            },
+            entries,
+        }
+    }
+    fn file(path: &str, hash: &str) -> Entry {
+        Entry { path: path.into(), kind: EntryKind::File, size: 1, mtime_ms: 0, hash: Some(hash.into()), file_id: None, mode: None, link: None, prev: None }
+    }
+    /// A file with an mtime (conflict arbitration goes by mtime)
+    fn file_at(path: &str, hash: &str, mtime_ms: i64) -> Entry {
+        Entry { mtime_ms, ..file(path, hash) }
+    }
+    fn sized(path: &str, hash: &str, size: u64) -> Entry {
+        Entry { size, ..file(path, hash) }
+    }
+    /// An archive entry: current hash + historic generations
+    fn arch(path: &str, hash: &str, prev: &[&str]) -> Entry {
+        Entry {
+            prev: if prev.is_empty() { None } else { Some(prev.iter().map(|s| s.to_string()).collect()) },
+            ..file(path, hash)
+        }
+    }
+    fn snap_named(os: &str, host: &str, entries: Vec<Entry>) -> Snapshot {
+        let mut s = snap(os, entries);
+        s.header.host = host.into();
+        s
+    }
+    fn actions(plan: &Plan) -> Vec<(&str, &str)> {
+        plan.ops
+            .iter()
+            .map(|o| {
+                (
+                    match o.action {
+                        Action::Copy => "copy",
+                        Action::Update => "update",
+                        Action::Move => "move",
+                        Action::Delete => "delete",
+                        Action::DeleteDir => "deletedir",
+                        Action::Chmod => "chmod",
+                        Action::Conflict => "conflict",
+                        Action::Note => "note",
+                    },
+                    o.path.as_str(),
+                )
+            })
+            .collect()
+    }
+
+    // P2-5: empty files / ambiguous pairing
+
+    #[test]
+    fn empty_files_are_never_paired_as_moves() {
+        // Every zero-length file has the same blake3. They used to get paired into a pile of "renames" —
+        // the resulting content was right, but the attribution was invented. syncthing simply excludes Size == 0 in findRename.
+        let e = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+        let s = snap("windows", vec![sized("new/a.py", e, 0), sized("new/b.py", e, 0)]);
+        let t = snap("windows", vec![sized("old/x.py", e, 0), sized("old/y.py", e, 0)]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        assert!(
+            !plan.ops.iter().any(|o| o.action == Action::Move),
+            "zero-length files must never be paired as renames: {:?}",
+            actions(&plan)
+        );
+        assert_eq!(plan.ops.iter().filter(|o| o.action == Action::Copy).count(), 2);
+        assert_eq!(plan.ops.iter().filter(|o| o.action == Action::Delete).count(), 2);
+    }
+
+    #[test]
+    fn ambiguous_move_is_labelled_as_such() {
+        // Several candidates with the same content: the pairing's content is correct, but from is picked arbitrarily — reason must tell the truth
+        let s = snap("windows", vec![sized("moved/one.bin", "h", 10)]);
+        let t = snap(
+            "windows",
+            vec![sized("a/one.bin", "h", 10), sized("b/one.bin", "h", 10), sized("c/one.bin", "h", 10)],
+        );
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        let mv = plan.ops.iter().find(|o| o.action == Action::Move).expect("should still pair one");
+        assert!(mv.reason.contains("ambiguous"), "reason must admit the ambiguity, got {:?}", mv.reason);
+        assert!(mv.reason.contains('3'), "and say how many candidates: {:?}", mv.reason);
+    }
+
+    #[test]
+    fn unambiguous_move_stays_clean() {
+        let s = snap("windows", vec![sized("moved/one.bin", "h", 10)]);
+        let t = snap("windows", vec![sized("one.bin", "h", 10)]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        let mv = plan.ops.iter().find(|o| o.action == Action::Move).unwrap();
+        assert!(!mv.reason.contains("ambiguous"), "a single candidate must not be flagged: {:?}", mv.reason);
+    }
+
+    // P1-3: multi-generation archive attribution
+
+    #[test]
+    fn a_side_that_is_merely_behind_is_not_a_conflict() {
+        // The archive has advanced to H2; source moved on to H3, target is still stuck at H1 (last sync didn't complete).
+        // Previously both sides != the archive's current generation → false both-changed.
+        let s = snap("windows", vec![file("f.txt", "H3")]);
+        let t = snap("macos", vec![file("f.txt", "H1")]);
+        let a = snap("windows", vec![arch("f.txt", "H2", &["H1", "H0"])]);
+        let plan = compare(&s, &t, "sync", Some(&a), false, &CompareOptions::default());
+        assert_eq!(plan.header.conflict_count, 0, "being behind is not concurrent editing: {:?}", actions(&plan));
+        let up = plan.ops.iter().find(|o| o.action == Action::Update).expect("should propagate");
+        assert_eq!(up.side, Side::Target);
+        assert_eq!(up.hash.as_deref(), Some("H3"));
+    }
+
+    #[test]
+    fn genuinely_novel_content_on_both_sides_is_still_a_conflict() {
+        // Neither side's content was ever seen by the archive → this is the genuine concurrent edit; the multi-generation logic must never let it slip
+        let s = snap("windows", vec![file("f.txt", "X")]);
+        let t = snap("macos", vec![file("f.txt", "Y")]);
+        let a = snap("windows", vec![arch("f.txt", "H2", &["H1", "H0"])]);
+        let plan = compare(&s, &t, "sync", Some(&a), false, &CompareOptions::default());
+        assert_eq!(plan.header.conflict_count, 1, "{:?}", actions(&plan));
+    }
+
+    #[test]
+    fn newer_generation_wins_when_both_sides_are_behind() {
+        // source sits at generation 1, target at generation 2 → source is newer, propagate to target
+        let s = snap("windows", vec![file("f.txt", "H1")]);
+        let t = snap("macos", vec![file("f.txt", "H0")]);
+        let a = snap("windows", vec![arch("f.txt", "H2", &["H1", "H0"])]);
+        let plan = compare(&s, &t, "sync", Some(&a), false, &CompareOptions::default());
+        assert_eq!(plan.header.conflict_count, 0);
+        let up = plan.ops.iter().find(|o| o.action == Action::Update).unwrap();
+        assert_eq!(up.side, Side::Target);
+        assert!(up.reason.contains("behind-by-generations"), "{}", up.reason);
+    }
+
+    #[test]
+    fn roll_generations_builds_the_history_chain() {
+        use crate::model::table::roll_generations;
+        let old = vec![arch("f.txt", "H1", &["H0"])];
+        let mut fresh = vec![file("f.txt", "H2")];
+        roll_generations(&mut fresh, &old);
+        assert_eq!(fresh[0].prev.as_ref().unwrap(), &vec!["H1".to_string(), "H0".to_string()]);
+
+        // When the content hasn't changed, the same hash must not be poured into the history
+        let mut same = vec![file("f.txt", "H1")];
+        roll_generations(&mut same, &old);
+        assert_eq!(same[0].prev.as_ref().unwrap(), &vec!["H0".to_string()]);
+    }
+
+    // P1-2: conflict copies
+
+    #[test]
+    fn conflict_policy_report_is_the_default_and_changes_nothing() {
+        let s = snap_named("windows", "WIN", vec![file_at("f.txt", "X", 200)]);
+        let t = snap_named("macos", "MAC", vec![file_at("f.txt", "Y", 100)]);
+        let plan = compare(&s, &t, "sync", None, false, &CompareOptions::default());
+        assert_eq!(plan.header.conflict_count, 1);
+        assert!(!plan.ops.iter().any(|o| o.action == Action::Move), "report policy must not touch anything");
+    }
+
+    #[test]
+    fn conflict_copy_keeps_the_loser_and_lands_the_winner() {
+        let s = snap_named("windows", "WIN", vec![file_at("doc/report.pdf", "NEW", 5_000)]);
+        let t = snap_named("macos", "MAC", vec![file_at("doc/report.pdf", "OLD", 1_000)]);
+        let opts = CompareOptions { conflict: ConflictPolicy::Copy, ..Default::default() };
+        let plan = compare(&s, &t, "sync", None, false, &opts);
+
+        // The loser (target, older mtime) is renamed and archived first
+        let mv = plan.ops.iter().find(|o| o.action == Action::Move).expect("loser must be kept");
+        assert_eq!(mv.side, Side::Target);
+        assert_eq!(mv.from.as_deref(), Some("doc/report.pdf"));
+        assert!(mv.path.starts_with("doc/report.sync-conflict-"), "{}", mv.path);
+        assert!(mv.path.ends_with(".pdf"), "extension must be preserved: {}", mv.path);
+        // The winner's content lands on target
+        let up = plan.ops.iter().find(|o| o.action == Action::Update && o.path == "doc/report.pdf").unwrap();
+        assert_eq!(up.hash.as_deref(), Some("NEW"));
+        // The original conflict row is downgraded to an auditable note and no longer counts as a conflict
+        assert_eq!(plan.header.conflict_count, 0);
+        assert!(plan.ops.iter().any(|o| o.action == Action::Note && o.reason.starts_with("auto-resolved")));
+    }
+
+    #[test]
+    fn conflict_newer_overwrites_without_a_copy() {
+        let s = snap_named("windows", "WIN", vec![file_at("f.txt", "NEW", 900)]);
+        let t = snap_named("macos", "MAC", vec![file_at("f.txt", "OLD", 100)]);
+        let opts = CompareOptions { conflict: ConflictPolicy::Newer, ..Default::default() };
+        let plan = compare(&s, &t, "sync", None, false, &opts);
+        assert!(!plan.ops.iter().any(|o| o.action == Action::Move), "newer policy keeps no copy");
+        let up = plan.ops.iter().find(|o| o.action == Action::Update).unwrap();
+        assert_eq!(up.side, Side::Target);
+        assert_eq!(up.hash.as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn conflict_resolution_respects_the_older_side_winning() {
+        // target is newer → target wins; both the copy and the overwrite happen on the source side
+        let s = snap_named("windows", "WIN", vec![file_at("f.txt", "OLD", 100)]);
+        let t = snap_named("macos", "MAC", vec![file_at("f.txt", "NEW", 900)]);
+        let opts = CompareOptions { conflict: ConflictPolicy::Copy, ..Default::default() };
+        let plan = compare(&s, &t, "sync", None, false, &opts);
+        let mv = plan.ops.iter().find(|o| o.action == Action::Move).unwrap();
+        assert_eq!(mv.side, Side::Source);
+        let up = plan.ops.iter().find(|o| o.action == Action::Update && o.path == "f.txt").unwrap();
+        assert_eq!(up.side, Side::Source);
+        assert_eq!(up.hash.as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn delete_versus_change_conflicts_are_never_auto_resolved() {
+        // "the other side deleted it but I changed it" — automatically arbitrating "delete or keep" is too dangerous; report only under every policy
+        let s = snap_named("windows", "WIN", vec![file("f.txt", "CHANGED")]);
+        let t = snap_named("macos", "MAC", Vec::new());
+        let a = snap("windows", vec![file("f.txt", "ORIGINAL")]);
+        let opts = CompareOptions { conflict: ConflictPolicy::Copy, ..Default::default() };
+        let plan = compare(&s, &t, "sync", Some(&a), false, &opts);
+        assert_eq!(plan.header.conflict_count, 1, "{:?}", actions(&plan));
+        assert!(plan.ops.iter().any(|o| o.reason.contains("deleted-on-target-but-changed-on-source")));
+    }
+
+    #[test]
+    fn conflict_names_are_well_formed() {
+        let n = conflict_name("a/b/report.pdf", "WIN 01", 1_769_000_000_000);
+        assert!(n.starts_with("a/b/report.sync-conflict-"), "{n}");
+        assert!(n.ends_with("-WIN-01.pdf"), "host must be sanitised and extension kept: {n}");
+        assert!(is_conflict_copy(&n));
+        // A hidden file has no extension to speak of
+        let h = conflict_name(".gitignore", "H", 0);
+        assert!(h.starts_with(".gitignore.sync-conflict-"), "{h}");
+        assert!(!is_conflict_copy("a/b/normal.pdf"));
+    }
+
+    #[test]
+    fn conflict_copies_over_the_limit_are_pruned() {
+        let mut entries = vec![file("f.txt", "SAME")];
+        for i in 1..=4 {
+            entries.push(file(&format!("f.sync-conflict-2026070{i}-120000-MAC.txt"), &format!("c{i}")));
+        }
+        let s = snap_named("windows", "WIN", vec![file("f.txt", "SAME")]);
+        let t = snap_named("macos", "MAC", entries);
+        let opts = CompareOptions { conflict: ConflictPolicy::Copy, max_conflicts: 2, ..Default::default() };
+        let plan = compare(&s, &t, "sync", None, false, &opts);
+        let pruned: Vec<&str> = plan
+            .ops
+            .iter()
+            .filter(|o| o.reason.contains("conflict-copy-over-limit"))
+            .map(|o| o.path.as_str())
+            .collect();
+        assert_eq!(pruned.len(), 2, "4 copies, limit 2 -> drop the 2 oldest: {pruned:?}");
+        assert!(pruned.iter().all(|p| p.contains("20260701") || p.contains("20260702")), "{pruned:?}");
+    }
+
+    // P2-4: unix permission bits
+
+    #[test]
+    fn mode_only_difference_produces_a_chmod_not_a_recopy() {
+        let mut se = file("run.sh", "SAME");
+        se.mode = Some(0o755);
+        let mut te = file("run.sh", "SAME");
+        te.mode = Some(0o644);
+        let s = snap("macos", vec![se]);
+        let t = snap("linux", vec![te]);
+        let opts = CompareOptions { sync_mode: true, ..Default::default() };
+        let plan = compare(&s, &t, "mirror", None, false, &opts);
+        assert_eq!(actions(&plan), vec![("chmod", "run.sh")], "content is identical; only the bits differ");
+        assert_eq!(plan.ops[0].mode, Some(0o755));
+    }
+
+    #[test]
+    fn mode_is_ignored_unless_enabled_and_both_sides_are_unix() {
+        let mut se = file("run.sh", "SAME");
+        se.mode = Some(0o755);
+        let mut te = file("run.sh", "SAME");
+        te.mode = Some(0o644);
+        // Off by default
+        let plan = compare(&snap("macos", vec![se.clone()]), &snap("linux", vec![te.clone()]), "mirror", None, false, &CompareOptions::default());
+        assert!(plan.ops.is_empty());
+        // The Windows side has no mode, so even switched on it must not report a difference
+        let opts = CompareOptions { sync_mode: true, ..Default::default() };
+        let plan2 = compare(&snap("macos", vec![se]), &snap("windows", vec![te]), "mirror", None, false, &opts);
+        assert!(plan2.ops.is_empty(), "{:?}", actions(&plan2));
+    }
+
+    #[test]
+    fn copies_carry_the_source_mode_when_enabled() {
+        let mut se = file("new.sh", "H");
+        se.mode = Some(0o755);
+        let s = snap("macos", vec![se]);
+        let t = snap("linux", Vec::new());
+        let opts = CompareOptions { sync_mode: true, ..Default::default() };
+        let plan = compare(&s, &t, "mirror", None, false, &opts);
+        assert_eq!(plan.ops.len(), 1);
+        assert_eq!(plan.ops[0].mode, Some(0o755), "a fresh copy must land with the right bits in one step");
+    }
+
+    // P2-3: case collisions
+
+    #[test]
+    fn case_sensitive_mode_flags_a_write_that_would_clobber_a_case_twin() {
+        // With case_sensitive = true, Foo.txt and foo.txt are two files,
+        // but on NTFS/APFS writing the former silently overwrites the latter.
+        let s = snap("windows", vec![file("Foo.txt", "A"), file("foo.txt", "B")]);
+        let t = snap("windows", vec![file("foo.txt", "B")]);
+        let opts = CompareOptions { case_insensitive: false, ..Default::default() };
+        let plan = compare(&s, &t, "mirror", None, false, &opts);
+        let c = plan.ops.iter().find(|o| o.path == "Foo.txt").expect("Foo.txt must be planned somehow");
+        assert_eq!(c.action, Action::Conflict, "{:?}", c.reason);
+        assert!(c.reason.contains("case-collision"), "{}", c.reason);
+    }
+
+    #[test]
+    fn nfc_nfd_paths_match() {
+        // "café" NFC (U+00E9) vs NFD (e + U+0301): the same file, must produce no op at all
+        let nfc = "caf\u{00e9}.txt";
+        let nfd = "cafe\u{0301}.txt";
+        let s = snap("windows", vec![file(nfc, "h1")]);
+        let t = snap("macos", vec![file(nfd, "h1")]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        assert_eq!(plan.ops.len(), 0, "NFC/NFD spellings of the same name must match");
+    }
+
+    #[test]
+    fn case_insensitive_match_and_opt_out() {
+        let s = snap("windows", vec![file("Readme.md", "h1")]);
+        let t = snap("macos", vec![file("readme.md", "h1")]);
+        assert_eq!(compare(&s, &t, "mirror", None, false, &CompareOptions { case_insensitive: true, ..Default::default() }).ops.len(), 0);
+        // Case-sensitive: case twins with the same hash get paired by move detection into a single rename — smarter than copy + delete
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions { case_insensitive: false, ..Default::default() });
+        assert_eq!(plan.ops.len(), 1);
+        assert_eq!(plan.ops[0].action, Action::Move);
+    }
+
+    #[test]
+    fn update_keeps_target_spelling() {
+        let s = snap("windows", vec![file("CAF\u{00c9}.TXT", "new")]);
+        let t = snap("macos", vec![file("cafe\u{0301}.txt", "old")]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        assert_eq!(plan.ops.len(), 1);
+        assert_eq!(plan.ops[0].action, Action::Update);
+        assert_eq!(plan.ops[0].path, "cafe\u{0301}.txt", "update must use target's own spelling");
+    }
+
+    #[test]
+    fn illegal_windows_names_become_conflicts() {
+        let s = snap("macos", vec![file("aux.log", "h1"), file("ok.txt", "h2"), file("bad. /x", "h3")]);
+        let t = snap("windows", Vec::new());
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        let conflicts: Vec<_> = plan.ops.iter().filter(|o| o.action == Action::Conflict).collect();
+        assert_eq!(conflicts.len(), 2, "aux.log and 'bad. ' segment must be flagged");
+        assert!(plan.ops.iter().any(|o| o.action == Action::Copy && o.path == "ok.txt"));
+    }
+
+    // sync-with-archive classification matrix
+    // State notation: E = present with content x, ∅ = absent. archive = the consensus state at the last sync.
+
+    fn plan_sync(s: Vec<Entry>, t: Vec<Entry>, a: Option<Vec<Entry>>) -> Plan {
+        let s = snap("windows", s);
+        let t = snap("macos", t);
+        let a = a.map(|e| snap("windows", e));
+        compare(&s, &t, "sync", a.as_ref(), false, &CompareOptions::default())
+    }
+    fn one(plan: &Plan) -> &Op {
+        assert_eq!(plan.ops.len(), 1, "expected exactly 1 op, got: {:?}", plan.ops);
+        &plan.ops[0]
+    }
+
+    #[test]
+    fn matrix_equal_no_op() {
+        let p = plan_sync(vec![file("a", "h")], vec![file("a", "h")], Some(vec![file("a", "h")]));
+        assert_eq!(p.ops.len(), 0);
+    }
+
+    #[test]
+    fn matrix_source_changed_propagates_to_target() {
+        let p = plan_sync(vec![file("a", "h2")], vec![file("a", "h1")], Some(vec![file("a", "h1")]));
+        let op = one(&p);
+        assert_eq!((op.side.clone(), op.action.clone()), (Side::Target, Action::Update));
+    }
+
+    #[test]
+    fn matrix_target_changed_propagates_to_source() {
+        let p = plan_sync(vec![file("a", "h1")], vec![file("a", "h2")], Some(vec![file("a", "h1")]));
+        let op = one(&p);
+        assert_eq!((op.side.clone(), op.action.clone()), (Side::Source, Action::Update));
+    }
+
+    #[test]
+    fn matrix_both_changed_conflict() {
+        let p = plan_sync(vec![file("a", "h2")], vec![file("a", "h3")], Some(vec![file("a", "h1")]));
+        assert_eq!(one(&p).action, Action::Conflict);
+        assert_eq!(p.header.conflict_count, 1);
+    }
+
+    #[test]
+    fn matrix_target_deleted_propagates_deletion() {
+        // The archive has it, target doesn't, source is unchanged → delete on source
+        let p = plan_sync(vec![file("a", "h1")], vec![], Some(vec![file("a", "h1")]));
+        let op = one(&p);
+        assert_eq!((op.side.clone(), op.action.clone()), (Side::Source, Action::Delete));
+    }
+
+    #[test]
+    fn matrix_delete_vs_edit_conflict() {
+        // target deleted it but source changed it → delete-vs-edit conflict; never delete silently
+        let p = plan_sync(vec![file("a", "h2")], vec![], Some(vec![file("a", "h1")]));
+        assert_eq!(one(&p).action, Action::Conflict);
+    }
+
+    #[test]
+    fn matrix_new_on_source_copies() {
+        let p = plan_sync(vec![file("a", "h1")], vec![], Some(vec![]));
+        let op = one(&p);
+        assert_eq!((op.side.clone(), op.action.clone()), (Side::Target, Action::Copy));
+    }
+
+    #[test]
+    fn matrix_move_on_source_replayed_on_target() {
+        // source moved a to b; target/archive still have a → replay the move on target
+        let p = plan_sync(vec![file("b", "h1")], vec![file("a", "h1")], Some(vec![file("a", "h1")]));
+        let op = one(&p);
+        assert_eq!(op.action, Action::Move);
+        assert_eq!(op.side, Side::Target);
+        assert_eq!(op.from.as_deref(), Some("a"));
+        assert_eq!(op.path, "b");
+    }
+
+    #[test]
+    fn matrix_no_archive_differ_is_conflict_and_adds_flow_both_ways() {
+        let p = plan_sync(vec![file("a", "h1"), file("s", "hs")], vec![file("a", "h2"), file("t", "ht")], None);
+        assert!(p.ops.iter().any(|o| o.action == Action::Conflict && o.path == "a"));
+        assert!(p.ops.iter().any(|o| o.action == Action::Copy && o.side == Side::Target && o.path == "s"));
+        assert!(p.ops.iter().any(|o| o.action == Action::Copy && o.side == Side::Source && o.path == "t"));
+        assert!(!p.ops.iter().any(|o| o.action == Action::Delete), "no-archive sync must never delete");
+    }
+
+    #[test]
+    fn matrix_enrich_never_deletes_or_downgrades() {
+        let s = snap("windows", vec![file("only-src", "h1")]);
+        let mut old = file("shared", "h-old");
+        old.mtime_ms = 0;
+        let mut newer_on_target = file("shared", "h-new");
+        newer_on_target.mtime_ms = 999_999;
+        let t = snap("macos", vec![newer_on_target, file("only-tgt", "hx")]);
+        let s = Snapshot { header: s.header, entries: vec![s.entries[0].clone(), old] };
+        let p = compare(&s, &t, "enrich", None, false, &CompareOptions::default());
+        assert!(p.ops.iter().any(|o| o.action == Action::Copy && o.path == "only-src"));
+        assert!(!p.ops.iter().any(|o| o.action == Action::Delete));
+        assert!(!p.ops.iter().any(|o| o.action == Action::Update), "enrich must not downgrade newer target");
+    }
+
+    #[test]
+    fn reverse_op_semantics() {
+        let copy = Op { side: Side::Target, action: Action::Copy, path: "x".into(), from: None, size: Some(5), mtime_ms: Some(1), hash: None, link: None, mode: None, reason: "only-in-source".into() };
+        let r = reverse_op(&copy).unwrap();
+        assert_eq!((r.side, r.action), (Side::Source, Action::Delete));
+
+        let del = Op { side: Side::Target, action: Action::Delete, path: "x".into(), from: None, size: Some(5), mtime_ms: None, hash: None, link: None, mode: None, reason: "gone-from-source".into() };
+        let r = reverse_op(&del).unwrap();
+        assert_eq!((r.side, r.action), (Side::Source, Action::Copy));
+
+        let upd = Op { side: Side::Target, action: Action::Update, path: "x".into(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "differs".into() };
+        let r = reverse_op(&upd).unwrap();
+        assert_eq!((r.side, r.action), (Side::Source, Action::Update));
+
+        let mv = Op { side: Side::Target, action: Action::Move, path: "b".into(), from: Some("a".into()), size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "m".into() };
+        assert!(reverse_op(&mv).is_none());
+    }
+
+    #[test]
+    fn normalization_twins_reported_not_merged() {
+        let s = snap("linux", vec![file("caf\u{00e9}.txt", "h1"), file("cafe\u{0301}.txt", "h2")]);
+        let t = snap("windows", vec![file("caf\u{00e9}.txt", "h1")]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        assert!(plan.ops.iter().any(|o| o.action == Action::Note && o.reason.contains("duplicate-after-normalization")));
+    }
+
+    // Evidence layer
+
+    #[test]
+    fn evidence_reports_both_sides_and_equal_count() {
+        // same: identical on both sides; upd: on both sides but with different content; only_s: source only; only_t: target only
+        let s = snap("windows", vec![
+            Entry { size: 10, mtime_ms: 1_000, ..file("same.txt", "h0") },
+            Entry { size: 30, mtime_ms: 9_000, ..file("upd.txt", "hs") },
+            Entry { size: 7, mtime_ms: 5_000, ..file("only_s.txt", "h1") },
+        ]);
+        let t = snap("windows", vec![
+            Entry { size: 10, mtime_ms: 1_000, ..file("same.txt", "h0") },
+            Entry { size: 20, mtime_ms: 2_000, ..file("upd.txt", "ht") },
+            Entry { size: 4, mtime_ms: 3_000, ..file("only_t.txt", "h2") },
+        ]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        let ev = evidence(&s, &t, &plan, &CompareOptions::default());
+        assert_eq!(ev.metas.len(), plan.ops.len(), "the evidence array must correspond one-to-one with ops");
+        assert_eq!(ev.equal_count, 1);
+        assert_eq!(ev.equal_bytes, 10);
+
+        let by = |name: &str| {
+            let i = plan.ops.iter().position(|o| o.path == name).expect(name);
+            ev.metas[i].clone()
+        };
+        // update row: both sides need their own measured values — today Op.size/mtime can only carry source's
+        let m = by("upd.txt");
+        assert_eq!(m.src.unwrap().size, 30);
+        assert_eq!(m.src.unwrap().mtime_ms, 9_000);
+        assert_eq!(m.dst.unwrap().size, 20);
+        assert_eq!(m.dst.unwrap().mtime_ms, 2_000);
+        // copy row: only the source side exists
+        let m = by("only_s.txt");
+        assert_eq!(m.src.unwrap().size, 7);
+        assert!(m.dst.is_none());
+        // delete row: only the target side exists
+        let m = by("only_t.txt");
+        assert!(m.src.is_none());
+        assert_eq!(m.dst.unwrap().size, 4);
+    }
+
+    #[test]
+    fn same_page_lists_only_equal_files_and_pages() {
+        let mk = |n: usize, h: &str| Entry { size: n as u64, mtime_ms: n as i64 * 1000, ..file(&format!("d{}/f{n}.bin", n % 3), h) };
+        let s = snap("windows", (0..10).map(|n| mk(n, "same")).collect());
+        // The last 3 differ in content on the target side → not counted as equal
+        let t = snap("windows", (0..10).map(|n| mk(n, if n >= 7 { "diff" } else { "same" })).collect());
+        let copts = CompareOptions::default();
+        let (total, rows) = same_page(&s, &t, &copts, "", 0, 100);
+        assert_eq!(total, 7);
+        assert_eq!(rows.len(), 7);
+        // Paging
+        let (total, rows) = same_page(&s, &t, &copts, "", 5, 100);
+        assert_eq!(total, 7, "total is the post-filter total, independent of the paging window");
+        assert_eq!(rows.len(), 2);
+        let (_t, rows) = same_page(&s, &t, &copts, "", 0, 3);
+        assert_eq!(rows.len(), 3);
+        // Substring filter (case-insensitive)
+        let (total, rows) = same_page(&s, &t, &copts, "D1/", 0, 100);
+        assert_eq!(total as usize, rows.len());
+        assert!(rows.iter().all(|r| r.path.starts_with("d1/")));
+        // Both sides' times must be surfaced (identical content, timestamps may differ)
+        assert!(rows.iter().all(|r| r.mtime_ms == r.other_mtime_ms));
+    }
+
+    #[test]
+    fn evidence_follows_move_naming_on_each_side() {
+        // Same-content rename: source is already called b.bin, target is still a.bin — each side is looked up under its own name
+        let s = snap("windows", vec![Entry { size: 42, mtime_ms: 8_000, ..file("b.bin", "hm") }]);
+        let t = snap("windows", vec![Entry { size: 42, mtime_ms: 4_000, ..file("a.bin", "hm") }]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        let i = plan.ops.iter().position(|o| o.action == Action::Move).expect("move");
+        let ev = evidence(&s, &t, &plan, &CompareOptions::default());
+        assert_eq!(ev.metas[i].src.unwrap().mtime_ms, 8_000, "the source side is looked up under the new name b.bin");
+        assert_eq!(ev.metas[i].dst.unwrap().mtime_ms, 4_000, "the target side is looked up under the old name a.bin");
+    }
+}
