@@ -21,10 +21,22 @@ pub struct Job {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub no_hash: bool,
-    /// 严谨级：quick（不 hash，size+mtime）| fast（≥4MB 抽样摘要：头/中/尾各 256KB——比 quick 多内容防线，
-    /// 比 standard 少读约百倍；云盘/媒体库推荐）| standard（全量 hash＋缓存，默认）| paranoid（全量重 hash＋复制后校验）
+    /// 严谨级**快捷预设**：quick | fast | standard | paranoid | custom。
+    /// 预设只是下面四个明细旋钮的宏；明细字段有值时**覆盖**预设对应轴（UI 保存时四项全显式落盘）。
     #[serde(default = "default_rigor")]
     pub rigor: String,
+    /// 内容证据：none（0 读，只看元数据）| sampled（采样窗：size+头/中/尾各 256KB）| full（全量 BLAKE3）
+    #[serde(default)]
+    pub evidence: Option<String>,
+    /// 是否信 (path,size,mtime) 哈希缓存（未变面直接用上次结果，不实读）
+    #[serde(default)]
+    pub use_cache: Option<bool>,
+    /// 分歧升级：抽样摘要相等但 |Δmtime|>2s → 双侧全量重验再裁决（仅 evidence=sampled 时有意义）
+    #[serde(default)]
+    pub escalate: Option<bool>,
+    /// 写后校验：复制流全量 blake3 vs 落盘重读，不合格不 rename
+    #[serde(default)]
+    pub verify_writes: Option<bool>,
     /// 默认 false（大小写不敏感匹配——NTFS/APFS 默认行为）；true 则大小写敏感
     #[serde(default)]
     pub case_sensitive: bool,
@@ -106,6 +118,10 @@ impl Default for Job {
             exclude: Vec::new(),
             no_hash: false,
             rigor: default_rigor(),
+            evidence: None,
+            use_cache: None,
+            escalate: None,
+            verify_writes: None,
             case_sensitive: false,
             symlinks: default_symlinks(),
             versioning: false,
@@ -149,7 +165,58 @@ fn default_max_conflicts() -> i32 {
     5
 }
 
+/// 严谨级的**解析结果**：预设铺底，四个明细 Option 覆盖。
+/// 单一事实来源——scan_opts / apply_opts / 分歧升级门全都从这里取值。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RigorResolved {
+    pub hash: bool,
+    pub sampled: bool,
+    pub use_cache: bool,
+    pub escalate: bool,
+    pub verify_writes: bool,
+}
+
 impl Job {
+    /// 预设 → 基线；明细字段有值则覆盖对应轴；`no_hash`（旧字段）最后强制关哈希
+    pub fn rigor_resolved(&self) -> RigorResolved {
+        let (hash, sampled, use_cache, escalate, verify) = match self.rigor.as_str() {
+            "quick" => (false, false, false, false, false),
+            "fast" => (true, true, true, true, false),
+            "paranoid" => (true, false, false, false, true),
+            _ => (true, true, false, true, true), // standard / custom 基线
+        };
+        let mut r = RigorResolved { hash, sampled, use_cache, escalate, verify_writes: verify };
+        if let Some(e) = self.evidence.as_deref() {
+            match e {
+                "none" => {
+                    r.hash = false;
+                    r.sampled = false;
+                }
+                "full" => {
+                    r.hash = true;
+                    r.sampled = false;
+                }
+                _ => {
+                    r.hash = true;
+                    r.sampled = true; // sampled
+                }
+            }
+        }
+        if let Some(v) = self.use_cache {
+            r.use_cache = v;
+        }
+        if let Some(v) = self.escalate {
+            r.escalate = v;
+        }
+        if let Some(v) = self.verify_writes {
+            r.verify_writes = v;
+        }
+        if self.no_hash {
+            r.hash = false;
+        }
+        r
+    }
+
     pub fn guards(&self, acknowledged: bool) -> crate::preflight::Guards {
         crate::preflight::Guards {
             require_marker: self.require_marker,
@@ -177,9 +244,8 @@ impl Job {
             dry_run: false,
             trash,
             verbose,
-            // 写后校验属于 standard 及以上：T4（传输损坏）是最吓人的静默故障，
-            // 校验成本上界 = 本轮传输量，日常档花得起
-            verify: matches!(self.rigor.as_str(), "standard" | "paranoid"),
+            // 写后校验从解析后的旋钮取值（standard/paranoid 预设默认开；明细可覆盖）
+            verify: self.rigor_resolved().verify_writes,
             versioning: self.versioning,
             fsync: self.fsync,
             filter: Some(crate::filter::PathFilter::build_full_opt(&self.include, &self.exclude, &self.deletable, &self.os_excludes, self.dev_excludes)),
@@ -266,7 +332,12 @@ target = '\\host\share\dir'
 # archive = 'C:\Users\me\AppData\Roaming\syncdash\archive\<名字>.jsonl'   # sync 模式用
 # include = ['*']                       # FFS 过滤器语法白名单（留空 = 全部）
 # exclude = ['*/big_temp/', '*/*.log']  # FFS 语法；默认垃圾/可重建排除已内置
-# rigor = "standard"                    # quick | fast（抽样摘要，云盘/媒体库推荐）| standard | paranoid（复制后校验）
+# rigor = "standard"                    # 快捷预设：quick | fast | standard | paranoid | custom
+# --- 严谨级明细（有值即覆盖预设对应轴；UI 保存时全部显式落盘）---
+# evidence = "sampled"                  # 内容证据：none（0读）| sampled（头/中/尾各256KB）| full（全量）
+# use_cache = false                     # 信 (path,size,mtime) 缓存？fast 预设 true，standard 起 false=每轮实读
+# escalate = true                       # 分歧升级：摘要同而 mtime 差>2s → 双侧全量重验
+# verify_writes = true                  # 写后校验：复制流哈希 vs 落盘重读
 # case_sensitive = false                # 默认大小写不敏感（NTFS/APFS 默认行为）
 # symlinks = "exclude"                  # exclude | direct（同步链接本身）
 # versioning = true                     # 被删/被覆盖文件存进各 root 的 .version_syncDash/
@@ -306,3 +377,44 @@ target = '\\host\share\dir'
 # remote_root = '/Users/xxx/Code/some/dir'
 # remote_exe = '~/Code/Utilities/SyncDash/target/release/syncdash'
 "#;
+
+#[cfg(test)]
+mod rigor_tests {
+    use super::*;
+
+    fn job(rigor: &str) -> Job {
+        Job { rigor: rigor.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn presets_map_to_expected_knobs() {
+        let q = job("quick").rigor_resolved();
+        assert!(!q.hash && !q.use_cache && !q.verify_writes);
+        let f = job("fast").rigor_resolved();
+        assert!(f.hash && f.sampled && f.use_cache && f.escalate && !f.verify_writes);
+        let s = job("standard").rigor_resolved();
+        assert!(s.hash && s.sampled && !s.use_cache && s.escalate && s.verify_writes);
+        let p = job("paranoid").rigor_resolved();
+        assert!(p.hash && !p.sampled && !p.use_cache && p.verify_writes);
+    }
+
+    #[test]
+    fn detail_overrides_beat_preset() {
+        let mut j = job("fast");
+        j.evidence = Some("full".into());
+        j.use_cache = Some(false);
+        j.verify_writes = Some(true);
+        let r = j.rigor_resolved();
+        assert!(r.hash && !r.sampled && !r.use_cache && r.verify_writes);
+        // custom 预设走 standard 基线，再被明细覆盖
+        let mut c = job("custom");
+        c.evidence = Some("none".into());
+        let rc = c.rigor_resolved();
+        assert!(!rc.hash);
+        assert!(rc.verify_writes, "custom base inherits standard verify");
+        // 旧字段 no_hash 最后强制关哈希
+        let mut n = job("paranoid");
+        n.no_hash = true;
+        assert!(!n.rigor_resolved().hash);
+    }
+}

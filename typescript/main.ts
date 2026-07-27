@@ -38,7 +38,9 @@ interface ApplyDto { done: number; skipped: number; errors: number; bytes_copied
 /// M5：编辑器用的完整 Job（与 Rust config::Job 的 serde 形状一一对应）
 interface JobFull {
   mode: string; source: string; target: string; archive?: string | null;
-  include: string[]; exclude: string[]; no_hash: boolean; rigor: string; os_excludes: string; dev_excludes: boolean;
+  include: string[]; exclude: string[]; no_hash: boolean; rigor: string;
+  evidence?: string | null; use_cache?: boolean | null; escalate?: boolean | null; verify_writes?: boolean | null;
+  os_excludes: string; dev_excludes: boolean;
   case_sensitive: boolean; symlinks: string; versioning: boolean;
   remote_host?: string | null; remote_root?: string | null; remote_exe?: string | null;
   require_marker: boolean; min_free_pct: number; max_delete_ratio: number;
@@ -885,7 +887,11 @@ const ED_FIELDS: FSpec[] = [
   { key: 'source', label: 'source 根目录', kind: 'dir', wide: true },
   { key: 'target', label: 'target 根目录', kind: 'dir', wide: true },
   { key: 'archive', label: 'archive 存档文件（sync 模式）', kind: 'file', hint: '留空 = 无；建议 %APPDATA%\\syncdash\\archives\\<名>.jsonl', wide: true },
-  { key: 'rigor', label: '严谨级', kind: 'select', opts: ['quick', 'fast', 'standard', 'paranoid'], hint: 'fast=抽样摘要：大文件只读头/中/尾各256KB，比quick多内容防线、比standard快百倍（云盘/媒体库推荐）' },
+  { key: 'rigor', label: '严谨级（快捷预设）', kind: 'select', opts: ['quick', 'fast', 'standard', 'paranoid', 'custom'], hint: '预设=一键设置下面四项明细；手动改任一项自动变 custom。阶梯：每级本轮实际读得更多' },
+  { key: 'evidence', label: '· 内容证据', kind: 'select', opts: ['none', 'sampled', 'full'], hint: 'none=0读只看元数据 | sampled=size+头/中/尾各256KB | full=全量BLAKE3' },
+  { key: 'use_cache', label: '· 使用哈希缓存（未变面信上次结果，不实读）', kind: 'bool' },
+  { key: 'escalate', label: '· 分歧升级（摘要同而mtime差>2s→双侧全量重验）', kind: 'bool' },
+  { key: 'verify_writes', label: '· 写后校验（复制流全量哈希 vs 落盘重读）', kind: 'bool' },
   { key: 'symlinks', label: 'symlink 策略', kind: 'select', opts: ['exclude', 'direct'] },
   { key: 'case_sensitive', label: '大小写敏感比对', kind: 'bool' },
   { key: 'versioning', label: '版本控制（.version_syncDash）', kind: 'bool', group: '行为' },
@@ -913,7 +919,9 @@ const ED_FIELDS: FSpec[] = [
 function defaultJob(): JobFull {
   return {
     mode: 'mirror', source: '', target: '', archive: null,
-    include: [], exclude: [], no_hash: false, rigor: 'standard', os_excludes: 'auto', dev_excludes: false,
+    include: [], exclude: [], no_hash: false, rigor: 'standard',
+    evidence: 'sampled', use_cache: false, escalate: true, verify_writes: true,
+    os_excludes: 'auto', dev_excludes: false,
     case_sensitive: false, symlinks: 'exclude', versioning: false,
     remote_host: null, remote_root: null, remote_exe: null,
     require_marker: false, min_free_pct: 0.01, max_delete_ratio: 0.5,
@@ -1085,6 +1093,57 @@ function wireEditorPaths() {
   scheduleVerdict();
 }
 
+/// 预设 → 四个明细旋钮的映射（与 Rust config::rigor_resolved 一字对齐）
+const RIGOR_PRESETS: Record<string, { evidence: string; use_cache: boolean; escalate: boolean; verify_writes: boolean }> = {
+  quick: { evidence: 'none', use_cache: false, escalate: false, verify_writes: false },
+  fast: { evidence: 'sampled', use_cache: true, escalate: true, verify_writes: false },
+  standard: { evidence: 'sampled', use_cache: false, escalate: true, verify_writes: true },
+  paranoid: { evidence: 'full', use_cache: false, escalate: false, verify_writes: true },
+};
+
+/// 老任务文件的明细可能是 null（跟随预设）——编辑器里全部实体化显示（保存时显式落盘）
+function applyRigorPresetDefaults(j: JobFull) {
+  const p = RIGOR_PRESETS[j.rigor] ?? RIGOR_PRESETS.standard;
+  if (j.evidence == null) j.evidence = p.evidence;
+  if (j.use_cache == null) j.use_cache = p.use_cache;
+  if (j.escalate == null) j.escalate = p.escalate;
+  if (j.verify_writes == null) j.verify_writes = p.verify_writes;
+}
+
+/// 预设=宏：选预设 → 填四项；手动改任一项 → 预设自动跳 custom（组合恰好命中预设则显示其名）
+function wireRigorMacro() {
+  const q = <T extends HTMLElement>(k: string) => edForm.querySelector(`[data-k="${k}"]`) as T | null;
+  const sel = q<HTMLSelectElement>('rigor');
+  const ev = q<HTMLSelectElement>('evidence');
+  const uc = q<HTMLInputElement>('use_cache');
+  const es = q<HTMLInputElement>('escalate');
+  const vw = q<HTMLInputElement>('verify_writes');
+  if (!sel || !ev || !uc || !es || !vw) return;
+  const syncEnable = () => {
+    const dis = ev.value !== 'sampled';
+    es.disabled = dis;
+    es.title = dis ? '仅 内容证据=sampled 时有意义' : '';
+  };
+  const detect = () => {
+    const hit = Object.entries(RIGOR_PRESETS).find(([, p]) =>
+      p.evidence === ev.value && p.use_cache === uc.checked && p.escalate === es.checked && p.verify_writes === vw.checked);
+    sel.value = hit ? hit[0] : 'custom';
+    syncEnable();
+  };
+  sel.addEventListener('change', () => {
+    const p = RIGOR_PRESETS[sel.value];
+    if (p) {
+      ev.value = p.evidence;
+      uc.checked = p.use_cache;
+      es.checked = p.escalate;
+      vw.checked = p.verify_writes;
+    }
+    syncEnable();
+  });
+  for (const el of [ev as HTMLElement, uc, es, vw]) el.addEventListener('change', detect);
+  detect();
+}
+
 async function openEditor(name?: string, focusGroup?: string) {
   edName = name ?? null;
   $('ed-title').textContent = name ? `编辑任务 — ${name}` : '新任务';
@@ -1093,7 +1152,9 @@ async function openEditor(name?: string, focusGroup?: string) {
   if (name) {
     try { j = await invoke<JobFull>('get_job', { name }); } catch (e) { setStatus(`读取任务失败：${e}`, 'err'); return; }
   }
+  applyRigorPresetDefaults(j);
   edBuild(j, name ?? '');
+  wireRigorMacro();
   $('ed-sched').classList.toggle('hidden', !name);
   editModal.classList.remove('hidden');
   if (focusGroup) {

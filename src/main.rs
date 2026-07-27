@@ -76,10 +76,16 @@ enum Cmd {
         /// 跳过内容 hash（快，但比对退化为 size+mtime，且无法做移动检测）
         #[arg(long)]
         no_hash: bool,
-        /// 严谨级：quick（0 读）| fast（采样+缓存）| standard（每轮实采样每个文件，默认）
+        /// 严谨级预设：quick（0 读）| fast（采样+缓存）| standard（每轮实采样每个文件，默认）
         /// | paranoid（每轮全读每个字节）
         #[arg(long, default_value = "standard")]
         rigor: String,
+        /// 明细覆盖：内容证据 none | sampled | full（覆盖预设）
+        #[arg(long)]
+        evidence: Option<String>,
+        /// 明细覆盖：哈希缓存 on | off（覆盖预设）
+        #[arg(long)]
+        cache: Option<String>,
         /// [兼容旧参] 无视缓存全部重读
         #[arg(long)]
         force_rehash: bool,
@@ -455,18 +461,29 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             Ok(if tot.2 > 0 { 1 } else { 0 })
         }
         Cmd::Gui => launch_desktop(),
-        Cmd::Scan { root, out, no_hash, rigor, force_rehash, fast, symlinks_direct, os_excludes, dev_excludes, exclude, progress } => {
+        Cmd::Scan { root, out, no_hash, rigor, evidence, cache, force_rehash, fast, symlinks_direct, os_excludes, dev_excludes, exclude, progress } => {
             if !root.is_dir() {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
             }
-            // 阶梯映射 + 旧旗标兼容覆盖
+            // 预设铺底 → 明细覆盖 → 旧旗标兼容覆盖
             let (mut hash, mut sampled, mut use_cache) = match rigor.as_str() {
                 "quick" => (false, false, false),
                 "fast" => (true, true, true),
                 "paranoid" => (true, false, false),
-                _ => (true, true, false), // standard
+                _ => (true, true, false), // standard / custom
             };
+            match evidence.as_deref() {
+                Some("none") => { hash = false; sampled = false; }
+                Some("full") => { hash = true; sampled = false; }
+                Some(_) => { hash = true; sampled = true; }
+                None => {}
+            }
+            match cache.as_deref() {
+                Some("on") => use_cache = true,
+                Some("off") => use_cache = false,
+                _ => {}
+            }
             if no_hash { hash = false; }
             if fast { sampled = true; use_cache = true; }
             if force_rehash { use_cache = false; }

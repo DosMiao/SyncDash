@@ -15,13 +15,8 @@ use std::path::Path;
 /// paranoid 本轮实读每个文件的全部字节
 pub fn scan_opts(job: &Job) -> scan::ScanOptions {
     let filter = crate::filter::PathFilter::build_full_opt(&job.include, &job.exclude, &job.deletable, &job.os_excludes, job.dev_excludes);
-    let (hash, sampled, use_cache) = match job.rigor.as_str() {
-        "quick" => (false, false, false),
-        "fast" => (true, true, true),
-        "paranoid" => (true, false, false),
-        _ => (true, true, false), // standard
-    };
-    scan::ScanOptions { hash: hash && !job.no_hash, sampled, use_cache, symlinks_direct: job.symlinks == "direct", filter }
+    let r = job.rigor_resolved();
+    scan::ScanOptions { hash: r.hash, sampled: r.sampled, use_cache: r.use_cache, symlinks_direct: job.symlinks == "direct", filter }
 }
 
 /// sync 成功后刷新 archive：重扫 source、剔除冲突路径（冲突下次继续报，绝不被静默仲裁）。
@@ -126,8 +121,9 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::progress::RunCtx) -> std::io
     );
     let copts = job.compare_opts();
     let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
-    // 分歧升级：抽样证据档（fast/standard）里"摘要相等但 mtime 差 >2s"的文件不许直接判相等
-    let plan = if opt.sampled { escalate_sampled_disagreements(job, plan, &s, &t, ctx) } else { plan };
+    // 分歧升级：抽样证据档里"摘要相等但 mtime 差 >2s"的文件不许直接判相等（旋钮可关）
+    let rr = job.rigor_resolved();
+    let plan = if rr.sampled && rr.escalate { escalate_sampled_disagreements(job, plan, &s, &t, ctx) } else { plan };
     Ok(CompareOutcome { plan, source: s, target: t })
 }
 
@@ -461,7 +457,16 @@ pub fn compare_remote_job_detailed(
     let link = probe_remote(name, job, ctx)?;
 
     // 2) 远端扫描（在远端自己的盘上哈希——比经 UNC 拉数据快得多）
-    let mut scan_args: Vec<String> = vec!["scan".into(), link.rroot.clone(), "--rigor".into(), job.rigor.clone()];
+    // 远端按**解析后**的旋钮显式传参（预设名不够——明细可能被覆盖）
+    let rr = job.rigor_resolved();
+    let mut scan_args: Vec<String> = vec![
+        "scan".into(),
+        link.rroot.clone(),
+        "--evidence".into(),
+        (if !rr.hash { "none" } else if rr.sampled { "sampled" } else { "full" }).into(),
+        "--cache".into(),
+        (if rr.use_cache { "on" } else { "off" }).into(),
+    ];
     if job.dev_excludes {
         scan_args.push("--dev-excludes".into());
     }
