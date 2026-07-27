@@ -11,9 +11,12 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use syncdash::compare::{self, Action, Op, Plan, PlanHeader};
-use syncdash::progress::{Phase, ProgressEvent, ProgressSink, RunCtl, RunCtx};
-use syncdash::{config, run};
+use syncdash::model::plan::{Action, Op, Plan, PlanHeader};
+use syncdash::pipeline::compare;
+use syncdash::model::event::{Phase, ProgressEvent};
+use syncdash::obs::progress::{ProgressSink, RunCtl, RunCtx};
+use syncdash::job;
+use syncdash::run;
 use tauri::Emitter;
 
 #[derive(Serialize, ts_rs::TS)]
@@ -108,8 +111,8 @@ struct PathVerdict {
 
 struct CachedSnaps {
     job: String,
-    source: syncdash::table::Snapshot,
-    target: syncdash::table::Snapshot,
+    source: syncdash::model::table::Snapshot,
+    target: syncdash::model::table::Snapshot,
 }
 
 #[derive(Default)]
@@ -255,7 +258,7 @@ fn make_ctx(app: &tauri::AppHandle, run_id: u64, ctl: Arc<RunCtl>, purpose: &'st
 }
 
 /// 1:N: resolve a multi-target job into "the single-job view of the currently selected target" (the engine's single pipeline is reused as-is)
-fn resolve_target(job: &config::Job, target_index: Option<usize>) -> Result<config::Job, String> {
+fn resolve_target(job: &job::Job, target_index: Option<usize>) -> Result<job::Job, String> {
     job.validate_multi_target()?;
     let list = job.target_list();
     let idx = target_index.unwrap_or(0);
@@ -264,14 +267,14 @@ fn resolve_target(job: &config::Job, target_index: Option<usize>) -> Result<conf
 }
 
 fn user_err(e: std::io::Error) -> String {
-    if syncdash::progress::is_cancelled(&e) { "cancelled".into() } else { e.to_string() }
+    if syncdash::obs::progress::is_cancelled(&e) { "cancelled".into() } else { e.to_string() }
 }
 
 // Commands
 
 #[tauri::command]
 fn list_jobs() -> Vec<JobDto> {
-    config::load_all()
+    job::load_all()
         .into_iter()
         .map(|(name, j)| JobDto {
             name,
@@ -296,28 +299,28 @@ fn list_jobs() -> Vec<JobDto> {
 
 #[tauri::command]
 fn jobs_dir() -> String {
-    config::jobs_dir().display().to_string()
+    syncdash::foundation::dirs::jobs_dir().display().to_string()
 }
 
 /// M5: the editor reads the full Job (the list_jobs DTO is only a summary)
 #[tauri::command]
-fn get_job(name: String) -> Result<config::Job, String> {
-    config::load(&name).map(|(_, j)| j).map_err(|e| e.to_string())
+fn get_job(name: String) -> Result<job::Job, String> {
+    job::load(&name).map(|(_, j)| j).map_err(|e| e.to_string())
 }
 
 /// M5: save a job (create, or overwrite the TOML of the same name)
 #[tauri::command]
-fn save_job(name: String, job: config::Job) -> Result<String, String> {
+fn save_job(name: String, job: job::Job) -> Result<String, String> {
     if name.trim().is_empty() {
         return Err("Job name cannot be empty".into());
     }
-    config::save_job(name.trim(), &job).map(|p| p.display().to_string()).map_err(|e| e.to_string())
+    job::save_job(name.trim(), &job).map(|p| p.display().to_string()).map_err(|e| e.to_string())
 }
 
 /// M5: delete the job's config file (not a single byte of data is touched)
 #[tauri::command]
 fn delete_job(name: String) -> Result<(), String> {
-    config::delete_job(&name).map_err(|e| e.to_string())
+    job::delete_job(&name).map_err(|e| e.to_string())
 }
 
 // P1: path health check and "show in file explorer"
@@ -344,7 +347,7 @@ fn inspect_paths(source: String, target: String) -> PathVerdict {
         PathInfo {
             exists: is_dir || path.is_file(),
             is_dir,
-            has_marker: is_dir && syncdash::preflight::has_marker(path),
+            has_marker: is_dir && syncdash::pipeline::guard::has_marker(path),
         }
     }
     let mut v = PathVerdict { source: info(&source), target: info(&target), warnings: Vec::new() };
@@ -377,7 +380,7 @@ fn inspect_paths(source: String, target: String) -> PathVerdict {
 /// semantics have exactly one implementation, in filter.rs, so a mask tried out in the UI behaves identically once written into the job's exclude.
 #[tauri::command]
 fn mask_match(masks: Vec<String>, paths: Vec<String>) -> Vec<bool> {
-    syncdash::filter::mask_hits(&masks, &paths)
+    syncdash::pipeline::filter::mask_hits(&masks, &paths)
 }
 
 /// Pagination for the "Identical" panel. The data source is the snapshot left by the last compare — no rescan.
@@ -396,7 +399,7 @@ fn list_same(
     if c.job != name {
         return Err(format!("The cache holds the snapshot for '{}'; run Compare again for '{}'", c.job, name));
     }
-    let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
+    let (_n, job) = job::load(&name).map_err(|e| e.to_string())?;
     let (total, rows) = compare::same_page(&c.source, &c.target, &job.compare_opts(), &query, offset, limit.min(2000));
     Ok(SamePage { total, rows, job: c.job.clone() })
 }
@@ -517,20 +520,20 @@ fn reveal(path: String) -> Result<(), String> {
 
 /// M4: run history (newest → oldest). job = null shows everything
 #[tauri::command]
-fn run_history(job: Option<String>, limit: Option<usize>) -> Vec<syncdash::runlog::RunRecord> {
-    syncdash::runlog::history(job.as_deref(), limit.unwrap_or(50))
+fn run_history(job: Option<String>, limit: Option<usize>) -> Vec<syncdash::obs::runlog::RunRecord> {
+    syncdash::obs::runlog::history(job.as_deref(), limit.unwrap_or(50))
 }
 
 /// M4: the most recent run per job — the data behind the sidebar's "last sync" dot
 #[tauri::command]
-fn last_syncs() -> std::collections::HashMap<String, syncdash::runlog::RunRecord> {
-    syncdash::runlog::latest_by_job()
+fn last_syncs() -> std::collections::HashMap<String, syncdash::obs::runlog::RunRecord> {
+    syncdash::obs::runlog::latest_by_job()
 }
 
 /// M4: the detail lines of one run (raw JSONL; line count capped)
 #[tauri::command]
 fn run_detail(detail: String) -> Vec<String> {
-    syncdash::runlog::detail_lines(&detail, 2000)
+    syncdash::obs::runlog::detail_lines(&detail, 2000)
 }
 
 // v0.10: centralized logging and app settings
@@ -538,21 +541,21 @@ fn run_detail(detail: String) -> Vec<String> {
 /// The run list. Unlike `run_history`, this one also folds in **interrupted runs** (the ones missing
 /// from the index that left only a directory behind) — the crashed run is exactly the one worth seeing.
 #[tauri::command]
-fn log_runs(job: Option<String>, limit: Option<usize>) -> Vec<syncdash::runlog::RunRecord> {
-    syncdash::runlog::history_merged(job.as_deref(), limit.unwrap_or(100))
+fn log_runs(job: Option<String>, limit: Option<usize>) -> Vec<syncdash::obs::runlog::RunRecord> {
+    syncdash::obs::runlog::history_merged(job.as_deref(), limit.unwrap_or(100))
 }
 
 /// One artifact of a run (which ∈ run / errors / items / plan / summary).
 /// Line count capped: the apply manifest records everything, one large sync runs to tens of thousands of lines, and shipping all of it over IPC would freeze the UI.
 #[tauri::command]
 fn log_artifact(run_id: String, which: String, max: Option<usize>) -> Vec<String> {
-    syncdash::runlog::artifact_lines(&run_id, &which, max.unwrap_or(5000))
+    syncdash::obs::runlog::artifact_lines(&run_id, &which, max.unwrap_or(5000))
 }
 
 /// The log root directory (the "open folder" button hands it to the existing `reveal`)
 #[tauri::command]
 fn log_dir_path(run_id: Option<String>) -> String {
-    let root = syncdash::runlog::logs_dir();
+    let root = syncdash::obs::runlog::logs_dir();
     match run_id {
         Some(id) if !id.is_empty() => root.join(id).display().to_string(),
         _ => root.display().to_string(),
@@ -563,7 +566,7 @@ fn log_dir_path(run_id: Option<String>) -> String {
 #[tauri::command]
 fn app_log_tail(n: Option<usize>) -> Vec<String> {
     let n = n.unwrap_or(500);
-    let p = syncdash::runlog::logs_dir().join(syncdash::logging::AppLogSink::FILE);
+    let p = syncdash::obs::runlog::logs_dir().join(syncdash::obs::logging::AppLogSink::FILE);
     let Ok(text) = std::fs::read_to_string(p) else {
         return Vec::new();
     };
@@ -572,8 +575,8 @@ fn app_log_tail(n: Option<usize>) -> Vec<String> {
 }
 
 #[tauri::command]
-fn get_settings() -> syncdash::settings::AppSettings {
-    syncdash::settings::load()
+fn get_settings() -> syncdash::store::settings::AppSettings {
+    syncdash::store::settings::load()
 }
 
 /// Save settings. `migrate` = move the whole old directory over when the log directory changes.
@@ -581,16 +584,16 @@ fn get_settings() -> syncdash::settings::AppSettings {
 /// The old location must be resolved **before** the new config is written — ask afterwards and you only get the new value.
 #[tauri::command]
 fn save_settings(
-    s: syncdash::settings::AppSettings,
+    s: syncdash::store::settings::AppSettings,
     migrate: bool,
-) -> Result<syncdash::settings::MigrateReport, String> {
-    let old_dir = syncdash::settings::load().wanted_log_dir();
+) -> Result<syncdash::store::settings::MigrateReport, String> {
+    let old_dir = syncdash::store::settings::load().wanted_log_dir();
     let new_dir = s.wanted_log_dir();
-    syncdash::settings::save(&s).map_err(|e| e.to_string())?;
+    syncdash::store::settings::save(&s).map_err(|e| e.to_string())?;
     if migrate && old_dir != new_dir {
-        Ok(syncdash::settings::migrate_log_dir(&old_dir, &new_dir))
+        Ok(syncdash::store::settings::migrate_log_dir(&old_dir, &new_dir))
     } else {
-        Ok(syncdash::settings::MigrateReport::default())
+        Ok(syncdash::store::settings::MigrateReport::default())
     }
 }
 
@@ -679,13 +682,13 @@ async fn compare_job(
     let st = state.inner().clone();
     let cache = snaps.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
+        let (_n, job) = job::load(&name).map_err(|e| e.to_string())?;
         let job = resolve_target(&job, target_index)?;
         let (run_id, ctl) = begin_run(&st)?;
         let ctx = make_ctx(&app, run_id, ctl, "compare");
         // Take over the process-level log outlet during compare too: the diagnostics in `trash`/`lock`/`scan`
         // that cannot reach a ctx go through the macro registry, and without installing here they fall back to stderr — in a windowed build that means never said.
-        let _log_guard = syncdash::progress::install(ctx.sink.clone());
+        let _log_guard = syncdash::obs::progress::install(ctx.sink.clone());
         let t0 = std::time::Instant::now();
         let ts_ms = syncdash::foundation::time::now_ms() as i64;
         // M3: remote jobs take the remote pipeline (scanning on the remote's own disk) instead of silently falling into the local one
@@ -697,13 +700,13 @@ async fn compare_job(
         end_run(&st);
         // compare has no side effects: one index line, no directory. A 30s watch cycle = 2880 runs a day,
         // and creating a directory each time would flood the log disk.
-        syncdash::runlog::compare_summary(
+        syncdash::obs::runlog::compare_summary(
             &name,
             if job.remote_host.is_some() { "remote-compare" } else { "compare" },
             ts_ms,
             r.as_ref().map(|o| o.plan.ops.len() as u64).unwrap_or(0),
             t0.elapsed().as_millis() as u64,
-            r.as_ref().err().map(syncdash::progress::is_cancelled).unwrap_or(false),
+            r.as_ref().err().map(syncdash::obs::progress::is_cancelled).unwrap_or(false),
         );
         let out = r.map_err(user_err)?;
         let reversed = out.plan.ops.iter().map(compare::reverse_op).collect();
@@ -731,7 +734,7 @@ async fn compare_job(
 #[tauri::command]
 async fn preflight(name: String, plan: PlanDto, ops: Vec<Op>, acknowledged: bool, target_index: Option<usize>) -> Result<PreflightDto, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
+        let (_n, job) = job::load(&name).map_err(|e| e.to_string())?;
         let job = resolve_target(&job, target_index)?;
         let full = Plan { header: plan.header.clone(), ops: plan.ops.clone() };
         let ops: Vec<Op> = ops
@@ -762,7 +765,7 @@ async fn apply_job(
 ) -> Result<ApplyDto, String> {
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (_n, job) = config::load(&name).map_err(|e| e.to_string())?;
+        let (_n, job) = job::load(&name).map_err(|e| e.to_string())?;
         let job = resolve_target(&job, target_index)?;
         let full = Plan { header: plan.header.clone(), ops: plan.ops.clone() };
         let ops: Vec<Op> = ops
@@ -784,7 +787,7 @@ async fn apply_job(
         let t0 = std::time::Instant::now();
         let remote = job.remote_host.is_some();
         let rec =
-            syncdash::runlog::Recorder::start(&name, if remote { "remote-apply" } else { "apply" }, &ctx, &ops);
+            syncdash::obs::runlog::Recorder::start(&name, if remote { "remote-apply" } else { "apply" }, &ctx, &ops);
         let out = if remote {
             match run::apply_remote_job_with(&name, &job, &full, &ops, false, acknowledged, &rec.ctx) {
                 Ok(o) => o,
@@ -811,15 +814,15 @@ async fn apply_job(
 }
 
 fn main() {
-    syncdash::scan::init_worker_pool();
+    syncdash::pipeline::scan::init_worker_pool();
     // A windowed build has no console — the only home for diagnostics outside a run (settings parse
     // failures, pruning, migration) is app.jsonl. `_log` must live until the process exits: writing
     // `let _ = …` drops it on the spot and the sink is unhooked immediately.
-    let cfg = syncdash::settings::load();
-    let _log = std::sync::Arc::new(syncdash::logging::AppLogSink::open(&cfg.resolved_log_dir(), cfg.level));
-    let _log_guard = syncdash::progress::install(_log.clone());
+    let cfg = syncdash::store::settings::load();
+    let _log = std::sync::Arc::new(syncdash::obs::logging::AppLogSink::open(&cfg.resolved_log_dir(), cfg.level));
+    let _log_guard = syncdash::obs::progress::install(_log.clone());
     // Retention runs once at startup: the apply manifest records everything and grows without a gate
-    let dropped = syncdash::runlog::prune(cfg.keep_days, cfg.max_total_mb);
+    let dropped = syncdash::obs::runlog::prune(cfg.keep_days, cfg.max_total_mb);
     if dropped > 0 {
         syncdash::log_info!("app", "Log cleanup: removed the records of {dropped} runs");
     }
@@ -853,7 +856,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syncdash::compare::{Action, Side, SideMeta};
+    use syncdash::model::plan::{Action, Side};
+use syncdash::pipeline::compare::SideMeta;
 
     #[test]
     fn civil_from_days_matches_known_dates() {
