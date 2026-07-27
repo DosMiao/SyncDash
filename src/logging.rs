@@ -1,23 +1,25 @@
-//! v0.10：集中日志。
+//! v0.10: centralised logging.
 //!
-//! **为什么不引 tracing/log**：项目里已经有一条贯穿全管线的事件总线
-//! （`progress::ProgressSink`），`RunCtx` 已经传到每个引擎函数，`runlog::ErrCollector`
-//! 也已经示范过 sink 装饰器写法。再叠一套 facade 只会让同一件事有两个出口。
-//! 本模块做的事只有一件：把旁路的 `eprintln!` 并进那条已有的总线。
+//! **Why not pull in tracing/log**: the project already has one event bus running through the whole
+//! pipeline (`progress::ProgressSink`), `RunCtx` already reaches every engine function, and
+//! `runlog::ErrCollector` has already demonstrated the sink-decorator pattern. Stacking another
+//! facade on top would only give one thing two outlets.
+//! This module does exactly one thing: it merges the stray `eprintln!`s into that existing bus.
 //!
-//! **为什么需要宏 + 进程级注册表**：`trash.rs` / `version.rs` / `lock.rs` 里的调用点
-//! 拿不到 `RunCtx`，改签名会波及几十个函数。注册表让它们零签名改动进总线；
-//! 拿得到 ctx 的地方仍然直接 `ctx.log()`，不绕这一圈。
+//! **Why macros plus a process-wide registry**: the call sites in `trash.rs` / `version.rs` / `lock.rs`
+//! have no `RunCtx`, and changing signatures would ripple through dozens of functions. The registry
+//! puts them on the bus with zero signature churn; where ctx is in hand the code still calls `ctx.log()` directly.
 //!
-//! **没装 sink 时按原文打 stderr** —— 这样"改造前后 CLI 输出逐字节相同"成立，
-//! 换线（P3）的正确性不依赖桌面壳或 CLI 有没有把 sink 装上。
+//! **With no sink installed, print verbatim to stderr** — this is what makes "CLI output is byte-for-byte
+//! identical before and after the rework" hold, so the correctness of the swap (P3) does not depend on
+//! whether the desktop shell or the CLI installed a sink.
 
 use crate::progress::{current, LogLevel, ProgressEvent, ProgressSink};
 use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// 宏的落点。没人接管时按原文进 stderr——即改造前的行为。
+/// Where the macros land. With nobody holding the sink it goes verbatim to stderr — the pre-rework behavior.
 pub fn emit(level: LogLevel, scope: &str, message: String) {
     match current() {
         Some(s) => s.emit(ProgressEvent::Log {
@@ -30,8 +32,8 @@ pub fn emit(level: LogLevel, scope: &str, message: String) {
     }
 }
 
-/// `log_info!("run", "远端 {host}: {os}")` —— 参数与 `format!` 一致。
-/// 消息里保留调用点原有的前缀（`[job] warning: …`），换线才不改变 CLI 输出的一个字节。
+/// `log_info!("run", "remote {host}: {os}")` — the arguments match `format!`.
+/// Messages keep the prefix the call site already had (`[job] warning: …`), so the swap does not change one byte of CLI output.
 #[macro_export]
 macro_rules! log_info {
     ($scope:expr, $($arg:tt)*) => {
@@ -54,10 +56,10 @@ macro_rules! log_error {
 }
 
 
-/// CLI 的老行为：`Log` 按原文进 stderr。
+/// The CLI's old behavior: `Log` goes verbatim to stderr.
 ///
-/// 只认 `Log`——`Error` 事件在换线后各自也会带一条 `Log`（`apply::record` 里
-/// 两者都发），两边都打会让输出翻倍。
+/// Only `Log` — after the swap every `Error` event also carries a `Log` alongside it (`apply::record`
+/// emits both), and printing both would double the output.
 pub struct StderrSink {
     pub min_level: LogLevel,
 }
@@ -72,7 +74,7 @@ impl ProgressSink for StderrSink {
     }
 }
 
-/// 把一个事件分发给多个 sink（桌面：TauriSink + FileSink）。
+/// Fan one event out to several sinks (desktop: TauriSink + FileSink).
 pub struct MultiSink(Vec<Arc<dyn ProgressSink>>);
 
 impl MultiSink {
@@ -89,11 +91,11 @@ impl ProgressSink for MultiSink {
     }
 }
 
-/// 每 N 行 flush 一次的追加写。
+/// Append writer that flushes every N lines.
 ///
-/// BufWriter 直接用会让 Ctrl-C 丢掉整条尾巴（进程被杀，Drop 不跑）；每行都 flush
-/// 又太贵——items.jsonl 动辄上万行。折中：攒够 `FLUSH_EVERY` 行落一次，
-/// 报错与阶段边界强制落。
+/// A bare BufWriter loses the whole tail on Ctrl-C (the process is killed, Drop never runs); flushing
+/// every line is too expensive — items.jsonl routinely runs to tens of thousands of lines. The
+/// compromise: flush once `FLUSH_EVERY` lines have piled up, and force a flush on errors and phase boundaries.
 struct Appender {
     w: std::io::BufWriter<std::fs::File>,
     since_flush: u32,
@@ -106,7 +108,7 @@ impl Appender {
         match std::fs::File::create(path) {
             Ok(f) => Some(Appender { w: std::io::BufWriter::new(f), since_flush: 0 }),
             Err(e) => {
-                eprintln!("logging: 建不出 {}：{e}", path.display());
+                eprintln!("logging: cannot create {}: {e}", path.display());
                 None
             }
         }
@@ -129,10 +131,10 @@ impl Appender {
     }
 }
 
-/// 一次运行的三路落盘：run.jsonl（叙事）/ errors.jsonl（报错清单）/ items.jsonl（执行清单）。
+/// Three-way persistence for one run: run.jsonl (narration) / errors.jsonl (error detail) / items.jsonl (execution detail).
 ///
-/// 所有 IO best-effort——沿用 `runlog` 的老规矩：**日志绝不让同步失败**。
-/// 哪一份开不出来就只是那一份缺席。
+/// All IO is best-effort — following `runlog`'s standing rule: **logging must never fail a sync**.
+/// Whichever file cannot be opened is simply the one that goes missing.
 pub struct FileSink {
     run: Mutex<Option<Appender>>,
     errors: Mutex<Option<Appender>>,
@@ -175,8 +177,8 @@ impl FileSink {
 
 impl ProgressSink for FileSink {
     fn emit(&self, ev: ProgressEvent) {
-        // Progress 太密（每文件 / 每 1MiB 块一条），落盘只会把叙事淹掉。
-        // "到哪了"是给界面看的，"做了什么"才归档——后者在 ItemResult 里。
+        // Progress is far too dense (one per file / per 1MiB chunk); persisting it would only drown the
+        // narration. "Where are we" is for the UI, "what was done" is what gets archived — the latter is in ItemResult.
         if matches!(ev, ProgressEvent::Progress { .. }) {
             return;
         }
@@ -189,7 +191,7 @@ impl ProgressSink for FileSink {
             return;
         };
         match &ev {
-            // 执行清单只进 items.jsonl：上万行混进 run.jsonl 会让叙事没法读
+            // The execution detail goes only to items.jsonl: tens of thousands of lines mixed into run.jsonl would make the narration unreadable
             ProgressEvent::ItemResult { .. } => Self::put(&self.items, &line, false),
             ProgressEvent::Error { .. } => {
                 Self::put(&self.run, &line, true);
@@ -202,7 +204,7 @@ impl ProgressSink for FileSink {
                     Self::put(&self.errors, &line, true);
                 }
             }
-            // 阶段边界与终态顺手全落盘——Ctrl-C 时尾巴才不至于整段丢
+            // Phase boundaries and terminal states flush everything while we are here — so Ctrl-C does not take the whole tail with it
             ProgressEvent::PhaseStart { .. } | ProgressEvent::Summary { .. } => {
                 Self::put(&self.run, &line, true);
                 self.flush_all();
@@ -218,8 +220,8 @@ impl Drop for FileSink {
     }
 }
 
-/// app 级滚动日志（运行之外的事件：启动、设置错误、prune、迁移）。
-/// 单文件追加，每条都 flush——这些事件稀疏且都发生在"可能马上就要出事"的时刻。
+/// App-level rolling log (events outside a run: startup, settings errors, prune, migration).
+/// Single-file append, flushed per line — these events are sparse and all happen at moments where something may be about to go wrong.
 pub struct AppLogSink {
     w: Mutex<Option<std::fs::File>>,
     min_level: LogLevel,
@@ -258,7 +260,7 @@ mod tests {
     use super::*;
     use crate::progress::ItemOutcome;
 
-    /// 装 sink 用的是进程级单槽，装卸类测试必须串行跑
+    /// Installing a sink uses a process-wide single slot, so install/uninstall tests must run serially
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn ev_log(level: LogLevel, msg: &str) -> ProgressEvent {
@@ -284,12 +286,12 @@ mod tests {
                 let _gb = crate::progress::install(b);
                 emit(LogLevel::Info, "t", "inner".into());
             }
-            // 内层 guard 落地后必须还原到 a——否则下一次运行的日志会串目录
+            // Once the inner guard lands it must restore a — otherwise the next run's log cross-contaminates the directory
             emit(LogLevel::Info, "t", "after".into());
         }
-        assert_eq!(sa.lock().unwrap().len(), 2, "外层 sink 应收到 first + after");
-        assert_eq!(sb.lock().unwrap().len(), 1, "内层 sink 只收到 inner");
-        // guard 全落地后回到"无人接管"
+        assert_eq!(sa.lock().unwrap().len(), 2, "the outer sink should receive first + after");
+        assert_eq!(sb.lock().unwrap().len(), 1, "the inner sink receives only inner");
+        // Once every guard has landed we are back to "nobody holding the sink"
         assert!(current().is_none());
     }
 
@@ -318,7 +320,7 @@ mod tests {
                 bytes: 0,
                 ms: 3,
             });
-            // Progress 不落盘（太密）
+            // Progress is not persisted (too dense)
             fs_sink.emit(ProgressEvent::Progress {
                 phase: crate::progress::Phase::Apply,
                 ts_ms: 1,
@@ -333,11 +335,11 @@ mod tests {
         let run = read(FileSink::RUN);
         let errors = read(FileSink::ERRORS);
         let items = read(FileSink::ITEMS);
-        assert_eq!(run.lines().count(), 3, "run.jsonl = info + warn + error，不含 item/progress：\n{run}");
-        assert!(!run.contains("\"progress\""), "Progress 不该落盘");
-        assert_eq!(errors.lines().count(), 2, "errors.jsonl = warn + error：\n{errors}");
-        assert!(!errors.contains("narrative"), "info 不进报错清单");
-        assert_eq!(items.lines().count(), 1, "items.jsonl 只收 ItemResult：\n{items}");
+        assert_eq!(run.lines().count(), 3, "run.jsonl = info + warn + error, no item/progress:\n{run}");
+        assert!(!run.contains("\"progress\""), "Progress must not be persisted");
+        assert_eq!(errors.lines().count(), 2, "errors.jsonl = warn + error:\n{errors}");
+        assert!(!errors.contains("narrative"), "info does not go into the error detail");
+        assert_eq!(items.lines().count(), 1, "items.jsonl takes only ItemResult:\n{items}");
         assert!(items.contains("\"failed\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -352,7 +354,7 @@ mod tests {
             fs_sink.emit(ev_log(LogLevel::Error, "boom"));
         }
         let run = std::fs::read_to_string(dir.join(FileSink::RUN)).unwrap();
-        assert_eq!(run.lines().count(), 1, "level=warn 时 info 被挡掉：\n{run}");
+        assert_eq!(run.lines().count(), 1, "at level=warn, info is blocked:\n{run}");
         assert!(run.contains("boom"));
         let _ = std::fs::remove_dir_all(&dir);
     }

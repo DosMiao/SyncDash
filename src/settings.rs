@@ -1,11 +1,11 @@
-//! v0.10：app 级设置。
+//! v0.10: app-level settings.
 //!
-//! 今天项目里只有 per-job TOML（`config.rs`）与前端 localStorage——"日志目录可配置"
-//! 需要一个 app 级落点，这是第一个。位置：`<config>/settings.toml`，
-//! 与 `config::jobs_dir()` 同级。
+//! Until now the project had only per-job TOML (`config.rs`) and frontend localStorage — "a
+//! configurable log directory" needs an app-level home, and this is the first one. Location:
+//! `<config>/settings.toml`, alongside `config::jobs_dir()`.
 //!
-//! 规矩同 `runlog`：**设置读不出来不该拦住同步**。解析失败、目录不可写，一律回退到
-//! 能用的值并留一条日志，绝不向上抛。
+//! Same rule as `runlog`: **failing to read settings must never block a sync**. A parse failure or an
+//! unwritable directory always falls back to a usable value and leaves a log line — never propagates up.
 
 use crate::progress::LogLevel;
 use serde::{Deserialize, Serialize};
@@ -14,25 +14,25 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct AppSettings {
-    /// 空 = 默认 `<config>/logs`
+    /// Empty = default `<config>/logs`
     #[serde(default)]
     pub log_dir: String,
-    /// 低于这个等级的 `Log` 事件不落盘
+    /// `Log` events below this level are not written to disk
     #[serde(default = "default_level")]
     pub level: LogLevel,
-    /// 超过这个天数的运行记录会被清理；0 = 不按天清
+    /// Run records older than this many days get pruned; 0 = no day-based pruning
     #[serde(default = "default_keep_days")]
     #[ts(type = "number")]
     pub keep_days: u64,
-    /// 日志总量上限（MB），超了从最旧的删起；0 = 不限
+    /// Total log size cap (MB); over it, the oldest go first. 0 = unlimited
     #[serde(default = "default_max_total_mb")]
     #[ts(type = "number")]
     pub max_total_mb: u64,
-    /// compare 运行的记录粒度：`summary`（只写索引行，不建目录）| `off`。
-    /// 不给 `full` 档：watch 30s 一轮 = 一天 2880 次，建目录会把日志盘冲垮。
+    /// Logging granularity for compare runs: `summary` (index line only, no directory) | `off`.
+    /// No `full` tier: watch on a 30s cycle = 2880 runs a day, and creating a directory each time would swamp the log disk.
     #[serde(default = "default_log_compare")]
     pub log_compare: String,
-    /// CLI：日志同时按原文进 stderr（保持改造前的终端体验）
+    /// CLI: also mirror log lines verbatim to stderr (keeps the pre-refactor terminal experience)
     #[serde(default = "default_true")]
     pub mirror_stderr: bool,
 }
@@ -66,7 +66,7 @@ fn default_true() -> bool {
     true
 }
 
-/// 配置根 = jobs 目录的父级（`jobs_dir()` 是 `<config>/jobs`）
+/// Config root = the parent of the jobs directory (`jobs_dir()` is `<config>/jobs`)
 pub fn config_dir() -> PathBuf {
     crate::config::jobs_dir().parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
 }
@@ -80,7 +80,7 @@ pub fn default_log_dir() -> PathBuf {
 }
 
 impl AppSettings {
-    /// 配置里写的目录（未必存在/可写）。迁移时要拿它当"旧位置"，所以单列。
+    /// The directory named in the config (may not exist, may not be writable). Migration needs it as the "old location", hence its own accessor.
     pub fn wanted_log_dir(&self) -> PathBuf {
         if self.log_dir.trim().is_empty() {
             default_log_dir()
@@ -89,8 +89,8 @@ impl AppSettings {
         }
     }
 
-    /// 实际可用的日志目录：配置值 → 建不出来退默认 → 默认也不行退临时目录。
-    /// **绝不返回一个写不了的路径**——日志系统要么能写，要么安静地换个地方写。
+    /// The log directory that actually works: configured value → if it can't be created, the default → if that fails too, the temp dir.
+    /// **Never returns a path that can't be written** — the logging system either writes, or quietly writes somewhere else.
     pub fn resolved_log_dir(&self) -> PathBuf {
         let want = self.wanted_log_dir();
         if std::fs::create_dir_all(&want).is_ok() {
@@ -98,7 +98,7 @@ impl AppSettings {
         }
         let fallback = default_log_dir();
         if want != fallback && std::fs::create_dir_all(&fallback).is_ok() {
-            eprintln!("settings: 日志目录 {} 不可用，回退 {}", want.display(), fallback.display());
+            eprintln!("settings: log dir {} unusable, falling back to {}", want.display(), fallback.display());
             return fallback;
         }
         std::env::temp_dir().join("syncdash-logs")
@@ -109,12 +109,12 @@ impl AppSettings {
     }
 }
 
-/// 读设置。文件不存在或读坏了都回默认。
+/// Read the settings. A missing file or a broken one both fall back to the defaults.
 pub fn load() -> AppSettings {
     let p = settings_path();
     match std::fs::read_to_string(&p) {
         Ok(t) => toml::from_str(&t).unwrap_or_else(|e| {
-            eprintln!("settings: {} 解析失败，改用默认值：{e}", p.display());
+            eprintln!("settings: {} failed to parse, using defaults: {e}", p.display());
             AppSettings::default()
         }),
         Err(_) => AppSettings::default(),
@@ -131,7 +131,7 @@ pub fn save(s: &AppSettings) -> std::io::Result<PathBuf> {
     Ok(p)
 }
 
-// ---------- 改日志目录时的整体迁移 ----------
+// wholesale migration when the log directory changes
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
@@ -142,15 +142,15 @@ pub struct MigrateReport {
     pub skipped: u64,
     #[ts(type = "number")]
     pub failed: u64,
-    /// 人话说明，界面直接贴出来
+    /// Plain-language explanation, pasted straight into the UI
     pub messages: Vec<String>,
 }
 
-/// 把 `old` 下的运行目录与索引搬到 `new`。全程 best-effort：
-/// - 同目录 / 旧目录不存在 → 直接返回
-/// - 目标已有同名运行目录 → 跳过（不覆盖别人的历史）
-/// - `runs.jsonl` 两边都有 → 按 ts_ms 归并重写
-/// - 跨盘 `rename` 失败 → copy + delete 兜底（Windows 上跨卷 rename 必失败）
+/// Move the run directories and the index under `old` into `new`. Best-effort throughout:
+/// - same directory / old directory missing → return right away
+/// - a run directory of that name already in the target → skip (never overwrite someone else's history)
+/// - `runs.jsonl` on both sides → merge and rewrite in ts_ms order
+/// - cross-volume `rename` fails → fall back to copy + delete (on Windows a cross-volume rename always fails)
 pub fn migrate_log_dir(old: &Path, new: &Path) -> MigrateReport {
     let mut r = MigrateReport::default();
     if old == new || !old.is_dir() {
@@ -158,12 +158,12 @@ pub fn migrate_log_dir(old: &Path, new: &Path) -> MigrateReport {
     }
     if let Err(e) = std::fs::create_dir_all(new) {
         r.failed += 1;
-        r.messages.push(format!("目标目录建不出来 {}：{e}", new.display()));
+        r.messages.push(format!("cannot create target directory {}: {e}", new.display()));
         return r;
     }
     let Ok(rd) = std::fs::read_dir(old) else {
         r.failed += 1;
-        r.messages.push(format!("旧目录读不了：{}", old.display()));
+        r.messages.push(format!("cannot read old directory: {}", old.display()));
         return r;
     };
     for e in rd.flatten() {
@@ -183,13 +183,13 @@ pub fn migrate_log_dir(old: &Path, new: &Path) -> MigrateReport {
         move_entry(&from, &to, &mut r);
     }
     if r.moved > 0 || r.failed > 0 {
-        r.messages.push(format!("迁移完成：{} 搬运，{} 跳过，{} 失败", r.moved, r.skipped, r.failed));
+        r.messages.push(format!("migration done: {} moved, {} skipped, {} failed", r.moved, r.skipped, r.failed));
     }
     r
 }
 
-/// 归并两份索引。索引是追加式 JSONL，`latest_by_job` 靠"后写的更新"取最近一次运行——
-/// 首尾相接会让这个判据失真，所以按 ts_ms 排序后重写。
+/// Merge two indexes. The index is append-only JSONL, and `latest_by_job` uses "written later = newer" to pick
+/// the most recent run — plain concatenation would distort that, so we sort by ts_ms and rewrite.
 fn merge_index(from: &Path, into: &Path, r: &mut MigrateReport) {
     let mut lines: Vec<(i64, String)> = Vec::new();
     for p in [from, into] {
@@ -217,13 +217,13 @@ fn merge_index(from: &Path, into: &Path, r: &mut MigrateReport) {
         }
         Err(e) => {
             r.failed += 1;
-            r.messages.push(format!("索引归并失败：{e}"));
+            r.messages.push(format!("index merge failed: {e}"));
         }
     }
 }
 
 fn move_entry(from: &Path, to: &Path, r: &mut MigrateReport) {
-    // 同卷 rename 是原子且瞬时的；跨卷（换到别的盘就是）必失败，落到 copy+delete
+    // A same-volume rename is atomic and instant; a cross-volume one (i.e. moving to another drive) always fails, so fall through to copy+delete
     if std::fs::rename(from, to).is_ok() {
         r.moved += 1;
         return;
@@ -233,14 +233,14 @@ fn move_entry(from: &Path, to: &Path, r: &mut MigrateReport) {
         Ok(_) => {
             let removed = if from.is_dir() { std::fs::remove_dir_all(from) } else { std::fs::remove_file(from) };
             if let Err(e) = removed {
-                // 复制成功但旧件删不掉：新位置数据是齐的，不算失败——说清楚就行
-                r.messages.push(format!("已复制但旧件删不掉 {}：{e}", from.display()));
+                // Copy succeeded but the old item won't delete: the data at the new location is complete, so not a failure — just say so
+                r.messages.push(format!("copied, but the old item could not be deleted {}: {e}", from.display()));
             }
             r.moved += 1;
         }
         Err(e) => {
             r.failed += 1;
-            r.messages.push(format!("搬运失败 {}：{e}", from.display()));
+            r.messages.push(format!("move failed {}: {e}", from.display()));
         }
     }
 }
@@ -275,7 +275,7 @@ mod tests {
         let text = toml::to_string_pretty(&s).unwrap();
         let back: AppSettings = toml::from_str(&text).unwrap();
         assert_eq!(s, back);
-        // 缺字段的老配置文件必须能读——每个字段都有 serde default
+        // Old config files with missing fields must still load — every field has a serde default
         let partial: AppSettings = toml::from_str("log_dir = ''").unwrap();
         assert_eq!(partial.level, LogLevel::Info);
         assert_eq!(partial.keep_days, 30);
@@ -290,16 +290,16 @@ mod tests {
         std::fs::create_dir_all(old.join("20260101-000000-a-apply")).unwrap();
         std::fs::write(old.join("20260101-000000-a-apply").join("run.jsonl"), "x\n").unwrap();
         std::fs::create_dir_all(old.join("20260102-000000-b-apply")).unwrap();
-        // 目标已有同名 → 必须跳过，不能覆盖别人的历史
+        // Same name already in the target → must skip, must not overwrite someone else's history
         std::fs::create_dir_all(new.join("20260102-000000-b-apply")).unwrap();
         std::fs::write(new.join("20260102-000000-b-apply").join("keep"), "mine").unwrap();
 
         let r = migrate_log_dir(&old, &new);
-        assert_eq!(r.moved, 1, "只搬 a；b 撞名跳过：{r:?}");
+        assert_eq!(r.moved, 1, "only a moves; b collides by name and is skipped: {r:?}");
         assert_eq!(r.skipped, 1);
         assert_eq!(r.failed, 0);
         assert!(new.join("20260101-000000-a-apply").join("run.jsonl").is_file());
-        assert!(new.join("20260102-000000-b-apply").join("keep").is_file(), "撞名的一份不能被覆盖");
+        assert!(new.join("20260102-000000-b-apply").join("keep").is_file(), "the colliding one must not be overwritten");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -319,8 +319,8 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["ts_ms"].as_i64().unwrap())
             .collect();
-        assert_eq!(ts, vec![10, 20, 30], "归并后必须按时间有序——latest_by_job 靠后写的更新");
-        assert!(!old.join(idx).exists(), "归并后旧索引应删掉");
+        assert_eq!(ts, vec![10, 20, 30], "after merging it must be in time order — latest_by_job relies on written-later = newer");
+        assert!(!old.join(idx).exists(), "the old index should be deleted after merging");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -334,14 +334,14 @@ mod tests {
 
     #[test]
     fn resolved_log_dir_falls_back_when_unwritable() {
-        // 把一个**文件**当目录填进设置：create_dir_all 必失败 → 必须回退到能写的地方
+        // Put a **file** into the setting where a directory belongs: create_dir_all must fail → it has to fall back somewhere writable
         let root = tmp("fallback");
         let f = root.join("not-a-dir");
         std::fs::write(&f, "x").unwrap();
         let s = AppSettings { log_dir: f.display().to_string(), ..Default::default() };
         let got = s.resolved_log_dir();
-        assert_ne!(got, f, "不能返回一个写不了的路径");
-        assert!(got.is_dir(), "回退目标必须真的存在：{}", got.display());
+        assert_ne!(got, f, "must not return a path that cannot be written");
+        assert!(got.is_dir(), "the fallback target must actually exist: {}", got.display());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

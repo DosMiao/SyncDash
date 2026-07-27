@@ -1,36 +1,36 @@
-//! 相对路径的字符串操作。
+//! String operations on relative paths.
 //!
-//! 全仓约定：表里的 rel 一律 `/` 分隔，只有落到真实文件系统时才转本地分隔符。
+//! Repo-wide rule: rel in the tables is always `/`-separated; it only becomes the native separator when it lands on a real filesystem.
 
 use std::path::{Path, PathBuf};
 
-/// 表里的 rel（`/` 分隔）→ 本地分隔符。
+/// Table rel (`/`-separated) → native separator.
 pub fn to_native(rel: &str) -> String {
     if cfg!(windows) { rel.replace('/', "\\") } else { rel.to_string() }
 }
 
-/// root + rel → 真实路径。
+/// root + rel → real path.
 pub fn join_native(root: &Path, rel: &str) -> PathBuf {
     root.join(to_native(rel))
 }
 
-/// 本地路径 → 表里的 rel。不在 root 下时返回 None。
+/// Native path → table rel. Returns None when it is not under root.
 pub fn to_rel(path: &Path, root: &Path) -> Option<String> {
     let r = path.strip_prefix(root).ok()?;
     Some(r.to_string_lossy().replace('\\', "/"))
 }
 
-/// 末段之前的部分，不含结尾的 `/`。顶层返回 None。
+/// Everything before the last segment, without the trailing `/`. None at top level.
 pub fn parent(rel: &str) -> Option<&str> {
     rel.rfind('/').map(|i| &rel[..i])
 }
 
-/// 末段。
+/// The last segment.
 pub fn base_name(rel: &str) -> &str {
     rel.rsplit('/').next().unwrap_or(rel)
 }
 
-/// 拆成 (含尾 `/` 的目录前缀, 末段)。顶层时目录前缀是空串。
+/// Split into (directory prefix including the trailing `/`, last segment). At top level the prefix is empty.
 pub fn split_parent(rel: &str) -> (&str, &str) {
     match rel.rfind('/') {
         Some(i) => (&rel[..=i], &rel[i + 1..]),
@@ -38,7 +38,7 @@ pub fn split_parent(rel: &str) -> (&str, &str) {
     }
 }
 
-/// 拆成 (主干, 含点的扩展名)。隐藏文件（`.gitignore`）整体算主干，不当扩展名。
+/// Split into (stem, extension including the dot). A hidden file (`.gitignore`) counts entirely as stem, with no extension.
 pub fn split_ext(name: &str) -> (&str, &str) {
     match name.rfind('.') {
         Some(i) if i > 0 => (&name[..i], &name[i..]),
@@ -46,15 +46,16 @@ pub fn split_ext(name: &str) -> (&str, &str) {
     }
 }
 
-/// 从 root 的写法猜本地分隔符。给 CSV 导出/前端拼路径用——那里拿到的是
-/// 对端机器的 root 字符串，`cfg!(windows)` 说的是**本机**，会猜反。
+/// Infer the separator from how the root is spelled. For CSV export and frontend path joining — what
+/// those get is the far machine's root string, and `cfg!(windows)` describes **this** host, so it guesses wrong.
 pub fn sep_of(root: &str) -> char {
     if root.contains('\\') { '\\' } else { '/' }
 }
 
-/// 来路不明的 rel 是否可以安全地落到磁盘上。
+/// Whether a rel of unknown provenance is safe to write to disk.
 ///
-/// 用于解包等「计划来自对端」的场景：拒绝绝对路径、盘符、`..` 穿越与空段。
+/// For unpacking and other "the plan came from the far side" cases: rejects absolute paths, drive
+/// letters, `..` traversal and empty segments.
 pub fn is_safe_rel(rel: &str) -> bool {
     !rel.is_empty()
         && !rel.starts_with('/')
@@ -87,17 +88,17 @@ mod tests {
     #[test]
     fn unsafe_rels_are_refused() {
         assert!(is_safe_rel("a/b.txt"));
-        assert!(!is_safe_rel(""), "空 rel");
-        assert!(!is_safe_rel("/etc/passwd"), "绝对路径");
-        assert!(!is_safe_rel("C:/x"), "盘符");
-        assert!(!is_safe_rel("a/../../etc"), "穿越");
-        assert!(!is_safe_rel("a//b"), "空段");
+        assert!(!is_safe_rel(""), "empty rel");
+        assert!(!is_safe_rel("/etc/passwd"), "absolute path");
+        assert!(!is_safe_rel("C:/x"), "drive letter");
+        assert!(!is_safe_rel("a/../../etc"), "traversal");
+        assert!(!is_safe_rel("a//b"), "empty segment");
         assert!(!is_safe_rel(".."));
     }
 
     #[test]
     fn sep_is_inferred_from_the_root_string_not_the_host() {
-        // 这正是 cfg!(windows) 会猜反的场景：本机是 Windows，但对端 root 是 posix
+        // Exactly the case cfg!(windows) gets backwards: this host is Windows, but the far root is posix
         assert_eq!(sep_of(r"D:\Code\x"), '\\');
         assert_eq!(sep_of("/Users/x/Code"), '/');
     }

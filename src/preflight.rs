@@ -1,15 +1,15 @@
-//! 动手之前的三道闸（P0-2 / P0-3）。
+//! The three gates before anything is touched (P0-2 / P0-3).
 //!
-//! 1. **挂载点标记**——语义参照 syncthing 的 `.stfolder`
-//!    （`lib/config/folderconfiguration.go:236` 的 CheckPath）。SMB 共享盘没挂上时
-//!    target 往往是个空目录（甚至会被本地自动创建），此时 mirror 会生成
-//!    "把 target 全删掉"或"把几十 GB 全传一遍"的计划。标记文件是唯一可靠的判据：
-//!    它跟着**数据**走，盘没挂上标记就不在。
-//! 2. **磁盘空间预检**——计划里每个 op 都带 size，动手前汇总一下就知道要写多少。
-//!    参照 syncthing 的 `CheckAvailableSpace` / `minDiskFree`（默认 1%）。
-//! 3. **计划体检**——删除占比过高时拒绝执行。syncthing 没有等价物（它是连续同步，
-//!    没有"一次性大计划"这个概念），但我们的显式模型很适合这道闸：
-//!    它能顺带拦住过滤器写错、source/target 写反、路径打错。
+//! 1. **Mount-point marker** — semantics modelled on syncthing's `.stfolder`
+//!    (CheckPath in `lib/config/folderconfiguration.go:236`). When an SMB share isn't mounted,
+//!    target is usually an empty directory (it may even be auto-created locally), and mirror
+//!    then plans "delete everything in target" or "re-send tens of GB". The marker file is the
+//!    only reliable test: it travels with the **data**, so no mount means no marker.
+//! 2. **Disk-space preflight** — every op in the plan carries a size, so summing them up front tells us how much gets written.
+//!    Modelled on syncthing's `CheckAvailableSpace` / `minDiskFree` (1% by default).
+//! 3. **Plan health check** — refuse to run when the deletion share is too high. syncthing has no
+//!    equivalent (it syncs continuously; there is no "one big plan"), but our explicit model suits
+//!    this gate well: it also catches a wrong filter, swapped source/target, and typo'd paths.
 
 use crate::compare::{Action, Op, Side};
 use crate::foundation::fmt::human_bytes;
@@ -23,7 +23,7 @@ pub struct Marker {
     pub job: String,
     pub host: String,
     pub created_at_ms: u64,
-    /// 自由备注，人类可读
+    /// Free-form note, human-readable
     #[serde(default)]
     pub note: String,
 }
@@ -41,7 +41,7 @@ pub fn read_marker(root: &Path) -> Option<Marker> {
     serde_json::from_str(&text).ok()
 }
 
-/// 写标记（`syncdash mark`）。已存在则保留原内容并报告，不覆盖。
+/// Write the marker (`syncdash mark`). If one already exists, keep its content and report it — never overwrite.
 pub fn write_marker(root: &Path, job: &str, note: &str) -> std::io::Result<(PathBuf, bool)> {
     let p = marker_path(root);
     if p.is_file() {
@@ -63,9 +63,7 @@ pub fn write_marker(root: &Path, job: &str, note: &str) -> std::io::Result<(Path
     Ok((p, true))
 }
 
-// ---------- 磁盘空间 ----------
-
-/// 返回 (当前用户可用字节, 卷总字节)。拿不到就 None（不因此阻断，只是没法检查）。
+/// Returns (bytes available to the current user, total bytes on the volume). None if unavailable (not a blocker, just no check).
 #[cfg(windows)]
 pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     use std::os::windows::ffi::OsStrExt;
@@ -78,7 +76,7 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
             lp_total_number_of_free_bytes: *mut u64,
         ) -> i32;
     }
-    // UNC 路径（\\host\share\...）同样受支持——正是 SMB target 需要的
+    // UNC paths (\\host\share\...) are supported too — exactly what an SMB target needs
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
     let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
@@ -98,17 +96,15 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
         if libc::statvfs(c.as_ptr(), &mut st) != 0 {
             return None;
         }
-        // f_frsize 是"片段大小"，容量统计的正确单位；为 0 时退回 f_bsize
+        // f_frsize is the "fragment size", the right unit for capacity math; fall back to f_bsize when it is 0
         let unit = if st.f_frsize > 0 { st.f_frsize as u64 } else { st.f_bsize as u64 };
         Some((st.f_bavail as u64 * unit, st.f_blocks as u64 * unit))
     }
 }
 
-// ---------- 计划统计 ----------
-
 #[derive(Default, Clone, Debug)]
 pub struct SideStats {
-    /// 需要写入的字节（copy + update）
+    /// Bytes that have to be written (copy + update)
     pub write_bytes: u64,
     pub copies: u64,
     pub updates: u64,
@@ -153,17 +149,15 @@ pub fn stat_plan(ops: &[Op]) -> PlanStats {
     st
 }
 
-// ---------- 闸门 ----------
-
 #[derive(Clone, Debug)]
 pub struct Guards {
-    /// 要求两侧 root 都有 .syncdash-root 标记（防共享盘没挂上）
+    /// Require a .syncdash-root marker on both roots (guards against an unmounted share)
     pub require_marker: bool,
-    /// 至少保留的空闲比例（0.01 = 1%）。<=0 关闭
+    /// Minimum free ratio to keep (0.01 = 1%). <=0 disables
     pub min_free_pct: f64,
-    /// 单侧删除条目占该侧总条目的比例超过它就拒绝执行。<=0 或 >=1 关闭
+    /// Refuse to run when one side's deleted entries exceed this share of that side's total. <=0 or >=1 disables
     pub max_delete_ratio: f64,
-    /// 用户显式放行（--i-know），只放行体检类闸门，标记/空间仍然拦
+    /// User allowed it through explicitly (--i-know); only lets the health-check gates pass, marker/space still block
     pub acknowledged: bool,
 }
 
@@ -173,7 +167,7 @@ impl Default for Guards {
     }
 }
 
-/// 一次预检的结论。`blockers` 非空 = 拒绝执行。
+/// The verdict of one preflight. Non-empty `blockers` = refuse to run.
 pub struct Verdict {
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
@@ -183,7 +177,7 @@ impl Verdict {
     pub fn ok(&self) -> bool {
         self.blockers.is_empty()
     }
-    /// 把结论打印到 stderr，返回是否放行
+    /// Print the verdict to stderr; returns whether it is allowed through
     pub fn report(&self, tag: &str) -> bool {
         for w in &self.warnings {
             crate::log_warn!("preflight", "[{tag}] warning: {w}");
@@ -195,7 +189,7 @@ impl Verdict {
     }
 }
 
-/// root 可用性 + 标记检查。`label` 只用于消息（"source"/"target"）。
+/// Root availability + marker check. `label` is only used in messages ("source"/"target").
 pub fn check_root(label: &str, root: &Path, require_marker: bool, v: &mut Verdict) {
     if !root.is_dir() {
         v.blockers.push(format!("{label} root not accessible: {}", root.display()));
@@ -210,7 +204,7 @@ pub fn check_root(label: &str, root: &Path, require_marker: bool, v: &mut Verdic
         ));
         return;
     }
-    // 即便不强制标记，空目录 + 有删除计划也值得警告（在 check_plan 里判）
+    // Even without a required marker, an empty directory plus planned deletions is worth a warning (decided in check_plan)
     if !require_marker && !has_marker(root) {
         let empty = std::fs::read_dir(root).map(|mut d| d.next().is_none()).unwrap_or(false);
         if empty {
@@ -223,7 +217,7 @@ pub fn check_root(label: &str, root: &Path, require_marker: bool, v: &mut Verdic
     }
 }
 
-/// 空间检查：写入侧需要 write_bytes，且写完后仍要留够 min_free_pct。
+/// Space check: the writing side needs write_bytes, and must still have min_free_pct left afterwards.
 pub fn check_space(label: &str, root: &Path, need: u64, min_free_pct: f64, v: &mut Verdict) {
     if need == 0 {
         return;
@@ -232,7 +226,7 @@ pub fn check_space(label: &str, root: &Path, need: u64, min_free_pct: f64, v: &m
         v.warnings.push(format!("{label}: cannot determine free space on {}", root.display()));
         return;
     };
-    // 10% 余量：目标可能有簇对齐/稀疏/元数据开销，且计划里的 size 是源侧的
+    // 10% margin: the target may have cluster alignment / sparseness / metadata overhead, and the sizes in the plan are the source side's
     let need_padded = need.saturating_add(need / 10);
     let reserve = if min_free_pct > 0.0 { (total as f64 * min_free_pct) as u64 } else { 0 };
     if avail < need_padded.saturating_add(reserve) {
@@ -246,7 +240,7 @@ pub fn check_space(label: &str, root: &Path, need: u64, min_free_pct: f64, v: &m
     }
 }
 
-/// 计划体检：删除占比。`entries` 是该侧快照的条目数（0 = 无从判断，跳过）。
+/// Plan health check: deletion share. `entries` is that side's snapshot entry count (0 = nothing to judge against, skip).
 pub fn check_delete_ratio(
     label: &str,
     side: &SideStats,
@@ -278,7 +272,7 @@ pub fn check_delete_ratio(
     }
 }
 
-/// 一次性跑完全部闸门。`source_entries` / `target_entries` 来自两侧快照。
+/// Run every gate in one pass. `source_entries` / `target_entries` come from the two snapshots.
 #[allow(clippy::too_many_arguments)]
 pub fn run_all(
     ops: &[Op],
@@ -292,7 +286,7 @@ pub fn run_all(
     check_root("source", source_root, g.require_marker, &mut v);
     check_root("target", target_root, g.require_marker, &mut v);
     if !v.ok() {
-        return v; // root 不可用时后面的检查没意义
+        return v; // with a root unavailable, the later checks are meaningless
     }
     let st = stat_plan(ops);
     check_space("target", target_root, st.target.write_bytes, g.min_free_pct, &mut v);
@@ -306,7 +300,6 @@ pub fn run_all(
 mod tests {
     use super::*;
     use crate::compare::{Action, Op, Side};
-use crate::foundation::fmt::human_bytes;
 
     fn op(side: Side, action: Action, path: &str, size: Option<u64>) -> Op {
         Op {
@@ -379,7 +372,7 @@ use crate::foundation::fmt::human_bytes;
 
     #[test]
     fn disk_space_reports_something_for_temp_dir() {
-        // 不断言具体数值，只断言在本机拿得到——拿不到会退化成 warning 而非阻断
+        // Don't assert specific numbers, only that this machine can report them — failing to would degrade to a warning, not a block
         let got = disk_space(&std::env::temp_dir());
         assert!(got.is_some(), "free space query should work on the temp volume");
         let (avail, total) = got.unwrap();

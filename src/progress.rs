@@ -1,23 +1,25 @@
-//! v0.9 M1：全管线统一的 进度/取消/暂停 底座。
+//! v0.9 M1: the pipeline-wide progress/cancel/pause substrate.
 //!
-//! 设计要点（详见 plans/ffs-ui 计划 §M1-API；行为参数对齐 FFS 14.10 progress_indicator.cpp）：
-//! - 引擎只保证：单调计数器、每个事件带时间戳、协作检查点。速率(4s 窗)/ETA(60s 窗)/
-//!   百分比 (bytesDone+itemsDone)/(bytesTotal+itemsTotal) 全是 UI 侧对事件流的算术。
-//! - 节流归 sink（Tauri 侧 Progress 类 ≥100ms/条）；引擎在文件边界/1MiB 块边界自由发射，
-//!   NullSink 情况下代价≈两次原子加。
-//! - 取消走 `io::ErrorKind::Interrupted`——复用全链路既有 io::Result，零新错误类型。
-//! - 暂停 = 100ms 小睡自旋：**栈帧存活 ⇒ RootLock 心跳线程继续跳**，对面机器不会把
-//!   我们的锁判成遗弃（lock.rs 12s 判据）。这是不用"挂起返回"的硬理由。
-//! - 与并行线 P2-6（scan_with_progress/ScanProgress）的关系：本模块是其超集；
-//!   闭包 blanket impl 让 `Fn(ProgressEvent)` 直接当 sink 用，旧回调形态由 scan 侧桥接。
+//! Design notes (see the plans/ffs-ui plan §M1-API; behavior parameters match FFS 14.10 progress_indicator.cpp):
+//! - The engine guarantees only: monotone counters, a timestamp on every event, cooperative
+//!   checkpoints. Rate (4s window) / ETA (60s window) / percentage
+//!   (bytesDone+itemsDone)/(bytesTotal+itemsTotal) are all UI-side arithmetic over the event stream.
+//! - Throttling belongs to the sink (the Tauri-side Progress class: ≥100ms per event); the engine
+//!   emits freely at file and 1MiB chunk boundaries, costing ≈two atomic adds under NullSink.
+//! - Cancel rides `io::ErrorKind::Interrupted` — it reuses the io::Result already threaded end to end, zero new error types.
+//! - Pause = a 100ms nap spin: **the stack frame stays alive ⇒ the RootLock heartbeat thread keeps
+//!   beating**, so the far machine never judges our lock abandoned (lock.rs 12s criterion). That is
+//!   the hard reason for not "returning suspended".
+//! - Relation to the parallel line P2-6 (scan_with_progress/ScanProgress): this module is a superset;
+//!   the blanket closure impl lets `Fn(ProgressEvent)` serve as a sink directly, and the scan side bridges the old callback shape.
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// 日志等级。与 `Error` 事件的分工：`Error` 是结构化的**单条 op 失败**
-/// （带 path/action/side，天然就是报错清单的行），`Log` 是管线叙事
-/// （远端探测结果、delta 降级、锁接管…）——库内那些 `eprintln!` 的去处。
+/// Log level. Division of labour with the `Error` event: `Error` is a structured **single-op failure**
+/// (carrying path/action/side, naturally a line in the error detail), `Log` is pipeline narration
+/// (remote probe results, delta downgrades, lock takeover…) — the sink for those in-library `eprintln!`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "lowercase")]
@@ -27,16 +29,16 @@ pub enum LogLevel {
     Error,
 }
 
-/// 一条 op 的实际结局——执行清单（items.jsonl）的核心字段。
-/// 今天这个信息只活在 `apply::record` 的四个分支里，出了那个函数就没了。
+/// What actually became of one op — the core field of the execution detail (items.jsonl).
+/// Today this information lives only in the four branches of `apply::record` and dies with that function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "lowercase")]
 pub enum ItemOutcome {
     Ok,
-    /// 目录非空所以留着（保护过滤中的文件是对的，但必须留痕）
+    /// Kept because the directory was not empty (protecting filtered-out files is correct, but it must leave a trace)
     Kept,
-    /// 用户取消，这条没轮到
+    /// The user cancelled; this one never got its turn
     Cancelled,
     Failed,
 }
@@ -52,7 +54,7 @@ pub enum Phase {
     Pack,
     Ship,
     Verify,
-    /// apply 成功后的 archive 重扫——今天完全不可见的长阶段
+    /// The archive rescan after a successful apply — a long phase that is completely invisible today
     Refresh,
 }
 
@@ -60,7 +62,7 @@ pub enum Phase {
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProgressEvent {
-    /// 进入阶段。totals 为 0 = 尚未知。label = 人类语境（root 路径、ssh:host…）
+    /// Entering a phase. totals of 0 = not yet known. label = human context (root path, ssh:host…)
     PhaseStart {
         phase: Phase,
         #[ts(type = "number")]
@@ -72,7 +74,7 @@ pub enum ProgressEvent {
         #[ts(type = "number")]
         bytes_total: u64,
     },
-    /// 阶段中期精化总量（scan：walk 结束、哈希开始前）
+    /// Mid-phase refinement of the totals (scan: after the walk, before hashing starts)
     Totals {
         phase: Phase,
         #[ts(type = "number")]
@@ -82,7 +84,7 @@ pub enum ProgressEvent {
         #[ts(type = "number")]
         bytes_total: u64,
     },
-    /// 计数快照。文件边界/块边界都会发；sink 负责节流
+    /// Counter snapshot. Emitted at file and chunk boundaries alike; throttling is the sink's job
     Progress {
         phase: Phase,
         #[ts(type = "number")]
@@ -97,7 +99,8 @@ pub enum ProgressEvent {
         bytes_total: u64,
         current_path: String,
     },
-    /// 一条失败记录（错误绝不中断执行——FFS 累积语义；windowed 桌面构建靠它首次看见错误）
+    /// One failure record (errors never abort the run — FFS accumulate semantics; in a windowed
+    /// desktop build this is where an error first becomes visible)
     Error {
         phase: Phase,
         #[ts(type = "number")]
@@ -107,8 +110,8 @@ pub enum ProgressEvent {
         side: String,
         message: String,
     },
-    /// 管线叙事。`scope` = 模块名（run / pack / lock…），面板按它分组与筛选。
-    /// windowed 桌面构建里 stderr 无处可去，这条是那些话唯一的出口。
+    /// Pipeline narration. `scope` = module name (run / pack / lock…); the panel groups and filters by it.
+    /// In a windowed desktop build stderr goes nowhere, so this is the only outlet those lines have.
     Log {
         #[ts(type = "number")]
         ts_ms: u64,
@@ -116,8 +119,8 @@ pub enum ProgressEvent {
         scope: String,
         message: String,
     },
-    /// 一条 op 的实际结局（执行清单的行）。与 `Progress` 的分工：
-    /// Progress 是"到哪了"（会被节流丢帧），ItemResult 是"这条成没成"（一条都不能丢）。
+    /// What actually became of one op (a line of the execution detail). Division of labour with `Progress`:
+    /// Progress is "where are we" (throttling drops frames), ItemResult is "did this one make it" (not one may be lost).
     ItemResult {
         #[ts(type = "number")]
         ts_ms: u64,
@@ -140,7 +143,7 @@ pub enum ProgressEvent {
         #[ts(type = "number")]
         paused_ms: u64,
     },
-    /// apply 类运行的终态摘要
+    /// Terminal summary of an apply-class run
     Summary {
         #[ts(type = "number")]
         ts_ms: u64,
@@ -169,7 +172,7 @@ impl ProgressSink for NullSink {
     fn emit(&self, _ev: ProgressEvent) {}
 }
 
-/// 任何 `Fn(ProgressEvent)+Send+Sync` 闭包都是 sink——并行线 P2-6 的闭包调用形态零成本兼容
+/// Any `Fn(ProgressEvent)+Send+Sync` closure is a sink — zero-cost compatibility with the closure call shape of the parallel line P2-6
 impl<F: Fn(ProgressEvent) + Send + Sync> ProgressSink for F {
     fn emit(&self, ev: ProgressEvent) {
         self(ev)
@@ -177,10 +180,10 @@ impl<F: Fn(ProgressEvent) + Send + Sync> ProgressSink for F {
 }
 
 //
-// 注册表存的是 `Arc<dyn ProgressSink>`，而 `ProgressSink` 是本模块的 trait——
-// 所以它归这里。此前它住在 logging.rs，于是 `RunCtx::null()` 要回头
-// `use crate::progress::current()`，而 logging 又 `use crate::progress::{...}`：
-// 两个模块互相依赖，事件词汇表永远没法独立编译。挪过来之后 logging 单向向下。
+// The registry stores `Arc<dyn ProgressSink>`, and `ProgressSink` is this module's trait —
+// so it belongs here. It used to live in logging.rs, which forced `RunCtx::null()` to reach back for
+// `use crate::progress::current()` while logging did `use crate::progress::{...}`: two mutually
+// dependent modules, and the event vocabulary could never compile alone. After the move logging points only downward.
 
 type Slot = std::sync::RwLock<Option<Arc<dyn ProgressSink>>>;
 static CURRENT: std::sync::OnceLock<Slot> = std::sync::OnceLock::new();
@@ -189,19 +192,19 @@ fn slot() -> &'static Slot {
     CURRENT.get_or_init(|| std::sync::RwLock::new(None))
 }
 
-/// 装上"当前运行"的 sink；guard 落地时自动摘除并还原上一个。
+/// Install the "current run" sink; when the guard lands the sink is removed and the previous one restored.
 ///
-/// **必须是 RAII**：漏摘会让下一次运行的日志串进上一个运行的目录。
-/// 桌面有 `RunState.active` 单运行互斥、CLI `run --all` 顺序执行，
-/// 所以进程级单槽本身是安全的。
-#[must_use = "guard 一落地 sink 就被摘除——必须绑到运行的生命周期上"]
+/// **Must be RAII**: leaking the guard cross-contaminates the next run's log directory.
+/// The desktop has `RunState.active` single-run mutual exclusion and the CLI runs `run --all`
+/// sequentially, so a process-wide single slot is safe in itself.
+#[must_use = "the sink is removed the moment the guard lands — bind it to the run's lifetime"]
 pub struct SinkGuard {
     prev: Option<Arc<dyn ProgressSink>>,
 }
 
-/// 当前接管者（若有）。`runlog::Recorder` 用它把**已有的**去处串进自己的
-/// MultiSink——运行期的文件捕获是**叠加**，不是替换：CLI 在进程启动装的
-/// StderrSink 必须在 apply 期间继续说话。
+/// The current sink, if any. `runlog::Recorder` uses it to thread the **existing** sink into its own
+/// MultiSink — capturing to file during a run is **layered on top of**, not a replacement for, what
+/// is already there: the StderrSink the CLI installs at process start must keep talking during apply.
 pub fn current() -> Option<Arc<dyn ProgressSink>> {
     slot().read().unwrap_or_else(|e| e.into_inner()).clone()
 }
@@ -220,14 +223,14 @@ impl Drop for SinkGuard {
     }
 }
 
-/// 协作式运行控制。Tauri/CLI 持有 Arc，引擎循环在检查点响应。
+/// Cooperative run control. Tauri/CLI hold the Arc; engine loops respond at checkpoints.
 #[derive(Default)]
 pub struct RunCtl {
     pub cancel: AtomicBool,
     pub paused: AtomicBool,
     paused_since_ms: AtomicU64,
     paused_total_ms: AtomicU64,
-    /// N 个工作线程同时阻塞时，Paused/Resumed 只各发一次（CAS 去重）
+    /// With N worker threads blocked at once, Paused/Resumed are each emitted exactly once (CAS dedup)
     pause_announced: AtomicBool,
 }
 
@@ -256,7 +259,7 @@ pub fn is_cancelled(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::Interrupted
 }
 
-/// 引擎函数需要的全部随身物。克隆廉价（两个 Arc）。
+/// Everything an engine function needs to carry around. Cloning is cheap (two Arcs).
 #[derive(Clone)]
 pub struct RunCtx {
     pub ctl: Arc<RunCtl>,
@@ -264,11 +267,12 @@ pub struct RunCtx {
 }
 
 impl RunCtx {
-    /// 无 UI 场景：不取消、不暂停——旧签名薄壳全用它。
+    /// No-UI case: no cancel, no pause — every thin shim over an old signature uses this.
     ///
-    /// 事件进黑洞，但**诊断不进**：sink 取进程当前的环境去处（CLI 启动装的
-    /// StderrSink），没装才退回 NullSink。"没有界面"不等于"不用说话"——
-    /// 之前这里硬写 NullSink，CLI 比对期的挂载点警告就是这么丢的。
+    /// Events go into the void, but **diagnostics do not**: the sink picks up the process's ambient
+    /// sink (the StderrSink the CLI installs at startup) and only falls back to NullSink when none is
+    /// installed. "No interface" does not mean "no need to talk" — this used to hard-code NullSink,
+    /// which is exactly how the mount-point warning during a CLI compare got lost.
     pub fn null() -> RunCtx {
         RunCtx { ctl: RunCtl::new(), sink: current().unwrap_or_else(|| Arc::new(NullSink)) }
     }
@@ -276,8 +280,8 @@ impl RunCtx {
         RunCtx { ctl, sink }
     }
 
-    /// 发一条管线叙事。拿得到 ctx 的地方直接用它；拿不到的（trash / version / lock）
-    /// 走 `logging::log_*!` 宏经进程级注册表落到同一条总线。
+    /// Emit one line of pipeline narration. Use this wherever ctx is in hand; where it is not
+    /// (trash / version / lock), the `logging::log_*!` macros reach the same bus via the process registry.
     pub fn log(&self, level: LogLevel, scope: &str, message: impl Into<String>) {
         self.sink.emit(ProgressEvent::Log {
             ts_ms: crate::foundation::time::now_ms(),
@@ -287,8 +291,8 @@ impl RunCtx {
         });
     }
 
-    /// 协作点：取消 → Err(Interrupted)；暂停 → 100ms 小睡循环（Paused/Resumed CAS 去重发射）。
-    /// PhaseProgress::checkpoint 委托到这里；远程管线的级间协作点（无计数器语境）直接用它。
+    /// Cooperation point: cancel → Err(Interrupted); pause → a 100ms nap loop (Paused/Resumed emitted once each, CAS-deduped).
+    /// PhaseProgress::checkpoint delegates here; the remote pipeline's between-stage cooperation points (no counter context) use it directly.
     pub fn checkpoint(&self) -> std::io::Result<()> {
         let ctl = &self.ctl;
         if ctl.cancel.load(Ordering::Relaxed) {
@@ -321,7 +325,7 @@ impl RunCtx {
     }
 }
 
-/// apply 类运行的结果（旧元组接口走 into_tuple）
+/// Result of an apply-class run (the old tuple interface goes through into_tuple)
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ApplyOutcome {
     pub done: u64,
@@ -337,7 +341,7 @@ impl ApplyOutcome {
     }
 }
 
-/// 单阶段计数器＋发射器。工作线程只借 &self（内部全原子）。
+/// Single-phase counters plus emitter. Worker threads only borrow &self (everything inside is atomic).
 pub struct PhaseProgress<'a> {
     ctx: &'a RunCtx,
     phase: Phase,
@@ -366,7 +370,7 @@ impl<'a> PhaseProgress<'a> {
         }
     }
 
-    /// 相位内换挡（scan：walk 计数的是"发现"，哈希期改计"处理完"）——清零已完成条数
+    /// Shift gears within a phase (scan: the walk counts "discovered", hashing switches to "processed") — resets the done count
     pub fn restart_items(&self) {
         self.items_done.store(0, Ordering::Relaxed);
     }
@@ -415,8 +419,8 @@ impl<'a> PhaseProgress<'a> {
         });
     }
 
-    /// 协作点：取消 → Err(Interrupted)；暂停 → 100ms 小睡循环（Paused/Resumed CAS 去重发射）。
-    /// 放进每个 walk 迭代、每个待哈希文件、每个 1MiB 复制块之间。
+    /// Cooperation point: cancel → Err(Interrupted); pause → a 100ms nap loop (Paused/Resumed emitted once each, CAS-deduped).
+    /// Drop it between every walk iteration, every file about to be hashed, every 1MiB copy chunk.
     pub fn checkpoint(&self) -> std::io::Result<()> {
         self.ctx.checkpoint()
     }

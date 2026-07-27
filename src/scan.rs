@@ -1,7 +1,7 @@
-//! scan：走目录树，产出快照表（要求 1 的"通用命令"）。
-//! - 排除已知垃圾/可重建目录（与 CodeSync 的 FFS 排除口径一致的子集）
-//! - blake3 内容 hash，带缓存：(path,size,mtime) 未变则复用上次 hash，避免每次重算几十 GB
-//! - 缓存放在本机用户缓存目录，绝不污染被扫描的目录
+//! scan: walk the directory tree and produce a snapshot table (the "generic command" of requirement 1).
+//! - Excludes known junk / rebuildable directories (a subset matching CodeSync's FFS exclusion rules)
+//! - blake3 content hash, with a cache: if (path,size,mtime) is unchanged, reuse the previous hash instead of rehashing tens of GB every run
+//! - The cache lives in the local user cache directory and never pollutes the scanned tree
 
 use crate::foundation::time::now_ms;
 use crate::table::{os_name, Entry, EntryKind, Header, Snapshot, SCHEMA};
@@ -29,10 +29,10 @@ fn unix_mode(_md: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
-/// 初始化全局 rayon 池（哈希工作线程）：**降优先级**——standard 扫描的 BLAKE3
-/// 刻意全核并行（让一次性成本尽快结束），但不该把整台机器压到卡顿；
-/// below-normal 优先级下满核哈希会自动给前台程序让路，空闲机器上吞吐不变。
-/// `SYNCDASH_SCAN_THREADS=N` 可再压线程数上限。CLI 与桌面启动时各调一次（幂等）。
+/// Initialize the global rayon pool (hash worker threads): **lowered priority** —— a standard scan's BLAKE3
+/// deliberately runs on every core (get the one-off cost over with) but must not grind the whole machine to a halt;
+/// at below-normal priority a full-core hash yields to foreground programs on its own, with no throughput loss on an idle box.
+/// `SYNCDASH_SCAN_THREADS=N` caps the thread count further. CLI and desktop each call this once at startup (idempotent).
 pub fn init_worker_pool() {
     let mut b = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("sd-hash-{i}"));
     if let Ok(n) = std::env::var("SYNCDASH_SCAN_THREADS") {
@@ -42,13 +42,13 @@ pub fn init_worker_pool() {
             }
         }
     }
-    // 已经有全局池（重复调用）时 build_global 返回 Err——静默即可
+    // build_global returns Err when a global pool already exists (repeat call) —— swallowing it is fine
     let _ = b.start_handler(|_| lower_thread_priority()).build_global();
 }
 
 #[cfg(windows)]
 fn lower_thread_priority() {
-    // THREAD_PRIORITY_BELOW_NORMAL = -1（只降本线程，不动进程；UI 线程不受影响）
+    // THREAD_PRIORITY_BELOW_NORMAL = -1 (lowers this thread only, not the process; the UI thread is untouched)
     extern "system" {
         fn GetCurrentThread() -> isize;
         fn SetThreadPriority(h: isize, p: i32) -> i32;
@@ -59,14 +59,14 @@ fn lower_thread_priority() {
 }
 #[cfg(target_os = "linux")]
 fn lower_thread_priority() {
-    // Linux 的 nice 是每线程的
+    // nice on Linux is per-thread
     unsafe {
         libc::nice(3);
     }
 }
 #[cfg(all(unix, not(target_os = "linux")))]
 fn lower_thread_priority() {
-    // macOS 的 nice() 是进程级，动了会连 UI 一起降——不做
+    // nice() on macOS is process-wide; touching it would drag the UI down with it —— so don't
 }
 
 fn mtime_ms(md: &std::fs::Metadata) -> i64 {
@@ -76,8 +76,6 @@ fn mtime_ms(md: &std::fs::Metadata) -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
-
-// ---------- hash 缓存 ----------
 
 fn cache_dir() -> PathBuf {
     if let Ok(l) = std::env::var("LOCALAPPDATA") {
@@ -114,14 +112,14 @@ fn load_cache(root: &Path) -> HashMap<String, (u64, i64, String)> {
     map
 }
 
-// ---------- mtime 校正表（P1-4）----------
+// mtime correction table (P1-4)
 //
-// FAT/exFAT 只有 2 秒粒度，某些 SMB 服务端会自行截断/偏移写入的时间戳。
-// 过去我们设完 mtime 就不管，靠比对时的 ±2s 容差硬扛——容差既可能漏判（真改动在 2 秒内）
-// 也可能误判（偏移大于容差），而且 rigor = "quick" 时容差是**唯一**判据。
-// syncthing 的 mtimeFS（`lib/fs/mtimefs.go:68`）写完立刻 stat 回来，
-// 把 (ondisk, virtual) 存进库，之后一律对外报 virtual。这里做同样的事，
-// 存储沿用已有的用户缓存目录，绝不污染被扫描的目录。
+// FAT/exFAT only has 2-second granularity, and some SMB servers truncate or shift the timestamp they are handed.
+// We used to set the mtime and forget it, leaning on a ±2s tolerance at compare time —— a tolerance can miss a real
+// change (edited within 2 seconds) and can equally invent one (shift larger than the tolerance), and with
+// rigor = "quick" the tolerance is the **only** criterion. syncthing's mtimeFS (`lib/fs/mtimefs.go:68`) stats the
+// file right back after writing, stores (ondisk, virtual) in its database and reports virtual from then on. Same
+// thing here, kept in the existing user cache directory, never polluting the scanned tree.
 
 fn mtime_fix_file_for_root(root: &Path) -> PathBuf {
     let key = blake3::hash(root.to_string_lossy().to_lowercase().as_bytes());
@@ -148,7 +146,7 @@ pub fn load_mtime_fixes(root: &Path) -> HashMap<String, (i64, i64)> {
     map
 }
 
-/// 记录若干条校正。同 path 以最新一条为准（读取时后写的覆盖先写的）。
+/// Record a batch of corrections. For a repeated path the newest one wins (on read, later lines overwrite earlier ones).
 pub fn record_mtime_fixes(root: &Path, fixes: &[(String, i64, i64)]) {
     if fixes.is_empty() {
         return;
@@ -157,7 +155,7 @@ pub fn record_mtime_fixes(root: &Path, fixes: &[(String, i64, i64)]) {
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // 合并后整体重写：避免无限追加
+    // Merge, then rewrite wholesale: avoids appending forever
     let mut map = load_mtime_fixes(root);
     for (p, ondisk, intended) in fixes {
         map.insert(p.clone(), (*ondisk, *intended));
@@ -187,29 +185,27 @@ fn save_cache(root: &Path, entries: &[Entry]) {
     }
 }
 
-// ---------- 扫描 ----------
-
 pub struct ScanOptions {
     pub hash: bool,
-    /// 抽样证据：≥4MB 的文件不读全文，抽样摘要（size + 头/中/尾各 256KB 的 blake3，
-    /// 值带 `~` 前缀与全量哈希严格隔离）；<4MB 全量。云盘占位文件只水合三小段。
-    /// 语义上不是逐字节相等证明——分歧升级规则（摘要同而 mtime 异 → 全量重验）兜底。
+    /// Sampled evidence: files ≥4MB are not read whole but get a sampled digest (size + blake3 of 256KB at head/middle/tail,
+    /// the value `~`-prefixed to keep it strictly apart from a full hash); <4MB is hashed in full. Cloud placeholders hydrate
+    /// only those three windows. Not a byte-for-byte equality proof —— the escalation rule (same digest, different mtime → full rehash) backstops it.
     pub sampled: bool,
-    /// 是否信 (path,size,mtime) 缓存。**阶梯的关键轴**：
-    /// fast = true（只实读变化面，未变面是缓存记忆）；
-    /// standard/paranoid = false（本轮实读每个文件——"一致 ✓"是本轮实测，不是记忆）。
+    /// Whether to trust the (path,size,mtime) cache. **The ladder's decisive axis**:
+    /// fast = true (only the changed surface is really read; the unchanged surface is cache memory);
+    /// standard/paranoid = false (every file is really read this run —— "identical ✓" is measured now, not remembered).
     pub use_cache: bool,
-    /// symlinks="direct"：记录链接本身（指向字符串），否则忽略 symlink
+    /// symlinks="direct": record the link itself (its target string); otherwise symlinks are ignored
     pub symlinks_direct: bool,
-    /// FFS 语义的过滤器（见 filter.rs），默认排除已内置
+    /// Filter with FFS semantics (see filter.rs); the default exclusions are built in
     pub filter: crate::filter::PathFilter,
 }
 
-/// 抽样摘要的参数与实现（fast 严谨级）
+/// Parameters and implementation of the sampled digest (the fast rigor tier)
 pub const SAMPLE_MIN: u64 = 4 * 1024 * 1024;
 const SAMPLE_CHUNK: usize = 256 * 1024;
 
-/// fast 模式下这次扫描真正要读的字节（进度总量/速率按它算才诚实）
+/// Bytes this scan will actually read in fast mode (only counting these makes the progress total and rate honest)
 fn effective_read(size: u64, sampled: bool) -> u64 {
     if sampled && size >= SAMPLE_MIN {
         (3 * SAMPLE_CHUNK as u64).min(size)
@@ -239,11 +235,11 @@ fn sampled_digest(path: &Path, size: u64) -> std::io::Result<String> {
     Ok(format!("~{}", hasher.finalize().to_hex()))
 }
 
-/// 扫描进度（P2-6）。syncthing 的 `FolderScanProgress` 同款信息量：
-/// 阶段 + 已处理/总字节 + 速率，够前端画进度条与估算剩余时间。
+/// Scan progress (P2-6). The same amount of information as syncthing's `FolderScanProgress`:
+/// phase + bytes done/total + rate, enough for the frontend to draw a bar and estimate the time remaining.
 #[derive(Clone, Copy, Debug)]
 pub struct ScanProgress {
-    /// "walk"（遍历元数据）| "hash"（并行哈希）
+    /// "walk" (metadata traversal) | "hash" (parallel hashing)
     pub phase: &'static str,
     pub files_total: u64,
     pub bytes_total: u64,
@@ -265,8 +261,8 @@ pub fn scan_with_progress(
     scan_impl(root, opt, progress, None)
 }
 
-/// v0.9 M1 统一底座入口：取消/暂停/ProgressEvent 事件流（见 progress.rs）。
-/// 旧的 ScanProgress 回调形态（P2-6）原样保留——两条通路共用同一个 scan_impl。
+/// v0.9 M1 unified-foundation entry point: cancel/pause/ProgressEvent event stream (see progress.rs).
+/// The old ScanProgress callback shape (P2-6) is kept as-is —— both paths share the same scan_impl.
 pub fn scan_ctx(
     root: &Path,
     opt: &ScanOptions,
@@ -296,15 +292,15 @@ fn scan_impl(
     let mut entries: Vec<Entry> = Vec::new();
     let mut hash_errors = 0u64;
 
-    // Windows 长路径：遍历用 \\?\ 前缀的根，所有后代路径免疫 260 字符 MAX_PATH
-    // （OneDrive 根前缀就 47 字符，深层课程目录实测撞线；撞线的目录整棵静默消失，
-    // 在 mirror 里表现为"对面成片被删"。FFS 正是靠 \\?\ 活着的）。
-    // 缓存键/快照头仍用原始 root，前缀只活在遍历与文件 I/O 里。
+    // Windows long paths: walk from a \\?\-prefixed root so every descendant path is immune to the 260-char MAX_PATH
+    // (the OneDrive root prefix alone is 47 chars; deep course directories were measured hitting the limit, and a directory
+    // that hits it vanishes silently along with its whole tree — in mirror mode that reads as "the other side got mass-deleted".
+    // \\?\ is exactly what keeps FFS alive). The cache key and snapshot header keep the original root; the prefix lives only in the walk and in file I/O.
     #[cfg(windows)]
     let walk_root: std::path::PathBuf = {
         let s = root.to_string_lossy();
         if s.starts_with(r"\\") {
-            root.to_path_buf() // 已是 \\?\ 或 UNC（\\server\share 需 \\?\UNC\ 形态，暂不转换）
+            root.to_path_buf() // already \\?\ or UNC (\\server\share needs the \\?\UNC\ form; not converted for now)
         } else {
             std::path::PathBuf::from(format!(r"\\?\{}", s))
         }
@@ -312,13 +308,13 @@ fn scan_impl(
     #[cfg(not(windows))]
     let walk_root: std::path::PathBuf = root.to_path_buf();
 
-    // walk 期的错误绝不再静默：计数 + 采样，收尾时如实喊出来
-    // （被跳过的条目在比对里等价于"该侧不存在"——这是能生成灾难计划的隐身故障）
+    // Walk-phase errors are never silent again: count them, sample them, and say so honestly at the end
+    // (a skipped entry is equivalent to "absent on this side" during compare —— an invisible fault that can produce a catastrophic plan)
     let mut walk_errors = 0u64;
     let mut walk_err_samples: Vec<String> = Vec::new();
 
-    // 排除必须可见：剪掉的目录/文件计数进快照头，界面明示"有多少没参与比对"。
-    // （教训：默认排除静默吞掉 .git，界面还写"两侧一致 ✓"——绝不允许再发生）
+    // Exclusions must be visible: pruned directories/files are counted into the snapshot header so the UI can state "this much never took part in the comparison".
+    // (Lesson learned: the default exclusions silently swallowed .git while the UI still said "both sides identical ✓" —— never again)
     let excl_dirs = std::cell::Cell::new(0u64);
     let excl_files = std::cell::Cell::new(0u64);
     let walker = walkdir::WalkDir::new(&walk_root)
@@ -338,7 +334,7 @@ fn scan_impl(
                 let (pass, child_might_match) = opt.filter.pass_dir(&rel);
                 let keep = pass || child_might_match;
                 if !keep {
-                    excl_dirs.set(excl_dirs.get() + 1); // 整棵子树被剪
+                    excl_dirs.set(excl_dirs.get() + 1); // the whole subtree is pruned
                 }
                 keep
             } else {
@@ -350,14 +346,14 @@ fn scan_impl(
             }
         });
 
-    // 阶段 1：串行遍历收集（元数据快）；阶段 2：rayon 并行哈希（FFS parallel_scan 的启示：
-    // 多小文件时瓶颈是串行 I/O）。大文件内部再用 mmap_rayon 分块，小文件用普通 mmap 免过订阅。
+    // Phase 1: serial walk to collect entries (metadata is fast); phase 2: parallel hashing with rayon (the lesson from FFS
+    // parallel_scan: with many small files the bottleneck is serial I/O). Large files split further via mmap_rayon; small ones use a plain mmap to avoid oversubscription.
     struct PendingFile {
         rel: String,
         abs: std::path::PathBuf,
         size: u64,
         mt: i64,
-        hash: Option<String>, // 缓存命中
+        hash: Option<String>, // cache hit
         file_id: Option<String>,
         mode: Option<u32>,
     }
@@ -365,7 +361,7 @@ fn scan_impl(
 
     for item in walker {
         if let Some(pp) = &pp {
-            pp.checkpoint()?; // 取消/暂停协作点（每迭代一次 relaxed 原子读）
+            pp.checkpoint()?; // cancel/pause cooperation point (one relaxed atomic read per iteration)
         }
         let item = match item {
             Ok(i) => i,
@@ -412,8 +408,8 @@ fn scan_impl(
             }
         } else {
             let size = md.len();
-            // P1-4：文件系统当初把我们要的 mtime 存成了别的值（FAT 2 秒粒度 / SMB 截断），
-            // 这里换算回我们的本意，让比对不必依赖容差
+            // P1-4: the filesystem once stored a different value than the mtime we asked for (FAT's 2-second granularity
+            // / SMB truncation); convert it back to what we meant so compare need not lean on a tolerance
             let raw_mt = mtime_ms(&md);
             let mt = match mtime_fixes.get(&rel) {
                 Some((ondisk, intended)) if *ondisk == raw_mt => *intended,
@@ -422,7 +418,7 @@ fn scan_impl(
             let mut hash = None;
             if opt.hash && opt.use_cache {
                 if let Some((cs, cm, ch)) = cache.get(&rel) {
-                    // 缓存值按模式隔离：`~` 前缀 = 抽样摘要，绝不能顶替全量哈希（反之亦然）
+                    // Cached values are isolated per mode: a `~` prefix means sampled digest, which must never stand in for a full hash (or the reverse)
                     let want_sampled = opt.sampled && size >= SAMPLE_MIN;
                     if *cs == size && *cm == mt && ch.starts_with('~') == want_sampled {
                         hash = Some(ch.clone());
@@ -448,14 +444,14 @@ fn scan_impl(
                 "",
                 "walk",
                 side,
-                &format!("{walk_errors} 个条目因遍历错误被跳过（该侧将视为不存在！）样本: {}", walk_err_samples.join(" | ")),
+                &format!("{walk_errors} entr(ies) skipped by walk errors (they will be treated as ABSENT on this side!) samples: {}", walk_err_samples.join(" | ")),
             );
         }
     }
 
-    // walk 结束即知总量（P2-6 的洞察）：条数 = 文件数；字节 = 真要读盘哈希的那部分。
-    // 条数计数换挡：walk 期计的是"发现了多少"，哈希期从零重计"处理完多少"
-    // ——否则界面从哈希一开始就停在 N/N。
+    // The totals are known the moment the walk ends (the P2-6 insight): items = file count; bytes = the part that really has to be read off disk and hashed.
+    // The item counter shifts gears: during the walk it counts "how many were found", during hashing it restarts from zero counting "how many are done"
+    // —— otherwise the UI would sit at N/N from the very start of hashing.
     if let Some(pp) = &pp {
         let bytes_to_hash: u64 = if opt.hash {
             pending.iter().filter(|p| p.hash.is_none()).map(|p| effective_read(p.size, opt.sampled)).sum()
@@ -471,7 +467,7 @@ fn scan_impl(
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
         const BIG_FILE: u64 = 32 * 1024 * 1024;
-        // 只有缓存没命中的文件才真的要读，进度条按它们的字节数算才准
+        // Only cache misses are actually read; the progress bar is only accurate if it counts their bytes
         let bytes_total: u64 = pending.iter().filter(|p| p.hash.is_none()).map(|p| p.size).sum();
         let files_total = pending.len() as u64;
         let bytes_done = AtomicU64::new(0);
@@ -481,8 +477,8 @@ fn scan_impl(
             cb(ScanProgress { phase: "walk", files_total, bytes_total, bytes_done: 0, mib_per_s: 0.0 });
         }
 
-        // 进度采样单独一个线程（syncthing 的 ProgressTicker 同款结构）：
-        // 哈希线程只做一次 relaxed 累加，不承担任何回调开销
+        // Progress sampling gets a thread of its own (same structure as syncthing's ProgressTicker):
+        // the hash threads only do one relaxed add and carry no callback overhead at all
         std::thread::scope(|sc| {
             if let Some(cb) = progress {
                 let (bd, hz, t_start) = (&bytes_done, &hashing, std::time::Instant::now());
@@ -501,18 +497,18 @@ fn scan_impl(
                     }
                 });
             }
-            // ≥32MB 的文件不再一把 mmap 哈希到底：那会让"取消"要等在飞的大文件读完
-            // （OneDrive 云占位文件还要先整只水合下载，可能一等几分钟）。
-            // 分块读环每 8MiB 一个取消/暂停检查点；少了 blake3 的文件内多核，
-            // 但外层文件级并行仍在，盘几乎总是瓶颈，吞吐差异进噪声。
+            // Files ≥32MB are no longer mmap-hashed in one shot: that would make "cancel" wait for the in-flight large file
+            // to finish reading (a OneDrive cloud placeholder would first have to hydrate whole, possibly a several-minute wait).
+            // The chunked read loop puts a cancel/pause checkpoint every 8MiB; this gives up blake3's intra-file multicore,
+            // but the outer file-level parallelism remains, the disk is almost always the bottleneck, and the throughput difference sinks into the noise.
             pending.par_iter_mut().for_each(|p| {
                 if let Some(pp) = &pp {
                     if pp.checkpoint().is_err() {
-                        return; // 取消：余下工单空转排空（rayon 标准提前退出法）
+                        return; // cancelled: the remaining work items spin out empty (the standard rayon early-exit)
                     }
                 }
                 if p.hash.is_none() {
-                    // fast 严谨级：大文件只读三个采样窗（云盘占位文件也只水合这三段）
+                    // fast rigor tier: large files only read the three sample windows (a cloud placeholder hydrates only those three too)
                     if opt.sampled && p.size >= SAMPLE_MIN {
                         match sampled_digest(&p.abs, p.size) {
                             Ok(d) => p.hash = Some(d),
@@ -554,7 +550,7 @@ fn scan_impl(
                     };
                     match res {
                         Ok(_) => p.hash = Some(hasher.finalize().to_hex().to_string()),
-                        Err(e) if crate::progress::is_cancelled(&e) => return, // 取消不是哈希错误
+                        Err(e) if crate::progress::is_cancelled(&e) => return, // cancellation is not a hash error
                         Err(e) => {
                             hash_err_count.fetch_add(1, Ordering::Relaxed);
                             if let Some(pp) = &pp {
@@ -568,13 +564,13 @@ fn scan_impl(
                     }
                 }
                 if let Some(pp) = &pp {
-                    pp.item_done(&p.rel); // 哈希期的条数 = 处理完的文件数（缓存命中即刻+1）
+                    pp.item_done(&p.rel); // item count during hashing = files processed (a cache hit bumps it immediately)
                 }
             });
             hashing.store(false, Ordering::Relaxed);
         });
         if let Some(pp) = &pp {
-            pp.checkpoint()?; // 取消发生在哈希期时，从这里如实返回 Interrupted
+            pp.checkpoint()?; // when the cancellation happened during hashing, this is where we honestly return Interrupted
         }
 
         if let Some(cb) = progress {
@@ -645,12 +641,12 @@ mod ctx_tests {
         std::fs::write(&f, &data).unwrap();
         let a = sampled_digest(&f, data.len() as u64).unwrap();
         assert!(a.starts_with('~'), "sampled digests carry the ~ marker");
-        // 中点在采样窗内 → 摘要必须变
+        // The midpoint falls inside a sample window → the digest must change
         data[4 * 1024 * 1024 + 10] = 9;
         std::fs::write(&f, &data).unwrap();
         let b = sampled_digest(&f, data.len() as u64).unwrap();
         assert_ne!(a, b, "an edit inside a sample window must change the digest");
-        // 1MB 处在三个采样窗之外 → 摘要不变。这是 fast 的安全边界，如实断言
+        // Offset 1MB lies outside all three sample windows → the digest does not change. That is fast mode's safety boundary; assert it honestly
         data[1024 * 1024] = 7;
         std::fs::write(&f, &data).unwrap();
         let c = sampled_digest(&f, data.len() as u64).unwrap();
@@ -662,7 +658,7 @@ mod ctx_tests {
         ScanOptions {
             hash: true,
             sampled: false,
-            use_cache: false, // 测试不吃缓存
+            use_cache: false, // tests never eat the cache
             symlinks_direct: false,
             filter: crate::filter::PathFilter::build(&[], &[]),
         }
@@ -681,7 +677,7 @@ mod ctx_tests {
             ProgressEvent::Totals { items_total, bytes_total, .. } => Some((*items_total, *bytes_total)),
             _ => None,
         });
-        assert_eq!(totals, Some((20, 2000)), "walk 结束必须给出精确总量");
+        assert_eq!(totals, Some((20, 2000)), "the end of the walk must yield exact totals");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -692,7 +688,7 @@ mod ctx_tests {
         let ctl2 = ctl.clone();
         let sink = move |ev: ProgressEvent| {
             if matches!(ev, ProgressEvent::Progress { .. }) {
-                ctl2.cancel.store(true, Ordering::SeqCst); // 第一个进度事件就喊停
+                ctl2.cancel.store(true, Ordering::SeqCst); // call a halt on the very first progress event
             }
         };
         let ctx = RunCtx::new(ctl, Arc::new(sink));

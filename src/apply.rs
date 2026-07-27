@@ -1,12 +1,12 @@
-//! apply：执行计划（本地/挂载模式）。
-//! - 默认 DRY-RUN，--apply 才动手（GitDash 同款哲学：预览默认、绝不悄悄动手）
-//! - **落盘一律原子**：写同目录临时文件 → fsync → rename（见 atomic.rs）。
-//!   中断绝不会在最终路径留半截内容。
-//! - 删除与被覆盖的文件先挪进本机回收目录 / `.version_syncDash`（可找回），不做原地销毁
-//! - copy 后把 mtime 设成源表里的值，并**回读校正** —— 下次比对的相等判定依赖它
-//! - v0.9 M1：执行分五个**串行相位**，其中 Copy/Update 相位内部并行
-//!   （唯一 I/O 重类；宽度 = `ApplyOptions::parallel`）。不信输入顺序——桌面翻向的
-//!   ops 会破坏计划的 rank 排序，apply 自己重新分类分相。
+//! apply: execute the plan (local / mounted mode).
+//! - DRY-RUN by default; only --apply actually touches anything (same philosophy as GitDash: preview by default, never act silently)
+//! - **every write is atomic**: temp file in the same directory → fsync → rename (see atomic.rs).
+//!   An interruption can never leave half a file at the final path.
+//! - deleted and overwritten files are moved into the local trash / `.version_syncDash` first (recoverable), never destroyed in place
+//! - after a copy the mtime is set to the value from the source table and **read back for correction** — the next comparison's equality test depends on it
+//! - v0.9 M1: execution runs in five **serial phases**, with the Copy/Update phase parallel inside
+//!   (the only I/O-heavy class; width = `ApplyOptions::parallel`). Input order is not trusted — ops flipped
+//!   in the desktop UI break the plan's rank ordering, so apply re-classifies and re-phases them itself.
 
 use crate::compare::{Action, Op, Side};
 use crate::foundation::path::join_native;
@@ -16,25 +16,25 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// 超过这个体积就不做内存内增量（避免把几 GB 读进内存）
+/// Above this size, skip the in-memory delta path (don't read several GB into memory)
 const DELTA_MEM_CAP: u64 = 1024 * 1024 * 1024;
 
 pub struct ApplyOptions {
     pub dry_run: bool,
     pub trash: Option<PathBuf>,
     pub verbose: bool,
-    /// paranoid 严谨级：复制/更新后重读目标文件校验 blake3（FFS "verify copied files" 同款）
+    /// paranoid rigor tier: after a copy/update, re-read the destination and verify blake3 (same as FFS "verify copied files")
     pub verify: bool,
-    /// 版本控制（可选）：被删/被覆盖的文件存进各 root 的 .version_syncDash/ 而非本机 trash
+    /// Versioning (optional): deleted/overwritten files go into each root's .version_syncDash/ instead of the local trash
     pub versioning: bool,
-    /// 临时文件 rename 前是否 fsync。默认 true；SMB 上嫌慢可关（自担风险）
+    /// Whether to fsync the temp file before the rename. Default true; can be turned off if it feels slow over SMB (at your own risk)
     pub fsync: bool,
-    /// 目录删除时用它判定"里面剩下的东西可不可以连带删"（syncthing 的 `(?d)`）
+    /// Used on directory deletion to decide "may the leftovers inside be removed along with it" (syncthing's `(?d)`)
     pub filter: Option<crate::filter::PathFilter>,
-    /// 本地/挂载盘的增量更新（详见 update_with_delta 的注释；默认关）
+    /// Delta updates for local/mounted disks (see the comments on update_with_delta; off by default)
     pub delta: bool,
-    /// Copy/Update 相位的并行宽度（1 = 顺序）。默认 4：SMB 上 2-4 条流基本吃满
-    /// 上行带宽，再宽只会加剧对端排队。clamp 到 1..=16。
+    /// Parallel width of the Copy/Update phase (1 = sequential). Default 4: over SMB, 2-4 streams basically
+    /// saturate the uplink, and going wider only worsens queueing on the far end. Clamped to 1..=16.
     pub parallel: usize,
 }
 
@@ -66,7 +66,7 @@ fn move_to_trash(file: &Path, rel: &str, trash: &Path) -> std::io::Result<()> {
     match std::fs::rename(file, &dest) {
         Ok(_) => Ok(()),
         Err(_) => {
-            // 跨卷：退化为 copy+delete
+            // Cross-volume: fall back to copy+delete
             std::fs::copy(file, &dest)?;
             std::fs::remove_file(file)
         }
@@ -78,8 +78,8 @@ fn set_mtime(path: &Path, mtime_ms: i64) {
     let _ = filetime::set_file_mtime(path, ft);
 }
 
-/// 读文件 mtime（unix 毫秒）。None 只表示"读不到"（metadata/modified 失败），
-/// 调用方靠它决定"那就不设 mtime"；换算本身交给 `foundation::time::systime_ms`。
+/// Read a file's mtime (unix milliseconds). None only means "could not read it" (metadata/modified failed);
+/// the caller uses that to decide "then don't set the mtime". The conversion itself is left to `foundation::time::systime_ms`.
 fn read_mtime_ms(path: &Path) -> Option<i64> {
     let t = std::fs::metadata(path).ok()?.modified().ok()?;
     Some(crate::foundation::time::systime_ms(t))
@@ -92,8 +92,8 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 }
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
-    // Windows 没有 unix 权限位。计划里带 mode 只会在 unix↔unix 之间产生，
-    // 走到这里说明执行侧是 Windows —— 静默跳过而不是报错。
+    // Windows has no unix permission bits. A plan carrying a mode can only arise between unix↔unix,
+    // so reaching here means the executing side is Windows — skip silently rather than error.
     Ok(())
 }
 
@@ -104,7 +104,7 @@ fn create_symlink(target: &str, link: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 fn create_symlink(target: &str, link: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::{symlink_dir, symlink_file};
-    // 文件链接失败（目标是目录/权限）再试目录链接；仍失败如实报错（Windows 需开发者模式或管理员）
+    // If the file link fails (target is a directory, or permissions), try a directory link; if that fails too, report it honestly (Windows needs developer mode or admin)
     symlink_file(target, link).or_else(|_| symlink_dir(target, link))
 }
 
@@ -112,14 +112,16 @@ fn exists_no_follow(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok()
 }
 
-/// 删除目录失败的分类结果（P0-4）。
-/// 过去这里是 `Err(_) => Ok(())`：行为安全（不递归删），但**完全静默**——
-/// 用户看到"0 错误"，可对面目录还在，下一轮比对又冒出同一条 DeleteDir，永远收敛不了。
+/// Classified outcome of a failed directory deletion (P0-4).
+/// This used to be `Err(_) => Ok(())`: safe behavior (no recursive delete) but **completely silent** —
+/// the user sees "0 errors" while the directory is still there, the next comparison emits the same DeleteDir again, and it never converges.
 enum DirOutcome {
     Removed,
-    /// 本来就不在
+    /// It was never there in the first place
     Absent,
-    /// 非空，附上残留项样本与是否全部可删
+    /// Non-empty; `sample` names a few of the leftovers so the error can say what is still in there.
+    /// Deletability was already decided before this point — a directory whose leftovers all match
+    /// `deletable` is removed outright and reports `Removed`, so reaching here means it is staying.
     NotEmpty { sample: Vec<String> },
     Failed(std::io::Error),
 }
@@ -129,13 +131,13 @@ fn try_delete_dir(dst: &Path, rel: &str, filter: Option<&crate::filter::PathFilt
         Ok(_) => return DirOutcome::Removed,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DirOutcome::Absent,
         Err(e) if e.kind() != std::io::ErrorKind::DirectoryNotEmpty && e.raw_os_error() != Some(145) && e.raw_os_error() != Some(39) => {
-            // 145 = ERROR_DIR_NOT_EMPTY (Windows), 39 = ENOTEMPTY (unix)。
-            // 其它错误（权限等）如实报告
+            // 145 = ERROR_DIR_NOT_EMPTY (Windows), 39 = ENOTEMPTY (unix).
+            // Any other error (permissions, etc.) is reported as-is
             return DirOutcome::Failed(e);
         }
         Err(_) => {}
     }
-    // 非空：看看剩下的是什么
+    // Non-empty: see what is left inside
     let mut sample = Vec::new();
     let mut all_deletable = true;
     let mut count = 0usize;
@@ -147,7 +149,7 @@ fn try_delete_dir(dst: &Path, rel: &str, filter: Option<&crate::filter::PathFilt
         let child_rel = format!(
             "{}/{}",
             rel.trim_end_matches('/'),
-            // strip_prefix 失败时退回整条路径，与此前一致
+            // fall back to the whole path if strip_prefix fails, as before
             crate::foundation::path::to_rel(e.path(), dst)
                 .unwrap_or_else(|| e.path().to_string_lossy().replace('\\', "/"))
         );
@@ -160,14 +162,14 @@ fn try_delete_dir(dst: &Path, rel: &str, filter: Option<&crate::filter::PathFilt
         }
     }
     if count == 0 {
-        // 只剩子目录：递归删空目录树
+        // Only subdirectories left: recursively remove the empty directory tree
         return match std::fs::remove_dir_all(dst) {
             Ok(_) => DirOutcome::Removed,
             Err(e) => DirOutcome::Failed(e),
         };
     }
     if all_deletable {
-        // 剩下的全是 `(?d)` 可删项 / 原子写残骸 → 连带清掉（syncthing 同款语义）
+        // Everything left is a `(?d)` deletable item / atomic-write debris → remove it along with the directory (same semantics as syncthing)
         return match std::fs::remove_dir_all(dst) {
             Ok(_) => DirOutcome::Removed,
             Err(e) => DirOutcome::Failed(e),
@@ -176,15 +178,15 @@ fn try_delete_dir(dst: &Path, rel: &str, filter: Option<&crate::filter::PathFilt
     DirOutcome::NotEmpty { sample }
 }
 
-/// 增量更新（P1-1 步骤 B，opt-in）。
+/// Delta update (P1-1 step B, opt-in).
 ///
-/// 做法：先把 dst 复制到同目录的临时文件（`fs::copy` 在 SMB2+ 上走服务端 copychunk、
-/// 在支持 reflink 的本地 FS 上近似零成本），再只把**内容不同的 FastCDC 块**写进临时文件，
-/// 最后 rename。同一条原子路径，不牺牲中断安全。
+/// How it works: first copy dst into a temp file in the same directory (`fs::copy` uses server-side copychunk
+/// on SMB2+, and is near-free on local filesystems with reflink support), then write only the **FastCDC chunks
+/// whose content differs** into that temp file, and rename at the end. Same atomic path, no loss of interruption safety.
 ///
-/// 取舍要说清楚：这条路要多读一遍 dst（远端读）换少写很多字节（远端写）。
-/// SMB / WAN 上传写远比读贵时是净赚，对称链路上是打平——所以默认关闭，由 job 显式开。
-/// 远程 pack 管线（v0.7 已有）才是增量收益最确定的地方。
+/// The trade-off, stated plainly: this path reads dst one extra time (a remote read) to avoid writing a lot of bytes (remote writes).
+/// It is a net win where writes cost far more than reads (SMB / WAN uplinks) and a wash on symmetric links — hence off by default, enabled explicitly per job.
+/// The remote pack pipeline (already present in v0.7) is where the delta payoff is most certain.
 fn update_with_delta(
     src: &Path,
     dst: &Path,
@@ -201,7 +203,7 @@ fn update_with_delta(
     }
     let old = std::fs::read(dst)?;
     let new = std::fs::read(src)?;
-    // 先把旧内容整体铺进临时文件（服务端复制 / reflink 的机会点）
+    // Lay the whole old content into the temp file first (the opening for server-side copy / reflink)
     staged.write_at(0, &old)?;
     let old_chunks = crate::chunk::chunk_bytes(&old);
     let new_chunks = crate::chunk::chunk_bytes(&new);
@@ -211,7 +213,7 @@ fn update_with_delta(
     for c in &new_chunks {
         let start = c.off as usize;
         let end = start + c.len as usize;
-        // 块内容相同**且落在同一偏移**才能省下这一次写
+        // Only when the chunk content matches **and it sits at the same offset** can this write be skipped
         if let Some(&(off, len)) = have.get(c.hash.as_str()) {
             if off == c.off && len == c.len {
                 continue;
@@ -220,17 +222,17 @@ fn update_with_delta(
         staged.write_at(c.off, &new[start..end])?;
         written += c.len as u64;
     }
-    // 新文件更短时要截断掉尾巴
+    // A shorter new file needs its tail truncated
     if (new.len() as u64) < old.len() as u64 {
         let f = std::fs::OpenOptions::new().write(true).open(staged.path())?;
         f.set_len(new.len() as u64)?;
     }
-    // 新内容就在内存里——顺手算全量哈希，供写后校验对照落盘重读
+    // The new content is right there in memory — hash it in full while we're at it, for post-copy verification against the readback from disk
     let h = blake3::hash(&new).to_hex().to_string();
     Ok(Some((written, new.len() as u64, h)))
 }
 
-/// 工作线程共享的执行环境。计数器全原子、写入器上锁——worker 只借 &Shared。
+/// Execution environment shared by the worker threads. All counters are atomic and writers sit behind locks — a worker only borrows &Shared.
 struct Shared<'a> {
     opt: &'a ApplyOptions,
     ctx: &'a RunCtx,
@@ -239,9 +241,9 @@ struct Shared<'a> {
     trash: PathBuf,
     ver_source: Mutex<Option<crate::version::VersionWriter>>,
     ver_target: Mutex<Option<crate::version::VersionWriter>>,
-    // P1-4：文件系统实际存下来的 mtime 与我们想要的不一致时（FAT 2 秒粒度、
-    // 某些 SMB 服务端截断），记下 (ondisk, intended) 供下次扫描换算，
-    // 而不是靠 ±2s 容差硬扛。syncthing 的 mtimeFS 同款做法。
+    // P1-4: when the mtime the filesystem actually stored differs from the one we wanted (FAT's 2-second
+    // granularity, truncation by some SMB servers), record (ondisk, intended) for the next scan to convert with,
+    // instead of brute-forcing it with a ±2s tolerance. Same approach as syncthing's mtimeFS.
     mtime_fixes: Mutex<Vec<(bool, String, i64, i64)>>,
     delta_saved: AtomicU64,
 }
@@ -253,7 +255,7 @@ struct Counters {
     errors: AtomicU64,
 }
 
-/// 被覆盖/被删的原件先留档（trash 或 .version_syncDash）
+/// Archive the original before it is overwritten/deleted (trash or .version_syncDash)
 fn preserve(sh: &Shared, op: &Op, exec_root: &Path, dst: &Path, why: &str, newer: Option<&Path>) -> std::io::Result<()> {
     if sh.opt.versioning {
         let slot = if op.side == Side::Source { &sh.ver_source } else { &sh.ver_target };
@@ -267,8 +269,8 @@ fn preserve(sh: &Shared, op: &Op, exec_root: &Path, dst: &Path, why: &str, newer
     }
 }
 
-/// 执行单个 op。取消/暂停经 `pp.checkpoint()` 在块边界响应；
-/// 取消返回 Interrupted，Staged::Drop 保证终点无残留。
+/// Execute a single op. Cancel/pause are honoured at chunk boundaries via `pp.checkpoint()`;
+/// a cancel returns Interrupted, and Staged::Drop guarantees no debris at the destination.
 fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
     let (exec_root, other_root) = match op.side {
         Side::Target => (sh.target_root, sh.source_root),
@@ -280,7 +282,7 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
             if let Some(p) = dst.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            // symlink 操作：创建链接本身，不复制内容（链接是元数据，无所谓原子写）
+            // symlink op: create the link itself, don't copy content (a link is metadata; atomic writes don't apply)
             if let Some(target) = &op.link {
                 if exists_no_follow(&dst) {
                     preserve(sh, op, exec_root, &dst, "overwritten", None)?;
@@ -289,17 +291,17 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
             }
             let src = join_native(other_root, &op.path);
 
-            // ---- 原子落盘（P0-1）----
+            // atomic write (P0-1)
             let mut staged = crate::atomic::Staged::create(&dst)?;
             let mut used_delta = false;
-            // 写后校验的期望值 = **本次复制流的全量 blake3**（复制反正读了全文，
-            // 流上算哈希零成本）。不用 op.hash——扫描证据可能只是抽样摘要（`~` 前缀），
-            // 而写路径的正确性必须整文件成立。
+            // The expected value for post-copy verification = **the full blake3 of this copy stream** (the copy reads
+            // the whole file anyway, so hashing on the stream is free). Not op.hash — scan evidence may be only a sampled
+            // digest (`~` prefix), whereas the correctness of the write path must hold over the entire file.
             let mut expect_hash: Option<String> = None;
             if sh.opt.delta && op.action == Action::Update && exists_no_follow(&dst) {
                 if let Some((written, total, h)) = update_with_delta(&src, &dst, &mut staged)? {
                     sh.delta_saved.fetch_add(total.saturating_sub(written), Ordering::Relaxed);
-                    // 进度按"这个文件完成了"记账（与 bytes_total 同一口径）；省下的字节另行汇报
+                    // Progress is booked as "this file is done" (same basis as bytes_total); the bytes saved are reported separately
                     pp.add_bytes(total, &op.path);
                     expect_hash = Some(h);
                     used_delta = true;
@@ -323,7 +325,7 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
             }
             staged.seal(sh.opt.fsync)?;
 
-            // 校验在临时文件上做：落盘重读 vs 复制流，不合格就根本不会成为最终文件
+            // Verification runs on the temp file: readback from disk vs the copy stream — a failure never becomes the final file
             if sh.opt.verify {
                 if let Some(expect) = &expect_hash {
                     let mut hasher = blake3::Hasher::new();
@@ -337,7 +339,7 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
                     }
                 }
             }
-            // mtime / mode 也在临时文件上设好，rename 之后立刻就是终态
+            // mtime / mode are set on the temp file too, so the rename lands it already in its final state
             let intended = match op.mtime_ms {
                 Some(mt) => {
                     set_mtime(staged.path(), mt);
@@ -348,13 +350,13 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
             if let Some(m) = op.mode {
                 set_mode(staged.path(), m)?;
             }
-            // 旧文件留档：放在 commit 前一刻，窗口只有一次 rename
+            // Archive the old file at the last moment before commit, so the window is a single rename
             if exists_no_follow(&dst) {
                 preserve(sh, op, exec_root, &dst, "overwritten", Some(&src))?;
             }
             staged.commit()?;
 
-            // ---- mtime 回读校正（P1-4）----
+            // mtime readback correction (P1-4)
             if let Some(want) = intended {
                 if let Some(got) = read_mtime_ms(&dst) {
                     if got != want {
@@ -378,8 +380,8 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
             match std::fs::rename(&from, &dst) {
                 Ok(_) => Ok(()),
                 Err(_) => {
-                    // 跨卷退路：同样走原子写，中断不会留半截。
-                    // Move 的字节不在 bytes_total 里，这里只挂检查点、不计字节。
+                    // Cross-volume fallback: still an atomic write, so an interruption leaves nothing half-done.
+                    // Move's bytes are not part of bytes_total, so only hook the checkpoint here, don't count bytes.
                     let mut staged = crate::atomic::Staged::create(&dst)?;
                     staged.copy_from(&from, &mut |_| pp.checkpoint())?;
                     staged.seal(sh.opt.fsync)?;
@@ -392,14 +394,14 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
             }
         }
         Action::Delete => {
-            // symlink_metadata：断链的 symlink exists() 会误报 false，这里不跟随
+            // symlink_metadata: exists() falsely reports false for a broken symlink, so don't follow here
             if exists_no_follow(&dst) {
                 preserve(sh, op, exec_root, &dst, "deleted", None)?;
             }
             Ok(())
         }
         Action::DeleteDir => {
-            // P0-4：分类汇报，不再静默吞掉
+            // P0-4: report by classification, no longer swallowed silently
             match try_delete_dir(&dst, &op.path, sh.opt.filter.as_ref()) {
                 DirOutcome::Removed | DirOutcome::Absent => Ok(()),
                 DirOutcome::NotEmpty { sample } => Err(std::io::Error::new(
@@ -417,8 +419,8 @@ fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
     }
 }
 
-/// 单个 op 的结果入账：错误绝不中断整体（FFS 累积语义），
-/// 逐条经 sink 发 Error 事件（windowed 桌面构建首次真正看得见错误）＋保留 eprintln 给 CLI。
+/// Book the result of a single op: an error never aborts the whole run (FFS accumulating semantics),
+/// each one emits an Error event through the sink (the first time the windowed desktop build can really see errors) plus keeps the eprintln for the CLI.
 fn record(sh: &Shared, op: &Op, res: std::io::Result<()>, pp: &PhaseProgress, acc: &Counters, ms: u64) {
     let label = format!(
         "[{}] {:?} {}",
@@ -427,8 +429,8 @@ fn record(sh: &Shared, op: &Op, res: std::io::Result<()>, pp: &PhaseProgress, ac
         op.path
     );
     let side = if op.side == Side::Target { "target" } else { "source" };
-    // 每条 op 的结局都发一条 ItemResult —— 这里是全库唯一知道"这条到底成没成"的地方，
-    // 出了这个函数就只剩三个聚合计数器了。执行清单（items.jsonl）全靠它。
+    // Every op's outcome emits one ItemResult — this is the only place in the codebase that knows "did this one actually succeed";
+    // outside this function all that remains are three aggregate counters. The execution ledger (items.jsonl) rests entirely on it.
     let ledger = |outcome: ItemOutcome| {
         sh.ctx.sink.emit(crate::progress::ProgressEvent::ItemResult {
             ts_ms: crate::foundation::time::now_ms(),
@@ -436,7 +438,7 @@ fn record(sh: &Shared, op: &Op, res: std::io::Result<()>, pp: &PhaseProgress, ac
             action: format!("{:?}", op.action),
             side: side.to_string(),
             outcome,
-            // 条目自身的大小（delta 更新实际写入的字节会更少——那是链路指标，不是清单指标）
+            // The item's own size (a delta update actually writes fewer bytes — that is a link metric, not a ledger metric)
             bytes: op.size.unwrap_or(0),
             ms,
         });
@@ -451,15 +453,15 @@ fn record(sh: &Shared, op: &Op, res: std::io::Result<()>, pp: &PhaseProgress, ac
             pp.item_done(&op.path);
         }
         Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-            // 目录留着不是错误（保护过滤中的文件是对的），但必须让人看见
+            // Keeping the directory is not an error (protecting a filtered file is correct), but it must be visible
             acc.skipped.fetch_add(1, Ordering::Relaxed);
             println!("KEPT      {} ({e})", op.path);
             ledger(ItemOutcome::Kept);
             pp.item_done(&op.path);
         }
         Err(e) if crate::progress::is_cancelled(&e) && sh.ctx.ctl.cancelled() => {
-            // 用户取消：这个 op 没完成也不算错——摘要里 cancelled=true 说明一切。
-            // 但清单里要留痕，否则"这条为什么没做"在事后无从回答。
+            // User cancelled: this op not completing is not an error — cancelled=true in the summary says it all.
+            // But it must leave a trace in the ledger, or "why wasn't this one done" has no answer after the fact.
             ledger(ItemOutcome::Cancelled);
         }
         Err(e) => {
@@ -472,9 +474,9 @@ fn record(sh: &Shared, op: &Op, res: std::io::Result<()>, pp: &PhaseProgress, ac
     }
 }
 
-/// 跑一类 op。width==1 在当前线程顺序执行；否则 scoped 线程池
-/// （AtomicUsize 工单索引，不切分区间——大文件不会把某个 worker 拖成长尾）。
-/// 不用 rayon：verify 的 blake3 已在 rayon 全局池里，嵌套会过订阅且缠住暂停语义。
+/// Run one class of ops. width==1 runs sequentially on the current thread; otherwise a scoped thread pool
+/// (an AtomicUsize work-ticket index rather than range splitting — one big file can't drag a worker into a long tail).
+/// No rayon: verify's blake3 already runs in rayon's global pool, and nesting would oversubscribe and tangle the pause semantics.
 fn run_class(class: &[&Op], width: usize, sh: &Shared, pp: &PhaseProgress, acc: &Counters) {
     if class.is_empty() {
         return;
@@ -488,11 +490,11 @@ fn run_class(class: &[&Op], width: usize, sh: &Shared, pp: &PhaseProgress, acc: 
                 break;
             }
             let op = class[i];
-            // 相邻两个 op 之间的协作点（暂停在这里打转、取消在这里退场）
+            // The cooperation point between two adjacent ops (a pause spins here, a cancel exits here)
             if pp.checkpoint().is_err() {
                 break;
             }
-            // 逐条计时：执行清单里"哪个文件拖慢了这次同步"只能在这里量到
+            // Per-item timing: "which file slowed this sync down" in the execution ledger can only be measured here
             let t_op = std::time::Instant::now();
             let res = exec_op(sh, op, pp);
             let bail = matches!(&res, Err(e) if crate::progress::is_cancelled(e) && sh.ctx.ctl.cancelled());
@@ -517,10 +519,10 @@ pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOpti
     apply_with(ops, source_root, target_root, opt, &RunCtx::null()).into_tuple()
 }
 
-/// v0.9 M1：带进度/取消/暂停的执行主体。五个串行相位：
-/// Moves → **Copy/Update（并行）** → Chmod → Delete → DeleteDir（类内 deepest-first）。
-/// 开 delta 的 Update 留在串行道——update_with_delta 会把新旧两份读进内存（≤1GB 帽），
-/// 并行 4 工 × 2GB 峰值不可接受。
+/// v0.9 M1: the execution body with progress/cancel/pause. Five serial phases:
+/// Moves → **Copy/Update (parallel)** → Chmod → Delete → DeleteDir (deepest-first within the class).
+/// Updates with delta enabled stay in the serial lane — update_with_delta reads both the old and the new copy into memory (≤1GB cap),
+/// and 4 parallel workers × a 2GB peak is not acceptable.
 pub fn apply_with(
     ops: &[Op],
     source_root: &Path,
@@ -528,7 +530,7 @@ pub fn apply_with(
     opt: &ApplyOptions,
     ctx: &RunCtx,
 ) -> ApplyOutcome {
-    // Apply 的总量开跑前即知：UI 百分比公式从 t=0 生效
+    // Apply's totals are known before it starts: the UI percentage formula is valid from t=0
     let items_total = ops.iter().filter(|o| !matches!(o.action, Action::Conflict | Action::Note)).count() as u64;
     let bytes_total: u64 = ops
         .iter()
@@ -538,7 +540,7 @@ pub fn apply_with(
     let pp = PhaseProgress::begin(ctx, Phase::Apply, None, items_total, bytes_total);
     let acc = Counters::default();
 
-    // Conflict/Note 只报告，与执行相位无关，先走完
+    // Conflict/Note are report-only and unrelated to the execution phases — get them out of the way first
     for op in ops {
         match op.action {
             Action::Conflict => {
@@ -575,8 +577,8 @@ pub fn apply_with(
         };
     }
 
-    // FFS dir_lock 思路：动手前锁两侧 root（带心跳），防两台机器同时 apply 同一目录。
-    // 暂停用 100ms 自旋而非挂起返回，正是为了让这两个锁的心跳线程在暂停期间继续跳。
+    // The FFS dir_lock idea: lock both roots (with a heartbeat) before touching anything, so two machines cannot apply to the same directory at once.
+    // Pause spins on 100ms instead of suspending and returning precisely so these two locks' heartbeat threads keep beating while paused.
     let _lock_guard: (crate::lock::RootLock, crate::lock::RootLock) = {
         let ls = match crate::lock::RootLock::acquire(source_root) {
             Ok(l) => l,
@@ -607,7 +609,7 @@ pub fn apply_with(
         delta_saved: AtomicU64::new(0),
     };
 
-    // 分相（不信输入顺序）
+    // Split into phases (input order is not trusted)
     let mut moves: Vec<&Op> = Vec::new();
     let mut copies: Vec<&Op> = Vec::new();
     let mut copies_delta: Vec<&Op> = Vec::new();
@@ -630,10 +632,10 @@ pub fn apply_with(
             Action::Conflict | Action::Note => {}
         }
     }
-    // 深目录先删，父目录才可能变空
+    // Delete deep directories first, so a parent has a chance to become empty
     deldirs.sort_by_key(|o| std::cmp::Reverse(o.path.matches('/').count()));
 
-    // 同一 (side, path) 出现两次（理论上计划不会生成，但翻向操作人为可造）→ 并行会竞写，强制串行
+    // The same (side, path) appearing twice (a plan shouldn't generate that, but flipping direction by hand can) → parallel would race on the write, so force sequential
     let mut seen = std::collections::HashSet::new();
     let has_dup = copies.iter().any(|o| !seen.insert((o.side == Side::Source, o.path.as_str())));
     let width = if has_dup { 1 } else { opt.parallel };
@@ -645,7 +647,7 @@ pub fn apply_with(
     run_class(&deletes, 1, &sh, &pp, &acc);
     run_class(&deldirs, 1, &sh, &pp, &acc);
 
-    // ---- 串行收尾 ----
+    // serial wrap-up
     let mtime_fixes = std::mem::take(&mut *sh.mtime_fixes.lock().unwrap());
     if !mtime_fixes.is_empty() {
         let mut src_fix = Vec::new();
@@ -724,7 +726,7 @@ mod tests {
         ApplyOptions { dry_run: false, trash: Some(trash), fsync: false, ..Default::default() }
     }
 
-    /// 收 ItemResult 的 ctx：执行清单（items.jsonl）的内容就是这批事件
+    /// A ctx that collects ItemResult: the contents of the execution ledger (items.jsonl) are exactly these events
     fn ledger_ctx() -> (RunCtx, std::sync::Arc<Mutex<Vec<(String, ItemOutcome, u64)>>>) {
         let store: std::sync::Arc<Mutex<Vec<(String, ItemOutcome, u64)>>> =
             std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -749,18 +751,18 @@ mod tests {
         let (ctx, log) = ledger_ctx();
         let ops = [
             op(Action::Copy, "a.txt"),          // → ok
-            op(Action::DeleteDir, "d"),         // → kept（非空且内容不可删）
-            op(Action::Copy, "missing.txt"),    // → failed（源文件不存在）
+            op(Action::DeleteDir, "d"),         // → kept (non-empty and its contents are not deletable)
+            op(Action::Copy, "missing.txt"),    // → failed (the source file does not exist)
         ];
         let out = apply_with(&ops, &s, &t, &opts(base.join("trash")), &ctx);
         assert_eq!((out.done, out.skipped, out.errors), (1, 1, 1));
 
         let rows = log.lock().unwrap();
-        // 关键不变量：计划里每一条都在清单里留了痕，一条不多一条不少
-        assert_eq!(rows.len(), ops.len(), "每条 op 都必须留痕：{rows:?}");
+        // Key invariant: every entry in the plan leaves a trace in the ledger — not one more, not one fewer
+        assert_eq!(rows.len(), ops.len(), "every op must leave a trace: {rows:?}");
         let find = |p: &str| rows.iter().find(|(path, _, _)| path == p).map(|(_, o, _)| *o);
         assert_eq!(find("a.txt"), Some(ItemOutcome::Ok));
-        assert_eq!(find("d"), Some(ItemOutcome::Kept), "目录留着不是错误，但必须可追溯");
+        assert_eq!(find("d"), Some(ItemOutcome::Kept), "keeping the directory is not an error, but it must be traceable");
         assert_eq!(find("missing.txt"), Some(ItemOutcome::Failed));
         drop(rows);
         let _ = std::fs::remove_dir_all(&base);
@@ -776,16 +778,16 @@ mod tests {
             std::fs::write(s.join(format!("f{i}.txt")), vec![b'x'; 4096]).unwrap();
         }
         let (ctx, log) = ledger_ctx();
-        ctx.ctl.request_cancel(); // 一条都轮不到执行
+        ctx.ctl.request_cancel(); // not a single one gets its turn to run
         let ops: Vec<Op> = (0..6).map(|i| op(Action::Copy, &format!("f{i}.txt"))).collect();
         let out = apply_with(&ops, &s, &t, &opts(base.join("trash")), &ctx);
 
         assert_eq!(out.done, 0);
         let rows = log.lock().unwrap();
-        // 如实断言：checkpoint 在**动手之前**就拦下了，所以一条 op 都没被执行，
-        // 清单里自然一行也没有。`all()` 对空集恒真，会把这条测成虚假通过——
-        // 必须显式钉住行数，否则将来 record 漏发也发现不了。
-        assert_eq!(rows.len(), 0, "取消发生在任何 op 之前时清单应为空：{rows:?}");
+        // Assert honestly: the checkpoint stopped things **before any work began**, so not a single op ran
+        // and the ledger naturally holds no rows. `all()` is vacuously true on an empty set, which would
+        // turn this into a false pass — the row count must be pinned explicitly, or a future missing emit in record would go unnoticed.
+        assert_eq!(rows.len(), 0, "the ledger must be empty when the cancel lands before any op: {rows:?}");
         assert!(rows.iter().all(|(_, o, _)| *o == ItemOutcome::Cancelled));
         drop(rows);
         let _ = std::fs::remove_dir_all(&base);
@@ -813,8 +815,8 @@ mod tests {
 
     #[test]
     fn failed_update_leaves_the_original_intact() {
-        // 源文件不存在 → 复制必然失败。目标必须原封不动，这正是原子写要保证的：
-        // 过去 fs::copy 直接写目标，失败会留下截断内容，下一轮 sync 会把它反向传播回 source。
+        // The source file does not exist → the copy is bound to fail. The destination must be untouched, which is exactly what the atomic write guarantees:
+        // fs::copy used to write the destination directly, so a failure left truncated content behind and the next sync propagated it back to source.
         let base = tmproot("fail");
         let (s, t) = (base.join("s"), base.join("t"));
         std::fs::create_dir_all(&s).unwrap();
@@ -856,7 +858,7 @@ mod tests {
         std::fs::create_dir_all(t.join("d")).unwrap();
         std::fs::write(t.join("d").join("protected.log"), b"x").unwrap();
 
-        // 无 filter → 残留项不可删 → 计入 skipped 并打印原因，而不是假装成功
+        // No filter → the leftovers are not deletable → count it as skipped and print the reason, rather than pretending it succeeded
         let (done, skipped, errors) = apply(&[op(Action::DeleteDir, "d")], &s, &t, &opts(base.join("trash")));
         assert_eq!(done, 0, "the directory was not actually removed");
         assert_eq!(skipped, 1, "it must be reported, not silently counted as done");
@@ -887,7 +889,7 @@ mod tests {
         let (s, t) = (base.join("s"), base.join("t"));
         std::fs::create_dir_all(&s).unwrap();
         std::fs::create_dir_all(&t).unwrap();
-        // 大于 DELTA_MIN_SIZE，且只有中间一小段不同
+        // Larger than DELTA_MIN_SIZE, with only a short stretch in the middle differing
         let mut old = vec![0u8; 6 * 1024 * 1024];
         for (i, b) in old.iter_mut().enumerate() {
             *b = (i % 251) as u8;
@@ -924,7 +926,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // ---- v0.9 M1：并行/进度/取消 ----
+    // v0.9 M1: parallelism / progress / cancellation
 
     use crate::progress::{ProgressEvent, RunCtl, RunCtx};
     use std::sync::Arc;
@@ -938,7 +940,7 @@ mod tests {
         (RunCtx::new(RunCtl::new(), Arc::new(sink)), store)
     }
 
-    /// 并行与串行必须产出逐字节相同的结果树（含 trash 保存集）
+    /// Parallel and sequential must produce byte-identical result trees (including the set preserved in trash)
     #[test]
     fn parallel_and_sequential_agree() {
         let run = |tag: &str, parallel: usize| -> (PathBuf, PathBuf, (u64, u64, u64)) {
@@ -952,7 +954,7 @@ mod tests {
                 std::fs::write(s.join(&name), vec![i as u8; 20_000 + i * 1000]).unwrap();
                 ops.push(op(Action::Copy, &name));
             }
-            // 混入一个 update（旧内容进 trash）与一个 delete
+            // Mix in one update (old content goes to trash) and one delete
             std::fs::write(s.join("up.txt"), b"NEW").unwrap();
             std::fs::write(t.join("up.txt"), b"OLD").unwrap();
             ops.push(op(Action::Update, "up.txt"));
@@ -967,7 +969,7 @@ mod tests {
         let (b1, t1, r1) = run("seq", 1);
         let (b2, t2, r2) = run("par", 4);
         assert_eq!(r1, r2, "counts must match");
-        // 结果树逐文件一致
+        // The result trees agree file by file
         for e in std::fs::read_dir(&t1).unwrap().flatten() {
             let name = e.file_name();
             let a = std::fs::read(e.path()).unwrap();
@@ -982,7 +984,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&b2);
     }
 
-    /// 错误不中断：10 好 1 坏 → 10 应用 + 1 Error 事件，字节账目 = Σ 成功文件
+    /// Errors don't abort: 10 good, 1 bad → 10 applied + 1 Error event, byte ledger = Σ of the successful files
     #[test]
     fn errors_accumulate_without_aborting() {
         let base = tmproot("errs");
@@ -1000,7 +1002,7 @@ mod tests {
             o.size = Some(body.len() as u64);
             ops.push(o);
         }
-        ops.push(op(Action::Copy, "missing-on-source.bin")); // 必失败
+        ops.push(op(Action::Copy, "missing-on-source.bin")); // guaranteed to fail
 
         let (ctx, store) = collecting_ctx();
         let out = apply_with(&ops, &s, &t, &opts(base.join("trash")), &ctx);
@@ -1017,7 +1019,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// 大文件复制中途取消：块间响应、终点无半截文件、零 .syncdash.tmp 残留
+    /// Cancel mid-copy of a big file: honoured between chunks, no half file at the destination, zero .syncdash.tmp debris
     #[test]
     fn cancel_mid_copy_leaves_no_debris() {
         let base = tmproot("cancel");
@@ -1030,7 +1032,7 @@ mod tests {
 
         let ctl = RunCtl::new();
         let ctl2 = ctl.clone();
-        // 第一个 Progress 事件（= 第一个 1MiB 块）后立刻请求取消
+        // Request the cancel right after the first Progress event (= the first 1MiB chunk)
         let sink = move |ev: ProgressEvent| {
             if matches!(ev, ProgressEvent::Progress { .. }) {
                 ctl2.request_cancel();
@@ -1051,14 +1053,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// DeleteDir 深度序：子目录先于父目录被删，父目录才可能空
+    /// DeleteDir depth ordering: subdirectories go before their parent, so the parent has a chance to be empty
     #[test]
     fn delete_dirs_deepest_first_regardless_of_input_order() {
         let base = tmproot("depth");
         let (s, t) = (base.join("s"), base.join("t"));
         std::fs::create_dir_all(&s).unwrap();
         std::fs::create_dir_all(t.join("a").join("b").join("c")).unwrap();
-        // 故意按浅→深的错误顺序给 op
+        // Deliberately hand over the ops in the wrong shallow→deep order
         let ops = vec![op(Action::DeleteDir, "a"), op(Action::DeleteDir, "a/b"), op(Action::DeleteDir, "a/b/c")];
         let (done, _, errors) = apply(&ops, &s, &t, &opts(base.join("trash")));
         assert_eq!((done, errors), (3, 0), "all three directories must go");

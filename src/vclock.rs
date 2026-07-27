@@ -1,23 +1,28 @@
-//! 版本向量（P2-1）。语义 1:1 对照 syncthing `lib/protocol/vector.go`，用 Rust 重写。
+//! Vector clocks (P2-1). Semantics map 1:1 onto syncthing `lib/protocol/vector.go`, rewritten in Rust.
 //!
-//! 为什么需要它：archive（上次同步快照）只能回答"相对上一次，这一侧变了没有"，
-//! 两个节点以上就会退化——A→B 同步后 B→C，C 再改回来，谁也说不清是谁基于谁改的。
-//! 版本向量把"因果关系"直接编码进每个文件的版本里：
-//!   - `Greater` / `Lesser`：一方是另一方的后代 → 单边传播，不是冲突
-//!   - `Concurrent`：互不为祖先 → **真冲突**
+//! Why it is needed: the archive (last-sync snapshot) can only answer "did this side change relative to
+//! last time", which degrades past two nodes —— A→B syncs, then B→C, then C edits it back, and nobody can
+//! say who based their edit on whom. A vector clock encodes causality directly into every file's version:
+//!   - `Greater` / `Lesser`: one side is a descendant of the other → one-way propagation, not a conflict
+//!   - `Concurrent`: neither is an ancestor of the other → **a real conflict**
 //!
-//! 计数器取 `max(old+1, unix_now)`（syncthing `updateWithNow`）：用时间戳做下界，
-//! 即使某个节点的库被旧备份覆盖，计数器也不会倒退回已用过的值。
+//! The counter takes `max(old+1, unix_now)` (syncthing `updateWithNow`): with the timestamp as a lower bound,
+//! a node's counter never rewinds to an already-used value even if its store is overwritten by an old backup.
 //!
-//! **当前定位**：数学核心与节点身份已完成并通过测试，`compare` 在
-//! `archive_format = "index"` 时启用（见 config.rs）。默认仍走 archive 快照路径——
-//! 真 N 向要求每次 apply 后精确维护向量，那是 v1.0 的收敛性工程。
+//! **Current status**: the mathematical core and node identity are complete and tested; `compare` is
+//! enabled when `archive_format = "index"` (see config.rs). The default still runs the archive snapshot
+//! path —— true N-way requires the vector to be maintained exactly after every apply, which is v1.0 convergence work.
+//!
+//! **Stale-doc note (added during translation)**: the activation claim above no longer matches the repo.
+//! The `archive_format` key exists nowhere in the codebase (config.rs has no such setting), so `compare`
+//! is never switched on that way. This module has zero callers — it is reachable only through
+//! `pub mod vclock;` in lib.rs. Read the paragraph above as intent, not as current behavior.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// 节点短 ID。由本机 node-id 文件派生，稳定且与 hostname 解耦
-/// （改主机名不该让历史版本全部变成"别人写的"）。
+/// Short node ID. Derived from the local node-id file: stable and decoupled from the hostname
+/// (renaming the host must not turn every historical version into "someone else's write").
 pub type ShortId = u64;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -26,7 +31,7 @@ pub struct Counter {
     pub value: u64,
 }
 
-/// 版本向量。counters 恒按 id 升序——比较是双指针线性扫，不需要 map。
+/// Vector clock. counters is always sorted ascending by id —— comparison is a two-pointer linear scan, no map needed.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Vector {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -38,9 +43,9 @@ pub enum Ordering {
     Equal,
     Greater,
     Lesser,
-    /// 并发，且首个分歧方向是"我更大" —— 只为排序稳定，语义上就是并发
+    /// Concurrent, with the first divergence pointing "mine is greater" —— purely for stable sorting; semantically this is just concurrent
     ConcurrentGreater,
-    /// 并发，且首个分歧方向是"我更小"
+    /// Concurrent, with the first divergence pointing "mine is lesser"
     ConcurrentLesser,
 }
 
@@ -70,7 +75,7 @@ impl Vector {
         self.counters.iter().find(|c| c.id == id).map(|c| c.value).unwrap_or(0)
     }
 
-    /// 「我改了这个文件」：把自己的计数器推进一格。
+    /// "I changed this file": advance my own counter by one.
     pub fn update(&mut self, id: ShortId) {
         self.update_with_now(id, unix_secs());
     }
@@ -85,7 +90,7 @@ impl Vector {
         }
     }
 
-    /// 「我收下了对方这一版」：逐 id 取最大值。
+    /// "I have taken in their version": per-id maximum.
     pub fn merge(&mut self, other: &Vector) {
         for c in &other.counters {
             match self.counters.binary_search_by_key(&c.id, |x| x.id) {
@@ -105,12 +110,12 @@ impl Vector {
         v
     }
 
-    /// 本向量相对 `other` 的关系。
+    /// This vector's relation to `other`.
     pub fn compare(&self, other: &Vector) -> Ordering {
         let (mut i, mut j) = (0usize, 0usize);
         let mut saw_greater = false;
         let mut saw_lesser = false;
-        // 记住首个分歧方向，让并发有一个稳定的排序表示（syncthing 同款处理）
+        // Remember the first divergence direction so concurrency gets a stable sort representation (same handling as syncthing)
         let mut first_greater: Option<bool> = None;
         let mark = |greater: bool, sg: &mut bool, sl: &mut bool, first: &mut Option<bool>| {
             if greater {
@@ -132,14 +137,14 @@ impl Vector {
                     i += 1;
                     j += 1;
                 }
-                // 只有我有这个 id → 我在这一维更大
+                // Only I have this id → I am greater on this axis
                 (Some(a), Some(b)) if a.id < b.id => {
                     if a.value > 0 {
                         mark(true, &mut saw_greater, &mut saw_lesser, &mut first_greater);
                     }
                     i += 1;
                 }
-                // 只有对方有 → 我在这一维更小
+                // Only they have it → I am lesser on this axis
                 (Some(_), Some(b)) => {
                     if b.value > 0 {
                         mark(false, &mut saw_greater, &mut saw_lesser, &mut first_greater);
@@ -189,7 +194,7 @@ impl Vector {
         self.compare(other).is_concurrent()
     }
 
-    /// 人类可读：`a1b2c3d4:17,e5f6:3`
+    /// Human-readable: `a1b2c3d4:17,e5f6:3`
     pub fn to_compact(&self) -> String {
         self.counters
             .iter()
@@ -199,8 +204,6 @@ impl Vector {
     }
 }
 
-// ---------- 节点身份 ----------
-
 fn node_id_path() -> PathBuf {
     crate::config::jobs_dir()
         .parent()
@@ -208,8 +211,8 @@ fn node_id_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("syncdash-node-id"))
 }
 
-/// 本机稳定节点 ID。首次调用时生成并落盘；之后一直复用。
-/// 生成材料 = hostname + 首次时间 + 进程 id，取 blake3 前 8 字节。
+/// Stable local node ID. Generated and written to disk on the first call; reused ever after.
+/// Seed material = hostname + first-call time + process id, taking the first 8 bytes of blake3.
 pub fn local_node_id() -> ShortId {
     let p = node_id_path();
     if let Ok(text) = std::fs::read_to_string(&p) {
@@ -223,7 +226,7 @@ pub fn local_node_id() -> ShortId {
     let h = blake3::hash(seed.as_bytes());
     let mut b = [0u8; 8];
     b.copy_from_slice(&h.as_bytes()[..8]);
-    // 0 是"缺席"的语义值，避开它
+    // 0 is the semantic value for "absent" — steer clear of it
     let id = u64::from_be_bytes(b).max(1);
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -259,10 +262,10 @@ mod tests {
     #[test]
     fn update_is_monotonic_even_with_a_stale_clock() {
         let mut a = v(&[(1, 500)]);
-        a.update_with_now(1, 10); // 时钟倒退
+        a.update_with_now(1, 10); // clock went backwards
         assert_eq!(a.counter(1), 501, "counter must never go backwards");
         let mut b = v(&[(1, 5)]);
-        b.update_with_now(1, 900); // 时钟跳前
+        b.update_with_now(1, 900); // clock jumped forward
         assert_eq!(b.counter(1), 900, "wall clock is a lower bound");
     }
 
@@ -290,7 +293,7 @@ mod tests {
 
     #[test]
     fn descendant_is_not_a_conflict() {
-        // A 改 → 传给 B → B 又改：线性历史，任何一步都不该是冲突
+        // A edits → hands off to B → B edits again: a linear history; no step should ever be a conflict
         let mut a = Vector::new();
         a.update_with_now(1, 100);
         let mut b = a.clone();
@@ -310,15 +313,15 @@ mod tests {
     fn concurrent_variant_is_stable_for_sorting() {
         let a = v(&[(1, 9), (2, 1)]);
         let b = v(&[(1, 1), (2, 9)]);
-        // 首个分歧在 id=1 上是"我更大" → ConcurrentGreater；反向必须是另一个变体
+        // The first divergence, at id=1, is "mine is greater" → ConcurrentGreater; the reverse must be the other variant
         assert_eq!(a.compare(&b), Ordering::ConcurrentGreater);
         assert_eq!(b.compare(&a), Ordering::ConcurrentLesser);
     }
 
     #[test]
     fn ordering_is_antisymmetric_and_reflexive() {
-        // 小规模穷举，替代 property test：所有向量都与自身 Equal，
-        // 且 a>b 必然 b<a、a||b 必然 b||a
+        // A small exhaustive sweep in place of a property test: every vector is Equal to itself,
+        // and a>b implies b<a, a||b implies b||a
         let space: Vec<Vector> = (0..3)
             .flat_map(|x| (0..3).map(move |y| v(&[(1, x), (2, y)])))
             .collect();

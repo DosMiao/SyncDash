@@ -1,30 +1,30 @@
-//! 原子落盘（语义参照 syncthing `lib/osutil/atomic.go`，按语义重写）。
+//! Atomic writes (semantics modelled on syncthing `lib/osutil/atomic.go`, rewritten to match).
 //!
-//! 所有写入先落到**与目标同目录**的临时文件，数据 fsync 之后再 rename 到最终名。
-//! 同卷 rename 是原子的：中断（断电/断网/Ctrl-C）只会留下一个临时文件，
-//! 绝不会在最终路径上留下半截内容。
+//! Every write lands first in a temp file **in the same directory as the destination**; the data is fsynced, then renamed to the final name.
+//! A same-volume rename is atomic: an interruption (power loss / network drop / Ctrl-C) leaves at most a temp file behind,
+//! never half a file at the final path.
 //!
-//! 这条修的是一个真实的数据丢失路径：过去 `apply` 直接 `fs::copy(src, dst)`，
-//! Update 写到一半断掉 → target 留下截断文件且 mtime 是新的 →
-//! 下轮 sync 比对判成 "target-changed" → **把截断文件反向覆盖回 source**。
+//! This fixes a real data-loss path: `apply` used to call `fs::copy(src, dst)` directly, so an
+//! Update interrupted mid-write → target left holding a truncated file with a fresh mtime →
+//! the next sync compares it as "target-changed" → **the truncated file gets propagated back over source**.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::foundation::names::{TEMP_LIFETIME_MS, TEMP_PREFIX};
 
-/// 文件名（不含目录）是否是我们的临时文件
+/// Whether a file name (no directory part) is one of our temp files
 pub fn is_temp_name(file_name: &str) -> bool {
     file_name.starts_with(TEMP_PREFIX)
 }
 
-/// 相对路径（'/' 分隔）的末段是否是临时文件
+/// Whether the last segment of a relative path ('/'-separated) is a temp file
 pub fn is_temp_rel(rel: &str) -> bool {
     is_temp_name(crate::foundation::path::base_name(rel))
 }
 
-/// 暂存中的写入。Drop 时若未 commit 会自动删掉临时文件，
-/// 因此任何提前 `?` 返回都不会留下垃圾。
+/// A staged write. Dropping it without a commit deletes the temp file automatically,
+/// so any early `?` return leaves no debris behind.
 pub struct Staged {
     tmp: PathBuf,
     dst: PathBuf,
@@ -33,16 +33,16 @@ pub struct Staged {
 }
 
 impl Staged {
-    /// 在 dst 同目录创建临时文件。同目录 = 同卷，保证 commit 的 rename 是原子的
-    /// （放系统 temp 目录就会退化成跨卷 copy，失去原子性）。
+    /// Create the temp file in dst's own directory. Same directory = same volume, which is what makes commit's rename atomic
+    /// (putting it in the system temp directory would degrade into a cross-volume copy and lose atomicity).
     pub fn create(dst: &Path) -> std::io::Result<Staged> {
         let dir = dst.parent().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "destination has no parent directory")
         })?;
         let base = dst.file_name().and_then(|s| s.to_str()).unwrap_or("out");
-        // 带 pid：同一目录下两个 syncdash 进程各写各的，互不踩踏
+        // Carry the pid: two syncdash processes in the same directory each write their own file, never stepping on each other
         let tmp = dir.join(format!("{TEMP_PREFIX}{base}.{}", std::process::id()));
-        // 上一次中断可能留下同名残骸
+        // A previous interruption may have left debris under the same name
         if tmp.exists() {
             std::fs::remove_file(&tmp)?;
         }
@@ -50,12 +50,12 @@ impl Staged {
         Ok(Staged { tmp, dst: dst.to_path_buf(), file: Some(file), committed: false })
     }
 
-    /// 临时文件路径（校验 hash / 设 mtime 都对它做，commit 后才成为最终文件）
+    /// Path of the temp file (hash verification and mtime are applied to it; it becomes the final file only after commit)
     pub fn path(&self) -> &Path {
         &self.tmp
     }
 
-    /// 把 reader 的内容全部写进来
+    /// Write the reader's entire content into the staged file
     pub fn write_all_from(&mut self, r: &mut dyn std::io::Read) -> std::io::Result<u64> {
         let f = self
             .file
@@ -64,7 +64,7 @@ impl Staged {
         std::io::copy(r, f)
     }
 
-    /// 在指定偏移写入一段数据（增量传输：只补不同的块）
+    /// Write a run of data at a given offset (delta transfer: patch only the chunks that differ)
     pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> std::io::Result<()> {
         use std::io::Seek;
         let f = self
@@ -75,12 +75,12 @@ impl Staged {
         f.write_all(buf)
     }
 
-    /// v0.9 M1：唯一的流式复制环——1MiB 缓冲，每块之后回调
-    /// （进度计数＋取消/暂停检查点挂这里）。on_chunk 返回 Err 即中止：
-    /// Drop 清掉临时文件，最终路径纹丝不动。
-    /// 同一个环同时服务：字节级进度（M1）、原子落盘（P0-1）、将来的 write_at 增量（P1-1B）。
-    /// 回调拿到的是**本块字节**（不只是长度）：写后校验要对"复制流的全量哈希"验证——
-    /// 复制本来就读了全文，流上顺手算哈希零成本，且与扫描证据深度（可能只是抽样）解耦。
+    /// v0.9 M1: the one streaming copy loop — 1MiB buffer, a callback after every chunk
+    /// (byte counting plus the cancel/pause checkpoint hang off it). An Err from on_chunk aborts:
+    /// Drop clears the temp file and the final path is untouched.
+    /// One loop serves all of: byte-level progress (M1), atomic writes (P0-1), the future write_at delta path (P1-1B).
+    /// The callback receives **this chunk's bytes** (not just its length): post-copy verification validates against the
+    /// full hash of the copy stream — the copy reads the whole file anyway, so hashing on the stream is free, and it decouples the check from scan-evidence depth (which may be only a sample).
     pub fn copy_from(
         &mut self,
         src: &Path,
@@ -106,21 +106,21 @@ impl Staged {
         Ok(total)
     }
 
-    /// 数据落盘并关闭句柄。
-    /// **必须在 commit 前调用**：Windows 上 rename 目标/源有打开的写句柄会失败。
+    /// Flush the data to disk and close the handle.
+    /// **Must be called before commit**: on Windows a rename fails while a write handle is open on the source or the destination.
     pub fn seal(&mut self, fsync: bool) -> std::io::Result<()> {
         if let Some(mut f) = self.file.take() {
             f.flush()?;
             if fsync {
-                // SMB 上 fsync 可能较慢，但这正是"rename 之后内容真的在盘上"的保证。
-                // 需要极致吞吐时可由 job 的 fsync=false 关掉（自担风险）。
+                // fsync can be slow over SMB, but it is exactly what guarantees "after the rename the content is really on disk".
+                // A job can turn it off with fsync=false when it needs maximum throughput (at its own risk).
                 f.sync_all()?;
             }
         }
         Ok(())
     }
 
-    /// 原子替换最终文件。调用前必须 seal。
+    /// Atomically replace the final file. seal must have been called first.
     pub fn commit(mut self) -> std::io::Result<()> {
         if self.file.is_some() {
             self.seal(true)?;
@@ -134,14 +134,14 @@ impl Staged {
 impl Drop for Staged {
     fn drop(&mut self) {
         if !self.committed {
-            self.file.take(); // 先关句柄，Windows 才删得掉
+            self.file.take(); // close the handle first, otherwise Windows will not let it be deleted
             let _ = std::fs::remove_file(&self.tmp);
         }
     }
 }
 
-/// 清理 root 下超龄的遗留临时文件。返回删除的个数。
-/// 只在明确处于写入流程时调用（scan 默认不做，避免在只读挂载上意外写）。
+/// Clean up over-age leftover temp files under root. Returns how many were deleted.
+/// Only call this inside an explicit write flow (scan does not by default, to avoid writing to a read-only mount by accident).
 pub fn sweep_stale_temps(root: &Path, now_ms: i64) -> u64 {
     let mut n = 0u64;
     let walker = walkdir::WalkDir::new(root).follow_links(false).into_iter();
@@ -186,7 +186,7 @@ mod tests {
         let mut s = Staged::create(&dst).unwrap();
         s.write_all_from(&mut &b"new content"[..]).unwrap();
         s.seal(true).unwrap();
-        // commit 之前，最终路径上仍是旧内容 —— 这正是原子性的意义
+        // before commit the final path still holds the old content — that is exactly what atomicity means
         assert_eq!(std::fs::read(&dst).unwrap(), b"old");
         s.commit().unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"new content");
@@ -201,10 +201,10 @@ mod tests {
         {
             let mut s = Staged::create(&dst).unwrap();
             s.write_all_from(&mut &b"half written..."[..]).unwrap();
-            // 不 commit 就 drop —— 模拟中途失败
+            // drop without committing — simulating a mid-write failure
         }
         assert_eq!(std::fs::read(&dst).unwrap(), b"original", "dst must never see partial content");
-        // 临时文件也不该留下
+        // the temp file must not survive either
         let leftovers: Vec<_> = std::fs::read_dir(&d)
             .unwrap()
             .flatten()
@@ -248,7 +248,7 @@ mod tests {
         let src = d.join("src.bin");
         std::fs::write(&src, vec![7u8; 3 * 1024 * 1024 + 123]).unwrap();
         let dst = d.join("dst.bin");
-        // 正常：块回调字节和 == 文件长
+        // normal path: the bytes seen by the chunk callback sum to the file length
         {
             let mut s = Staged::create(&dst).unwrap();
             let mut seen = 0u64;
@@ -259,7 +259,7 @@ mod tests {
             s.commit().unwrap();
         }
         assert_eq!(std::fs::metadata(&dst).unwrap().len(), 3 * 1024 * 1024 + 123);
-        // 中止：第一块后喊停 → dst 不变、零临时残留
+        // abort: call stop after the first chunk → dst unchanged, zero temp debris
         std::fs::write(&dst, b"keep me").unwrap();
         {
             let mut s = Staged::create(&dst).unwrap();

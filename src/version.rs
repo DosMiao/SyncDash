@@ -1,17 +1,17 @@
-//! 可选版本控制（v0.8）：job 里 `versioning = true` 后，apply 不再把被删/被覆盖的文件
-//! 丢进本机 trash，而是存进 **该根目录自己的 `.version_syncDash/`** —— 历史跟着数据走，
-//! 两台机器经 SMB 都能看见、都能恢复。
+//! Optional versioning (v0.8): with `versioning = true` in the job, apply no longer throws deleted or
+//! overwritten files into the local trash but stores them in **that root's own `.version_syncDash/`** ——
+//! history travels with the data, so both machines see it over SMB and either can restore from it.
 //!
-//! 目录布局：
+//! Directory layout:
 //!   <root>/.version_syncDash/
-//!     index.jsonl                  一行一个版本 {id, ts_ms, host, ops, preserved, bytes}
-//!     <id>/plan.jsonl              本次执行的指令清单（审计）
-//!     <id>/manifest.json           保存条目：rel → whole|rdelta + 各 hash + 原 mtime/mode
-//!     <id>/files/<rel>             原内容整存（小文件与被删除文件）
-//!     <id>/rdelta/<rel>            反向补丁 blob（≥4MB 且有新内容可参照的被覆盖文件）
+//!     index.jsonl                  one line per version {id, ts_ms, host, ops, preserved, bytes}
+//!     <id>/plan.jsonl              the op list this run executed (audit trail)
+//!     <id>/manifest.json           preserved entries: rel → whole|rdelta + the hashes + original mtime/mode
+//!     <id>/files/<rel>             whole-file copy of the original (small files and deleted files)
+//!     <id>/rdelta/<rel>            reverse-patch blob (overwritten files ≥4MB whose new content can serve as a reference)
 //!
-//! 反向补丁：用 FastCDC 把"旧文件"表达为"新文件里已有的块 + blob 里的旧独有块"。
-//! restore 时要求当前文件 hash == 记录的 new_hash，重组后校验 old_hash —— 三重保险。
+//! Reverse patch: FastCDC expresses the "old file" as "chunks already present in the new file + the old-only chunks in the blob".
+//! restore requires the current file's hash == the recorded new_hash and verifies old_hash after reassembly —— three checks in series.
 
 use crate::chunk::RecipeStep;
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ pub struct PreservedEntry {
     pub old_mtime_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub old_mode: Option<u32>,
-    /// rdelta：重组时当前文件必须匹配的 hash
+    /// rdelta: the hash the current file must match at reassembly time
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub new_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -73,7 +73,7 @@ fn hash_file(p: &Path) -> std::io::Result<String> {
     Ok(h.finalize().to_hex().to_string())
 }
 
-/// 一次 apply 在某个 root 上的版本写入器（惰性创建：真有保存动作才建目录）
+/// Version writer for one apply run against one root (lazily created: the directory appears only once something is really preserved)
 pub struct VersionWriter {
     root: PathBuf,
     vdir: PathBuf,
@@ -90,8 +90,8 @@ impl VersionWriter {
         Ok(VersionWriter { root: root.to_path_buf(), vdir, id, entries: Vec::new(), bytes: 0 })
     }
 
-    /// 保存一个即将被删/被覆盖的文件。new_content = 覆盖它的新内容（有则大文件走反向补丁）。
-    /// 成功后原文件已从原位移走/可被覆盖。
+    /// Preserve a file that is about to be deleted or overwritten. new_content = the new content replacing it (when present, large files go through a reverse patch).
+    /// On success the original has been moved out of its old spot / is free to be overwritten.
     pub fn preserve(&mut self, rel: &str, old_abs: &Path, new_content: Option<&Path>, why: &str) -> std::io::Result<()> {
         let md = std::fs::symlink_metadata(old_abs)?;
         let old_size = md.len();
@@ -179,7 +179,7 @@ impl VersionWriter {
         !self.entries.is_empty()
     }
 
-    /// 收尾：写 plan/manifest/index。没保存任何东西则清掉空目录。
+    /// Wrap up: write plan/manifest/index. If nothing was preserved, clear away the empty directory.
     pub fn finish(self, ops: &[crate::compare::Op]) -> std::io::Result<Option<String>> {
         if self.entries.is_empty() {
             let _ = std::fs::remove_dir_all(&self.vdir);
@@ -226,7 +226,7 @@ pub fn list(root: &Path) -> std::io::Result<Vec<IndexLine>> {
     Ok(out)
 }
 
-/// 保留最新 keep 个版本，其余删除。返回删掉的版本 id。
+/// Keep the newest `keep` versions and delete the rest. Returns the ids of the deleted versions.
 pub fn prune(root: &Path, keep: usize) -> std::io::Result<Vec<String>> {
     let mut all = list(root)?;
     all.sort_by_key(|l| l.ts_ms);
@@ -235,7 +235,7 @@ pub fn prune(root: &Path, keep: usize) -> std::io::Result<Vec<String>> {
     for d in &drop {
         let _ = std::fs::remove_dir_all(root.join(crate::foundation::names::VERSION_STORE_DIR).join(&d.id));
     }
-    // 重写 index
+    // Rewrite the index
     let idx_path = root.join(crate::foundation::names::VERSION_STORE_DIR).join("index.jsonl");
     let mut f = std::fs::File::create(&idx_path)?;
     for l in &all {
@@ -244,8 +244,8 @@ pub fn prune(root: &Path, keep: usize) -> std::io::Result<Vec<String>> {
     Ok(drop.into_iter().map(|d| d.id).collect())
 }
 
-/// 恢复：把某版本保存的文件放回原位（当前占位内容先进本机 trash）。
-/// files 为空 = 全部；dry_run 只列出。返回 (restored, skipped, errors)。
+/// Restore: put a version's preserved files back where they came from (whatever currently occupies the spot goes into the local trash first).
+/// Empty `files` = all of them; dry_run only lists. Returns (restored, skipped, errors).
 pub fn restore(root: &Path, version: &str, files: &[String], dry_run: bool) -> std::io::Result<(u64, u64, u64)> {
     let vdir = root.join(crate::foundation::names::VERSION_STORE_DIR).join(version);
     let mani: VersionManifest = serde_json::from_slice(&std::fs::read(vdir.join("manifest.json"))?)
@@ -269,14 +269,14 @@ pub fn restore(root: &Path, version: &str, files: &[String], dry_run: bool) -> s
             if let Some(par) = dst.parent() {
                 std::fs::create_dir_all(par)?;
             }
-            // 占位的当前文件挪进 trash（不销毁）
+            // Move the current occupant into the trash (never destroy it)
             if std::fs::symlink_metadata(&dst).is_ok() {
                 let tp = trash.join(to_native(&e.rel));
                 if let Some(par) = tp.parent() {
                     std::fs::create_dir_all(par)?;
                 }
                 if e.kind == "rdelta" {
-                    // rdelta 需要当前文件作底——先校验再复制到 trash（保留原位做重组底本）
+                    // rdelta needs the current file as its base — verify first, then copy to trash (the original stays in place as the reassembly base)
                     let cur_hash = hash_file(&dst)?;
                     if Some(cur_hash.as_str()) != e.new_hash.as_deref() {
                         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "current file no longer matches recorded new_hash"));
@@ -290,7 +290,7 @@ pub fn restore(root: &Path, version: &str, files: &[String], dry_run: bool) -> s
             }
             if e.kind == "rdelta" {
                 let blob = std::fs::read(vdir.join("rdelta").join(to_native(&e.rel)))?;
-                let base = std::fs::read(&dst)?; // 当前文件 = new
+                let base = std::fs::read(&dst)?; // the current file is the new one
                 let mut out: Vec<u8> = Vec::with_capacity(e.old_size as usize);
                 if let Some(recipe) = &e.recipe {
                     for st in recipe {
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn rdelta_roundtrip_bytes() {
-        // 直接在字节层验证 反向补丁 的重组逻辑
+        // Verify the reverse-patch reassembly logic directly at the byte level
         let mut old = vec![7u8; 6 * 1024 * 1024];
         let mut new = old.clone();
         for i in 3_000_000..3_004_096 {

@@ -1,8 +1,8 @@
-//! 根目录锁（参考 FFS base/dir_lock.cpp 的协议，简化版）：
-//! - apply 动手前在两侧 root 各放一个 .syncdash.lock（JSON：host/pid/开始时间）
-//! - 持锁进程每 4 秒刷新锁文件 mtime（心跳）——经 SMB 也能被对面机器看到
-//! - 抢锁方发现已有锁时观察 12 秒：心跳还在跳 → 拒绝执行；一动不动 → 判定遗弃，接管
-//! - Drop 时停心跳、删锁
+//! Root directory lock (protocol modelled on FFS base/dir_lock.cpp, simplified):
+//! - before apply touches anything, drop a .syncdash.lock in each root (JSON: host/pid/start time)
+//! - the holder refreshes the lock file's mtime every 4s (heartbeat) — visible to the other machine even over SMB
+//! - a contender that finds an existing lock watches it for 12s: heartbeat still beating → refuse to run; dead still → declared stale, take over
+//! - on Drop: stop the heartbeat, delete the lock
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::foundation::names::LOCK_NAME;
-const WATCH_ROUNDS: u32 = 6; // 6 × 2s = 12s 观察窗
+const WATCH_ROUNDS: u32 = 6; // 6 × 2s = 12s observation window
 const HEARTBEAT_MS: u64 = 4000;
 
 #[derive(Serialize, Deserialize)]
@@ -45,7 +45,7 @@ impl RootLock {
                 std::thread::sleep(std::time::Duration::from_millis(2000));
                 match mtime_of(&path) {
                     None => {
-                        vanished = true; // 对方正常收工
+                        vanished = true; // the other side finished cleanly
                         break;
                     }
                     Some(m) if Some(m) != m0 => {

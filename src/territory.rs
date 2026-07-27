@@ -1,9 +1,9 @@
-//! v0.5：与 CodeSync 生态的 `.ffs-sync` 标记打通。
-//! 标记语义（见 win-mac 同步架构）：含 `.ffs-sync` 文件的目录 = 同步领地。
-//! - find_territories：扫描标记，输出领地相对路径
-//! - gen_jobs：每个领地生成一个 syncdash job（cs-<slug>.toml，默认 sync 模式 + 自动 archive 路径），
-//!   与 FFS 的 Update-CodeSyncConfig.ps1 同源同义 —— syncdash 版的 CodeSync。
-//! 生成是幂等的：重跑会覆盖 cs-*.toml（与 FFS 生成器同精神）；手工任务不受影响。
+//! v0.5: interop with the `.ffs-sync` marker of the CodeSync ecosystem.
+//! Marker semantics (see the win-mac sync architecture): a directory containing a `.ffs-sync` file = a sync territory.
+//! - find_territories: scan for markers, emit territory paths relative to the root
+//! - gen_jobs: generate one syncdash job per territory (cs-<slug>.toml, sync mode by default + an automatic archive path),
+//!   same origin and same meaning as FFS's Update-CodeSyncConfig.ps1 — CodeSync, the syncdash edition.
+//! Generation is idempotent: a re-run overwrites cs-*.toml (same spirit as the FFS generator); hand-written jobs are untouched.
 
 use crate::config::Job;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ const PRUNE_DIRS: &[&str] = &[
     "worktrees", ".syncdash", "$RECYCLE.BIN", "System Volume Information",
 ];
 
-/// 返回含 .ffs-sync 标记的目录（相对 root，'/' 分隔，排序）
+/// Returns the directories holding a .ffs-sync marker (relative to root, '/'-separated, sorted)
 pub fn find_territories(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let walker = walkdir::WalkDir::new(root)
@@ -68,14 +68,14 @@ pub struct GenOutcome {
     pub path: PathBuf,
 }
 
-/// 远程管线生成参数（--remote-host 时启用）
+/// Remote pipeline generation parameters (enabled by --remote-host)
 pub struct RemoteGen {
     pub host: String,
     pub root_base: String,
     pub exe: Option<String>,
 }
 
-/// 为每个领地生成 `cs-<slug>.toml` job。target 侧路径 = target_root + 同一相对路径。
+/// Generate one `cs-<slug>.toml` job per territory. Target-side path = target_root + the same relative path.
 pub fn gen_jobs(source_root: &Path, target_root: &Path, mode: &str, rigor: &str, remote: Option<&RemoteGen>) -> std::io::Result<Vec<GenOutcome>> {
     let terrs = find_territories(source_root);
     let jobs_dir = crate::config::jobs_dir();
@@ -88,7 +88,7 @@ pub fn gen_jobs(source_root: &Path, target_root: &Path, mode: &str, rigor: &str,
         let job = Job {
             mode: mode.to_string(),
             source: source_root.join(&native),
-            // target_root 可能是 UNC / posix，两边都按其自身分隔符拼
+            // target_root may be UNC or posix — join each side with its own separator
             target: if target_root.to_string_lossy().contains('/') && !target_root.to_string_lossy().contains('\\') {
                 PathBuf::from(format!("{}/{}", target_root.to_string_lossy().trim_end_matches('/'), rel))
             } else {
@@ -102,7 +102,7 @@ pub fn gen_jobs(source_root: &Path, target_root: &Path, mode: &str, rigor: &str,
             case_sensitive: false,
             symlinks: "exclude".into(),
             versioning: false,
-            // 代码领地：开发产物排除显式开——代码经 git 走，.git/node_modules 不参与文件同步
+            // Code territory: dev-artifact excludes are explicitly on — code travels via git, so .git/node_modules stay out of file sync
             dev_excludes: true,
             remote_host: remote.map(|r| r.host.clone()),
             remote_root: remote.map(|r| format!("{}/{}", r.root_base.trim_end_matches('/'), rel)),

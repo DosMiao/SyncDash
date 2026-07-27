@@ -1,6 +1,6 @@
-//! FastCDC 内容定义分块（v0.7 增量传输）。
-//! 参数固定 min/avg/max = 16K/64K/256K（v2020 gear）——两端必须一致才能命中相同切点。
-//! 只对 ≥ DELTA_MIN_SIZE 的更新文件启用（小文件整传更划算）。
+//! FastCDC content-defined chunking (v0.7 delta transfer).
+//! Parameters are fixed at min/avg/max = 16K/64K/256K (v2020 gear) —— both ends must agree to land on the same cut points.
+//! Only enabled for updated files ≥ DELTA_MIN_SIZE (below that, shipping the whole file is cheaper).
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -21,17 +21,18 @@ pub struct ChunkInfo {
 pub struct FileChunks {
     pub rel: String,
     pub size: u64,
-    /// 整文件 blake3
+    /// blake3 of the whole file
     pub hash: String,
     pub chunks: Vec<ChunkInfo>,
 }
 
-/// 增量重组步骤：s = "base"（从接收侧现有文件取 off..off+len）| "blob"（从增量 blob 取）。
+/// Delta reassembly step: s = "base" (take off..off+len from the receiver's existing file) | "blob" (take it from the delta blob).
 ///
-/// 住在这里而不是 `pack`：它描述的是「怎么用分块拼回一个文件」，是分块的语义，
-/// 跟 tar 容器无关。此前它定义在 `pack.rs`，于是版本库 `version.rs` 为了这一个类型
-/// `use crate::chunk::RecipeStep`——而 `pack` 又 `use crate::apply`，`apply` 又用
-/// `version`：三个模块绕成一个环。挪到这个零依赖的叶子上，环就断了。
+/// It lives here rather than in `pack` because it describes how to reassemble a file out of chunks —
+/// chunking semantics, unrelated to the tar container. It used to be defined in `pack.rs`, which made
+/// the version store reach for `crate::pack::RecipeStep` for this one type; `pack` in turn calls
+/// `crate::apply`, and `apply` uses `version` — three modules wound into a cycle. Moving it onto this
+/// zero-dependency leaf breaks that cycle.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RecipeStep {
     pub s: String,
@@ -51,7 +52,7 @@ pub fn chunk_bytes(data: &[u8]) -> Vec<ChunkInfo> {
 pub fn chunk_file(root: &Path, rel: &str) -> std::io::Result<FileChunks> {
     let native = if cfg!(windows) { rel.replace('/', "\\") } else { rel.to_string() };
     let p = root.join(native);
-    // 增量只对大文件启用，但读入内存的上限就是文件本身；GB 级 .mph 也可接受（一次性、顺序读）
+    // Delta only kicks in for large files, and the memory ceiling here is the file itself; a GB-scale .mph is acceptable (one-shot, sequential read)
     let data = std::fs::read(&p)?;
     let hash = blake3::hash(&data).to_hex().to_string();
     Ok(FileChunks { rel: rel.to_string(), size: data.len() as u64, hash, chunks: chunk_bytes(&data) })

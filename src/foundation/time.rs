@@ -1,9 +1,9 @@
-//! 时间：取当下、unix ms ↔ 民用历法。UTC，不引 chrono。
+//! Time: read now, unix ms ↔ civil calendar. UTC, no chrono dependency.
 //!
-//! 本地时间的显示归前端，数据里始终是 `ts_ms`。
+//! Rendering local time is the frontend's job; the data always carries `ts_ms`.
 
-/// 墙上时钟，unix 毫秒。取不到时间时返回 0（而不是 panic）——
-/// 调用方全都是在打标签/记日志，没有一个值得为此中断同步。
+/// Wall clock, unix milliseconds. Returns 0 rather than panicking when the time is unavailable —
+/// every caller is stamping or logging, and not one of them is worth aborting a sync over.
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -11,17 +11,17 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// `SystemTime` → unix 毫秒。
+/// `SystemTime` → unix milliseconds.
 pub fn systime_ms(t: std::time::SystemTime) -> i64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
-/// days since 1970-01-01 → (year, month, day)。Howard Hinnant 的 `civil_from_days`。
+/// days since 1970-01-01 → (year, month, day). Howard Hinnant's `civil_from_days`.
 ///
-/// 用 `div_euclid`/`rem_euclid` 而非手写分支：负数天（1970 之前）必须向下取整，
-/// Rust 的 `/` 是向零截断，直接用会让 1969-12-31 算成 1970-01-00。
+/// `div_euclid`/`rem_euclid` rather than hand-written branches: negative days (before 1970) must
+/// floor, and Rust's `/` truncates toward zero — using it directly turns 1969-12-31 into 1970-01-00.
 pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
@@ -35,7 +35,7 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// 拆出 (年, 月, 日, 时, 分, 秒)（UTC）。
+/// Break out (year, month, day, hour, minute, second) (UTC).
 fn parts(ms: i64) -> (i64, u32, u32, i64, i64, i64) {
     let secs = ms.div_euclid(1000);
     let sod = secs.rem_euclid(86_400);
@@ -43,13 +43,13 @@ fn parts(ms: i64) -> (i64, u32, u32, i64, i64, i64) {
     (y, m, d, sod / 3600, (sod % 3600) / 60, sod % 60)
 }
 
-/// `YYYYMMDD-HHMMSS`（UTC）。用于目录名与冲突副本名：要能按字典序排出时间序。
+/// `YYYYMMDD-HHMMSS` (UTC). For directory names and conflict-copy names: lexicographic order must come out chronological.
 pub fn stamp_compact(ms: i64) -> String {
     let (y, m, d, h, mi, s) = parts(ms);
     format!("{y:04}{m:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
 
-/// `YYYY-MM-DDTHH:MM:SSZ`（UTC）。用于 CSV 导出等要给人/Excel 看的地方。
+/// `YYYY-MM-DDTHH:MM:SSZ` (UTC). For CSV export and other places read by humans/Excel.
 pub fn stamp_iso(ms: i64) -> String {
     let (y, m, d, h, mi, s) = parts(ms);
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
@@ -63,9 +63,9 @@ mod tests {
     fn civil_from_days_matches_known_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_000), (2022, 1, 8));
-        // 负数天必须向下取整——这正是手写 `/` 分支会错的那一格
+        // Negative days must floor — exactly the cell a hand-written `/` branch gets wrong
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
-        // 闰日
+        // Leap day
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
     }
 
@@ -74,7 +74,7 @@ mod tests {
         assert_eq!(stamp_compact(0), "19700101-000000");
         assert_eq!(stamp_compact(946_684_800_000), "20000101-000000");
         assert_eq!(stamp_compact(1_000_000_000_000), "20010909-014640");
-        // 闰日
+        // Leap day
         assert_eq!(stamp_compact(951_782_400_000), "20000229-000000");
     }
 
@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn stamps_sort_chronologically() {
-        // 目录名按字典序排 = 按时间排，这是 runlog 列目录时不做解析就能排序的前提
+        // Lexicographic order on directory names = chronological order; this is what lets runlog sort a listing without parsing
         let a = stamp_compact(1_000_000_000_000);
         let b = stamp_compact(1_000_000_001_000);
         assert!(a < b, "{a} !< {b}");
