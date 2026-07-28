@@ -181,13 +181,15 @@ pub fn assert_same(want: &[Shape], got: &[Shape], tol: &Tolerance, what: &str) {
                 ));
             }
         }
-        if tol.mtime_at_all && w.kind != EntryKind::Dir {
+        // Files only. A directory's mtime is a side effect of its contents, and a **symlink** is
+        // compared by its target string — never by its timestamp — so requiring one to survive
+        // would assert a guarantee the pipeline does not make. It could not keep it either:
+        // stamping a link's own mtime needs `lutimes`, and SFTP's `setstat` follows the link, so a
+        // copied link legitimately lands with the time it was created.
+        if tol.mtime_at_all && w.kind == EntryKind::File {
             let d = (g.mtime_ms - w.mtime_ms).abs();
             if d > tol.mtime_ms {
-                diffs.push(format!(
-                    "{at}: mtime off by {d} ms (tolerance {} ms)",
-                    tol.mtime_ms
-                ));
+                diffs.push(format!("{at}: mtime off by {d} ms (tolerance {} ms)", tol.mtime_ms));
             }
         }
         if tol.mode && w.mode != g.mode {

@@ -141,12 +141,6 @@ pub struct Report {
     pub skipped: Vec<(&'static str, Need)>,
 }
 
-impl Report {
-    pub fn skipped_names(&self) -> Vec<&'static str> {
-        self.skipped.iter().map(|(n, _)| *n).collect()
-    }
-}
-
 /// A backend under test. Must return a **fresh, empty** root on every call; the harness asks for two
 /// per case and never assumes they share a filesystem.
 pub type Roots<'a> = &'a mut dyn FnMut() -> Arc<dyn Vfs>;
@@ -206,6 +200,7 @@ pub fn watched() -> (Transcript, RunCtx) {
 /// Roots stay blank because everything below `compare_resolved` works on open backends and never
 /// reads the phrases. `targets` stays empty deliberately: `compare_resolved` sits *below* the
 /// multi-target check, so a stray entry here would silently test a shape production refuses.
+///
 pub fn bare_job() -> Job {
     Job {
         mode: "mirror".into(),
@@ -257,7 +252,19 @@ pub fn run_case(lane: &str, case: &Case, mk: Roots<'_>) -> Outcome {
     corpus::prune_empty_dirs(&sv, "");
     corpus::prune_empty_dirs(&tv, "");
 
-    let job = Job { mode: case.mode.into(), rigor: case.rigor.into(), ..bare_job() };
+    let mut job = Job { mode: case.mode.into(), rigor: case.rigor.into(), ..bare_job() };
+    // A `Need` is two statements in one: what the backends must support, and what the job must
+    // therefore ask for. Recording symlinks and comparing mode bits are both off by default, so a
+    // case needing the capability needs the setting too — deriving it here keeps the two from being
+    // declared separately and drifting. Turning either on globally is not an option: `symlinks =
+    // "direct"` against a backend that cannot represent links is a hard Block, by design.
+    for n in case.needs {
+        match n {
+            Need::Symlink => job.symlinks = "direct".into(),
+            Need::UnixMode => job.sync_mode = true,
+            _ => {}
+        }
+    }
     let (said, ctx) = watched();
 
     let out = super::local::compare_resolved(&job, &sv, &tv, &ctx, true)

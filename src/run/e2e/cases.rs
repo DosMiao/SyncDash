@@ -434,6 +434,63 @@ pub const ALL: &[Case] = &[
             preserved: &["big/at-4mib-minus1.bin"],
         },
     },
+    // --- metadata that is not content ---
+    //
+    // Both of these skip on Windows and on every protocol backend that cannot carry the attribute,
+    // which is the skip vocabulary doing its job: `unix_mode` and `symlink` are `No` there, so the
+    // case reports itself skipped instead of asserting against a backend that was never going to
+    // comply. Only a POSIX pair — the memory lane, or sftp-to-sftp on real hardware — runs them.
+    Case {
+        name: "a_mode_only_change_is_a_chmod_not_a_copy",
+        seeds: BASE,
+        source_edits: &[super::corpus::Edit::Chmod { path: "code/lib/core.rs", mode: 0o755 }],
+        target_edits: &[super::corpus::Edit::Chmod { path: "code/lib/core.rs", mode: 0o644 }],
+        mode: "mirror",
+        rigor: "standard",
+        needs: &[Need::UnixMode],
+        expect: Expect {
+            ops: &[ExpectOp {
+                side: Side::Target,
+                action: Action::Chmod,
+                path: "code/lib/core.rs",
+                from: None,
+                reason: "mode-differs-master-wins",
+            }],
+            // The content already matches, so nothing crosses — a chmod that copies would mean the
+            // engine could not tell "the bits differ" from "the file differs".
+            bytes: Bytes::None,
+            target_equals_source: true,
+            extra_on_target: &[],
+            preserved: &[],
+        },
+    },
+    Case {
+        name: "a_symlink_is_copied_as_a_link",
+        seeds: BASE,
+        source_edits: &[super::corpus::Edit::Symlink {
+            path: "links/readme-link",
+            target: "../docs/readme.md",
+        }],
+        target_edits: &[],
+        mode: "mirror",
+        rigor: "standard",
+        needs: &[Need::Symlink],
+        expect: Expect {
+            ops: &[ExpectOp {
+                side: Side::Target,
+                action: Action::Copy,
+                path: "links/readme-link",
+                from: None,
+                reason: "symlink-only-in-source",
+            }],
+            // The link is recreated, never followed: copying its target's bytes instead is the
+            // failure this pins, and it would show up here as a non-zero count.
+            bytes: Bytes::None,
+            target_equals_source: true,
+            extra_on_target: &[],
+            preserved: &[],
+        },
+    },
     // enrich fills gaps and never removes: the file the source dropped must survive on the target.
     Case {
         name: "enrich_never_deletes",
