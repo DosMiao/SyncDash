@@ -90,7 +90,7 @@ syncdash gen-jobs <root> --target-root R [--junk ids] [--force] [--remote-host m
 syncdash junk [--patterns ids]                   # The junk exclude presets, and the exact patterns each writes into a job's exclude
 syncdash gui                                     # Launch the desktop app (same as running syncdash-desktop directly)
 syncdash probe                                   # Local environment as JSON (remote probing: ssh the far side and run this)
-syncdash scan <root> [--out t.jsonl] [--no-hash] [--force-rehash] [--symlinks-direct] [--progress] [--junk ids] [--exclude PHRASE]...
+syncdash scan <root> [--out t.jsonl] [--no-hash] [--force-rehash] [--symlinks-direct] [--progress] [--junk ids] [--include PHRASE]... [--exclude PHRASE]...
 syncdash compare --source a.jsonl --target b.jsonl \
     [--mode mirror|sync|enrich] [--archive last.jsonl] [--resolve-newer] [--case-sensitive] [--out plan.jsonl]
 syncdash apply plan.jsonl [--apply] [--verify] [--delta] [--no-fsync] [--source-root R] [--target-root R] [-v]
@@ -394,6 +394,15 @@ than to do the wrong thing.
 An archive is just an ordinary snapshot table: **after a successful sync, rescan either side and save it, then
 pass it with `--archive` next time** (v0.3 automates this step).
 
+**An archive is only usable against digests of its own evidence tier.** A sampled digest is `~`-prefixed
+precisely so it can never compare equal to a full hash, so an archive gathered at one tier and read at another
+would call every file over the 4 MB sampling floor "changed" — and a file the far side merely deleted would
+surface as a delete/modify conflict, the one kind no `on_conflict` policy resolves. Two rules keep that from
+happening: the archive is written at **the tier the comparison actually ran at** (the joint tier of both roots,
+not the job's nominal `rigor` — a target that cannot do ranged reads forces both sides to full), and the archive
+records that tier in its header. Reading one written at a different tier — after a `rigor` change, say — is
+**refused with a warning** and the run falls back to safe mode above, rather than misread.
+
 ### Move detection (curing FFS's delete+add)
 
 After comparing, the "to copy" list and the "to delete" list are paired on `(hash, size)`: the same content
@@ -412,7 +421,10 @@ falls back to copy+delete (and gives up move detection).
 1. `ssh <host> syncdash probe` — probe the far side: OS/arch/version/schema; if the binary isn't there it prints
    installation guidance (both machines have the Rust toolchain, so `cargo build --release` suffices; or just copy
    the binary across the shared drive).
-2. `ssh <host> syncdash scan <root>` — collect the table off stdout.
+2. `ssh <host> syncdash scan <root>` — collect the table off stdout. The far side is handed the job's
+   **whole** filter (`--include` and `--exclude` both, plus `--junk none` so it adds no preset of its own)
+   and the resolved rigor knobs. Both roots must be filtered by the same rule: a mask that binds only one
+   side makes the other side's unlisted files look like deletions.
 3. `compare` locally to produce the plan.
 4. `syncdash pack plan.jsonl --out pkg.zip`: **the files to be written + the plan (including the delete list) + a
    hash of the data section + a hash of the plan**.
@@ -421,6 +433,12 @@ falls back to copy+delete (and gives up move detection).
 
 Win↔Mac SSH is verified working (port 22 is open on the Mac; passwordless login just needs the public key written
 into authorized_keys).
+
+**Both ends must run the same build.** The probe compares `schema`, but nothing negotiates the *command line*:
+stage 2 invokes the far side's `syncdash scan` with the flags this version knows about, so a far side that
+predates one of them stops with `error: unexpected argument`. That is the intended failure — it is how adding
+`--include` to the filter that crosses the link announces itself, instead of quietly filtering one root and
+proposing deletions on the other. Upgrade the pair together.
 
 ## Multi-endpoint (settled in v0.6: hub-and-spoke)
 
@@ -451,6 +469,75 @@ territory in one shot.
 declared but unreachable, they are skipped naming the mount; undeclared, they are skipped saying how to enable it.
 A job written before this grammar (schema ≤ 2, with `remote_host`/`remote_root`/`remote_exe`) migrates on load,
 carrying both roots across so it keeps doing exactly what it did.
+
+## Testing
+
+Two executable contracts, one layer apart. `src/fs/vfs/conformance.rs` asks whether a **backend**
+honours the `Vfs` trait — twelve checks, seeded through the write API, optional ones gated on
+`caps()`. `src/run/e2e/` asks whether the **pipeline** honours the mode contracts above when running
+on top of one: seed two roots, drift one, sync, then assert the plan, the bytes moved, what was
+preserved, and the resulting tree. A move is proved three ways at once — the plan says `Move`,
+`bytes_copied` is zero, and nothing reached trash — because the final tree looks identical whether
+the tool renamed a file or copied and deleted it.
+
+Both take the same shape (a factory returning fresh empty roots), so a live lane hands one closure
+to both and gets the backend and the pipeline checked together.
+
+**Skips are loud.** A case declares its `Need`s; an unmet need reports a skip and each lane pins its
+skip set exactly, so a backend that quietly loses a capability turns a green run red. A LIST-only
+FTP root, for instance, skips *every* case — it cannot hold a root lock without `set_mtime`, so it
+is readable and never writable, and that is asserted rather than discovered.
+
+```bash
+cargo test --lib e2e                     # memory, local, sftp-shaped and ftp-shaped lanes
+cargo test --workspace                   # everything, including tests/apply_ops.rs
+```
+
+Live lanes need a server and are `#[ignore]`d behind an env var:
+
+```bash
+SYNCDASH_E2E_SFTP_URL=sftp://user@host/scratch  cargo test --lib sftp_live_lane -- --ignored --nocapture
+SYNCDASH_E2E_SMB_URL=smb://user@host/share/dir  cargo test --lib smb_live_lane  -- --ignored --nocapture
+SYNCDASH_E2E_FTP_URL=ftp://anonymous@host:2121/ cargo test --lib ftp_live_lane  -- --ignored --nocapture
+SYNCDASH_E2E_EXFAT_ROOT=E:\syncdash-e2e         cargo test --lib exfat_live_lane -- --ignored --nocapture
+```
+
+`smb://` additionally needs `syncdash cred set` first — a native SMB root cannot ride the session
+login the way a `\\host\share` path can. Everything a live lane creates lives under the given root
+and is removed before *and* after, so "fresh and empty" holds even if an earlier run died.
+
+**What the live FTP lane established.** Two capabilities the backend declared turned out not to hold,
+and a live server was the only thing that could show it:
+
+- **`ranged_read` is now `No`, regardless of REST.** REST positions a transfer, but nothing in FTP
+  ends one early and cleanly, and servers disagree about the reply. Both `ABOR` and closing the data
+  socket left a response unconsumed, and the next command received it instead — a `stat` answering
+  "350 Restarting at position 0" from two calls earlier. On one control connection that confusion
+  cannot be contained, so the tier drops to full reads via the joint rule and says so. Sampled
+  digests over FTP were a quiet evidence downgrade on exactly the large files sampling exists for.
+- **The apply lane now clamps to `max_parallel_streams`.** It never did, so a four-wide default put
+  a second transfer on a single-connection backend: `ftp://` copied one file per run and errored on
+  every other. The trait had documented the clamp all along.
+
+- **`staged_len` no longer asks the server.** It used to `SIZE` the temp file — while the upload was
+  still open, so a server mid-STOR answered with however much it had flushed to disk. That is a race,
+  not a length; over TLS the same 32 KiB write reconciled as 0, 16384 or 32768 bytes purely by
+  timing. The writer knows what it wrote, so it says that, and whether the server really holds the
+  bytes is asked after the transfer is finalized, where it can be answered honestly.
+
+**`ftps://` connects and reads correctly** — the certificate verifies against the machine trust
+store, which is the whole design working: a LAN server whose certificate its owner installed is
+accepted, with no bypass flag anywhere. **Its writes are not yet trustworthy.** On the code path that
+plain FTP moves a 6 MB file over without trouble, uploads arrive partial or empty, varying run to
+run — a data-stream problem below this crate, not sync logic. Every occurrence was refused by the
+post-rename size check, so nothing corrupt has ever been committed; the job fails loudly instead.
+Treat `ftps://` as read-capable and write-unproven until that is chased down.
+
+**Still open:** the conformance check `write_commit_visibility` stats and lists a directory while a
+write is staged, which one control connection cannot answer. Closing it means a second control
+connection per staged write; the pipeline does not need one, so it is recorded rather than papered
+over. Everything else passes — 11 cases run, and the three sampling cases skip loudly against a
+backend that honestly declares it cannot sample.
 
 ## Relationship to CodeSync (FFS)
 
