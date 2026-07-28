@@ -15,8 +15,10 @@
 //!   the write side refuses without MFMT (a Block naming the reason);
 //! - one control connection, operations serialized (`max_parallel_streams = 1`).
 //!
-//! ftps:// is deliberately not wired yet: it needs a root-store decision (rustls
-//! config), and a half-secure default would be worse than an honest refusal.
+//! `ftps://` upgrades the control connection with AUTH TLS before the login goes out (explicit
+//! FTPS, not the deprecated implicit kind on port 990). Certificates are checked against the
+//! **operating system's** trust store — see `tls_connector` for why that rather than a bundled
+//! root set, and for why there is no flag to turn verification off.
 
 use std::io::Read;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -45,8 +47,153 @@ pub(super) struct Feats {
     pub(super) rest: bool,
 }
 
+/// The control connection, plain or TLS.
+///
+/// suppaftp parameterizes the stream on its TLS type — `FtpStream` is `ImplFtpStream<NoTlsStream>`
+/// and `into_secure` hands back an `ImplFtpStream<RustlsStream>` — so the two are different types
+/// all the way down and cannot live in one field. Both carry identical method signatures, though,
+/// so the split is absorbed here in one forwarder per method the backend uses, and **every call
+/// site stays exactly as it was**. The alternative was making the whole backend generic and
+/// spreading `<T>` through sixteen call sites and two structs to say one thing.
+///
+/// The data streams are the reason this stays small: `retr_as_stream` yields `DataStream<T>`,
+/// which is also parameterized, but `finalize_*` and `abort` take `impl Read` / `impl Write`
+/// rather than the concrete type — so the boxes `staged.rs` already uses cross the split
+/// unchanged.
+pub(super) enum Stream {
+    Plain(FtpStream),
+    Tls(Box<suppaftp::RustlsFtpStream>),
+}
+
+/// One forwarder per method, both arms identical. Written out rather than macro'd: eleven lines
+/// a reader can check against the call sites beats a macro they have to expand in their head.
+macro_rules! fwd {
+    ($self:ident, $m:ident $(, $a:expr)*) => {
+        match $self {
+            Stream::Plain(s) => s.$m($($a),*),
+            Stream::Tls(s) => s.$m($($a),*),
+        }
+    };
+}
+
+impl Stream {
+    pub(super) fn cwd(&mut self, p: &str) -> Result<(), FtpError> {
+        fwd!(self, cwd, p)
+    }
+    pub(super) fn mkdir(&mut self, p: &str) -> Result<(), FtpError> {
+        fwd!(self, mkdir, p)
+    }
+    pub(super) fn rm(&mut self, p: &str) -> Result<(), FtpError> {
+        fwd!(self, rm, p)
+    }
+    pub(super) fn rmdir(&mut self, p: &str) -> Result<(), FtpError> {
+        fwd!(self, rmdir, p)
+    }
+    pub(super) fn rename(&mut self, from: &str, to: &str) -> Result<(), FtpError> {
+        fwd!(self, rename, from, to)
+    }
+    pub(super) fn list(&mut self, p: Option<&str>) -> Result<Vec<String>, FtpError> {
+        fwd!(self, list, p)
+    }
+    pub(super) fn mlsd(&mut self, p: Option<&str>) -> Result<Vec<String>, FtpError> {
+        fwd!(self, mlsd, p)
+    }
+    pub(super) fn resume_transfer(&mut self, offset: usize) -> Result<(), FtpError> {
+        fwd!(self, resume_transfer, offset)
+    }
+    /// Boxed because the concrete `DataStream<T>` differs per arm — the same erasure
+    /// `staged.rs` already relies on.
+    pub(super) fn retr_as_stream(&mut self, p: &str) -> Result<Box<dyn Read + Send>, FtpError> {
+        Ok(match self {
+            Stream::Plain(s) => Box::new(s.retr_as_stream(p)?) as Box<dyn Read + Send>,
+            Stream::Tls(s) => Box::new(s.retr_as_stream(p)?) as Box<dyn Read + Send>,
+        })
+    }
+    pub(super) fn put_with_stream(
+        &mut self,
+        p: &str,
+    ) -> Result<Box<dyn std::io::Write + Send>, FtpError> {
+        Ok(match self {
+            Stream::Plain(s) => Box::new(s.put_with_stream(p)?) as Box<dyn std::io::Write + Send>,
+            Stream::Tls(s) => Box::new(s.put_with_stream(p)?) as Box<dyn std::io::Write + Send>,
+        })
+    }
+    pub(super) fn finalize_retr_stream(&mut self, r: impl Read) -> Result<(), FtpError> {
+        fwd!(self, finalize_retr_stream, r)
+    }
+    pub(super) fn finalize_put_stream(&mut self, w: impl std::io::Write) -> Result<(), FtpError> {
+        fwd!(self, finalize_put_stream, w)
+    }
+    pub(super) fn abort(&mut self, r: impl Read + 'static) -> Result<(), FtpError> {
+        fwd!(self, abort, r)
+    }
+    pub(super) fn login(&mut self, user: &str, pass: &str) -> Result<(), FtpError> {
+        fwd!(self, login, user, pass)
+    }
+    pub(super) fn feat(&mut self) -> Result<suppaftp::types::Features, FtpError> {
+        fwd!(self, feat)
+    }
+    pub(super) fn opts(&mut self, o: &str, v: Option<&str>) -> Result<(), FtpError> {
+        fwd!(self, opts, o, v)
+    }
+    pub(super) fn transfer_type(&mut self, t: FileType) -> Result<(), FtpError> {
+        fwd!(self, transfer_type, t)
+    }
+    pub(super) fn set_mode(&mut self, m: Mode) {
+        fwd!(self, set_mode, m)
+    }
+    pub(super) fn size(&mut self, p: &str) -> Result<usize, FtpError> {
+        fwd!(self, size, p)
+    }
+    pub(super) fn custom_command(
+        &mut self,
+        cmd: impl ToString,
+        ok: &[suppaftp::Status],
+    ) -> Result<suppaftp::types::Response, FtpError> {
+        fwd!(self, custom_command, cmd, ok)
+    }
+}
+
+/// The TLS client config for `ftps://`, built on the **operating system's** trust store.
+///
+/// The choice between this and a bundled root set (`webpki-roots`) is the one real decision here,
+/// and it follows the precedent `fs::ssh` already set with `known_hosts`: reuse the trust the user
+/// has established rather than shipping a second, parallel one. Concretely, the FTPS server on a
+/// LAN NAS usually presents a certificate its owner installed themselves — a bundled Mozilla root
+/// set rejects exactly that, which is the main case this exists for, while the OS store accepts it
+/// *because the user already said so somewhere they can see and revoke*.
+///
+/// No `insecure_tls` escape hatch: a flag that turns verification off is a flag that ends up set.
+/// A certificate this refuses is a certificate to install, and the error says which.
+fn tls_connector() -> VfsResult<suppaftp::RustlsConnector> {
+    let mut roots = rustls::RootCertStore::empty();
+    let loaded = rustls_native_certs::load_native_certs();
+    for cert in loaded.certs {
+        // A store with one unparseable certificate in it is still a usable store; refusing the
+        // whole connection over one bad entry would be worse than skipping it.
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        return Err(VfsError::new(
+            VfsErrorKind::Io,
+            format!(
+                "no trusted root certificates could be read from this machine's store{} — ftps:// cannot verify anything without them",
+                loaded
+                    .errors
+                    .first()
+                    .map(|e| format!(" ({e})"))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+    let cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(suppaftp::RustlsConnector::from(std::sync::Arc::new(cfg)))
+}
+
 pub(super) struct FtpConn {
-    stream: FtpStream,
+    stream: Stream,
 }
 
 pub(super) type ConnSlot = Arc<Mutex<Option<FtpConn>>>;
@@ -236,12 +383,6 @@ impl Vfs for FtpBackend {
         if guard.is_some() {
             return Ok(());
         }
-        if self.spec.scheme == "ftps" {
-            return Err(VfsError::new(
-                VfsErrorKind::Unsupported,
-                "ftps:// is not wired yet (needs a root-store decision) — plain ftp:// works, and refusing beats a half-secure default",
-            ));
-        }
         let user = self.spec.user.clone().ok_or_else(|| {
             VfsError::new(
                 VfsErrorKind::Auth,
@@ -275,8 +416,23 @@ impl Vfs for FtpBackend {
             .next()
             .ok_or_else(|| VfsError::new(VfsErrorKind::Transient, format!("no address for {}", self.spec.host)))?;
 
-        let mut stream = FtpStream::connect_timeout(addr, self.timeout)
-            .map_err(|e| map_ftp_err("connect", e))?;
+        // The TLS parameter is fixed at construction — `into_secure` performs AUTH TLS on a
+        // stream that is *already* typed for it and hands back the same type, so the two schemes
+        // branch here rather than upgrading one into the other. Securing happens before the login
+        // below, which is the whole point: explicit FTPS, not the deprecated implicit kind on 990.
+        let mut stream = if self.spec.scheme == "ftps" {
+            let s = suppaftp::RustlsFtpStream::connect_timeout(addr, self.timeout)
+                .map_err(|e| map_ftp_err("connect", e))?;
+            Stream::Tls(Box::new(
+                s.into_secure(tls_connector()?, &self.spec.host)
+                    .map_err(|e| map_ftp_err("AUTH TLS", e))?,
+            ))
+        } else {
+            Stream::Plain(
+                FtpStream::connect_timeout(addr, self.timeout)
+                    .map_err(|e| map_ftp_err("connect", e))?,
+            )
+        };
 
         // FEAT before login: some servers only advertise honestly pre-auth; a refusal
         // just means an empty feature set (FFS: any FTP response = connectivity)
@@ -516,10 +672,29 @@ mod tests {
         assert_eq!(r.abs("a.txt"), "/a.txt");
     }
 
+    /// `ftps://` used to refuse outright — the root store was undecided and a half-secure default
+    /// is worse than an honest no. Now it is a real scheme, so the thing to pin is that it goes
+    /// down the *same* path as `ftp://` rather than a special one: a phrase with no stored secret
+    /// fails on credentials, not on the scheme.
     #[test]
-    fn ftps_refuses_instead_of_pretending() {
-        let b = backend("ftps://u@h/x");
-        let e = b.connect().unwrap_err();
-        assert_eq!(e.kind, VfsErrorKind::Unsupported);
+    fn ftps_is_a_real_scheme_and_authenticates_like_ftp() {
+        let e = backend("ftps://u@h/x").connect().unwrap_err();
+        assert_eq!(e.kind, VfsErrorKind::Auth, "no stored secret — same rung ftp:// stops at");
+        assert_ne!(e.kind, VfsErrorKind::Unsupported, "the scheme itself is supported now");
+
+        // And it is still refused when the phrase names nobody, for the same reason ftp:// is:
+        // anonymous has to be asked for, never assumed.
+        let e = backend("ftps://h/x").connect().unwrap_err();
+        assert_eq!(e.kind, VfsErrorKind::Auth);
+    }
+
+    /// The trust store has to actually yield roots on this machine, or every `ftps://` connection
+    /// fails at verification for a reason that looks like the server's fault.
+    #[test]
+    fn the_os_trust_store_yields_usable_roots() {
+        assert!(
+            tls_connector().is_ok(),
+            "no roots readable from this machine's store — ftps:// could not verify anything"
+        );
     }
 }

@@ -40,6 +40,8 @@ russh-sftp = "2.3.0"
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "io-util", "time"] }
 suppaftp = { version = "10", features = ["rustls-ring"] }
 smb2 = "0.13.1"
+rustls-native-certs = "0.8.4"
+rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
 
 # statvfs (disk-space preflight). Windows goes through kernel32's GetDiskFreeSpaceExW, no extra crate needed.
 [target.'cfg(unix)'.dependencies]
