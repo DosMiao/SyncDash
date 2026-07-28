@@ -23,7 +23,12 @@ pub use imp::*;
 pub fn umount_private_mounts() -> Vec<(String, Result<(), String>)> {
     #[cfg(target_os = "macos")]
     {
-        let dir = platform::private_mount_dir();
+        // Unqualified: this *is* the platform module, and `private_mount_dir` arrives here
+        // through `pub use imp::*` above. The call read `platform::private_mount_dir()` while
+        // this function still lived in `smb/mod.rs`, where `platform` was a sibling — the split
+        // moved the function without moving the path with it, and no Windows build compiles this
+        // branch, so it stayed broken until someone built on a Mac.
+        let dir = private_mount_dir();
         let mut out = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
