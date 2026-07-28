@@ -1,0 +1,413 @@
+//! `pipeline::apply` against real directories.
+//!
+//! These were inline `#[cfg(test)]` tests, but every one of them builds a temp tree and drives
+//! the public `apply` entry point — they are integration tests that happened to live inside the
+//! module. Out here they keep `apply/mod.rs` to its actual production size, and they exercise the
+//! crate the way a caller does.
+
+use std::path::PathBuf;
+
+use syncdash::model::event::{ItemOutcome, ProgressEvent};
+use syncdash::model::plan::{Action, Op, Side};
+use syncdash::obs::progress::{RunCtl, RunCtx};
+use syncdash::pipeline::apply::{self, ApplyOptions};
+use std::sync::{Arc, Mutex};
+
+fn tmproot(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("syncdash-apply-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn op(action: Action, path: &str) -> Op {
+    Op {
+        side: Side::Target,
+        action,
+        path: path.into(),
+        from: None,
+        size: None,
+        mtime_ms: None,
+        hash: None,
+        link: None,
+        mode: None,
+        reason: "test".into(),
+    }
+}
+
+fn opts(trash: PathBuf) -> ApplyOptions {
+    ApplyOptions { dry_run: false, trash: Some(trash), fsync: false, ..Default::default() }
+}
+
+/// A ctx that collects ItemResult: the contents of the execution ledger (items.jsonl) are exactly these events
+fn ledger_ctx() -> (RunCtx, std::sync::Arc<Mutex<Vec<(String, ItemOutcome, u64)>>>) {
+    let store: std::sync::Arc<Mutex<Vec<(String, ItemOutcome, u64)>>> =
+        std::sync::Arc::new(Mutex::new(Vec::new()));
+    let s2 = store.clone();
+    let sink = move |ev: syncdash::model::event::ProgressEvent| {
+        if let syncdash::model::event::ProgressEvent::ItemResult { path, outcome, bytes, .. } = ev {
+            s2.lock().unwrap().push((path, outcome, bytes));
+        }
+    };
+    (RunCtx::new(syncdash::obs::progress::RunCtl::new(), std::sync::Arc::new(sink)), store)
+}
+
+#[test]
+fn ledger_records_ok_kept_and_failed_per_item() {
+    let base = tmproot("ledger");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(t.join("d")).unwrap();
+    std::fs::write(s.join("a.txt"), b"hello").unwrap();
+    std::fs::write(t.join("d").join("protected.log"), b"x").unwrap();
+
+    let (ctx, log) = ledger_ctx();
+    let ops = [
+        op(Action::Copy, "a.txt"),          // → ok
+        op(Action::DeleteDir, "d"),         // → kept (non-empty and its contents are not deletable)
+        op(Action::Copy, "missing.txt"),    // → failed (the source file does not exist)
+    ];
+    let out = apply::apply_with(&ops, &s, &t, &opts(base.join("trash")), &ctx);
+    assert_eq!((out.done, out.skipped, out.errors), (1, 1, 1));
+
+    let rows = log.lock().unwrap();
+    // Key invariant: every entry in the plan leaves a trace in the ledger — not one more, not one fewer
+    assert_eq!(rows.len(), ops.len(), "every op must leave a trace: {rows:?}");
+    let find = |p: &str| rows.iter().find(|(path, _, _)| path == p).map(|(_, o, _)| *o);
+    assert_eq!(find("a.txt"), Some(ItemOutcome::Ok));
+    assert_eq!(find("d"), Some(ItemOutcome::Kept), "keeping the directory is not an error, but it must be traceable");
+    assert_eq!(find("missing.txt"), Some(ItemOutcome::Failed));
+    drop(rows);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn ledger_marks_untouched_items_as_cancelled() {
+    let base = tmproot("ledgercancel");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    for i in 0..6 {
+        std::fs::write(s.join(format!("f{i}.txt")), vec![b'x'; 4096]).unwrap();
+    }
+    let (ctx, log) = ledger_ctx();
+    ctx.ctl.request_cancel(); // not a single one gets its turn to run
+    let ops: Vec<Op> = (0..6).map(|i| op(Action::Copy, &format!("f{i}.txt"))).collect();
+    let out = apply::apply_with(&ops, &s, &t, &opts(base.join("trash")), &ctx);
+
+    assert_eq!(out.done, 0);
+    let rows = log.lock().unwrap();
+    // Assert honestly: the checkpoint stopped things **before any work began**, so not a single op ran
+    // and the ledger naturally holds no rows. `all()` is vacuously true on an empty set, which would
+    // turn this into a false pass — the row count must be pinned explicitly, or a future missing emit in record would go unnoticed.
+    assert_eq!(rows.len(), 0, "the ledger must be empty when the cancel lands before any op: {rows:?}");
+    assert!(rows.iter().all(|(_, o, _)| *o == ItemOutcome::Cancelled));
+    drop(rows);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn copy_lands_atomically_and_leaves_no_temp_files() {
+    let base = tmproot("copy");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(s.join("a.txt"), b"hello").unwrap();
+
+    let (done, _, errors) = apply::apply(&[op(Action::Copy, "a.txt")], &s, &t, &opts(base.join("trash")));
+    assert_eq!((done, errors), (1, 0));
+    assert_eq!(std::fs::read(t.join("a.txt")).unwrap(), b"hello");
+    let leftovers: Vec<_> = std::fs::read_dir(&t)
+        .unwrap()
+        .flatten()
+        .filter(|e| syncdash::fs::staged::is_temp_name(&e.file_name().to_string_lossy()))
+        .collect();
+    assert!(leftovers.is_empty(), "no temp files may survive a successful apply");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn failed_update_leaves_the_original_intact() {
+    // The source file does not exist → the copy is bound to fail. The destination must be untouched, which is exactly what the atomic write guarantees:
+    // fs::copy used to write the destination directly, so a failure left truncated content behind and the next sync propagated it back to source.
+    let base = tmproot("fail");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(t.join("keep.txt"), b"precious original").unwrap();
+
+    let (done, _, errors) = apply::apply(&[op(Action::Update, "keep.txt")], &s, &t, &opts(base.join("trash")));
+    assert_eq!(done, 0);
+    assert_eq!(errors, 1);
+    assert_eq!(
+        std::fs::read(t.join("keep.txt")).unwrap(),
+        b"precious original",
+        "a failed update must never damage the destination"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn update_preserves_old_content_in_trash() {
+    let base = tmproot("trash");
+    let (s, t, tr) = (base.join("s"), base.join("t"), base.join("trash"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(s.join("f.txt"), b"new").unwrap();
+    std::fs::write(t.join("f.txt"), b"old").unwrap();
+
+    let (done, _, errors) = apply::apply(&[op(Action::Update, "f.txt")], &s, &t, &opts(tr.clone()));
+    assert_eq!((done, errors), (1, 0));
+    assert_eq!(std::fs::read(t.join("f.txt")).unwrap(), b"new");
+    assert_eq!(std::fs::read(tr.join("f.txt")).unwrap(), b"old", "old version must be recoverable");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn readonly_files_delete_and_update_like_git_objects() {
+    // Git marks loose objects r--r--r--; Windows refuses to delete read-only files,
+    // which a live sync surfaced as thousands of os-error-5 Delete failures.
+    // Both the delete and the overwrite lane must clear the attribute and proceed.
+    let base = tmproot("readonly");
+    let (s, t, tr) = (base.join("s"), base.join("t"), base.join("trash"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(s.join("upd.bin"), b"new").unwrap();
+    for name in ["gone.bin", "upd.bin"] {
+        let p = t.join(name);
+        std::fs::write(&p, b"old").unwrap();
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&p, perms).unwrap();
+    }
+
+    let (done, _, errors) = apply::apply(
+        &[op(Action::Delete, "gone.bin"), op(Action::Update, "upd.bin")],
+        &s,
+        &t,
+        &opts(tr.clone()),
+    );
+    assert_eq!(errors, 0, "read-only originals must not fail the ops");
+    assert_eq!(done, 2);
+    assert!(!t.join("gone.bin").exists(), "the read-only file must really be gone");
+    assert_eq!(std::fs::read(t.join("upd.bin")).unwrap(), b"new");
+    // and both originals are still recoverable from the trash
+    assert_eq!(std::fs::read(tr.join("gone.bin")).unwrap(), b"old");
+    assert_eq!(std::fs::read(tr.join("upd.bin")).unwrap(), b"old");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn delete_dir_reports_kept_contents_instead_of_silence() {
+    let base = tmproot("deldir");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(t.join("d")).unwrap();
+    std::fs::write(t.join("d").join("protected.log"), b"x").unwrap();
+
+    // No filter → the leftovers are not deletable → count it as skipped and print the reason, rather than pretending it succeeded
+    let (done, skipped, errors) = apply::apply(&[op(Action::DeleteDir, "d")], &s, &t, &opts(base.join("trash")));
+    assert_eq!(done, 0, "the directory was not actually removed");
+    assert_eq!(skipped, 1, "it must be reported, not silently counted as done");
+    assert_eq!(errors, 0, "keeping a protected file is not an error");
+    assert!(t.join("d").is_dir());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn delete_dir_removes_when_leftovers_are_deletable() {
+    let base = tmproot("deldir2");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(t.join("d")).unwrap();
+    std::fs::write(t.join("d").join("cache.tmp"), b"x").unwrap();
+
+    let mut o = opts(base.join("trash"));
+    o.filter = Some(syncdash::pipeline::filter::PathFilter::build_full(&[], &[], &["*/*.tmp".to_string()]));
+    let (done, _, errors) = apply::apply(&[op(Action::DeleteDir, "d")], &s, &t, &o);
+    assert_eq!((done, errors), (1, 0));
+    assert!(!t.join("d").exists(), "deletable leftovers must not block the directory removal");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn delta_update_produces_identical_content() {
+    let base = tmproot("delta");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    // Larger than DELTA_MIN_SIZE, with only a short stretch in the middle differing
+    let mut old = vec![0u8; 6 * 1024 * 1024];
+    for (i, b) in old.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let mut new = old.clone();
+    new[3_000_000..3_001_000].fill(0xAB);
+    std::fs::write(s.join("big.bin"), &new).unwrap();
+    std::fs::write(t.join("big.bin"), &old).unwrap();
+
+    let mut o = opts(base.join("trash"));
+    o.delta = true;
+    let (done, _, errors) = apply::apply(&[op(Action::Update, "big.bin")], &s, &t, &o);
+    assert_eq!((done, errors), (1, 0));
+    assert_eq!(std::fs::read(t.join("big.bin")).unwrap(), new, "delta path must be byte-exact");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn delta_update_handles_shrinking_files() {
+    let base = tmproot("delta2");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    let old = vec![7u8; 8 * 1024 * 1024];
+    let new = vec![7u8; 5 * 1024 * 1024];
+    std::fs::write(s.join("shrink.bin"), &new).unwrap();
+    std::fs::write(t.join("shrink.bin"), &old).unwrap();
+
+    let mut o = opts(base.join("trash"));
+    o.delta = true;
+    let (done, _, errors) = apply::apply(&[op(Action::Update, "shrink.bin")], &s, &t, &o);
+    assert_eq!((done, errors), (1, 0));
+    assert_eq!(std::fs::read(t.join("shrink.bin")).unwrap().len(), new.len(), "tail must be truncated");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// v0.9 M1: parallelism / progress / cancellation
+
+fn collecting_ctx() -> (RunCtx, Arc<Mutex<Vec<ProgressEvent>>>) {
+    let store: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let s2 = store.clone();
+    let sink = move |ev: ProgressEvent| {
+        s2.lock().unwrap().push(ev);
+    };
+    (RunCtx::new(RunCtl::new(), Arc::new(sink)), store)
+}
+
+/// Parallel and sequential must produce byte-identical result trees (including the set preserved in trash)
+#[test]
+fn parallel_and_sequential_agree() {
+    let run = |tag: &str, parallel: usize| -> (PathBuf, PathBuf, (u64, u64, u64)) {
+        let base = tmproot(&format!("par-{tag}"));
+        let (s, t) = (base.join("s"), base.join("t"));
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::create_dir_all(&t).unwrap();
+        let mut ops = Vec::new();
+        for i in 0..12 {
+            let name = format!("f{i:02}.bin");
+            std::fs::write(s.join(&name), vec![i as u8; 20_000 + i * 1000]).unwrap();
+            ops.push(op(Action::Copy, &name));
+        }
+        // Mix in one update (old content goes to trash) and one delete
+        std::fs::write(s.join("up.txt"), b"NEW").unwrap();
+        std::fs::write(t.join("up.txt"), b"OLD").unwrap();
+        ops.push(op(Action::Update, "up.txt"));
+        std::fs::write(t.join("gone.txt"), b"bye").unwrap();
+        ops.push(op(Action::Delete, "gone.txt"));
+
+        let mut o = opts(base.join("trash"));
+        o.parallel = parallel;
+        let r = apply::apply(&ops, &s, &t, &o);
+        (base.clone(), t, r)
+    };
+    let (b1, t1, r1) = run("seq", 1);
+    let (b2, t2, r2) = run("par", 4);
+    assert_eq!(r1, r2, "counts must match");
+    // The result trees agree file by file
+    for e in std::fs::read_dir(&t1).unwrap().flatten() {
+        let name = e.file_name();
+        let a = std::fs::read(e.path()).unwrap();
+        let b = std::fs::read(t2.join(&name)).unwrap();
+        assert_eq!(a, b, "file {:?} differs between seq and par runs", name);
+    }
+    assert_eq!(
+        std::fs::read_dir(&t1).unwrap().count(),
+        std::fs::read_dir(&t2).unwrap().count()
+    );
+    let _ = std::fs::remove_dir_all(&b1);
+    let _ = std::fs::remove_dir_all(&b2);
+}
+
+/// Errors don't abort: 10 good, 1 bad → 10 applied + 1 Error event, byte ledger = Σ of the successful files
+#[test]
+fn errors_accumulate_without_aborting() {
+    let base = tmproot("errs");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    let mut ops = Vec::new();
+    let mut expect_bytes = 0u64;
+    for i in 0..10 {
+        let name = format!("g{i}.bin");
+        let body = vec![9u8; 5_000];
+        std::fs::write(s.join(&name), &body).unwrap();
+        expect_bytes += body.len() as u64;
+        let mut o = op(Action::Copy, &name);
+        o.size = Some(body.len() as u64);
+        ops.push(o);
+    }
+    ops.push(op(Action::Copy, "missing-on-source.bin")); // guaranteed to fail
+
+    let (ctx, store) = collecting_ctx();
+    let out = apply::apply_with(&ops, &s, &t, &opts(base.join("trash")), &ctx);
+    assert_eq!(out.done, 10);
+    assert_eq!(out.errors, 1);
+    assert!(!out.cancelled);
+    assert_eq!(out.bytes_copied, expect_bytes, "byte ledger must equal the sum of successful copies");
+    let evs = store.lock().unwrap();
+    assert_eq!(
+        evs.iter().filter(|e| matches!(e, ProgressEvent::Error { .. })).count(),
+        1,
+        "exactly one Error event"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Cancel mid-copy of a big file: honored between chunks, no half file at the destination, zero .syncdash.tmp debris
+#[test]
+fn cancel_mid_copy_leaves_no_debris() {
+    let base = tmproot("cancel");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(s.join("big.bin"), vec![3u8; 64 * 1024 * 1024]).unwrap();
+    let mut o = op(Action::Copy, "big.bin");
+    o.size = Some(64 * 1024 * 1024);
+
+    let ctl = RunCtl::new();
+    let ctl2 = ctl.clone();
+    // Request the cancel right after the first Progress event (= the first 1MiB chunk)
+    let sink = move |ev: ProgressEvent| {
+        if matches!(ev, ProgressEvent::Progress { .. }) {
+            ctl2.request_cancel();
+        }
+    };
+    let ctx = RunCtx::new(ctl, Arc::new(sink));
+    let out = apply::apply_with(&[o], &s, &t, &opts(base.join("trash")), &ctx);
+    assert!(out.cancelled);
+    assert_eq!(out.done, 0);
+    assert_eq!(out.errors, 0, "cancellation is not an error");
+    assert!(!t.join("big.bin").exists(), "no partial file may reach the destination");
+    let leftovers: Vec<_> = std::fs::read_dir(&t)
+        .unwrap()
+        .flatten()
+        .filter(|e| syncdash::fs::staged::is_temp_name(&e.file_name().to_string_lossy()))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files must be cleaned on cancel");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// DeleteDir depth ordering: subdirectories go before their parent, so the parent has a chance to be empty
+#[test]
+fn delete_dirs_deepest_first_regardless_of_input_order() {
+    let base = tmproot("depth");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(t.join("a").join("b").join("c")).unwrap();
+    // Deliberately hand over the ops in the wrong shallow→deep order
+    let ops = vec![op(Action::DeleteDir, "a"), op(Action::DeleteDir, "a/b"), op(Action::DeleteDir, "a/b/c")];
+    let (done, _, errors) = apply::apply(&ops, &s, &t, &opts(base.join("trash")));
+    assert_eq!((done, errors), (3, 0), "all three directories must go");
+    assert!(!t.join("a").exists());
+    let _ = std::fs::remove_dir_all(&base);
+}

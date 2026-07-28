@@ -164,8 +164,8 @@ pub fn compare_resolved(
     // P0-2: root reachability + mount-point marker. When the share isn't mounted, target is often an empty directory,
     // and comparing as usual yields a plan that either "wipes the other side" or "re-sends everything".
     let mut v = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-    crate::pipeline::guard::check_root_vfs("source", sv, job.require_marker, &mut v);
-    crate::pipeline::guard::check_root_vfs("target", tv, job.require_marker, &mut v);
+    crate::pipeline::guard::roots::check_root_vfs("source", sv, job.require_marker, &mut v);
+    crate::pipeline::guard::roots::check_root_vfs("target", tv, job.require_marker, &mut v);
     for w in &v.warnings {
         // v0.10: Log{Warn} replaces the Error{action:"warning"} hack —
         // with a real level, a warning no longer has to masquerade as an "error that doesn't count"
@@ -185,10 +185,10 @@ pub fn compare_resolved(
     // can give is listed BEFORE any scanning — blockers refuse, NeedsAck lines demand
     // explicit consent, Info lines go to the log. Nothing degrades silently.
     let q = job.read_caps_query(copts.mtime_window_ms, sv.as_local().is_some(), tv.as_local().is_some());
-    let caps_report = crate::pipeline::guard::cap_report_read(&q, &sv.caps(), &tv.caps());
+    let caps_report = crate::pipeline::guard::caps::cap_report_read(&q, &sv.caps(), &tv.caps());
     {
         use crate::model::event::LogLevel;
-        use crate::pipeline::guard::CapSeverity;
+        use crate::pipeline::guard::caps::CapSeverity;
         for i in &caps_report.items {
             let lvl = match i.severity {
                 CapSeverity::Block => LogLevel::Error,
@@ -234,7 +234,7 @@ pub fn compare_resolved(
     // The consented degradations ride on the snapshot itself — a table must say how its
     // evidence was gathered
     {
-        use crate::pipeline::guard::CapSeverity;
+        use crate::pipeline::guard::caps::CapSeverity;
         let lines_for = |side: &str| {
             caps_report
                 .items
@@ -453,9 +453,9 @@ use crate::obs::progress::ApplyOutcome;
     // Write-side capability report: gaps listed BEFORE anything is touched
     {
         use crate::model::event::LogLevel;
-        use crate::pipeline::guard::CapSeverity;
+        use crate::pipeline::guard::caps::CapSeverity;
         let q = job.write_caps_query(sv.as_local().is_some(), tv.as_local().is_some());
-        let wr = crate::pipeline::guard::cap_report_write(&q, ops, &sv.caps(), &tv.caps());
+        let wr = crate::pipeline::guard::caps::cap_report_write(&q, ops, &sv.caps(), &tv.caps());
         for i in &wr.items {
             let lvl = match i.severity {
                 CapSeverity::Block => LogLevel::Error,
@@ -734,7 +734,7 @@ use crate::obs::progress::PhaseProgress;
 
     // 3) Local scan + compare (the local source side goes through the mount-point gate too)
     let mut v = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-    crate::pipeline::guard::check_root("source", job.source_path(), job.require_marker, &mut v);
+    crate::pipeline::guard::roots::check_root("source", job.source_path(), job.require_marker, &mut v);
     for w in &v.warnings {
         ctx.log(crate::model::event::LogLevel::Warn, "compare", format!("[{name}] warning: {w}"));
     }
@@ -762,10 +762,10 @@ use crate::obs::progress::PhaseProgress;
 /// disk space and the marker live on the remote machine; we cannot check them locally and must not pretend we did.
 pub fn preflight_remote_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::pipeline::guard::Verdict {
     let g = job.guards(acknowledged);
-    let st = crate::pipeline::guard::stat_plan(ops);
+    let st = crate::pipeline::guard::stats::stat_plan(ops);
     let mut gv = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-    crate::pipeline::guard::check_delete_ratio("target", &st.target, plan.header.target_entries, &g, &mut gv);
-    crate::pipeline::guard::check_delete_ratio("source", &st.source, plan.header.source_entries, &g, &mut gv);
+    crate::pipeline::guard::ratio::check_delete_ratio("target", &st.target, plan.header.target_entries, &g, &mut gv);
+    crate::pipeline::guard::ratio::check_delete_ratio("source", &st.source, plan.header.source_entries, &g, &mut gv);
     gv
 }
 
