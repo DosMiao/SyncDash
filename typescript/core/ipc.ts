@@ -15,11 +15,12 @@ import type { PlanHeader } from './types/generated/PlanHeader';
 import type { PreflightDto } from './types/generated/PreflightDto';
 import type { RowMeta } from './types/generated/RowMeta';
 import type { RunRecord } from './types/generated/RunRecord';
+import type { SamePage } from './types/generated/SamePage';
+import type { SameRow } from './types/generated/SameRow';
 
 export type { JobFull, JunkPresetDto };
 
-export interface SameRow { path: string; size: number; mtime_ms: number; other_mtime_ms: number }
-export interface SamePage { total: number; rows: SameRow[]; job: string }
+export type { SameRow, SamePage };
 
 // Jobs
 

@@ -20,10 +20,23 @@ export default defineConfig({
       // No content hash in filenames: dist/ is committed, and a hash would turn every
       // frontend edit into an add/delete pair plus an index.html churn. Cache busting buys
       // nothing here — Tauri serves these from the binary over tauri://, not over HTTP.
+      //
+      // Without an explicit name the shared chunk is named after whichever module Rollup picks as
+      // its representative. That was `core/zoom.ts` — 35 lines — so React, react-dom, lucide and
+      // all of core/ shipped as `assets/zoom.js` (220 KB), and the whole stylesheet as
+      // `assets/zoom.css`. Both windows load it, so it is `shared`.
       output: {
         entryFileNames: 'assets/[name].js',
         chunkFileNames: 'assets/[name].js',
         assetFileNames: 'assets/[name].[ext]',
+        manualChunks(id) {
+          if (id.includes('node_modules')) return 'vendor';
+          // Everything both windows share: core/ and the stylesheet. The emitted CSS attaches to
+          // whichever chunk pulls it in, so naming this one is what stops the whole stylesheet
+          // shipping as `zoom.css`.
+          if (id.includes('/typescript/core/') || id.endsWith('styles.css')) return 'shared';
+          return null;
+        },
       },
     },
   },

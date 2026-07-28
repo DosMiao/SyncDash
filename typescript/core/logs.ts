@@ -4,10 +4,14 @@
 // against the plan.
 
 import { humanSize } from './format';
+import type { LogLevel } from './types/generated/LogLevel';
 import type { RunRecord } from './types/generated/RunRecord';
 
 export type LogView = 'run' | 'errors' | 'items' | 'plan';
-export type LogLevel = 'info' | 'warn' | 'error';
+
+/// From the engine: the same three levels the sinks filter on. A fourth level added in Rust must
+/// reach the level picker, and this is what makes that a compile error rather than a silent gap.
+export type { LogLevel };
 
 export const LP_VIEWS: [LogView, string][] = [
   ['run', 'Events'], ['errors', 'Errors'], ['items', 'Items'], ['plan', 'Plan'],
