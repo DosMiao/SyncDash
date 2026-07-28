@@ -4,9 +4,13 @@
 //! This file owns the `Job` schema and its load/save. `territory` is the generator that
 //! walks a tree of `.ffs-sync` markers and writes one job file per territory found.
 
+pub mod junk;
+pub mod rigor;
 pub mod territory;
 
 use serde::{Deserialize, Serialize};
+
+use crate::job::rigor::RigorResolved;
 use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
@@ -146,7 +150,7 @@ impl Default for Job {
             include: Vec::new(),
             // A new job is born with the default-on junk presets already **written out** in exclude,
             // which is what `os_excludes = "auto"` used to mean invisibly
-            exclude: crate::pipeline::filter::default_junk_patterns(),
+            exclude: crate::job::junk::default_junk_patterns(),
             no_hash: false,
             rigor: default_rigor(),
             evidence: None,
@@ -269,55 +273,16 @@ impl Job {
 }
 
 /// The **resolved** rigor level: the preset lays the base, the four detail Options override it.
-/// Single source of truth — scan_opts / apply_opts / the disagreement-escalation gate all read from here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RigorResolved {
-    pub hash: bool,
-    pub sampled: bool,
-    pub use_cache: bool,
-    pub escalate: bool,
-    pub verify_writes: bool,
-}
 
 impl Job {
     /// preset → baseline; a detail field with a value overrides its axis; `no_hash` (legacy field) forces hashing off last
     pub fn rigor_resolved(&self) -> RigorResolved {
-        let (hash, sampled, use_cache, escalate, verify) = match self.rigor.as_str() {
-            "quick" => (false, false, false, false, false),
-            "fast" => (true, true, true, true, false),
-            "paranoid" => (true, false, false, false, true),
-            _ => (true, true, false, true, true), // standard / custom baseline
-        };
-        let mut r = RigorResolved { hash, sampled, use_cache, escalate, verify_writes: verify };
-        if let Some(e) = self.evidence.as_deref() {
-            match e {
-                "none" => {
-                    r.hash = false;
-                    r.sampled = false;
-                }
-                "full" => {
-                    r.hash = true;
-                    r.sampled = false;
-                }
-                _ => {
-                    r.hash = true;
-                    r.sampled = true; // sampled
-                }
-            }
-        }
-        if let Some(v) = self.use_cache {
-            r.use_cache = v;
-        }
-        if let Some(v) = self.escalate {
-            r.escalate = v;
-        }
-        if let Some(v) = self.verify_writes {
-            r.verify_writes = v;
-        }
-        if self.no_hash {
-            r.hash = false;
-        }
-        r
+        RigorResolved::from_preset(&self.rigor)
+            .with_evidence(self.evidence.as_deref())
+            .with_cache(self.use_cache)
+            .with_escalate(self.escalate)
+            .with_verify_writes(self.verify_writes)
+            .with_no_hash(self.no_hash)
     }
 
     /// The read-side capability query (window already widened to the coarser backend)
@@ -465,7 +430,7 @@ fn legacy_os_excludes_default() -> String {
 /// deliberately deleted `*/.DS_Store` from a v1 job that never listed it, and every load would helpfully
 /// put the rule back.
 fn migrate_v1_junk_presets(job: &mut Job, text: &str) {
-    use crate::pipeline::filter::{expand_junk_presets, same_exclude_entry};
+    use crate::job::junk::{expand_junk_presets, same_exclude_entry};
     let legacy: LegacyJunkKeys = toml::from_str(text).unwrap_or(LegacyJunkKeys {
         os_excludes: legacy_os_excludes_default(),
         dev_excludes: false,
@@ -579,7 +544,8 @@ target = '\\host\share\dir'
 #[cfg(test)]
 mod migration_tests {
     use super::*;
-    use crate::pipeline::filter::{expand_junk_presets, PathFilter};
+    use crate::job::junk::expand_junk_presets;
+    use crate::pipeline::filter::PathFilter;
 
     fn load_text(tag: &str, text: &str) -> Job {
         let p = std::env::temp_dir().join(format!("syncdash-job-{tag}-{}.toml", crate::foundation::time::now_ms()));

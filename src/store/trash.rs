@@ -16,14 +16,7 @@
 use std::path::{Path, PathBuf};
 
 pub fn trash_root() -> PathBuf {
-    let base = if let Ok(l) = std::env::var("LOCALAPPDATA") {
-        PathBuf::from(l).join("syncdash")
-    } else if let Ok(h) = std::env::var("HOME") {
-        PathBuf::from(h).join(".cache").join("syncdash")
-    } else {
-        PathBuf::from(".syncdash")
-    };
-    base.join("trash")
+    crate::foundation::dirs::data_dir().join("trash")
 }
 
 #[derive(Clone, Debug)]

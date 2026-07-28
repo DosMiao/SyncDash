@@ -854,10 +854,10 @@ pub fn apply_vfs(
         // Keyed by identity(): a local root's identity is its path string, so the
         // pre-VFS correction files keep working; a remote root gets its own table
         if !src_fix.is_empty() {
-            crate::pipeline::scan::record_mtime_fixes_by_key(&sh.source.identity(), &src_fix);
+            crate::store::mtimefix::record_by_key(&sh.source.identity(), &src_fix);
         }
         if !tgt_fix.is_empty() {
-            crate::pipeline::scan::record_mtime_fixes_by_key(&sh.target.identity(), &tgt_fix);
+            crate::store::mtimefix::record_by_key(&sh.target.identity(), &tgt_fix);
         }
     }
     let delta_saved = sh.delta_saved.load(Ordering::Relaxed);

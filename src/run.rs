@@ -1000,10 +1000,6 @@ mod tests {
     use crate::obs::progress::RunCtx;
     use std::sync::Arc;
 
-    fn roots() -> (Arc<dyn Vfs>, Arc<dyn Vfs>) {
-        (Arc::new(MemVfs::new("src")) as Arc<dyn Vfs>, Arc::new(MemVfs::new("tgt")) as Arc<dyn Vfs>)
-    }
-
     /// The generic VFS lane end to end: `as_local()` is None on both sides, so this drives
     /// `scan_vfs` rather than the walkdir fast path, then compares and plans.
     #[test]
