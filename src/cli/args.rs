@@ -27,7 +27,7 @@ pub enum Mode {
 pub enum Cmd {
     /// Print this machine's environment info (used for remote probing: this is what runs over ssh on the far side)
     Probe,
-    /// List job configs (%APPDATA%\syncdash\jobs\*.toml)
+    /// List job configs (the *.toml files in the jobs directory; `syncdash probe` prints its path)
     Jobs,
     /// Run a job: scan both sides → compare → (with --apply) execute + refresh the archive. A job whose target is a `peer://` root takes the ssh peer pipeline
     Run {
@@ -251,7 +251,7 @@ pub enum Cmd {
     },
     /// Connect to a root and print its full capability sheet (what preflight will reason from)
     Caps {
-        /// A root phrase: a local path, smb://…, sftp://…, ftp://…
+        /// A root phrase: a local path, smb://…, sftp://…, ftp://…, ftps://… (not peer://, which this process never opens)
         phrase: String,
     },
     /// Execute a plan. dry-run by default; only --apply touches anything
