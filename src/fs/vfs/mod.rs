@@ -91,6 +91,33 @@ pub enum CaseSense {
     Unknown,
 }
 
+/// What kind of storage a root sits on.
+///
+/// A local *path* says nothing about this: `D:\photos` and `\\nas\photos` are both
+/// `RootSpec::Local` and both take the walkdir fast path, yet only one of them can have its
+/// deletions renamed into a trash store on this machine. Local roots probe it on first use
+/// (`local::LocalVfs::volume`); protocol backends know it by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Medium {
+    FixedDisk,
+    RemovableDisk,
+    /// Reached over a network — a mounted share, or a protocol backend's own link.
+    NetworkShare,
+    /// The probe could not tell. Treated as "assume nothing", never as "assume local".
+    Unknown,
+}
+
+impl Medium {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Medium::FixedDisk => "fixed disk",
+            Medium::RemovableDisk => "removable disk",
+            Medium::NetworkShare => "network share",
+            Medium::Unknown => "unknown",
+        }
+    }
+}
+
 /// Which naming rules a write to this root is subject to.
 ///
 /// **This is a property of the path layer the write travels through, not of the far machine.**
@@ -156,8 +183,16 @@ pub struct VfsCaps {
     pub free_space: Support,
     /// Re-reading the staged file before commit (verify_writes' strong form).
     pub read_back: Support,
-    /// The OS trash can take this root's deletions (local roots only; a remote
-    /// root's preserve area is a rename inside the root instead).
+    /// What kind of storage this root sits on. Local roots measure it; protocol backends
+    /// report `NetworkShare` by construction.
+    pub medium: Medium,
+    /// The central trash store may take this root's deletions.
+    ///
+    /// False does **not** mean "cannot preserve" — it means "preserving here would copy the
+    /// bytes off this root", so the originals are renamed into `<root>/.syncdash/trash/<run>/`
+    /// instead. That is the whole point: for a network share, a move into the local trash is a
+    /// download of every deleted file. A cross-volume move between two disks on this machine is
+    /// merely a local copy, so removable and fixed volumes both keep the central store.
     pub local_trash: bool,
     pub case_sensitivity: CaseSense,
     /// Naming rules writes to this root must satisfy. Drives the plan-time legality

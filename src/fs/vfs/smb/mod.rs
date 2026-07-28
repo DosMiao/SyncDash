@@ -59,12 +59,16 @@ impl SmbBackend {
 }
 impl Vfs for SmbBackend {
     fn caps(&self) -> VfsCaps {
-        // Full local semantics — that is the entire point of the translation route.
-        let mut c = LocalVfs::new(PathBuf::new()).caps();
+        // Full local semantics — that is the entire point of the translation route — but read off
+        // the *translated path* rather than a blank template. The volume probe there sees the
+        // share for what it is, so `local_trash = false` and the narrower stream ceiling follow
+        // from the medium instead of being patched back by hand afterwards (which is how the
+        // field came to be set correctly and read by nobody).
+        let mut c = match self.inner.get() {
+            Some(l) => l.caps(),
+            None => LocalVfs::new(PathBuf::new()).caps(),
+        };
         c.protocol = "smb";
-        // The OS trash has no reach onto a network share; the honest preserve story
-        // (in-root retention area) arrives with the VFS apply lane.
-        c.local_trash = false;
         c
     }
 

@@ -37,6 +37,11 @@ pub struct VfsNote {
     pub protocol: String,
     pub display_root: String,
     pub mtime_precision_ms: u32,
+    /// "fixed disk" | "removable disk" | "network share" | "unknown" — what the root sits on.
+    /// It decides where preserved originals go, so a table that omits it cannot account for its
+    /// own run. Empty on snapshots written before the volume probe existed.
+    #[serde(default)]
+    pub medium: String,
     /// "none" | "sampled" | "full" — what the scan really did (post-preflight)
     pub evidence_effective: String,
     /// "windows" | "posix" | "unknown" — the naming rules writes to this root must satisfy.

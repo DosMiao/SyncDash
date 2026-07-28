@@ -118,6 +118,14 @@ pub fn describe_root(phrase: &str) -> std::io::Result<String> {
     }
     let _ = writeln!(out, "protocol:  {}", c.protocol);
     let _ = writeln!(out, "local lane: {}", if v.as_local().is_some() { "yes (fast path)" } else { "no (generic VFS lane)" });
+    // The medium and the trash destination are printed together because one decides the other,
+    // and "where do my deleted files go" is the question this sheet most often has to answer.
+    let _ = writeln!(
+        out,
+        "medium:    {}  (preserved originals → {})",
+        c.medium.as_str(),
+        if c.local_trash { "this machine's trash store" } else { "<root>/.syncdash/trash/<run>/, by rename" }
+    );
     let _ = writeln!(out, "mtime precision: {} ms", c.mtime_precision_ms);
     let _ = writeln!(out, "name rules: {}{}", c.name_rules.as_str(), match c.name_rules {
         crate::fs::vfs::NameRules::Windows =>

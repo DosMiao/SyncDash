@@ -197,6 +197,7 @@ impl Vfs for FtpBackend {
             file_id: Support::No,
             free_space: Support::No,
             read_back: Support::Yes, // a full re-download — honest, and verify's cost on this backend
+            medium: super::Medium::NetworkShare,
             local_trash: false,
             case_sensitivity: CaseSense::Unknown,
             // SYST hints at the server OS but lies often enough not to be evidence.

@@ -242,20 +242,7 @@ pub(super) fn scan_vfs(
             hashed: opt.hash,
             excluded_dirs: excl_dirs,
             excluded_files: excl_files,
-            vfs: Some(crate::model::table::VfsNote {
-                protocol: caps.protocol.to_string(),
-                display_root: vfs.display(),
-                mtime_precision_ms: caps.mtime_precision_ms,
-                evidence_effective: if !opt.hash {
-                    "none".into()
-                } else if sampled {
-                    "sampled".into()
-                } else {
-                    "full".into()
-                },
-                name_rules: caps.name_rules.as_str().into(),
-                degraded: Vec::new(),
-            }),
+            vfs: Some(super::vfs_note(vfs.as_ref(), opt, sampled)),
         },
         entries,
     })

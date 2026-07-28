@@ -78,8 +78,43 @@ pub fn scan_root(
     phase: crate::model::event::Phase,
 ) -> std::io::Result<Snapshot> {
     match vfs.as_local() {
-        Some(root) => scan_impl(root, opt, None, Some((ctx, phase))),
+        Some(root) => {
+            let mut snap = scan_impl(root, opt, None, Some((ctx, phase)))?;
+            // The local lane used to leave this empty, which meant a table could not say whether
+            // its root was a disk on this machine or a share on another — the very fact that
+            // decides where its deletions were preserved.
+            snap.header.vfs = Some(vfs_note(vfs.as_ref(), opt, opt.sampled));
+            Ok(snap)
+        }
         None => scan_vfs(vfs, opt, ctx, phase),
+    }
+}
+
+/// A snapshot's self-description, written by both lanes so they cannot drift.
+///
+/// `sampled` is passed rather than read off `opt` because the generic lane may have been forced
+/// down a tier by a backend that cannot do ranged reads; the note has to record what ran, not
+/// what was asked for.
+pub(crate) fn vfs_note(
+    vfs: &dyn crate::fs::vfs::Vfs,
+    opt: &ScanOptions,
+    sampled: bool,
+) -> crate::model::table::VfsNote {
+    let caps = vfs.caps();
+    crate::model::table::VfsNote {
+        protocol: caps.protocol.to_string(),
+        display_root: vfs.display(),
+        mtime_precision_ms: caps.mtime_precision_ms,
+        medium: caps.medium.as_str().to_string(),
+        evidence_effective: if !opt.hash {
+            "none".into()
+        } else if sampled {
+            "sampled".into()
+        } else {
+            "full".into()
+        },
+        name_rules: caps.name_rules.as_str().into(),
+        degraded: Vec::new(),
     }
 }
 

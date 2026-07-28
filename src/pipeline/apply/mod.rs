@@ -150,6 +150,8 @@ pub fn apply_vfs(
 
     let source_local = source.as_local().map(|p| p.to_path_buf());
     let target_local = target.as_local().map(|p| p.to_path_buf());
+    let source_trash_ok = source.caps().local_trash;
+    let target_trash_ok = target.caps().local_trash;
 
     // The FFS dir_lock idea: lock both roots (with a heartbeat) before touching anything, so two machines cannot apply to the same directory at once.
     // Pause spins on 100ms instead of suspending and returning precisely so these two locks' heartbeat threads keep beating while paused.
@@ -179,6 +181,8 @@ pub fn apply_vfs(
         target,
         source_local,
         target_local,
+        source_trash_ok,
+        target_trash_ok,
         trash: opt.trash.clone().unwrap_or_else(default_trash),
         remote_keep_rel: format!(
             "{}/trash/{}",

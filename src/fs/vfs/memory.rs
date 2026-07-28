@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use super::error::{VfsError, VfsErrorKind, VfsResult};
 use super::{
-    CaseSense, CommitReport, NameRules, ReadStream, Support, VDirEntry, VMeta, Vfs, VfsCaps,
-    WriteHint, WriteStaged,
+    CaseSense, CommitReport, Medium, NameRules, ReadStream, Support, VDirEntry, VMeta, Vfs,
+    VfsCaps, WriteHint, WriteStaged,
 };
 use crate::model::table::EntryKind;
 
@@ -62,6 +62,9 @@ fn default_caps() -> VfsCaps {
         file_id: Support::No,
         free_space: Support::Yes,
         read_back: Support::Yes,
+        // It stands in for a protocol backend, so it answers as one: reached over a link, and
+        // therefore not somewhere the central trash store can rename into.
+        medium: Medium::NetworkShare,
         local_trash: false,
         case_sensitivity: CaseSense::Sensitive,
         name_rules: NameRules::Posix,

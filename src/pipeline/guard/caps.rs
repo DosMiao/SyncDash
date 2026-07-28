@@ -258,8 +258,10 @@ pub fn cap_report_write(
         let destructive = side_ops
             .iter()
             .any(|o| matches!(o.action, Action::Delete | Action::Update | Action::Copy));
-        if destructive && !local {
-            if q.versioning {
+        if destructive {
+            // The version store writes into `<root>/.version_syncDash/`, so it only needs a real
+            // path — it works on a mounted share. A protocol backend has no path at all.
+            if q.versioning && !local {
                 r.items.push(CapItem {
                     feature: "versioning".into(),
                     side: side_tag.into(),
@@ -268,14 +270,17 @@ pub fn cap_report_write(
                     actual: "remote backend (no local version machinery)".into(),
                     effect: "overwritten/deleted files are kept as whole files under <root>/.syncdash/trash/<run>/ instead — recover with any file browser; rdelta history does not accrue on this side".into(),
                 });
-            } else if !caps.local_trash {
+            } else if !q.versioning && !caps.local_trash {
+                // Deliberately NOT gated on `local`: a UNC root is a real path, which is exactly
+                // why this went unnoticed — the store is on THIS machine, so preserving there
+                // would have pulled every deleted file across the link first.
                 r.items.push(CapItem {
                     feature: "trash".into(),
                     side: side_tag.into(),
                     severity: CapSeverity::NeedsAck,
-                    requested: "deleted/overwritten files into the local trash".into(),
-                    actual: "the OS trash cannot reach this root".into(),
-                    effect: "originals move into <root>/.syncdash/trash/<run>/ ON THE REMOTE side (a rename, nothing downloaded) — not this machine's recycle bin".into(),
+                    requested: "deleted/overwritten files into the central trash store".into(),
+                    actual: format!("root sits on a {} — the store is on this machine", caps.medium.as_str()),
+                    effect: "originals are renamed into <root>/.syncdash/trash/<run>/ on the root's own side — recover with any file browser; nothing is transferred, and nothing lands in this machine's store".into(),
                 });
             }
         }

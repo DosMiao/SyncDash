@@ -219,6 +219,7 @@ impl Vfs for SftpBackend {
             file_id: Support::No,
             free_space: Support::No, // statvfs corrupts sessions on some servers (FFS finding); never asked
             read_back: Support::Yes,
+            medium: super::Medium::NetworkShare,
             local_trash: false,
             case_sensitivity: CaseSense::Unknown,
             // The server may well be Windows OpenSSH; the banner does not prove it either way.

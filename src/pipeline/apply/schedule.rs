@@ -23,9 +23,16 @@ pub(super) struct Shared<'a> {
     pub(super) source: &'a std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     pub(super) target: &'a std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     /// The local escape hatches, precomputed: Some = this side is a real directory and
-    /// the path-based machinery (delta, VersionWriter, OS trash, walkdir) applies.
+    /// the path-based machinery (delta, VersionWriter, walkdir) applies.
     pub(super) source_local: Option<PathBuf>,
     pub(super) target_local: Option<PathBuf>,
+    /// Whether the central trash store may take each side's deletions.
+    ///
+    /// A separate question from `local_of`, and the reason this field exists: `\\nas\share` is a
+    /// real local path, so delta and mmap do apply to it — but it is on another machine, so a
+    /// move into the store on this one copies every deleted file across the network first.
+    pub(super) source_trash_ok: bool,
+    pub(super) target_trash_ok: bool,
     pub(super) trash: PathBuf,
     /// The in-root retention area for remote sides: `.syncdash/trash/<run_ms>` under
     /// the executing root — originals move there by RENAME on the far side, nothing
@@ -53,6 +60,13 @@ impl<'a> Shared<'a> {
         match side {
             Side::Target => self.target_local.as_deref(),
             Side::Source => self.source_local.as_deref(),
+        }
+    }
+
+    pub(super) fn trash_reaches(&self, side: &Side) -> bool {
+        match side {
+            Side::Target => self.target_trash_ok,
+            Side::Source => self.source_trash_ok,
         }
     }
 

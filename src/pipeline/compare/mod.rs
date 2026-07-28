@@ -681,6 +681,7 @@ mod tests {
             protocol: protocol.into(),
             display_root: "/r".into(),
             mtime_precision_ms: 1,
+            medium: crate::fs::vfs::Medium::NetworkShare.as_str().into(),
             evidence_effective: "full".into(),
             name_rules: name_rules.into(),
             degraded: Vec::new(),

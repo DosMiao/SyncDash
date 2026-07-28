@@ -7,6 +7,10 @@
 
 use std::path::PathBuf;
 
+use syncdash::fs::vfs::error::VfsResult;
+use syncdash::fs::vfs::{
+    Medium, ReadStream, VDirEntry, VMeta, VfsCaps, WriteHint, WriteStaged,
+};
 use syncdash::model::event::{ItemOutcome, ProgressEvent};
 use syncdash::model::plan::{Action, Op, Side};
 use syncdash::obs::progress::{RunCtl, RunCtx};
@@ -409,5 +413,132 @@ fn delete_dirs_deepest_first_regardless_of_input_order() {
     let (done, _, errors) = apply::apply(&ops, &s, &t, &opts(base.join("trash")));
     assert_eq!((done, errors), (3, 0), "all three directories must go");
     assert!(!t.join("a").exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A root with a real path that is **not on this machine** — the `\\nas\share` shape.
+///
+/// This exact combination is where the cross-volume trash bug lived: `as_local()` is `Some`, so
+/// delta, mmap hashing and the version store all correctly apply, while the central trash store
+/// sits on the other side of a network link. Only a wrapper can stand in for it; a real one needs
+/// a real share, and `memory::MemVfs` cannot (it has no path at all, so it never took this route).
+struct OffMachine(syncdash::fs::vfs::local::LocalVfs);
+
+impl syncdash::fs::vfs::Vfs for OffMachine {
+    fn caps(&self) -> VfsCaps {
+        VfsCaps { medium: Medium::NetworkShare, local_trash: false, ..self.0.caps() }
+    }
+    fn display(&self) -> String {
+        self.0.display()
+    }
+    fn identity(&self) -> String {
+        self.0.identity()
+    }
+    fn as_local(&self) -> Option<&std::path::Path> {
+        self.0.as_local()
+    }
+    fn connect(&self) -> VfsResult<()> {
+        self.0.connect()
+    }
+    fn stat(&self, rel: &str) -> VfsResult<Option<VMeta>> {
+        self.0.stat(rel)
+    }
+    fn read_dir(&self, rel: &str) -> VfsResult<Vec<VDirEntry>> {
+        self.0.read_dir(rel)
+    }
+    fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>> {
+        self.0.open_read(rel)
+    }
+    fn read_range(&self, rel: &str, off: u64, len: u32) -> VfsResult<Vec<u8>> {
+        self.0.read_range(rel, off, len)
+    }
+    fn read_link(&self, rel: &str) -> VfsResult<String> {
+        self.0.read_link(rel)
+    }
+    fn mkdir_all(&self, rel: &str) -> VfsResult<()> {
+        self.0.mkdir_all(rel)
+    }
+    fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
+        self.0.open_write(rel, hint)
+    }
+    fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
+        self.0.rename(from_rel, to_rel)
+    }
+    fn remove_file(&self, rel: &str) -> VfsResult<()> {
+        self.0.remove_file(rel)
+    }
+    fn remove_dir(&self, rel: &str) -> VfsResult<()> {
+        self.0.remove_dir(rel)
+    }
+    fn set_mtime(&self, rel: &str, mtime_ms: i64) -> VfsResult<()> {
+        self.0.set_mtime(rel, mtime_ms)
+    }
+    fn set_mode(&self, rel: &str, mode: u32) -> VfsResult<()> {
+        self.0.set_mode(rel, mode)
+    }
+    fn make_symlink(&self, rel: &str, target: &str) -> VfsResult<()> {
+        self.0.make_symlink(rel, target)
+    }
+    fn free_space(&self) -> VfsResult<Option<(u64, u64)>> {
+        self.0.free_space()
+    }
+}
+
+/// The bug: preserving an original chose its route from `as_local()`, so a share took the central
+/// trash store, the same-volume rename into it failed, and `move_to_trash` fell back to
+/// `fs::copy` — **downloading every deleted file** before removing it. A mirror clearing 50 GB
+/// off a NAS pulled 50 GB onto the local disk, and the space gate had checked the share.
+#[test]
+fn an_off_machine_root_preserves_in_place_instead_of_downloading() {
+    let base = tmproot("offmachine");
+    let (s, t, tr) = (base.join("s"), base.join("t"), base.join("trash"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(s.join("f.txt"), b"new").unwrap();
+    std::fs::write(t.join("f.txt"), b"old").unwrap();
+
+    let sv: Arc<dyn syncdash::fs::vfs::Vfs> =
+        Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s.clone()));
+    let tv: Arc<dyn syncdash::fs::vfs::Vfs> =
+        Arc::new(OffMachine(syncdash::fs::vfs::local::LocalVfs::new(t.clone())));
+    let out = apply::apply_vfs(
+        &[op(Action::Update, "f.txt")],
+        &sv,
+        &tv,
+        &opts(tr.clone()),
+        &RunCtx::null(),
+    );
+    assert_eq!((out.done, out.errors), (1, 0));
+    assert_eq!(std::fs::read(t.join("f.txt")).unwrap(), b"new");
+
+    // Nothing crossed the link: the central store never sees this root's originals
+    assert!(!tr.join("f.txt").exists(), "the original must not be copied off the root");
+
+    // …it was renamed into the root's own retention area instead, recoverable with any browser
+    let kept = std::fs::read_dir(t.join(".syncdash").join("trash"))
+        .expect("in-root retention area must exist")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join("f.txt"))
+        .find(|p| p.exists())
+        .expect("the original must be kept under <root>/.syncdash/trash/<run>/");
+    assert_eq!(std::fs::read(kept).unwrap(), b"old", "old version must still be recoverable");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The other half of the same decision: an ordinary local root keeps using the central store, so
+/// the fix narrows the route rather than moving everyone onto the in-root area.
+#[test]
+fn an_on_machine_root_still_uses_the_central_trash_store() {
+    let base = tmproot("onmachine");
+    let (s, t, tr) = (base.join("s"), base.join("t"), base.join("trash"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(s.join("f.txt"), b"new").unwrap();
+    std::fs::write(t.join("f.txt"), b"old").unwrap();
+
+    let (done, _, errors) = apply::apply(&[op(Action::Update, "f.txt")], &s, &t, &opts(tr.clone()));
+    assert_eq!((done, errors), (1, 0));
+    assert_eq!(std::fs::read(tr.join("f.txt")).unwrap(), b"old");
+    assert!(!t.join(".syncdash").exists(), "a local root needs no in-root retention area");
     let _ = std::fs::remove_dir_all(&base);
 }

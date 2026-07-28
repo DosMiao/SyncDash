@@ -27,9 +27,19 @@ pub(super) fn move_to_trash(file: &Path, rel: &str, trash: &Path) -> std::io::Re
     }
 }
 /// Archive the original before it is overwritten/deleted (trash or .version_syncDash).
-/// Local sides keep the whole path-based machinery (OS trash / rdelta version store);
-/// a remote side renames the original into the in-root retention area instead —
-/// exactly what the preflight NeedsAck line promised, and never a download.
+///
+/// Three routes, chosen by two independent questions:
+///
+/// - **Is there a real path?** (`local_of`) — the rdelta version store needs one. It writes into
+///   `<root>/.version_syncDash/`, so it stays a move *within* the root and is safe anywhere a
+///   path exists, share or not.
+/// - **Can the central trash store take it?** (`local_trash`) — that store lives on this machine.
+///   A move into it from a network share is cross-volume, and `move_to_trash` answers a failed
+///   rename by copying: every deleted file downloaded before it is removed. So a share takes the
+///   in-root retention area instead, which is the same rename a genuinely remote root gets.
+///
+/// The two used to be one test, and the second question was never asked — `VfsCaps::local_trash`
+/// was set correctly by the SMB backend and read by nobody.
 pub(super) fn preserve(
     sh: &Shared,
     op: &Op,
@@ -47,9 +57,12 @@ pub(super) fn preserve(
             }
             return w.as_mut().unwrap().preserve(&op.path, &dst, newer, why);
         }
-        return move_to_trash(&dst, &op.path, &sh.trash);
+        if sh.trash_reaches(&op.side) {
+            return move_to_trash(&dst, &op.path, &sh.trash);
+        }
     }
-    // Remote side: rename into <root>/.syncdash/trash/<run_ms>/<rel>
+    // Off-machine root — mounted share or protocol backend alike: rename into
+    // <root>/.syncdash/trash/<run_ms>/<rel>, on the far side, nothing transferred.
     let keep_rel = format!("{}/{}", sh.remote_keep_rel, op.path);
     if let Some(parent) = crate::foundation::path::parent(&keep_rel) {
         sh.ensure_dir(&op.side, exec, parent)?;
