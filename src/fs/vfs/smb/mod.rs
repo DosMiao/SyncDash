@@ -403,10 +403,9 @@ impl Vfs for SmbBackend {
             medium: Medium::NetworkShare,
             local_trash: false,
             case_sensitivity: CaseSense::Unknown,
-            // Unlike the translation backend, nothing here passes through the local path
-            // layer — the packets go straight out, so the rules that apply are the *server's*
-            // and we cannot see its OS. `Unknown` downgrades the legality preflight from a
-            // refusal to a visible warning, which is the honest outcome.
+            // Names go on the wire as spelled, so what governs them is the *server's* rules and
+            // its OS is not visible from here. `Unknown` downgrades the legality preflight from
+            // a refusal to a visible warning, which is the honest outcome.
             name_rules: NameRules::Unknown,
             max_parallel_streams: 4,
         }

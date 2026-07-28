@@ -69,7 +69,7 @@ impl std::error::Error for VfsError {
     }
 }
 
-/// io::Error -> VfsError, for backends that sit on std::fs (local, SMB translation).
+/// io::Error -> VfsError, for the local backend and anything else sitting on std::fs.
 /// For a **local** filesystem NotFound really is confirmed absence, so the mapping is direct.
 impl From<std::io::Error> for VfsError {
     fn from(e: std::io::Error) -> VfsError {

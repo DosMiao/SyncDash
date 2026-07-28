@@ -7,9 +7,9 @@
 
 /// Open + connect a root phrase to a live backend (a plain local path resolves to `LocalVfs`).
 ///
-/// Local paths pass through untouched. A backend that *translates* to a local path (`smb://` → UNC
-/// or mount point) connects first — that is where mount orchestration lives — and hands back the
-/// translated path. A `peer://` phrase never reaches here: that root belongs to the far side's own
+/// Connecting here rather than lazily is the point: a protocol root's authentication and reachability
+/// both resolve at this line, so a bad credential surfaces before a scan starts rather than part way
+/// through one. A `peer://` phrase never reaches here — that root belongs to the far side's own
 /// syncdash, so `vfs::open` refuses it rather than opening something local that looks similar.
 pub fn resolve_root(s: &str) -> std::io::Result<std::sync::Arc<dyn crate::fs::vfs::Vfs>> {
     let v = crate::fs::vfs::open(s, &crate::fs::vfs::cred::default_provider())?;
