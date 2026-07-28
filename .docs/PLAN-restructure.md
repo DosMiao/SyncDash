@@ -363,26 +363,43 @@ history rather than as a present-tense prerequisite.
 
 ---
 
-## 7. Progress
+## 7. What was done (2026-07-28)
 
-- **Phase 1 — DONE.** −1,523 net lines over 25 files; `cargo check --all-targets` clean,
-  201 tests green, `tsc --noEmit` clean.
-  - Deleted: `vclock.rs`, `fake.rs` + the `fake://` scheme, `materialize_roots`/`materialize_one`,
-    `matches_any_generation`, `as_vfs_error`, `VfsError::with_source`, `sweep_stale_temps`,
-    `NoPrompt`, `RootLock::acquire`, `scan::record_mtime_fixes`.
-  - Barrel removed (`vfs/mod.rs:40-43`); `EntryKind` now imported from `model::table` at each
-    backend, so the L0→L0 edge is visible at its call sites again.
-  - Artifact filenames: `FileSink::{RUN,ERRORS,ITEMS}` and `AppLogSink::FILE` deleted; all seven
-    names now come from `foundation::names`, so `runlog::artifact_lines` stops sourcing one
-    function's filenames from two places.
-  - Adopted `stamp_iso`, `sep_of`, `civil_from_days` (3 copies → 1).
-  - **`humanSize` in `core/format.ts` now mirrors `foundation::fmt::human_bytes`** — the
-    `1.5 MiB` / `1.5 MB` split is fixed. (Written as a loop: JS bitwise is 32-bit, so `1 << 40` is 256.)
-  - **Two plan corrections.** `fmt::pct` and `fmt::human_duration` were deleted, not adopted. Their
-    doc claimed a consolidation that should never happen: `pct`'s `-1` in `src-tauri` is a live
-    sentinel (`App.tsx:558` renders nothing when `pct < 0`), `main.rs`'s `100` means "nothing to
-    hash = complete", and `human_duration` renders `1:02:03` while its supposed call sites render
-    `5m ago`. Forcing either would have been a behavior change disguised as cleanup.
-  - `lib.rs` layering doctrine corrected: the Tarjan claim holds **per file**; the `log_*!` macro
-    edges put `fs → obs → store → fs` in a directory-level cycle. Both L0 headers now say why they
-    reach up.
+All seven phases executed, each on its own branch and merged with `--no-ff`. Every phase ended
+green: `cargo check --workspace --all-targets` with **zero warnings**, `cargo test --workspace`,
+`npx tsc --noEmit`.
+
+**Tests: 231 → 233**, and the composition changed more than the count. 27 tests were deleted with
+the dead modules they belonged to (`vclock` held all 11 of `model/`'s); 29 were added under code
+that had none.
+
+**Files ≥ 400 lines: 16 → 11. Rust files: 50 → 99.** Line total is roughly flat (~19.3k) — this
+was redistribution, not deletion, apart from Phase 1.
+
+| Phase | Result |
+|---|---|
+| 1 | −1,523 lines. `vclock.rs` and `fake.rs` deleted, the crate's only barrel removed, three `civil_from_days` collapsed to one, `humanSize` aligned with Rust |
+| 0 | `MemVfs` (test-only) restores the `scan_vfs` lane and the degraded-caps consent gate; `tests/pack_roundtrip.rs` covers the remote trust boundary; `model/` gets round-trip tests |
+| 2 | `store/{hashcache,mtimefix,migrate}`, `foundation/disk`, `job/{junk,rigor}`, `boot`. The `apply → scan` edge is gone |
+| 3 | `pipeline/{compare,apply,scan,guard}/` — 4 files → 24 |
+| 4 | Transport router: six duplicated branches → zero. `run/`, `cli/`, `src-tauri/{dto,bridge,state,cmd/}`. `main.rs` 1102 → 29 |
+| 5 | `smb/` per-platform, `sftp/` and `ftp/` give up their stream and staged types |
+| 6-7 | Generated DTOs adopted where safe (unconsumed 9 → 5); bundle renamed `vendor`/`shared` |
+
+### Deliberately not done
+
+**The frontend decomposition.** A second session has been live in `App.tsx`, `filter.ts`,
+`plan.ts`, `styles.css`, `FilterBar`, `PlanTable`, `Toolbar` and `useVirtualRows` throughout, and
+independently created `core/grouping.ts` moving `RowSpec` out of `useVirtualRows` — the same
+relocation §3 Phase 6 proposed. Doing the rest would have overwritten live work. Still open:
+`App.tsx` (1047, 84 hooks), the `components/` regrouping, the CSS split, the `chmod` tally
+divergence, the 1:N stale-state bug, `ED_GROUPS` as a union, and an ESLint config.
+
+**Two long functions, named rather than left implicit.** `compare()` is 549 lines whose ten passes
+accumulate into shared state — splitting them is a control-flow change, not a move. `run_cli`'s
+558-line dispatch would need each arm lifted into a function. Both are honest single
+responsibilities; neither is a file-organization problem.
+
+**Remaining ≥ 400-line files** are mostly one thing each: a `Vfs` impl (`sftp` 639, `ftp` 518), a
+dispatch (`cli` 630), a walker (`scan/local` 511). `obs/runlog.rs` (594) and `job/mod.rs` (712)
+are the two that would still repay a split.
