@@ -233,6 +233,42 @@ mod suite {
         });
     }
 
+    /// The same contract against a **live SMB share**, for when the backend under it changes.
+    ///
+    /// Ignored by default because it needs a server: point `SYNCDASH_SMB_ROOT` at a writable
+    /// directory on one and run
+    ///
+    /// ```text
+    /// cargo test --lib live_smb_backend_conforms -- --ignored --nocapture
+    /// ```
+    ///
+    /// It exists to make the native-SMB question answerable: the same twelve checks that pass on
+    /// a local disk have to pass through a real server before any backend claiming to speak SMB
+    /// can replace the one that delegates to the OS. Running it against the *current* backend
+    /// first is the point — it says what "passing" looks like today.
+    #[test]
+    #[ignore = "needs a live SMB share in SYNCDASH_SMB_ROOT"]
+    fn live_smb_backend_conforms() {
+        let Ok(root) = std::env::var("SYNCDASH_SMB_ROOT") else {
+            panic!("set SYNCDASH_SMB_ROOT to a writable directory on an SMB share");
+        };
+        let base = std::path::PathBuf::from(&root);
+        assert!(base.is_dir(), "SYNCDASH_SMB_ROOT '{root}' is not a reachable directory");
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        let mut n = 0usize;
+        run_all(&mut || {
+            n += 1;
+            let d = base.join(format!("conf-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            dirs.push(d.clone());
+            Arc::new(LocalVfs::new(d)) as Arc<dyn Vfs>
+        });
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
     /// The SFTP capability shape: rename refuses to overwrite, mtimes land on a second boundary.
     #[test]
     fn sftp_shaped_caps_conform() {

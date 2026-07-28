@@ -21,6 +21,7 @@ pub enum CapSeverity {
     /// Stated for the record; nothing to decide.
     Info,
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CapItem {
     /// The job feature concerned ("evidence=sampled", "mtime window", …)
@@ -35,15 +36,18 @@ pub struct CapItem {
     /// What this run will therefore do — in plain words, shown verbatim
     pub effect: String,
 }
+
 impl CapItem {
     pub fn render(&self) -> String {
         format!("[{}] {}: wanted {}, backend has {} — {}", self.side, self.feature, self.requested, self.actual, self.effect)
     }
 }
+
 #[derive(Clone, Debug, Default)]
 pub struct CapReport {
     pub items: Vec<CapItem>,
 }
+
 impl CapReport {
     pub fn blockers(&self) -> Vec<&CapItem> {
         self.items.iter().filter(|i| i.severity == CapSeverity::Block).collect()
@@ -55,6 +59,7 @@ impl CapReport {
         self.items.iter().filter(|i| i.severity == CapSeverity::Info).collect()
     }
 }
+
 /// What the read side of a run asks of its backends — primitives only (this layer
 /// must not know the Job schema; `Job::read_caps_query` builds one).
 #[derive(Clone, Copy, Debug)]
@@ -69,6 +74,7 @@ pub struct ReadCapsQuery {
     pub src_local: bool,
     pub tgt_local: bool,
 }
+
 /// The read-side capability comparison. Write-side items (fsync, verify, trash,
 /// delta, chmod) join when the VFS apply lane lands.
 pub fn cap_report_read(
@@ -154,6 +160,7 @@ pub fn cap_report_read(
 
     r
 }
+
 /// What the write side of a run asks of its backends (`Job::write_caps_query` builds one).
 #[derive(Clone, Copy, Debug)]
 pub struct WriteCapsQuery {
@@ -164,6 +171,7 @@ pub struct WriteCapsQuery {
     pub src_local: bool,
     pub tgt_local: bool,
 }
+
 /// The write-side capability comparison, evaluated against the ops that will actually
 /// run. Joins the read-side report before the apply stage starts.
 pub fn cap_report_write(
@@ -279,8 +287,10 @@ pub fn cap_report_write(
                     side: side_tag.into(),
                     severity: CapSeverity::NeedsAck,
                     requested: "deleted/overwritten files into the central trash store".into(),
-                    actual: format!("root sits on a {} — the store is on this machine", caps.medium.as_str()),
-                    effect: "originals are renamed into <root>/.syncdash/trash/<run>/ on the root's own side — recover with any file browser; nothing is transferred, and nothing lands in this machine's store".into(),
+                    // Reads through the template as "wanted …, backend has a network share, the
+                    // central store is on this machine — …"
+                    actual: format!("a {}, and the central store is on this machine", caps.medium.as_str()),
+                    effect: "originals are renamed into <root>/.syncdash/trash/<run>/ on the root's own side instead — recoverable with any file browser, and nothing crosses the link".into(),
                 });
             }
         }
