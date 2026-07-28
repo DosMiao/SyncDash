@@ -45,9 +45,25 @@ pub struct RemoteSpec {
     /// Server-side root path, '/'-separated, no leading or trailing '/'. Empty = the
     /// protocol's default root (SFTP: the login home; SMB: the share root).
     pub root: String,
-    /// The `|key=value` tail. Flag options carry an empty value. Interpretation is
-    /// the backend's business (`timeout=`, `key=`, `agent`, `active`, `insecure_tls`,
-    /// `compress`, `max_conns=`, `no_sample`; `peer://` reads `exe=` and `mount=`).
+    /// The `|key=value` tail. Flag options carry an empty value, and interpretation is the
+    /// backend's business. Parsing stays permissive — an option this build does not know is
+    /// carried, not refused — so the list of what is actually *read* belongs here and has to stay
+    /// honest:
+    ///
+    /// - `timeout=` — sftp, smb, ftp
+    /// - `key=` — sftp, via `cred`
+    /// - `domain=` — smb
+    /// - `active` — ftp
+    /// - `exe=`, `mount=` — `peer://`
+    ///
+    /// `agent` parses into `Credentials.use_agent` and **nothing reads it yet**: ssh-agent auth is
+    /// not implemented, so the phrase silently falls through to the key/password chain. Named here
+    /// rather than dropped because the parse would otherwise look like support.
+    ///
+    /// This list previously also advertised `insecure_tls`, `compress`, `max_conns=` and
+    /// `no_sample`, none of which any backend has ever read. `insecure_tls` was the harmful one:
+    /// `ftp::tls_connector` deliberately offers no way to skip certificate verification, so the
+    /// grammar was promising an escape hatch the design exists to refuse.
     pub options: Vec<(String, String)>,
 }
 
