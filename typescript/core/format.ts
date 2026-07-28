@@ -3,12 +3,20 @@
 
 export const p2 = (n: number) => String(n).padStart(2, '0');
 
+/// Mirrors Rust `foundation::fmt::human_bytes` exactly — same units, same tiers, same decimals.
+/// It has to: the CLI and this window render the same byte counts, and they previously disagreed
+/// (`1.5 MiB` there, `1.5 MB` here) because the divisor was 1024 while the label said MB.
+/// A loop rather than `1 << 40` for the top tier: JS bitwise operands are 32-bit, so `1 << 40` is 256.
 export function humanSize(b?: number): string {
   if (b === undefined) return '';
-  if (b >= 1 << 30) return (b / (1 << 30)).toFixed(2) + ' GB';
-  if (b >= 1 << 20) return (b / (1 << 20)).toFixed(1) + ' MB';
-  if (b >= 1024) return (b / 1024).toFixed(1) + ' KB';
-  return b + ' B';
+  const U = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let v = b;
+  let i = 0;
+  while (v >= 1024 && i < U.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return i === 0 ? `${b} B` : `${v.toFixed(1)} ${U[i]}`;
 }
 
 /// This year shows only MM-DD HH:mm; earlier years add the year — the column is narrow, density wins
