@@ -68,7 +68,7 @@ export const compareJob = (name: string, targetIndex: number) =>
 export const applyJob = (name: string, plan: PlanDto, ops: OpDto[], acknowledged: boolean, targetIndex: number) =>
   withCapsConsent<ApplyDto>('apply_job', { name, plan, ops, acknowledged, targetIndex });
 
-/// Watch never grants capability consent by itself — it only reuses consent the user already gave
+/// AutoScan never grants capability consent by itself — it only reuses consent the user already gave
 /// interactively this session (a degraded run must never start on a timer without a human having seen the list)
 export const applyJobUnattended = (name: string, plan: PlanDto, ops: OpDto[], targetIndex: number) =>
   invoke<ApplyDto>('apply_job', {

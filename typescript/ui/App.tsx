@@ -796,7 +796,6 @@ export function App() {
             watchSecs={watchSecs}
             onCompare={() => void doCompare()}
             onSync={() => void openConfirm()}
-            onEditGroup={(g) => { if (currentJob) setEditor({ name: currentJob.name, focusGroup: g }); }}
             onToggleLog={() => setLogOpen((v) => !v)}
             onToggleWatch={() => {
               if (watchSecs !== null) { setWatchSecs(null); setStatus('AutoScan stopped'); return; }

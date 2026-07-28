@@ -94,7 +94,7 @@ export const ED_FIELDS: FSpec[] = [
   },
   { key: 'deletable', label: 'Deletable', kind: 'lines', desc: 'May be removed along with a deleted parent directory.' },
 
-  { key: 'watch_interval_secs', label: 'Scheduled scan interval', kind: 'num', group: 'Watch', desc: 'Seconds; empty = off. For UNC targets use 30 or more.' },
+  { key: 'watch_interval_secs', label: 'Scheduled scan interval', kind: 'num', group: 'AutoScan', desc: 'Seconds; empty = off. For UNC targets use 30 or more.' },
   { key: 'watch_auto_apply', label: 'Run automatically when differences are found', kind: 'bool' },
 ];
 
@@ -104,7 +104,7 @@ export const SET_FIELDS: FSpec[] = [
   {
     key: 'log_compare', label: 'Compare runs', kind: 'select', opts: ['summary', 'off'],
     desc: 'summary = one line, no directory.',
-    help: 'Watch compares every 30 s, and creating a run directory each time would flood the log disk.',
+    help: 'AutoScan compares every 30 s, and creating a run directory each time would flood the log disk.',
   },
   { key: 'mirror_stderr', label: 'CLI also prints to the terminal', kind: 'bool' },
   { key: 'keep_days', label: 'Retention days', kind: 'num', group: 'Retention', desc: '0 = no age-based cleanup.' },

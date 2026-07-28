@@ -76,9 +76,9 @@ function configPills(j: JobFull, presets: JunkPresetDto[]): Pill[] {
         + (j.require_marker ? '\nBoth roots must also carry a .syncdash-root marker.' : ''),
     },
     {
-      key: 'Watch',
+      key: 'AutoScan',
       value: j.watch_interval_secs ? `${j.watch_interval_secs}s${j.watch_auto_apply ? ' · auto' : ''}` : 'off',
-      group: 'Watch',
+      group: 'AutoScan',
       title: j.watch_interval_secs
         ? `Compares every ${j.watch_interval_secs}s${j.watch_auto_apply ? ' and runs the result automatically' : ' and waits for you to review'}.`
         : 'No scheduled comparison.',

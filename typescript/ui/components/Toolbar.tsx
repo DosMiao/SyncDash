@@ -1,23 +1,15 @@
 import {
   ArrowLeftRight,
-  MoveRight,
-  Pencil,
-  Plus,
   RefreshCw,
   ScrollText,
   Sigma,
-  SquarePen,
   Timer,
-  Trash2,
-  Zap,
 } from 'lucide-react';
-import { ED_FIELDS, MODE_HINT, RIGOR_HINT, groupsOf } from '../../core/jobfields';
+import { MODE_HINT, RIGOR_HINT } from '../../core/jobfields';
 import { humanSize } from '../../core/format';
+import { MARK } from '../icons';
 import type { ReactNode } from 'react';
 import type { JobDto } from '../../core/types/generated/JobDto';
-
-/// Edit job opens on the first section; the config pills below name their own
-const EDIT_ENTRY = groupsOf(ED_FIELDS)[0];
 
 export interface PlanStats {
   copy: number;
@@ -37,10 +29,11 @@ interface Props {
   stats: PlanStats | null;
   busy: boolean;
   canSync: boolean;
+  /// Seconds between scheduled scans while AutoScan is on, null when it is off. The job field behind
+  /// it is still `watch_interval_secs` — AutoScan is what this control is called on screen.
   watchSecs: number | null;
   onCompare: () => void;
   onSync: () => void;
-  onEditGroup: (group: string) => void;
   onToggleLog: () => void;
   onToggleWatch: () => void;
 }
@@ -57,7 +50,7 @@ function Seg({ cls, icon, n, title }: { cls?: string; icon: ReactNode; n: number
 }
 
 export function Toolbar(props: Props) {
-  const { job, hasPlan, finalCount, stats, busy, canSync, watchSecs, onCompare, onSync, onEditGroup, onToggleLog, onToggleWatch } = props;
+  const { job, hasPlan, finalCount, stats, busy, canSync, watchSecs, onCompare, onSync, onToggleLog, onToggleWatch } = props;
 
   // An unknown tier shows just its name, with no dangling "·" (the rigor ladder will gain tiers later)
   const rh = job ? RIGOR_HINT[job.rigor] : undefined;
@@ -65,68 +58,67 @@ export function Toolbar(props: Props) {
 
   return (
     <header className="toolbar">
-      {/* Five controls, every one labelled, every one the same height, no icon used twice.
-          What each button *does* is its label; what it will do this time — the rigor tier, the
-          item count, the conflict policy — is in `title`. The counts are already on the stats bar
-          two inches to the right, so a subtitle repeating them bought nothing and cost the most
-          valuable strip on the screen. */}
-      <button
-        className="btn primary"
-        disabled={busy || !job}
-        title={job ? `Walk both roots and build a plan (F5).\nRigor: ${cmpVariant}` : 'Select a job first'}
-        onClick={onCompare}
-      ><RefreshCw size={13} /> Compare</button>
+      {/* Left is the run, read straight across: press Compare, read what it found, press the mode
+          button to carry it out. The counts sit *between* the two because they are the case for the
+          second press — at the far edge they made you look away from the pair and back. Right is
+          what runs alongside a run rather than being one: the log, and the scheduled scan.
+          Editing the job is not on this bar at all — every setting worth changing is one click away
+          on its own config pill below, which names the section it opens. */}
+      <div className="tb-run">
+        <button
+          className="btn primary"
+          disabled={busy || !job}
+          title={job ? `Walk both roots and build a plan (F5).\nRigor: ${cmpVariant}` : 'Select a job first'}
+          onClick={onCompare}
+        ><RefreshCw size={13} /> Compare</button>
 
-      {/* The label is the **mode**, not a verb: what decides "what will happen" is mirror vs sync
-          vs enrich, and the verb never changes. Writing "Synchronize" would also collide the
-          action with the mode of the same name — and mirror is not synchronization at all. */}
-      <button
-        className="btn accent mode-btn"
-        disabled={busy || !canSync}
-        title={job
-          ? `${job.mode}: ${MODE_HINT[job.mode] ?? ''}${job.versioning ? ' · versioning on' : ''}`
-            + `${hasPlan ? `\nRuns ${finalCount} checked items (F9)` : '\nCompare first'}`
-          : undefined}
-        onClick={onSync}
-      >{job ? job.mode.toUpperCase() : 'No job'}</button>
-
-      <button
-        className="btn"
-        title="Open this job's settings"
-        disabled={!job}
-        onClick={() => onEditGroup(EDIT_ENTRY)}
-      ><SquarePen size={13} /> Edit job</button>
-
-      <button className="btn" title="Show the run log" onClick={onToggleLog}>
-        <ScrollText size={13} /> Log
-      </button>
-
-      {/* A solid fill rather than the usual tinted toggle: Watch is the one control here that keeps
-          working after you look away, so it should be legible from across the room */}
-      <button
-        className={'btn' + (watchSecs !== null ? ' on-solid' : '')}
-        title="Compare automatically on the job's watch interval"
-        disabled={!job}
-        onClick={onToggleWatch}
-      >
-        <Timer size={13} />
-        {watchSecs !== null ? `Watch ${watchSecs}s` : 'Watch'}
-      </button>
-
-      <span className="stats">
         {stats && (
-          <>
-            <Seg cls="s-copy" icon={<Plus size={12} />} n={stats.copy} title="Copy" />
-            <Seg cls="s-upd" icon={<Pencil size={12} />} n={stats.upd} title="Update" />
-            <Seg cls="s-mv" icon={<MoveRight size={12} />} n={stats.mv} title="Move (no re-transfer)" />
-            <Seg cls="s-del" icon={<Trash2 size={12} />} n={stats.del} title="Delete (into the trash)" />
-            <Seg cls="s-conf" icon={<Zap size={12} />} n={stats.conflicts} title="Conflict" />
+          <span className="stats">
+            {/* Same glyph and same hue as the matching chip and the matching row, from one map */}
+            <Seg cls="k-copy" icon={MARK.copy} n={stats.copy} title="Copy" />
+            <Seg cls="k-update" icon={MARK.update} n={stats.upd} title="Update" />
+            <Seg cls="k-move" icon={MARK.move} n={stats.mv} title="Move (no re-transfer)" />
+            <Seg cls="k-delete" icon={MARK.delete} n={stats.del} title="Delete (into the trash)" />
+            <Seg cls="k-conflict" icon={MARK.conflict} n={stats.conflicts} title="Conflict" />
+            {/* No hue class: these two are not categories, so they inherit the stats bar's own colour */}
             <Seg icon={<Sigma size={12} />} n={humanSize(stats.bytes) || '0 B'} title="Bytes to transfer" />
             {stats.flips > 0 && <Seg icon={<ArrowLeftRight size={12} />} n={stats.flips} title="Reversed direction" />}
-          </>
+          </span>
         )}
-      </span>
-      {busy && <span className="spinner" />}
+
+        {/* The label is the **mode**, not a verb: what decides "what will happen" is mirror vs sync
+            vs enrich, and the verb never changes. Writing "Synchronize" would also collide the
+            action with the mode of the same name — and mirror is not synchronization at all. */}
+        <button
+          className="btn accent mode-btn"
+          disabled={busy || !canSync}
+          title={job
+            ? `${job.mode}: ${MODE_HINT[job.mode] ?? ''}${job.versioning ? ' · versioning on' : ''}`
+              + `${hasPlan ? `\nRuns ${finalCount} checked items (F9)` : '\nCompare first'}`
+            : undefined}
+          onClick={onSync}
+        >{job ? job.mode.toUpperCase() : 'No job'}</button>
+
+        {busy && <span className="spinner" />}
+      </div>
+
+      <div className="tb-side">
+        <button className="btn" title="Show the run log" onClick={onToggleLog}>
+          <ScrollText size={13} /> Log
+        </button>
+
+        {/* A solid fill rather than the usual tinted toggle: AutoScan is the one control here that
+            keeps working after you look away, so it should be legible from across the room */}
+        <button
+          className={'btn' + (watchSecs !== null ? ' on-solid' : '')}
+          title="Compare automatically on the job's scan interval"
+          disabled={!job}
+          onClick={onToggleWatch}
+        >
+          <Timer size={13} />
+          {watchSecs !== null ? `AutoScan ${watchSecs}s` : 'AutoScan'}
+        </button>
+      </div>
     </header>
   );
 }

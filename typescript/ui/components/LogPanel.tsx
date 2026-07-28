@@ -46,7 +46,7 @@ export function LogPanel({ jobName, onClose, onSettings, onStatus, reloadKey }: 
     if (!current) return;
     if (!current.run_id) {
       // Compare runs leave only an index line and no directory — spell out why this is empty
-      setNotice('Compare runs record a summary only, with no detail directory (Watch runs every 30 s, and creating a directory each time would flood the log disk)');
+      setNotice('Compare runs record a summary only, with no detail directory (AutoScan runs every 30 s, and creating a directory each time would flood the log disk)');
       return;
     }
     setNotice('Loading…');
