@@ -157,10 +157,6 @@ pub fn load_mtime_fixes_by_key(key: &str) -> HashMap<String, (i64, i64)> {
     map
 }
 
-/// Record a batch of corrections. For a repeated path the newest one wins (on read, later lines overwrite earlier ones).
-pub fn record_mtime_fixes(root: &Path, fixes: &[(String, i64, i64)]) {
-    record_mtime_fixes_by_key(&root.to_string_lossy(), fixes)
-}
 
 pub fn record_mtime_fixes_by_key(key: &str, fixes: &[(String, i64, i64)]) {
     if fixes.is_empty() {
@@ -303,7 +299,7 @@ pub fn scan_root(
     }
 }
 
-fn sampled_digest_vfs(vfs: &dyn crate::fs::vfs::Vfs, rel: &str, size: u64) -> Result<String, crate::fs::vfs::VfsError> {
+fn sampled_digest_vfs(vfs: &dyn crate::fs::vfs::Vfs, rel: &str, size: u64) -> Result<String, crate::fs::vfs::error::VfsError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&size.to_le_bytes());
     for off in [0u64, size / 2, size.saturating_sub(SAMPLE_CHUNK as u64)] {
@@ -319,14 +315,14 @@ fn full_hash_vfs(
     vfs: &dyn crate::fs::vfs::Vfs,
     rel: &str,
     pp: &crate::obs::progress::PhaseProgress<'_>,
-) -> Result<String, crate::fs::vfs::VfsError> {
+) -> Result<String, crate::fs::vfs::error::VfsError> {
     let mut stream = vfs.open_read(rel)?;
     let mut hasher = blake3::Hasher::new();
     let block = stream.block_size().clamp(64 * 1024, 8 * 1024 * 1024);
     let mut buf = vec![0u8; block];
     loop {
-        pp.checkpoint().map_err(crate::fs::vfs::VfsError::from)?; // cancel/pause between blocks
-        let n = std::io::Read::read(&mut stream, &mut buf).map_err(crate::fs::vfs::VfsError::from)?;
+        pp.checkpoint().map_err(crate::fs::vfs::error::VfsError::from)?; // cancel/pause between blocks
+        let n = std::io::Read::read(&mut stream, &mut buf).map_err(crate::fs::vfs::error::VfsError::from)?;
         if n == 0 {
             break;
         }
@@ -348,7 +344,7 @@ fn scan_vfs(
     ctx: &crate::obs::progress::RunCtx,
     phase: crate::model::event::Phase,
 ) -> std::io::Result<Snapshot> {
-    use crate::fs::vfs::VfsErrorKind;
+    use crate::fs::vfs::error::VfsErrorKind;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     let pp = crate::obs::progress::PhaseProgress::begin(ctx, phase, Some(vfs.display()), 0, 0);

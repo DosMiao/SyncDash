@@ -26,8 +26,6 @@ use std::path::PathBuf;
 pub enum RootSpec {
     Local(PathBuf),
     Remote(RemoteSpec),
-    /// `fake://…` — the in-memory test filesystem; the raw phrase carries its knobs.
-    Fake(String),
     /// `scheme://…` where the scheme is not one we know. Never silently local.
     UnknownScheme { raw: String, scheme: String },
 }
@@ -132,9 +130,6 @@ pub fn parse(raw: &str) -> RootSpec {
         let scheme_raw = &s[..idx];
         let scheme = scheme_raw.to_ascii_lowercase();
         if !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric()) {
-            if scheme == "fake" {
-                return RootSpec::Fake(s.to_string());
-            }
             if KNOWN_SCHEMES.contains(&scheme.as_str()) {
                 return RootSpec::Remote(parse_remote(&scheme, &s[idx + 3..]));
             }
@@ -319,8 +314,11 @@ mod tests {
         assert_eq!(r.user.as_deref(), Some("user@corp"));
     }
 
+    /// `fake://` was a routed scheme until the in-memory test backend was deleted. It must now
+    /// take the unknown-scheme path like any other typo, never fall back to a local path.
     #[test]
-    fn fake_scheme_is_reserved_for_tests() {
-        assert!(matches!(parse("fake://seed1?latency_ms=5"), RootSpec::Fake(_)));
+    fn unknown_scheme_is_refused_never_treated_as_local() {
+        assert!(matches!(parse("fake://seed1"), RootSpec::UnknownScheme { .. }));
+        assert!(matches!(parse("nfs://server/export"), RootSpec::UnknownScheme { .. }));
     }
 }

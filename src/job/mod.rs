@@ -247,7 +247,7 @@ impl Job {
                         "{label} '{s}': unknown scheme '{scheme}://' — refusing to treat it as a local path (known: sftp, ftp, ftps, smb)"
                     ));
                 }
-                RootSpec::Remote(_) | RootSpec::Fake(_) => any_remote = true,
+                RootSpec::Remote(_) => any_remote = true,
                 RootSpec::Local(_) => {}
             }
         }

@@ -20,10 +20,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::model::table::EntryKind;
 use super::error::{VfsError, VfsErrorKind, VfsResult};
 use super::spec::RemoteSpec;
 use super::{
-    CaseSense, CommitReport, CredentialProvider, Credentials, EntryKind, ReadStream, Support,
+    CaseSense, CommitReport, CredentialProvider, Credentials, ReadStream, Support,
     VDirEntry, VMeta, Vfs, VfsCaps, WriteHint, WriteStaged,
 };
 

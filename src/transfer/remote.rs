@@ -16,7 +16,7 @@ fn ssh_base(host: &str) -> Command {
 }
 
 /// Wrap in POSIX single quotes (an embedded single quote is escaped as '\'')
-pub fn shq(s: &str) -> String {
+fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
@@ -34,7 +34,7 @@ impl RemoteShell {
 }
 
 /// Quote for the remote dialect (inside PowerShell single quotes, an embedded single quote is written '')
-pub fn shq_for(shell: RemoteShell, s: &str) -> String {
+fn shq_for(shell: RemoteShell, s: &str) -> String {
     match shell {
         RemoteShell::Posix => shq(s),
         RemoteShell::PowerShell => format!("'{}'", s.replace('\'', "''")),

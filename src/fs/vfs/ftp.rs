@@ -22,10 +22,11 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::model::table::EntryKind;
 use super::error::{VfsError, VfsErrorKind, VfsResult};
 use super::spec::RemoteSpec;
 use super::{
-    CaseSense, CommitReport, CredentialProvider, EntryKind, ReadStream, Support, VDirEntry, VMeta,
+    CaseSense, CommitReport, CredentialProvider, ReadStream, Support, VDirEntry, VMeta,
     Vfs, VfsCaps, WriteHint, WriteStaged,
 };
 

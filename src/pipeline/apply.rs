@@ -121,7 +121,7 @@ fn try_delete_dir_vfs(
     rel: &str,
     filter: Option<&crate::pipeline::filter::PathFilter>,
 ) -> DirOutcome {
-    use crate::fs::vfs::VfsErrorKind;
+    use crate::fs::vfs::error::VfsErrorKind;
     use crate::model::table::EntryKind;
     match exec.remove_dir(rel) {
         Ok(_) => return DirOutcome::Removed,

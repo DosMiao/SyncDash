@@ -8,9 +8,12 @@
 //! its heartbeat rides set_mtime (SFTP's setstat), same protocol, same observers.
 //! A backend without settable mtimes (FTP without MFMT) will need the content-beat
 //! variant; that lands together with the FTP write lane, not before.
+//!
+//! Layering: this L0 module reaches up to L1 `obs::logging` through `log_warn!`. A stale-lock
+//! takeover silently discards another machine's claim on the root — the one event here that must
+//! reach the operator's log, and there is no `RunCtx` this deep. See `lib.rs` for the edge.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -55,11 +58,6 @@ fn write_lock(vfs: &Arc<dyn Vfs>, rel: &str, info: &LockInfo) -> std::io::Result
 }
 
 impl RootLock {
-    pub fn acquire(root: &Path) -> std::io::Result<RootLock> {
-        let v: Arc<dyn Vfs> = Arc::new(crate::fs::vfs::local::LocalVfs::new(root.to_path_buf()));
-        Self::acquire_vfs(&v)
-    }
-
     pub fn acquire_vfs(vfs: &Arc<dyn Vfs>) -> std::io::Result<RootLock> {
         let rel = LOCK_NAME;
         let disp = vfs.display();
@@ -90,7 +88,7 @@ impl RootLock {
                 crate::log_warn!("lock", "stale lock from {holder} on {disp} — taking over");
                 match vfs.remove_file(rel) {
                     Ok(()) => {}
-                    Err(e) if e.kind == crate::fs::vfs::VfsErrorKind::NotFound => {}
+                    Err(e) if e.kind == crate::fs::vfs::error::VfsErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
                 }
             }

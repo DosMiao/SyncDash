@@ -11,22 +11,30 @@
 //! L3  orchestration  run · job
 //! L2  domain         pipeline (scan/compare/apply/filter/guard) · transfer (remote/pack)
 //! L1  services       obs (progress/logging/runlog) · store (settings/trash/version)
-//! L0  foundation     foundation · model (plan/event/table/chunk/vclock) · fs (staged/lock)
+//! L0  foundation     foundation · model (plan/event/table/chunk) · fs (staged/lock)
 //! ```
 //!
-//! Verified mechanically, not by assertion: Tarjan over the comment-stripped sources reports no
-//! strongly-connected component larger than one, and no edge points up the ladder.
+//! Verified mechanically, not by assertion: Tarjan over the comment-stripped **files** reports no
+//! strongly-connected component larger than one. Two things that reading `use crate::` will not
+//! show, both accepted rather than engineered away:
+//! - The `log_*!` macros are `#[macro_export]` and expand to `$crate::obs::logging::emit`, so a
+//!   call site carries an edge to L1 that no `use` declares. `fs::lock` and `fs::vfs::local` each
+//!   have one, and each header says why.
+//! - Counting those, the *directory* graph has one cycle: `fs → obs → store → fs`. Being able to
+//!   log from anywhere is worth more than an acyclic directory graph. It is still a cycle — the
+//!   file-level claim above is the one that holds unqualified.
 //!
 //! `model` holds **vocabulary** — the plan format and the event schema — while the engines that
-//! produce them live in `pipeline` and `obs`. That split is what keeps the graph acyclic: both
-//! `store::version` and `obs::runlog` persist ops, and `store::settings` needs `LogLevel`, so
+//! produce them live in `pipeline` and `obs`. That split is what keeps the *file* graph acyclic:
+//! both `store::version` and `obs::runlog` persist ops, and `store::settings` needs `LogLevel`, so
 //! leaving those types inside their engines forced service modules to reach up into the domain
 //! layer for a struct definition.
 //!
 //! `foundation` is the one layer guaranteed to have zero in-crate dependencies: everyone may use
-//! it, it uses no one. The implementations that used to be copied per call site — timestamp
-//! conversion ×3, byte formatting ×3, rel→native ×8, compare-key folding ×2 with inconsistent
-//! semantics — all converge there.
+//! it, it uses no one. Timestamp conversion (was 3 copies), rel→native (8) and compare-key folding
+//! (2, with inconsistent semantics) all converge there. Byte formatting converges too, but with a
+//! deliberate second implementation: `typescript/core/format.ts` renders the same units for the
+//! GUI, and the two are kept in step by hand — see `foundation::fmt`.
 //!
 //! Two shape rules, both taken from the reference project:
 //! - A single-file domain stays flat at its parent (`transfer/remote.rs`); only a multi-file

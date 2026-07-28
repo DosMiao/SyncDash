@@ -52,14 +52,6 @@ impl VfsError {
         VfsError { kind, detail: detail.into(), source: None }
     }
 
-    pub fn with_source(
-        kind: VfsErrorKind,
-        detail: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> VfsError {
-        VfsError { kind, detail: detail.into(), source: Some(Box::new(source)) }
-    }
-
     pub fn unsupported(what: impl Into<String>) -> VfsError {
         VfsError::new(VfsErrorKind::Unsupported, what)
     }
@@ -132,11 +124,6 @@ impl From<VfsError> for std::io::Error {
     }
 }
 
-/// Recover the VfsError classification from an io::Error that carried one.
-pub fn as_vfs_error(e: &std::io::Error) -> Option<&VfsError> {
-    e.get_ref()?.downcast_ref::<VfsError>()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,9 +133,11 @@ mod tests {
         let v = VfsError::new(VfsErrorKind::Transient, "link dropped");
         let io: std::io::Error = v.into();
         assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
-        let back = as_vfs_error(&io).expect("payload survives");
+        // The classification is what survives the crossing — `From` re-derives it from
+        // ErrorKind, so a Transient that becomes an io::Error comes back Transient.
+        let back: VfsError = io.into();
         assert_eq!(back.kind, VfsErrorKind::Transient);
-        assert_eq!(back.detail, "link dropped");
+        assert!(back.detail.contains("link dropped"), "{}", back.detail);
     }
 
     #[test]

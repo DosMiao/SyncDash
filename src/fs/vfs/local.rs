@@ -4,12 +4,17 @@
 //! walkdir+mmap fast path — this impl is what the *generic* engine lanes use, and
 //! its write side deliberately wraps the very same `Staged` the direct lane uses,
 //! so local behavior cannot drift between lanes.
+//!
+//! Layering: this L0 module reaches up to L1 `obs::logging` through `log_warn!`, in `read_dir`,
+//! where an entry whose name is not valid Unicode is skipped. The skip has no return channel —
+//! the signature yields entries, not diagnostics — so without the log it is silent. See `lib.rs`.
 
 use std::path::{Path, PathBuf};
 
+use crate::model::table::EntryKind;
 use super::error::VfsResult;
 use super::{
-    CaseSense, CommitReport, EntryKind, ReadStream, Support, VDirEntry, VMeta, Vfs, VfsCaps,
+    CaseSense, CommitReport, ReadStream, Support, VDirEntry, VMeta, Vfs, VfsCaps,
     WriteHint, WriteStaged,
 };
 use crate::foundation::path::join_native;

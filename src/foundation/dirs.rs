@@ -4,7 +4,7 @@
 //! answers "which directory", never "how do I splice this path".
 //!
 //! Pure environment-variable derivation, no crate dependencies — which is the point. These
-//! paths used to live in the job module, so `settings`, `vclock` and `territory` all had to
+//! paths used to live in the job module, so `settings` and `territory` both had to
 //! depend on the job schema just to learn where a directory was, and `settings::config_dir`
 //! recovered the config root by taking `jobs_dir().parent()`. That made the `jobs` suffix
 //! load-bearing: rename it and the settings file silently relocates.

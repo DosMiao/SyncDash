@@ -14,6 +14,7 @@
 //! identical before and after the rework" hold, so the correctness of the swap (P3) does not depend on
 //! whether the desktop shell or the CLI installed a sink.
 
+use crate::foundation::names::{APP_LOG_FILE, RUNLOG_ERRORS_FILE, RUNLOG_ITEMS_FILE, RUNLOG_RUN_FILE};
 use crate::model::event::{LogLevel, ProgressEvent};
 use crate::obs::progress::{current, ProgressSink};
 use std::io::Write;
@@ -144,15 +145,11 @@ pub struct FileSink {
 }
 
 impl FileSink {
-    pub const RUN: &'static str = "run.jsonl";
-    pub const ERRORS: &'static str = "errors.jsonl";
-    pub const ITEMS: &'static str = "items.jsonl";
-
     pub fn open(dir: &Path, min_level: LogLevel) -> FileSink {
         FileSink {
-            run: Mutex::new(Appender::create(&dir.join(Self::RUN))),
-            errors: Mutex::new(Appender::create(&dir.join(Self::ERRORS))),
-            items: Mutex::new(Appender::create(&dir.join(Self::ITEMS))),
+            run: Mutex::new(Appender::create(&dir.join(RUNLOG_RUN_FILE))),
+            errors: Mutex::new(Appender::create(&dir.join(RUNLOG_ERRORS_FILE))),
+            items: Mutex::new(Appender::create(&dir.join(RUNLOG_ITEMS_FILE))),
             min_level,
         }
     }
@@ -229,10 +226,8 @@ pub struct AppLogSink {
 }
 
 impl AppLogSink {
-    pub const FILE: &'static str = "app.jsonl";
-
     pub fn open(dir: &Path, min_level: LogLevel) -> AppLogSink {
-        let f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(Self::FILE)).ok();
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(APP_LOG_FILE)).ok();
         AppLogSink { w: Mutex::new(f), min_level }
     }
 }
@@ -333,9 +328,9 @@ mod tests {
             });
         }
         let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap();
-        let run = read(FileSink::RUN);
-        let errors = read(FileSink::ERRORS);
-        let items = read(FileSink::ITEMS);
+        let run = read(RUNLOG_RUN_FILE);
+        let errors = read(RUNLOG_ERRORS_FILE);
+        let items = read(RUNLOG_ITEMS_FILE);
         assert_eq!(run.lines().count(), 3, "run.jsonl = info + warn + error, no item/progress:\n{run}");
         assert!(!run.contains("\"progress\""), "Progress must not be persisted");
         assert_eq!(errors.lines().count(), 2, "errors.jsonl = warn + error:\n{errors}");
@@ -354,7 +349,7 @@ mod tests {
             fs_sink.emit(ev_log(LogLevel::Info, "chatter"));
             fs_sink.emit(ev_log(LogLevel::Error, "boom"));
         }
-        let run = std::fs::read_to_string(dir.join(FileSink::RUN)).unwrap();
+        let run = std::fs::read_to_string(dir.join(RUNLOG_RUN_FILE)).unwrap();
         assert_eq!(run.lines().count(), 1, "at level=warn, info is blocked:\n{run}");
         assert!(run.contains("boom"));
         let _ = std::fs::remove_dir_all(&dir);
