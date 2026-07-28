@@ -1,7 +1,10 @@
-//! The local lane: walkdir + rayon + mmap over a real directory.
+//! The local lane: walkdir + rayon over a real directory.
 //!
 //! Kept byte-for-byte on the fast path — this is what runs for the overwhelming majority of
 //! scans, and the parallel hashing here is the reason a cold scan of a large tree is bearable.
+//! Parallelism is per *file*, not within one: hashing reads through an explicit loop rather than
+//! mapping the file, because a mapped page whose backing store goes away kills the process with
+//! SIGBUS instead of returning an error (see the hashing section for the full reasoning).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -156,13 +159,16 @@ pub(super) fn scan_impl(
         });
 
     // Phase 1: serial walk to collect entries (metadata is fast); phase 2: parallel hashing with rayon (the lesson from FFS
-    // parallel_scan: with many small files the bottleneck is serial I/O). Large files split further via mmap_rayon; small ones use a plain mmap to avoid oversubscription.
+    // parallel_scan: with many small files the bottleneck is serial I/O). Every file is read through the same chunked loop, so the parallelism is across files and the buffer is sized to the file.
     struct PendingFile {
         rel: String,
         abs: std::path::PathBuf,
         size: u64,
         mt: i64,
         hash: Option<String>, // cache hit
+        /// Set when hashing was attempted and failed: distinct from `hash: None`, which also covers
+        /// "hashing was never requested". Only the first is a degraded judgment.
+        hash_failed: bool,
         file_id: Option<String>,
         mode: Option<u32>,
     }
@@ -259,14 +265,14 @@ pub(super) fn scan_impl(
         };
         if item.file_type().is_dir() {
             if opt.filter.pass_dir(&rel).0 {
-                entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None, link: None, prev: None });
+                entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, hash_failed: false, file_id: None, mode: None, link: None, prev: None });
             }
         } else if item.file_type().is_symlink() {
             if opt.symlinks_direct {
                 let target = std::fs::read_link(item.path())
                     .ok()
                     .map(|t| t.to_string_lossy().into_owned());
-                entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None, link: target, prev: None });
+                entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, hash_failed: false, file_id: None, mode: None, link: target, prev: None });
             }
         } else {
             // Both iCloud eviction shapes, judged before the entry is recorded. Neither is an
@@ -299,7 +305,7 @@ pub(super) fn scan_impl(
                     }
                 }
             }
-            pending.push(PendingFile { rel, abs: item.path().to_path_buf(), size, mt, hash, file_id: file_id(&md), mode: unix_mode(&md) });
+            pending.push(PendingFile { rel, abs: item.path().to_path_buf(), size, mt, hash, hash_failed: false, file_id: file_id(&md), mode: unix_mode(&md) });
             if let Some(pp) = &pp {
                 pp.item_done(&pending.last().unwrap().rel);
             }
@@ -340,7 +346,8 @@ pub(super) fn scan_impl(
     if opt.hash {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        const BIG_FILE: u64 = 32 * 1024 * 1024;
+        /// Read granularity, and therefore how often cancel/pause is honoured mid-file.
+        const READ_CHUNK: u64 = 8 * 1024 * 1024;
         // Only cache misses are actually read; the progress bar is only accurate if it counts their bytes
         let bytes_total: u64 = pending.iter().filter(|p| p.hash.is_none()).map(|p| p.size).sum();
         let files_total = pending.len() as u64;
@@ -371,10 +378,22 @@ pub(super) fn scan_impl(
                     }
                 });
             }
-            // Files ≥32MB are no longer mmap-hashed in one shot: that would make "cancel" wait for the in-flight large file
-            // to finish reading (a OneDrive cloud placeholder would first have to hydrate whole, possibly a several-minute wait).
-            // The chunked read loop puts a cancel/pause checkpoint every 8MiB; this gives up blake3's intra-file multicore,
-            // but the outer file-level parallelism remains, the disk is almost always the bottleneck, and the throughput difference sinks into the noise.
+            // Every file is read through the same chunked loop, whatever its size. Two reasons, and
+            // the second is why the small-file mmap fast path is gone:
+            //
+            // Cancellation. An mmap'd hash finishes the whole file before it can be interrupted (a
+            // cloud placeholder would have to hydrate entirely first, possibly minutes). A
+            // checkpoint every READ_CHUNK gives up blake3's intra-file multicore, but file-level
+            // parallelism remains and the disk is almost always the bottleneck.
+            //
+            // Durability. Reading a mapped page whose backing file was truncated, or whose volume
+            // disappeared, raises **SIGBUS** — a signal, not an io::Error — so the Err arm below
+            // was unreachable and the process simply died: no dialog, no run-log summary, both root
+            // locks left on disk because Drop never runs. On macOS a mounted SMB/AFP share under
+            // /Volumes is an ordinary path and takes this lane, so a Wi-Fi roam mid-scan was enough.
+            // The answer is not a SIGBUS handler in a process that writes user files; it is to not
+            // map the file, so a vanishing file is an ordinary Err the hash-error path already
+            // knows how to record.
             pending.par_iter_mut().for_each(|p| {
                 if let Some(pp) = &pp {
                     if pp.checkpoint().is_err() {
@@ -387,6 +406,7 @@ pub(super) fn scan_impl(
                         match sampled_digest(&p.abs, p.size) {
                             Ok(d) => p.hash = Some(d),
                             Err(e) => {
+                                p.hash_failed = true;
                                 hash_err_count.fetch_add(1, Ordering::Relaxed);
                                 if let Some(pp) = &pp {
                                     pp.error(&p.rel, "hash", side, &e.to_string());
@@ -402,30 +422,30 @@ pub(super) fn scan_impl(
                         return;
                     }
                     let mut hasher = blake3::Hasher::new();
-                    let res = if p.size >= BIG_FILE {
-                        (|| -> std::io::Result<()> {
-                            use std::io::Read;
-                            let mut f = std::fs::File::open(&p.abs)?;
-                            let mut buf = vec![0u8; 8 * 1024 * 1024];
-                            loop {
-                                if let Some(pp) = &pp {
-                                    pp.checkpoint()?;
-                                }
-                                let n = f.read(&mut buf)?;
-                                if n == 0 {
-                                    break;
-                                }
-                                hasher.update(&buf[..n]);
+                    let res = (|| -> std::io::Result<()> {
+                        use std::io::Read;
+                        let mut f = std::fs::File::open(&p.abs)?;
+                        // Sized to the file, capped at the checkpoint interval: a tree of small
+                        // files must not allocate 8MiB per rayon worker.
+                        let cap = p.size.clamp(1, READ_CHUNK) as usize;
+                        let mut buf = vec![0u8; cap];
+                        loop {
+                            if let Some(pp) = &pp {
+                                pp.checkpoint()?;
                             }
-                            Ok(())
-                        })()
-                    } else {
-                        hasher.update_mmap(&p.abs).map(|_| ())
-                    };
+                            let n = f.read(&mut buf)?;
+                            if n == 0 {
+                                break;
+                            }
+                            hasher.update(&buf[..n]);
+                        }
+                        Ok(())
+                    })();
                     match res {
                         Ok(_) => p.hash = Some(hasher.finalize().to_hex().to_string()),
                         Err(e) if crate::obs::progress::is_cancelled(&e) => return, // cancellation is not a hash error
                         Err(e) => {
+                            p.hash_failed = true;
                             hash_err_count.fetch_add(1, Ordering::Relaxed);
                             if let Some(pp) = &pp {
                                 pp.error(&p.rel, "hash", side, &e.to_string());
@@ -458,7 +478,7 @@ pub(super) fn scan_impl(
         }
     }
     for p in pending {
-        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, file_id: p.file_id, mode: p.mode, link: None, prev: None });
+        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, hash_failed: p.hash_failed, file_id: p.file_id, mode: p.mode, link: None, prev: None });
     }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));

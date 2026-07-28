@@ -220,7 +220,7 @@ mod tests {
         }
     }
     fn file(path: &str, hash: &str) -> Entry {
-        Entry { path: path.into(), kind: EntryKind::File, size: 1, mtime_ms: 0, hash: Some(hash.into()), file_id: None, mode: None, link: None, prev: None }
+        Entry { path: path.into(), kind: EntryKind::File, size: 1, mtime_ms: 0, hash: Some(hash.into()), hash_failed: false, file_id: None, mode: None, link: None, prev: None }
     }
     /// A file with an mtime (conflict arbitration goes by mtime)
     /// An archive entry: current hash + historic generations

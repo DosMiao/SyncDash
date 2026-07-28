@@ -12,6 +12,18 @@ use crate::model::table::{Entry, EntryKind, Header, Snapshot, SCHEMA};
 use super::digest::{effective_read, full_hash_vfs, sampled_digest_vfs, SAMPLE_MIN};
 use super::ScanOptions;
 
+/// What the hashing pass produced for one pending entry.
+///
+/// Three outcomes, not two. `Skipped` (a cache hit, or a cancellation) and `Failed` both used to
+/// collapse to `None`, which made a read failure indistinguishable from having nothing to do — and
+/// that is precisely the distinction compare needs, because only one of them means the equality
+/// judgment for that file has been silently downgraded to size and mtime.
+enum HashOutcome {
+    Skipped,
+    Done(String),
+    Failed,
+}
+
 /// The generic scan lane: engine-driven traversal over `read_dir` (pruned subtrees cost
 /// zero round-trips), then a hashing pool sized to the backend's stream budget.
 ///
@@ -50,6 +62,9 @@ pub(super) fn scan_vfs(
         size: u64,
         mt: i64,
         hash: Option<String>,
+        /// Hashing was attempted and failed — not the same fact as `hash: None`, which also means
+        /// "hashing was never requested".
+        hash_failed: bool,
         file_id: Option<String>,
         mode: Option<u32>,
     }
@@ -91,7 +106,7 @@ pub(super) fn scan_vfs(
                 EntryKind::Dir => {
                     let (pass, child_might_match) = opt.filter.pass_dir(&rel);
                     if pass {
-                        entries.push(Entry { path: rel.clone(), kind: EntryKind::Dir, size: 0, mtime_ms: de.meta.mtime_ms, hash: None, file_id: None, mode: None, link: None, prev: None });
+                        entries.push(Entry { path: rel.clone(), kind: EntryKind::Dir, size: 0, mtime_ms: de.meta.mtime_ms, hash: None, hash_failed: false, file_id: None, mode: None, link: None, prev: None });
                     }
                     if pass || child_might_match {
                         stack.push(rel);
@@ -106,7 +121,7 @@ pub(super) fn scan_vfs(
                     }
                     if opt.symlinks_direct {
                         let target = de.meta.link.clone().or_else(|| vfs.read_link(&rel).ok());
-                        entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: de.meta.mtime_ms, hash: None, file_id: None, mode: None, link: target, prev: None });
+                        entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: de.meta.mtime_ms, hash: None, hash_failed: false, file_id: None, mode: None, link: target, prev: None });
                     }
                 }
                 EntryKind::File => {
@@ -129,7 +144,7 @@ pub(super) fn scan_vfs(
                             }
                         }
                     }
-                    pending.push(PendingVfs { rel, size, mt, hash, file_id: de.meta.file_id, mode: de.meta.mode });
+                    pending.push(PendingVfs { rel, size, mt, hash, hash_failed: false, file_id: de.meta.file_id, mode: de.meta.mode });
                     pp.item_done(&pending.last().unwrap().rel);
                 }
             }
@@ -166,7 +181,7 @@ pub(super) fn scan_vfs(
         let width = caps.max_parallel_streams.clamp(1, 4);
         let next = AtomicUsize::new(0);
         let err_count = AtomicU64::new(0);
-        let hashes: Vec<std::sync::OnceLock<Option<String>>> =
+        let hashes: Vec<std::sync::OnceLock<HashOutcome>> =
             pending.iter().map(|_| std::sync::OnceLock::new()).collect();
         std::thread::scope(|sc| {
             for _ in 0..width {
@@ -174,12 +189,12 @@ pub(super) fn scan_vfs(
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(p) = pending.get(i) else { break };
                     if pp.checkpoint().is_err() {
-                        let _ = hashes[i].set(None);
+                        let _ = hashes[i].set(HashOutcome::Skipped);
                         continue; // cancelled: drain the remaining slots empty
                     }
                     if p.hash.is_some() {
                         pp.item_done(&p.rel); // cache hit: nothing to read
-                        let _ = hashes[i].set(None);
+                        let _ = hashes[i].set(HashOutcome::Skipped);
                         continue;
                     }
                     let res = if sampled && p.size >= SAMPLE_MIN {
@@ -189,16 +204,16 @@ pub(super) fn scan_vfs(
                     };
                     match res {
                         Ok(h) => {
-                            let _ = hashes[i].set(Some(h));
+                            let _ = hashes[i].set(HashOutcome::Done(h));
                         }
                         Err(e) if e.kind == VfsErrorKind::Cancelled => {
-                            let _ = hashes[i].set(None);
+                            let _ = hashes[i].set(HashOutcome::Skipped);
                             continue;
                         }
                         Err(e) => {
                             err_count.fetch_add(1, Ordering::Relaxed);
                             pp.error(&p.rel, "hash", side, &e.to_string());
-                            let _ = hashes[i].set(None);
+                            let _ = hashes[i].set(HashOutcome::Failed);
                         }
                     }
                     let eff = effective_read(p.size, sampled);
@@ -209,8 +224,11 @@ pub(super) fn scan_vfs(
         });
         pp.checkpoint()?; // a cancellation during hashing surfaces here, honestly
         for (p, slot) in pending.iter_mut().zip(hashes) {
-            if p.hash.is_none() {
-                p.hash = slot.into_inner().flatten();
+            match slot.into_inner() {
+                Some(HashOutcome::Done(h)) => p.hash = Some(h),
+                Some(HashOutcome::Failed) => p.hash_failed = true,
+                // A cache hit already carries its hash; a cancellation leaves the entry alone.
+                Some(HashOutcome::Skipped) | None => {}
             }
         }
         hash_errors = err_count.load(Ordering::Relaxed);
@@ -219,7 +237,7 @@ pub(super) fn scan_vfs(
     }
 
     for p in pending {
-        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, file_id: p.file_id, mode: p.mode, link: None, prev: None });
+        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, hash_failed: p.hash_failed, file_id: p.file_id, mode: p.mode, link: None, prev: None });
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     if opt.hash {

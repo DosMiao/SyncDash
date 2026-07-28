@@ -93,6 +93,18 @@ pub struct Entry {
     pub mtime_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    /// Content evidence was asked for on this entry and could not be obtained — the file exists but
+    /// could not be read (an ACL, a TCC denial on the file rather than its directory, a share that
+    /// dropped mid-scan).
+    ///
+    /// It cannot be inferred from `hash: None`, which also means "hashing was never requested", and
+    /// the two must not be confused: the first is a degraded judgment, the second is the intended
+    /// one. The header's `hashed` flag records what was *asked for*, so it says `true` for both.
+    /// Without this field a file whose content changed but whose size and mtime were preserved — a
+    /// restore, `touch -r`, an SMB mtime round-trip — was silently declared identical and never
+    /// synced again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hash_failed: bool,
     /// unix: dev:inode; empty on windows for now. Only corroborates same-machine moves; across machines we rely on hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_id: Option<String>,
@@ -202,6 +214,7 @@ mod tests {
             size,
             mtime_ms: 1_700_000_000_000,
             hash: hash.map(String::from),
+            hash_failed: false,
             file_id: None,
             mode: None,
             link: None,

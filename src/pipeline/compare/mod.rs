@@ -26,7 +26,7 @@ use crate::foundation::time::now_ms;
 use crate::model::plan::{Action, Op, Plan, PlanHeader, Side, MTIME_SLACK_MS};
 use crate::model::table::{Entry, EntryKind, Snapshot};
 
-use keys::{files_equal, generation_of, map_of};
+use keys::{evidence_missing, files_equal, generation_of, map_of};
 use moves::{detect_moves, move_reason};
 use winnames::{name_rules_of, win_name_fault, WinNameFault};
 use crate::fs::vfs::NameRules;
@@ -118,7 +118,14 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                 match t_files.get(p) {
                     None => adds.push(se),
                     Some(&te) => {
-                        if !files_equal(se, te, win) && (mode == "mirror" || se.mtime_ms > te.mtime_ms + win) {
+                        // One side's content could not be read, so there is no evidence to judge on.
+                        // Not an Update: that would re-copy this file on every run for as long as
+                        // the read keeps failing, and would silently overwrite the other side on the
+                        // strength of a size-and-mtime guess. Conflicts are never auto-arbitrated
+                        // here, and "I could not look" is exactly that case.
+                        if evidence_missing(se, te) {
+                            ops.push(Op { side: Side::Target, action: Action::Conflict, path: te.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "evidence-unavailable (content unreadable on one side)".into() });
+                        } else if !files_equal(se, te, win) && (mode == "mirror" || se.mtime_ms > te.mtime_ms + win) {
                             let reason = if mode == "mirror" { "differs-master-wins" } else { "source-newer" };
                             // The update writes onto a file that already exists on target: open it with target's own spelling, don't rewrite the other side's form
                             ops.push(Op { side: Side::Target, action: Action::Update, path: te.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: se.hash.clone(), link: None, mode: None, reason: reason.into() });
@@ -167,6 +174,13 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
                 let se = *se;
                 match t_files.get(p) {
                     Some(&te) => {
+                        if evidence_missing(se, te) {
+                            // Same reasoning as the mirror lane: with one side unreadable, neither
+                            // the archive generations nor the mtime tiebreak below are standing on
+                            // anything.
+                            ops.push(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "evidence-unavailable (content unreadable on one side)".into() });
+                            continue;
+                        }
                         if files_equal(se, te, win) {
                             continue;
                         }
@@ -668,7 +682,41 @@ mod tests {
         }
     }
     fn file(path: &str, hash: &str) -> Entry {
-        Entry { path: path.into(), kind: EntryKind::File, size: 1, mtime_ms: 0, hash: Some(hash.into()), file_id: None, mode: None, link: None, prev: None }
+        Entry { path: path.into(), kind: EntryKind::File, size: 1, mtime_ms: 0, hash: Some(hash.into()), hash_failed: false, file_id: None, mode: None, link: None, prev: None }
+    }
+    /// A file whose content could not be read: same size and mtime as its twin, no hash.
+    fn unreadable(path: &str) -> Entry {
+        Entry { hash: None, hash_failed: true, ..file(path, "") }
+    }
+
+    /// The exact shape that used to pass silently: identical size and mtime, no hash on one side
+    /// because the read failed, so `files_equal` fell through to the size+mtime line and declared
+    /// them the same file — forever, since the read keeps failing. A restore, `touch -r`, or an SMB
+    /// mtime round-trip all produce changed content under a preserved size and mtime.
+    #[test]
+    fn an_unreadable_file_is_a_conflict_not_an_equality() {
+        let s = snap("linux", vec![unreadable("a.bin")]);
+        let t = snap("linux", vec![file("a.bin", "deadbeef")]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        let ops: Vec<_> = plan.ops.iter().filter(|o| o.path == "a.bin").collect();
+        assert_eq!(ops.len(), 1, "exactly one op for the pair: {:?}", plan.ops);
+        assert_eq!(ops[0].action, Action::Conflict, "unreadable content must not resolve to equal or to a blind update");
+        assert!(ops[0].reason.contains("evidence-unavailable"), "{}", ops[0].reason);
+    }
+
+    /// The same pair with the read succeeding must go back to being ordinary — the guard must not
+    /// fire on every hashless comparison, only on a failed one.
+    #[test]
+    fn a_hashless_comparison_is_still_judged_on_size_and_mtime() {
+        let bare = |p: &str| Entry { hash: None, hash_failed: false, ..file(p, "") };
+        let s = snap("linux", vec![bare("a.bin")]);
+        let t = snap("linux", vec![bare("a.bin")]);
+        let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+        assert!(
+            !plan.ops.iter().any(|o| o.path == "a.bin"),
+            "equal size and mtime with hashing switched off is equality, not a conflict: {:?}",
+            plan.ops
+        );
     }
     /// A file with an mtime (conflict arbitration goes by mtime)
     fn file_at(path: &str, hash: &str, mtime_ms: i64) -> Entry {
