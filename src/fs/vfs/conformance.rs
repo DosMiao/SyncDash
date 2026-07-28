@@ -201,6 +201,23 @@ fn staged_read_back_returns_written_bytes(v: Arc<dyn Vfs>) {
     w.commit().unwrap();
 }
 
+/// Depth-first delete through the `Vfs` surface itself. Any suite that writes onto someone's real
+/// share has to leave it exactly as it found it; a name that is already gone is a success, not an
+/// error. Shared with the pipeline-level suite in `run::e2e`, which cleans live roots the same way.
+pub fn remove_tree(v: &Arc<dyn Vfs>, rel: &str) -> super::error::VfsResult<()> {
+    let Some(m) = v.stat(rel)? else {
+        return Ok(());
+    };
+    if m.kind == EntryKind::Dir {
+        for (name, _) in v.read_dir_names(rel)? {
+            remove_tree(v, &format!("{rel}/{name}"))?;
+        }
+        v.remove_dir(rel)
+    } else {
+        v.remove_file(rel)
+    }
+}
+
 #[cfg(test)]
 mod suite {
     use super::*;
@@ -259,7 +276,11 @@ mod suite {
         let mut n = 0usize;
         run_all(&mut || {
             n += 1;
-            let d = base.join(format!("conf-{}-{n}", std::process::id()));
+            // Namespaced per suite, not just per process: this and `smb_backend_conforms` point
+            // at the same share and cargo runs them on two threads of one process, so a shared
+            // `conf-<pid>-<n>` had each clearing roots the other had just made. The failure
+            // looked like a backend fault and was a test one.
+            let d = base.join(format!("conf-osroute-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             dirs.push(d.clone());
@@ -314,7 +335,9 @@ mod suite {
         let mut n = 0usize;
         run_all(&mut || {
             n += 1;
-            let name = format!("conf-{}-{n}", std::process::id());
+            // See the note in `os_route_smb_conforms`: both suites share a directory, so each
+            // owns its own prefix rather than racing on one.
+            let name = format!("conf-native-{}-{n}", std::process::id());
             // "Fresh and empty" has to hold even if an earlier run died mid-suite.
             remove_tree(&base, &name).unwrap_or_else(|e| panic!("clearing '{name}': {e}"));
             base.mkdir_all(&name).unwrap_or_else(|e| panic!("creating '{name}': {e}"));
@@ -323,23 +346,6 @@ mod suite {
         });
         for name in roots {
             remove_tree(&base, &name).unwrap_or_else(|e| panic!("cleaning up '{name}': {e}"));
-        }
-    }
-
-    /// Depth-first delete through the `Vfs` surface itself. The suite writes onto someone's
-    /// real share, so it leaves it exactly as it found it; a name that is already gone is a
-    /// success, not an error.
-    fn remove_tree(v: &Arc<dyn Vfs>, rel: &str) -> crate::fs::vfs::error::VfsResult<()> {
-        let Some(m) = v.stat(rel)? else {
-            return Ok(());
-        };
-        if m.kind == EntryKind::Dir {
-            for (name, _) in v.read_dir_names(rel)? {
-                remove_tree(v, &format!("{rel}/{name}"))?;
-            }
-            v.remove_dir(rel)
-        } else {
-            v.remove_file(rel)
         }
     }
 
