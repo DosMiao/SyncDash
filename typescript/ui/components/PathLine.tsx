@@ -94,8 +94,19 @@ function configPills(j: JobFull, presets: JunkPresetDto[]): Pill[] {
         : 'Without an archive, sync mode cannot tell a delete from a file that was never there — deletes and moves are not attributed.',
     });
   }
-  if (j.remote_host) {
-    pills.push({ key: 'Remote', value: `ssh ${j.remote_host}`, group: 'Remote', title: 'The far side runs syncdash over ssh.' });
+  // The link used to live in three job fields; it is in the target phrase now, which the box above
+  // already shows in full. So the pill reports only what the phrase does not make obvious: that
+  // this job pushes to a peer, and whether it declared a mount to pull back through.
+  if (j.target?.startsWith('peer://')) {
+    const mounted = /\|mount=/.test(j.target);
+    pills.push({
+      key: 'Peer',
+      value: mounted ? 'push + pull' : 'push only',
+      group: 'Remote',
+      title: mounted
+        ? 'The far side runs its own syncdash and applies what this side packs. Source-side (pull) ops write through the declared |mount= path.'
+        : 'The far side runs its own syncdash and applies what this side packs. No |mount= is declared, so source-side (pull) ops are skipped — add |mount=<path serving the same tree> to enable them.',
+    });
   }
   return pills;
 }

@@ -78,18 +78,6 @@ symlinks: string,
  */
 versioning: boolean, 
 /**
- * Remote pipeline (optional): once set, run goes over ssh — the remote scans on its own disk (no slow hashing over UNC) plus ship-the-package execution
- */
-remote_host: string | null, 
-/**
- * Remote root path (the remote machine's own local path, e.g. /Users/xxx/Code/...)
- */
-remote_root: string | null, 
-/**
- * Path to the remote syncdash executable (defaults to assuming it is on PATH)
- */
-remote_exe: string | null, 
-/**
  * Require a `.syncdash-root` marker on both roots before touching anything (so an unmounted SMB share isn't treated as an empty directory).
  * Recommended for new jobs; `syncdash mark <root>` writes the marker.
  */

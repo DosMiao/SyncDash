@@ -4,10 +4,15 @@
 //!
 //! ```text
 //! remote := scheme "://" [user "@"] host [":" port] ["/" path] {"|" opt}
-//! scheme := "sftp" | "ftp" | "ftps" | "smb"        (case-insensitive)
+//! scheme := "sftp" | "ftp" | "ftps" | "smb" | "peer"   (case-insensitive)
 //! host   := name | ipv4 | "[" ipv6 "]"
 //! opt    := key ["=" value]
 //! ```
+//!
+//! `peer://` is the odd one: it does not name a protocol this process speaks, it names a machine
+//! running its own syncdash. It lives in the same grammar anyway because it answers the same
+//! question — *where does this root live* — and that question is supposed to have one answer in
+//! one place. It used to have two: this grammar, and a `remote_host` field on the job.
 //!
 //! Everything that is not a known scheme is a local path — with one deliberate
 //! exception: `xyz://` with an *unknown* scheme parses to `UnknownScheme` instead of
@@ -42,7 +47,7 @@ pub struct RemoteSpec {
     pub root: String,
     /// The `|key=value` tail. Flag options carry an empty value. Interpretation is
     /// the backend's business (`timeout=`, `key=`, `agent`, `active`, `insecure_tls`,
-    /// `compress`, `max_conns=`, `no_sample`).
+    /// `compress`, `max_conns=`, `no_sample`; `peer://` reads `exe=` and `mount=`).
     pub options: Vec<(String, String)>,
 }
 
@@ -105,14 +110,31 @@ fn push_host(s: &mut String, host: &str) {
 
 pub fn default_port(scheme: &str) -> u16 {
     match scheme {
-        "sftp" => 22,
+        "sftp" | "peer" => 22,
         "ftp" | "ftps" => 21,
         "smb" => 445,
         _ => 0,
     }
 }
 
-pub const KNOWN_SCHEMES: &[&str] = &["sftp", "ftp", "ftps", "smb"];
+pub const KNOWN_SCHEMES: &[&str] = &["sftp", "ftp", "ftps", "smb", "peer"];
+
+/// Whether this scheme names a root a **peer syncdash** owns rather than one this process reaches.
+///
+/// The distinction is the transport, not the protocol: `sftp://` also travels over ssh, but this
+/// process does the reading and writing. `peer://` means the far side scans its own disk and
+/// applies a package against it.
+pub fn is_peer_scheme(scheme: &str) -> bool {
+    scheme == "peer"
+}
+
+/// Whether a root phrase names a peer root. The one place this question is asked.
+///
+/// It used to be asked of a `remote_host` field on the job instead — a second, unrelated place to
+/// say where a root lives, which `validate_roots` then had to keep from contradicting the phrase.
+pub fn is_peer(phrase: &str) -> bool {
+    matches!(parse(phrase), RootSpec::Remote(r) if is_peer_scheme(&r.scheme))
+}
 
 /// Parse a root phrase. Never fails and never panics: anything unparseable in the
 /// remote grammar still comes back as a representable value, and the error (if it is
@@ -320,5 +342,30 @@ mod tests {
     fn unknown_scheme_is_refused_never_treated_as_local() {
         assert!(matches!(parse("fake://seed1"), RootSpec::UnknownScheme { .. }));
         assert!(matches!(parse("nfs://server/export"), RootSpec::UnknownScheme { .. }));
+    }
+
+    #[test]
+    fn a_peer_phrase_carries_the_whole_link() {
+        let r = remote(r"peer://mac/Users/ben/Code|exe=~/bin/syncdash|mount=\\mac\share\Code");
+        assert_eq!(r.scheme, "peer");
+        assert_eq!(r.host, "mac");
+        assert_eq!(r.root, "Users/ben/Code");
+        assert_eq!(r.opt("exe"), Some("~/bin/syncdash"));
+        // The mount is a Windows path; splitting on '|' before anything else keeps it intact
+        assert_eq!(r.opt("mount"), Some(r"\\mac\share\Code"));
+        // …and no option ever reaches a display string
+        assert_eq!(r.display(), "peer://mac/Users/ben/Code");
+    }
+
+    #[test]
+    fn peer_is_recognized_only_by_its_own_scheme() {
+        assert!(is_peer("peer://mac/Users/ben/x"));
+        assert!(is_peer_scheme("peer"));
+        // sftp also rides ssh, but there this process does the reading and writing
+        assert!(!is_peer("sftp://ben@mac/Users/ben/x"));
+        assert!(!is_peer(r"D:\Code\x"));
+        assert!(!is_peer(r"\\mac\share\x"));
+        // The default port matters: a spelled-out :22 and an implicit one must share a key
+        assert_eq!(remote("peer://mac/x").identity(), remote("peer://mac:22/x/").identity());
     }
 }

@@ -94,10 +94,6 @@ export const ED_FIELDS: FSpec[] = [
   },
   { key: 'deletable', label: 'Deletable', kind: 'lines', desc: 'May be removed along with a deleted parent directory.' },
 
-  { key: 'remote_host', label: 'ssh host alias', kind: 'text', group: 'Remote' },
-  { key: 'remote_root', label: 'Remote root path', kind: 'text' },
-  { key: 'remote_exe', label: 'Remote syncdash path', kind: 'text', desc: 'Empty = found on PATH.' },
-
   { key: 'watch_interval_secs', label: 'Scheduled scan interval', kind: 'num', group: 'Watch', desc: 'Seconds; empty = off. For UNC targets use 30 or more.' },
   { key: 'watch_auto_apply', label: 'Run automatically when differences are found', kind: 'bool' },
 ];
@@ -135,7 +131,7 @@ export function fieldsInGroup(fields: FSpec[], group: string): FSpec[] {
 }
 
 /// Optional fields where an empty string means "unset" rather than "the empty string" (serde Option)
-export const NULLABLE_TEXT = new Set(['archive', 'remote_host', 'remote_root', 'remote_exe']);
+export const NULLABLE_TEXT = new Set(['archive']);
 
 /// Preset → the four detail knobs (aligned word for word with Rust config::rigor_resolved)
 export const RIGOR_PRESETS: Record<string, { evidence: string; use_cache: boolean; escalate: boolean; verify_writes: boolean }> = {

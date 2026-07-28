@@ -136,15 +136,29 @@ pub fn gen_jobs(
             continue;
         }
         let native = crate::foundation::path::to_native(&rel);
+        // target_root may be UNC or posix — join each side with its own separator
+        let mount = if target_root.to_string_lossy().contains('/') && !target_root.to_string_lossy().contains('\\') {
+            format!("{}/{}", target_root.to_string_lossy().trim_end_matches('/'), rel)
+        } else {
+            target_root.join(&native).to_string_lossy().into_owned()
+        };
+        // With a peer, the mount is no longer the target — it is the path the *pull* direction
+        // writes through, and it rides on the phrase where the rest of the link already lives.
+        let target = match remote {
+            Some(r) => {
+                let mut p = format!("peer://{}/{}/{}", r.host, r.root_base.trim_end_matches('/').trim_start_matches('/'), rel);
+                if let Some(exe) = r.exe.as_deref().filter(|e| !e.trim().is_empty()) {
+                    p.push_str(&format!("|exe={exe}"));
+                }
+                p.push_str(&format!("|mount={mount}"));
+                p
+            }
+            None => mount,
+        };
         let job = Job {
             mode: opts.mode.clone(),
             source: source_root.join(&native).to_string_lossy().into_owned(),
-            // target_root may be UNC or posix — join each side with its own separator
-            target: if target_root.to_string_lossy().contains('/') && !target_root.to_string_lossy().contains('\\') {
-                format!("{}/{}", target_root.to_string_lossy().trim_end_matches('/'), rel)
-            } else {
-                target_root.join(&native).to_string_lossy().into_owned()
-            },
+            target,
             archive: if opts.mode == "sync" { Some(opts.archives.join(format!("{name}.jsonl"))) } else { None },
             include: Vec::new(),
             // The seed selection, materialized in full. Every rule this job will act on is a line here —
@@ -156,9 +170,6 @@ pub fn gen_jobs(
             case_sensitive: false,
             symlinks: "exclude".into(),
             versioning: false,
-            remote_host: remote.map(|r| r.host.clone()),
-            remote_root: remote.map(|r| format!("{}/{}", r.root_base.trim_end_matches('/'), rel)),
-            remote_exe: remote.and_then(|r| r.exe.clone()),
             ..Default::default()
         };
         let toml_text = toml::to_string_pretty(&job)

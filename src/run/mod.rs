@@ -35,11 +35,15 @@ pub fn scan_opts(job: &Job) -> scan::ScanOptions {
 }
 /// Whether this job executes on a peer over ssh rather than here.
 ///
-/// The distinction is the *transport*, not the roots: a job whose target is `sftp://` still runs
-/// locally — this process does the reading and writing. A peer job ships a package to another
-/// machine and has it apply the plan against its own disk.
+/// The distinction is the *transport*, not the protocol: a job whose target is `sftp://` still
+/// runs here — this process does the reading and writing. A `peer://` target ships a package to
+/// another machine and has it apply the plan against its own disk.
+///
+/// It reads the target phrase because that is where a root says where it lives. It used to read a
+/// `remote_host` field instead, which meant the same question had two answers and a validation
+/// rule whose only job was to stop them disagreeing.
 pub fn is_peer_job(job: &Job) -> bool {
-    job.remote_host.is_some()
+    crate::fs::vfs::spec::is_peer(&job.target)
 }
 /// The run-log `kind` for this job's compare or apply, so the history reads back correctly.
 pub fn run_kind(job: &Job, verb: &str) -> String {

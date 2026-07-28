@@ -28,7 +28,7 @@ pub enum Cmd {
     Probe,
     /// List job configs (%APPDATA%\syncdash\jobs\*.toml)
     Jobs,
-    /// Run a job: scan both sides → compare → (with --apply) execute + refresh the archive. A job with remote_host set takes the ssh remote pipeline
+    /// Run a job: scan both sides → compare → (with --apply) execute + refresh the archive. A job whose target is a `peer://` root takes the ssh peer pipeline
     Run {
         /// Job name (a filename in the jobs directory) or a toml path; omit it and use --all / --prefix
         job: Option<String>,

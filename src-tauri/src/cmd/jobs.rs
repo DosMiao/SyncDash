@@ -17,7 +17,6 @@ pub fn list_jobs() -> Vec<JobDto> {
             target: j.target.clone(),
             has_archive: j.archive.is_some(),
             remote: run::is_peer_job(&j),
-            remote_host: j.remote_host.clone(),
             versioning: j.versioning,
             delta: j.delta,
             parallel: j.parallel,

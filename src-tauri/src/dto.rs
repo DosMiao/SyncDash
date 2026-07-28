@@ -15,9 +15,10 @@ pub(crate) struct JobDto {
     pub(crate) source: String,
     pub(crate) target: String,
     pub(crate) has_archive: bool,
-    // v0.9 M3: fill in the fields the frontend needs to see (remote badge / versioning marker / filter hints)
+    // v0.9 M3: fill in the fields the frontend needs to see (remote badge / versioning marker / filter hints).
+    // The host is not among them: it lives in `target` now (`peer://<host>/…`), and shipping a second
+    // copy is how the frontend ends up rendering a stale one.
     pub(crate) remote: bool,
-    pub(crate) remote_host: Option<String>,
     pub(crate) versioning: bool,
     pub(crate) delta: bool,
     #[ts(type = "number | null")]

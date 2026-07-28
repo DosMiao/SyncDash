@@ -83,23 +83,47 @@ pub struct RemoteLink {
     pub host: String,
     pub exe: String,
     pub rroot: String,
+    /// A local path serving the *same* tree the peer syncs — the `|mount=` option.
+    ///
+    /// The peer lane pushes: it packs the target-side ops and the far side applies them. The
+    /// reverse (source-side) direction has nothing to push, so it writes through this mount
+    /// instead. It is an option on the phrase rather than an assumption because a peer job used
+    /// to depend on it silently: the mount lived in `target` alongside an unrelated
+    /// `remote_root`, nothing said the two named one tree, and a missing mount skipped those ops
+    /// with a warning nobody had a reason to expect.
+    pub mount: Option<std::path::PathBuf>,
     pub shell: crate::transfer::remote::RemoteShell,
 }
+
+/// Pull the link out of a `peer://` target phrase.
+fn link_of(job: &Job) -> std::io::Result<(String, String, String, Option<std::path::PathBuf>)> {
+    use crate::fs::vfs::spec::{parse, RootSpec};
+    let bad = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, m);
+    let RootSpec::Remote(r) = parse(&job.target) else {
+        return Err(bad(format!("target '{}' is not a peer:// root", job.target)));
+    };
+    if r.root.is_empty() {
+        return Err(bad(format!(
+            "target '{}' names no path on {} — a peer root needs one (peer://{}/path/to/tree)",
+            job.target, r.host, r.host
+        )));
+    }
+    Ok((
+        r.host.clone(),
+        r.opt("exe").filter(|e| !e.is_empty()).unwrap_or("syncdash").to_string(),
+        r.root.clone(),
+        r.opt("mount").filter(|m| !m.is_empty()).map(std::path::PathBuf::from),
+    ))
+}
+
 /// Stage 1: probe reachability + schema agreement + the remote OS (which decides the shell dialect).
 ///
 /// It takes `ctx` for the sake of the schema-mismatch warning: that one has to reach the UI **during compare**.
 /// Going through the macro and the global registry, no sink is installed during compare (only apply starts a Recorder),
 /// so this line in particular would fall back to stderr — which in a windowed desktop build is the same as saying nothing.
 pub fn probe_remote(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<RemoteLink> {
-    let host = job
-        .remote_host
-        .as_deref()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "remote_host not set"))?;
-    let exe = job.remote_exe.as_deref().unwrap_or("syncdash");
-    let rroot = job
-        .remote_root
-        .as_deref()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "remote_root required for remote jobs"))?;
+    let (host, exe, rroot, mount) = link_of(job)?;
+    let (host, exe, rroot) = (host.as_str(), exe.as_str(), rroot.as_str());
     let probe = crate::transfer::remote::ssh_capture(host, &format!("{exe} probe"))?;
     let pv: serde_json::Value = serde_json::from_slice(&probe)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad probe output: {e}")))?;
@@ -124,6 +148,7 @@ pub fn probe_remote(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -
         host: host.to_string(),
         exe: exe.to_string(),
         rroot: rroot.to_string(),
+        mount,
         shell: crate::transfer::remote::RemoteShell::from_os(&remote_os),
     })
 }
@@ -368,7 +393,10 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         }
     }
 
-    // 5) Source side (sync's pull-back direction): read the remote content straight through the mounted path; if it is unreachable, skip and say why
+    // 5) Source side (sync's pull direction). The peer lane only pushes — it packs ops for the far
+    // side to apply — so a pull has to read the remote tree through a mount of it, named by
+    // `|mount=` on the phrase. No mount means the job never had a pull path; say so plainly
+    // rather than reporting ops as skipped for a reason the config does not mention.
     let src_ops: Vec<Op> = plan
         .ops
         .iter()
@@ -376,29 +404,44 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         .cloned()
         .collect();
     if !src_ops.is_empty() {
-        if job.target_path().is_dir() {
-            let out = crate::pipeline::apply::apply_with(
-                &src_ops,
-                job.source_path(),
-                job.target_path(),
-                &job.apply_opts(None, verbose),
-                ctx,
-            );
-            done += out.done;
-            skipped += out.skipped;
-            errors += out.errors;
-            bytes_done_total += out.bytes_copied;
-        } else {
-            skipped += src_ops.len() as u64;
-            ctx.log(
-                crate::model::event::LogLevel::Warn,
-                "remote",
-                format!(
-                    "[{name}] {} source-side op(s) skipped: mounted target '{}' not accessible (pull direction needs the SMB mount)",
-                    src_ops.len(),
-                    job.target
-                ),
-            );
+        match link.mount.as_deref() {
+            Some(m) if m.is_dir() => {
+                let out = crate::pipeline::apply::apply_with(
+                    &src_ops,
+                    job.source_path(),
+                    m,
+                    &job.apply_opts(None, verbose),
+                    ctx,
+                );
+                done += out.done;
+                skipped += out.skipped;
+                errors += out.errors;
+                bytes_done_total += out.bytes_copied;
+            }
+            Some(m) => {
+                skipped += src_ops.len() as u64;
+                ctx.log(
+                    crate::model::event::LogLevel::Warn,
+                    "remote",
+                    format!(
+                        "[{name}] {} pull op(s) skipped: the declared mount '{}' is not reachable — check the share, or drop |mount= if this job only pushes",
+                        src_ops.len(),
+                        m.display()
+                    ),
+                );
+            }
+            None => {
+                skipped += src_ops.len() as u64;
+                ctx.log(
+                    crate::model::event::LogLevel::Warn,
+                    "remote",
+                    format!(
+                        "[{name}] {} pull op(s) skipped: '{}' declares no |mount=, and the peer lane cannot pull without one (add |mount=<path serving the same tree>)",
+                        src_ops.len(),
+                        job.target
+                    ),
+                );
+            }
         }
     }
 

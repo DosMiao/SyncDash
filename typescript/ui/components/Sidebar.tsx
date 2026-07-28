@@ -41,7 +41,7 @@ export function Sidebar(props: Props) {
           <div
             key={j.name}
             className={'job' + (currentName === j.name ? ' active' : '')}
-            title={`${j.source}\n→ ${j.target}` + (j.remote ? `\nssh:${j.remote_host ?? ''}` : '')}
+            title={`${j.source}\n→ ${j.target}` + (j.remote ? '\n(applied by a peer syncdash over ssh)' : '')}
             onClick={() => { if (!busy) onSelect(j); }}
           >
             <div className="jrow1">

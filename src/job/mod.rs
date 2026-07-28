@@ -79,15 +79,6 @@ pub struct Job {
     /// paired with `syncdash versions` / `syncdash restore` to browse and recover; false uses the local trash
     #[serde(default)]
     pub versioning: bool,
-    /// Remote pipeline (optional): once set, run goes over ssh — the remote scans on its own disk (no slow hashing over UNC) plus ship-the-package execution
-    #[serde(default)]
-    pub remote_host: Option<String>,
-    /// Remote root path (the remote machine's own local path, e.g. /Users/xxx/Code/...)
-    #[serde(default)]
-    pub remote_root: Option<String>,
-    /// Path to the remote syncdash executable (defaults to assuming it is on PATH)
-    #[serde(default)]
-    pub remote_exe: Option<String>,
 
     // v0.9 safety nets and new capabilities
     /// Require a `.syncdash-root` marker on both roots before touching anything (so an unmounted SMB share isn't treated as an empty directory).
@@ -160,9 +151,6 @@ impl Default for Job {
             case_sensitive: false,
             symlinks: default_symlinks(),
             versioning: false,
-            remote_host: None,
-            remote_root: None,
-            remote_exe: None,
             require_marker: false,
             min_free_pct: default_min_free(),
             max_delete_ratio: default_max_delete_ratio(),
@@ -185,7 +173,7 @@ fn default_true() -> bool {
 /// Current job-file schema. Bump when a load-time migration is added, and give the migration a
 /// `schema < N` guard — the version is what tells "the user deleted this rule" apart from
 /// "this file predates the rule", which no amount of inspecting the contents can.
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 fn default_schema() -> u32 {
     1 // no `schema` key in the file = written before versioning existed = needs the v1 migration
 }
@@ -228,37 +216,41 @@ impl Job {
             if self.mode == "sync" {
                 return Err("sync mode does not support multiple targets (N-way merge needs version-vector attribution) — use paired sync jobs instead (hub-and-spoke)".into());
             }
-            if self.remote_host.is_some() {
-                return Err("ssh-peer jobs do not support multiple targets yet".into());
+            if self.target_list().iter().any(|t| crate::fs::vfs::spec::is_peer(t)) {
+                return Err("peer:// targets do not support multiple targets yet".into());
             }
         }
         self.validate_roots()
     }
 
-    /// Root-phrase sanity: unknown `xyz://` schemes are refused (never silently local),
-    /// and a VFS root cannot be combined with the ssh smart-peer pipeline — they are
-    /// different transports and mixing them would leave it ambiguous who owns the target.
+    /// Root-phrase sanity: unknown `xyz://` schemes are refused, never silently treated as a local
+    /// path, and a peer root may only be the target.
+    ///
+    /// There used to be a second rule here — a `scheme://` root could not be combined with the ssh
+    /// peer pipeline, because "where the target lives" was answered in two unrelated places and
+    /// nothing said which won. With `peer://` in the grammar there is one answer, so there is
+    /// nothing left to keep apart.
     pub fn validate_roots(&self) -> Result<(), String> {
-        use crate::fs::vfs::spec::{parse, RootSpec};
-        let mut any_remote = false;
+        use crate::fs::vfs::spec::{is_peer, parse, RootSpec, KNOWN_SCHEMES};
         for (label, s) in std::iter::once(("source", &self.source))
             .chain(std::iter::once(("target", &self.target)))
             .chain(self.targets.iter().map(|t| ("targets", t)))
         {
-            match parse(s) {
-                RootSpec::UnknownScheme { scheme, .. } => {
-                    return Err(format!(
-                        "{label} '{s}': unknown scheme '{scheme}://' — refusing to treat it as a local path (known: sftp, ftp, ftps, smb)"
-                    ));
-                }
-                RootSpec::Remote(_) => any_remote = true,
-                RootSpec::Local(_) => {}
+            if let RootSpec::UnknownScheme { scheme, .. } = parse(s) {
+                return Err(format!(
+                    "{label} '{s}': unknown scheme '{scheme}://' — refusing to treat it as a local path (known: {})",
+                    KNOWN_SCHEMES.join(", ")
+                ));
             }
         }
-        if any_remote && self.remote_host.is_some() {
-            return Err(
-                "a job cannot use both a VFS root (scheme:// phrase) and the ssh smart-peer pipeline (remote_host) — pick one transport".into(),
-            );
+        // The peer lane is directional by construction: this side builds a package and the far
+        // side applies it. A peer *source* would mean asking it to send one back, which nothing
+        // implements — better a clear error than a run that reads an empty tree.
+        if is_peer(&self.source) {
+            return Err(format!(
+                "source '{}': a peer root can only be the target — this side packs, the far side applies",
+                self.source
+            ));
         }
         Ok(())
     }
@@ -400,9 +392,16 @@ pub fn load(name_or_path: &str) -> std::io::Result<(String, Job)> {
     let text = std::fs::read_to_string(&path)?;
     let mut job: Job = toml::from_str(&text)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad job file {}: {e}", path.display())))?;
-    if job.schema < SCHEMA {
+    // Each migration guards its own version and none of them stamps `schema`; the stamp happens
+    // once, here, after the last one. A migration that stamped SCHEMA itself would skip every
+    // later migration the moment one was added.
+    if job.schema < 2 {
         migrate_v1_junk_presets(&mut job, &text);
     }
+    if job.schema < 3 {
+        migrate_v2_peer_target(&mut job, &text);
+    }
+    job.schema = SCHEMA;
     Ok((name, job))
 }
 
@@ -448,7 +447,47 @@ fn migrate_v1_junk_presets(job: &mut Job, text: &str) {
     merged.retain(|p| !job.exclude.iter().any(|e| same_exclude_entry(e, p)));
     merged.append(&mut job.exclude);
     job.exclude = merged;
-    job.schema = SCHEMA;
+}
+
+/// The keys a v2 job file used to name a peer. Read once, on load, and never written again.
+#[derive(Deserialize)]
+struct LegacyPeerKeys {
+    #[serde(default)]
+    remote_host: Option<String>,
+    #[serde(default)]
+    remote_root: Option<String>,
+    #[serde(default)]
+    remote_exe: Option<String>,
+}
+
+/// v2 → v3: the peer moves out of three flat fields and into the target phrase.
+///
+/// A v2 peer job carried **two** roots and said so nowhere: `remote_root` was the path the far
+/// side syncs, while `target` was an SMB mount of that same tree, which the reverse (source-side)
+/// direction wrote through. Nothing declared that dependency and nothing checked it — a missing
+/// mount just skipped those ops with a warning.
+///
+/// So the migration carries both across rather than dropping one: the peer path becomes the
+/// phrase, and the old `target` becomes `|mount=`, where it is visible and can be validated. That
+/// keeps a migrated job doing exactly what it did before, which is the whole bar for a migration —
+/// quietly losing the pull direction would be a data-flow change disguised as a rename.
+fn migrate_v2_peer_target(job: &mut Job, text: &str) {
+    let Ok(legacy) = toml::from_str::<LegacyPeerKeys>(text) else { return };
+    let Some(host) = legacy.remote_host.filter(|h| !h.trim().is_empty()) else { return };
+    let mut phrase = format!(
+        "peer://{}/{}",
+        host.trim(),
+        legacy.remote_root.unwrap_or_default().trim().replace('\\', "/").trim_matches('/')
+    );
+    if let Some(exe) = legacy.remote_exe.filter(|e| !e.trim().is_empty()) {
+        phrase.push_str(&format!("|exe={}", exe.trim()));
+    }
+    // The old target was the mount the pull direction used. An empty one means there was never a
+    // pull path, so there is nothing to declare.
+    if !job.target.trim().is_empty() {
+        phrase.push_str(&format!("|mount={}", job.target.trim()));
+    }
+    job.target = phrase;
 }
 
 pub fn load_all() -> Vec<(String, Job)> {
@@ -533,10 +572,14 @@ target = '\\host\share\dir'
 # watch_interval_secs = 30              # compare automatically every N seconds; the hash cache means an unchanged tree only pays the walk
 # watch_auto_apply = false              # apply automatically on differences (notify only by default)
 #
-# Remote pipeline (optional): the remote scans on its own disk (fast), the target side is packed and shipped over ssh to execute
-# remote_host = 'mac'
-# remote_root = '/Users/xxx/Code/some/dir'
-# remote_exe = '~/Code/Utilities/SyncDash/target/release/syncdash'
+# --- peer targets (optional) ---
+# A `peer://` target means the far side runs its own syncdash: it scans its own disk (no hashing
+# over a share) and applies a package this side builds. The whole link is in the phrase.
+# target = 'peer://mac/Users/xxx/Code/some/dir|exe=~/Code/SyncDash/target/release/syncdash|mount=\\mac\share\some\dir'
+#   exe=    path to syncdash on the far side; omit if it is on PATH
+#   mount=  a local path serving the SAME tree. The peer lane only pushes, so the pull (source-side)
+#           direction writes through this instead. Omit it and a job that only pushes is unaffected;
+#           pull ops are then skipped with a message saying no mount was declared.
 "#;
 
 /// The v1 → v2 migration. Its one job is to be a **behavioural no-op**: whatever a job file used to
@@ -611,6 +654,64 @@ mod migration_tests {
         assert!(j.exclude.is_empty(), "an empty exclude in a v2 file means empty");
     }
 
+    /// v2 → v3 must keep a peer job doing exactly what it did. The subtle half is `mount=`: a v2
+    /// peer job carried two roots — `remote_root` for the peer, and `target` as an SMB mount of
+    /// the same tree that the pull direction wrote through — and declared neither relationship.
+    /// Dropping the mount would silently turn a two-way job into a push-only one.
+    #[test]
+    fn a_v2_peer_job_migrates_into_one_phrase_without_losing_the_pull_path() {
+        let j = load_text(
+            "v2-peer",
+            "schema = 2\nmode = 'sync'\nsource = 'D:\\Code\\x'\ntarget = '\\\\mac\\share\\x'\n\
+             remote_host = 'mac'\nremote_root = '/Users/ben/Code/x'\nremote_exe = '~/bin/syncdash'\n",
+        );
+        assert_eq!(j.schema, SCHEMA);
+        assert_eq!(j.target, r"peer://mac/Users/ben/Code/x|exe=~/bin/syncdash|mount=\\mac\share\x");
+        // …and it still routes to the peer lane, which is the behaviour that must not change
+        assert!(crate::fs::vfs::spec::is_peer(&j.target));
+        let crate::fs::vfs::spec::RootSpec::Remote(r) = crate::fs::vfs::spec::parse(&j.target) else {
+            panic!("a migrated peer target must parse as a remote root")
+        };
+        assert_eq!(r.host, "mac");
+        assert_eq!(r.root, "Users/ben/Code/x");
+        assert_eq!(r.opt("exe"), Some("~/bin/syncdash"));
+        assert_eq!(r.opt("mount"), Some(r"\\mac\share\x"));
+    }
+
+    #[test]
+    fn a_peer_job_without_an_exe_or_a_mount_migrates_to_the_bare_phrase() {
+        let j = load_text(
+            "v2-peer-bare",
+            "schema = 2\nmode = 'mirror'\nsource = 'D:\\Code\\x'\ntarget = ''\n\
+             remote_host = 'mac'\nremote_root = '/Users/ben/x'\n",
+        );
+        assert_eq!(j.target, "peer://mac/Users/ben/x", "no exe and no mount = nothing to declare");
+    }
+
+    /// A v2 job with no peer keeps its target untouched — the migration must not touch the
+    /// overwhelming majority of jobs, which are plain local-to-local.
+    #[test]
+    fn a_v2_job_without_a_peer_keeps_its_target() {
+        let j = load_text("v2-nopeer", "schema = 2\nmode = 'mirror'\nsource = 'S'\ntarget = 'T'\n");
+        assert_eq!(j.target, "T");
+        assert!(!crate::fs::vfs::spec::is_peer(&j.target));
+    }
+
+    /// A v1 peer job has to pass through BOTH migrations. This is what the per-version guards buy:
+    /// the junk migration used to stamp `SCHEMA` itself, which would now carry a v1 file straight
+    /// past the peer migration and leave it with a target nothing routes.
+    #[test]
+    fn a_v1_peer_job_runs_every_migration_in_order() {
+        let j = load_text(
+            "v1-peer",
+            "mode = 'mirror'\nsource = 'S'\ntarget = 'T'\nos_excludes = 'windows'\n\
+             remote_host = 'mac'\nremote_root = '/Users/ben/x'\n",
+        );
+        assert_eq!(j.schema, SCHEMA);
+        assert_eq!(j.exclude, expand_junk_presets(["windows"]), "the v1 junk migration still ran");
+        assert_eq!(j.target, "peer://mac/Users/ben/x|mount=T", "…and so did the v2 one");
+    }
+
     /// A Job built in memory and written straight to TOML — which is what `gen-jobs` does, bypassing
     /// `save_job` — must come back exactly as written. It did not: `Job::default()` stamped the *legacy*
     /// schema, so every generated job was re-migrated on load and quietly grew preset patterns its author
@@ -638,7 +739,7 @@ mod migration_tests {
     fn saving_stamps_the_current_schema() {
         let stale = Job { schema: 1, exclude: vec!["*/mine/".into()], ..Default::default() };
         let text = toml::to_string_pretty(&Job { schema: SCHEMA, ..stale.clone() }).unwrap();
-        assert!(text.contains("schema = 2"));
+        assert!(text.contains(&format!("schema = {SCHEMA}")));
         // …and the migration would have fired on the stale one, which is exactly what stamping prevents
         let j = load_text("stale", &format!("schema = 1\n{HEAD}exclude = ['*/mine/']\n"));
         assert!(j.exclude.len() > 1, "premise: schema 1 does trigger the migration");
@@ -655,14 +756,20 @@ mod migration_tests {
             p
         };
 
-        // A v1 file: on disk it is 1, while the job load hands back is already migrated to 2
+        // A v1 file: on disk it is 1, while the job load hands back is already migrated to current
         let p = write("v1", &format!("{HEAD}os_excludes = 'auto'\n"));
         assert_eq!(file_schema(&p.to_string_lossy()).unwrap(), 1, "no schema key = v1");
         assert_eq!(load(&p.to_string_lossy()).unwrap().1.schema, SCHEMA, "…but the loaded job is migrated");
         let _ = std::fs::remove_file(&p);
 
-        // A v2 file says so, and there is nothing to announce
+        // An intermediate version reports itself, not the version it will become on load
         let p = write("v2", &format!("schema = 2\n{HEAD}"));
+        assert_eq!(file_schema(&p.to_string_lossy()).unwrap(), 2);
+        assert_eq!(load(&p.to_string_lossy()).unwrap().1.schema, SCHEMA);
+        let _ = std::fs::remove_file(&p);
+
+        // A current file says so, and there is nothing to announce
+        let p = write("cur", &format!("schema = {SCHEMA}\n{HEAD}"));
         assert_eq!(file_schema(&p.to_string_lossy()).unwrap(), SCHEMA);
         let _ = std::fs::remove_file(&p);
 
