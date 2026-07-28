@@ -13,7 +13,11 @@
 //! - MFMT is FEAT-gated. Without it mtimes cannot be set — the P1-4 correction table
 //!   absorbs that for compare, but the root-lock heartbeat also rides set_mtime, so
 //!   the write side refuses without MFMT (a Block naming the reason);
-//! - one control connection, operations serialized (`max_parallel_streams = 1`).
+//! - one control connection, operations serialized (`max_parallel_streams = 1`) — and the apply
+//!   lane clamps to that, because a second concurrent transfer here does not queue, it fails;
+//! - **no ranged reads, whatever FEAT says about REST.** Nothing in FTP ends a partial transfer
+//!   cleanly, and the unread completion reply desynchronizes the one control channel — so sampled
+//!   evidence is declined and both sides of a comparison read whole files instead.
 //!
 //! `ftps://` upgrades the control connection with AUTH TLS before the login goes out (explicit
 //! FTPS, not the deprecated implicit kind on port 990). Certificates are checked against the
@@ -98,9 +102,6 @@ impl Stream {
     pub(super) fn mlsd(&mut self, p: Option<&str>) -> Result<Vec<String>, FtpError> {
         fwd!(self, mlsd, p)
     }
-    pub(super) fn resume_transfer(&mut self, offset: usize) -> Result<(), FtpError> {
-        fwd!(self, resume_transfer, offset)
-    }
     /// Boxed because the concrete `DataStream<T>` differs per arm — the same erasure
     /// `staged.rs` already relies on.
     pub(super) fn retr_as_stream(&mut self, p: &str) -> Result<Box<dyn Read + Send>, FtpError> {
@@ -165,6 +166,40 @@ impl Stream {
 ///
 /// No `insecure_tls` escape hatch: a flag that turns verification off is a flag that ends up set.
 /// A certificate this refuses is a certificate to install, and the error says which.
+/// An AUTH TLS failure, told as something the operator can act on.
+///
+/// Two things the generic mapper gets wrong here. A refused certificate is not `Transient` — it
+/// will be refused identically on every retry until somebody installs something, so it belongs
+/// with a refused password under `Auth`. And `tls_connector` above promises that "a certificate
+/// this refuses is a certificate to install, and the error says which"; rustls reports the
+/// *reason* but hands back no chain to print, so the message carries the command that shows the
+/// operator the exact certificate being refused. Naming the remedy is what makes having no
+/// `insecure_tls` flag a reasonable position rather than a dead end.
+fn map_tls_err(host: &str, port: u16, e: FtpError) -> VfsError {
+    let text = e.to_string();
+    if !text.contains("invalid peer certificate") && !text.contains("CertificateError") {
+        return map_ftp_err("AUTH TLS", e);
+    }
+    let why = if text.contains("UnknownIssuer") {
+        "signed by an issuer this machine does not trust"
+    } else if text.contains("Expired") {
+        "that has expired"
+    } else if text.contains("NotValidForName") {
+        "that is not valid for this host"
+    } else {
+        "this machine's trust store will not accept"
+    };
+    VfsError::new(
+        VfsErrorKind::Auth,
+        format!(
+            "ftps://{host}:{port} presented a certificate {why} ({text}). There is deliberately no \
+             flag to skip verification — install the issuing certificate into this machine's trust \
+             store instead, where you can see it and revoke it. To read the certificate being \
+             refused: openssl s_client -starttls ftp -connect {host}:{port} -showcerts"
+        ),
+    )
+}
+
 fn tls_connector() -> VfsResult<suppaftp::RustlsConnector> {
     let mut roots = rustls::RootCertStore::empty();
     let loaded = rustls_native_certs::load_native_certs();
@@ -339,11 +374,19 @@ impl Vfs for FtpBackend {
             fsync: Support::No,
             rename: Support::Yes,
             rename_overwrite: Support::Unknown, // varies by server; the engine clears targets anyway
-            ranged_read: match f {
-                Some(f) if f.rest => Support::Yes,
-                Some(_) => Support::No,
-                None => Support::Unknown,
-            },
+            // REST positions a transfer, but nothing in FTP *ends* one early and cleanly: the
+            // client has to stop a RETR it no longer wants, and servers disagree about the reply.
+            // Verified against pyftpdlib: both ABOR and closing the data socket leave a response
+            // the client does not consume, and the next command receives it instead — a `stat`
+            // answered "350 Restarting at position 0" from two calls earlier. On a single control
+            // connection there is nowhere for that confusion to be contained, and every answer
+            // afterwards decides whether a file gets deleted.
+            //
+            // So this says No rather than "Yes, usually". The joint-tier rule then reads both sides
+            // in full, which is slower and correct, and the caps report says so out loud. Declaring
+            // a capability the backend cannot honour is the worse failure: it degrades evidence
+            // quietly, on exactly the large files sampling exists for.
+            ranged_read: Support::No,
             write_at: Support::No,
             unix_mode: Support::No,
             symlink: Support::No, // reading them in listings works; creating them does not
@@ -369,11 +412,14 @@ impl Vfs for FtpBackend {
 
     fn server_info(&self) -> Option<String> {
         self.feats.get().map(|f| {
+            // REST is reported because it is what the server said, not because this backend uses
+            // it: ranged reads are declined regardless (see `read_range`), so it is a fact about
+            // the server, never a promise about the evidence tier.
             format!(
-                "ftp, MLSD:{} MFMT:{} REST:{}",
+                "ftp, MLSD:{} MFMT:{} REST:{} (unused)",
                 if f.mlsd { "yes" } else { "NO (minute-precision LIST)" },
                 if f.mfmt { "yes" } else { "NO (mtimes cannot be set)" },
-                if f.rest { "yes" } else { "NO (no sampled evidence)" },
+                if f.rest { "yes" } else { "no" },
             )
         })
     }
@@ -425,7 +471,7 @@ impl Vfs for FtpBackend {
                 .map_err(|e| map_ftp_err("connect", e))?;
             Stream::Tls(Box::new(
                 s.into_secure(tls_connector()?, &self.spec.host)
-                    .map_err(|e| map_ftp_err("AUTH TLS", e))?,
+                    .map_err(|e| map_tls_err(&self.spec.host, port, e))?,
             ))
         } else {
             Stream::Plain(
@@ -506,34 +552,24 @@ impl Vfs for FtpBackend {
         Ok(Box::new(FtpRead { conn: self.conn.clone(), data: Some(Box::new(data)), finished: false }))
     }
 
-    fn read_range(&self, rel: &str, off: u64, len: u32) -> VfsResult<Vec<u8>> {
-        if !self.feats.get().map(|f| f.rest).unwrap_or(false) {
-            return Err(VfsError::unsupported("this server advertises no REST — no ranged reads"));
-        }
-        let abs = self.abs(rel);
-        let mut data = self.with_conn("read_range", |c| {
-            c.stream.resume_transfer(off as usize)?;
-            c.stream.retr_as_stream(&abs)
-        })?;
-        let mut buf = vec![0u8; len as usize];
-        let mut got = 0usize;
-        let read_res = loop {
-            match data.read(&mut buf[got..]) {
-                Ok(0) => break Ok(()),
-                Ok(n) => {
-                    got += n;
-                    if got == buf.len() {
-                        break Ok(());
-                    }
-                }
-                Err(e) => break Err(e),
-            }
-        };
-        // Abort the transfer (we rarely want the tail) — ABOR also resets REST state
-        let _ = self.with_conn("abort ranged read", |c| c.stream.abort(data));
-        read_res.map_err(|e| VfsError::new(VfsErrorKind::Transient, format!("ranged read failed: {e}")))?;
-        buf.truncate(got);
-        Ok(buf)
+    /// Refused, and `caps().ranged_read` says so before anyone asks.
+    ///
+    /// REST positions a transfer; what FTP has no clean answer for is *ending* one the client no
+    /// longer wants. Verified against a live pyftpdlib: ABOR after the server's send had finished
+    /// drew "225 No transfer to abort", and closing the data socket instead left the completion
+    /// reply unread — either way a response stays queued on the control channel and the next
+    /// command receives it. A `stat` came back "350 Restarting at position 0", the REST reply from
+    /// two calls earlier. One control connection has nowhere to put that confusion, and every
+    /// answer on it decides whether a file gets deleted.
+    ///
+    /// The window-fetching implementation is in git history at the commit that retired it. It is
+    /// not kept here behind a flag: an unreachable partial implementation is the thing a later
+    /// reader flips back on without knowing what it cost.
+    fn read_range(&self, _rel: &str, _off: u64, _len: u32) -> VfsResult<Vec<u8>> {
+        Err(VfsError::unsupported(
+            "FTP cannot end a partial transfer without desynchronizing its control connection — \
+             this backend reads whole files instead (caps.ranged_read = No)",
+        ))
     }
 
     fn read_link(&self, rel: &str) -> VfsResult<String> {
