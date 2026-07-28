@@ -12,6 +12,16 @@ use serde::{Deserialize, Serialize};
 
 pub const MTIME_SLACK_MS: i64 = 2000;
 
+/// The plan file format's own version, distinct from `table::SCHEMA` — a plan and a snapshot are
+/// different artifacts and have no reason to move together. The header carried the table's number
+/// for want of one of its own, and nothing read it back, so the field was decoration.
+///
+/// **2**: `Op` gained fields that a reader cannot invent. Bumped rather than defaulted because a
+/// plan is *derived* data — re-running Compare reproduces it — so refusing an older one costs a
+/// keystroke, while quietly defaulting a missing field would let a plan execute under an assumption
+/// its author never made. A job file is the opposite case, and gets a real migration.
+pub const PLAN_SCHEMA: u32 = 2;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "snake_case")]
@@ -146,6 +156,19 @@ impl Plan {
         let head = lines.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty plan"))??;
         let header: PlanHeader = serde_json::from_str(&head)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad plan header: {e}")))?;
+        // Read the version before the ops, so an older plan is named as an older plan instead of
+        // failing later as "bad op: missing field ..." — the same bytes, but one of those messages
+        // reads as corruption and sends the user looking for a damaged file.
+        if header.schema != PLAN_SCHEMA {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "this plan is format version {} and this build writes {PLAN_SCHEMA} — re-run Compare to produce a current one \
+                     (a plan is derived from the two roots, so nothing is lost by regenerating it)",
+                    header.schema
+                ),
+            ));
+        }
         let mut ops = Vec::new();
         for line in lines {
             let line = line?;
@@ -161,9 +184,27 @@ impl Plan {
 mod tests {
     use super::*;
 
+    /// A plan written by an older build must be named as such, not decoded as far as its first
+    /// missing field. Both messages come from the same bytes, but "bad op: missing field" reads as
+    /// corruption and sends the user looking for a damaged file.
+    #[test]
+    fn an_older_plan_is_refused_by_version_not_by_a_parse_error() {
+        let mut buf = Vec::new();
+        let mut p = Plan { header: header(1), ops: vec![] };
+        p.header.schema = PLAN_SCHEMA - 1;
+        p.write_to(&mut buf).unwrap();
+        let e = match Plan::from_reader(std::io::BufReader::new(&buf[..])) {
+            Err(e) => e,
+            Ok(_) => panic!("a plan from an older format must not load"),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("format version"), "{msg}");
+        assert!(msg.contains("re-run Compare"), "the message has to carry the remedy: {msg}");
+    }
+
     fn header(ops: usize) -> PlanHeader {
         PlanHeader {
-            schema: 1,
+            schema: PLAN_SCHEMA,
             kind: "plan".into(),
             mode: "mirror".into(),
             generated_at_ms: 1_700_000_000_000,

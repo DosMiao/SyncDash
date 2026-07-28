@@ -636,7 +636,7 @@ pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option
     let conflict_count = ops.iter().filter(|o| o.action == Action::Conflict).count() as u64;
     Plan {
         header: PlanHeader {
-            schema: crate::model::table::SCHEMA,
+            schema: crate::model::plan::PLAN_SCHEMA,
             kind: "plan".into(),
             mode: mode.into(),
             generated_at_ms: now_ms(),

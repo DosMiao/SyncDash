@@ -1,8 +1,13 @@
 //! The read-only layer the desktop reads: per-row measurements, the paged "identical items" view,
 //! and the reverse of an op for the UI's direction flip.
 //!
-//! Explicitly not part of the decision. `compare()` never calls into this module — everything here
-//! describes a plan that already exists, so a change in this file cannot change what a sync does.
+//! `compare()` never calls into this module, and `evidence()` / `same_page()` only describe a plan
+//! that already exists — neither can change what a sync does.
+//!
+//! `reverse_op` is the exception, and the header used to claim otherwise. Its output is not a
+//! description: `cmd::run` precomputes it into the DTO, and when the user flips a row the frontend
+//! builds the apply payload from the reversed op. A field dropped there is a field dropped from a
+//! write. That mistaken "this file is inert" line is why it went unexamined.
 
 
 use serde::{Deserialize, Serialize};
@@ -154,48 +159,36 @@ pub fn same_page(
 /// - Reverse of Copy: instead of pushing the file over, delete the "extra" one (the side that has it falls in line with the side that lacks it)
 /// - Reverse of Update: let the other side's content win
 /// - Reverse of Delete: don't delete — copy it back to the other side instead (restore)
+///
+/// **Built by overriding a clone, not by listing fields.** Each arm used to construct an `Op` from
+/// scratch, which meant every field nobody thought to name was silently dropped — `link` and `mode`
+/// both arrived as `None`. That is not display-only: `cmd::run` precomputes these into the DTO and
+/// the frontend builds the apply payload from the flipped op, so a flipped symlink Update took the
+/// content-copy lane instead of `make_symlink`. Spelling it `..op.clone()` means the next field
+/// added to `Op` is carried here by default and only a deliberate override can drop it.
 pub fn reverse_op(op: &Op) -> Option<Op> {
     let other = match op.side {
         Side::Source => Side::Target,
         Side::Target => Side::Source,
     };
+    let reason = format!("flipped({})", op.reason);
     match op.action {
+        // Copy becomes Delete: the content evidence describes a file that is about to be removed,
+        // not written, so hash and mtime are dropped on purpose. `size` stays — it is what the
+        // deletion tally is measured in.
         Action::Copy => Some(Op {
             side: other,
             action: Action::Delete,
-            path: op.path.clone(),
             from: None,
-            size: op.size,
             mtime_ms: None,
             hash: None,
             link: None,
-            mode: None,
-            reason: format!("flipped({})", op.reason),
+            reason,
+            ..op.clone()
         }),
-        Action::Update => Some(Op {
-            side: other,
-            action: Action::Update,
-            path: op.path.clone(),
-            from: None,
-            size: None,
-            mtime_ms: None,
-            hash: None,
-            link: None,
-            mode: None,
-            reason: format!("flipped({})", op.reason),
-        }),
-        Action::Delete => Some(Op {
-            side: other,
-            action: Action::Copy,
-            path: op.path.clone(),
-            from: None,
-            size: op.size,
-            mtime_ms: None,
-            hash: None,
-            link: None,
-            mode: None,
-            reason: format!("flipped({})", op.reason),
-        }),
+        // The other side's content wins, so this op can no longer describe *this* side's bytes.
+        Action::Update => Some(Op { side: other, from: None, size: None, mtime_ms: None, hash: None, reason, ..op.clone() }),
+        Action::Delete => Some(Op { side: other, action: Action::Copy, from: None, mtime_ms: None, hash: None, reason, ..op.clone() }),
         _ => None,
     }
 }
@@ -205,6 +198,35 @@ mod tests {
     use super::super::{compare, CompareOptions};
     use super::*;
     use crate::model::table::{Header, SCHEMA};
+
+    /// A flipped row is executed, not just displayed, so the reversal must not quietly drop fields.
+    /// `link` is the sharp one: a symlink op that loses it stops being a symlink op and takes the
+    /// content-copy lane instead. `mode` is inert only until Copy/Update start carrying it, at which
+    /// point the loss would be *selective* — the one row the user looked hardest at is the one
+    /// written without its mode.
+    #[test]
+    fn a_flipped_op_keeps_the_fields_that_decide_how_it_is_written() {
+        let src = Op {
+            side: Side::Target,
+            action: Action::Update,
+            path: "bin/node".into(),
+            from: None,
+            size: Some(10),
+            mtime_ms: Some(5),
+            hash: Some("abc".into()),
+            link: Some("../nodejs/bin/node".into()),
+            mode: Some(0o755),
+            reason: "differs".into(),
+        };
+        let r = reverse_op(&src).expect("an Update is reversible");
+        assert_eq!(r.side, Side::Source, "the flip is what the side is for");
+        assert_eq!(r.link.as_deref(), Some("../nodejs/bin/node"), "a symlink op must stay a symlink op");
+        assert_eq!(r.mode, Some(0o755), "the mode survives the flip");
+        assert_eq!(r.path, "bin/node");
+        // The content evidence belonged to the side that just lost, so it is dropped deliberately.
+        assert_eq!(r.hash, None);
+        assert_eq!(r.size, None);
+    }
 
     fn snap(os: &str, entries: Vec<Entry>) -> Snapshot {
         Snapshot {

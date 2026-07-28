@@ -111,7 +111,7 @@ use syncdash::pipeline::compare::evidence::SideMeta;
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("plan.csv");
         let header = PlanHeader {
-            schema: 1, kind: "plan".into(), mode: "mirror".into(), generated_at_ms: 0,
+            schema: syncdash::model::plan::PLAN_SCHEMA, kind: "plan".into(), mode: "mirror".into(), generated_at_ms: 0,
             source_root: r"D:\S".into(), source_host: "h".into(),
             target_root: r"E:\T".into(), target_host: "h".into(),
             op_count: 1, conflict_count: 0, source_entries: 1, target_entries: 1,
@@ -155,7 +155,7 @@ use syncdash::pipeline::compare::evidence::SideMeta;
             size: Some(5), mtime_ms: None, hash: None, link: None, mode: None, reason: "gone".into(),
         }];
         let h2 = PlanHeader {
-            schema: 1, kind: "plan".into(), mode: "mirror".into(), generated_at_ms: 0,
+            schema: syncdash::model::plan::PLAN_SCHEMA, kind: "plan".into(), mode: "mirror".into(), generated_at_ms: 0,
             source_root: "/s".into(), source_host: "h".into(),
             target_root: "/t".into(), target_host: "h".into(),
             op_count: 1, conflict_count: 0, source_entries: 1, target_entries: 1,

@@ -29,7 +29,7 @@ fn write(root: &Path, rel: &str, body: &[u8]) {
 fn plan_of(target_root: &str, ops: Vec<Op>) -> Plan {
     Plan {
         header: PlanHeader {
-            schema: 1,
+            schema: syncdash::model::plan::PLAN_SCHEMA,
             kind: "plan".into(),
             mode: "mirror".into(),
             generated_at_ms: 0,
