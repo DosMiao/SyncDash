@@ -96,7 +96,15 @@ impl WriteStaged for FtpStaged {
     fn seal(&mut self, _fsync: bool) -> VfsResult<()> {
         // fsync does not exist in this protocol; caps say No and the preflight
         // NeedsAck line covered it — the flag is knowingly moot here
-        if let Some(data) = self.data.take() {
+        if let Some(mut data) = self.data.take() {
+            // Flush before handing the stream back. Over plain FTP this is invisible — the socket
+            // drains whatever it holds — but `ftps://` writes through a TLS session that buffers,
+            // and finalizing without flushing drops whatever has not been encrypted and sent yet.
+            // Observed against a live server as a 64 KiB file arriving as exactly 32 KiB. The
+            // commit-time size check caught it rather than letting a truncated file land, which is
+            // what that check is for; this is the cause it was reporting.
+            data.flush()
+                .map_err(|e| VfsError::new(VfsErrorKind::Transient, format!("flushing the upload failed: {e}")))?;
             let mut guard = self.conn.lock().unwrap();
             let conn = guard
                 .as_mut()
@@ -108,15 +116,19 @@ impl WriteStaged for FtpStaged {
         Ok(())
     }
 
+    /// What this writer has handed to the upload — **not** a `SIZE` of the temp file.
+    ///
+    /// `staged_len` is asked while the transfer is still open, and a server mid-STOR answers with
+    /// however much it has flushed to disk so far, which is a race, not a length. Over `ftps://` the
+    /// TLS layer widens the window enough to lose it outright: files reconciled as 0, 16384 or
+    /// 32768 bytes against the same 32 KiB write, purely by timing. Plain FTP kept winning the race
+    /// and so never showed it.
+    ///
+    /// The writer already knows the answer, so it gives that. Whether the *server* really holds the
+    /// bytes is a different question, asked at a moment when it can be answered honestly — the
+    /// post-rename `SIZE` in `commit`, once the transfer is finalized.
     fn staged_len(&self) -> VfsResult<u64> {
-        let mut guard = self.conn.lock().unwrap();
-        let conn = guard
-            .as_mut()
-            .ok_or_else(|| VfsError::new(VfsErrorKind::Transient, "connection lost"))?;
-        conn.stream
-            .size(&self.tmp_abs)
-            .map(|s| s as u64)
-            .map_err(|e| map_ftp_err("SIZE staged", e))
+        Ok(self.wrote)
     }
 
     fn open_staged_read(&self) -> VfsResult<Box<dyn ReadStream>> {
@@ -198,7 +210,11 @@ impl Drop for FtpStaged {
         if !self.committed {
             // Close the data connection (the server finishes the partial STOR), then
             // delete the temp — the destination was never touched
-            if let Some(data) = self.data.take() {
+            if let Some(mut data) = self.data.take() {
+                // Flushed for the same reason `seal` flushes: a buffered TLS writer that is merely
+                // dropped loses its tail. Here the bytes are being discarded anyway, but the
+                // *stream* still has to end cleanly or the control channel is left mid-transfer.
+                let _ = data.flush();
                 if let Some(conn) = self.conn.lock().unwrap().as_mut() {
                     let _ = conn.stream.finalize_put_stream(data);
                 }
