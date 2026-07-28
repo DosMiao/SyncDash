@@ -42,6 +42,12 @@ pub struct Header {
     pub icloud_stubs: u64,
     #[serde(default)]
     pub icloud_stub_samples: Vec<String>,
+    /// Symlinks the scan saw and did not record, because `symlinks = "exclude"` (the default).
+    /// Counted for the same reason `excluded_*` is: an exclusion has to be visible. A macOS tree is
+    /// made of links — every `.app`, every framework, every Homebrew prefix — so "0 differences"
+    /// over a tree full of them is a claim the snapshot was not entitled to make.
+    #[serde(default)]
+    pub skipped_symlinks: u64,
     /// Files evicted in place (macOS `SF_DATALESS`). Unlike a stub these still carry the true name,
     /// size and mtime, so nothing is lost — but reading one downloads it, which is worth saying
     /// before a full-rigor scan hydrates an entire library.
@@ -240,6 +246,7 @@ mod tests {
             icloud_stubs: 0,
             icloud_stub_samples: Vec::new(),
             dataless_files: 0,
+            skipped_symlinks: 0,
             vfs: None,
         }
     }

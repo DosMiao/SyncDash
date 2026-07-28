@@ -218,6 +218,37 @@ fn delete_dir_reports_kept_contents_instead_of_silence() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A symlink is content, and it used to be the one kind of leftover that could not protect its
+/// directory. Symlinks were pushed onto the removal list without being counted or tested for
+/// deletability, so a directory whose leftovers were *only* symlinks had count == 0, skipped the
+/// "not empty, and not everything here is disposable" guard, and had every link unlinked directly —
+/// no preserve, no version store, no trash. With `symlinks = "exclude"` (the default) the links are
+/// also absent from both snapshots, so nothing recorded what was destroyed. One `Foo.app` was
+/// enough: every `Versions/Current -> A` inside it went this way.
+#[cfg(unix)]
+#[test]
+fn delete_dir_will_not_silently_unlink_symlinks() {
+    let base = tmproot("deldir-link");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(t.join("d")).unwrap();
+    // The leftovers must be symlinks and nothing else. A single regular file beside them would
+    // protect the directory on its own and the test would pass without proving anything.
+    std::fs::write(t.join("payload.txt"), b"payload").unwrap();
+    std::os::unix::fs::symlink("../payload.txt", t.join("d").join("Current")).unwrap();
+    std::os::unix::fs::symlink("../payload.txt", t.join("d").join("Latest")).unwrap();
+
+    let (done, skipped, errors) = apply::apply(&[op(Action::DeleteDir, "d")], &s, &t, &opts(base.join("trash")));
+    assert_eq!(done, 0, "the directory must not be removed over a leftover symlink");
+    assert_eq!(skipped, 1, "it must be reported, exactly as a protected file is");
+    assert_eq!(errors, 0);
+    assert!(
+        t.join("d").join("Current").symlink_metadata().is_ok(),
+        "the symlink must still be there"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn delete_dir_removes_when_leftovers_are_deletable() {
     let base = tmproot("deldir2");

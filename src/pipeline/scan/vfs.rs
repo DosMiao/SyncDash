@@ -71,6 +71,7 @@ pub(super) fn scan_vfs(
     let mut pending: Vec<PendingVfs> = Vec::new();
     let mut walk_errors = 0u64;
     let mut walk_err_samples: Vec<String> = Vec::new();
+    let mut skipped_symlinks = 0u64;
     let mut excl_dirs = 0u64;
     let mut excl_files = 0u64;
 
@@ -118,6 +119,9 @@ pub(super) fn scan_vfs(
                     if !opt.filter.pass_file(&rel) {
                         excl_files += 1;
                         continue;
+                    }
+                    if !opt.symlinks_direct {
+                        skipped_symlinks += 1;
                     }
                     if opt.symlinks_direct {
                         let target = de.meta.link.clone().or_else(|| vfs.read_link(&rel).ok());
@@ -268,6 +272,7 @@ pub(super) fn scan_vfs(
             icloud_stubs: 0,
             icloud_stub_samples: Vec::new(),
             dataless_files: 0,
+            skipped_symlinks,
             vfs: Some(super::vfs_note(vfs.as_ref(), opt, sampled)),
         },
         entries,

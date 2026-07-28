@@ -124,6 +124,7 @@ pub(super) fn scan_impl(
     let mut icloud_stubs = 0u64;
     let mut icloud_stub_samples: Vec<String> = Vec::new();
     let mut dataless_files = 0u64;
+    let mut skipped_symlinks = 0u64;
 
     // Exclusions must be visible: pruned directories/files are counted into the snapshot header so the UI can state "this much never took part in the comparison".
     // (Lesson learned: the default exclusions silently swallowed .git while the UI still said "both sides identical ✓" —— never again)
@@ -268,6 +269,9 @@ pub(super) fn scan_impl(
                 entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, hash_failed: false, file_id: None, mode: None, link: None, prev: None });
             }
         } else if item.file_type().is_symlink() {
+            if !opt.symlinks_direct {
+                skipped_symlinks += 1;
+            }
             if opt.symlinks_direct {
                 let target = std::fs::read_link(item.path())
                     .ok()
@@ -508,6 +512,7 @@ pub(super) fn scan_impl(
             icloud_stubs,
             icloud_stub_samples,
             dataless_files,
+            skipped_symlinks,
             vfs: None,
         },
         entries,
