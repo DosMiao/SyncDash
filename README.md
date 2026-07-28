@@ -561,7 +561,15 @@ strategy is worth reading, but adopting it means going resident).
       five-phase parallel apply (`parallel`); a standalone progress sub-window (dual cumulative graphs / rate / ETA / pause / stop / When-finished);
       the Overview aggregation sidebar + iconified stats bar; run logs + "last sync"; the full-field Tauri job editor; watch-mode timed rescans
       (`watch_interval_secs`/`--watch`); the real remote pipeline for remote jobs in the GUI; **egui retired and deleted** (see the GUI section above)
-- **The roadmap is fully complete**. The only remaining long-range direction is version-vector P2P (see
+- [x] v0.10 one unified diagnostic path (the Logging section above), and **`smb://` became an in-process SMB2 client**.
+      It used to hand the phrase to the operating system — a UNC path via `WNetAddConnection2W` on Windows, `mount_smbfs`
+      subprocesses on macOS, a refusal on Linux — and delegate to the local backend on whatever path came back. It now
+      speaks the protocol itself, which brings Linux with it and retires the mount orchestration and its `net umount` verb.
+      **One user-visible trade, deliberate:** an `smb://` root now needs `syncdash cred set` first, because the SMB crate
+      forbids unsafe code and so cannot reach SSPI to borrow this machine's login. `\\host\share` (and any smbfs mount
+      point) still parses as a plain local path, still uses the login you already have, and still needs no configuration
+      at all — that route did not go anywhere, it just stopped being the thing `smb://` silently meant.
+- **The v0.1–v0.9 roadmap is fully complete**. The only remaining long-range direction is version-vector P2P (see
   "Multi-endpoint" — an explicit non-goal unless direct writes bypassing the hub appear).
   The mathematical groundwork was done and then removed: a complete version-vector implementation rewritten from
   the semantics of syncthing's `lib/protocol/vector.go` (`update` monotonicity, `merge` as least upper bound, and
