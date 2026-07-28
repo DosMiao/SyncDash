@@ -1,12 +1,16 @@
-//! scan: walk the directory tree and produce a snapshot table (the "generic command" of requirement 1).
-//! - Excludes known junk / rebuildable directories (a subset matching CodeSync's FFS exclusion rules)
-//! - blake3 content hash, with a cache: if (path,size,mtime) is unchanged, reuse the previous hash instead of rehashing tens of GB every run
-//! - The cache lives in the local user cache directory and never pollutes the scanned tree
+//! The local lane: walkdir + rayon + mmap over a real directory.
+//!
+//! Kept byte-for-byte on the fast path — this is what runs for the overwhelming majority of
+//! scans, and the parallel hashing here is the reason a cold scan of a large tree is bearable.
+
+use std::collections::HashMap;
+use std::path::Path;
 
 use crate::foundation::time::now_ms;
 use crate::model::table::{os_name, Entry, EntryKind, Header, Snapshot, SCHEMA};
-use std::collections::HashMap;
-use std::path::Path;
+
+use super::digest::{effective_read, sampled_digest, SAMPLE_MIN};
+use super::{ProgressFn, ScanOptions, ScanProgress};
 
 #[cfg(unix)]
 fn file_id(md: &std::fs::Metadata) -> Option<String> {
@@ -17,7 +21,6 @@ fn file_id(md: &std::fs::Metadata) -> Option<String> {
 fn file_id(_md: &std::fs::Metadata) -> Option<String> {
     None
 }
-
 #[cfg(unix)]
 fn unix_mode(md: &std::fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
@@ -27,7 +30,6 @@ fn unix_mode(md: &std::fs::Metadata) -> Option<u32> {
 fn unix_mode(_md: &std::fs::Metadata) -> Option<u32> {
     None
 }
-
 fn mtime_ms(md: &std::fs::Metadata) -> i64 {
     md.modified()
         .ok()
@@ -35,392 +37,7 @@ fn mtime_ms(md: &std::fs::Metadata) -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
-
-pub struct ScanOptions {
-    pub hash: bool,
-    /// Sampled evidence: files ≥4MB are not read whole but get a sampled digest (size + blake3 of 256KB at head/middle/tail,
-    /// the value `~`-prefixed to keep it strictly apart from a full hash); <4MB is hashed in full. Cloud placeholders hydrate
-    /// only those three windows. Not a byte-for-byte equality proof —— the escalation rule (same digest, different mtime → full rehash) backstops it.
-    pub sampled: bool,
-    /// Whether to trust the (path,size,mtime) cache. **The ladder's decisive axis**:
-    /// fast = true (only the changed surface is really read; the unchanged surface is cache memory);
-    /// standard/paranoid = false (every file is really read this run —— "identical ✓" is measured now, not remembered).
-    pub use_cache: bool,
-    /// symlinks="direct": record the link itself (its target string); otherwise symlinks are ignored
-    pub symlinks_direct: bool,
-    /// Filter with FFS semantics (see filter.rs); the default exclusions are built in
-    pub filter: crate::pipeline::filter::PathFilter,
-}
-
-/// Parameters and implementation of the sampled digest (the fast rigor tier)
-pub const SAMPLE_MIN: u64 = 4 * 1024 * 1024;
-const SAMPLE_CHUNK: usize = 256 * 1024;
-
-/// Bytes this scan will actually read in fast mode (only counting these makes the progress total and rate honest)
-fn effective_read(size: u64, sampled: bool) -> u64 {
-    if sampled && size >= SAMPLE_MIN {
-        (3 * SAMPLE_CHUNK as u64).min(size)
-    } else {
-        size
-    }
-}
-
-fn sampled_digest(path: &Path, size: u64) -> std::io::Result<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&size.to_le_bytes());
-    let mut buf = vec![0u8; SAMPLE_CHUNK];
-    for off in [0u64, size / 2, size.saturating_sub(SAMPLE_CHUNK as u64)] {
-        f.seek(SeekFrom::Start(off))?;
-        let mut read = 0usize;
-        while read < SAMPLE_CHUNK {
-            let n = f.read(&mut buf[read..])?;
-            if n == 0 {
-                break;
-            }
-            read += n;
-        }
-        hasher.update(&buf[..read]);
-    }
-    Ok(format!("~{}", hasher.finalize().to_hex()))
-}
-
-/// Scan progress (P2-6). The same amount of information as syncthing's `FolderScanProgress`:
-/// phase + bytes done/total + rate, enough for the frontend to draw a bar and estimate the time remaining.
-#[derive(Clone, Copy, Debug)]
-pub struct ScanProgress {
-    /// "walk" (metadata traversal) | "hash" (parallel hashing)
-    pub phase: &'static str,
-    pub files_total: u64,
-    pub bytes_total: u64,
-    pub bytes_done: u64,
-    pub mib_per_s: f64,
-}
-
-pub type ProgressFn<'a> = &'a (dyn Fn(ScanProgress) + Sync);
-
-pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
-    scan_impl(root, opt, None, None)
-}
-
-pub fn scan_with_progress(
-    root: &Path,
-    opt: &ScanOptions,
-    progress: Option<ProgressFn<'_>>,
-) -> std::io::Result<Snapshot> {
-    scan_impl(root, opt, progress, None)
-}
-
-/// v0.9 M1 unified-foundation entry point: cancel/pause/ProgressEvent event stream (see progress.rs).
-/// The old ScanProgress callback shape (P2-6) is kept as-is —— both paths share the same scan_impl.
-pub fn scan_ctx(
-    root: &Path,
-    opt: &ScanOptions,
-    ctx: &crate::obs::progress::RunCtx,
-    phase: crate::model::event::Phase,
-) -> std::io::Result<Snapshot> {
-    scan_impl(root, opt, None, Some((ctx, phase)))
-}
-
-/// Route a root to the right scan lane: a local (or locally-translated) root keeps the
-/// existing walkdir+mmap fast path byte-for-byte; everything else runs the generic VFS
-/// lane. Both lanes speak the same filter contract and the same exclusion accounting —
-/// the differential tests pin those numbers against each other.
-pub fn scan_root(
-    vfs: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
-    opt: &ScanOptions,
-    ctx: &crate::obs::progress::RunCtx,
-    phase: crate::model::event::Phase,
-) -> std::io::Result<Snapshot> {
-    match vfs.as_local() {
-        Some(root) => scan_impl(root, opt, None, Some((ctx, phase))),
-        None => scan_vfs(vfs, opt, ctx, phase),
-    }
-}
-
-fn sampled_digest_vfs(vfs: &dyn crate::fs::vfs::Vfs, rel: &str, size: u64) -> Result<String, crate::fs::vfs::error::VfsError> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&size.to_le_bytes());
-    for off in [0u64, size / 2, size.saturating_sub(SAMPLE_CHUNK as u64)] {
-        let buf = vfs.read_range(rel, off, SAMPLE_CHUNK as u32)?;
-        hasher.update(&buf);
-    }
-    // Same windows, same size prefix, same `~` marker as the local sampled_digest —
-    // the two lanes must produce identical digests for identical content
-    Ok(format!("~{}", hasher.finalize().to_hex()))
-}
-
-fn full_hash_vfs(
-    vfs: &dyn crate::fs::vfs::Vfs,
-    rel: &str,
-    pp: &crate::obs::progress::PhaseProgress<'_>,
-) -> Result<String, crate::fs::vfs::error::VfsError> {
-    let mut stream = vfs.open_read(rel)?;
-    let mut hasher = blake3::Hasher::new();
-    let block = stream.block_size().clamp(64 * 1024, 8 * 1024 * 1024);
-    let mut buf = vec![0u8; block];
-    loop {
-        pp.checkpoint().map_err(crate::fs::vfs::error::VfsError::from)?; // cancel/pause between blocks
-        let n = std::io::Read::read(&mut stream, &mut buf).map_err(crate::fs::vfs::error::VfsError::from)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
-/// The generic scan lane: engine-driven traversal over `read_dir` (pruned subtrees cost
-/// zero round-trips), then a hashing pool sized to the backend's stream budget.
-///
-/// Error discipline, and the one place it differs from the local lane on purpose:
-/// an entry-level NotFound is a scan race (counted + sampled, like local walk errors),
-/// but a directory-level Transient/Auth/Protocol failure aborts the whole scan —
-/// a half table would make the missing half read as deletions on the next compare.
-fn scan_vfs(
-    vfs: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
-    opt: &ScanOptions,
-    ctx: &crate::obs::progress::RunCtx,
-    phase: crate::model::event::Phase,
-) -> std::io::Result<Snapshot> {
-    use crate::fs::vfs::error::VfsErrorKind;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-
-    let pp = crate::obs::progress::PhaseProgress::begin(ctx, phase, Some(vfs.display()), 0, 0);
-    let side = match phase {
-        crate::model::event::Phase::ScanTarget => "target",
-        _ => "source",
-    };
-    let started = now_ms();
-    let t0 = std::time::Instant::now();
-    let identity = vfs.identity();
-    let caps = vfs.caps();
-    // A backend without ranged reads cannot sample — the tier upgrades to full reads.
-    // Never silent: preflight already put a NeedsAck line in front of the user, and the
-    // snapshot's VfsNote records the tier that actually ran.
-    let sampled = opt.sampled && caps.ranged_read.yes();
-    let cache = if opt.hash && opt.use_cache { crate::store::hashcache::load_by_key(&identity) } else { HashMap::new() };
-    let mtime_fixes = crate::store::mtimefix::load_by_key(&identity);
-
-    let mut entries: Vec<Entry> = Vec::new();
-    struct PendingVfs {
-        rel: String,
-        size: u64,
-        mt: i64,
-        hash: Option<String>,
-        file_id: Option<String>,
-        mode: Option<u32>,
-    }
-    let mut pending: Vec<PendingVfs> = Vec::new();
-    let mut walk_errors = 0u64;
-    let mut walk_err_samples: Vec<String> = Vec::new();
-    let mut excl_dirs = 0u64;
-    let mut excl_files = 0u64;
-
-    // Engine-driven DFS: one read_dir round-trip per kept directory
-    let mut stack: Vec<String> = vec![String::new()];
-    while let Some(dir) = stack.pop() {
-        pp.checkpoint()?;
-        let list = match vfs.read_dir(&dir) {
-            Ok(l) => l,
-            Err(e) if e.kind == VfsErrorKind::NotFound && !dir.is_empty() => {
-                // The directory vanished between being listed and being read: a scan race,
-                // same class as a local walk error
-                walk_errors += 1;
-                if walk_err_samples.len() < 5 {
-                    walk_err_samples.push(format!("{dir}: {e}"));
-                }
-                continue;
-            }
-            Err(e) => {
-                let ioe: std::io::Error = e.into();
-                return Err(std::io::Error::new(
-                    ioe.kind(),
-                    format!(
-                        "scan of '{}' aborted at directory '{dir}': {ioe} — refusing to emit a half table (its missing subtrees would read as deletions)",
-                        vfs.display()
-                    ),
-                ));
-            }
-        };
-        for de in list {
-            let rel = if dir.is_empty() { de.name.clone() } else { format!("{dir}/{}", de.name) };
-            match de.meta.kind {
-                EntryKind::Dir => {
-                    let (pass, child_might_match) = opt.filter.pass_dir(&rel);
-                    if pass {
-                        entries.push(Entry { path: rel.clone(), kind: EntryKind::Dir, size: 0, mtime_ms: de.meta.mtime_ms, hash: None, file_id: None, mode: None, link: None, prev: None });
-                    }
-                    if pass || child_might_match {
-                        stack.push(rel);
-                    } else {
-                        excl_dirs += 1; // whole subtree pruned — and never even listed
-                    }
-                }
-                EntryKind::Symlink => {
-                    if !opt.filter.pass_file(&rel) {
-                        excl_files += 1;
-                        continue;
-                    }
-                    if opt.symlinks_direct {
-                        let target = de.meta.link.clone().or_else(|| vfs.read_link(&rel).ok());
-                        entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: de.meta.mtime_ms, hash: None, file_id: None, mode: None, link: target, prev: None });
-                    }
-                }
-                EntryKind::File => {
-                    if !opt.filter.pass_file(&rel) {
-                        excl_files += 1;
-                        continue;
-                    }
-                    let size = de.meta.size;
-                    let raw_mt = de.meta.mtime_ms;
-                    let mt = match mtime_fixes.get(&rel) {
-                        Some((ondisk, intended)) if *ondisk == raw_mt => *intended,
-                        _ => raw_mt,
-                    };
-                    let mut hash = None;
-                    if opt.hash && opt.use_cache {
-                        if let Some((cs, cm, ch)) = cache.get(&rel) {
-                            let want_sampled = sampled && size >= SAMPLE_MIN;
-                            if *cs == size && *cm == mt && ch.starts_with('~') == want_sampled {
-                                hash = Some(ch.clone());
-                            }
-                        }
-                    }
-                    pending.push(PendingVfs { rel, size, mt, hash, file_id: de.meta.file_id, mode: de.meta.mode });
-                    pp.item_done(&pending.last().unwrap().rel);
-                }
-            }
-        }
-    }
-
-    if walk_errors > 0 {
-        crate::log_warn!(
-            "scan",
-            "warning: {walk_errors} entr(ies) under {} skipped by walk errors — they will look ABSENT on this side! samples: {}",
-            vfs.display(),
-            walk_err_samples.join(" | ")
-        );
-        pp.error(
-            "",
-            "walk",
-            side,
-            &format!("{walk_errors} entr(ies) skipped by walk errors (they will be treated as ABSENT on this side!) samples: {}", walk_err_samples.join(" | ")),
-        );
-    }
-
-    let bytes_to_hash: u64 = if opt.hash {
-        pending.iter().filter(|p| p.hash.is_none()).map(|p| effective_read(p.size, sampled)).sum()
-    } else {
-        0
-    };
-    pp.set_totals(pending.len() as u64, bytes_to_hash);
-    pp.restart_items();
-
-    let hash_errors;
-    if opt.hash {
-        // Not rayon: the bottleneck is the network, and the width belongs to the backend
-        // (its connection budget), not to the CPU count
-        let width = caps.max_parallel_streams.clamp(1, 4);
-        let next = AtomicUsize::new(0);
-        let err_count = AtomicU64::new(0);
-        let hashes: Vec<std::sync::OnceLock<Option<String>>> =
-            pending.iter().map(|_| std::sync::OnceLock::new()).collect();
-        std::thread::scope(|sc| {
-            for _ in 0..width {
-                sc.spawn(|| loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(p) = pending.get(i) else { break };
-                    if pp.checkpoint().is_err() {
-                        let _ = hashes[i].set(None);
-                        continue; // cancelled: drain the remaining slots empty
-                    }
-                    if p.hash.is_some() {
-                        pp.item_done(&p.rel); // cache hit: nothing to read
-                        let _ = hashes[i].set(None);
-                        continue;
-                    }
-                    let res = if sampled && p.size >= SAMPLE_MIN {
-                        sampled_digest_vfs(vfs.as_ref(), &p.rel, p.size)
-                    } else {
-                        full_hash_vfs(vfs.as_ref(), &p.rel, &pp)
-                    };
-                    match res {
-                        Ok(h) => {
-                            let _ = hashes[i].set(Some(h));
-                        }
-                        Err(e) if e.kind == VfsErrorKind::Cancelled => {
-                            let _ = hashes[i].set(None);
-                            continue;
-                        }
-                        Err(e) => {
-                            err_count.fetch_add(1, Ordering::Relaxed);
-                            pp.error(&p.rel, "hash", side, &e.to_string());
-                            let _ = hashes[i].set(None);
-                        }
-                    }
-                    let eff = effective_read(p.size, sampled);
-                    pp.add_bytes(eff, &p.rel);
-                    pp.item_done(&p.rel);
-                });
-            }
-        });
-        pp.checkpoint()?; // a cancellation during hashing surfaces here, honestly
-        for (p, slot) in pending.iter_mut().zip(hashes) {
-            if p.hash.is_none() {
-                p.hash = slot.into_inner().flatten();
-            }
-        }
-        hash_errors = err_count.load(Ordering::Relaxed);
-    } else {
-        hash_errors = 0;
-    }
-
-    for p in pending {
-        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, file_id: p.file_id, mode: p.mode, link: None, prev: None });
-    }
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    if opt.hash {
-        crate::store::hashcache::save_by_key(&identity, &entries);
-    }
-    if hash_errors > 0 {
-        crate::log_warn!("scan", "warning: {hash_errors} file(s) could not be hashed (in use / unreadable)");
-    }
-
-    Ok(Snapshot {
-        header: Header {
-            schema: SCHEMA,
-            kind: "snapshot".into(),
-            root: vfs.display(),
-            host: crate::model::table::host_name(),
-            os: caps.protocol.to_string(),
-            scanned_at_ms: started,
-            duration_ms: t0.elapsed().as_millis() as u64,
-            entry_count: entries.len() as u64,
-            hashed: opt.hash,
-            excluded_dirs: excl_dirs,
-            excluded_files: excl_files,
-            vfs: Some(crate::model::table::VfsNote {
-                protocol: caps.protocol.to_string(),
-                display_root: vfs.display(),
-                mtime_precision_ms: caps.mtime_precision_ms,
-                evidence_effective: if !opt.hash {
-                    "none".into()
-                } else if sampled {
-                    "sampled".into()
-                } else {
-                    "full".into()
-                },
-                name_rules: caps.name_rules.as_str().into(),
-                degraded: Vec::new(),
-            }),
-        },
-        entries,
-    })
-}
-
-fn scan_impl(
+pub(super) fn scan_impl(
     root: &Path,
     opt: &ScanOptions,
     progress: Option<ProgressFn<'_>>,
@@ -797,17 +414,21 @@ fn scan_impl(
 }
 
 #[cfg(test)]
-mod ctx_tests {
+mod tests {
     use super::*;
-    use crate::model::event::{Phase, ProgressEvent};
-use crate::obs::progress::{is_cancelled, RunCtl, RunCtx};
-    use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Mutex};
+    use crate::pipeline::filter::PathFilter;
+    use crate::pipeline::scan::{scan, ScanOptions};
 
-    /// A name the filesystem accepts but Unicode does not. Recording it through
-    /// `to_string_lossy` would put `b<U+FFFD>c` in the table — a path that resolves to
-    /// nothing, so apply would miss the real file and mirror would read the original as a
-    /// deletion. It must be skipped and counted, never spelled differently.
+    fn opts() -> ScanOptions {
+        ScanOptions {
+            hash: true,
+            sampled: false,
+            use_cache: false, // tests never eat the cache
+            symlinks_direct: false,
+            filter: PathFilter::build(&[], &[]),
+        }
+    }
+
     #[test]
     fn a_name_that_is_not_valid_unicode_is_skipped_not_substituted() {
         let root = std::env::temp_dir().join(format!("syncdash-wtf8-{}", std::process::id()));
@@ -886,83 +507,5 @@ use crate::obs::progress::{is_cancelled, RunCtl, RunCtx};
             Ok(s) => panic!("a missing root scanned as a {}-entry tree instead of erroring", s.entries.len()),
             Err(e) => assert!(e.to_string().contains("refusing to report it as an empty tree"), "{e}"),
         }
-    }
-
-    fn mk_tree(tag: &str, n: usize) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("syncdash-scanctx-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("sub")).unwrap();
-        for i in 0..n {
-            std::fs::write(root.join("sub").join(format!("f{i}.dat")), vec![i as u8; 100]).unwrap();
-        }
-        root
-    }
-
-    #[test]
-    fn sampled_digest_catches_edge_edits_only() {
-        let d = std::env::temp_dir().join(format!("sd-sample-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let f = d.join("s.bin");
-        let mut data = vec![5u8; 8 * 1024 * 1024];
-        std::fs::write(&f, &data).unwrap();
-        let a = sampled_digest(&f, data.len() as u64).unwrap();
-        assert!(a.starts_with('~'), "sampled digests carry the ~ marker");
-        // The midpoint falls inside a sample window → the digest must change
-        data[4 * 1024 * 1024 + 10] = 9;
-        std::fs::write(&f, &data).unwrap();
-        let b = sampled_digest(&f, data.len() as u64).unwrap();
-        assert_ne!(a, b, "an edit inside a sample window must change the digest");
-        // Offset 1MB lies outside all three sample windows → the digest does not change. That is fast mode's safety boundary; assert it honestly
-        data[1024 * 1024] = 7;
-        std::fs::write(&f, &data).unwrap();
-        let c = sampled_digest(&f, data.len() as u64).unwrap();
-        assert_eq!(b, c, "fast mode by design does not see edits outside sample windows");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    fn opts() -> ScanOptions {
-        ScanOptions {
-            hash: true,
-            sampled: false,
-            use_cache: false, // tests never eat the cache
-            symlinks_direct: false,
-            filter: crate::pipeline::filter::PathFilter::build(&[], &[]),
-        }
-    }
-
-    #[test]
-    fn scan_ctx_reports_exact_totals() {
-        let root = mk_tree("totals", 20);
-        let store: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let s2 = store.clone();
-        let ctx = RunCtx::new(RunCtl::new(), Arc::new(move |ev| s2.lock().unwrap().push(ev)));
-        let snap = scan_ctx(&root, &opts(), &ctx, Phase::ScanSource).unwrap();
-        assert_eq!(snap.entries.iter().filter(|e| e.kind == EntryKind::File).count(), 20);
-        let evs = store.lock().unwrap();
-        let totals = evs.iter().find_map(|e| match e {
-            ProgressEvent::Totals { items_total, bytes_total, .. } => Some((*items_total, *bytes_total)),
-            _ => None,
-        });
-        assert_eq!(totals, Some((20, 2000)), "the end of the walk must yield exact totals");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_ctx_cancels_midway() {
-        let root = mk_tree("cancel", 50);
-        let ctl = RunCtl::new();
-        let ctl2 = ctl.clone();
-        let sink = move |ev: ProgressEvent| {
-            if matches!(ev, ProgressEvent::Progress { .. }) {
-                ctl2.cancel.store(true, Ordering::SeqCst); // call a halt on the very first progress event
-            }
-        };
-        let ctx = RunCtx::new(ctl, Arc::new(sink));
-        match scan_ctx(&root, &opts(), &ctx, Phase::ScanSource) {
-            Err(e) => assert!(is_cancelled(&e)),
-            Ok(_) => panic!("expected cancellation"),
-        }
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

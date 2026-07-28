@@ -286,9 +286,9 @@ impl Job {
     }
 
     /// The read-side capability query (window already widened to the coarser backend)
-    pub fn read_caps_query(&self, window_ms: i64, src_local: bool, tgt_local: bool) -> crate::pipeline::guard::ReadCapsQuery {
+    pub fn read_caps_query(&self, window_ms: i64, src_local: bool, tgt_local: bool) -> crate::pipeline::guard::caps::ReadCapsQuery {
         let rr = self.rigor_resolved();
-        crate::pipeline::guard::ReadCapsQuery {
+        crate::pipeline::guard::caps::ReadCapsQuery {
             hash: rr.hash,
             sampled: rr.sampled,
             escalate: rr.escalate,
@@ -300,9 +300,9 @@ impl Job {
         }
     }
 
-    /// The write-side capability query (see `guard::cap_report_write`)
-    pub fn write_caps_query(&self, src_local: bool, tgt_local: bool) -> crate::pipeline::guard::WriteCapsQuery {
-        crate::pipeline::guard::WriteCapsQuery {
+    /// The write-side capability query (see `guard::caps::cap_report_write`)
+    pub fn write_caps_query(&self, src_local: bool, tgt_local: bool) -> crate::pipeline::guard::caps::WriteCapsQuery {
+        crate::pipeline::guard::caps::WriteCapsQuery {
             fsync: self.fsync,
             verify: self.rigor_resolved().verify_writes,
             versioning: self.versioning,

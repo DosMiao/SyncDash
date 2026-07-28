@@ -867,11 +867,11 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             Ok(if errors > 0 { 1 } else { 0 })
         }
         Cmd::Mark { root, job, note } => {
-            let (path, created) = syncdash::pipeline::guard::write_marker(&root, &job, &note)?;
+            let (path, created) = syncdash::pipeline::guard::marker::write_marker(&root, &job, &note)?;
             if created {
                 println!("marked: {}", path.display());
             } else {
-                let m = syncdash::pipeline::guard::read_marker(&root);
+                let m = syncdash::pipeline::guard::marker::read_marker(&root);
                 println!(
                     "already marked: {}{}",
                     path.display(),
