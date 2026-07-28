@@ -233,7 +233,7 @@ impl SmbBackend {
 /// The asymmetry in `error.rs` is the point: everything ambiguous goes to `Transient`, and
 /// only a server's own definite "no such name" becomes `NotFound` — which callers still
 /// double-check before trusting.
-pub(super) fn map_smb_err(what: &str, e: smb2::Error) -> VfsError {
+fn map_smb_err(what: &str, e: smb2::Error) -> VfsError {
     use smb2::ErrorKind as K;
     if let smb2::Error::Protocol { status, .. } = &e {
         if status.0 == STATUS_DIRECTORY_NOT_EMPTY {
@@ -262,7 +262,7 @@ pub(super) fn map_smb_err(what: &str, e: smb2::Error) -> VfsError {
 }
 
 /// A non-success status from one sub-response of a compound, routed through the same table.
-pub(super) fn status_err(what: &str, command: Command, status: NtStatus) -> VfsError {
+fn status_err(what: &str, command: Command, status: NtStatus) -> VfsError {
     map_smb_err(what, smb2::Error::Protocol { status, command })
 }
 
@@ -276,7 +276,7 @@ pub(super) fn status_err(what: &str, command: Command, status: NtStatus) -> VfsE
 ///
 /// `wire_path` must already be normalized (see `SmbBackend::wire_path`).
 /// `FileId::SENTINEL` is the compound's "the handle the previous operation just opened".
-pub(super) async fn set_write_time(
+async fn set_write_time(
     tree: &Tree,
     conn: &Connection,
     wire_path: &str,

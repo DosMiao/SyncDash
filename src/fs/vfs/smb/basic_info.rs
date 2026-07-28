@@ -11,7 +11,7 @@ const EPOCH_DIFF_100NS: i64 = 116_444_736_000_000_000;
 const TICKS_PER_MS: i64 = 10_000;
 
 /// The buffer is four 8-byte times, then two 4-byte words.
-pub const FILE_BASIC_INFORMATION_LEN: usize = 40;
+const FILE_BASIC_INFORMATION_LEN: usize = 40;
 
 /// FileBasicInformation, from the SMB2 file-information-class table.
 pub const FILE_BASIC_INFORMATION: u8 = 4;
