@@ -250,10 +250,6 @@ pub enum Cmd {
         cmd: CredCmd,
     },
     /// Network-mount housekeeping for smb:// roots
-    Net {
-        #[command(subcommand)]
-        cmd: NetCmd,
-    },
     /// Connect to a root and print its full capability sheet (what preflight will reason from)
     Caps {
         /// A root phrase: a local path, smb://…, sftp://…, ftp://…
@@ -303,12 +299,6 @@ pub enum CredCmd {
     Ls,
     /// Connect once and report what happened, step by step
     Test { phrase: String },
-}
-
-#[derive(Subcommand)]
-pub enum NetCmd {
-    /// Release the private smb mount points this tool created (macOS; Windows sessions are device-less)
-    Umount,
 }
 
 #[derive(Subcommand)]

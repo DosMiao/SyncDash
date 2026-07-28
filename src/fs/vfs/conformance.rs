@@ -239,7 +239,7 @@ mod suite {
     /// directory on one and run
     ///
     /// ```text
-    /// cargo test --lib live_smb_backend_conforms -- --ignored --nocapture
+    /// cargo test --lib os_route_smb_conforms -- --ignored --nocapture
     /// ```
     ///
     /// It exists to make the native-SMB question answerable: the same twelve checks that pass on
@@ -248,7 +248,7 @@ mod suite {
     /// first is the point — it says what "passing" looks like today.
     #[test]
     #[ignore = "needs a live SMB share in SYNCDASH_SMB_ROOT"]
-    fn live_smb_backend_conforms() {
+    fn os_route_smb_conforms() {
         let Ok(root) = std::env::var("SYNCDASH_SMB_ROOT") else {
             panic!("set SYNCDASH_SMB_ROOT to a writable directory on an SMB share");
         };
@@ -266,6 +266,81 @@ mod suite {
         });
         for d in dirs {
             let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// The same contract against a live share through the **native SMB2 backend** — the
+    /// in-process client, no OS mount involved.
+    ///
+    /// This is the twin of `os_route_smb_conforms` above, and the pair is the point: that
+    /// one measures what the OS-delegating backend does today, this one has to match it before
+    /// the native client can be trusted with anyone's files. `set_mtime` in particular is the
+    /// reason the backend exists in this order — it is the one `Vfs` method the SMB crate has
+    /// no high-level call for, and `fs::lock::RootLock`'s heartbeat is a repeated `set_mtime`,
+    /// so a backend that fails this check cannot hold a root lock.
+    ///
+    /// Needs a server *and* a stored credential — a native smb root cannot ride this machine's
+    /// session login the way a `\\host\share` path can:
+    ///
+    /// ```text
+    /// syncdash cred set "smb://<user>@<host>/<share>"
+    /// set SYNCDASH_SMB_URL=smb://<user>@<host>/<share>/<scratch-dir>
+    /// cargo test --lib smb_backend_conforms -- --ignored --nocapture
+    /// ```
+    ///
+    /// Everything it makes lives under `SYNCDASH_SMB_URL` and is removed again on the way out.
+    #[test]
+    #[ignore = "needs a live SMB share in SYNCDASH_SMB_URL and a stored credential"]
+    fn smb_backend_conforms() {
+        use crate::fs::vfs::smb::SmbBackend;
+        use crate::fs::vfs::spec::{parse, RootSpec};
+
+        let Ok(base_url) = std::env::var("SYNCDASH_SMB_URL") else {
+            panic!("set SYNCDASH_SMB_URL to an smb://user@host/share/subdir phrase");
+        };
+        let creds = crate::fs::vfs::cred::default_provider();
+        let open = |url: &str| -> Arc<dyn Vfs> {
+            let RootSpec::Remote(spec) = parse(url) else {
+                panic!("'{url}' is not an smb:// phrase");
+            };
+            let b = SmbBackend::new(spec, creds.clone())
+                .unwrap_or_else(|e| panic!("building a backend for '{url}': {e}"));
+            b.connect().unwrap_or_else(|e| panic!("connecting to '{url}': {e}"));
+            Arc::new(b) as Arc<dyn Vfs>
+        };
+
+        let base = open(&base_url);
+        let mut roots: Vec<String> = Vec::new();
+        let mut n = 0usize;
+        run_all(&mut || {
+            n += 1;
+            let name = format!("conf-{}-{n}", std::process::id());
+            // "Fresh and empty" has to hold even if an earlier run died mid-suite.
+            remove_tree(&base, &name).unwrap_or_else(|e| panic!("clearing '{name}': {e}"));
+            base.mkdir_all(&name).unwrap_or_else(|e| panic!("creating '{name}': {e}"));
+            roots.push(name.clone());
+            open(&format!("{base_url}/{name}"))
+        });
+        for name in roots {
+            remove_tree(&base, &name).unwrap_or_else(|e| panic!("cleaning up '{name}': {e}"));
+        }
+    }
+
+    /// Depth-first delete through the `Vfs` surface itself. The suite writes onto someone's
+    /// real share, so it leaves it exactly as it found it; a name that is already gone is a
+    /// success, not an error.
+    #[cfg(test)]
+    fn remove_tree(v: &Arc<dyn Vfs>, rel: &str) -> super::super::error::VfsResult<()> {
+        let Some(m) = v.stat(rel)? else {
+            return Ok(());
+        };
+        if m.kind == EntryKind::Dir {
+            for (name, _) in v.read_dir_names(rel)? {
+                remove_tree(v, &format!("{rel}/{name}"))?;
+            }
+            v.remove_dir(rel)
+        } else {
+            v.remove_file(rel)
         }
     }
 

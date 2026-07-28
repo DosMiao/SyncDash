@@ -14,7 +14,7 @@ use syncdash::pipeline::{apply, compare, filter, scan};
 use syncdash::run;
 use syncdash::transfer::pack;
 
-use args::{Cli, Cmd, CredCmd, Mode, NetCmd, TrashCmd};
+use args::{Cli, Cmd, CredCmd, Mode, TrashCmd};
 use logs::run_logs;
 
 #[cfg(windows)]
@@ -500,29 +500,6 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 }
             }
         }
-        Cmd::Net { cmd } => match cmd {
-            NetCmd::Umount => {
-                let rs = syncdash::fs::vfs::smb::umount_private_mounts();
-                if rs.is_empty() {
-                    if cfg!(windows) {
-                        println!("nothing to do on Windows — smb:// sessions are device-less; drop one with: net use \\\\host\\share /delete");
-                    } else {
-                        println!("no private mount points found");
-                    }
-                }
-                let mut fails = 0;
-                for (label, r) in rs {
-                    match r {
-                        Ok(()) => println!("unmounted {label}"),
-                        Err(e) => {
-                            fails += 1;
-                            eprintln!("failed to unmount {label}: {e}");
-                        }
-                    }
-                }
-                Ok(if fails > 0 { 1 } else { 0 })
-            }
-        },
         Cmd::Logs { cmd } => run_logs(cmd),
         Cmd::History { job, limit, prune_days } => {
             if let Some(days) = prune_days {

@@ -349,6 +349,15 @@ pub trait CredentialProvider: Send + Sync {
 pub fn open(phrase: &str, creds: &Arc<dyn CredentialProvider>) -> VfsResult<Arc<dyn Vfs>> {
     match spec::parse(phrase) {
         RootSpec::Local(p) => Ok(Arc::new(local::LocalVfs::new(p))),
+        // The in-process SMB2 client, not the OS's. It passes the same twelve-check contract
+        // against a live server that the OS route did, `set_mtime` included — which is the one
+        // that matters, because the root lock's heartbeat is a repeated `set_mtime`.
+        //
+        // The trade this makes is visible to the user and deliberate: an `smb://` root now needs
+        // a stored credential, because the crate forbids unsafe and so cannot reach SSPI to
+        // borrow this machine's login. `\\host\share` still parses as a plain local path and
+        // still needs nothing at all, so the zero-configuration route did not go anywhere — it
+        // just stopped being the thing `smb://` secretly meant.
         RootSpec::Remote(r) if r.scheme == "smb" => {
             Ok(Arc::new(smb::SmbBackend::new(r, creds.clone())?))
         }
