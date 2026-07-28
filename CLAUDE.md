@@ -38,7 +38,7 @@ Inherited conventions live in the reference project and apply here unchanged:
 
 - Verification after any edit — the whole story, no other tier: `cargo check --workspace`, `cargo test --workspace`, `npm run typecheck`. Done when all three pass with **zero warnings**.
 - After changing ANY `#[ts(export)]` type (`src/**` or `src-tauri/src/dto.rs`): `npm run gen:types` (= `node Script/gen-types.mjs`). Without it the frontend silently compiles against a stale shape.
-- Build: `npm run build && cargo build --release -p syncdash-desktop` (desktop) · `cargo build --release -p syncdash` (CLI). Windows menu `builder.bat`; Mac `bash builder.command` (pure cargo, no node).
+- Build: `npm run build && cargo build --release -p syncdash-desktop` (desktop) · `cargo build --release -p syncdash` (CLI). Windows menu `builder.bat`; Mac `./builder.command` (double-click or run; same item numbering). The Mac menu's `[2]`/`[3]`/`[4]` are pure cargo over the committed `dist/` and need no node; `[1]` Dev and `[A]` App do, because tauri runs `beforeBuildCommand` on both.
 - The root package is the **CLI**. A bare `cargo build --release` never builds the desktop — `-p syncdash-desktop` is required, and forgetting it leaves a stale GUI binary that looks like a code bug.
 - After any frontend change run `npm run build` and commit `dist/` with it: Tauri embeds `dist/` at compile time and the Mac cannot regenerate it.
 - `cargo test` does NOT refresh `target/release/syncdash.exe` — rebuild before any binary-level test.
