@@ -63,45 +63,6 @@ pub fn write_marker(root: &Path, job: &str, note: &str) -> std::io::Result<(Path
     Ok((p, true))
 }
 
-/// Returns (bytes available to the current user, total bytes on the volume). None if unavailable (not a blocker, just no check).
-#[cfg(windows)]
-pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
-    use std::os::windows::ffi::OsStrExt;
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetDiskFreeSpaceExW(
-            lp_directory_name: *const u16,
-            lp_free_bytes_available_to_caller: *mut u64,
-            lp_total_number_of_bytes: *mut u64,
-            lp_total_number_of_free_bytes: *mut u64,
-        ) -> i32;
-    }
-    // UNC paths (\\host\share\...) are supported too — exactly what an SMB target needs
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
-    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
-    if ok == 0 {
-        None
-    } else {
-        Some((avail, total))
-    }
-}
-
-#[cfg(unix)]
-pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    unsafe {
-        let mut st: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
-            return None;
-        }
-        // f_frsize is the "fragment size", the right unit for capacity math; fall back to f_bsize when it is 0
-        let unit = if st.f_frsize > 0 { st.f_frsize as u64 } else { st.f_bsize as u64 };
-        Some((st.f_bavail as u64 * unit, st.f_blocks as u64 * unit))
-    }
-}
-
 #[derive(Default, Clone, Debug)]
 pub struct SideStats {
     /// Bytes that have to be written (copy + update)
@@ -558,7 +519,7 @@ pub fn check_space(label: &str, root: &Path, need: u64, min_free_pct: f64, v: &m
     if need == 0 {
         return;
     }
-    let Some((avail, total)) = disk_space(root) else {
+    let Some((avail, total)) = crate::foundation::disk::disk_space(root) else {
         v.warnings.push(format!("{label}: cannot determine free space on {}", root.display()));
         return;
     };
@@ -760,7 +721,7 @@ mod tests {
     #[test]
     fn disk_space_reports_something_for_temp_dir() {
         // Don't assert specific numbers, only that this machine can report them — failing to would degrade to a warning, not a block
-        let got = disk_space(&std::env::temp_dir());
+        let got = crate::foundation::disk::disk_space(&std::env::temp_dir());
         assert!(got.is_some(), "free space query should work on the temp volume");
         let (avail, total) = got.unwrap();
         assert!(total > 0 && avail <= total);

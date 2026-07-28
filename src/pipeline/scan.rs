@@ -6,8 +6,7 @@
 use crate::foundation::time::now_ms;
 use crate::model::table::{os_name, Entry, EntryKind, Header, Snapshot, SCHEMA};
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[cfg(unix)]
 fn file_id(md: &std::fs::Metadata) -> Option<String> {
@@ -29,171 +28,12 @@ fn unix_mode(_md: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
-/// Initialize the global rayon pool (hash worker threads): **lowered priority** —— a standard scan's BLAKE3
-/// deliberately runs on every core (get the one-off cost over with) but must not grind the whole machine to a halt;
-/// at below-normal priority a full-core hash yields to foreground programs on its own, with no throughput loss on an idle box.
-/// `SYNCDASH_SCAN_THREADS=N` caps the thread count further. CLI and desktop each call this once at startup (idempotent).
-pub fn init_worker_pool() {
-    let mut b = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("sd-hash-{i}"));
-    if let Ok(n) = std::env::var("SYNCDASH_SCAN_THREADS") {
-        if let Ok(n) = n.parse::<usize>() {
-            if n >= 1 {
-                b = b.num_threads(n.min(64));
-            }
-        }
-    }
-    // build_global returns Err when a global pool already exists (repeat call) —— swallowing it is fine
-    let _ = b.start_handler(|_| lower_thread_priority()).build_global();
-}
-
-#[cfg(windows)]
-fn lower_thread_priority() {
-    // THREAD_PRIORITY_BELOW_NORMAL = -1 (lowers this thread only, not the process; the UI thread is untouched)
-    extern "system" {
-        fn GetCurrentThread() -> isize;
-        fn SetThreadPriority(h: isize, p: i32) -> i32;
-    }
-    unsafe {
-        SetThreadPriority(GetCurrentThread(), -1);
-    }
-}
-#[cfg(target_os = "linux")]
-fn lower_thread_priority() {
-    // nice on Linux is per-thread
-    unsafe {
-        libc::nice(3);
-    }
-}
-#[cfg(all(unix, not(target_os = "linux")))]
-fn lower_thread_priority() {
-    // nice() on macOS is process-wide; touching it would drag the UI down with it —— so don't
-}
-
 fn mtime_ms(md: &std::fs::Metadata) -> i64 {
     md.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-fn cache_dir() -> PathBuf {
-    if let Ok(l) = std::env::var("LOCALAPPDATA") {
-        PathBuf::from(l).join("syncdash").join("hashcache")
-    } else if let Ok(h) = std::env::var("HOME") {
-        PathBuf::from(h).join(".cache").join("syncdash").join("hashcache")
-    } else {
-        PathBuf::from(".syncdash-cache")
-    }
-}
-
-/// Cache identity: for a local root this is the root string exactly as spelled (existing
-/// cache files keep their names — pinned by a regression test); for a VFS root it is
-/// `Vfs::identity()`, so different hosts/users/protocols never share a cache.
-fn cache_file_for_key(key: &str) -> PathBuf {
-    let key = blake3::hash(key.to_lowercase().as_bytes());
-    cache_dir().join(format!("{}.jsonl", &key.to_hex()[..16]))
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CacheLine {
-    path: String,
-    size: u64,
-    mtime_ms: i64,
-    hash: String,
-}
-
-fn load_cache_by_key(key: &str) -> HashMap<String, (u64, i64, String)> {
-    let mut map = HashMap::new();
-    if let Ok(f) = std::fs::File::open(cache_file_for_key(key)) {
-        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-            if let Ok(c) = serde_json::from_str::<CacheLine>(&line) {
-                map.insert(c.path, (c.size, c.mtime_ms, c.hash));
-            }
-        }
-    }
-    map
-}
-
-fn load_cache(root: &Path) -> HashMap<String, (u64, i64, String)> {
-    load_cache_by_key(&root.to_string_lossy())
-}
-
-// mtime correction table (P1-4)
-//
-// FAT/exFAT only has 2-second granularity, and some SMB servers truncate or shift the timestamp they are handed.
-// We used to set the mtime and forget it, leaning on a ±2s tolerance at compare time —— a tolerance can miss a real
-// change (edited within 2 seconds) and can equally invent one (shift larger than the tolerance), and with
-// rigor = "quick" the tolerance is the **only** criterion. syncthing's mtimeFS (`lib/fs/mtimefs.go:68`) stats the
-// file right back after writing, stores (ondisk, virtual) in its database and reports virtual from then on. Same
-// thing here, kept in the existing user cache directory, never polluting the scanned tree.
-
-fn mtime_fix_file_for_key(key: &str) -> PathBuf {
-    let k = blake3::hash(key.to_lowercase().as_bytes());
-    cache_dir().join(format!("{}.mtimefix.jsonl", &k.to_hex()[..16]))
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct MtimeFix {
-    path: String,
-    ondisk_ms: i64,
-    intended_ms: i64,
-}
-
-/// path -> (ondisk, intended)
-pub fn load_mtime_fixes(root: &Path) -> HashMap<String, (i64, i64)> {
-    load_mtime_fixes_by_key(&root.to_string_lossy())
-}
-
-pub fn load_mtime_fixes_by_key(key: &str) -> HashMap<String, (i64, i64)> {
-    let mut map = HashMap::new();
-    if let Ok(f) = std::fs::File::open(mtime_fix_file_for_key(key)) {
-        for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-            if let Ok(c) = serde_json::from_str::<MtimeFix>(&line) {
-                map.insert(c.path, (c.ondisk_ms, c.intended_ms));
-            }
-        }
-    }
-    map
-}
-
-
-pub fn record_mtime_fixes_by_key(key: &str, fixes: &[(String, i64, i64)]) {
-    if fixes.is_empty() {
-        return;
-    }
-    let file = mtime_fix_file_for_key(key);
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    // Merge, then rewrite wholesale: avoids appending forever
-    let mut map = load_mtime_fixes_by_key(key);
-    for (p, ondisk, intended) in fixes {
-        map.insert(p.clone(), (*ondisk, *intended));
-    }
-    if let Ok(f) = std::fs::File::create(&file) {
-        let mut w = std::io::BufWriter::new(f);
-        for (path, (ondisk_ms, intended_ms)) in map {
-            let rec = MtimeFix { path, ondisk_ms, intended_ms };
-            let _ = writeln!(w, "{}", serde_json::to_string(&rec).unwrap());
-        }
-    }
-}
-
-fn save_cache_by_key(key: &str, entries: &[Entry]) {
-    let file = cache_file_for_key(key);
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(f) = std::fs::File::create(&file) {
-        let mut w = std::io::BufWriter::new(f);
-        for e in entries {
-            if let Some(h) = &e.hash {
-                let c = CacheLine { path: e.path.clone(), size: e.size, mtime_ms: e.mtime_ms, hash: h.clone() };
-                let _ = writeln!(w, "{}", serde_json::to_string(&c).unwrap());
-            }
-        }
-    }
 }
 
 pub struct ScanOptions {
@@ -360,8 +200,8 @@ fn scan_vfs(
     // Never silent: preflight already put a NeedsAck line in front of the user, and the
     // snapshot's VfsNote records the tier that actually ran.
     let sampled = opt.sampled && caps.ranged_read.yes();
-    let cache = if opt.hash && opt.use_cache { load_cache_by_key(&identity) } else { HashMap::new() };
-    let mtime_fixes = load_mtime_fixes_by_key(&identity);
+    let cache = if opt.hash && opt.use_cache { crate::store::hashcache::load_by_key(&identity) } else { HashMap::new() };
+    let mtime_fixes = crate::store::mtimefix::load_by_key(&identity);
 
     let mut entries: Vec<Entry> = Vec::new();
     struct PendingVfs {
@@ -542,7 +382,7 @@ fn scan_vfs(
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     if opt.hash {
-        save_cache_by_key(&identity, &entries);
+        crate::store::hashcache::save_by_key(&identity, &entries);
     }
     if hash_errors > 0 {
         crate::log_warn!("scan", "warning: {hash_errors} file(s) could not be hashed (in use / unreadable)");
@@ -595,8 +435,8 @@ fn scan_impl(
     };
     let started = now_ms();
     let t0 = std::time::Instant::now();
-    let cache = if opt.hash { load_cache(root) } else { HashMap::new() };
-    let mtime_fixes = load_mtime_fixes(root);
+    let cache = if opt.hash { crate::store::hashcache::load(root) } else { HashMap::new() };
+    let mtime_fixes = crate::store::mtimefix::load(root);
     let mut entries: Vec<Entry> = Vec::new();
     let mut hash_errors = 0u64;
 
@@ -930,7 +770,7 @@ fn scan_impl(
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     if opt.hash {
-        save_cache_by_key(&root.to_string_lossy(), &entries);
+        crate::store::hashcache::save_by_key(&root.to_string_lossy(), &entries);
     }
     hash_errors += hash_err_count.load(std::sync::atomic::Ordering::Relaxed);
     if hash_errors > 0 {
@@ -1048,7 +888,7 @@ use crate::obs::progress::{is_cancelled, RunCtl, RunCtx};
         }
     }
 
-    fn mk_tree(tag: &str, n: usize) -> PathBuf {
+    fn mk_tree(tag: &str, n: usize) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("syncdash-scanctx-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sub")).unwrap();
@@ -1056,17 +896,6 @@ use crate::obs::progress::{is_cancelled, RunCtl, RunCtx};
             std::fs::write(root.join("sub").join(format!("f{i}.dat")), vec![i as u8; 100]).unwrap();
         }
         root
-    }
-
-    #[test]
-    fn cache_key_formula_is_pinned_to_the_pre_vfs_one() {
-        // The historical key was blake3(root_string.to_lowercase())[..16] over the root
-        // exactly as spelled. LocalVfs::identity() reproduces the root string, so every
-        // pre-VFS cache file must keep its name — this pins the formula against drift.
-        let root = r"D:\Some\Root";
-        let expected_stem = &blake3::hash(root.to_lowercase().as_bytes()).to_hex()[..16];
-        let got = cache_file_for_key(&std::path::PathBuf::from(root).to_string_lossy());
-        assert_eq!(got.file_name().unwrap().to_string_lossy(), format!("{expected_stem}.jsonl"));
     }
 
     #[test]

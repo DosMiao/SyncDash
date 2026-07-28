@@ -42,6 +42,21 @@ pub fn default_log_dir() -> PathBuf {
     config_dir().join("logs")
 }
 
+/// Machine-local state root: `%LOCALAPPDATA%\syncdash`, else `$HOME/.cache/syncdash`.
+///
+/// Deliberately **not** `config_dir`. That one is `%APPDATA%` (roaming), which is right for job
+/// files and settings and wrong for everything below: a hash cache keyed by local path and a
+/// recycle store full of file bodies must not follow a user onto another machine.
+pub fn data_dir() -> PathBuf {
+    if let Ok(l) = std::env::var("LOCALAPPDATA") {
+        PathBuf::from(l).join("syncdash")
+    } else if let Ok(h) = std::env::var("HOME") {
+        PathBuf::from(h).join(".cache").join("syncdash")
+    } else {
+        PathBuf::from(".syncdash")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

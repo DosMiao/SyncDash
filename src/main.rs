@@ -2,7 +2,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
-use syncdash::job::{self, territory};
+use syncdash::job::{self, junk, territory};
 use syncdash::model::table;
 use syncdash::pipeline::{apply, compare, filter, scan};
 use syncdash::run;
@@ -496,13 +496,11 @@ fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
 }
 
 fn main() {
-    syncdash::pipeline::scan::init_worker_pool();
-    // The CLI has a console: pipe the library's diagnostics back to stderr verbatim — the pre-refactor terminal experience, word for word.
-    // It must be installed before any library call, and the guard must live to process exit (`_g` cannot be
-    // written `_`: `let _ = ...` drops on the spot and the sink is pulled straight back out).
-    let cfg = syncdash::store::settings::load();
-    let _g = cfg.mirror_stderr.then(|| {
-        syncdash::obs::progress::install(Arc::new(syncdash::obs::logging::StderrSink { min_level: cfg.level }))
+    // The CLI has a console: pipe the library's diagnostics back to stderr verbatim — the
+    // pre-refactor terminal experience, word for word. `_session` must live to process exit.
+    let _session = syncdash::boot::init(|cfg| {
+        cfg.mirror_stderr
+            .then(|| Arc::new(syncdash::obs::logging::StderrSink { min_level: cfg.level }) as Arc<_>)
     });
     let cli = Cli::parse();
     let code = match run_cli(cli) {
@@ -654,17 +652,17 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             match patterns {
                 Some(ids) => {
                     let ids: Vec<&str> = ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-                    if let Some(bad) = ids.iter().find(|id| filter::junk_preset(id).is_none()) {
+                    if let Some(bad) = ids.iter().find(|id| junk::junk_preset(id).is_none()) {
                         eprintln!("error: unknown junk preset '{bad}' — run `syncdash junk` for the list");
                         return Ok(2);
                     }
-                    for p in filter::expand_junk_presets(&ids) {
+                    for p in junk::expand_junk_presets(&ids) {
                         println!("{p}");
                     }
                 }
                 None => {
                     println!("Junk presets — each one is a macro over a job's `exclude` list, nothing more:\n");
-                    for p in filter::JUNK_PRESETS {
+                    for p in junk::JUNK_PRESETS {
                         println!("{}{}  ({})", p.id, if p.default_on { " [on for new jobs]" } else { "" }, p.label);
                         println!("  {}", p.hint);
                         println!("  {}\n", p.patterns.join("  "));
@@ -683,35 +681,38 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
             // An unknown preset id is an error, never a silent no-op: a scan that quietly excluded less
             // than asked is exactly the kind of near-miss that only shows up as a surprise in a plan
             let ids: Vec<&str> = junk.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none")).collect();
-            if let Some(bad) = ids.iter().find(|id| filter::junk_preset(id).is_none()) {
-                let known: Vec<&str> = filter::JUNK_PRESETS.iter().map(|p| p.id).collect();
+            if let Some(bad) = ids.iter().find(|id| junk::junk_preset(id).is_none()) {
+                let known: Vec<&str> = junk::JUNK_PRESETS.iter().map(|p| p.id).collect();
                 eprintln!("error: unknown junk preset '{bad}' (known: {}, or `none`)", known.join(", "));
                 return Ok(2);
             }
-            let mut excludes = filter::expand_junk_presets(&ids);
+            let mut excludes = junk::expand_junk_presets(&ids);
             excludes.extend(exclude.iter().cloned());
-            // preset lays the base → detail overrides → legacy-flag compatibility overrides
-            let (mut hash, mut sampled, mut use_cache) = match rigor.as_str() {
-                "quick" => (false, false, false),
-                "fast" => (true, true, true),
-                "paranoid" => (true, false, false),
-                _ => (true, true, false), // standard / custom
+            // One ladder, shared with `Job::rigor_resolved`: preset → detail overrides → the two
+            // legacy flags this subcommand still accepts. `--fast` and `--force-rehash` predate
+            // `--evidence`/`--cache` and are applied after them, so an explicit flag still wins.
+            let mut r = job::rigor::RigorResolved::from_preset(&rigor)
+                .with_evidence(evidence.as_deref())
+                .with_cache(match cache.as_deref() {
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    _ => None,
+                })
+                .with_no_hash(no_hash);
+            if fast {
+                r.sampled = true;
+                r.use_cache = true;
+            }
+            if force_rehash {
+                r.use_cache = false;
+            }
+            let sopt = scan::ScanOptions {
+                hash: r.hash,
+                sampled: r.sampled,
+                use_cache: r.use_cache,
+                symlinks_direct,
+                filter: filter::PathFilter::build(&[], &excludes),
             };
-            match evidence.as_deref() {
-                Some("none") => { hash = false; sampled = false; }
-                Some("full") => { hash = true; sampled = false; }
-                Some(_) => { hash = true; sampled = true; }
-                None => {}
-            }
-            match cache.as_deref() {
-                Some("on") => use_cache = true,
-                Some("off") => use_cache = false,
-                _ => {}
-            }
-            if no_hash { hash = false; }
-            if fast { sampled = true; use_cache = true; }
-            if force_rehash { use_cache = false; }
-            let sopt = scan::ScanOptions { hash, sampled, use_cache, symlinks_direct, filter: filter::PathFilter::build(&[], &excludes) };
             let bar = |p: scan::ScanProgress| {
                 let pct = if p.bytes_total > 0 { p.bytes_done * 100 / p.bytes_total } else { 100 };
                 eprint!("\r{} {:>3}%  {}/{}  {:.1} MiB/s   ", p.phase, pct,
@@ -777,12 +778,12 @@ fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
                 .collect();
-            if let Some(bad) = ids.iter().find(|id| filter::junk_preset(id).is_none()) {
-                let known: Vec<&str> = filter::JUNK_PRESETS.iter().map(|p| p.id).collect();
+            if let Some(bad) = ids.iter().find(|id| junk::junk_preset(id).is_none()) {
+                let known: Vec<&str> = junk::JUNK_PRESETS.iter().map(|p| p.id).collect();
                 eprintln!("error: unknown junk preset '{bad}' (known: {}, or `none`)", known.join(", "));
                 return Ok(2);
             }
-            let n_pat = filter::expand_junk_presets(&ids).len();
+            let n_pat = junk::expand_junk_presets(&ids).len();
             let opts = territory::GenOpts { mode, rigor, junk: ids.clone(), force, ..Default::default() };
             let outs = territory::gen_jobs(&root, &target_root, &opts, remote.as_ref())?;
             for o in &outs {

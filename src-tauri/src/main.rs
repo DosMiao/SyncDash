@@ -459,7 +459,7 @@ struct JunkPresetDto {
 /// reason a checkbox can now be trusted to describe what a job excludes.
 #[tauri::command]
 fn junk_presets() -> Vec<JunkPresetDto> {
-    syncdash::pipeline::filter::JUNK_PRESETS
+    syncdash::job::junk::JUNK_PRESETS
         .iter()
         .map(|p| JunkPresetDto {
             id: p.id.to_string(),
@@ -655,14 +655,14 @@ fn get_settings() -> syncdash::store::settings::AppSettings {
 fn save_settings(
     s: syncdash::store::settings::AppSettings,
     migrate: bool,
-) -> Result<syncdash::store::settings::MigrateReport, String> {
+) -> Result<syncdash::store::migrate::MigrateReport, String> {
     let old_dir = syncdash::store::settings::load().wanted_log_dir();
     let new_dir = s.wanted_log_dir();
     syncdash::store::settings::save(&s).map_err(|e| e.to_string())?;
     if migrate && old_dir != new_dir {
-        Ok(syncdash::store::settings::migrate_log_dir(&old_dir, &new_dir))
+        Ok(syncdash::store::migrate::migrate_log_dir(&old_dir, &new_dir))
     } else {
-        Ok(syncdash::store::settings::MigrateReport::default())
+        Ok(syncdash::store::migrate::MigrateReport::default())
     }
 }
 
@@ -889,13 +889,12 @@ async fn apply_job(
 }
 
 fn main() {
-    syncdash::pipeline::scan::init_worker_pool();
     // A windowed build has no console — the only home for diagnostics outside a run (settings parse
-    // failures, pruning, migration) is app.jsonl. `_log` must live until the process exits: writing
-    // `let _ = …` drops it on the spot and the sink is unhooked immediately.
-    let cfg = syncdash::store::settings::load();
-    let _log = std::sync::Arc::new(syncdash::obs::logging::AppLogSink::open(&cfg.resolved_log_dir(), cfg.level));
-    let _log_guard = syncdash::obs::progress::install(_log.clone());
+    // failures, pruning, migration) is app.jsonl. `_session` must live until the process exits.
+    let _session = syncdash::boot::init(|cfg| {
+        Some(Arc::new(syncdash::obs::logging::AppLogSink::open(&cfg.resolved_log_dir(), cfg.level)) as Arc<_>)
+    });
+    let cfg = &_session.settings;
     // Retention runs once at startup: the apply manifest records everything and grows without a gate
     let dropped = syncdash::obs::runlog::prune(cfg.keep_days, cfg.max_total_mb);
     if dropped > 0 {

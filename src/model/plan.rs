@@ -114,7 +114,6 @@ impl Plan {
     /// Parse from any reader. `apply_pack` holds the plan as bytes already, and routing it
     /// through a temp file to reach `load` gave two concurrent calls the same path to fight over.
     pub fn from_reader(r: impl std::io::BufRead) -> std::io::Result<Plan> {
-        use std::io::BufRead;
         let mut lines = r.lines();
         let head = lines.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty plan"))??;
         let header: PlanHeader = serde_json::from_str(&head)

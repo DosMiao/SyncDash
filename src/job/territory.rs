@@ -126,7 +126,7 @@ pub fn gen_jobs(
     let terrs = find_territories(source_root);
     std::fs::create_dir_all(&opts.dest)?;
     std::fs::create_dir_all(&opts.archives)?;
-    let junk = crate::pipeline::filter::expand_junk_presets(&opts.junk);
+    let junk = crate::job::junk::expand_junk_presets(&opts.junk);
     let mut out = Vec::new();
     for rel in terrs {
         let name = format!("cs-{}", slug(&rel));
@@ -218,7 +218,7 @@ mod tests {
         assert!(o[0].written);
 
         let (_, job) = crate::job::load(&o[0].path.to_string_lossy()).unwrap();
-        let expect = crate::pipeline::filter::expand_junk_presets(["windows", "dev"]);
+        let expect = crate::job::junk::expand_junk_presets(["windows", "dev"]);
         assert_eq!(job.exclude, expect, "every rule is a line in exclude");
         // …and the same lines are literally in the text, not hidden behind a preset name
         let text = std::fs::read_to_string(&o[0].path).unwrap();

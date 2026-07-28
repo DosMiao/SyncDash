@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! L4  shells         src/main.rs (CLI) · src-tauri (desktop)
-//! L3  orchestration  run · job
+//! L3  orchestration  run · job · boot (process startup)
 //! L2  domain         pipeline (scan/compare/apply/filter/guard) · transfer (remote/pack)
 //! L1  services       obs (progress/logging/runlog) · store (settings/trash/version)
 //! L0  foundation     foundation · model (plan/event/table/chunk) · fs (staged/lock)
@@ -54,5 +54,6 @@ pub mod store;
 pub mod pipeline;
 pub mod transfer;
 
+pub mod boot;
 pub mod job;
 pub mod run;

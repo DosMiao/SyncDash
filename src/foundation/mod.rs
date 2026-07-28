@@ -6,6 +6,7 @@
 pub mod fmt;
 pub mod names;
 pub mod dirs;
+pub mod disk;
 pub mod path;
 pub mod text;
 pub mod time;
