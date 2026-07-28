@@ -970,9 +970,11 @@ mod tests {
         assert!(c.reason.contains("case-collision"), "{}", c.reason);
     }
 
-    /// The gap that shipped: `smb://` roots record `header.os = "smb"`, so the
-    /// `os == "windows"` gate skipped them — while the SMB backend delegates through the
-    /// local Win32 path layer, which is precisely where these names get mangled.
+    /// The gap that shipped: a VFS root records `header.os` as the *protocol*, so the
+    /// `os == "windows"` gate skipped every one of them. The recorded `name_rules` is what
+    /// decides now — and a root can still carry `windows` while `os` says `smb`, because that
+    /// is exactly what the tables written by the old OS-delegating SMB backend look like, and
+    /// those tables are still on disk being compared against.
     #[test]
     fn windows_name_check_fires_on_an_smb_root_not_just_a_local_windows_one() {
         let bad = vec![
