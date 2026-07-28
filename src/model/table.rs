@@ -162,3 +162,101 @@ pub fn host_name() -> String {
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "unknown".into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(path: &str, size: u64, hash: Option<&str>) -> Entry {
+        Entry {
+            path: path.into(),
+            kind: EntryKind::File,
+            size,
+            mtime_ms: 1_700_000_000_000,
+            hash: hash.map(String::from),
+            file_id: None,
+            mode: None,
+            link: None,
+            prev: None,
+        }
+    }
+
+    fn header() -> Header {
+        Header {
+            schema: 1,
+            kind: "snapshot".into(),
+            root: r"D:\data".into(),
+            host: "win01".into(),
+            os: "windows".into(),
+            scanned_at_ms: 1_700_000_000_000,
+            duration_ms: 12,
+            entry_count: 0,
+            hashed: true,
+            excluded_dirs: 3,
+            excluded_files: 4,
+            vfs: None,
+        }
+    }
+
+    /// The snapshot is the format every stage hands to the next and the one an archive is read
+    /// back from months later. A field that silently stops surviving the trip is a whole class
+    /// of wrong answers, so pin the round-trip rather than the struct.
+    #[test]
+    fn a_snapshot_survives_write_then_read() {
+        let snap = Snapshot {
+            header: header(),
+            entries: vec![
+                entry("a/one.txt", 10, Some("abc")),
+                entry("b/two.bin", 2048, None),
+            ],
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        snap.write_to(&mut buf).unwrap();
+        let back = Snapshot::from_reader(std::io::BufReader::new(&buf[..])).unwrap();
+
+        assert_eq!(back.header.root, snap.header.root);
+        assert_eq!(back.header.hashed, snap.header.hashed);
+        assert_eq!(back.header.excluded_dirs, 3, "exclusion counts must survive — the UI reports them");
+        assert_eq!(back.header.excluded_files, 4);
+        assert_eq!(back.entries.len(), 2);
+        assert_eq!(back.entries[0].path, "a/one.txt");
+        assert_eq!(back.entries[0].hash.as_deref(), Some("abc"));
+        assert_eq!(back.entries[1].hash, None, "an absent hash must stay absent, not become empty string");
+    }
+
+    /// One JSON object per line is what lets an ssh pipe, an archive and an audit share a format.
+    #[test]
+    fn the_table_is_one_json_object_per_line() {
+        let snap = Snapshot { header: header(), entries: vec![entry("x", 1, None), entry("y", 2, None)] };
+        let mut buf: Vec<u8> = Vec::new();
+        snap.write_to(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "one header line plus one line per entry");
+        for l in &lines {
+            serde_json::from_str::<serde_json::Value>(l).expect("every line parses on its own");
+        }
+    }
+
+    /// Generations are the archive's cheap stand-in for a causal clock: the newest hash is the
+    /// current one and older ones ride along, newest first, capped.
+    #[test]
+    fn roll_generations_chains_history_newest_first_and_caps() {
+        let mut fresh = vec![entry("f", 1, Some("v4"))];
+        let old = vec![Entry { prev: Some(vec!["v2".into(), "v1".into()]), ..entry("f", 1, Some("v3")) }];
+        roll_generations(&mut fresh, &old);
+        let prev = fresh[0].prev.clone().expect("history must attach");
+        assert_eq!(prev.first().map(String::as_str), Some("v3"), "the previous current hash leads");
+        assert!(prev.len() <= ARCHIVE_GENERATIONS, "history is capped at {ARCHIVE_GENERATIONS}");
+    }
+
+    /// An unchanged file must not accumulate a generation per scan.
+    #[test]
+    fn roll_generations_does_not_grow_when_content_is_unchanged() {
+        let mut fresh = vec![entry("f", 1, Some("same"))];
+        let old = vec![entry("f", 1, Some("same"))];
+        roll_generations(&mut fresh, &old);
+        let prev = fresh[0].prev.clone().unwrap_or_default();
+        assert!(!prev.contains(&"same".to_string()), "the current hash must not also sit in its own history");
+    }
+}

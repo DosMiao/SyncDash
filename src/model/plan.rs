@@ -109,9 +109,13 @@ impl Plan {
         Ok(())
     }
     pub fn load(path: &std::path::Path) -> std::io::Result<Plan> {
+        Plan::from_reader(std::io::BufReader::new(std::fs::File::open(path)?))
+    }
+    /// Parse from any reader. `apply_pack` holds the plan as bytes already, and routing it
+    /// through a temp file to reach `load` gave two concurrent calls the same path to fight over.
+    pub fn from_reader(r: impl std::io::BufRead) -> std::io::Result<Plan> {
         use std::io::BufRead;
-        let f = std::fs::File::open(path)?;
-        let mut lines = std::io::BufReader::new(f).lines();
+        let mut lines = r.lines();
         let head = lines.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty plan"))??;
         let header: PlanHeader = serde_json::from_str(&head)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad plan header: {e}")))?;
@@ -123,5 +127,86 @@ impl Plan {
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad op: {e}")))?);
         }
         Ok(Plan { header, ops })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(ops: usize) -> PlanHeader {
+        PlanHeader {
+            schema: 1,
+            kind: "plan".into(),
+            mode: "mirror".into(),
+            generated_at_ms: 1_700_000_000_000,
+            source_root: r"D:\src".into(),
+            source_host: "win01".into(),
+            target_root: "/Volumes/tgt".into(),
+            target_host: "mac".into(),
+            op_count: ops as u64,
+            conflict_count: 1,
+            source_entries: 10,
+            target_entries: 9,
+            source_excluded: 2,
+            target_excluded: 3,
+        }
+    }
+
+    fn op(action: Action, path: &str) -> Op {
+        Op {
+            side: Side::Target,
+            action,
+            path: path.into(),
+            from: None,
+            size: Some(4096),
+            mtime_ms: Some(1_700_000_000_000),
+            hash: Some("deadbeef".into()),
+            link: None,
+            mode: Some(0o644),
+            reason: "because".into(),
+        }
+    }
+
+    /// The plan crosses machines inside a package and is replayed on the far side, so what
+    /// survives serialization is exactly what the remote will execute.
+    #[test]
+    fn a_plan_survives_write_then_read() {
+        let plan = Plan {
+            header: header(2),
+            ops: vec![op(Action::Copy, "a/one.txt"), Op { from: Some("old/two.bin".into()), ..op(Action::Move, "new/two.bin") }],
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        plan.write_to(&mut buf).unwrap();
+        let back = Plan::from_reader(std::io::BufReader::new(&buf[..])).unwrap();
+
+        assert_eq!(back.header.mode, "mirror");
+        assert_eq!(back.header.target_root, "/Volumes/tgt");
+        assert_eq!(back.header.conflict_count, 1);
+        assert_eq!(back.ops.len(), 2);
+        assert_eq!(back.ops[0].action, Action::Copy);
+        assert_eq!(back.ops[0].mode, Some(0o644), "the mode SMB cannot carry must survive the plan");
+        assert_eq!(back.ops[1].action, Action::Move);
+        assert_eq!(back.ops[1].from.as_deref(), Some("old/two.bin"), "a move without its origin is a copy");
+    }
+
+    /// Action and Side serialize snake_case, and the CSV export, the event stream and the plan
+    /// JSONL all quote that same spelling. Debug's PascalCase would put them out of step.
+    #[test]
+    fn action_and_side_spell_themselves_snake_case() {
+        let j = serde_json::to_string(&op(Action::DeleteDir, "d")).unwrap();
+        assert!(j.contains("\"delete_dir\""), "{j}");
+        assert!(j.contains("\"target\""), "{j}");
+    }
+
+    /// An empty file is not a valid plan — better a loud parse error than an empty op list
+    /// silently reported as "nothing to do".
+    #[test]
+    fn an_empty_plan_file_is_an_error_not_an_empty_plan() {
+        let e = match Plan::from_reader(std::io::BufReader::new(&b""[..])) {
+            Err(e) => e,
+            Ok(_) => panic!("an empty file must not parse as a plan"),
+        };
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
     }
 }

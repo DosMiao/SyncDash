@@ -205,6 +205,7 @@ fn staged_read_back_returns_written_bytes(v: Arc<dyn Vfs>) {
 mod suite {
     use super::*;
     use crate::fs::vfs::local::LocalVfs;
+    use crate::fs::vfs::memory::MemVfs;
 
     #[test]
     fn local_backend_conforms() {
@@ -221,5 +222,46 @@ mod suite {
         for d in dirs {
             let _ = std::fs::remove_dir_all(&d);
         }
+    }
+
+    #[test]
+    fn memory_backend_conforms() {
+        let mut n = 0;
+        run_all(&mut || {
+            n += 1;
+            Arc::new(MemVfs::new(&format!("conformance-{n}"))) as Arc<dyn Vfs>
+        });
+    }
+
+    /// The SFTP capability shape: rename refuses to overwrite, mtimes land on a second boundary.
+    #[test]
+    fn sftp_shaped_caps_conform() {
+        let mut n = 0;
+        run_all(&mut || {
+            n += 1;
+            Arc::new(MemVfs::new(&format!("sftpish-{n}")).without(|c| {
+                c.rename_overwrite = Support::No;
+                c.mtime_precision_ms = 1000;
+            })) as Arc<dyn Vfs>
+        });
+    }
+
+    /// The LIST-only FTP shape: no ranged reads, no mtime setting, no symlinks, no read-back,
+    /// no unix modes, minute-granular mtimes. Every optional check must skip rather than fail.
+    #[test]
+    fn ftp_shaped_caps_conform() {
+        let mut n = 0;
+        run_all(&mut || {
+            n += 1;
+            Arc::new(MemVfs::new(&format!("ftpish-{n}")).without(|c| {
+                c.ranged_read = Support::No;
+                c.set_mtime = Support::No;
+                c.symlink = Support::No;
+                c.read_back = Support::No;
+                c.fsync = Support::No;
+                c.unix_mode = Support::No;
+                c.mtime_precision_ms = 60_000;
+            })) as Arc<dyn Vfs>
+        });
     }
 }
