@@ -14,24 +14,19 @@ set "VITE_PORT=5173"
 REM Explorer-launched cmd does not always inherit cargo's bin dir. Add it.
 set PATH=%USERPROFILE%\.cargo\bin;%PATH%
 
-REM Detect ESC once (menu colors + clickable file links).
-REM Windows Terminal (WT_SESSION) renders VT natively, so the instant cmd
-REM prompt-trick suffices and the menu appears with zero spawn delay; legacy
-REM conhost keeps the slower powershell spawn - that spawn also flips the
-REM console into VT mode as a side effect, which plain cmd cannot do.
+REM Windows Terminal renders VT natively, so the cmd prompt-trick is instant; legacy
+REM conhost needs the powershell spawn, which also flips the console into VT mode.
 set "ESC="
 if defined WT_SESSION goto :esc_prompt_trick
 for /f %%a in ('powershell -NoProfile -Command "[char]27" 2^>nul') do set "ESC=%%a"
 goto :esc_done
 :esc_prompt_trick
-REM Every line the child cmd echoes starts with the #$E# prompt, so token 1
-REM under delims=# is the bare ESC char.
+REM Each echoed line starts with the #$E# prompt, so token 1 under delims=# is bare ESC.
 for /f "delims=#" %%a in ('"prompt #$E# & echo on & for %%b in (1) do rem"') do set "ESC=%%a"
 :esc_done
 
-REM Dim is CDM, not CD: %CD% is cmd's dynamic current-directory variable - when
-REM the no-ANSI path unsets it, %CD% expands to the working directory instead of
-REM "" and the menu prints paths mid-text.
+REM Dim is CDM, not CD: %CD% is cmd's dynamic current-directory variable, so the
+REM no-ANSI path would expand it to the working directory mid-menu.
 if not defined ESC goto :colors_empty
 set "C0=%ESC%[0m"
 set "CB=%ESC%[96m"
@@ -64,39 +59,39 @@ echo     %CG%[1]%C0% %CW%Dev%C0%          %CDM%tauri dev, HMR%C0%         %CG%[R
 echo     %CG%[2]%C0% %CW%Desktop%C0%      %CDM%vite + cargo%C0%
 echo     %CG%[3]%C0% %CW%CLI%C0%          %CDM%syncdash.exe, no node%C0%
 echo     %CG%[4]%C0% %CW%All%C0%          %CDM%[2] + [3]%C0%
+echo     %CG%[5]%C0% %CW%Installer%C0%    %CDM%NSIS setup%C0%
 echo                      %CDM%2 / 4 auto-launch on success%C0%
 echo.
 echo   %CDM%Utility%C0%
-echo     %CY%[5]%C0% %CW%Kill app%C0%    %CY%[6]%C0% %CW%Kill + unlock exe%C0%    %CY%[7]%C0% %CW%Clean artifacts%C0%    %CR%[Q]%C0% %CW%Quit%C0%
+echo     %CY%[6]%C0% %CW%Kill app%C0%    %CY%[7]%C0% %CW%Kill + unlock exe%C0%    %CY%[8]%C0% %CW%Clean artifacts%C0%    %CR%[Q]%C0% %CW%Quit%C0%
 echo.
-choice /c 1234567RQ /n /t 3 /d 2 /m "   Choice [1-7 R Q]  (default = 2 Desktop in 3s): "
+choice /c 12345678RQ /n /t 3 /d 2 /m "   Choice [1-8 R Q]  (default = 2 Desktop in 3s): "
 set "MODE=%errorlevel%"
 
-REM choice: 0 = Ctrl+C / break, 255 = error - bail out instead of falling
-REM through the if-ladder.
+REM choice: 0 = Ctrl+C, 255 = error - bail instead of falling through the if-ladder.
 if "%MODE%"=="0" goto :end
 if "%MODE%"=="255" goto :end
 REM Q is the LAST character in the /c list, so its errorlevel is the list length.
 REM Adding an option moves both it and R - keep these two lines in step.
-if "%MODE%"=="9" goto :end
-if "%MODE%"=="8" goto :run_app
+if "%MODE%"=="10" goto :end
+if "%MODE%"=="9" goto :run_app
 
 if "%MODE%"=="1" goto :dev
 if "%MODE%"=="2" goto :desktop
 if "%MODE%"=="3" goto :cli
 if "%MODE%"=="4" goto :all
-if "%MODE%"=="5" goto :kill_only
-if "%MODE%"=="6" goto :kill_unlock
-if "%MODE%"=="7" goto :clean_all
+if "%MODE%"=="5" goto :installer
+if "%MODE%"=="6" goto :kill_only
+if "%MODE%"=="7" goto :kill_unlock
+if "%MODE%"=="8" goto :clean_all
 goto :end
 
 :dev
 call :need_node
 if errorlevel 1 goto :prereq_fail
 title SyncDash Builder - Dev
-REM tauri dev relinks target\debug\syncdash-desktop.exe and Vite holds
-REM %VITE_PORT% with strictPort, so a leftover instance of either kills the run
-REM before it starts.
+REM tauri dev relinks target\debug\syncdash-desktop.exe and Vite holds %VITE_PORT%
+REM with strictPort, so a leftover instance of either kills the run before it starts.
 call :free_desktop
 call :free_port %VITE_PORT%
 echo.
@@ -109,11 +104,9 @@ goto :end
 call :need_node
 if errorlevel 1 goto :prereq_fail
 title SyncDash Builder - Desktop
-REM Nothing here renames its output: cargo links straight over
-REM target\release\syncdash-desktop.exe, and a running app holds its own image
-REM file. That is exactly what "Access is denied. (os error 5)" at the end of a
-REM compile means - so the app goes first, and the exe is confirmed free before
-REM anything long starts.
+REM Nothing renames its output: cargo links straight over syncdash-desktop.exe and a
+REM running app holds its own image file - that is what "Access is denied. (os error
+REM 5)" at the end of a compile means. So the app goes first.
 call :free_desktop
 call :wait_unlocked "%APP%"
 call :total_start
@@ -131,8 +124,7 @@ goto :end
 call :need_cargo
 if errorlevel 1 goto :prereq_fail
 title SyncDash Builder - CLI
-REM The CLI needs no node: dist/ is a committed artifact and this target does
-REM not touch the frontend at all.
+REM The CLI needs no node: dist/ is committed and this target never touches it.
 call :free_cli
 call :wait_unlocked "%CLI%"
 call :total_start
@@ -147,9 +139,8 @@ goto :end
 call :need_node
 if errorlevel 1 goto :prereq_fail
 title SyncDash Builder - All
-REM One workspace, one target\release: both binaries have to be free before the
-REM two cargo builds, so both get asked about up front rather than failing at
-REM the second link three minutes in.
+REM One workspace, one target\release: both binaries must be free before the two
+REM cargo builds, so both get asked about up front rather than failing three minutes in.
 call :free_desktop
 call :free_cli
 call :wait_unlocked "%APP%"
@@ -167,6 +158,32 @@ call :report "%CLI%" "CLI OK - syncdash.exe"
 if errorlevel 1 goto :build_fail
 call :total_end
 call :launch_app
+goto :end
+
+:installer
+call :need_node
+if errorlevel 1 goto :prereq_fail
+title SyncDash Builder - Installer
+REM tauri build runs beforeBuildCommand (npm run build) itself and auto-enables
+REM custom-protocol, so this needs no separate :step_frontend.
+call :free_desktop
+call :wait_unlocked "%APP%"
+call :total_start
+call :phase_start "INSTALLER - vite bundle + exe + NSIS setup"
+cd /d "%PROJECT_DIR%"
+call npx tauri build --bundles nsis
+if errorlevel 1 goto :build_fail
+call :phase_end "INSTALLER - vite bundle + exe + NSIS setup"
+set "SETUP="
+for %%F in ("%REL%\bundle\nsis\*-setup.exe") do set "SETUP=%%~fF"
+if not defined SETUP for %%F in ("%REL%\bundle\nsis\*.exe") do set "SETUP=%%~fF"
+if not defined SETUP ( echo   %CR%ERROR: no installer under target\release\bundle\nsis%C0% & goto :build_fail )
+call :size_mb "%SETUP%"
+echo.
+echo   %CG%===== INSTALLER SUCCESS =====%C0%  %CDM%%SIZE_MB% MB%C0%
+call :print_link "%SETUP%"
+call :total_end
+start "" explorer /select,"%SETUP%"
 goto :end
 
 :run_app
@@ -199,19 +216,17 @@ call :wait_unlocked "%CLI%"
 goto :end
 
 :clean_all
-REM One target/ for the whole workspace, so a single cargo clean covers both
-REM crates. dist/ is deliberately left alone: it is a committed artifact, and
-REM the Mac builds with pure cargo and has no node to regenerate it.
+REM One target/ for the whole workspace, so a single cargo clean covers both crates.
+REM dist/ is left alone: it is committed, and the Mac has no node to regenerate it.
 call :free_desktop
 call :free_cli
 echo.
 echo   %CY%[Clean]%C0% cargo clean over the workspace, dist/ untouched ...
-cargo clean --manifest-path "%PROJECT_DIR%Cargo.toml" && echo     target/ cleaned || echo     %CR%Clean FAILED%C0% - exe still locked? try [6]
+cargo clean --manifest-path "%PROJECT_DIR%Cargo.toml" && echo     target/ cleaned || echo     %CR%Clean FAILED%C0% - exe still locked? try [7]
 goto :end
 
 :step_frontend
-REM %1 = phase counter. Unlike a `tauri build`, bare cargo never runs
-REM beforeBuildCommand, so the frontend has to be bundled explicitly here.
+REM %1 = phase counter. Bare cargo never runs beforeBuildCommand, so vite runs here.
 call :phase_start "%~1 FRONTEND - vite build"
 cd /d "%PROJECT_DIR%"
 call npm run build
@@ -252,7 +267,6 @@ start "" "%APP%"
 exit /b 0
 
 REM Only the frontend needs Node. Install deps on a fresh clone too, so a double
-REM click does not dead-end on "vite is not recognized".
 :need_node
 where npm >nul 2>&1
 if errorlevel 1 (
@@ -280,10 +294,8 @@ if errorlevel 1 (
 exit /b 0
 
 :free_desktop
-REM The GUI shell, killed without asking: it is a viewer over the library, holds
-REM no lock of its own, and relaunches in a second. taskkill /T takes the
-REM WebView2 children with it - they hold the exe just as firmly as the parent.
-REM Name matching is exact, so this never touches a running syncdash.exe.
+REM The GUI shell is killed without asking: it is a viewer over the library and holds
+REM no lock. taskkill /T takes the WebView2 children. Name matching is exact.
 echo.
 echo   %CY%[Kill]%C0% Freeing syncdash-desktop ...
 powershell -NoProfile -Command ^
@@ -297,10 +309,9 @@ powershell -NoProfile -Command ^
 exit /b 0
 
 :free_cli
-REM The CLI is not a shell: a live syncdash.exe can be halfway through an apply,
-REM holding the root heartbeat lock and writing files. Killing that behind the
-REM user's back is not a build step's business, so this one asks, and a timeout
-REM leaves it running - the build failing is the cheaper of the two outcomes.
+REM The CLI is not a shell: a live syncdash.exe may be mid-apply, holding the root
+REM heartbeat lock and writing files. Killing that behind the user's back is not a
+REM build step's business, so this asks, and a timeout leaves it running.
 powershell -NoProfile -Command ^
   "$p = Get-Process -Name 'syncdash' -ErrorAction SilentlyContinue;" ^
   "if (-not $p) { exit 0 };" ^
@@ -318,17 +329,15 @@ powershell -NoProfile -Command "Get-Process -Name 'syncdash' -ErrorAction Silent
 exit /b 0
 
 :free_port
-REM %1 = TCP port. Vite is on strictPort, so a dev server left over from a
-REM closed terminal does not shift to 5174 - it refuses to start at all.
+REM %1 = TCP port. Vite is on strictPort: a leftover server refuses, it does not shift.
 powershell -NoProfile -Command ^
   "$c = Get-NetTCPConnection -LocalPort %~1 -State Listen -ErrorAction SilentlyContinue;" ^
   "if ($c) { $c | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }; Write-Host '    Freed port %~1' } else { Write-Host '    Port %~1 free' }"
 exit /b 0
 
 :wait_unlocked
-REM %1 = file. Killing a process returns before Windows has dropped its handles,
-REM and antivirus can hold an exe open for seconds after that. Waiting here
-REM turns a compile that dies at the link step into an immediate, readable line.
+REM %1 = file. Killing returns before Windows drops handles, and antivirus can hold
+REM an exe open for seconds after. Waiting turns a dead link step into a clear line.
 if not exist "%~1" exit /b 0
 powershell -NoProfile -Command ^
   "$f = '%~1'; $r = 0;" ^
@@ -338,8 +347,7 @@ powershell -NoProfile -Command ^
 exit /b 0
 
 :size_mb
-REM %1 = file -> SIZE_MB as "12.3". The decimal comes off the remainder rather
-REM than FSIZE*10 so a large artifact cannot overflow set /a's 32-bit signed math.
+REM %1 = file -> SIZE_MB as "12.3". Decimal off the remainder so it cannot overflow.
 set "SIZE_MB=?"
 if not exist "%~1" exit /b 0
 for %%F in ("%~1") do set "FSIZE=%%~zF"
@@ -349,8 +357,7 @@ set "SIZE_MB=%SZ_INT%.%SZ_DEC%"
 exit /b 0
 
 :print_link
-REM %1 = full path. OSC-8 hyperlink (ctrl+click in Windows Terminal) when ESC is
-REM available, else a plain selectable path.
+REM %1 = full path. OSC-8 hyperlink when ESC is available, else a plain path.
 set "LP=%~1"
 set "LURI=file:///%LP:\=/%"
 if defined ESC (
@@ -360,7 +367,6 @@ if defined ESC (
 )
 exit /b 0
 
-REM Timing helpers (PowerShell clock; locale-independent)
 :tic
 REM %1 = name of var to receive start ticks; also sets _CLK = HH:mm:ss now
 for /f "usebackq tokens=1,2 delims=|" %%a in (`powershell -NoProfile -Command "$n=[DateTime]::Now; '{0:HH:mm:ss}|{1}' -f $n,$n.Ticks"`) do ( set "_CLK=%%a" & set "%~1=%%b" )
@@ -403,7 +409,7 @@ echo   %CR%===== BUILD FAILED =====%C0%
 REM The one failure that is not about the code: cargo cannot relink an exe that
 REM is still running, and reports it as "Access is denied. (os error 5)".
 echo   %CDM%"Access is denied" on syncdash-desktop.exe or syncdash.exe = a live%C0%
-echo   %CDM%instance still holds it. Run [6] Kill + unlock exe, then build again.%C0%
+echo   %CDM%instance still holds it. Run [7] Kill + unlock exe, then build again.%C0%
 call :total_end
 goto :end
 

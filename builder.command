@@ -236,6 +236,48 @@ launch_app() {
   ( "${APP}" >/dev/null 2>&1 </dev/null & )
 }
 
+build_installer() {
+  # The macOS bundler shells out to codesign + hdiutil (Xcode CLT).
+  if ! xcode-select -p >/dev/null 2>&1; then
+    echo "  ${CR}[Bundle] ERROR: Xcode Command Line Tools missing (codesign/hdiutil).${C0}"
+    echo "  Install with: ${CW}xcode-select --install${C0}  then retry."
+    return 1
+  fi
+
+  local signed="unsigned (ad-hoc)"
+  [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && signed="signed as ${APPLE_SIGNING_IDENTITY}"
+  echo
+  echo "  ${CDM}Signing${C0}   ${signed}"
+
+  total_start
+  phase_start "INSTALLER - tauri build (.app + .dmg)"
+  ( cd "${PROJECT_DIR}" && npx tauri build --bundles app,dmg ) || { fail_build; return 1; }
+  phase_end "INSTALLER - tauri build (.app + .dmg)"
+
+  local app dmg
+  app="$(ls -dt "${BUNDLE}/macos/"*.app 2>/dev/null | head -n1)"
+  dmg="$(ls -t  "${BUNDLE}/dmg/"*.dmg   2>/dev/null | head -n1)"
+  if [ -z "${dmg}" ]; then
+    echo "  ${CR}ERROR: no .dmg under ${BUNDLE}/dmg${C0}"
+    fail_build; return 1
+  fi
+  echo
+  echo "  ${CG}===== INSTALLER SUCCESS =====${C0}"
+  [ -n "${app}" ] && { echo "  ${CW}.app${C0}"; print_link "${app}"; }
+  echo "  ${CW}.dmg${C0}  ${CDM}($(size_mb "${dmg}") MB)${C0}"
+  print_link "${dmg}"
+  if [ "${signed}" = "unsigned (ad-hoc)" ]; then
+    echo
+    echo "  ${CY}Unsigned:${C0} on another Mac Gatekeeper blocks it until the recipient runs"
+    echo "    ${CW}xattr -dr com.apple.quarantine <dropped .app>${C0}"
+    echo "  ${CDM}To ship signed + notarized, export APPLE_SIGNING_IDENTITY (and APPLE_ID /${C0}"
+    echo "  ${CDM}APPLE_PASSWORD / APPLE_TEAM_ID) before [5]; tauri signs + notarizes then.${C0}"
+  fi
+  total_end
+  open -R "${dmg}" 2>/dev/null
+  return 0
+}
+
 build_app_self() {
   total_start
   phase_start "SELF-USE APP - tauri build (.app)"
@@ -265,11 +307,14 @@ build_app_self() {
 }
 
 reveal_bundle() {
-  if [ -d "${BUNDLE}/macos" ]; then
+  if [ -d "${BUNDLE}/dmg" ]; then
+    echo "  ${CG}[Reveal]${C0} Opening ${BUNDLE}/dmg ..."
+    open "${BUNDLE}/dmg"
+  elif [ -d "${BUNDLE}/macos" ]; then
     echo "  ${CG}[Reveal]${C0} Opening ${BUNDLE}/macos ..."
     open "${BUNDLE}/macos"
   else
-    echo "  ${CY}[Reveal]${C0} No bundle yet — build one with ${CW}[A]${C0} first."
+    echo "  ${CY}[Reveal]${C0} No bundle yet — build one with ${CW}[5]${C0} or ${CW}[A]${C0} first."
     print_link "${BUNDLE}"
   fi
 }
@@ -294,16 +339,17 @@ echo "    ${CG}[1]${C0} ${CW}Dev${C0}          ${CDM}tauri dev, HMR${C0}       $
 echo "    ${CG}[2]${C0} ${CW}Desktop${C0}      ${CDM}cargo, committed dist/${C0}"
 echo "    ${CG}[3]${C0} ${CW}CLI${C0}          ${CDM}syncdash, no node${C0}"
 echo "    ${CG}[4]${C0} ${CW}All${C0}          ${CDM}[2] + [3]${C0}"
+echo "    ${CG}[5]${C0} ${CW}Installer${C0}    ${CDM}.app + .dmg${C0}"
 echo "                     ${CDM}2 / 4 auto-launch on success${C0}"
 echo
 echo "  ${CDM}Bundle${C0} ${CDM}(real .app via tauri bundler — Dock icon + app identity)${C0}"
 echo "    ${CG}[A]${C0} ${CW}App Self${C0}     ${CDM}.app -> /Applications${C0}    ${CG}[V]${C0} ${CW}Reveal in Finder${C0}"
 echo
 echo "  ${CDM}Utility${C0}"
-echo "    ${CY}[5]${C0} ${CW}Kill app${C0}    ${CY}[6]${C0} ${CW}Kill + installed${C0}    ${CY}[7]${C0} ${CW}Clean artifacts${C0}    ${CR}[Q]${C0} ${CW}Quit${C0}"
+echo "    ${CY}[6]${C0} ${CW}Kill app${C0}    ${CY}[7]${C0} ${CW}Kill + installed${C0}    ${CY}[8]${C0} ${CW}Clean artifacts${C0}    ${CR}[Q]${C0} ${CW}Quit${C0}"
 echo
 MODE=""
-read -t 3 -n 1 -r -p "   Choice [1-7 A V R Q]  (Enter / 3s -> 2 Desktop): " MODE
+read -t 3 -n 1 -r -p "   Choice [1-8 A V R Q]  (Enter / 3s -> 2 Desktop): " MODE
 echo
 [ -z "${MODE}" ] && MODE="2"     # timeout / Enter -> default
 case "${MODE}" in [Qq]) echo; echo "  ${CB}Done.${C0}"; exit 0;; esac
@@ -335,7 +381,7 @@ esac
 # read accepts ANY character — bail before the kill sweep so a typo cannot tear
 # down a running app.
 case "${MODE}" in
-  [1-7]) ;;
+  [1-8]) ;;
   *) echo "  ${CR}Unknown choice:${C0} ${MODE}"; echo; echo "  ${CB}Done.${C0}"; exit 1 ;;
 esac
 
@@ -389,17 +435,24 @@ case "${MODE}" in
     fi
     ;;
   5)
+    need_node || { echo; echo "  ${CR}===== CANNOT BUILD =====${C0}"; echo; echo "  ${CB}Done.${C0}"; exit 1; }
     free_desktop
-    free_port
-    free_cli
+    echo
+    echo "  ${CG}[Build]${C0} INSTALLER (.app + .dmg) ..."
+    build_installer
     ;;
   6)
     free_desktop
     free_port
     free_cli
-    free_installed
     ;;
   7)
+    free_desktop
+    free_port
+    free_cli
+    free_installed
+    ;;
+  8)
     clean_all
     ;;
 esac
