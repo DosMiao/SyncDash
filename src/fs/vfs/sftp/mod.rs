@@ -411,8 +411,23 @@ impl Vfs for SftpBackend {
     fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
         let sftp = self.conn()?.sftp.clone();
         let (f, t) = (self.abs(from_rel), self.abs(to_rel));
-        // v3 semantics: refuses an existing target (declared in caps; relied upon)
-        self.block("rename", async move { sftp.rename(f, t).await })
+        // v3 semantics: refuses an existing target (declared in caps as rename_overwrite: No, and
+        // relied upon). It signals that refusal with the same generic Failure it uses for
+        // everything else, so — exactly as `remove_dir` below does with a non-empty directory —
+        // classify by looking, never by guessing. Callers are entitled to tell "the destination is
+        // occupied" apart from "the link broke": the first is an ordinary outcome they recover
+        // from by staging elsewhere, the second is not.
+        match self.block("rename", async move { sftp.rename(f, t).await }) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind == VfsErrorKind::Protocol => match self.stat(to_rel) {
+                Ok(Some(_)) => Err(VfsError::new(
+                    VfsErrorKind::AlreadyExists,
+                    format!("rename target already exists: {to_rel}"),
+                )),
+                _ => Err(e),
+            },
+            Err(e) => Err(e),
+        }
     }
 
     fn remove_file(&self, rel: &str) -> VfsResult<()> {
