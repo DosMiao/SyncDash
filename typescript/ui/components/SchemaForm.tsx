@@ -1,10 +1,16 @@
-import { Fragment } from 'react';
+import { ArrowLeftRight, FolderOpen, Info } from 'lucide-react';
+import { Menu } from './ui';
 import type { ReactNode } from 'react';
 import type { FormValues, FSpec } from '../../core/jobfields';
 
-// One renderer for both schema-driven sheets (job editor, log settings). The two differ only in which
-// optional affordances they pass in — a browse button, the ⇄ swap, the health-check verdict slot — so
-// they stay one implementation and cannot drift apart visually.
+// One renderer for both schema-driven sheets (job editor, log settings). The two differ only in
+// which optional affordances they pass in — a browse button, the swap, the health-check verdict
+// slot — so they stay one implementation and cannot drift apart visually.
+//
+// Every row is the same three-part shape: **name, control, one short line**. The three are given
+// different size, weight and colour by .field-label / .hint, which is the whole point — the rule
+// this replaced gave a field's name and its explanation identical typography, so the form read as
+// an undifferentiated wall. Anything longer than that one line goes behind the info icon.
 
 export interface SchemaFormProps {
   fields: FSpec[];
@@ -15,142 +21,141 @@ export interface SchemaFormProps {
   onSwap?: () => void;
   /// Extra class for a path input — 'good' | 'bad' | 'dropon' from the two-root health check
   pathClass?: (key: string) => string;
-  /// Marks path inputs the Tauri drag-drop handler is allowed to fill (see useDragDrop)
+  /// Marks path inputs the Tauri drag-drop handler is allowed to fill (see App's dropScope)
   droppable?: boolean;
   /// Node injected after a given field, e.g. the two-root verdict box under `target`
   after?: (key: string) => ReactNode;
   disabledField?: (key: string) => boolean;
-  /// Lets the caller attach a section anchor so a config pill can scroll straight to a group
-  groupRef?: (group: string, el: HTMLElement | null) => void;
   /// Body for a `custom` field — the junk-preset checkbox block, which edits `exclude` rather than
   /// holding a form value of its own
   renderCustom?: (f: FSpec) => ReactNode;
 }
 
-export function SchemaForm(props: SchemaFormProps) {
-  const { fields, values, set, onPick, onSwap, pathClass, droppable, after, disabledField, groupRef, renderCustom } = props;
-
+/// The paragraph, behind an icon. A Menu rather than a `title`: these run to several sentences and
+/// a native tooltip both truncates them and vanishes while you are still reading.
+function Help({ text }: { text: string }) {
   return (
-    <>
-      {fields.map((f) => {
-        const v = values[f.key];
-        const disabled = disabledField?.(f.key) ?? false;
-        const hint = f.hint ? <span className="thin">{f.hint}</span> : null;
+    <Menu className="ed-help" title="What this does" trigger={<Info size={13} />}>
+      <div className="ed-help-body">{text}</div>
+    </Menu>
+  );
+}
 
-        let control: ReactNode;
-        if (f.kind === 'select') {
-          control = (
-            <>
-              <span>{f.label}</span>
-              <select value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)}>
-                {f.opts!.map((o) => <option key={o} value={o}>{o}</option>)}
-              </select>
-            </>
-          );
-        } else if (f.kind === 'bool') {
-          control = (
-            <>
-              <input type="checkbox" checked={!!v} disabled={disabled} onChange={(e) => set(f.key, e.target.checked)} />
-              <span>{f.label}</span>
-            </>
-          );
-        } else if (f.kind === 'lines') {
-          control = (
-            <>
-              <span>{f.label}</span>
-              <textarea
-                spellCheck={false}
-                value={String(v ?? '')}
-                disabled={disabled}
-                onChange={(e) => set(f.key, e.target.value)}
-              />
-            </>
-          );
-        } else if (f.kind === 'custom') {
-          control = (
-            <>
-              <span>{f.label}</span>
-              {renderCustom?.(f)}
-            </>
-          );
-        } else if (f.kind === 'num') {
-          control = (
-            <>
-              <span>{f.label}</span>
-              <input
-                type="number"
-                step="any"
-                value={String(v ?? '')}
-                disabled={disabled}
-                onChange={(e) => set(f.key, e.target.value)}
-              />
-            </>
-          );
-        } else if (f.kind === 'dir' || f.kind === 'file') {
-          control = (
-            <>
-              <span>{f.label}</span>
-              <div className="pathrow">
-                <input
-                  type="text"
-                  className={pathClass?.(f.key) ?? ''}
-                  data-drop={droppable ? '1' : undefined}
-                  data-k={f.key}
-                  list="sd-paths"
-                  spellCheck={false}
-                  value={String(v ?? '')}
-                  disabled={disabled}
-                  onChange={(e) => set(f.key, e.target.value)}
-                />
-                {f.key === 'source' && onSwap && (
-                  <button type="button" className="pbtn" title="Swap with target" onClick={onSwap}>⇄</button>
-                )}
-                {onPick && (
-                  <button
-                    type="button"
-                    className="pbtn"
-                    title="Browse…"
-                    onClick={() => onPick(f.key, f.kind as 'dir' | 'file')}
-                  >📁</button>
-                )}
-              </div>
-            </>
-          );
-        } else {
-          control = (
-            <>
-              <span>{f.label}</span>
-              <input
-                type="text"
-                spellCheck={false}
-                value={String(v ?? '')}
-                disabled={disabled}
-                onChange={(e) => set(f.key, e.target.value)}
-              />
-            </>
-          );
-        }
+function Field({ f, props }: { f: FSpec; props: SchemaFormProps }) {
+  const { values, set, onPick, onSwap, pathClass, droppable, disabledField, renderCustom } = props;
+  const v = values[f.key];
+  const disabled = disabledField?.(f.key) ?? false;
 
-        // A Fragment, not a wrapper element: the sheet is a two-column grid and any real box here would
-        // become a single grid item, collapsing every field into one cell.
-        // Every field is a <label> wrapping its one control — except `custom`, which holds a whole grid
-        // of its own labelled checkboxes. Nesting labels is invalid HTML and makes a click ambiguous:
-        // the browser may forward it to the outer label's control, i.e. the *first* checkbox in the
-        // grid, so ticking "Developer" would silently tick "Windows" instead.
-        const Wrap = f.kind === 'custom' ? 'div' : 'label';
+  const name = (
+    <span className="ed-field-head">
+      <span className="field-label">{f.label}</span>
+      {f.help && <Help text={f.help} />}
+    </span>
+  );
+  const desc = f.desc ? <span className="hint">{f.desc}</span> : null;
+
+  // A boolean leads with its control: the checkbox *is* the subject, and a label floating above a
+  // tickbox reads as a heading for the whole group rather than that one row's name
+  if (f.kind === 'bool') {
+    return (
+      <label className="ed-field ed-check">
+        <input type="checkbox" checked={!!v} disabled={disabled} onChange={(e) => set(f.key, e.target.checked)} />
+        <span className="ed-field-body">{name}{desc}</span>
+      </label>
+    );
+  }
+
+  let control: ReactNode;
+  if (f.kind === 'select') {
+    control = (
+      <select value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)}>
+        {f.opts!.map((o) => <option key={o} value={o}>{o}</option>)}
+      </select>
+    );
+  } else if (f.kind === 'lines') {
+    control = (
+      <textarea spellCheck={false} value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)} />
+    );
+  } else if (f.kind === 'num') {
+    control = (
+      <input type="number" step="any" value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)} />
+    );
+  } else if (f.kind === 'dir' || f.kind === 'file') {
+    control = (
+      <div className="pathrow">
+        <input
+          type="text"
+          className={pathClass?.(f.key) ?? ''}
+          data-drop={droppable ? '1' : undefined}
+          data-k={f.key}
+          list="sd-paths"
+          spellCheck={false}
+          value={String(v ?? '')}
+          disabled={disabled}
+          onChange={(e) => set(f.key, e.target.value)}
+        />
+        {f.key === 'source' && onSwap && (
+          <button type="button" className="pbtn" title="Swap with target" onClick={onSwap}>
+            <ArrowLeftRight size={13} />
+          </button>
+        )}
+        {onPick && (
+          <button
+            type="button"
+            className="pbtn"
+            title="Browse…"
+            onClick={() => onPick(f.key, f.kind as 'dir' | 'file')}
+          ><FolderOpen size={13} /></button>
+        )}
+      </div>
+    );
+  } else if (f.kind === 'custom') {
+    control = renderCustom?.(f);
+  } else {
+    control = (
+      <input type="text" spellCheck={false} value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)} />
+    );
+  }
+
+  // A label element wrapping the control, except for `custom`: that slot holds a whole grid of its
+  // own labelled checkboxes, and nesting labels is invalid HTML — the browser may forward a click
+  // to the outer label's control, i.e. the *first* checkbox in the grid, so ticking "Developer"
+  // would silently tick "Windows" instead.
+  const Wrap = f.kind === 'custom' ? 'div' : 'label';
+  return (
+    <Wrap className={`ed-field k-${f.kind}`}>
+      {name}
+      {control}
+      {desc}
+    </Wrap>
+  );
+}
+
+/**
+ * One section as a single bordered box, one row per setting.
+ *
+ * One box per *section*, not per field: thirty boxes is thirty borders and no grouping, which is
+ * the same undifferentiated wall in a different costume. This is how the reference groups its own
+ * settings — a titled panel, rows inside it, hairlines between.
+ */
+export function SchemaSection({ fields, ...props }: SchemaFormProps) {
+  const all = { fields, ...props };
+  return (
+    <div className="box">
+      {fields.filter((f) => !f.parent).map((f) => {
+        const kids = fields.filter((k) => k.parent === f.key);
         return (
-          <Fragment key={f.key}>
-            {f.group && (
-              <div className="ed-group" ref={(el) => groupRef?.(f.group!, el)}>{f.group}</div>
+          <div key={f.key} className="box-row">
+            <Field f={f} props={all} />
+            {kids.length > 0 && (
+              <div className="ed-child">
+                {kids.map((k) => <Field key={k.key} f={k} props={all} />)}
+              </div>
             )}
-            <Wrap className={'ed-field' + (f.wide ? ' wide' : '') + (f.kind === 'bool' ? ' ed-check' : '')}>
-              {control}
-              {hint}
-            </Wrap>
-            {after?.(f.key)}
-          </Fragment>
+            {props.after?.(f.key)}
+          </div>
         );
       })}
-    </>
+    </div>
   );
 }

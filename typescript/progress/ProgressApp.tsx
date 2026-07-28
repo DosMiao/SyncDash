@@ -11,6 +11,7 @@
 // the throttle stays exactly where FFS put it instead of being whatever React decides to coalesce.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Check, Pause, Play, RefreshCw, Square, TriangleAlert } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, ProgressBarStatus } from '@tauri-apps/api/window';
 import { cancelRun, pauseRun, postSyncAction } from '../core/ipc';
@@ -32,7 +33,10 @@ export function ProgressApp() {
   const [whenFin, setWhenFin] = useState(() => localStorage.getItem('sd.whenfin') ?? 'none');
   const [countdown, setCountdown] = useState<{ kind: string; left: number } | null>(null);
   const [errorsOpen, setErrorsOpen] = useState(false);
-  const [stopLabel, setStopLabel] = useState('■ Stop');
+  /// Where the Stop button is in its own little lifecycle. A state rather than the button's caption:
+  /// the enabled test used to be `label !== '■ Stop'`, which quietly turns into "always disabled" the
+  /// day anyone edits the wording.
+  const [stop, setStop] = useState<'idle' | 'stopping' | 'finished'>('idle');
 
   const autocloseRef = useRef(autoclose);
   autocloseRef.current = autoclose;
@@ -73,7 +77,7 @@ export function ProgressApp() {
     if (ev.run_id < s.runId) return;        // late event from an already-cancelled run
     if (ev.run_id > s.runId) {
       run.current = newRunState(ev.run_id, ev.ts_ms);
-      setStopLabel('■ Stop');
+      setStop('idle');
       setCountdown(null);
     }
     const st = run.current;
@@ -206,7 +210,7 @@ export function ProgressApp() {
       if (st.running && !st.summary) {
         e.preventDefault();
         st.closeAfterStop = true;
-        setStopLabel('Stopping…');
+        setStop('stopping');
         if (st.pausedSince) { st.pausedSince = 0; await pauseRun(false).catch(() => {}); }
         const had = await cancelRun().catch(() => false);
         if (!had) {
@@ -232,21 +236,20 @@ export function ProgressApp() {
   })();
 
   return (
-    <div id="pwin" className={s.applying ? 'applying' : ''}>
-      <div id="phead">
-        <span id="pjob">SyncDash</span>
-        <span id="pphase">
+    <div className={'pwin' + (s.applying ? ' applying' : '')}>
+      <div className="phead">
+        <span className="pjob">SyncDash</span>
+        <span className="pphase">
           {s.summary
             ? (s.summary.cancelled
               ? `Cancelled — ${s.summary.done} applied, ${s.summary.skipped} skipped`
               : `Done — ${s.summary.done} applied, ${s.summary.skipped} skipped, ${s.summary.errors} errors · ${humanSize(s.summary.bytes_done ?? 0)} · ${humanDuration(s.summary.elapsed_ms ?? 0)}`)
             : s.running
-              ? (paused ? '⏸ Paused — ' : '') + (s.phase ? PHASE_LABEL[s.phase] : '')
+              ? <>{paused && <><Pause size={12} /> Paused — </>}{s.phase ? PHASE_LABEL[s.phase] : ''}</>
               : 'Waiting for a run…'}
         </span>
         <span
-          id="ppct"
-          className={s.summary ? (s.summary.cancelled || s.summary.errors ? 'err' : 'ok') : paused ? 'paused' : ''}
+          className={'ppct ' + (s.summary ? (s.summary.cancelled || s.summary.errors ? 'err' : 'ok') : paused ? 'paused' : '')}
         >
           {s.summary
             ? (s.summary.cancelled ? 'Stopped' : `${Math.round(pct)}%`)
@@ -254,20 +257,24 @@ export function ProgressApp() {
         </span>
       </div>
 
-      <div id="stagerows">
+      <div className="stagerows">
         {s.stages.map((row) => (
           <div key={row.phase} className={'stagerow' + (row.active ? ' active' : '') + (row.done ? ' done' : '')}>
-            <span className="st-ico">{row.done ? (row.cancelled ? '■' : '✓') : '⟳'}</span>
+            <span className="st-ico">
+              {row.done
+                ? (row.cancelled ? <Square size={12} /> : <Check size={13} />)
+                : <RefreshCw size={13} className={row.active ? 'spin' : ''} />}
+            </span>
             <span className="st-name">{PHASE_LABEL[row.phase]}</span>
             <span className="st-detail">{row.detail}</span>
           </div>
         ))}
       </div>
 
-      <div id="graphs">
+      <div className="graphs">
         <Graph caption="Data (cumulative bytes)" field="b" runRef={run} rateText={rateBytes} />
         <Graph caption="Items (cumulative count)" field="i" runRef={run} rateText={rateItems} />
-        <div id="readouts">
+        <div className="readouts">
           <div className="rh" /><div className="rh">Processed</div><div className="rh">Remaining</div>
           <div className="rh">Items</div>
           <div>{s.dones.items} / {s.totals.items}</div>
@@ -279,17 +286,17 @@ export function ProgressApp() {
           <div>{humanDuration(s.summary ? s.summary.elapsed_ms ?? 0 : activeNow(s))}</div>
           <div>{eta}</div>
         </div>
-        <div id="curfile" title={s.currentPath}>{s.currentPath ? `‎${s.currentPath}` : ''}</div>
+        <div className="curfile" title={s.currentPath}>{s.currentPath ? `‎${s.currentPath}` : ''}</div>
       </div>
 
-      <div id="errsec" className={(s.errors.length ? 'show' : '') + (errorsOpen ? ' open' : '')}>
-        <div id="errhead" onClick={() => setErrorsOpen((v) => !v)}>
-          <span>⚠</span>
+      <div className={'errsec' + (s.errors.length ? ' show' : '') + (errorsOpen ? ' open' : '')}>
+        <div className="errhead" onClick={() => setErrorsOpen((v) => !v)}>
+          <TriangleAlert size={14} className={nErr ? 'icon-err' : 'icon-warn'} />
           <span className="cnt-err">{nErr ? `${nErr} errors` : ''}</span>
           <span className="cnt-warn">{nWarn ? `${nWarn} warnings` : ''}</span>
           <span className="dim errtip">Click to expand</span>
         </div>
-        <div id="errlist">
+        <div className="errlist">
           {s.errors.map((e, k) => (
             <div key={k} className={'erow' + (e.warning ? ' warn' : '')}>
               <span className="epath mono">{e.path}</span>{' '}
@@ -301,14 +308,14 @@ export function ProgressApp() {
       </div>
 
       {countdown && (
-        <div id="countdown" className="show">
-          <span id="cdtext">{countdown.kind === 'sleep' ? 'Sleep' : 'Shut down'} in {countdown.left}s</span>
-          <div id="cdbar"><div id="cdfill" style={{ width: `${countdown.left * 10}%` }} /></div>
+        <div className="countdown show">
+          <span className="cdtext">{countdown.kind === 'sleep' ? 'Sleep' : 'Shut down'} in {countdown.left}s</span>
+          <div className="cdbar"><div className="cdfill" style={{ width: `${countdown.left * 10}%` }} /></div>
           <button className="btn" onClick={() => setCountdown(null)}>Cancel</button>
         </div>
       )}
 
-      <div id="controls">
+      <div className="controls">
         <button
           className="btn"
           disabled={!s.running || !!s.summary}
@@ -319,21 +326,22 @@ export function ProgressApp() {
             rerender();
             await pauseRun(wantPause).catch(() => {});
           }}
-        >{paused ? '▶ Continue' : '⏸ Pause'}</button>
+        >{paused ? <><Play size={12} /> Continue</> : <><Pause size={12} /> Pause</>}</button>
         <button
-          id="btn-stop"
-          className="btn"
-          disabled={!s.running || !!s.summary || stopLabel !== '■ Stop'}
+          className="btn btn-stop"
+          disabled={!s.running || !!s.summary || stop !== 'idle'}
           onClick={async () => {
-            setStopLabel('Stopping…');
+            setStop('stopping');
             const st = run.current;
             // Stop pressed while paused: resume first, otherwise the cancel never reaches a checkpoint
             if (st.pausedSince) { st.pausedSince = 0; await pauseRun(false).catch(() => {}); }
             const had = await cancelRun().catch(() => false);
             // no active run (it already finished on its own) — don't leave the button stuck on "Stopping…"
-            if (!had) setStopLabel('Finished');
+            if (!had) setStop('finished');
           }}
-        >{stopLabel}</button>
+        >
+          {stop === 'idle' ? <><Square size={12} /> Stop</> : stop === 'stopping' ? 'Stopping…' : 'Finished'}
+        </button>
         <label className="dim chkline">
           <input
             type="checkbox"
@@ -341,7 +349,7 @@ export function ProgressApp() {
             onChange={(e) => { setAutoclose(e.target.checked); localStorage.setItem('sd.autoclose', e.target.checked ? '1' : '0'); }}
           /> Auto-close when finished
         </label>
-        <span id="wfin">
+        <span className="wfin">
           When finished
           <select
             value={whenFin}

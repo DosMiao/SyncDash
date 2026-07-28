@@ -1,9 +1,11 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { ArrowLeft, ArrowRight, ChevronDown, ChevronRight, ChevronUp, Info, Zap } from 'lucide-react';
 import { baseOf, dirOf, fmtTime, fullPath, humanSize } from '../../core/format';
 import { badge, canFlip, eff, metaOf, newerSide, selectable, sidePaths } from '../../core/plan';
 import { useVirtualRows } from '../hooks/useVirtualRows';
+import type { ReactNode } from 'react';
 import type { RowSpec } from '../hooks/useVirtualRows';
-import type { PlanDto, SortKey, Sort } from '../../core/plan';
+import type { BadgeIcon, PlanDto, SortKey, Sort } from '../../core/plan';
 import type { SideMeta } from '../../core/types/generated/SideMeta';
 
 interface Props {
@@ -15,6 +17,9 @@ interface Props {
   pathMode: 'rel' | 'full';
   sort: Sort | null;
   collapsedDirs: Set<string>;
+  /// The scroll container, owned by whoever rendered this table. Both the virtual window and the
+  /// column policy measure it, and neither can find it on its own without reaching into the DOM.
+  wrap: HTMLElement | null;
   /// Changing this string scrolls the body back to the top — a filter change should not leave you
   /// staring at row 4000 of a list that no longer has one
   resetKey: string;
@@ -34,8 +39,8 @@ interface Props {
 ///   full:     | 38 chk | 200 action | path | 178 size·time | path | 178 size·time | 240 reason |
 ///   noreason: | 38 chk | 140 action | path | 178 size·time | path | 178 size·time |
 ///   compact:  | 38 chk | 140 action | path |  96 size      | path |  96 size      |
-/// 140 = badge min-width 92 + badge padding/border 22 + cell padding 24, the floor before badges smear
-/// into the next column (fixed layout does not clip). 178 fits "894.0 MB · 07-26 16:51" at --fs-sm.
+/// 140 = badge min-width 88 + badge padding/border 20 + cell padding 20, with room to spare before
+/// badges smear into the next column (fixed layout does not clip). 178 fits "894.0 MB · 07-26 16:51".
 type ColMode = 'full' | 'noreason' | 'compact';
 const COLW: Record<ColMode, (number | null)[]> = {
   full: [38, 200, null, 178, null, 178, 240],
@@ -45,19 +50,27 @@ const COLW: Record<ColMode, (number | null)[]> = {
 const colMode = (w: number): ColMode => (w >= 1160 ? 'full' : w >= 900 ? 'noreason' : 'compact');
 
 /// The column set tracks the scroll container, not the window: collapsing the Overview pane widens the
-/// table by 224px without any window resize. Found by id for the same reason wrapRef is (not ours).
-function useWrapWidth(): number {
+/// table by 224px without any window resize.
+function useWrapWidth(wrap: HTMLElement | null): number {
   const [w, setW] = useState(1600);
   useLayoutEffect(() => {
-    const el = document.getElementById('tablewrap');
-    if (!el) return;
-    const ro = new ResizeObserver(() => setW(el.clientWidth));
-    ro.observe(el);
-    setW(el.clientWidth);
+    if (!wrap) return;
+    const ro = new ResizeObserver(() => setW(wrap.clientWidth));
+    ro.observe(wrap);
+    setW(wrap.clientWidth);
     return () => ro.disconnect();
-  }, []);
+  }, [wrap]);
   return w;
 }
+
+/// The badge's leading mark. Kept beside the table rather than in core/plan.ts: which glyph draws a
+/// direction is a rendering decision, while *which direction it is* is plan semantics.
+const BADGE_ICON: Record<BadgeIcon, ReactNode> = {
+  right: <ArrowRight size={12} />,
+  left: <ArrowLeft size={12} />,
+  conflict: <Zap size={12} />,
+  note: <Info size={12} />,
+};
 
 /// indeterminate is a DOM property with no HTML attribute, so it can only be set through a ref
 function TriCheckbox(props: { checked: boolean; indeterminate?: boolean; disabled?: boolean; title?: string; onChange: (v: boolean) => void; stopClick?: boolean }) {
@@ -88,37 +101,36 @@ function MetaCell({ sm, isNewer, compact }: { sm: SideMeta | null; isNewer: bool
 
 export function PlanTable(props: Props) {
   const {
-    plan, flipped, checked, rowPlan, visible, pathMode, sort, collapsedDirs, resetKey,
+    plan, flipped, checked, rowPlan, visible, pathMode, sort, collapsedDirs, resetKey, wrap,
     onToggleRow, onToggleMany, onFlip, onFoldDir, onSort, onContextRow,
   } = props;
 
-  const wrapRef = useRef<HTMLElement | null>(null);
   const theadRef = useRef<HTMLTableSectionElement>(null);
   const bodyRef = useRef<HTMLTableSectionElement>(null);
 
-  // The scroll container is #tablewrap, which the table does not own; find it once on mount
-  useEffect(() => { wrapRef.current = document.getElementById('tablewrap'); }, []);
-  useEffect(() => { if (wrapRef.current) wrapRef.current.scrollTop = 0; }, [resetKey]);
+  useEffect(() => { if (wrap) wrap.scrollTop = 0; }, [resetKey, wrap]);
 
-  const win = useVirtualRows(rowPlan, wrapRef, theadRef, bodyRef);
-  const mode = colMode(useWrapWidth());
+  const win = useVirtualRows(rowPlan, wrap, theadRef, bodyRef);
+  const mode = colMode(useWrapWidth(wrap));
   const compact = mode === 'compact';
   const nCols = COLW[mode].length;
 
   const selectableVisible = visible.filter((i) => selectable(eff(plan, flipped, i)));
   const allChecked = selectableVisible.length > 0 && selectableVisible.every((i) => checked[i]);
 
-  const sortMark = (key: SortKey) => (sort?.key === key ? (sort.dir === 1 ? '▲' : '▼') : '');
-  const Sortable = ({ k, children }: { k: SortKey; children: React.ReactNode }) => (
-    <span
-      className={'sortable' + (sort?.key === k ? ' on' : '')}
-      data-dir={sortMark(k)}
-      onClick={() => onSort(k)}
-    >{children}</span>
+  const Sortable = ({ k, children }: { k: SortKey; children: ReactNode }) => (
+    <span className={'sortable' + (sort?.key === k ? ' on' : '')} onClick={() => onSort(k)}>
+      {children}
+      {sort?.key === k && (
+        <span className="sortmark">
+          {sort.dir === 1 ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+        </span>
+      )}
+    </span>
   );
 
   return (
-    <table id="plantable">
+    <table className="plantable">
       {/* Column widths are pinned (via COLW): the body is virtually scrolled, and auto layout would
           recompute widths from whichever rows happen to be mounted, so the columns would jump on every
           scroll. The two path columns get no width and split the remaining space. */}
@@ -136,7 +148,7 @@ export function PlanTable(props: Props) {
           </th>
           <th className="c-act">
             <Sortable k="action">action</Sortable>
-            {mode === 'full' && <> <span className="dim thin">(click a badge to flip direction)</span></>}
+            {mode === 'full' && <> <span className="hint">click a badge to flip</span></>}
           </th>
           <th className="c-path"><Sortable k="path">source side</Sortable></th>
           <th className="c-meta">
@@ -179,7 +191,7 @@ export function PlanTable(props: Props) {
                   />
                 </td>
                 <td colSpan={nCols - 1} title={`${plan.header.source_root}\n${plan.header.target_root}\n… ${label}`}>
-                  <span className="gchev">{folded ? '▸' : '▾'}</span>{' '}
+                  <span className="gchev">{folded ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
                   <span className="gdir mono">{label}</span>
                   <span className="gmeta">{spec.items.length} items{bytes ? ` · ${humanSize(bytes)}` : ''}</span>
                 </td>
@@ -228,7 +240,7 @@ export function PlanTable(props: Props) {
                     flippable ? 'Click to reverse the direction (click again to restore)' : '',
                   ].filter(Boolean).join('\n') || undefined}
                   onClick={flippable ? () => onFlip(i) : undefined}
-                >{b.text}</span>
+                >{BADGE_ICON[b.icon]}{b.label}</span>
               </td>
               {pathCell(sp, plan.header.source_root)}
               <MetaCell sm={m.src} isNewer={newer === 's'} compact={compact} />

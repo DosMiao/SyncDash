@@ -1,3 +1,4 @@
+import { Check, RefreshCw, X } from 'lucide-react';
 import { humanSize } from '../../core/format';
 
 export const CMP_LABEL: Record<string, string> = {
@@ -28,9 +29,9 @@ interface Props {
 /// child-window lifecycle).
 export function ComparePanel({ stages, cancelling, onCancel }: Props) {
   return (
-    <div id="cmp-panel">
+    <div className="cmp-panel">
       <div className="cmp-title">Comparing</div>
-      <div id="cmp-rows">
+      <div className="cmp-rows">
         {stages.map((s) => {
           const pct = s.done ? 100
             : s.bytesTotal > 0 ? (s.bytesDone / s.bytesTotal) * 100
@@ -39,7 +40,9 @@ export function ComparePanel({ stages, cancelling, onCancel }: Props) {
           const showPct = s.done || s.bytesTotal > 0 || s.itemsTotal > 0;
           return (
             <div key={s.phase} className={'stagerow cmp2' + (s.active ? ' active' : '') + (s.done ? ' done' : '')}>
-              <span className="st-ico">{s.done ? '✓' : '⟳'}</span>
+              <span className="st-ico">
+                {s.done ? <Check size={13} /> : <RefreshCw size={13} className={s.active ? 'spin' : ''} />}
+              </span>
               <span className="st-name">{CMP_LABEL[s.phase] ?? s.phase}</span>
               <span className="st-bar"><i style={{ width: `${pct}%` }} /></span>
               <span className="st-pct">{showPct ? `${Math.floor(pct)}%` : ''}</span>
@@ -57,7 +60,7 @@ export function ComparePanel({ stages, cancelling, onCancel }: Props) {
         })}
       </div>
       <button className="btn" disabled={cancelling} onClick={onCancel}>
-        {cancelling ? 'Cancelling… (waiting for in-flight chunks)' : '✕ Cancel'}
+        {cancelling ? 'Cancelling… (waiting for in-flight chunks)' : <><X size={12} /> Cancel</>}
       </button>
     </div>
   );

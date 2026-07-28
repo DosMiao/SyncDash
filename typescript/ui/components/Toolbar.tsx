@@ -1,6 +1,23 @@
+import {
+  ArrowLeftRight,
+  MoveRight,
+  Pencil,
+  Plus,
+  RefreshCw,
+  ScrollText,
+  Sigma,
+  SquarePen,
+  Timer,
+  Trash2,
+  Zap,
+} from 'lucide-react';
+import { ED_FIELDS, MODE_HINT, RIGOR_HINT, groupsOf } from '../../core/jobfields';
 import { humanSize } from '../../core/format';
-import { MODE_HINT, RIGOR_HINT } from '../../core/jobfields';
+import type { ReactNode } from 'react';
 import type { JobDto } from '../../core/types/generated/JobDto';
+
+/// Edit job opens on the first section; the config pills below name their own
+const EDIT_ENTRY = groupsOf(ED_FIELDS)[0];
 
 export interface PlanStats {
   copy: number;
@@ -28,8 +45,9 @@ interface Props {
   onToggleWatch: () => void;
 }
 
-/// M3: icon stats bar (same semantics as the FFS bottom bar: zeros dimmed, non-zeros bold)
-function Seg({ cls, icon, n, title }: { cls?: string; icon: string; n: number | string; title: string }) {
+/// One count and its icon (same semantics as the FFS bottom bar). A zero recedes by colour rather
+/// than alpha — it still has to be readable to say "nothing of this kind", which is itself an answer.
+function Seg({ cls, icon, n, title }: { cls?: string; icon: ReactNode; n: number | string; title: string }) {
   const zero = n === 0 || n === '0 B';
   return (
     <span className={'st' + (cls ? ' ' + cls : '') + (zero ? ' zero' : '')} title={title}>
@@ -46,64 +64,65 @@ export function Toolbar(props: Props) {
   const cmpVariant = job ? (rh ? `${job.rigor} · ${rh}` : job.rigor) : 'Select a job';
 
   return (
-    <header id="toolbar">
-      {/* Each primary button and its settings cog are grouped so a toolbar wrap moves them together */}
-      <div className="tgroup">
-        <button className="btn primary two" disabled={busy || !job} onClick={onCompare}>
-          <span className="l1">⟳ Compare</span>
-          <span className="l2">{cmpVariant}</span>
-        </button>
-        <button
-          className="btn cog"
-          title={job ? `Compare settings: rigor ${job.rigor} / case sensitivity / symlinks` : 'Compare settings'}
-          disabled={!job}
-          onClick={() => onEditGroup('Basics')}
-        >⚙</button>
-      </div>
-
-      {/* Information hierarchy on the run button: the large text is the **mode**, the small text is the
-          action. Two reasons: (1) what decides "what will happen" is the mode, not the verb that never
-          changes; (2) we already have a mode called sync, so writing Synchronize on the button collides
-          the action with the mode — and mirror is not synchronization at all, it is one-way mirroring. */}
-      <div className="tgroup">
-        <button
-          className="btn accent two mode-btn"
-          disabled={busy || !canSync}
-          title={job ? `${job.mode}: ${MODE_HINT[job.mode] ?? ''}${job.versioning ? ' · versioning on' : ''}` : undefined}
-          onClick={onSync}
-        >
-          <span className={'l1 m-' + (job ? job.mode : 'none')}>{job ? job.mode.toUpperCase() : 'No job'}</span>
-          <span className="l2">
-            {job ? `Run${hasPlan ? ` ${finalCount} items` : ''} · ${MODE_HINT[job.mode] ?? ''}` : 'Compare first'}
-          </span>
-        </button>
-        <button
-          className="btn cog"
-          title="Mode / conflict policy / versioning"
-          disabled={!job}
-          onClick={() => onEditGroup('Behavior')}
-        >⚙</button>
-      </div>
-
-      <button className="btn cog" title="Run log" onClick={onToggleLog}>🗒</button>
+    <header className="toolbar">
+      {/* Five controls, every one labelled, every one the same height, no icon used twice.
+          What each button *does* is its label; what it will do this time — the rigor tier, the
+          item count, the conflict policy — is in `title`. The counts are already on the stats bar
+          two inches to the right, so a subtitle repeating them bought nothing and cost the most
+          valuable strip on the screen. */}
       <button
-        className={'btn' + (watchSecs !== null ? ' on' : '')}
-        id="btn-watch"
-        title="Watch: compare on the job's watch interval"
+        className="btn primary"
+        disabled={busy || !job}
+        title={job ? `Walk both roots and build a plan (F5).\nRigor: ${cmpVariant}` : 'Select a job first'}
+        onClick={onCompare}
+      ><RefreshCw size={13} /> Compare</button>
+
+      {/* The label is the **mode**, not a verb: what decides "what will happen" is mirror vs sync
+          vs enrich, and the verb never changes. Writing "Synchronize" would also collide the
+          action with the mode of the same name — and mirror is not synchronization at all. */}
+      <button
+        className="btn accent mode-btn"
+        disabled={busy || !canSync}
+        title={job
+          ? `${job.mode}: ${MODE_HINT[job.mode] ?? ''}${job.versioning ? ' · versioning on' : ''}`
+            + `${hasPlan ? `\nRuns ${finalCount} checked items (F9)` : '\nCompare first'}`
+          : undefined}
+        onClick={onSync}
+      >{job ? job.mode.toUpperCase() : 'No job'}</button>
+
+      <button
+        className="btn"
+        title="Open this job's settings"
+        disabled={!job}
+        onClick={() => onEditGroup(EDIT_ENTRY)}
+      ><SquarePen size={13} /> Edit job</button>
+
+      <button className="btn" title="Show the run log" onClick={onToggleLog}>
+        <ScrollText size={13} /> Log
+      </button>
+
+      {/* A solid fill rather than the usual tinted toggle: Watch is the one control here that keeps
+          working after you look away, so it should be legible from across the room */}
+      <button
+        className={'btn' + (watchSecs !== null ? ' on-solid' : '')}
+        title="Compare automatically on the job's watch interval"
         disabled={!job}
         onClick={onToggleWatch}
-      >{watchSecs !== null ? `⏱ Watch ${watchSecs}s` : '⏱ Watch'}</button>
+      >
+        <Timer size={13} />
+        {watchSecs !== null ? `Watch ${watchSecs}s` : 'Watch'}
+      </button>
 
       <span className="stats">
         {stats && (
           <>
-            <Seg cls="s-copy" icon="✚" n={stats.copy} title="Copy" />
-            <Seg cls="s-upd" icon="✎" n={stats.upd} title="Update" />
-            <Seg cls="s-mv" icon="⇢" n={stats.mv} title="Move (no re-transfer)" />
-            <Seg cls="s-del" icon="✕" n={stats.del} title="Delete (into the trash)" />
-            <Seg cls="s-conf" icon="⚡" n={stats.conflicts} title="Conflict" />
-            <Seg icon="Σ" n={humanSize(stats.bytes) || '0 B'} title="Bytes to transfer" />
-            {stats.flips > 0 && <Seg icon="⇄" n={stats.flips} title="Reversed direction" />}
+            <Seg cls="s-copy" icon={<Plus size={12} />} n={stats.copy} title="Copy" />
+            <Seg cls="s-upd" icon={<Pencil size={12} />} n={stats.upd} title="Update" />
+            <Seg cls="s-mv" icon={<MoveRight size={12} />} n={stats.mv} title="Move (no re-transfer)" />
+            <Seg cls="s-del" icon={<Trash2 size={12} />} n={stats.del} title="Delete (into the trash)" />
+            <Seg cls="s-conf" icon={<Zap size={12} />} n={stats.conflicts} title="Conflict" />
+            <Seg icon={<Sigma size={12} />} n={humanSize(stats.bytes) || '0 B'} title="Bytes to transfer" />
+            {stats.flips > 0 && <Seg icon={<ArrowLeftRight size={12} />} n={stats.flips} title="Reversed direction" />}
           </>
         )}
       </span>

@@ -21,11 +21,14 @@ function draw(cv: HTMLCanvasElement, s: RunState, key: 'b' | 'i', total: number)
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
 
-  // Colors come from the stylesheet so the graph tracks the token layer instead of hard-coding a palette
+  // Colors are read from the stylesheet on every frame so the graph tracks the token layer — and,
+  // since the tokens flip with prefers-color-scheme, follows a light/dark switch without a reload.
+  // The fallbacks are the light-theme values (light is the default) and only ever apply if the
+  // stylesheet has not loaded.
   const css = getComputedStyle(document.documentElement);
-  const cAccent = css.getPropertyValue('--accent').trim() || '#5cabf2';
-  const cDim = css.getPropertyValue('--dim').trim() || '#a7b1c0';
-  const cBorder = css.getPropertyValue('--border').trim() || '#333b48';
+  const cAccent = css.getPropertyValue('--accent').trim() || '#3b82f6';
+  const cDim = css.getPropertyValue('--text-2').trim() || '#5c5c63';
+  const cBorder = css.getPropertyValue('--border').trim() || '#e0e0e3';
 
   const now = activeNow(s);
   const lastV = s.samples.length ? s.samples[s.samples.length - 1][key] : 0;
@@ -60,7 +63,12 @@ function draw(cv: HTMLCanvasElement, s: RunState, key: 'b' | 'i', total: number)
     ctx.lineTo(X(s.samples[s.samples.length - 1].t), Y(lastV));
     ctx.strokeStyle = cAccent; ctx.lineWidth = 1.5; ctx.stroke();
     ctx.lineTo(X(s.samples[s.samples.length - 1].t), Y(0)); ctx.closePath();
-    ctx.fillStyle = cAccent + '33'; ctx.fill();
+    // globalAlpha rather than appending '33' to the colour string: that assumed --accent is always
+    // a 6-digit hex, which a token written as rgb() or color-mix() would silently break
+    ctx.fillStyle = cAccent;
+    ctx.globalAlpha = 0.2;
+    ctx.fill();
+    ctx.globalAlpha = 1;
   }
   // "now" vertical line + estimated-completion dashed line
   ctx.strokeStyle = cDim;

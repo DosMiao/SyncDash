@@ -36,9 +36,13 @@ export interface VirtualWindow {
   padBottom: number;
 }
 
+/// `wrap` is the scroll container, which the table does not own — it is handed down from whoever
+/// rendered it. Passed as the element rather than a ref: a ref object's identity never changes, so
+/// an effect depending on it would not re-run when `.current` goes from null to the real node, and
+/// on mount it is always null (a child's effects run before an ancestor host ref attaches).
 export function useVirtualRows(
   rowPlan: RowSpec[],
-  wrapRef: RefObject<HTMLElement | null>,
+  wrap: HTMLElement | null,
   theadRef: RefObject<HTMLElement | null>,
   bodyRef: RefObject<HTMLElement | null>,
 ): VirtualWindow {
@@ -58,7 +62,7 @@ export function useVirtualRows(
   // A ResizeObserver rather than a window resize listener: the table also changes height when the log
   // panel opens or the compare panel closes, and neither of those is a window resize.
   useEffect(() => {
-    const el = wrapRef.current;
+    const el = wrap;
     if (!el) return;
     let pending = false;
     const onScroll = () => {
@@ -71,7 +75,7 @@ export function useVirtualRows(
     ro.observe(el);
     setView({ top: el.scrollTop, height: el.clientHeight });
     return () => { el.removeEventListener('scroll', onScroll); ro.disconnect(); };
-  }, [wrapRef]);
+  }, [wrap]);
 
   // Measure after every commit. Returning the identical state object when nothing moved is what keeps
   // this from looping: React bails out of the re-render, so there is no measure → setState → measure cycle.

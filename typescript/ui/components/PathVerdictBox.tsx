@@ -1,3 +1,4 @@
+import { Check, TriangleAlert } from 'lucide-react';
 import type { PathVerdict } from '../../core/types/generated/PathVerdict';
 
 /// Warnings from inspect_paths plus the marker confirmation, in the shape both the main path row
@@ -11,8 +12,10 @@ export function PathVerdictBox({ verdict, className }: { verdict: PathVerdict | 
 
   return (
     <div className={className}>
-      {verdict.warnings.map((w, k) => <div className="vwarn" key={k}>⚠ {w}</div>)}
-      {marks && <div className="vok">✓ {marks}</div>}
+      {verdict.warnings.map((w, k) => (
+        <div className="vwarn" key={k}><TriangleAlert size={12} /> {w}</div>
+      ))}
+      {marks && <div className="vok"><Check size={12} /> {marks}</div>}
     </div>
   );
 }

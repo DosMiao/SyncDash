@@ -1,4 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ArrowUpDown,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  Download,
+  Equal,
+  FolderTree,
+  List,
+  ListFilter,
+  Route,
+} from 'lucide-react';
 import { CHIPS, category, eff } from '../../core/plan';
 import type { Chip, PlanDto, Sort } from '../../core/plan';
 
@@ -34,7 +45,6 @@ export function FilterBar(props: Props) {
 
   const [q, setQ] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
-  const funnelBtn = useRef<HTMLButtonElement>(null);
 
   useEffect(() => { setQ(''); onSearch(''); }, [searchKey]);
 
@@ -72,17 +82,17 @@ export function FilterBar(props: Props) {
   };
 
   return (
-    <div id="filterbar">
+    <div className="filterbar">
       <input
-        id="search"
         ref={inputRef}
-        className="mono"
+        className="search mono"
         type="text"
-        placeholder="Search path / from / reason   (Ctrl+F)"
+        title="Filter the rows by path, source path or reason (Ctrl+F)"
+        placeholder="Search path / from / reason"
         value={q}
         onChange={(e) => setQ(e.target.value)}
       />
-      <div id="chips">
+      <div className="chips">
         {CHIPS.map(([key, label]) => {
           const n = counts.get(key) ?? 0;
           // The category filter is a set of **independent toggles**, not a radio group; "All" just clears it
@@ -100,45 +110,53 @@ export function FilterBar(props: Props) {
       {/* One block, so a bar wrap never breaks between these three: on a narrow window they open the
           second row together, with .fb-right still pushed to its right end */}
       <div className="fb-actions">
+        {/* Green rather than the usual accent toggle: these two *narrow what you are looking at*,
+            and a filter you forgot you left on is the one piece of state worth colour-coding apart
+            from every other latched button in the bar */}
         <button
-          ref={funnelBtn}
-          className={'btn' + (funnelCount > 0 || funnelOpen ? ' on' : '')}
-          id="btn-funnel"
+          className={'btn' + (funnelCount > 0 || funnelOpen ? ' on-green' : '')}
           title="Filter: name masks / size / modified time (applies to the current results, no rescan)"
-          onClick={(e) => { e.stopPropagation(); onToggleFunnel((e.currentTarget as HTMLElement).getBoundingClientRect()); }}
-        >{funnelCount ? `🔻 Filter ${funnelCount}` : '🔻 Filter'}</button>
+          onClick={(e) => { e.stopPropagation(); onToggleFunnel(e.currentTarget.getBoundingClientRect()); }}
+        >
+          <ListFilter size={12} />
+          {funnelCount ? `Filter ${funnelCount}` : 'Filter'}
+        </button>
         <button
-          className={'btn' + (sameOpen ? ' on' : '')}
-          id="btn-same"
+          className={'btn' + (sameOpen ? ' on-green' : '')}
           title="View the files judged identical on both sides (no rescan, reads the last compare's snapshot)"
           onClick={onToggleSame}
-        >≡ Identical</button>
+        ><Equal size={12} /> Identical</button>
         <button
           className="btn"
           title="Export the current view as CSV (UTF-8 with BOM, opens straight in Excel)"
           onClick={onExportCsv}
-        >⤓ CSV</button>
+        ><Download size={12} /> CSV</button>
       </div>
       {/* The display-mode group is pushed right by .fb-right rather than by a margin on the fold button:
           the fold button is absent while sorting, and an auto margin on a missing element pushes nothing. */}
       <div className="fb-right">
-      {grouped && !sort && (
-        <button id="btn-fold" className="btn" title="Collapse / expand all directory groups" onClick={onToggleFold}>
-          {anyCollapsed ? 'Expand all' : 'Collapse all'}
+        {grouped && !sort && (
+          <button className="btn" title="Collapse / expand all directory groups" onClick={onToggleFold}>
+            {anyCollapsed ? <ChevronsUpDown size={12} /> : <ChevronsDownUp size={12} />}
+            {anyCollapsed ? 'Expand all' : 'Collapse all'}
+          </button>
+        )}
+        <button
+          className={'btn' + (grouped && !sort ? ' on' : '')}
+          title={sort ? 'Click to clear the sort and return to the grouped view' : 'Toggle: tree groups (aggregated by directory, same as FFS) ↔ flat list'}
+          onClick={onToggleGroup}
+        >
+          {sort ? <ArrowUpDown size={12} /> : grouped ? <FolderTree size={12} /> : <List size={12} />}
+          {sort ? `Sorted: ${sort.key}` : grouped ? 'Tree groups' : 'Flat list'}
         </button>
-      )}
-      <button
-        id="btn-group"
-        className={'btn' + (grouped && !sort ? ' on' : '')}
-        title={sort ? 'Click to clear the sort and return to the grouped view' : 'Toggle: tree groups (aggregated by directory, same as FFS) ↔ flat list'}
-        onClick={onToggleGroup}
-      >{sort ? `Sorted: ${sort.key}` : grouped ? 'Tree groups' : 'Flat list'}</button>
-      <button
-        id="btn-pathmode"
-        className="btn"
-        title="Toggle: relative (to the compare root) ↔ full path"
-        onClick={onTogglePathMode}
-      >{pathMode === 'rel' ? 'Relative paths' : 'Full paths'}</button>
+        <button
+          className="btn"
+          title="Toggle: relative (to the compare root) ↔ full path"
+          onClick={onTogglePathMode}
+        >
+          <Route size={12} />
+          {pathMode === 'rel' ? 'Relative paths' : 'Full paths'}
+        </button>
       </div>
     </div>
   );

@@ -11,64 +11,128 @@ export type FormValues = Record<string, string | boolean>;
 
 /// 'custom' is a slot the caller fills (the junk-preset checkbox block); it carries no form value
 export type FKind = 'text' | 'num' | 'bool' | 'select' | 'lines' | 'dir' | 'file' | 'custom';
+
+/**
+ * One row of a settings form.
+ *
+ * `label` / `desc` / `help` are three distinct jobs and used to be one field, which is how a
+ * label ended up reading "Multiple targets (one root per line; overrides the single target above
+ * when non-empty)". The renderer gives each its own typography, so the split is what makes the
+ * hierarchy visible at all:
+ *
+ *   label  what this setting is          13px semibold  — always on screen
+ *   desc   one short line, no more       11px muted     — always on screen
+ *   help   the paragraph                 popover        — behind an info icon
+ *
+ * If a `desc` will not fit on one line, it belongs in `help`.
+ */
 export interface FSpec {
   key: string;
   label: string;
   kind: FKind;
   opts?: string[];
-  hint?: string;
-  wide?: boolean;
-  /// Starts a new titled section; the config pills on the main screen jump straight to one of these
+  desc?: string;
+  help?: string;
+  /// Key of the setting this one qualifies; rendered indented beneath it behind a rule
+  parent?: string;
+  /// Starts a new section; the section rail and the config pills on the main screen both key off this
   group?: string;
 }
 
 export const ED_FIELDS: FSpec[] = [
-  { key: '__name', label: 'Job name (file name)', kind: 'text', group: 'Basics' },
-  { key: 'mode', label: 'Mode', kind: 'select', opts: ['mirror', 'sync', 'enrich'] },
-  { key: 'source', label: 'source root', kind: 'dir', wide: true },
-  { key: 'target', label: 'target root', kind: 'dir', wide: true },
-  { key: 'targets', label: 'Multiple targets (one root per line; overrides the single target above when non-empty)', kind: 'lines', wide: true, hint: '1:N: one source mirrored/enriched into several targets in turn, each with its own plan and logs. Not supported in sync mode (use paired jobs)' },
-  { key: 'archive', label: 'Archive file (sync mode)', kind: 'file', hint: 'Empty = none; suggested %APPDATA%\\syncdash\\archives\\<name>.jsonl', wide: true },
-  { key: 'rigor', label: 'Rigor (shortcut preset)', kind: 'select', opts: ['quick', 'fast', 'standard', 'paranoid', 'custom'], hint: 'A preset sets the four details below in one click; changing any of them by hand switches to custom. Ladder: each tier actually reads more this round' },
-  { key: 'evidence', label: '· Content evidence', kind: 'select', opts: ['none', 'sampled', 'full'], hint: 'none = no reads, metadata only | sampled = size + 256 KB at head/middle/tail | full = whole-file BLAKE3' },
-  { key: 'use_cache', label: '· Use the hash cache (trust last result for unchanged files, no real read)', kind: 'bool' },
-  { key: 'escalate', label: '· Escalate on divergence (same digest but mtime differs >2 s → full re-verify on both sides)', kind: 'bool' },
-  { key: 'verify_writes', label: '· Verify after write (full hash of the copy stream vs a re-read from disk)', kind: 'bool' },
-  { key: 'symlinks', label: 'symlink policy', kind: 'select', opts: ['exclude', 'direct'] },
-  { key: 'case_sensitive', label: 'Case-sensitive compare', kind: 'bool' },
-  { key: 'versioning', label: 'Versioning (.version_syncDash)', kind: 'bool', group: 'Behavior' },
-  { key: 'delta', label: 'Local delta writes (delta)', kind: 'bool' },
-  { key: 'fsync', label: 'fsync before rename', kind: 'bool' },
-  { key: 'sync_mode', label: 'Synchronize unix permission bits', kind: 'bool' },
-  { key: 'parallel', label: 'Parallel width (empty = 4)', kind: 'num' },
-  { key: 'on_conflict', label: 'Conflict policy', kind: 'select', opts: ['report', 'copy', 'newer'] },
-  { key: 'max_conflicts', label: 'Conflict copy limit', kind: 'num' },
-  { key: 'require_marker', label: 'Require a .syncdash-root marker', kind: 'bool', group: 'Guardrails' },
-  { key: 'min_free_pct', label: 'Minimum free disk ratio (0.01 = 1%)', kind: 'num' },
-  { key: 'max_delete_ratio', label: 'Delete ratio gate (0.5 = 50%)', kind: 'num' },
-  { key: '__junk', label: 'Junk presets', kind: 'custom', wide: true, group: 'Filters', hint: 'Each preset is a macro over the exclude list below: ticking writes its patterns in verbatim, unticking takes exactly those lines back out. A tick adds nothing you cannot see, and nothing puts a line back once you delete it. The excluded count is stated in the status bar under "⚠ Excluded" — never silently' },
-  { key: 'include', label: 'include (one per line)', kind: 'lines', wide: true },
-  // Naming the one remaining unconditional rule rather than letting the hint above imply there is none.
-  // It is four names, it is why the mount-point gate works (a synced .syncdash-root would grow on an
-  // unmounted empty directory and defeat it), and a filter you cannot see is exactly what this screen
-  // was rebuilt to stop having.
-  { key: 'exclude', label: 'exclude (one per line; leading ! = exception)', kind: 'lines', wide: true, hint: 'This list is the filter. The only thing excluded without appearing here is SyncDash\'s own metadata — .syncdash-root, .syncdash.lock, its in-flight temp files and .version_syncDash — which cannot be synced without breaking the mount-point gate and the versioning store' },
-  { key: 'deletable', label: 'deletable (may be removed along with a deleted parent directory)', kind: 'lines', wide: true },
-  { key: 'remote_host', label: 'ssh host alias', kind: 'text', group: 'Remote (optional)' },
+  { key: '__name', label: 'Job name', kind: 'text', group: 'Basics', desc: 'Also the name of the TOML file on disk.' },
+  { key: 'mode', label: 'Mode', kind: 'select', opts: ['mirror', 'sync', 'enrich'], desc: 'mirror = source wins · sync = two-way · enrich = add only, never delete' },
+  { key: 'source', label: 'Source root', kind: 'dir' },
+  { key: 'target', label: 'Target root', kind: 'dir' },
+  {
+    key: 'targets', label: 'Multiple targets', kind: 'lines',
+    desc: 'One root per line. Overrides the single target above when non-empty.',
+    help: '1:N — one source mirrored or enriched into several targets in turn, each with its own plan and its own logs. Not supported in sync mode; use paired jobs there.',
+  },
+  { key: 'archive', label: 'Archive file', kind: 'file', desc: 'Sync mode only. Empty = none.', help: 'Suggested location: %APPDATA%\\syncdash\\archives\\<name>.jsonl' },
+  {
+    key: 'rigor', label: 'Rigor', kind: 'select', opts: ['quick', 'fast', 'standard', 'paranoid', 'custom'],
+    desc: 'A preset for the four knobs below. Changing one by hand switches this to custom.',
+    help: 'Each tier actually reads more this round. quick = size and time only · fast = sampled digest, uses the cache · standard = sampled digest, no cache, escalates on divergence · paranoid = full hash and verify after write.',
+  },
+  {
+    key: 'evidence', label: 'Content evidence', kind: 'select', opts: ['none', 'sampled', 'full'], parent: 'rigor',
+    desc: 'none = metadata only · sampled = size + 256 KB at head, middle and tail · full = whole-file BLAKE3',
+  },
+  { key: 'use_cache', label: 'Use the hash cache', kind: 'bool', parent: 'rigor', desc: 'Trust the last result for unchanged files instead of reading them again.' },
+  { key: 'escalate', label: 'Escalate on divergence', kind: 'bool', parent: 'rigor', desc: 'Same digest but mtime differs by more than 2s — re-verify both sides in full.' },
+  { key: 'verify_writes', label: 'Verify after write', kind: 'bool', parent: 'rigor', desc: 'Hash the copy stream and compare it against a re-read from disk.' },
+  { key: 'symlinks', label: 'Symlink policy', kind: 'select', opts: ['exclude', 'direct'], desc: 'exclude = skip them · direct = copy the link itself, not its target' },
+  { key: 'case_sensitive', label: 'Case-sensitive compare', kind: 'bool', desc: 'Off matches how NTFS and APFS behave by default.' },
+
+  { key: 'versioning', label: 'Versioning', kind: 'bool', group: 'Behavior', desc: 'Keep replaced and deleted files under .version_syncDash in each root.' },
+  { key: 'delta', label: 'Local delta writes', kind: 'bool', desc: 'Rewrite only the changed blocks of a large file.' },
+  { key: 'fsync', label: 'fsync before rename', kind: 'bool', desc: 'Flush to disk before the atomic swap. Safer, slower.' },
+  { key: 'sync_mode', label: 'Synchronize unix permission bits', kind: 'bool', desc: 'No effect when the target is a Windows filesystem.' },
+  { key: 'parallel', label: 'Parallel width', kind: 'num', desc: 'Empty = 4.' },
+  { key: 'on_conflict', label: 'Conflict policy', kind: 'select', opts: ['report', 'copy', 'newer'], desc: 'report = list them and change nothing · copy = keep both sides · newer = the newer file wins' },
+  { key: 'max_conflicts', label: 'Conflict copy limit', kind: 'num', desc: 'How many conflicting files the copy policy will duplicate before stopping.' },
+
+  { key: 'require_marker', label: 'Require a .syncdash-root marker', kind: 'bool', group: 'Guardrails', desc: 'Refuse to run unless both roots carry the marker file — catches an unmounted drive.' },
+  { key: 'min_free_pct', label: 'Minimum free disk ratio', kind: 'num', desc: '0.01 = 1%. The run is blocked below this.' },
+  { key: 'max_delete_ratio', label: 'Delete ratio gate', kind: 'num', desc: '0.5 = 50%. Blocks a run that would delete more than this share of the target.' },
+
+  {
+    key: '__junk', label: 'Junk presets', kind: 'custom', group: 'Filters',
+    desc: 'Each preset writes its patterns straight into the exclude list below.',
+    help: 'Ticking a preset writes its patterns in verbatim; unticking takes exactly those lines back out. A tick adds nothing you cannot see, and nothing puts a line back once you have deleted it. Whatever the filter removes is counted in the status bar — never silently.',
+  },
+  { key: 'include', label: 'Include', kind: 'lines', desc: 'One pattern per line. Empty = everything.' },
+  // Naming the one remaining unconditional rule rather than letting the description imply there is
+  // none. It is four names, it is why the mount-point gate works (a synced .syncdash-root would grow
+  // on an unmounted empty directory and defeat it), and a filter you cannot see is exactly what this
+  // screen was rebuilt to stop having.
+  {
+    key: 'exclude', label: 'Exclude', kind: 'lines',
+    desc: 'One pattern per line; a leading ! makes an exception.',
+    help: 'This list is the filter. The only thing excluded without appearing here is SyncDash\'s own metadata — .syncdash-root, .syncdash.lock, its in-flight temp files and .version_syncDash — none of which can be synced without breaking the mount-point gate and the versioning store.',
+  },
+  { key: 'deletable', label: 'Deletable', kind: 'lines', desc: 'May be removed along with a deleted parent directory.' },
+
+  { key: 'remote_host', label: 'ssh host alias', kind: 'text', group: 'Remote' },
   { key: 'remote_root', label: 'Remote root path', kind: 'text' },
-  { key: 'remote_exe', label: 'Remote syncdash path (empty = PATH)', kind: 'text' },
-  { key: 'watch_interval_secs', label: 'Scheduled scan interval (seconds; empty = off)', kind: 'num', group: 'Watch', hint: 'Seconds = near real time; for UNC targets use ≥30' },
+  { key: 'remote_exe', label: 'Remote syncdash path', kind: 'text', desc: 'Empty = found on PATH.' },
+
+  { key: 'watch_interval_secs', label: 'Scheduled scan interval', kind: 'num', group: 'Watch', desc: 'Seconds; empty = off. For UNC targets use 30 or more.' },
   { key: 'watch_auto_apply', label: 'Run automatically when differences are found', kind: 'bool' },
 ];
 
 export const SET_FIELDS: FSpec[] = [
-  { key: 'log_dir', label: 'Log directory (empty = default %APPDATA%\\syncdash\\logs)', kind: 'dir', wide: true, group: 'Location' },
-  { key: 'level', label: 'Record level', kind: 'select', opts: ['info', 'warn', 'error'], hint: 'Narration below this level is not written to disk; the error list is unaffected', group: 'Content' },
-  { key: 'log_compare', label: 'Compare runs', kind: 'select', opts: ['summary', 'off'], hint: 'summary = one summary line, no directory (Watch runs every 30 s, and creating a directory each time would flood the disk)' },
+  { key: 'log_dir', label: 'Log directory', kind: 'dir', group: 'Location', desc: 'Empty = %APPDATA%\\syncdash\\logs.' },
+  { key: 'level', label: 'Record level', kind: 'select', opts: ['info', 'warn', 'error'], group: 'Content', desc: 'Narration below this level is not written to disk. The error list is unaffected.' },
+  {
+    key: 'log_compare', label: 'Compare runs', kind: 'select', opts: ['summary', 'off'],
+    desc: 'summary = one line, no directory.',
+    help: 'Watch compares every 30 s, and creating a run directory each time would flood the log disk.',
+  },
   { key: 'mirror_stderr', label: 'CLI also prints to the terminal', kind: 'bool' },
-  { key: 'keep_days', label: 'Retention days (0 = no age-based cleanup)', kind: 'num', group: 'Retention' },
-  { key: 'max_total_mb', label: 'Total size cap in MB (0 = unlimited)', kind: 'num', hint: 'The item list records everything — one big sync is tens of thousands of rows, and the total cap is its seatbelt' },
+  { key: 'keep_days', label: 'Retention days', kind: 'num', group: 'Retention', desc: '0 = no age-based cleanup.' },
+  {
+    key: 'max_total_mb', label: 'Total size cap in MB', kind: 'num', desc: '0 = unlimited.',
+    help: 'The item list records every file touched — one big sync is tens of thousands of rows, and this cap is its seatbelt.',
+  },
 ];
+
+/// Section titles in rail order, derived from whichever fields open a group
+export function groupsOf(fields: FSpec[]): string[] {
+  return fields.map((f) => f.group).filter((g): g is string => !!g);
+}
+
+/// The fields of one section. `group` marks where a section *starts*, so a field belongs to the
+/// most recent group above it — the list stays flat and a field only ever names its section when
+/// it opens one.
+export function fieldsInGroup(fields: FSpec[], group: string): FSpec[] {
+  let cur = '';
+  return fields.filter((f) => {
+    if (f.group) cur = f.group;
+    return cur === group;
+  });
+}
 
 /// Optional fields where an empty string means "unset" rather than "the empty string" (serde Option)
 export const NULLABLE_TEXT = new Set(['archive', 'remote_host', 'remote_root', 'remote_exe']);

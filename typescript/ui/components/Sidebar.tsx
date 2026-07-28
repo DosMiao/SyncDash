@@ -1,3 +1,4 @@
+import { Circle, Pencil, Plus } from 'lucide-react';
 import { relTime } from '../../core/format';
 import type { JobDto } from '../../core/types/generated/JobDto';
 import type { RunRecord } from '../../core/types/generated/RunRecord';
@@ -21,7 +22,9 @@ function LastRun({ r }: { r: RunRecord }) {
   const note = r.errors > 0 ? ` · ${r.errors} errors` : r.cancelled ? ' · cancelled' : '';
   return (
     <div className={'jrow2' + (stale ? ' stale' : '')}>
-      <span className={'dot ' + dot}>●</span>
+      {/* Filled rather than outlined: at 7px an outlined ring reads as a smudge, and this dot is
+          carrying the whole outcome of the last run */}
+      <span className={'dot ' + dot}><Circle size={7} fill="currentColor" strokeWidth={0} /></span>
       {relTime(r.ts_ms)} · {r.done} items{note}
     </div>
   );
@@ -31,9 +34,9 @@ export function Sidebar(props: Props) {
   const { jobs, currentName, lastMap, busy, appVersion, jobsDir, onSelect, onEdit, onNew } = props;
 
   return (
-    <aside id="sidebar">
+    <aside className="sidebar">
       <div className="brand" data-tauri-drag-region>Sync<span>Dash</span></div>
-      <div id="joblist">
+      <div className="joblist">
         {jobs.map((j) => (
           <div
             key={j.name}
@@ -50,16 +53,16 @@ export function Sidebar(props: Props) {
                 className="jedit"
                 title="Edit job"
                 onClick={(e) => { e.stopPropagation(); onEdit(j.name); }}
-              >✎</button>
+              ><Pencil size={12} /></button>
             </div>
             {lastMap[j.name] && <LastRun r={lastMap[j.name]} />}
           </div>
         ))}
       </div>
-      <button className="btn newjob" onClick={onNew}>+ New job</button>
-      <div id="sidefoot">
-        <span className="dim">{appVersion}</span>
-        <span className="dim">{jobsDir}</span>
+      <button className="btn newjob" onClick={onNew}><Plus size={13} /> New job</button>
+      <div className="sidefoot">
+        <span>{appVersion}</span>
+        <span>{jobsDir}</span>
       </div>
     </aside>
   );

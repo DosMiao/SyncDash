@@ -1,23 +1,33 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { CornerRightUp } from 'lucide-react';
 import {
-  ED_FIELDS, RIGOR_PRESETS, applyRigorPresetDefaults, detectRigor, formToJob, jobToForm, schtasksCmd,
+  ED_FIELDS, RIGOR_PRESETS, applyRigorPresetDefaults, detectRigor, fieldsInGroup, formToJob,
+  groupsOf, jobToForm, schtasksCmd,
 } from '../../core/jobfields';
 import { defaultJob, deleteJob, getJob, jobFileSchema, pickPath, saveJob } from '../../core/ipc';
 import { pathState, usePathVerdict } from '../hooks/usePathVerdict';
 import { JunkPresets, useJunkPresets } from './JunkPresets';
 import { PathVerdictBox } from './PathVerdictBox';
-import { SchemaForm } from './SchemaForm';
+import { SchemaSection } from './SchemaForm';
+import { ConfirmDialog, Sheet } from './ui';
 import type { FormValues } from '../../core/jobfields';
 import type { JobFull } from '../../core/ipc';
 
 export interface EditorApi { setField: (key: string, value: string) => void }
 
+const ED_GROUPS = groupsOf(ED_FIELDS);
+
 interface Props {
   /// null = a new job
   name: string | null;
+  /// Section to open on. The config pills on the main screen each name the section that owns the
+  /// setting they show, so clicking one lands you on it rather than scrolling you near it.
   focusGroup?: string;
   /// Field key the Tauri drag handler is hovering, for the drop highlight
   dropOn: string | null;
+  /// Registers the form as the drop region. While the editor is open it takes precedence over the
+  /// main screen's two roots, and unmounting clears it — which is the whole reason it is a callback ref.
+  scopeRef: (el: HTMLElement | null) => void;
   apiRef: React.RefObject<EditorApi | null>;
   onClose: () => void;
   onSaved: (name: string, job: JobFull) => void;
@@ -32,12 +42,15 @@ interface Props {
 interface Loaded { base: JobFull; values: FormValues }
 
 export function JobEditor(props: Props) {
-  const { name, focusGroup, dropOn, apiRef, onClose, onSaved, onDeleted, onStatus } = props;
+  const { name, focusGroup, dropOn, scopeRef, apiRef, onClose, onSaved, onDeleted, onStatus } = props;
   const [form, setForm] = useState<Loaded | null>(null);
   /// Set when the file on disk predates the current job schema, i.e. the exclude lines on screen were
   /// produced by the load-time migration and are not in the file yet
   const [migratedFrom, setMigratedFrom] = useState<number | null>(null);
-  const groups = useRef(new Map<string, HTMLElement>());
+  const [askDelete, setAskDelete] = useState(false);
+  const [section, setSection] = useState(() =>
+    (focusGroup && ED_GROUPS.includes(focusGroup) ? focusGroup : ED_GROUPS[0]));
+  const sectionFields = useMemo(() => fieldsInGroup(ED_FIELDS, section), [section]);
 
   const set = useCallback((key: string, value: string | boolean) => {
     setForm((f) => {
@@ -95,11 +108,6 @@ export function JobEditor(props: Props) {
     return () => { live = false; };
   }, [name]);
 
-  useEffect(() => {
-    if (!form || !focusGroup) return;
-    groups.current.get(focusGroup)?.scrollIntoView({ block: 'start' });
-  }, [form, focusGroup]);
-
   // The default-on presets arrive already written into `exclude` by `default_job()`. Seeding them here
   // as well would be a second implementation of the same policy, racing the IPC that supplies the list.
   const presets = useJunkPresets();
@@ -137,7 +145,6 @@ export function JobEditor(props: Props) {
 
   const remove = async () => {
     if (!name) return;
-    if (!window.confirm(`Delete the job config '${name}'? (Removes the TOML only — no data is touched.)`)) return;
     try {
       await deleteJob(name);
       onDeleted(name);
@@ -154,49 +161,13 @@ export function JobEditor(props: Props) {
   };
 
   return (
-    <div id="editmodal" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="sheet edsheet">
-        <h3>{name ? `Edit job — ${name}` : 'New job'}</h3>
-        {migratedFrom !== null && (
-          <div className="ed-notice">
-            <span className="edn-mark">⤴</span>
-            <span>
-              This job file is at schema v{migratedFrom}: its junk exclusions were kept in
-              {' '}<code>os_excludes</code> / <code>dev_excludes</code>, and loading it wrote the matching
-              patterns into the exclude list below. The filter is unchanged — those lines are what the old
-              keys already meant. They are not in the file yet; saving writes them out.
-            </span>
-          </div>
-        )}
-        <div id="ed-form">
-          {form && (
-            <SchemaForm
-              fields={ED_FIELDS}
-              values={form.values}
-              set={set}
-              onPick={onPick}
-              onSwap={() => setForm((f) => (f ? { ...f, values: { ...f.values, source: f.values.target, target: f.values.source } } : f))}
-              pathClass={pathClass}
-              droppable
-              // "Escalate on divergence" only means anything when the evidence is a sampled digest
-              disabledField={(k) => k === 'escalate' && form.values.evidence !== 'sampled'}
-              groupRef={(g, el) => { if (el) groups.current.set(g, el); }}
-              renderCustom={() => (
-                <JunkPresets
-                  presets={presets}
-                  excludeText={String(form.values.exclude ?? '')}
-                  onChange={(t) => set('exclude', t)}
-                />
-              )}
-              // Warnings sit right under the two roots they talk about
-              after={(k) => (k === 'target'
-                ? <PathVerdictBox key="v" verdict={verdict} className="ed-verdict" />
-                : null)}
-            />
-          )}
-        </div>
-        <div className="btnrow">
-          {name && <button className="btn danger" onClick={remove}>Delete job</button>}
+    <Sheet
+      title={name ? `Edit job — ${name}` : 'New job'}
+      width="xl"
+      onClose={onClose}
+      footer={
+        <>
+          {name && <button className="btn danger" onClick={() => setAskDelete(true)}>Delete job</button>}
           {name && (
             <button
               className="btn"
@@ -212,8 +183,71 @@ export function JobEditor(props: Props) {
           <span className="spacer" />
           <button className="btn" onClick={onClose}>Cancel (Esc)</button>
           <button className="btn accent" onClick={save}>Save</button>
+        </>
+      }
+    >
+      <>
+        {migratedFrom !== null && (
+          <div className="ed-notice">
+            <span className="edn-mark"><CornerRightUp size={14} /></span>
+            <span>
+              This job file is at schema v{migratedFrom}: its junk exclusions were kept in
+              {' '}<code>os_excludes</code> / <code>dev_excludes</code>, and loading it wrote the matching
+              patterns into the exclude list under <b>Filters</b>. The filter is unchanged — those lines
+              are what the old keys already meant. They are not in the file yet; saving writes them out.
+            </span>
+          </div>
+        )}
+        <div className="ed-body">
+          <nav className="ed-nav">
+            {ED_GROUPS.map((g) => (
+              <button key={g} className={g === section ? 'on' : ''} onClick={() => setSection(g)}>{g}</button>
+            ))}
+          </nav>
+          <div className="ed-pane" ref={scopeRef}>
+            <div className="section-title">{section}</div>
+            {form && (
+              <SchemaSection
+                fields={sectionFields}
+                values={form.values}
+                set={set}
+                onPick={onPick}
+                onSwap={() => setForm((f) => (f ? { ...f, values: { ...f.values, source: f.values.target, target: f.values.source } } : f))}
+                pathClass={pathClass}
+                droppable
+                // "Escalate on divergence" only means anything when the evidence is a sampled digest
+                disabledField={(k) => k === 'escalate' && form.values.evidence !== 'sampled'}
+                renderCustom={() => (
+                  <JunkPresets
+                    presets={presets}
+                    excludeText={String(form.values.exclude ?? '')}
+                    onChange={(t) => set('exclude', t)}
+                  />
+                )}
+                // Warnings sit right under the two roots they talk about
+                after={(k) => (k === 'target'
+                  ? <PathVerdictBox key="v" verdict={verdict} className="ed-verdict" />
+                  : null)}
+              />
+            )}
+          </div>
         </div>
-      </div>
-    </div>
+
+        {/* Nested inside this sheet on purpose: the editor stays on screen behind it, so cancelling
+            puts you back exactly where you were. Escape unwinds one layer at a time. */}
+        {askDelete && name && (
+          <ConfirmDialog
+            title={`Delete the job config '${name}'?`}
+            message={
+              `This removes the job file only:\n\n· ${name}.toml is deleted from the jobs directory\n` +
+              '· Neither root is touched — no file on either side is read, moved or removed\n' +
+              '· Past run logs and anything already in the trash are left alone'
+            }
+            actions={[{ label: 'Delete the job file', danger: true, onConfirm: () => void remove() }]}
+            onCancel={() => setAskDelete(false)}
+          />
+        )}
+      </>
+    </Sheet>
   );
 }

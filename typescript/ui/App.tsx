@@ -6,6 +6,7 @@
 // frontend carries zero of them and cannot drift.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { CircleCheck, FolderSearch } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -27,7 +28,6 @@ import { useStatus } from './hooks/useStatus';
 import { useZoomControl } from './hooks/useZoomControl';
 import { ComparePanel } from './components/ComparePanel';
 import { ConfirmSheet } from './components/ConfirmSheet';
-import { ContextMenu } from './components/ContextMenu';
 import { FilterBar } from './components/FilterBar';
 import { FunnelPopover } from './components/FunnelPopover';
 import { JobEditor } from './components/JobEditor';
@@ -40,12 +40,25 @@ import { SettingsSheet } from './components/SettingsSheet';
 import { Sidebar } from './components/Sidebar';
 import { StatusBar } from './components/StatusBar';
 import { Toolbar } from './components/Toolbar';
+import { ConfirmDialog, ContextMenu, MenuDivider, MenuItem, Placeholder } from './components/ui';
 import type { CmpStage } from './components/ComparePanel';
 import type { ConfirmTotals } from './components/ConfirmSheet';
-import type { CtxState } from './components/ContextMenu';
 import type { EditorApi } from './components/JobEditor';
 
 const HIST_KEY = 'sd.pathhist';
+
+/// One entry in a row's right-click menu. Built at open time so each closure sees the row and the
+/// plan as they were when you right-clicked — a menu is transient, and a stale entry would be worse
+/// than a frozen one.
+interface CtxItem {
+  label: string;
+  disabled?: boolean;
+  danger?: boolean;
+  sep?: boolean;
+  run?: () => void;
+}
+
+interface CtxState { x: number; y: number; items: CtxItem[] }
 
 interface CmpEv {
   kind: string;
@@ -108,6 +121,13 @@ export function App() {
   const [logReload, setLogReload] = useState(0);
   const [sameOpen, setSameOpen] = useState(false);
   const [dropOn, setDropOn] = useState<string | null>(null);
+  /// The diff table's scroll container. App renders it, so App owns it and hands it down.
+  const [tableWrap, setTableWrap] = useState<HTMLDivElement | null>(null);
+  /// Pending root swap, held with the job it read so the confirmation can spell out both roots
+  const [askSwap, setAskSwap] = useState<{ name: string; job: ipc.JobFull } | null>(null);
+  /// The two regions holding droppable path fields. A ref rather than state: the drag handler is
+  /// registered once and reads this at drop time, so state here would only hand it a stale closure.
+  const dropScope = useRef<{ editor: HTMLElement | null; path: HTMLElement | null }>({ editor: null, path: null });
 
   // Compare progress (fed by the run-progress stream)
   const [cmpActive, setCmpActive] = useState(false);
@@ -229,10 +249,12 @@ export function App() {
       setOvExpanded(new Set());
       setSort(null);
       await recomputeMasks(p, f, vfilter.masks);
+      // The counts bar to the right already says what was scanned and what is showing, and the
+      // placeholder in the table says "identical" in full — this line only has to say the result
       setStatus(
         p.ops.length === 0
-          ? `'${currentJob.name}' both sides identical ✓`
-          : `'${currentJob.name}': ${p.ops.length} items, ${p.header.conflict_count} conflicts — review, then Synchronize (Enter)`,
+          ? 'Both sides identical'
+          : `${p.ops.length} items · ${p.header.conflict_count} conflicts`,
         p.header.conflict_count > 0 ? 'err' : '',
       );
     } catch (e) {
@@ -307,7 +329,7 @@ export function App() {
     setSelTarget(0);
     setSameOpen(false);
     setWatchSecs(null);
-    setStatus(`Selected '${j.name}' (${j.mode}${j.has_archive ? ', with archive' : ''}${j.rigor !== 'standard' ? ', ' + j.rigor : ''}) — Compare to start`);
+    setStatus(`${j.name} · ${j.mode}${j.rigor !== 'standard' ? ` · ${j.rigor}` : ''}`);
   }, [setStatus]);
 
   /// Write a root edited on the main screen back to the job TOML. Changing a root invalidates the current
@@ -347,16 +369,18 @@ export function App() {
 
   /// The FFS ⇄ swaps the in-memory config; our jobs are named TOML files on disk, so a swap has to hit
   /// the disk — otherwise the two roots in the plan header say something different from the job file, and
-  /// both run logs and archive refresh point in the wrong direction.
-  const swapRoots = useCallback(async () => {
+  /// both run logs and archive refresh point in the wrong direction. Read the job first so the
+  /// confirmation can name the two roots it is about to exchange.
+  const requestSwap = useCallback(async () => {
     if (!currentJob || busy) return;
-    const name = currentJob.name;
-    let j: ipc.JobFull;
-    try { j = await ipc.getJob(name); } catch (e) { setStatus(`Failed to read job: ${e}`, 'err'); return; }
-    const warn = j.mode === 'mirror'
-      ? `\n\nIn mirror mode this reverses which side is authoritative: after the swap, the original target wins.`
-      : '';
-    if (!window.confirm(`Swap the two roots of '${name}'?\n\nsource ← ${j.target}\ntarget ← ${j.source}${warn}\n\nThe job file will be rewritten and the current compare result discarded.`)) return;
+    try {
+      setAskSwap({ name: currentJob.name, job: await ipc.getJob(currentJob.name) });
+    } catch (e) {
+      setStatus(`Failed to read job: ${e}`, 'err');
+    }
+  }, [currentJob, busy, setStatus]);
+
+  const doSwap = useCallback(async (name: string, j: ipc.JobFull) => {
     const prev = { source: j.source, target: j.target };
     try {
       await ipc.saveJob(name, { ...j, source: j.target, target: j.source });
@@ -376,7 +400,7 @@ export function App() {
     } catch (e) {
       setStatus(`Swap failed: ${e}`, 'err');
     }
-  }, [currentJob, busy, refreshJobs, setStatus, setStatusUndo]);
+  }, [refreshJobs, setStatus, setStatusUndo]);
 
   /// Write an exclude back into the job's exclude list. Pruning during the scan only takes effect at the
   /// next Compare, so the message has to say so and leave an undo behind.
@@ -529,7 +553,7 @@ export function App() {
     const un = listen<LegacyProgress>('progress', (ev) => {
       const { phase, detail, pct, rate } = ev.payload;
       const map: Record<string, string> = {
-        'scan-source': 'Scanning source: ', 'scan-target': 'Scanning target: ', 'comparing': 'Comparing: ', 'warning': '⚠ ',
+        'scan-source': 'Scanning source: ', 'scan-target': 'Scanning target: ', 'comparing': 'Comparing: ', 'warning': 'Warning: ',
       };
       const suffix = pct >= 0 ? `  ${pct}%${rate > 0 ? `  ${rate.toFixed(1)} MiB/s` : ''}` : '';
       setStatus((map[phase] ?? phase) + detail + suffix, phase === 'warning' ? 'err' : '');
@@ -596,8 +620,10 @@ export function App() {
       if (!pos) return;
       const r = window.devicePixelRatio || 1;
       const x = pos.x / r, y = pos.y / r;
-      // While the editor is open only its fields count; otherwise the two roots on the main screen do
-      const scope = document.getElementById('ed-form') ?? document.getElementById('pathline');
+      // While the editor is open only its fields count; otherwise the two roots on the main screen do.
+      // Each region registers itself through a callback ref, so the editor's entry clears itself on
+      // unmount and this stays a plain null check rather than a lookup that has to guess at markup.
+      const scope = dropScope.current.editor ?? dropScope.current.path;
       const el = [...(scope?.querySelectorAll<HTMLInputElement>('input[data-drop]') ?? [])]
         .filter((n) => !n.disabled)
         .find((n) => {
@@ -653,7 +679,7 @@ export function App() {
     const iv = (currentJob.watch_interval_secs ?? 30) * 1000;
     const left = watchNext.current - Date.now();
     if (left > 0) {
-      if (!busy) setStatus(`⏱ Watching — next scan in ${Math.ceil(left / 1000)}s (${currentJob.name})`);
+      if (!busy) setStatus(`Watching — next scan in ${Math.ceil(left / 1000)}s (${currentJob.name})`);
       return;
     }
     if (busy) return; // the previous round hasn't finished — skip this beat
@@ -675,13 +701,13 @@ export function App() {
     autoApplied.current = plan;
     void (async () => {
       const ops = plan.ops.filter((op) => selectable(op));
-      setStatus(`⏱ Watch found ${ops.length} differences — running automatically…`);
+      setStatus(`Watch found ${ops.length} differences — running automatically…`);
       setBusy(true);
       try {
         await ipc.applyJobUnattended(currentJob.name, plan, ops, selTarget);
         refreshLastSyncs();
       } catch (e) {
-        setStatus(`⏱ Auto-sync failed: ${e}`, 'err');
+        setStatus(`Auto-sync failed: ${e}`, 'err');
       }
       setBusy(false);
     })();
@@ -689,18 +715,21 @@ export function App() {
 
   useEffect(() => {
     if (watchSecs === null || !plan || !currentJob || currentJob.watch_auto_apply) return;
-    if (plan.ops.length > 0) setStatus(`⏱ Watch found ${plan.ops.length} differences — review, then Synchronize`, 'err');
+    if (plan.ops.length > 0) setStatus(`Watch found ${plan.ops.length} differences`, 'err');
   }, [watchSecs, plan, currentJob, setStatus]);
 
-  // Keyboard
+  // Keyboard.
+  //
+  // Escape is deliberately absent: every overlay closes itself, and they stack, so one Escape
+  // unwinds exactly one layer. Handling it here as well would close the sheet *and* the dialog
+  // nested inside it on a single press.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
-      if (ctx && e.key === 'Escape') { setCtx(null); return; }
-      if (editor) { if (e.key === 'Escape') setEditor(null); return; }
-      if (settingsOpen) { if (e.key === 'Escape') setSettingsOpen(false); return; }
+      // While an overlay owns the screen it owns the keyboard: F5 must not kick off a compare
+      // behind an open editor
+      if (ctx || editor || settingsOpen || askSwap) return;
       if (confirmOpen) {
-        if (e.key === 'Escape') setConfirmOpen(false);
         if (e.key === 'Enter' && !(preflight && !preflight.ok && !acknowledged)) void doSync();
         return;
       }
@@ -712,13 +741,13 @@ export function App() {
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [ctx, editor, settingsOpen, confirmOpen, preflight, acknowledged, doSync, doCompare, openConfirm]);
+  }, [ctx, editor, settingsOpen, askSwap, confirmOpen, preflight, acknowledged, doSync, doCompare, openConfirm]);
 
-  // Dismiss the popovers on any outside click
+  // The funnel is anchored to its toolbar button and has no dismissal of its own; the context menu
+  // brings its own (outside click, Esc, and any scroll under it), so it is not handled here
   useEffect(() => {
-    const onClick = () => { setCtx(null); setFunnelAnchor(null); };
+    const onClick = () => setFunnelAnchor(null);
     document.addEventListener('click', onClick);
-    document.addEventListener('scroll', () => setCtx(null), true);
     return () => document.removeEventListener('click', onClick);
   }, []);
 
@@ -740,8 +769,8 @@ export function App() {
 
   return (
     <>
-      <div id="dragstrip" data-tauri-drag-region />
-      <div id="app">
+      <div className="dragstrip" data-tauri-drag-region />
+      <div className="app">
         <Sidebar
           jobs={jobs}
           currentName={currentJob?.name ?? null}
@@ -753,7 +782,7 @@ export function App() {
           onEdit={(name) => setEditor({ name })}
           onNew={() => setEditor({ name: null })}
         />
-        <main id="main">
+        <main className="main">
           <Toolbar
             job={currentJob}
             hasPlan={!!plan}
@@ -772,7 +801,7 @@ export function App() {
               const iv = currentJob.watch_interval_secs ?? 30;
               watchNext.current = Date.now() + iv * 1000;
               setWatchSecs(iv);
-              setStatus(`⏱ Watch on: compare every ${iv}s (the hash cache means an unchanged tree costs only the walk)${currentJob.watch_auto_apply ? ' · auto-run' : ''}`);
+              setStatus(`Watch on: compare every ${iv}s (the hash cache means an unchanged tree costs only the walk)${currentJob.watch_auto_apply ? ' · auto-run' : ''}`);
             }}
           />
           <PathLine
@@ -782,9 +811,10 @@ export function App() {
             selTarget={selTarget}
             pathHistory={pathHistory}
             dropOn={dropOn === 'source' || dropOn === 'target' ? dropOn : null}
+            scopeRef={(el) => { dropScope.current.path = el; }}
             onCommit={(which, v) => void saveRoot(which, v)}
             onBrowse={(which) => void browseRoot(which)}
-            onSwap={() => void swapRoots()}
+            onSwap={() => void requestSwap()}
             onSelectTarget={(i) => {
               // A different target means a different comparison, so the old plan is stale
               setSelTarget(i);
@@ -836,7 +866,7 @@ export function App() {
               }}
             />
           )}
-          <div id="reviewrow">
+          <div className="reviewrow">
             <Overview
               plan={plan}
               flipped={flipped}
@@ -854,7 +884,10 @@ export function App() {
                 return next;
               })}
             />
-            <div id="tablewrap">
+            {/* A callback ref into state, not a useRef: the table measures this element, and a child's
+                effects run before an ancestor host ref attaches — so on mount a ref would still be
+                null exactly when the virtual window first needs it */}
+            <div className="tablewrap" ref={setTableWrap}>
               {cmpActive ? (
                 <ComparePanel
                   stages={cmpStages}
@@ -877,6 +910,7 @@ export function App() {
                   pathMode={pathMode}
                   sort={sort}
                   collapsedDirs={collapsedDirs}
+                  wrap={tableWrap}
                   resetKey={`${currentJob?.name}|${search}|${[...chips].join()}|${ovFilter}|${sort?.key}${sort?.dir}`}
                   onToggleRow={toggleRow}
                   onToggleMany={toggleMany}
@@ -885,10 +919,22 @@ export function App() {
                   onSort={toggleSort}
                   onContextRow={rowMenu}
                 />
+              ) : plan ? (
+                <Placeholder
+                  icon={<CircleCheck size={26} className="icon-ok" />}
+                  title="Both sides are identical"
+                  description="Nothing to synchronize. The status bar below counts what was scanned and what a filter excluded."
+                />
               ) : (
-                <div className="empty">
-                  {plan ? '✓ Both sides are identical — nothing to synchronize' : '← Select a job, then Compare (Ctrl+R)'}
-                </div>
+                <Placeholder
+                  icon={<FolderSearch size={26} />}
+                  title={currentJob ? `Ready — ${currentJob.name}` : 'No job selected'}
+                  description={
+                    currentJob
+                      ? 'Press Compare (F5 or Ctrl+R) to walk both roots and build a plan.'
+                      : 'Pick a job on the left, then press Compare (F5 or Ctrl+R).'
+                  }
+                />
               )}
             </div>
           </div>
@@ -914,7 +960,14 @@ export function App() {
         </main>
       </div>
 
-      {ctx && <ContextMenu state={ctx} onClose={() => setCtx(null)} />}
+      {ctx && (
+        <ContextMenu at={ctx} onClose={() => setCtx(null)}>
+          {ctx.items.map((it, k) => (it.sep
+            ? <MenuDivider key={k} />
+            : <MenuItem key={k} disabled={it.disabled} danger={it.danger} onClick={it.run}>{it.label}</MenuItem>
+          ))}
+        </ContextMenu>
+      )}
       {funnelAnchor && plan && (
         <FunnelPopover
           anchor={funnelAnchor}
@@ -939,6 +992,7 @@ export function App() {
           name={editor.name}
           focusGroup={editor.focusGroup}
           dropOn={dropOn}
+          scopeRef={(el) => { dropScope.current.editor = el; }}
           apiRef={editorApi}
           onClose={() => setEditor(null)}
           onSaved={async (name, job) => {
@@ -963,6 +1017,20 @@ export function App() {
           onClose={() => setSettingsOpen(false)}
           onSaved={(msg, cls) => { setSettingsOpen(false); setStatus(msg, cls); setLogReload((k) => k + 1); }}
           onStatus={setStatus}
+        />
+      )}
+      {askSwap && (
+        <ConfirmDialog
+          title={`Swap the two roots of '${askSwap.name}'?`}
+          message={
+            `source ← ${askSwap.job.target}\ntarget ← ${askSwap.job.source}\n\n` +
+            (askSwap.job.mode === 'mirror'
+              ? 'In mirror mode this reverses which side is authoritative: after the swap, the original target wins.\n\n'
+              : '') +
+            'The job file is rewritten and the current compare result is discarded. The status bar keeps an undo.'
+          }
+          actions={[{ label: 'Swap them', onConfirm: () => void doSwap(askSwap.name, askSwap.job) }]}
+          onCancel={() => setAskSwap(null)}
         />
       )}
       {confirmOpen && currentJob && confirmTotals && (

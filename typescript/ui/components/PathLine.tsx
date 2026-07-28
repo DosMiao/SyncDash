@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { ArrowLeftRight, FolderOpen } from 'lucide-react';
 import { summarizePresets } from '../../core/junk';
 import { pathState, usePathVerdict } from '../hooks/usePathVerdict';
 import { useJunkPresets } from './JunkPresets';
@@ -15,6 +16,8 @@ interface Props {
   pathHistory: string[];
   /// Which root input the Tauri drag handler is currently hovering, if any
   dropOn: 'source' | 'target' | null;
+  /// Registers this row as a drop region: the drag handler hit-tests the inputs inside it
+  scopeRef: (el: HTMLElement | null) => void;
   onCommit: (which: 'source' | 'target', value: string) => void;
   onBrowse: (which: 'source' | 'target') => void;
   onSwap: () => void;
@@ -40,17 +43,60 @@ function filterSummary(j: JobFull, presets: JunkPresetDto[]): string {
   return parts.length ? parts.join(' · ') : `${j.exclude.length} excluded`;
 }
 
-function configPills(j: JobFull, presets: JunkPresetDto[]): [string, string, string][] {
-  const pills: [string, string, string][] = [
-    // [label, value, editor group]
-    ['Filters', filterSummary(j, presets) + (j.include.length ? ` · ${j.include.length} allowed` : ''), 'Filters'],
-    ['Conflicts', j.on_conflict + (j.on_conflict === 'copy' ? ` ≤${j.max_conflicts}` : ''), 'Behavior'],
-    ['Versioning', j.versioning ? 'on (history kept under each root)' : 'off (deletes go to the local trash)', 'Behavior'],
-    ['Gates', `delete ≤${pct(j.max_delete_ratio)} · free ≥${pct(j.min_free_pct)}${j.require_marker ? ' · marker required' : ''}`, 'Guardrails'],
-    ['Watch', j.watch_interval_secs ? `${j.watch_interval_secs}s${j.watch_auto_apply ? ' · auto-run' : ''}` : 'off', 'Watch'],
+interface Pill { key: string; value: string; group: string; title: string }
+
+/// A pill states the setting and its value; what the value *means* is in the tooltip. These sit on
+/// the main screen, where a parenthetical explanation costs a column of the diff table to say
+/// something you only need once.
+function configPills(j: JobFull, presets: JunkPresetDto[]): Pill[] {
+  const pills: Pill[] = [
+    {
+      key: 'Filters',
+      value: filterSummary(j, presets) + (j.include.length ? ` · ${j.include.length} allowed` : ''),
+      group: 'Filters',
+      title: 'Which junk presets are on, plus any hand-written rules. Whatever the filter removes is counted in the status bar.',
+    },
+    {
+      key: 'Conflicts',
+      value: j.on_conflict + (j.on_conflict === 'copy' ? ` ≤${j.max_conflicts}` : ''),
+      group: 'Behavior',
+      title: 'What happens when both sides changed since the last run.\nreport = list them and change nothing · copy = keep both sides · newer = the newer file wins',
+    },
+    {
+      key: 'Versioning',
+      value: j.versioning ? 'on' : 'off',
+      group: 'Behavior',
+      title: 'On: replaced and deleted files are kept under .version_syncDash in each root.\nOff: deletes go to the local trash instead.',
+    },
+    {
+      key: 'Gates',
+      value: `≤${pct(j.max_delete_ratio)} del · ≥${pct(j.min_free_pct)} free${j.require_marker ? ' · marker' : ''}`,
+      group: 'Guardrails',
+      title: `A run is blocked if it would delete more than ${pct(j.max_delete_ratio)} of the target, or if free disk is under ${pct(j.min_free_pct)}.`
+        + (j.require_marker ? '\nBoth roots must also carry a .syncdash-root marker.' : ''),
+    },
+    {
+      key: 'Watch',
+      value: j.watch_interval_secs ? `${j.watch_interval_secs}s${j.watch_auto_apply ? ' · auto' : ''}` : 'off',
+      group: 'Watch',
+      title: j.watch_interval_secs
+        ? `Compares every ${j.watch_interval_secs}s${j.watch_auto_apply ? ' and runs the result automatically' : ' and waits for you to review'}.`
+        : 'No scheduled comparison.',
+    },
   ];
-  if (j.mode === 'sync') pills.push(['archive', j.archive ? 'configured' : 'not configured (deletes/moves cannot be attributed)', 'Basics']);
-  if (j.remote_host) pills.push(['Remote', `ssh ${j.remote_host}`, 'Remote (optional)']);
+  if (j.mode === 'sync') {
+    pills.push({
+      key: 'Archive',
+      value: j.archive ? 'set' : 'none',
+      group: 'Basics',
+      title: j.archive
+        ? `Last-run table: ${j.archive}`
+        : 'Without an archive, sync mode cannot tell a delete from a file that was never there — deletes and moves are not attributed.',
+    });
+  }
+  if (j.remote_host) {
+    pills.push({ key: 'Remote', value: `ssh ${j.remote_host}`, group: 'Remote', title: 'The far side runs syncdash over ssh.' });
+  }
   return pills;
 }
 
@@ -58,7 +104,7 @@ function configPills(j: JobFull, presets: JunkPresetDto[]): [string, string, str
 /// job TOML. No "just tweak it in memory" — once the two roots in the plan header disagree with what the
 /// job file says, run logs and archive refresh both point in the wrong direction.
 export function PathLine(props: Props) {
-  const { job, cfgJob, busy, selTarget, pathHistory, dropOn, onCommit, onBrowse, onSwap, onSelectTarget, onEditGroup } = props;
+  const { job, cfgJob, busy, selTarget, pathHistory, dropOn, scopeRef, onCommit, onBrowse, onSwap, onSelectTarget, onEditGroup } = props;
 
   const targets = job ? (job.targets && job.targets.length ? job.targets : [job.target]) : [];
   const targetValue = targets[selTarget] ?? '';
@@ -78,7 +124,7 @@ export function PathLine(props: Props) {
   };
 
   return (
-    <div id="pathline" className="pathline">
+    <div className="pathline" ref={scopeRef}>
       <div className="prow">
         <span className="plabel">source</span>
         <input
@@ -100,13 +146,15 @@ export function PathLine(props: Props) {
             if (e.key === 'Escape') { setSrc(job?.source ?? ''); (e.target as HTMLInputElement).blur(); }
           }}
         />
-        <button className="pbtn" title="Browse…" disabled={!job || busy} onClick={() => onBrowse('source')}>📁</button>
+        <button className="pbtn" title="Browse…" disabled={!job || busy} onClick={() => onBrowse('source')}>
+          <FolderOpen size={13} />
+        </button>
         <button
           className="pbtn"
           title={job ? `Swap: ${job.source} ⇄ ${job.target} (written back to the job file)` : 'Swap source / target'}
           disabled={!job || busy}
           onClick={onSwap}
-        >⇄</button>
+        ><ArrowLeftRight size={13} /></button>
         <span className="plabel">target</span>
         <input
           type="text"
@@ -125,10 +173,12 @@ export function PathLine(props: Props) {
             if (e.key === 'Escape') { setTgt(targetValue); (e.target as HTMLInputElement).blur(); }
           }}
         />
-        <button className="pbtn" title="Browse…" disabled={!job || busy} onClick={() => onBrowse('target')}>📁</button>
+        <button className="pbtn" title="Browse…" disabled={!job || busy} onClick={() => onBrowse('target')}>
+          <FolderOpen size={13} />
+        </button>
         {targets.length > 1 && (
           <select
-            id="target-sel"
+            className="target-sel"
             title="Multi-target job: pick the target to work on"
             value={selTarget}
             onChange={(e) => onSelectTarget(Number(e.target.value) || 0)}
@@ -149,14 +199,14 @@ export function PathLine(props: Props) {
       <PathVerdictBox verdict={job ? verdict : null} className="pwarn" />
 
       <div className="cfgline">
-        {cfgJob && configPills(cfgJob, presets).map(([k, v, g]) => (
+        {cfgJob && configPills(cfgJob, presets).map((p) => (
           <button
-            key={k}
+            key={p.key}
             className="cfgpill"
-            title={`Open the '${g}' group in the editor`}
-            onClick={() => onEditGroup(g)}
+            title={`${p.title}\n\nClick to edit — opens ${p.group}.`}
+            onClick={() => onEditGroup(p.group)}
           >
-            <span className="ck">{k}</span><span className="cv">{v}</span>
+            <span className="ck">{p.key}</span><span className="cv">{p.value}</span>
           </button>
         ))}
       </div>

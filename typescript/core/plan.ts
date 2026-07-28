@@ -79,18 +79,23 @@ export function sidePaths(op: OpDto): [string | null, string | null] {
   }
 }
 
-/// Badge text and color class. The arrow is the direction the bytes move, not which side is "source".
-export function badge(op: OpDto): { text: string; cls: string } {
-  const toTarget = op.side === 'target';
+/// Which mark leads the badge. `right` / `left` are the direction the bytes move, not which side is
+/// "source" — the single most important thing in a plan row, so it is returned as a kind and drawn as
+/// a real icon that inherits the badge's colour, rather than baked into the label as a text arrow.
+export type BadgeIcon = 'right' | 'left' | 'conflict' | 'note';
+
+/// Badge mark, label and colour class.
+export function badge(op: OpDto): { icon: BadgeIcon; label: string; cls: string } {
+  const dir: BadgeIcon = op.side === 'target' ? 'right' : 'left';
   switch (op.action) {
-    case 'copy': return { text: toTarget ? '→ copy' : '← copy', cls: toTarget ? 'copy-r' : 'copy-l' };
-    case 'update': return { text: toTarget ? '→ update' : '← update', cls: 'update' };
-    case 'move': return { text: (toTarget ? '→' : '←') + ' move', cls: 'mv' };
+    case 'copy': return { icon: dir, label: 'copy', cls: dir === 'right' ? 'copy-r' : 'copy-l' };
+    case 'update': return { icon: dir, label: 'update', cls: 'update' };
+    case 'move': return { icon: dir, label: 'move', cls: 'mv' };
     case 'delete':
-    case 'delete_dir': return { text: (toTarget ? '→' : '←') + ' delete', cls: 'del' };
-    case 'chmod': return { text: (toTarget ? '→' : '←') + ' chmod', cls: 'update' };
-    case 'conflict': return { text: '⚡ conflict', cls: 'conflict' };
-    default: return { text: 'ⓘ note', cls: 'note' };
+    case 'delete_dir': return { icon: dir, label: 'delete', cls: 'del' };
+    case 'chmod': return { icon: dir, label: 'chmod', cls: 'update' };
+    case 'conflict': return { icon: 'conflict', label: 'conflict', cls: 'conflict' };
+    default: return { icon: 'note', label: 'note', cls: 'note' };
   }
 }
 

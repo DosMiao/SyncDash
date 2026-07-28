@@ -1,4 +1,5 @@
 import { useMemo } from 'react';
+import { ChevronDown, ChevronRight, PanelLeftClose, PanelLeftOpen, X } from 'lucide-react';
 import { humanSize } from '../../core/format';
 import { eff } from '../../core/plan';
 import type { PlanDto } from '../../core/plan';
@@ -58,13 +59,19 @@ export function Overview(props: Props) {
   }) => (
     <div
       className={'ovrow' + (ovFilter === rowKey ? ' on' : '') + (depth ? ' ovchild' : '')}
-      onClick={(e) => {
-        if (hasKids && (e.target as HTMLElement).classList.contains('chev')) onToggleExpanded(rowKey);
-        else onFilter(ovFilter === rowKey ? null : rowKey);
-      }}
+      onClick={() => onFilter(ovFilter === rowKey ? null : rowKey)}
     >
       <div className="l1">
-        <span className="chev">{hasKids ? (expanded.has(rowKey) ? '▾' : '▸') : ''}</span>
+        {/* A real button rather than testing what the click landed on: the chevron is an <svg> now,
+            so e.target is the icon's own element and a classList check on it never matches */}
+        <span className="chev">
+          {hasKids ? (
+            <button
+              title={expanded.has(rowKey) ? 'Collapse' : 'Expand one level'}
+              onClick={(e) => { e.stopPropagation(); onToggleExpanded(rowKey); }}
+            >{expanded.has(rowKey) ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</button>
+          ) : null}
+        </span>
         <span className="nm" title={label}>{label}</span>
         <span className="ct">{items} · {humanSize(bytes) || '0 B'}</span>
       </div>
@@ -74,14 +81,20 @@ export function Overview(props: Props) {
   );
 
   return (
-    <aside id="overview" className={collapsed ? 'collapsed' : ''}>
-      <button id="ov-toggle" title="Overview aggregation (expand / collapse)" onClick={onToggleCollapsed}>☰</button>
-      <div id="ov-body">
+    <aside className={'overview' + (collapsed ? ' collapsed' : '')}>
+      <button
+        className="icon-btn ov-toggle"
+        title="Overview aggregation (expand / collapse)"
+        onClick={onToggleCollapsed}
+      >{collapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}</button>
+      <div className="ov-body">
         <div className="ov-head">
           <span>Overview</span>
-          <span id="ov-clear" title="Clear filter" onClick={() => onFilter(null)}>✕</span>
+          <button className="icon-btn ov-clear" title="Clear filter" onClick={() => onFilter(null)}>
+            <X size={13} />
+          </button>
         </div>
-        <div id="ov-list">
+        <div className="ov-list">
           {rows.map(([seg, g]) => {
             const hasKids = seg !== '(root)' && g.children.size > 0;
             const kids = hasKids && expanded.has(seg)

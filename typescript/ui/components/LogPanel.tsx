@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { FolderOpen, Settings2, X } from 'lucide-react';
 import { hms } from '../../core/format';
 import { logArtifact, logDirPath, logRuns, reveal } from '../../core/ipc';
 import { LOG_LEVEL_LABEL, LP_LEVELS, LP_VIEWS, parseLogLine, runLabel } from '../../core/logs';
@@ -68,7 +69,7 @@ export function LogPanel({ jobName, onClose, onSettings, onStatus, reloadKey }: 
   }, [rows, level, q]);
 
   return (
-    <div id="logpanel">
+    <div className="logpanel">
       <div className="lp-head">
         <span className="lp-title">Log</span>
         <select title="Select a run" value={sel} onChange={(e) => setSel(Number(e.target.value))}>
@@ -101,18 +102,18 @@ export function LogPanel({ jobName, onClose, onSettings, onStatus, reloadKey }: 
         <span className="dim">{rows.length ? `${shown.length} / ${rows.length}` : ''}</span>
         <span className="spacer" />
         <button
-          className="btn"
+          className="icon-btn"
           title="Open this run's folder in the file manager"
           onClick={() => {
             logDirPath(current?.run_id ?? null)
               .then(reveal)
               .catch((e) => onStatus(`Failed to open the directory: ${e}`, 'err'));
           }}
-        >📂</button>
-        <button className="btn" title="Log settings" onClick={onSettings}>⚙</button>
-        <button className="btn" title="Collapse the log panel" onClick={onClose}>✕</button>
+        ><FolderOpen size={14} /></button>
+        <button className="icon-btn" title="Log settings" onClick={onSettings}><Settings2 size={14} /></button>
+        <button className="icon-btn" title="Collapse the log panel" onClick={onClose}><X size={14} /></button>
       </div>
-      <div id="lp-body">
+      <div className="lp-body">
         {notice && <div className="logempty">{notice}</div>}
         {!notice && shown.length === 0 && (
           <div className="logempty">{rows.length ? 'No matching rows' : 'This artifact is empty'}</div>
@@ -127,7 +128,8 @@ export function LogPanel({ jobName, onClose, onSettings, onStatus, reloadKey }: 
         ))}
         {shown.length > CAP && (
           <div className="logempty">
-            Showing the first {CAP} of {shown.length} rows — narrow it with search, or click 📂 to open the raw file
+            Showing the first {CAP} of {shown.length} rows — narrow it with search, or open the run
+            folder above to read the raw file
           </div>
         )}
       </div>

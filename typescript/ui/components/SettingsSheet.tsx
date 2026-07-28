@@ -1,8 +1,12 @@
 import { useEffect, useState } from 'react';
-import { SET_FIELDS, formToSettings, settingsToForm } from '../../core/jobfields';
+import { SET_FIELDS, fieldsInGroup, formToSettings, groupsOf, settingsToForm } from '../../core/jobfields';
 import { getSettings, pickPath, saveSettings } from '../../core/ipc';
-import { SchemaForm } from './SchemaForm';
+import { SchemaSection } from './SchemaForm';
+import { Sheet } from './ui';
 import type { FormValues } from '../../core/jobfields';
+
+/// Three short sections — they stack, where the job editor's six earn a rail
+const SET_GROUPS = groupsOf(SET_FIELDS);
 
 interface Props {
   onClose: () => void;
@@ -34,13 +38,23 @@ export function SettingsSheet({ onClose, onSaved, onStatus }: Props) {
   };
 
   return (
-    <div id="setmodal" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="sheet setsheet">
-        <h3>Log settings</h3>
-        <div id="set-form">
-          {values && (
-            <SchemaForm
-              fields={SET_FIELDS}
+    <Sheet
+      title="Log settings"
+      width="mid"
+      onClose={onClose}
+      footer={
+        <>
+          <button className="btn" onClick={onClose}>Cancel (Esc)</button>
+          <button className="btn accent" onClick={save}>Save</button>
+        </>
+      }
+    >
+      <div className="ed-pane">
+        {values && SET_GROUPS.map((g) => (
+          <div key={g} className="ed-section">
+            <div className="section-title">{g}</div>
+            <SchemaSection
+              fields={fieldsInGroup(SET_FIELDS, g)}
               values={values}
               set={(k, v) => setValues((prev) => (prev ? { ...prev, [k]: v } : prev))}
               onPick={async (key) => {
@@ -54,17 +68,13 @@ export function SettingsSheet({ onClose, onSaved, onStatus }: Props) {
                 }
               }}
             />
-          )}
-        </div>
-        <div id="set-note" className="thin">
+          </div>
+        ))}
+        <div className="set-note hint">
           Change the log directory and save, and the old directory moves wholesale to the new location
           (across volumes it falls back to copy + delete).
         </div>
-        <div className="btnrow">
-          <button className="btn" onClick={onClose}>Cancel (Esc)</button>
-          <button className="btn accent" onClick={save}>Save</button>
-        </div>
       </div>
-    </div>
+    </Sheet>
   );
 }

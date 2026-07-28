@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { ArrowLeft } from 'lucide-react';
 import { fmtTime, humanSize } from '../../core/format';
 import { listSame } from '../../core/ipc';
 import { MTIME_SLACK } from '../../core/plan';
@@ -36,21 +37,20 @@ export function SamePanel({ jobName, onClose }: { jobName: string; onClose: () =
   useEffect(() => { void load(0); }, [load]);
 
   return (
-    <div id="samepanel">
+    <div className="samepanel">
       <div className="sp-head">
         <span>Files identical on both sides</span>
         <input
-          id="sp-q"
-          className="mono"
+          className="sp-q mono"
           type="text"
           placeholder="Filter paths…"
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
-        <span id="sp-count" className="dim">{error ? '' : `${rows.length} / ${total.toLocaleString()}`}</span>
-        <button className="btn" onClick={onClose}>✕ Back to differences</button>
+        <span className="sp-count dim">{error ? '' : `${rows.length} / ${total.toLocaleString()}`}</span>
+        <button className="btn" onClick={onClose}><ArrowLeft size={12} /> Back to differences</button>
       </div>
-      <table id="sametable">
+      <table className="sametable">
         <thead>
           <tr>
             <th className="c-path">Relative path</th>
@@ -74,7 +74,7 @@ export function SamePanel({ jobName, onClose }: { jobName: string; onClose: () =
         </tbody>
       </table>
       {rows.length < total && (
-        <button id="sp-more" className="btn" onClick={() => void load(rows.length)}>Load more</button>
+        <button className="btn sp-more" onClick={() => void load(rows.length)}>Load more</button>
       )}
     </div>
   );

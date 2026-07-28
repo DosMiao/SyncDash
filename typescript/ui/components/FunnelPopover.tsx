@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { clamp } from './ui';
 import type { ViewFilter } from '../../core/filter';
 
 interface Props {
@@ -24,9 +25,11 @@ export function FunnelPopover(props: Props) {
   const [pos, setPos] = useState({ left: anchor.left, top: anchor.bottom + 4 });
   const [maskText, setMaskText] = useState(vfilter.masks.join('\n'));
 
+  // Clamped on both axes: this panel is tall, and opened from a filter bar low in a short window it
+  // used to run straight off the bottom with the buttons unreachable
   useLayoutEffect(() => {
-    const w = ref.current?.offsetWidth ?? 400;
-    setPos({ left: Math.max(6, Math.min(anchor.left, window.innerWidth - w - 6)), top: anchor.bottom + 4 });
+    const el = ref.current;
+    setPos(clamp(anchor.left, anchor.bottom + 4, el?.offsetWidth ?? 400, el?.offsetHeight ?? 380));
   }, [anchor]);
 
   // Mask matching costs an IPC round trip per keystroke otherwise
@@ -42,8 +45,8 @@ export function FunnelPopover(props: Props) {
   const hidden = planned - shown;
 
   return (
-    <div id="funnelpop" ref={ref} style={pos} onClick={(e) => e.stopPropagation()}>
-      <div className="fp-head">Filter current results<span className="dim thin">no rescan</span></div>
+    <div className="funnelpop" ref={ref} style={pos} onClick={(e) => e.stopPropagation()}>
+      <div className="fp-head">Filter current results<span className="hint">no rescan</span></div>
       <label className="fp-row wide">
         <span>Name masks (FFS syntax, one per line)</span>
         <textarea
