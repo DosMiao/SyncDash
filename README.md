@@ -20,14 +20,16 @@ SyncDash/
 │   ├─ foundation/            L0  fmt · time · path · text · names · dirs   (zero in-crate deps)
 │   ├─ model/                 L0  plan · event · table · chunk              (vocabulary, no I/O)
 │   ├─ fs/                    L0  staged (atomic write) · lock · vfs/ (one root = one backend)
-│   ├─ store/                 L1  settings · trash · version
+│   ├─ store/                 L1  settings · trash · version · hashcache · mtimefix · migrate
 │   ├─ obs/                   L1  progress · logging · runlog
-│   ├─ pipeline/              L2  scan · compare · apply · filter · guard
+│   ├─ pipeline/              L2  scan/ · compare/ · apply/ · guard/ (directories) · filter
 │   ├─ transfer/              L2  remote · pack
-│   ├─ job/                   L3  the Job schema · territory
-│   ├─ run.rs                 L3  the orchestrator
-│   └─ main.rs                L4  CLI bin
-├─ src-tauri/                 L4  Tauri v2 desktop shell: thin IPC layer
+│   ├─ job/                   L3  the Job schema · territory · junk presets · rigor
+│   ├─ run/                   L3  the orchestrator: local · remote · roots · archive, behind one transport router
+│   ├─ boot.rs                L3  process startup: worker pool, settings, progress sink (both shells)
+│   ├─ cli/                   L4  args (the --help contract) · dispatch
+│   └─ main.rs                L4  CLI bin (29 lines: parse, dispatch, exit)
+├─ src-tauri/                 L4  Tauri v2 desktop shell: dto · bridge · state · cmd/
 ├─ typescript/                frontend (Vite + React 19; styling is a hand-written CSS token layer, no UI library)
 │   ├─ core/                  framework-free domain + IPC; components never call invoke() directly
 │   │   └─ types/generated/   wire types ts-rs generates from the Rust structs — do not hand-edit
@@ -162,8 +164,11 @@ mirror_stderr = true     # the CLI also mirrors verbatim to stderr (terminal exp
 ## GUI (desktop app `syncdash-desktop`, Tauri v2)
 
 An FFS-shaped dark two-pane UI: the job list on the left (mode badges: mirror blue / sync green / enrich orange) →
-**Compare** (runs in the background via spawn_blocking, the UI never freezes) → the diff table: checkbox + colored
-action badge (`→ copy` / `← copy` / `⇢ move` / `✕ delete` / `⚡ conflict`) + path / from / size / reason →
+**Compare** (runs in the background via spawn_blocking, the UI never freezes) → the diff table, laid out
+symmetrically around what happens: checkbox + source path / size / time + **action** + target path / size / time +
+reason. The action is coloured text with a direction arrow and a per-category glyph (`→ ⧉ copy`, `← 🗑 delete`,
+`⚡ conflict`) — the same glyph and hue the matching filter chip and stats segment use, from one map in
+`typescript/ui/icons.tsx` →
 stats bar (items / selected / bytes to transfer / conflicts) → **Synchronize** applies the checked rows and
 **re-compares automatically** afterwards to verify convergence. conflict/note rows are locked and cannot be
 checked. Frontend: Vite + React 19, styled by the hand-written token layer in `typescript/styles.css` — no UI
@@ -171,9 +176,10 @@ or styling library. Every size and color resolves through that one file, with a 
 4.5:1 contrast; the whole window scales through the webview's own zoom (Ctrl +/-/0), not a font knob, so
 borders and layout scale with the text.
 
-Added in v0.3.2: **per-row direction flip** (click the action badge to toggle; the semantics are precomputed by the
-core's `reverse_op`: copy↔delete are inverses, update swaps sides; a flipped row gets a dashed border and a tinted
-background), **filter chips** (all/copy/update/move/delete/conflict, live counts, 0-item chips dimmed — GitDash
+Added in v0.3.2: **per-row direction flip** (click the row's action to toggle; the semantics are precomputed by the
+core's `reverse_op`: copy↔delete are inverses, update swaps sides; a flipped row gets a tinted background and a
+dashed outline on its direction arrow), **filter chips** (all/copy/update/move/delete/conflict, live counts, each
+carrying its category's own hue and glyph, 0-item chips dimmed by token — GitDash
 style), **search box** (substring over path/from/reason), **pre-sync confirmation sheet** (per-category counts +
 bytes, deletions highlighted in red), **keyboard shortcuts** (Ctrl/⌘+R compare, Ctrl/⌘+F search, Enter
 synchronize, Esc close overlay), **immersive Mac title bar**.
@@ -226,9 +232,12 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
   2s — "which side is newer" previously had to be guessed out of reason, and conflict rows didn't even carry
   size/mtime. The data comes from a new read-only evidence layer in the core library, `compare::evidence()` (it
   shares `norm_key`/`files_equal` with `compare()`, and the `Op` struct and on-disk plan format did not change by
-  a single byte). **Click-to-sort headers** (path/action/both sizes/both mtimes) — sorting and tree grouping are
-  mutually exclusive, because grouping relies on the invariant that rows in the same directory are contiguous in
-  the plan.
+  a single byte). **Every column sorts** — both side paths, action, both sizes, both mtimes, reason — and sorting
+  works *inside* the tree: rows order within each directory while the directories order by an aggregate of the same
+  key (summed bytes for a size, newest member for a time, lowest action rank, the dir name itself for a path).
+  `core/grouping.ts` owns display order for exactly this reason: it used to be split between the row sort and the
+  group builder, which is why the two had to be mutually exclusive. A column the responsive layout folds away hands
+  its sort key to the surviving column on the same side, so no key is ever unreachable.
 - **Status-bar counts**: `Showing X / Y · Z hidden, not run · Scanned A ⇄ B · Identical K` (FFS's "Showing 481 of 23,112").
   `source_entries`/`target_entries` had been sitting in the plan header all along.
 - **Funnel filter** (applies to the current result, no rescan): name mask (FFS syntax) + size range + time span.
@@ -504,7 +513,7 @@ strategy is worth reading, but adopting it means going resident).
 - [x] v0.2.2 rigor levels quick/standard/paranoid (verify after copy) + cross-platform correctness: NFC-normalized compare keys, case folding, Windows illegal-name preflight, unix mode recorded (with unit tests)
 - [x] v0.3 Tauri v2 desktop shell (modeled on AlexQuant Desktop: Vite+TS frontend, dual-platform builder scripts, dist committed so the Mac builds with pure cargo and no node);
       rigor levels (quick/standard/paranoid: no hash / cached hash / full re-hash + verify after copy); NFC + case-folded compare keys; Windows illegal-path preflight
-- [x] v0.3.x compare classification-matrix unit tests (the full archive-attribution matrix, 20 tests); two-phase parallel scan (rayon hashes whole files in parallel, splitting internally at ≥32MB); `compare::reverse_op` per-row direction flip (in egui, click the action badge to flip; the Tauri shell reuses the very same lib function)
+- [x] v0.3.x compare classification-matrix unit tests (the full archive-attribution matrix, 20 tests); two-phase parallel scan (rayon hashes whole files in parallel, splitting internally at ≥32MB); `compare::reverse_op` per-row direction flip (click the row's action to flip; the Tauri shell reuses the very same lib function)
 - [x] v0.4 remote: `pack` / `apply-pack` — a tar container (plan.jsonl + payload + trailing manifest), plan blake3 + per-file blake3 + a combined hash; nothing touches target until the whole staging area verifies; reuses apply's lock/trash/verify-after-copy; unix mode restored. **Pack on Win → ship over SMB → apply-pack on Mac → remote rescan shows 0 ops; the whole flow verified on real machines**
 - [x] v0.5 `territories` / `gen-jobs`: scan for `.ffs-sync` markers and generate a `cs-<slug>.toml` per territory (sync mode + an automatic archive path) — the syncdash edition of the CodeSync generator, measured generating 11 territories; runs in parallel with FFS, the moment to switch left to the user
 - [x] v0.6 `run --all`/`--prefix`; the end-to-end ssh remote pipeline (enabled just by setting remote_host in the job; verified on real machines: dry → apply → rerun 0 ops, symlinks included); symlink policies exclude/direct (compared by target, with apply creating/replacing/deleting the link itself); renames within the same parent directory are paired first (reason distinguishes rename from move); updating the Mac via a git bundle over SMB (the channel for when the mount is offline)
