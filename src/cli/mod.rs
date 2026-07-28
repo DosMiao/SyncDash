@@ -203,7 +203,7 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Scan { root, out, no_hash, rigor, evidence, cache, force_rehash, fast, symlinks_direct, junk, exclude, progress } => {
+        Cmd::Scan { root, out, no_hash, rigor, evidence, cache, force_rehash, fast, symlinks_direct, junk, include, exclude, progress } => {
             if !root.is_dir() {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
@@ -241,7 +241,7 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 sampled: r.sampled,
                 use_cache: r.use_cache,
                 symlinks_direct,
-                filter: filter::PathFilter::build(&[], &excludes),
+                filter: filter::PathFilter::build(&include, &excludes),
             };
             let bar = |p: scan::ScanProgress| {
                 let pct = if p.bytes_total > 0 { p.bytes_done * 100 / p.bytes_total } else { 100 };

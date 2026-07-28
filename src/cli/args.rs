@@ -99,6 +99,12 @@ pub enum Cmd {
         /// what a job passes, since a job's own `exclude` already spells its junk rules out in full
         #[arg(long, default_value = "windows,macos", value_delimiter = ',')]
         junk: Vec<String>,
+        /// Restrict the scan to these masks (FFS filter syntax, e.g. */keep/ or /docs/; repeatable).
+        /// With none given, everything is in scope. A peer job passes its own `include` here, so both
+        /// roots are filtered by the same rule — an allowlist that bound only one side would make the
+        /// other side's unlisted files look deleted
+        #[arg(long)]
+        include: Vec<String>,
         /// Extra excludes (FFS filter syntax, e.g. */big_temp/ or */*.log; repeatable)
         #[arg(long)]
         exclude: Vec<String>,
