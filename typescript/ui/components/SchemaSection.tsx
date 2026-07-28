@@ -12,7 +12,7 @@ import type { FormValues, FSpec } from '../../core/jobfields';
 // this replaced gave a field's name and its explanation identical typography, so the form read as
 // an undifferentiated wall. Anything longer than that one line goes behind the info icon.
 
-export interface SchemaFormProps {
+export interface SchemaSectionProps {
   fields: FSpec[];
   values: FormValues;
   set: (key: string, value: string | boolean) => void;
@@ -41,7 +41,7 @@ function Help({ text }: { text: string }) {
   );
 }
 
-function Field({ f, props }: { f: FSpec; props: SchemaFormProps }) {
+function Field({ f, props }: { f: FSpec; props: SchemaSectionProps }) {
   const { values, set, onPick, onSwap, pathClass, droppable, disabledField, renderCustom } = props;
   const v = values[f.key];
   const disabled = disabledField?.(f.key) ?? false;
@@ -123,7 +123,7 @@ function Field({ f, props }: { f: FSpec; props: SchemaFormProps }) {
   // would silently tick "Windows" instead.
   const Wrap = f.kind === 'custom' ? 'div' : 'label';
   return (
-    <Wrap className={`ed-field k-${f.kind}`}>
+    <Wrap className={`ed-field ed-kind-${f.kind}`}>
       {name}
       {control}
       {desc}
@@ -138,7 +138,7 @@ function Field({ f, props }: { f: FSpec; props: SchemaFormProps }) {
  * the same undifferentiated wall in a different costume. This is how the reference groups its own
  * settings — a titled panel, rows inside it, hairlines between.
  */
-export function SchemaSection({ fields, ...props }: SchemaFormProps) {
+export function SchemaSection({ fields, ...props }: SchemaSectionProps) {
   const all = { fields, ...props };
   return (
     <div className="box">

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { CornerRightUp } from 'lucide-react';
 import {
   ED_FIELDS, RIGOR_PRESETS, applyRigorPresetDefaults, detectRigor, fieldsInGroup, formToJob,
@@ -8,8 +8,9 @@ import { defaultJob, deleteJob, getJob, jobFileSchema, pickPath, saveJob } from 
 import { pathState, usePathVerdict } from '../hooks/usePathVerdict';
 import { JunkPresets, useJunkPresets } from './JunkPresets';
 import { PathVerdictBox } from './PathVerdictBox';
-import { SchemaSection } from './SchemaForm';
+import { SchemaSection } from './SchemaSection';
 import { ConfirmDialog, Sheet } from './ui';
+import { useScrollSpy } from '../hooks/useScrollSpy';
 import type { FormValues } from '../../core/jobfields';
 import type { JobFull } from '../../core/ipc';
 
@@ -48,9 +49,18 @@ export function JobEditor(props: Props) {
   /// produced by the load-time migration and are not in the file yet
   const [migratedFrom, setMigratedFrom] = useState<number | null>(null);
   const [askDelete, setAskDelete] = useState(false);
-  const [section, setSection] = useState(() =>
-    (focusGroup && ED_GROUPS.includes(focusGroup) ? focusGroup : ED_GROUPS[0]));
-  const sectionFields = useMemo(() => fieldsInGroup(ED_FIELDS, section), [section]);
+  /// The pane is the scroll container and the drop region both; it goes through state rather than a
+  /// ref so the scrollspy re-subscribes when the node actually arrives
+  const [pane, setPane] = useState<HTMLDivElement | null>(null);
+  const { active, register, scrollTo } = useScrollSpy(pane, ED_GROUPS);
+
+  // The pane is two things at once: the scrollspy's container and the drag-drop region. One stable
+  // callback, not an inline arrow — React detaches and reattaches a ref whose identity changed, so
+  // an inline one would null out both on every render.
+  const paneRef = useCallback((el: HTMLDivElement | null) => {
+    setPane(el);
+    scopeRef(el);
+  }, [scopeRef]);
 
   const set = useCallback((key: string, value: string | boolean) => {
     setForm((f) => {
@@ -107,6 +117,16 @@ export function JobEditor(props: Props) {
     void load();
     return () => { live = false; };
   }, [name]);
+
+  // Open on the section a config pill named. Instant rather than smooth: a dialog that appears
+  // already mid-glide reads as a glitch. Once only — a later re-render must not yank you back to
+  // where you came in, after you have scrolled somewhere else.
+  const jumped = useRef(false);
+  useEffect(() => {
+    if (jumped.current || !form || !pane || !focusGroup || !ED_GROUPS.includes(focusGroup)) return;
+    jumped.current = true;
+    scrollTo(focusGroup, false);
+  }, [form, pane, focusGroup, scrollTo]);
 
   // The default-on presets arrive already written into `exclude` by `default_job()`. Seeding them here
   // as well would be a second implementation of the same policy, racing the IPC that supplies the list.
@@ -198,38 +218,43 @@ export function JobEditor(props: Props) {
             </span>
           </div>
         )}
+        {/* Every section stays mounted, which is also what keeps the two root inputs in the DOM at
+            any scroll position — rendering only the visible one would silently break drag-and-drop
+            onto source/target from anywhere but Basics. */}
         <div className="ed-body">
           <nav className="ed-nav">
             {ED_GROUPS.map((g) => (
-              <button key={g} className={g === section ? 'on' : ''} onClick={() => setSection(g)}>{g}</button>
+              <button key={g} className={g === active ? 'on' : ''} onClick={() => scrollTo(g)}>{g}</button>
             ))}
           </nav>
-          <div className="ed-pane" ref={scopeRef}>
-            <div className="section-title">{section}</div>
-            {form && (
-              <SchemaSection
-                fields={sectionFields}
-                values={form.values}
-                set={set}
-                onPick={onPick}
-                onSwap={() => setForm((f) => (f ? { ...f, values: { ...f.values, source: f.values.target, target: f.values.source } } : f))}
-                pathClass={pathClass}
-                droppable
-                // "Escalate on divergence" only means anything when the evidence is a sampled digest
-                disabledField={(k) => k === 'escalate' && form.values.evidence !== 'sampled'}
-                renderCustom={() => (
-                  <JunkPresets
-                    presets={presets}
-                    excludeText={String(form.values.exclude ?? '')}
-                    onChange={(t) => set('exclude', t)}
-                  />
-                )}
-                // Warnings sit right under the two roots they talk about
-                after={(k) => (k === 'target'
-                  ? <PathVerdictBox key="v" verdict={verdict} className="ed-verdict" />
-                  : null)}
-              />
-            )}
+          <div className="ed-pane" ref={paneRef}>
+            {form && ED_GROUPS.map((g) => (
+              <section key={g} className="ed-section" ref={register(g)}>
+                <h4 className="section-title ed-section-title">{g}</h4>
+                <SchemaSection
+                  fields={fieldsInGroup(ED_FIELDS, g)}
+                  values={form.values}
+                  set={set}
+                  onPick={onPick}
+                  onSwap={() => setForm((f) => (f ? { ...f, values: { ...f.values, source: f.values.target, target: f.values.source } } : f))}
+                  pathClass={pathClass}
+                  droppable
+                  // "Escalate on divergence" only means anything when the evidence is a sampled digest
+                  disabledField={(k) => k === 'escalate' && form.values.evidence !== 'sampled'}
+                  renderCustom={() => (
+                    <JunkPresets
+                      presets={presets}
+                      excludeText={String(form.values.exclude ?? '')}
+                      onChange={(t) => set('exclude', t)}
+                    />
+                  )}
+                  // Warnings sit right under the two roots they talk about
+                  after={(k) => (k === 'target'
+                    ? <PathVerdictBox key="v" verdict={verdict} className="ed-verdict" />
+                    : null)}
+                />
+              </section>
+            ))}
           </div>
         </div>
 

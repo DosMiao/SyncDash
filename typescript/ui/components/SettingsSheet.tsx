@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { SET_FIELDS, fieldsInGroup, formToSettings, groupsOf, settingsToForm } from '../../core/jobfields';
 import { getSettings, pickPath, saveSettings } from '../../core/ipc';
-import { SchemaSection } from './SchemaForm';
+import { SchemaSection } from './SchemaSection';
 import { Sheet } from './ui';
 import type { FormValues } from '../../core/jobfields';
 
