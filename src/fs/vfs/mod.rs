@@ -121,10 +121,12 @@ impl Medium {
 /// Which naming rules a write to this root is subject to.
 ///
 /// **This is a property of the path layer the write travels through, not of the far machine.**
-/// A Windows client writing to a Linux Samba box still gets Win32 parsing — `a:b` turns into an
-/// alternate-data-stream write on the client side before a single packet leaves. So the SMB
-/// backend, which delegates through the local OS, reports the *client's* rules, while SFTP and
-/// FTP speak their own path syntax to a server whose OS we cannot see and report `Unknown`.
+/// A Windows client writing to a Linux Samba box over a mounted `\\host\share` still gets Win32
+/// parsing — `a:b` turns into an alternate-data-stream write on the client side before a single
+/// packet leaves — and such a root is a plain `RootSpec::Local`, so it reports the host's rules.
+/// The protocol backends bypass that layer entirely and put the name on the wire as spelled, so
+/// what governs is the *server's* rules and its OS is not visible from here: smb, sftp and ftp
+/// all report `Unknown`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NameRules {
     /// Reserved device names; no `< > : " | ? *`; no trailing dot or space.
@@ -343,21 +345,13 @@ pub trait CredentialProvider: Send + Sync {
     fn credentials_for(&self, spec: &RemoteSpec) -> VfsResult<Credentials>;
 }
 
-/// Route a root phrase to a live backend. Local and smb roots resolve today;
-/// sftp/ftp land in their milestones and report `Unsupported` (with the plan spelled
-/// out) until then — never a silent local fallback.
+/// Route a root phrase to a live backend. Every scheme here is spoken in this process; an
+/// unknown one is refused rather than quietly read as a local path.
 pub fn open(phrase: &str, creds: &Arc<dyn CredentialProvider>) -> VfsResult<Arc<dyn Vfs>> {
     match spec::parse(phrase) {
         RootSpec::Local(p) => Ok(Arc::new(local::LocalVfs::new(p))),
-        // The in-process SMB2 client, not the OS's. It passes the same twelve-check contract
-        // against a live server that the OS route did, `set_mtime` included — which is the one
-        // that matters, because the root lock's heartbeat is a repeated `set_mtime`.
-        //
-        // The trade this makes is visible to the user and deliberate: an `smb://` root now needs
-        // a stored credential, because the crate forbids unsafe and so cannot reach SSPI to
-        // borrow this machine's login. `\\host\share` still parses as a plain local path and
-        // still needs nothing at all, so the zero-configuration route did not go anywhere — it
-        // just stopped being the thing `smb://` secretly meant.
+        // Needs a stored credential where `\\host\share` needs none — `smb`'s module doc has
+        // the whole trade.
         RootSpec::Remote(r) if r.scheme == "smb" => {
             Ok(Arc::new(smb::SmbBackend::new(r, creds.clone())?))
         }
