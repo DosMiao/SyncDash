@@ -233,7 +233,13 @@ mod suite {
         });
     }
 
-    /// The same contract against a **live SMB share**, for when the backend under it changes.
+    /// The contract against a share the **OS** has mounted, reached as a plain path.
+    ///
+    /// This is the zero-configuration route, and it is `LocalVfs` doing the work: `\\host\share`
+    /// and an smbfs mount point both parse as `RootSpec::Local`, so they never touch
+    /// `smb::SmbBackend` and never need a stored credential. It is the one SMB arrangement that
+    /// still leans on the operating system, which is exactly why it needs its own live check —
+    /// nothing else in the suite would notice if it broke.
     ///
     /// Ignored by default because it needs a server: point `SYNCDASH_SMB_ROOT` at a writable
     /// directory on one and run
@@ -241,11 +247,6 @@ mod suite {
     /// ```text
     /// cargo test --lib os_route_smb_conforms -- --ignored --nocapture
     /// ```
-    ///
-    /// It exists to make the native-SMB question answerable: the same twelve checks that pass on
-    /// a local disk have to pass through a real server before any backend claiming to speak SMB
-    /// can replace the one that delegates to the OS. Running it against the *current* backend
-    /// first is the point — it says what "passing" looks like today.
     #[test]
     #[ignore = "needs a live SMB share in SYNCDASH_SMB_ROOT"]
     fn os_route_smb_conforms() {
@@ -269,17 +270,16 @@ mod suite {
         }
     }
 
-    /// The same contract against a live share through the **native SMB2 backend** — the
-    /// in-process client, no OS mount involved.
+    /// The contract against a live share through `smb::SmbBackend` — the in-process SMB2
+    /// client, no OS mount involved. This is what an `smb://` phrase actually resolves to.
     ///
-    /// This is the twin of `os_route_smb_conforms` above, and the pair is the point: that
-    /// one measures what the OS-delegating backend does today, this one has to match it before
-    /// the native client can be trusted with anyone's files. `set_mtime` in particular is the
-    /// reason the backend exists in this order — it is the one `Vfs` method the SMB crate has
-    /// no high-level call for, and `fs::lock::RootLock`'s heartbeat is a repeated `set_mtime`,
-    /// so a backend that fails this check cannot hold a root lock.
+    /// It is the admission ticket the backend was held to before `vfs::open` was pointed at it,
+    /// scored against `os_route_smb_conforms` on the same server. `set_mtime` is the check that
+    /// earns its keep: the crate has no high-level call for it, so it is the one operation here
+    /// written against the wire format directly, and `fs::lock::RootLock`'s heartbeat is a
+    /// repeated `set_mtime` — a backend failing it could not hold a root lock at all.
     ///
-    /// Needs a server *and* a stored credential — a native smb root cannot ride this machine's
+    /// Needs a server *and* a stored credential; an `smb://` root cannot ride this machine's
     /// session login the way a `\\host\share` path can:
     ///
     /// ```text
@@ -329,8 +329,7 @@ mod suite {
     /// Depth-first delete through the `Vfs` surface itself. The suite writes onto someone's
     /// real share, so it leaves it exactly as it found it; a name that is already gone is a
     /// success, not an error.
-    #[cfg(test)]
-    fn remove_tree(v: &Arc<dyn Vfs>, rel: &str) -> super::super::error::VfsResult<()> {
+    fn remove_tree(v: &Arc<dyn Vfs>, rel: &str) -> crate::fs::vfs::error::VfsResult<()> {
         let Some(m) = v.stat(rel)? else {
             return Ok(());
         };
