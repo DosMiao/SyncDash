@@ -198,6 +198,21 @@ fn readonly_files_delete_and_update_like_git_objects() {
     // and both originals are still recoverable from the trash
     assert_eq!(std::fs::read(tr.join("gone.bin")).unwrap(), b"old");
     assert_eq!(std::fs::read(tr.join("upd.bin")).unwrap(), b"old");
+
+    // The assertions above pass on unix without exercising anything: `rm` of a 0444 file succeeds,
+    // so the retry never fires and "errors == 0" proves nothing about the code this test names.
+    // What matters here is the end state — the mode must come through untouched. The retry used to
+    // be unconditional, and on unix `set_readonly(false)` is `mode |= 0o222`, so a file that took
+    // the retry path was left group- and world-writable for good.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(tr.join("gone.bin")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o444,
+            "preserving a read-only file must not widen it (0o{mode:o}); on unix the retry is not the remedy and must not run"
+        );
+    }
     let _ = std::fs::remove_dir_all(&base);
 }
 

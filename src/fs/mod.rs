@@ -16,16 +16,29 @@ pub mod vfs;
 
 use std::path::Path;
 
-/// `remove_file`, clearing the read-only attribute on a PermissionDenied retry.
+/// `remove_file`, clearing the read-only attribute on a PermissionDenied retry — **on Windows**.
 ///
 /// Git marks loose objects `r--r--r--`, and Windows (plus SMB servers honoring the
 /// DOS attribute) refuses to delete such files — a real sync against a `.git`-carrying
 /// tree failed thousands of deletes with os error 5 exactly this way. Both reference
 /// projects carry this fallback (syncthing `Remove`: chmod 0600 then retry; FFS
-/// `withPreparedTarget`: chmod 0666 then remove). On unix, unlink never needs write
-/// permission on the file itself, so the retry simply never fires there.
+/// `withPreparedTarget`: chmod 0666 then remove).
+///
+/// The retry is Windows-only because it is only *correct* on Windows, where the read-only DOS
+/// attribute really is the cause and clearing it really is the remedy. This module used to claim
+/// the retry "never fires" on unix, which was wrong about the trigger: `unlink` returns EACCES
+/// when the **parent directory** is not writable, under a sticky-bit directory you do not own, or
+/// on a `chflags uchg` file — measured here, errno 13. And on unix `set_readonly(false)` is not an
+/// attribute, it is `mode |= 0o222`: measured, 0600 becomes 0622. So in the commonest case the
+/// chmod succeeded (you own the file), the retry failed again (the parent is still not writable),
+/// and the file was left group- and world-writable permanently. Mirroring into `/Users/Shared` or
+/// another user's tree widened one more file on every failed delete.
+///
+/// On unix the original PermissionDenied now propagates untouched. That is both the loud failure
+/// and the honest diagnosis: the file's own mode was never the problem.
 pub fn remove_file_force(p: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(p) {
+        #[cfg(windows)]
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             let md = std::fs::symlink_metadata(p)?;
             if md.file_type().is_symlink() {
@@ -34,7 +47,6 @@ pub fn remove_file_force(p: &Path) -> std::io::Result<()> {
                 return Err(e);
             }
             let mut perms = md.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
             perms.set_readonly(false);
             std::fs::set_permissions(p, perms)?;
             std::fs::remove_file(p)
@@ -53,12 +65,14 @@ pub fn remove_file_force(p: &Path) -> std::io::Result<()> {
 ///
 /// (`std::fs::remove_dir_all` needs no such helper — it clears the attribute itself, verified
 /// over a tree holding both a read-only file and a read-only directory.)
+///
+/// Windows-only for the same reason as [`remove_file_force`]: on unix this turned 0755 into 0777.
 pub fn remove_dir_force(p: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir(p) {
+        #[cfg(windows)]
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             let Ok(md) = std::fs::symlink_metadata(p) else { return Err(e) };
             let mut perms = md.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
             perms.set_readonly(false);
             std::fs::set_permissions(p, perms)?;
             std::fs::remove_dir(p)
@@ -69,13 +83,16 @@ pub fn remove_dir_force(p: &Path) -> std::io::Result<()> {
 
 /// `rename`, with the same read-only-clearing retry on the source (NTFS moves
 /// read-only files fine, but an SMB server mapping unix modes may refuse).
+///
+/// Windows-only, as above — and this one hid the widening the hardest, because the chmod's failure
+/// was discarded with `let _ =`.
 pub fn rename_force(from: &Path, to: &Path) -> std::io::Result<()> {
     match std::fs::rename(from, to) {
+        #[cfg(windows)]
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             match std::fs::symlink_metadata(from) {
                 Ok(md) if !md.file_type().is_symlink() => {
                     let mut perms = md.permissions();
-                    #[allow(clippy::permissions_set_readonly_false)]
                     perms.set_readonly(false);
                     let _ = std::fs::set_permissions(from, perms);
                     std::fs::rename(from, to)
