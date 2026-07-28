@@ -9,8 +9,10 @@ import {
   List,
   ListFilter,
   Route,
+  X,
 } from 'lucide-react';
-import { CHIPS, category, eff } from '../../core/plan';
+import { CHIPS, SORT_LABEL, category, eff } from '../../core/plan';
+import { MARK } from '../icons';
 import type { Chip, PlanDto, Sort } from '../../core/plan';
 
 interface Props {
@@ -33,6 +35,7 @@ interface Props {
   onExportCsv: () => void;
   onToggleFold: () => void;
   onToggleGroup: () => void;
+  onClearSort: () => void;
   onTogglePathMode: () => void;
 }
 
@@ -40,7 +43,7 @@ export function FilterBar(props: Props) {
   const {
     plan, flipped, chips, onChips, onSearch, searchKey, funnelCount, funnelOpen, sameOpen,
     grouped, sort, anyCollapsed, pathMode,
-    onToggleFunnel, onToggleSame, onExportCsv, onToggleFold, onToggleGroup, onTogglePathMode,
+    onToggleFunnel, onToggleSame, onExportCsv, onToggleFold, onToggleGroup, onClearSort, onTogglePathMode,
   } = props;
 
   const [q, setQ] = useState('');
@@ -100,10 +103,12 @@ export function FilterBar(props: Props) {
           return (
             <button
               key={key}
-              className={'chip' + (on ? ' on' : '') + (n === 0 ? ' zero' : '')}
+              // 'All' gets no hue class and no glyph: it is the absence of a filter, not a sixth
+              // category, and marking it as one would assert it belongs to a vocabulary it doesn't
+              className={['chip', key !== 'all' && `k-${key}`, on && 'on', n === 0 && 'zero'].filter(Boolean).join(' ')}
               title={key === 'all' ? 'Clear category filter' : 'Toggle for this category (can be on alongside others)'}
               onClick={() => toggle(key)}
-            >{label} {n}</button>
+            >{key !== 'all' && MARK[key]}{label} {n}</button>
           );
         })}
       </div>
@@ -132,22 +137,36 @@ export function FilterBar(props: Props) {
           onClick={onExportCsv}
         ><Download size={12} /> CSV</button>
       </div>
-      {/* The display-mode group is pushed right by .fb-right rather than by a margin on the fold button:
-          the fold button is absent while sorting, and an auto margin on a missing element pushes nothing. */}
+      {/* The auto margin lives on this group, not on its first child: which buttons are present here
+          varies with the view state, and a margin on an unmounted element pushes nothing. */}
       <div className="fb-right">
-        {grouped && !sort && (
+        {/* Its own control, not a mode of the group button: a sort now coexists with grouping, so
+            the two states need to be readable — and clearable — at the same time. This is also the
+            only way to clear a sort whose column the responsive layout has folded away. */}
+        {sort && (
+          <button
+            className="btn on"
+            title={`Sorted by ${SORT_LABEL[sort.key]}, ${sort.dir === 1 ? 'ascending' : 'descending'}. Click to clear.`}
+            onClick={onClearSort}
+          >
+            <ArrowUpDown size={12} />
+            Sorted: {SORT_LABEL[sort.key]}
+            <X size={12} />
+          </button>
+        )}
+        {grouped && (
           <button className="btn" title="Collapse / expand all directory groups" onClick={onToggleFold}>
             {anyCollapsed ? <ChevronsUpDown size={12} /> : <ChevronsDownUp size={12} />}
             {anyCollapsed ? 'Expand all' : 'Collapse all'}
           </button>
         )}
         <button
-          className={'btn' + (grouped && !sort ? ' on' : '')}
-          title={sort ? 'Click to clear the sort and return to the grouped view' : 'Toggle: tree groups (aggregated by directory, same as FFS) ↔ flat list'}
+          className={'btn' + (grouped ? ' on' : '')}
+          title="Toggle: tree groups (aggregated by directory, same as FFS) ↔ flat list"
           onClick={onToggleGroup}
         >
-          {sort ? <ArrowUpDown size={12} /> : grouped ? <FolderTree size={12} /> : <List size={12} />}
-          {sort ? `Sorted: ${sort.key}` : grouped ? 'Tree groups' : 'Flat list'}
+          {grouped ? <FolderTree size={12} /> : <List size={12} />}
+          {grouped ? 'Tree groups' : 'Flat list'}
         </button>
         <button
           className="btn"

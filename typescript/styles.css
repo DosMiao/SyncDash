@@ -48,10 +48,12 @@
   --lh: 1.45;
 
   /* The five action hues — copy, update, move, delete, conflict. That is the whole vocabulary a
-     plan row has. Each is set per theme, because SyncDash spends these as **text**: badge labels,
-     the newer-side timestamp, warning lines, the group directory. Light takes a darker step than
-     Primer publishes — its own success/attention/done values measure 4.29–4.48:1 against the
-     hover surface, just under the floor. Measured, not assumed. */
+     plan row has, and the .k-* classes below hand it to all three surfaces that speak it. Each is
+     set per theme, because SyncDash spends these mostly as **text**: the row's action label, the
+     newer-side timestamp, warning lines, the group directory. Light takes a darker step than Primer
+     publishes — its own success/attention/done values measure 4.29–4.48:1 against the hover surface,
+     just under the floor. Measured, not assumed. Used as a solid fill (an active chip) they pair
+     with --on-accent, measured at 5.19:1 worst case light / 5.63:1 dark. */
   --c-blue: #0969da;
   --c-orange: #7d4e00;
   --c-green: #116329;
@@ -76,7 +78,7 @@
   --shadow-lg: 0 24px 64px rgba(31, 35, 40, 0.2);
   --scrim: rgba(31, 35, 40, 0.4);
 
-  /* Text sitting on a solid accent or status fill — the run button, an active chip, Watch. It flips
+  /* Text sitting on a solid accent or status fill — the run button, an active chip, AutoScan. It flips
      with the theme because the fill does: on the light theme's deep blue, white reads 6.7:1 and
      near-black only 3.1:1; on the dark theme's pale blue those numbers swap (2.7 vs 7.1). */
   --on-accent: #ffffff;
@@ -126,8 +128,6 @@
   }
 }
 
-/* ------------------------------------------------------------------ reset -- */
-
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body, .app, #root { height: 100%; }
 
@@ -153,15 +153,12 @@ button:disabled { cursor: default; }
 input, textarea, select { font: inherit; color: inherit; }
 input, textarea { user-select: text; }
 
-/* -------------------------------------------------------------- utilities -- */
-
 .mono { font-family: var(--mono); font-size: var(--fs-sm); }
 .dim { color: var(--text-2); }
 .hidden { display: none !important; }
 .spacer { flex: 1; min-width: 0; }
 
-/* ------------------------------------------------------- typographic roles --
-   Three levels, and each differs from the one above in **size, weight and colour** — not in one
+/* Three levels, and each differs from the one above in **size, weight and colour** — not in one
    of the three. The rule this replaces (`.thin`) resolved to the same 12px/--text-2 as the field
    label beside it, so a setting's name and its explanation were literally indistinguishable.
    Anything that explains uses .hint; anything that names uses .field-label. */
@@ -172,8 +169,7 @@ input, textarea { user-select: text; }
 .field-label { font-size: var(--fs-base); font-weight: 600; color: var(--text-1); }
 .hint { font-size: var(--fs-micro); font-weight: 400; color: var(--text-2); line-height: 1.5; }
 
-/* ------------------------------------------------------------------ boxes --
-   The other half of "not grey". Primer's surface *step* is 1.09:1 — the same as the one it
+/* The other half of "not grey". Primer's surface *step* is 1.09:1 — the same as the one it
    replaces — so a nested panel is never legible as a panel by its fill alone. What makes it read
    is the border enclosing it. Every settings group, every grouped list, sits in one of these. */
 
@@ -212,8 +208,6 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { border-color
 ::-webkit-scrollbar-thumb:hover { background: var(--text-3); background-clip: content-box; }
 ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
 
-/* --------------------------------------------------------------- skeleton -- */
-
 /* minmax(0, 1fr), not bare 1fr: a bare 1fr track refuses to go below its content's min-content,
    and one nowrap line (the status counts) is enough to shove the whole main column past the
    window edge. */
@@ -235,8 +229,6 @@ body.mac .dragstrip {
 }
 body.mac .app { padding-top: 0; }
 body.mac .brand { padding-left: 62px; padding-top: 10px; }
-
-/* --------------------------------------------------------------- controls -- */
 
 .btn {
   display: inline-flex;
@@ -271,7 +263,7 @@ body.mac .brand { padding-left: 62px; padding-top: 10px; }
 .btn.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--c-red) 24%, transparent); }
 
 /* Latched toggles. The tone follows what is being turned on rather than one generic "active":
-   green for the two filters that *narrow* the list, accent for grouping, solid for Watch —
+   green for the two filters that *narrow* the list, accent for grouping, solid for AutoScan —
    which is the only one that keeps running after you look away. */
 .btn.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 .btn.on-green { border-color: var(--c-green); color: var(--c-green); background: color-mix(in srgb, var(--c-green) 14%, transparent); }
@@ -336,7 +328,17 @@ body.mac .brand { padding-left: 62px; padding-top: 10px; }
    and hit target. */
 input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; flex: none; }
 
-/* ------------------------------------------------------------------ chips -- */
+/* The five hues as a class you can put on anything, and one local variable — the same "one rule,
+   one variable" the old .badge block used, now shared by the three surfaces that speak this
+   vocabulary: a row's action cell, the category chips and the toolbar stats. An element with no
+   k-* class gets the fallback spelled out at each var() site, which is how the 'All' chip and the
+   bytes/flips stat segments stay neutral without needing a class of their own. */
+.k-copy     { --k: var(--c-green); }
+.k-update   { --k: var(--c-orange); }
+.k-move     { --k: var(--c-blue); }
+.k-delete   { --k: var(--c-red); }
+.k-conflict { --k: var(--c-purple); }
+.k-note     { --k: var(--text-2); }
 
 .chip {
   display: inline-flex;
@@ -345,50 +347,54 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
   white-space: nowrap;
   padding: 3px 10px;
   border-radius: var(--r-pill);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--k, var(--border-strong));
   background: transparent;
-  color: var(--text-2);
+  color: var(--k, var(--text-2));
   font-size: var(--fs-sm);
   font-variant-numeric: tabular-nums;
   transition: background 0.12s, border-color 0.12s, color 0.12s;
 }
-.chip:hover { border-color: var(--accent); color: var(--text-1); background: var(--accent-soft); }
-.chip.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
-/* A count of zero is muted by colour, not opacity: 0.35 alpha on top of --text-2 landed near 1.6:1 */
-.chip.zero { color: var(--text-3); border-color: var(--border); }
+/* --bg-3 is the surface the five hues were calibrated against (see the palette block): hue text on
+   it measures 4.54:1 at the worst of the five. The obvious alternative — a 14% hue wash, the mix the
+   old badge used — fails, because 14% blue into --bg-2 drops blue text to 4.02:1. */
+.chip:hover { background: var(--bg-3); }
+/* A solid status fill is exactly what --on-accent exists for (see its comment). White on the five
+   light hues measures 5.19–7.39:1; #04121f on the five dark hues, 5.63–7.49:1. The 'All' chip has no
+   category, so every var(--k, …) falls through to --accent and it keeps the fill it always had. */
+.chip.on { background: var(--k, var(--accent)); border-color: var(--k, var(--accent)); color: var(--on-accent); font-weight: 600; }
+/* A count of zero is muted by colour, not opacity: 0.35 alpha on top of --text-2 landed near 1.6:1.
+   :not(.on) is load-bearing — you can switch on a category that has no items, and a --text-3 fill
+   under --on-accent measures 3.45:1. An on-and-empty chip keeps its hue and says so loudly. */
+.chip.zero:not(.on) { --k: var(--text-3); border-color: var(--border); }
 
-/* ----------------------------------------------------------------- badges -- */
-
-/* One rule, one local variable. A new badge colour is a single line rather than four, and the
-   tint composites correctly over whichever surface it lands on in either theme. */
-.badge {
-  display: inline-flex;
+/* No pill: at one row per file the border and the tint were thousands of stacked rectangles
+   competing with the paths, which are what you actually read. Colour and a glyph carry the same
+   five categories the pill carried, and the pill carried nothing else. */
+.act {
+  display: flex;
   align-items: center;
-  justify-content: center;
   gap: 4px;
-  min-width: 88px;
+  min-width: 0;
+  color: var(--k, var(--text-2));
   font-size: var(--fs-sm);
   font-weight: 500;
-  padding: 1px 9px;
-  border-radius: var(--r-pill);
-  border: 1px solid var(--badge);
-  color: var(--badge);
-  background: color-mix(in srgb, var(--badge) 16%, transparent);
-  transition: box-shadow 0.12s;
+  line-height: var(--lh-tight);
+  border-radius: var(--r-xs);   /* only so the hover ring has a shape to follow */
 }
-.badge.flippable { cursor: pointer; }
-.badge.flippable:hover { box-shadow: var(--ring); }
-tr.flip .badge { border-style: dashed; }
-
-/* Plan actions, mapped onto the palette above. copy-l carries a heavier fill than copy-r: the
-   two are the same verb pointing opposite ways, and direction is the thing you must not misread. */
-.badge.copy-r, .badge.copy-l { --badge: var(--c-green); }
-.badge.copy-l { background: color-mix(in srgb, var(--c-green) 30%, transparent); }
-.badge.update { --badge: var(--c-orange); }
-.badge.mv { --badge: var(--c-blue); }
-.badge.del { --badge: var(--c-red); }
-.badge.conflict { --badge: var(--c-purple); }
-.badge.note { --badge: var(--text-2); border-color: var(--border-strong); }
+/* Fixed slots, always present — see the comment at the render site. */
+.act-dir, .act-mark { width: 12px; flex: none; display: inline-flex; justify-content: center; }
+/* The label is the only elastic item, and it ellipsizes rather than widening anything: the column
+   width comes from <colgroup> and must not depend on which rows happen to be mounted. */
+.act-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.act.flippable { cursor: pointer; }
+/* The ring, not a background: tr:hover already paints --bg-3 across the whole row, so a background
+   cue on the cell would be invisible exactly when you are pointing at it. */
+.act.flippable:hover { box-shadow: var(--ring); }
+/* "This row's direction was reversed", replacing the pill's dashed border — moved onto the thing it
+   is actually about, the direction arrow. outline, not border: it paints outside the box, so it
+   cannot change the row height the virtual scroller measures. The row tint below is the primary
+   signal; this is the confirmation you look for once the tint has caught your eye. */
+tr.flip .act-dir { outline: 1px dashed currentColor; outline-offset: 1px; border-radius: var(--r-xs); }
 
 /* A pill stating a mode or tier. Words, never icons — an icon at this size has to be guessed at. */
 .mode, .rigor, .rbadge {
@@ -406,8 +412,6 @@ tr.flip .badge { border-style: dashed; }
 .mode.enrich { color: var(--c-orange); border-color: var(--c-orange); background: color-mix(in srgb, var(--c-orange) 14%, transparent); }
 .rigor { color: var(--c-orange); border-color: var(--c-orange); background: color-mix(in srgb, var(--c-orange) 14%, transparent); }
 .rbadge { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
-
-/* ---------------------------------------------------------------- sidebar -- */
 
 .sidebar {
   background: var(--bg-2);
@@ -457,12 +461,12 @@ tr.flip .badge { border-style: dashed; }
 .newjob { margin: 0 2px; }
 .sidefoot { display: flex; flex-direction: column; gap: 3px; font-size: var(--fs-micro); color: var(--text-2); padding: 0 6px; word-break: break-all; }
 
-/* ---------------------------------------------------------------- toolbar -- */
-
 /* The toolbar wraps under pressure instead of overflowing: buttons are atomic units (nowrap,
    no shrink), so a row that no longer fits breaks between units, trailing (lower-priority)
-   items first — stats give way before Watch, Watch before the primary pair. Nothing ever
-   overlaps or clips. */
+   items first. Two clusters rather than one flat row, so the break lands where it costs the
+   least: the side cluster drops to its own line before the run cluster gives up anything, and
+   inside the run cluster the counts reflow before either button moves. Nothing ever overlaps
+   or clips. */
 .toolbar {
   display: flex;
   align-items: center;
@@ -474,17 +478,22 @@ tr.flip .badge { border-style: dashed; }
 }
 .toolbar .btn { flex: none; }
 
-/* Right-aligned and wrap-tolerant: on a narrow window the whole cluster drops to its own row
-   (still right-aligned via the auto margin), and the segments reflow instead of tearing
-   mid-number */
+/* Compare → what it found → the button that runs it. Its own flex context (shrinkable, wrapping)
+   so the counts absorb the pressure a narrow window puts on this row. */
+.tb-run { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; min-width: 0; }
+
+/* Everything that stands beside a run rather than being one. Pinned right by the auto margin,
+   which keeps working per line — on a narrow window the pair drops to its own row, still
+   right-aligned. */
+.tb-side { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-left: auto; }
+
+/* Wrap-tolerant: the segments reflow instead of tearing mid-number */
 .stats {
   display: flex;
   flex-wrap: wrap;
-  justify-content: flex-end;
   align-items: center;
   gap: 2px 8px;
   min-width: 0;
-  margin-left: auto;
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
   font-size: var(--fs-sm);
@@ -493,15 +502,12 @@ tr.flip .badge { border-style: dashed; }
 /* One count and its icon. Zeros recede by colour rather than alpha — the number still has to be
    readable to say "nothing of this kind". */
 .st { display: inline-flex; gap: 3px; align-items: center; }
-.st b { font-weight: 600; }
+/* var(--k) with no k-* class on the segment is invalid at computed-value time, and `color` inherits
+   — so it lands on .stats's own --text-2, which is how the bytes and flips segments stay neutral
+   without a class. The five category segments carry k-copy … k-conflict and take the hue. */
+.st b { font-weight: 600; color: var(--k, currentColor); }
+/* Must stay after .st b to win — a zero is a zero whatever category it belongs to */
 .st.zero, .st.zero b { color: var(--text-3); }
-.st.s-copy b { color: var(--c-green); }
-.st.s-upd b { color: var(--c-orange); }
-.st.s-mv b { color: var(--c-blue); }
-.st.s-del b { color: var(--c-red); }
-.st.s-conf b { color: var(--c-purple); }
-
-/* -------------------------------------------------------------- path line -- */
 
 .pathline { display: flex; flex-direction: column; gap: 5px; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: var(--fs-sm); min-width: 0; }
 
@@ -559,8 +565,6 @@ tr.flip .badge { border-style: dashed; }
 .cfgpill .ck { color: var(--text-2); }
 .cfgpill .cv { font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* ------------------------------------------------------------- filter bar -- */
-
 /* Two clusters that wrap between, never through, each other: "narrow the list" (search +
    category chips) and "tools" (.fb-actions | .fb-right). On a narrow window the bar becomes two
    tidy rows — filtering on top, tools below with the display-mode group still right-aligned —
@@ -599,8 +603,6 @@ tr.flip .badge { border-style: dashed; }
    unmounted while a sort is active, and a margin on an element that is not there pushes nothing. */
 .fb-right { display: flex; gap: 5px; margin-left: auto; flex: none; flex-wrap: wrap; justify-content: flex-end; }
 
-/* -------------------------------------------------------- overview column -- */
-
 .overview { width: 236px; flex: none; background: var(--bg-2); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
 .overview.collapsed { width: 28px; }
 .overview.collapsed .ov-body { display: none; }
@@ -622,8 +624,6 @@ tr.flip .badge { border-style: dashed; }
 .ovbar { height: 3px; background: var(--bg-3); border-radius: 2px; margin-top: 4px; overflow: hidden; }
 .ovbar > div { height: 100%; background: var(--accent); }
 .ovchild { margin-left: 16px; }
-
-/* ------------------------------------------------------------- plan table -- */
 
 table { width: 100%; border-collapse: collapse; }
 
@@ -648,19 +648,28 @@ tbody tr:hover { background: var(--bg-3); }
 /* An unticked row recedes by colour, never by alpha — the reason column still has to be
    readable to explain why you unticked it */
 tbody tr.off td { color: var(--text-2); }
-tbody tr.off td.reason, tbody tr.off td.c-meta { color: var(--text-3); }
+tbody tr.off td.c-reason, tbody tr.off td.c-size, tbody tr.off td.c-time { color: var(--text-3); }
 tbody tr.flip td { background: color-mix(in srgb, var(--accent) 10%, transparent); }
 
 .c-chk { width: 38px; }
-.c-act { width: 130px; }
+.c-act { width: 124px; }
+/* Shared with the Identical panel, which lays out automatically and does rely on this width. The
+   diff table overrides it through <colgroup> under fixed layout, so the number here is that panel's. */
 .c-size { width: 92px; text-align: right; }
 td.c-size { text-align: right; color: var(--text-2); font-variant-numeric: tabular-nums; }
 /* The reason column is why this row is in the list — it is read to make a decision, so it stays
    on --text-2 rather than dropping to the disabled tier */
-td.reason { color: var(--text-2); font-size: var(--fs-sm); }
+td.c-reason { color: var(--text-2); font-size: var(--fs-sm); }
+.c-time { text-align: right; white-space: nowrap; }
+td.c-time { color: var(--text-2); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
+/* Only the Identical panel still fuses size and time into one cell */
 .c-meta { width: 160px; text-align: right; white-space: nowrap; }
 td.c-meta { color: var(--text-2); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
-td.c-meta.newer { color: var(--c-green); }
+/* The newer side, wherever the responsive ladder has left it. PlanTable picks the cell (the most
+   specific of that side's columns still on screen, path last), so every column that can receive it
+   needs the rule — otherwise the class lands on a cell no selector paints and the hint is silently
+   lost at exactly the widths the fallback exists for. */
+td.c-time.newer, td.c-size.newer, td.c-meta.newer, td.c-path.newer { color: var(--c-green); }
 td.c-path { max-width: 330px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 th .sortable { cursor: pointer; user-select: none; }
@@ -675,32 +684,33 @@ tr.grp td { padding: 5px 10px; border-top: 1px solid var(--border); font-size: v
 tr.grp .gchev { color: var(--text-2); display: inline-flex; width: 14px; vertical-align: middle; }
 tr.grp .gdir { color: var(--accent); font-family: var(--mono); }
 tr.grp .gmeta { color: var(--text-2); margin-left: 10px; font-size: var(--fs-micro); font-variant-numeric: tabular-nums; }
-tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
+/* Rows inside a group indent under their directory heading. Hooked on the source path column by
+   name: :first-of-type would mean "the first td in the row", which is always the checkbox. */
+tr.ingrp td.c-path-s { padding-left: 28px; }
 
 /* Virtual scrolling: only the screenful of rows in the viewport is mounted, and spacer rows
    above and below stretch the scrollbar to the real height. That requires equal row heights and
    column widths independent of "which rows are mounted".
-   Column widths live in PlanTable.tsx (COLW): the set and the widths change with the container
-   width, so the component owns them. min-width is the floor where even the compact column set
-   stops working — below it the table holds its width and scrolls sideways instead of crushing
-   the path columns to nothing. */
-.plantable { table-layout: fixed; min-width: 560px; }
+   Which columns exist and how wide they are lives in PlanTable.tsx (COLS): both change with the
+   container width, so the component owns them — including min-width, which is the current column
+   set's pinned total plus a floor per path column. Below it the table holds its width and scrolls
+   sideways instead of crushing the paths to nothing, and because the floor moves with the set it is
+   a real constraint in every mode rather than only the narrowest one. */
+.plantable { table-layout: fixed; }
 
 /* Row height must stay constant — a wrap in any column throws off the precomputed height and
    rows drift out of place. Under fixed layout, overflow is not clipped automatically and smears
    into the neighbouring column, so every column clips itself. */
-.plantable td.reason, .plantable tr.grp td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* c-meta too: fmtTime carries the year for older files ("2025-07-26 16:51"), which is wider than
-   the column sized for the yearless form — unclipped it smears into the neighbour (the tooltip
-   has it all) */
-.plantable td.c-meta { overflow: hidden; text-overflow: ellipsis; }
+.plantable td.c-reason, .plantable tr.grp td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The time column too: fmtTime carries the year for older files ("2025-07-26 16:51"), which is
+   wider than the column sized for the yearless form — unclipped it smears into the neighbour (the
+   tooltip has it all) */
+.plantable td.c-time, .plantable td.c-size { overflow: hidden; text-overflow: ellipsis; }
 .plantable thead th { overflow: hidden; text-overflow: ellipsis; }
 
 /* Spacer rows only hold height: no borders, padding, zebra stripes, or hover colour */
 .plantable tr.vspacer, .plantable tr.vspacer:hover { background: none; }
 .plantable tr.vspacer td { padding: 0; border: 0; }
-
-/* ----------------------------------------------------------- empty states -- */
 
 .placeholder {
   display: flex;
@@ -719,8 +729,6 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
 .placeholder-desc { font-size: var(--fs-base); max-width: 420px; user-select: text; }
 .logempty { color: var(--text-2); padding: 20px; text-align: center; }
 
-/* --------------------------------------------------- identical-items pane -- */
-
 .samepanel { display: flex; flex-direction: column; height: 100%; min-width: 0; }
 .sp-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; padding: 8px 10px; background: var(--bg-2); border-bottom: 1px solid var(--border); font-size: var(--fs-sm); }
 .sp-head .sp-q {
@@ -736,8 +744,6 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
 .sametable tr:hover { background: var(--bg-3); }
 .sametable td.c-meta.drift { color: var(--c-orange); }
 .sp-more { margin: 12px auto; }
-
-/* ------------------------------------------------------------ compare pane -- */
 
 .cmp-panel { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; }
 .cmp-panel .cmp-title { color: var(--text-2); font-size: var(--fs-md); letter-spacing: 1px; }
@@ -765,8 +771,6 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
   .cmp-rows .stagerow.cmp2 { grid-template-columns: 20px 112px 1fr 52px 136px; }
   .cmp2 .st-bytes, .cmp2 .st-rate { display: none; }
 }
-
-/* -------------------------------------------------------------- log panel -- */
 
 .logpanel {
   flex: none; height: 38vh; min-height: 180px; display: flex; flex-direction: column;
@@ -801,8 +805,6 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
 .lp-row .lp-m { white-space: pre-wrap; word-break: break-all; }
 .lp-row.lv-warn .lp-l, .lp-row.lv-warn .lp-m { color: var(--c-orange); }
 .lp-row.lv-error .lp-l, .lp-row.lv-error .lp-m { color: var(--c-red); }
-
-/* --------------------------------------------------------------- overlays -- */
 
 .scrim {
   position: fixed;
@@ -854,10 +856,11 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
 
 .dialog-message { white-space: pre-wrap; font-size: var(--fs-sm); color: var(--text-2); line-height: var(--lh); max-height: 46vh; overflow: auto; user-select: text; }
 
-/* ------------------------------------------------------------- job editor --
-   One topic at a time: a section rail on the left, the chosen section's boxes on the right.
-   Thirty fields in one flat two-column grid is what made this screen unreadable — no amount of
-   typography fixes a page you have to scroll four times to find a checkbox on. */
+/* One long page with a rail that follows it. The rail is a table of contents, not a tab strip:
+   every section is mounted, scrolling moves the highlight, and clicking the rail scrolls the same
+   page. Thirty fields in one flat two-column grid is what made this screen unreadable — but
+   swapping the pane's contents per section, which is what this replaced, only traded that for a
+   page you cannot read straight through. */
 
 .ed-body { display: flex; gap: 16px; min-height: 0; flex: 1; }
 
@@ -890,9 +893,34 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
 .ed-nav button:hover { background: var(--bg-3); color: var(--text-1); }
 .ed-nav button.on { background: var(--bg-3); border-left-color: var(--accent); color: var(--text-1); font-weight: 600; }
 
-.ed-pane { flex: 1; min-width: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 2px; }
-/* Settings stacks several titled sections in one pane; the editor shows one at a time */
-.ed-section { display: flex; flex-direction: column; gap: 10px; }
+/* position: relative is load-bearing — the scrollspy compares each section's offsetTop against the
+   pane's scrollTop, and without a positioned ancestor those offsets are measured from the sheet
+   instead, so every section activates one early for the whole length of the page. */
+.ed-pane {
+  position: relative;
+  flex: 1; min-width: 0;
+  overflow-y: auto;
+  display: flex; flex-direction: column;
+  gap: 22px;
+  padding-right: 2px;
+}
+
+/* One titled section, in either sheet: the editor stacks six of them under a rail, settings stacks
+   three with none. Sections need more air between them than the boxes inside one, or the seam
+   between Behavior and Guardrails simply is not there. */
+.ed-section { display: flex; flex-direction: column; gap: 10px; scroll-margin-top: 30px; }
+
+/* The heading stays put while you read the section under it. On a tall section — Filters runs to
+   four boxes — the rail is otherwise the only thing telling you where you are, and it is 180px
+   away on the far side of the pane. --surface, not transparent: rows scroll *under* this.
+   Its rendered height is what useScrollSpy's STICKY_H tracks. */
+.ed-section-title {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface);
+  padding: 2px 0 6px;
+}
 
 /* A field row: name on top, control under it, one short line of explanation under that. The three
    differ in size, weight and colour — see the typographic-roles block. */
@@ -925,7 +953,10 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
 
 /* A number or a fixed set of options is never as wide as a path. Left unconstrained they stretch
    the full pane and the form reads as a column of identical bars. */
-.ed-field.k-num input, .ed-field.k-select select { max-width: 240px; }
+/* ed-kind-*, not k-*: k-* is the plan-category hue family (k-copy, k-update, …) and means one
+   thing. This is a different axis — what sort of control the field renders — and sharing the
+   prefix would put two unrelated vocabularies in one namespace. */
+.ed-field.ed-kind-num input, .ed-field.ed-kind-select select { max-width: 240px; }
 
 .ed-help { display: inline-flex; padding: 0; border: none; background: none; color: var(--text-2); flex: none; }
 .ed-help:hover { color: var(--accent); }
@@ -968,8 +999,6 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
 .junkbox .jb-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .junkbox .jb-count { color: var(--text-2); font-size: var(--fs-micro); font-variant-numeric: tabular-nums; flex: none; }
 
-/* ---------------------------------------------------------------- popovers -- */
-
 /* Positioned by JS through the CSSOM — under a CSP nonce a style="" attribute is blocked */
 .funnelpop {
   position: fixed; z-index: 115; width: 400px; max-width: calc(100vw - 12px); padding: 12px 14px;
@@ -990,8 +1019,6 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
 .fp-chips { display: flex; gap: 5px; }
 .fp-stat { font-size: var(--fs-sm); min-height: 18px; color: var(--text-2); }
 .fp-btns { display: flex; gap: 8px; justify-content: flex-end; padding-top: 4px; }
-
-/* ------------------------------------------------------------------ menus -- */
 
 .menu-panel {
   position: fixed;
@@ -1029,8 +1056,6 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
 .menu-section { padding: 6px 8px 3px; font-size: var(--fs-micro); color: var(--text-2); white-space: normal; max-width: 300px; }
 .submenu { position: relative; }
 .submenu-panel { position: absolute; top: -4px; left: 100%; margin-left: 2px; }
-
-/* ------------------------------------------------------------- status bar -- */
 
 .status {
   display: flex;
@@ -1070,8 +1095,6 @@ tr.ingrp td.c-path:first-of-type { padding-left: 28px; }
   color: var(--text-2); font-size: var(--fs-micro); background: none; border: none;
 }
 .zoomval:hover { color: var(--text-1); }
-
-/* ---------------------------------------------------- progress sub-window -- */
 
 .pwin { display: flex; flex-direction: column; height: 100vh; padding: 12px 14px; gap: 8px; }
 .phead { display: flex; align-items: baseline; gap: 10px; }

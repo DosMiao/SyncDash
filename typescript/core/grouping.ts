@@ -51,20 +51,20 @@ export interface LayoutInput {
   sort: Sort | null;
 }
 
-/// Shared stand-in so a numeric sort never allocates a per-plan string array. Never written to, and
-/// only ever read on the text path, which always allocates a real one.
-const EMPTY_STR: string[] = [];
+/// Ranks two entries by their precomputed keys. `sign` scales the value comparison and nothing else:
+/// a missing side sorts last in both directions, and the caller's index tie-break stays ascending
+/// whichever way you clicked, so flipping direction never scrambles entries that compare equal.
+///
+/// A key is numeric *or* text, never both — `keySpec().kind` decides which array was filled — so the
+/// two are separate functions rather than one that reads an array it knows is empty.
+type Rank = (a: number, b: number) => number;
 
-/// Compare two precomputed key triples. `dir` scales the value comparison and nothing else — a
-/// missing side sorts last in both directions, and ties resolve ascending whichever way you clicked,
-/// so flipping the direction never scrambles rows that compare equal.
-function cmp(
-  miss: ArrayLike<number>, num: ArrayLike<number>, str: ArrayLike<string>,
-  a: number, b: number, dir: 1 | -1,
-): number {
-  return (miss[a] - miss[b])
-    || (num[a] - num[b]) * dir
-    || (str[a] < str[b] ? -dir : str[a] > str[b] ? dir : 0);
+function numRank(miss: ArrayLike<number>, num: ArrayLike<number>, sign: 1 | -1): Rank {
+  return (a, b) => (miss[a] - miss[b]) || (num[a] - num[b]) * sign;
+}
+
+function textRank(miss: ArrayLike<number>, text: ArrayLike<string>, sign: 1 | -1): Rank {
+  return (a, b) => (miss[a] - miss[b]) || (text[a] < text[b] ? -sign : text[a] > text[b] ? sign : 0);
 }
 
 /// Rows in display order, plus the directory groups when grouping is on.
@@ -81,33 +81,36 @@ export function buildLayout(inp: LayoutInput): PlanLayout {
   // indices, so a row's key is addressable by its plan index with no indirection. Computing keys
   // inside the comparator instead would mean hundreds of thousands of eff()/metaOf() calls.
   const isText = !!sort && keySpec(sort.key).kind === 'text';
-  let miss: Int8Array | null = null, num: Float64Array | null = null, str: string[] | null = null;
+  const rowMiss = new Int8Array(sort ? n : 0);
+  const rowNum = new Float64Array(sort && !isText ? n : 0);
+  // Allocated only for text keys: the numeric keys are the common ones, and filling 20k empty
+  // strings on every size click is pure waste
+  const rowText: string[] = new Array(sort && isText ? n : 0);
   if (sort) {
-    miss = new Int8Array(n);
-    num = new Float64Array(n);
-    // Only allocated for text keys: the numeric keys are the common ones, and filling 20k empty
-    // strings on every size click is pure waste
-    str = isText ? new Array(n) : EMPTY_STR;
     for (const i of visible) {
-      const [a, b, c] = sortVal(plan, flipped, i, sort.key);
-      miss[i] = a; num[i] = b;
-      if (isText) str[i] = c;
+      const [miss, num, text] = sortVal(plan, flipped, i, sort.key);
+      rowMiss[i] = miss;
+      if (isText) rowText[i] = text; else rowNum[i] = num;
     }
   }
+  // `|| a - b` makes each comparator a total order rather than merely stable: same input, same
+  // output, whatever the engine's sort does with equal elements
+  const rankRow: Rank | null = !sort ? null
+    : isText ? textRank(rowMiss, rowText, sort.dir) : numRank(rowMiss, rowNum, sort.dir);
+  const cmpRow = rankRow && ((a: number, b: number) => rankRow(a, b) || a - b);
 
   if (!grouped) {
-    const order = sort ? [...visible] : visible;
-    // `|| a - b` makes the comparator a total order rather than merely stable: same input, same
-    // output, whatever the engine's sort does with equal elements
-    if (sort) order.sort((a, b) => cmp(miss!, num!, str!, a, b, sort.dir) || a - b);
-    return { order, groups: null };
+    // `visible` is returned as-is when there is nothing to reorder: it is treated as immutable
+    // everywhere, and copying 20k indices to hand back the same sequence buys nothing
+    if (!cmpRow) return { order: visible, groups: null };
+    return { order: [...visible].sort(cmpRow), groups: null };
   }
 
   // One group per directory — not per contiguous run. A directory holding both a copy and a delete
   // used to produce two group rows, because the engine ranks by action before path; merging fixes
   // that, and makes the group's dir a unique React key that survives a re-sort.
   const byDir = new Map<string, GroupSpec>();
-  const groups: GroupSpec[] = [];
+  let groups: GroupSpec[] = [];
   for (const i of visible) {
     const op = eff(plan, flipped, i);
     const dir = dirOf(op.path);
@@ -123,49 +126,52 @@ export function buildLayout(inp: LayoutInput): PlanLayout {
     g.bytes += op.size ?? 0;
   }
 
-  if (sort) {
-    const { dir, key } = sort;
-    const { fold } = keySpec(key);
-    for (const g of groups) g.items.sort((a, b) => cmp(miss!, num!, str!, a, b, dir) || a - b);
+  if (sort && cmpRow) {
+    const { fold } = keySpec(sort.key);
+    for (const g of groups) g.items.sort(cmpRow);
 
     // Fold each group's members into one value, then order the groups by it. Folds never depend on
-    // `dir` — a group's aggregate has to be a property of the group, or "why is this folder above
-    // that one" stops having an answer you can check.
-    const d = groups.length;
-    const gmiss = new Int8Array(d), gnum = new Float64Array(d);
-    const gstr: string[] = new Array(d);
-    for (let k = 0; k < d; k++) {
+    // the direction — a group's aggregate has to be a property of the group, or "why is this folder
+    // above that one" stops having an answer you can check.
+    const nGroups = groups.length;
+    const groupMiss = new Int8Array(nGroups);
+    const groupNum = new Float64Array(isText ? 0 : nGroups);
+    const groupText: string[] = new Array(isText || fold === 'dir' ? nGroups : 0);
+    for (let k = 0; k < nGroups; k++) {
       const g = groups[k];
       if (fold === 'dir') {
         // A path column's group value is the directory itself: folding member paths is circular,
         // and would let one missing side sink a whole directory
-        gmiss[k] = 0; gnum[k] = 0; gstr[k] = g.dir.toLowerCase();
+        groupText[k] = g.dir.toLowerCase();
         continue;
       }
       // A group has something to show in this column if *any* member does — the row-level rule,
       // lifted one level
-      let m = 1, v = fold === 'sum' ? 0 : fold === 'min' ? Infinity : -Infinity;
-      let s = '';
+      let missing = 1;
+      let value = fold === 'sum' ? 0 : fold === 'min' ? Infinity : -Infinity;
+      let text = '';
       for (const i of g.items) {
-        if (miss![i]) continue;
-        m = 0;
-        if (fold === 'sum') v += num![i];
-        else if (fold === 'min') v = Math.min(v, num![i]);
-        else v = Math.max(v, num![i]);
+        if (rowMiss[i]) continue;
+        missing = 0;
         if (isText) {
-          const t = str![i];
-          if (s === '' || (fold === 'min' ? t < s : t > s)) s = t;
-        }
+          const t = rowText[i];
+          if (text === '' || (fold === 'min' ? t < text : t > text)) text = t;
+        } else if (fold === 'sum') value += rowNum[i];
+        else if (fold === 'min') value = Math.min(value, rowNum[i]);
+        else value = Math.max(value, rowNum[i]);
       }
-      gmiss[k] = m;
-      gnum[k] = m ? 0 : v;
-      gstr[k] = s;
+      groupMiss[k] = missing;
+      if (isText) groupText[k] = text; else groupNum[k] = missing ? 0 : value;
     }
-    const idx = groups.map((_, k) => k);
-    idx.sort((a, b) => cmp(gmiss, gnum, gstr, a, b, dir) || groups[a].first - groups[b].first);
-    const sorted = idx.map((k) => groups[k]);
-    groups.length = 0;
-    groups.push(...sorted);
+    // `fold === 'dir'` writes a directory name, so it ranks as text whatever the key's own kind says
+    const rankGroup = isText || fold === 'dir'
+      ? textRank(groupMiss, groupText, sort.dir)
+      : numRank(groupMiss, groupNum, sort.dir);
+    // Pair each group with its index into the fold arrays, so the sort never has to read back into
+    // the array it is producing. Tie-break on first appearance, unique because plan indices are.
+    const ranked = groups.map((g, k) => ({ g, k }));
+    ranked.sort((x, y) => rankGroup(x.k, y.k) || x.g.first - y.g.first);
+    groups = ranked.map((r) => r.g);
   }
 
   const order: number[] = [];

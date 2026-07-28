@@ -13,12 +13,13 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 
 import * as ipc from '../core/ipc';
 import { EMPTY_FILTER, computeVisible, finalIdx, funnelActive } from '../core/filter';
+import { buildLayout, flattenLayout, layoutDirs } from '../core/grouping';
 import { addExcludeEntries } from '../core/junk';
 import { baseOf, dirOf, fullPath, p2 } from '../core/format';
-import { canFlip, eff, metaOf, selectable, sidePaths } from '../core/plan';
+import { canFlip, eff, keySpec, metaOf, selectable, sidePaths } from '../core/plan';
 import type { Chip, PlanDto, Sort, SortKey } from '../core/plan';
 import type { ViewFilter } from '../core/filter';
-import type { RowSpec } from './hooks/useVirtualRows';
+import type { PlanLayout } from '../core/grouping';
 import type { JobDto } from '../core/types/generated/JobDto';
 import type { LegacyProgress } from '../core/types/generated/LegacyProgress';
 import type { PreflightDto } from '../core/types/generated/PreflightDto';
@@ -46,6 +47,10 @@ import type { ConfirmTotals } from './components/ConfirmSheet';
 import type { EditorApi } from './components/JobEditor';
 
 const HIST_KEY = 'sd.pathhist';
+
+/// Stable identity for "no plan, nothing to lay out" — a fresh object literal here would make the
+/// flatten memo below recompute on every render
+const EMPTY_LAYOUT: PlanLayout = { order: [], groups: null };
 
 /// One entry in a row's right-click menu. Built at open time so each closure sees the row and the
 /// plan as they were when you right-clicked — a menu is transient, and a stale entry would be worse
@@ -128,6 +133,10 @@ export function App() {
   /// The two regions holding droppable path fields. A ref rather than state: the drag handler is
   /// registered once and reads this at drop time, so state here would only hand it a stale closure.
   const dropScope = useRef<{ editor: HTMLElement | null; path: HTMLElement | null }>({ editor: null, path: null });
+  // Stable identities: a ref callback whose identity changes is detached with null and reattached
+  // on every render, and these two are handed to components that re-render on every keystroke.
+  const setPathScope = useCallback((el: HTMLElement | null) => { dropScope.current.path = el; }, []);
+  const setEditorScope = useCallback((el: HTMLElement | null) => { dropScope.current.editor = el; }, []);
 
   // Compare progress (fed by the run-progress stream)
   const [cmpActive, setCmpActive] = useState(false);
@@ -136,7 +145,7 @@ export function App() {
   /// Rate EMA (0.7 old + 0.3 new): the instantaneous rate swings wildly with file size
   const cmpRate = useRef(new Map<string, { t: number; b: number; ema: number }>());
 
-  // Watch
+  // AutoScan (the job field behind it is watch_interval_secs)
   const [watchSecs, setWatchSecs] = useState<number | null>(null);
   const watchNext = useRef(0);
 
@@ -146,32 +155,24 @@ export function App() {
 
   // Derived view
 
+  // Three memos, not one, because the three questions change at different rates. Membership is the
+  // expensive full-table scan and no longer depends on `sort`, so clicking a header does not re-run
+  // it; the layout does the sorting; flattening only decides which member rows a fold emits, so
+  // folding one directory costs one pass instead of redoing the sort.
+  //
+  // `flipped` legitimately appears in all three: a flip changes eff(op), hence the row's directory
+  // and its side paths, hence its group and its sort key. It is a full rebuild by necessity.
   const visible = useMemo(() => (
-    plan ? computeVisible({ plan, flipped, chips, search, ovFilter, vfilter, maskHit, sort }) : []
-  ), [plan, flipped, chips, search, ovFilter, vfilter, maskHit, sort]);
+    plan ? computeVisible({ plan, flipped, chips, search, ovFilter, vfilter, maskHit }) : []
+  ), [plan, flipped, chips, search, ovFilter, vfilter, maskHit]);
 
   const final = useMemo(() => finalIdx(visible, checked), [visible, checked]);
 
-  const { rowPlan, groupDirs } = useMemo(() => {
-    if (!plan) return { rowPlan: [] as RowSpec[], groupDirs: [] as string[] };
-    // Always flat while sorting: grouping relies on the invariant that same-directory rows are
-    // consecutive in the plan, and sorting destroys it
-    if (!grouped || sort) {
-      return { rowPlan: visible.map((i) => ({ kind: 'row', i, groupDir: null }) as RowSpec), groupDirs: [] };
-    }
-    const groups: { dir: string; items: number[] }[] = [];
-    for (const i of visible) {
-      const d = dirOf(eff(plan, flipped, i).path);
-      if (!groups.length || groups[groups.length - 1].dir !== d) groups.push({ dir: d, items: [] });
-      groups[groups.length - 1].items.push(i);
-    }
-    const out: RowSpec[] = [];
-    for (const g of groups) {
-      out.push({ kind: 'grp', dir: g.dir, items: g.items });
-      if (!collapsedDirs.has(g.dir)) for (const i of g.items) out.push({ kind: 'row', i, groupDir: g.dir });
-    }
-    return { rowPlan: out, groupDirs: [...new Set(groups.map((g) => g.dir))] };
-  }, [plan, visible, flipped, grouped, sort, collapsedDirs]);
+  const layout = useMemo(() => (
+    plan ? buildLayout({ plan, flipped, visible, grouped, sort }) : EMPTY_LAYOUT
+  ), [plan, flipped, visible, grouped, sort]);
+
+  const rowPlan = useMemo(() => flattenLayout(layout, collapsedDirs), [layout, collapsedDirs]);
 
   /// The stats bar counts exactly what will run (checked ∩ visible), matching the confirm sheet
   const stats = useMemo(() => {
@@ -438,17 +439,19 @@ export function App() {
     try {
       const path = await ipc.pickPath({ save: true, title: 'Export CSV', defaultPath: def });
       if (!path) return;
+      // layout.order, not `visible`: the export is a snapshot of the view, so it follows the sort
+      // and the directory grouping you are looking at
       const n = await ipc.exportCsv(
         path, plan.header,
-        visible.map((i) => eff(plan, flipped, i)),
-        visible.map((i) => metaOf(plan, i)),
-        visible.map((i) => checked[i]),
+        layout.order.map((i) => eff(plan, flipped, i)),
+        layout.order.map((i) => metaOf(plan, i)),
+        layout.order.map((i) => checked[i]),
       );
       setStatusUndo(`Exported ${n} rows to ${path}`, 'Open containing folder', () => ipc.reveal(path));
     } catch (e) {
       setStatus(`Export failed: ${e}`, 'err');
     }
-  }, [plan, currentJob, visible, flipped, checked, setStatus, setStatusUndo]);
+  }, [plan, currentJob, visible, layout, flipped, checked, setStatus, setStatusUndo]);
 
   const browseRoot = useCallback(async (which: 'source' | 'target') => {
     try {
@@ -489,7 +492,7 @@ export function App() {
   /// to the plan's order
   const toggleSort = useCallback((key: SortKey) => {
     setSort((cur) => {
-      const natural: 1 | -1 = key === 'path' || key === 'action' ? 1 : -1;
+      const { natural } = keySpec(key);
       if (!cur || cur.key !== key) return { key, dir: natural };
       if (cur.dir === natural) return { key, dir: (cur.dir === 1 ? -1 : 1) as 1 | -1 };
       return null;
@@ -672,14 +675,14 @@ export function App() {
     return () => { live = false; };
   }, [currentJob]);
 
-  // Watch (scheduled scans; seconds = near real time)
+  // AutoScan (scheduled scans; seconds = near real time)
   const tickRef = useRef<() => void>(() => {});
   tickRef.current = async () => {
     if (!currentJob) { setWatchSecs(null); return; }
     const iv = (currentJob.watch_interval_secs ?? 30) * 1000;
     const left = watchNext.current - Date.now();
     if (left > 0) {
-      if (!busy) setStatus(`Watching — next scan in ${Math.ceil(left / 1000)}s (${currentJob.name})`);
+      if (!busy) setStatus(`AutoScan — next scan in ${Math.ceil(left / 1000)}s (${currentJob.name})`);
       return;
     }
     if (busy) return; // the previous round hasn't finished — skip this beat
@@ -701,7 +704,7 @@ export function App() {
     autoApplied.current = plan;
     void (async () => {
       const ops = plan.ops.filter((op) => selectable(op));
-      setStatus(`Watch found ${ops.length} differences — running automatically…`);
+      setStatus(`AutoScan found ${ops.length} differences — running automatically…`);
       setBusy(true);
       try {
         await ipc.applyJobUnattended(currentJob.name, plan, ops, selTarget);
@@ -715,7 +718,7 @@ export function App() {
 
   useEffect(() => {
     if (watchSecs === null || !plan || !currentJob || currentJob.watch_auto_apply) return;
-    if (plan.ops.length > 0) setStatus(`Watch found ${plan.ops.length} differences`, 'err');
+    if (plan.ops.length > 0) setStatus(`AutoScan found ${plan.ops.length} differences`, 'err');
   }, [watchSecs, plan, currentJob, setStatus]);
 
   // Keyboard.
@@ -796,12 +799,12 @@ export function App() {
             onEditGroup={(g) => { if (currentJob) setEditor({ name: currentJob.name, focusGroup: g }); }}
             onToggleLog={() => setLogOpen((v) => !v)}
             onToggleWatch={() => {
-              if (watchSecs !== null) { setWatchSecs(null); setStatus('Watch stopped'); return; }
+              if (watchSecs !== null) { setWatchSecs(null); setStatus('AutoScan stopped'); return; }
               if (!currentJob) return;
               const iv = currentJob.watch_interval_secs ?? 30;
               watchNext.current = Date.now() + iv * 1000;
               setWatchSecs(iv);
-              setStatus(`Watch on: compare every ${iv}s (the hash cache means an unchanged tree costs only the walk)${currentJob.watch_auto_apply ? ' · auto-run' : ''}`);
+              setStatus(`AutoScan on: compare every ${iv}s (the hash cache means an unchanged tree costs only the walk)${currentJob.watch_auto_apply ? ' · auto-run' : ''}`);
             }}
           />
           <PathLine
@@ -811,7 +814,7 @@ export function App() {
             selTarget={selTarget}
             pathHistory={pathHistory}
             dropOn={dropOn === 'source' || dropOn === 'target' ? dropOn : null}
-            scopeRef={(el) => { dropScope.current.path = el; }}
+            scopeRef={setPathScope}
             onCommit={(which, v) => void saveRoot(which, v)}
             onBrowse={(which) => void browseRoot(which)}
             onSwap={() => void requestSwap()}
@@ -847,18 +850,16 @@ export function App() {
                 setSameOpen((v) => !v);
               }}
               onExportCsv={() => void exportCsv()}
-              onToggleFold={() => setCollapsedDirs((prev) => (prev.size > 0 ? new Set() : new Set(groupDirs)))}
+              onToggleFold={() => setCollapsedDirs((prev) => (prev.size > 0 ? new Set() : new Set(layoutDirs(layout))))}
+              // Grouping and sorting are independent now — a sort orders rows inside each group and
+              // the groups among themselves, so this button no longer has to double as a sort clear
               onToggleGroup={() => {
-                // Clicking it while sorted clears the sort and returns to grouping, rather than adding
-                // another toggle on top of "sorted + flat"
-                if (sort) setSort(null);
-                else {
-                  const next = !grouped;
-                  setGrouped(next);
-                  localStorage.setItem('sd.grouped', next ? 'on' : 'off');
-                }
+                const next = !grouped;
+                setGrouped(next);
+                localStorage.setItem('sd.grouped', next ? 'on' : 'off');
                 setCollapsedDirs(new Set());
               }}
+              onClearSort={() => setSort(null)}
               onTogglePathMode={() => {
                 const next = pathMode === 'rel' ? 'full' : 'rel';
                 setPathMode(next);
@@ -911,7 +912,7 @@ export function App() {
                   sort={sort}
                   collapsedDirs={collapsedDirs}
                   wrap={tableWrap}
-                  resetKey={`${currentJob?.name}|${search}|${[...chips].join()}|${ovFilter}|${sort?.key}${sort?.dir}`}
+                  resetKey={`${currentJob?.name}|${search}|${[...chips].join()}|${ovFilter}|${sort?.key}${sort?.dir}|${grouped}`}
                   onToggleRow={toggleRow}
                   onToggleMany={toggleMany}
                   onFlip={flipRow}
@@ -992,7 +993,7 @@ export function App() {
           name={editor.name}
           focusGroup={editor.focusGroup}
           dropOn={dropOn}
-          scopeRef={(el) => { dropScope.current.editor = el; }}
+          scopeRef={setEditorScope}
           apiRef={editorApi}
           onClose={() => setEditor(null)}
           onSaved={async (name, job) => {

@@ -1,21 +1,20 @@
 import { useEffect, useLayoutEffect, useMemo, useState } from 'react';
 import type { RefObject } from 'react';
+import type { RowSpec } from '../../core/grouping';
 
 // Virtual scrolling for the diff table body.
 //
-// One diff row = <tr> + 7 <td> + checkbox + badge. Thousands of those in a live <table> cost seconds just
-// to build and to recompute column widths — and a chip switch, a keystroke in the search box, or folding
-// one directory redoes all of it. So we mount only the viewport's rows and pad above and below with
-// spacer rows that stretch the scrollbar to the real height: render cost drops from O(whole table) to
+// One diff row = <tr> + up to 9 <td> + checkbox + action cell. Thousands of those in a live <table> cost
+// seconds just to build and to recompute column widths — and a chip switch, a keystroke in the search box,
+// or folding one directory redoes all of it. So we mount only the viewport's rows and pad above and below
+// with spacer rows that stretch the scrollbar to the real height: render cost drops from O(whole table) to
 // O(one screen).
 //
 // Row heights are measured from the live DOM rather than hard-coded, so a change to the type scale or to
 // the row padding — or the user zooming the whole webview — corrects itself on the next frame instead of
 // drifting rows out of place.
-
-export type RowSpec =
-  | { kind: 'grp'; dir: string; items: number[] }
-  | { kind: 'row'; i: number; groupDir: string | null };
+//
+// core/grouping.ts decides what the lines are; this hook only decides which of them are on screen.
 
 const OVERSCAN = 8; // extra rows above and below the viewport so fast scrolling never shows blanks
 
