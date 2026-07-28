@@ -17,12 +17,10 @@ Full app wide swap for redundant code, logic, using parallel agent
 
 Full app wide swap using parallel agent:
 1. give me a plan to optimize the codebase — it requires an in-depth understanding first, then splitting and refactoring.
-2. I prefer a more hierarchical rather than flat code structure.
+2. I prefer a more hierarchical (tree-like) rather than flat code structure.
 3. Avoid single files being overly long/short unless absolutely necessary. Code file can be extensive long/short if needed, but not encoraged.
 4. Look for code that should be relocated out to other locations, and also look for code from other locations that should be moved in.
 5. Prefer unidirectional dependencies with clear layering; reverse references are acceptable when necessary — don't force their elimination; avoid barrel files.
-
-
 
 Review and refine the plan phase by phase again, make sub-phase plan if needed.
 And then you can proceed the entire plan
@@ -86,7 +84,9 @@ What I should test for this phase
 
 1.fact check； 2. 告诉我方案的主要内容是什么；3. 评价
 
-all as your recommended, please execute all phases, commit per phase done by follow D:\Code\Financial\AlexQuant\.docs\Skills\phased_commit.md, non stop until all done
+start your execution after there is no code change for 5 minutes, be patient, just keep waiting. when waiting done, re-base code.
+proceed all as your recommended, please execute all phases, non stop until all done
+commit per phase done by follow D:\Code\Financial\AlexQuant\.docs\Skills\phased_commit.md
 
 Please don't stop, and don't ask me any questions—just proceed exactly as you recommended. I'm going to sleep now and won't be answering any questions; I trust your choices.
 
