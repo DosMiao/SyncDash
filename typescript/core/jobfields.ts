@@ -49,7 +49,7 @@ export const ED_FIELDS: FSpec[] = [
     desc: 'One root per line. Overrides the single target above when non-empty.',
     help: '1:N — one source mirrored or enriched into several targets in turn, each with its own plan and its own logs. Not supported in sync mode; use paired jobs there.',
   },
-  { key: 'archive', label: 'Archive file', kind: 'file', desc: 'Sync mode only. Empty = none.', help: 'Suggested location: %APPDATA%\\syncdash\\archives\\<name>.jsonl' },
+  { key: 'archive', label: 'Archive file', kind: 'file', desc: 'Sync mode only. Empty = none.', help: 'Suggested location: the archive/ directory beside your jobs/ one, as <name>.jsonl. syncdash gen-jobs fills this in for you.' },
   {
     key: 'rigor', label: 'Rigor', kind: 'select', opts: ['quick', 'fast', 'standard', 'paranoid', 'custom'],
     desc: 'A preset for the four knobs below. Changing one by hand switches this to custom.',

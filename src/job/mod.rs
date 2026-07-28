@@ -530,12 +530,13 @@ pub fn delete_job(name: &str) -> std::io::Result<()> {
     std::fs::remove_file(crate::foundation::dirs::jobs_dir().join(format!("{name}.toml")))
 }
 
-pub const SAMPLE: &str = r#"# %APPDATA%\syncdash\jobs\<name>.toml — one file, one job
-schema = 2                 # job-file schema; a file without it is migrated on load (junk presets -> exclude)
-mode = "mirror"            # mirror | sync | enrich
-source = 'D:\some\dir'
-target = '\\host\share\dir'
-# archive = 'C:\Users\me\AppData\Roaming\syncdash\archive\<name>.jsonl'   # for sync mode
+pub const SAMPLE: &str = r#"# <name>.toml in the jobs directory — one file, one job
+schema = 2                              # job-file schema; a file without it is migrated on load (junk presets -> exclude)
+mode = "mirror"                         # mirror | sync | enrich
+source = 'D:\some\dir'                  # a Windows path; on mac/Linux e.g. '/Users/me/Code'
+target = '\\host\share\dir'             # or a root phrase: smb:// sftp:// ftp:// ftps:// peer://
+# archive = '…/syncdash/archive/<name>.jsonl'   # sync mode only; sits beside this jobs/ directory.
+#                                       # Without it deletes and moves are not attributed — `syncdash gen-jobs` writes the path for you
 # include = ['*']                       # FFS filter-syntax allowlist (empty = everything)
 # exclude = ['*/big_temp/', '*/*.log']  # FFS syntax. The ONLY exclude policy besides this tool's own metadata —
 #                                       # junk presets (Windows/macOS/Linux/Developer/IDE/Office/sync tools) write
