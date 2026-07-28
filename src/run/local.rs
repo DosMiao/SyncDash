@@ -10,7 +10,7 @@ use crate::model::plan::{Action, Op, Plan};
 use crate::model::table::Snapshot;
 use crate::pipeline::{apply, compare, scan};
 
-use super::{scan_opts, CompareOutcome};
+use super::CompareOutcome;
 use super::archive::refresh_archive_with;
 use super::roots::resolve_root;
 use std::path::Path;
@@ -46,7 +46,7 @@ pub fn compare_resolved(
     accept_caps: bool,
 ) -> std::io::Result<CompareOutcome> {
     use crate::model::event::Phase;
-    let mut opt = scan_opts(job);
+    let opt = super::effective_scan_opts(job, sv, tv);
     // P0-2: root reachability + mount-point marker. When the share isn't mounted, target is often an empty directory,
     // and comparing as usual yields a plan that either "wipes the other side" or "re-sends everything".
     let mut v = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
@@ -101,13 +101,6 @@ pub fn compare_resolved(
             ));
         }
     }
-    // Joint tier adjustment: a `~` sampled digest can only ever match another sampled
-    // digest, so when either side cannot sample, BOTH sides read in full — a one-sided
-    // upgrade would make identical files look different (a false positive, the exact
-    // kind of lie this tool exists to not tell).
-    if opt.sampled && !(sv.caps().ranged_read.yes() && tv.caps().ranged_read.yes()) {
-        opt.sampled = false;
-    }
     // Scan both sides in parallel: source and target are almost always on different disks/links (local disk vs SMB,
     // OneDrive vs an external drive), so serial execution is pure queueing — in parallel, wall clock ≈ the slower side.
     // Each side emits its own PhaseStart at the same moment, so the progress panel ticks on two rows at once.
@@ -137,7 +130,32 @@ pub fn compare_resolved(
         }
     }
     let archive = match (&job.archive, job.mode.as_str()) {
-        (Some(p), "sync") if p.is_file() => Some(Snapshot::load(p)?),
+        (Some(p), "sync") if p.is_file() => {
+            let a = Snapshot::load(p)?;
+            // An archive is only usable against digests of its own tier: `~` sampled values are
+            // prefixed so they can never equal a full hash, so comparing across tiers would call
+            // every large file changed and turn a plain deletion into a delete-versus-edit
+            // conflict that no `on_conflict` policy can resolve. Refusing the archive drops sync
+            // into the documented no-archive safe mode — it fills both ways and reports rather
+            // than deletes — which is a loss of attribution, not of data.
+            let want = super::evidence_label(&opt);
+            match a.header.vfs.as_ref().map(|v| v.evidence_effective.as_str()) {
+                Some(had) if had != want => {
+                    ctx.log(
+                        crate::model::event::LogLevel::Warn,
+                        "compare",
+                        format!(
+                            "archive was written with {had} evidence but this run compares at {want} — \
+                             the two cannot be matched, so it is being ignored for this run. Sync \
+                             falls back to safe mode (fills both ways, reports differences, deletes \
+                             nothing). The next successful run rewrites it at {want}."
+                        ),
+                    );
+                    None
+                }
+                _ => Some(a),
+            }
+        }
         _ => None,
     };
     // compare itself is sub-second CPU work: report the phase boundary only, no internal counting
@@ -265,6 +283,33 @@ pub fn preflight_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> 
     )
 }
 
+/// The refusal shape both halves of the apply gate share: one `Error` event, and an outcome that did
+/// nothing. A module-level fn rather than a closure because the phrase half (a root that will not
+/// open) and the backend half (a capability report that blocks) both have to raise it.
+fn refuse_apply(
+    ctx: &crate::obs::progress::RunCtx,
+    ops_len: usize,
+    action: &str,
+    message: String,
+) -> crate::obs::progress::ApplyOutcome {
+    use crate::model::event::{Phase, ProgressEvent};
+    ctx.sink.emit(ProgressEvent::Error {
+        phase: Phase::Apply,
+        ts_ms: crate::foundation::time::now_ms(),
+        path: String::new(),
+        action: action.into(),
+        side: "target".into(),
+        message,
+    });
+    crate::obs::progress::ApplyOutcome {
+        done: 0,
+        skipped: ops_len as u64,
+        errors: 1,
+        bytes_copied: 0,
+        cancelled: false,
+    }
+}
+
 /// v0.9 M1: apply orchestration with an event stream — the Apply phase (apply_with reports its own totals and
 /// byte-by-byte progress) → the Refresh phase → the Summary terminal state.
 pub fn apply_job_guarded_with(
@@ -277,43 +322,57 @@ pub fn apply_job_guarded_with(
     accept_caps: bool,
     ctx: &crate::obs::progress::RunCtx,
 ) -> crate::obs::progress::ApplyOutcome {
-    use crate::model::event::{Phase, ProgressEvent};
-use crate::obs::progress::ApplyOutcome;
     let t0 = std::time::Instant::now();
-    let refuse = |action: &str, message: String| {
-        ctx.sink.emit(ProgressEvent::Error {
-            phase: Phase::Apply,
-            ts_ms: crate::foundation::time::now_ms(),
-            path: String::new(),
-            action: action.into(),
-            side: "target".into(),
-            message,
-        });
-        ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false }
-    };
     let sv = match resolve_root(&job.source) {
         Ok(v) => v,
-        Err(e) => return refuse("resolve-roots", e.to_string()),
+        Err(e) => return refuse_apply(ctx, ops.len(), "resolve-roots", e.to_string()),
     };
     let tv = match resolve_root(&job.target) {
         Ok(v) => v,
-        Err(e) => return refuse("resolve-roots", e.to_string()),
+        Err(e) => return refuse_apply(ctx, ops.len(), "resolve-roots", e.to_string()),
     };
+    apply_resolved(job, plan, ops, &sv, &tv, trash, verbose, acknowledged, accept_caps, t0, ctx)
+}
+
+/// Apply a plan to two roots that are already open. Split out from `apply_job_guarded_with` the same
+/// way, and for the same reason, `compare_resolved` was split from `compare_job_detailed`:
+/// everything below here works on backends, not spellings — which is what lets the write lane be
+/// exercised against an in-memory root instead of only against a phrase naming a real disk.
+///
+/// `t0` belongs to the caller, so the Summary still measures from before the roots were opened.
+#[allow(clippy::too_many_arguments)] // every one is a distinct decision the caller has already made
+pub fn apply_resolved(
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    sv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    tv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    trash: Option<std::path::PathBuf>,
+    verbose: bool,
+    acknowledged: bool,
+    accept_caps: bool,
+    t0: std::time::Instant,
+    ctx: &crate::obs::progress::RunCtx,
+) -> crate::obs::progress::ApplyOutcome {
+    use crate::model::event::{Phase, ProgressEvent};
+    use crate::obs::progress::ApplyOutcome;
     // The plan must be the one made for THESE roots. The header carries the label the
     // scan wrote: the local (possibly translated) path for local lanes, the display
     // phrase for generic-lane roots.
     let label = |v: &std::sync::Arc<dyn crate::fs::vfs::Vfs>| {
         v.as_local().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| v.display())
     };
-    if label(&sv) != plan.header.source_root || label(&tv) != plan.header.target_root {
-        return refuse(
+    if label(sv) != plan.header.source_root || label(tv) != plan.header.target_root {
+        return refuse_apply(
+            ctx,
+            ops.len(),
             "resolve-roots",
             format!(
                 "this plan was made for '{}' → '{}' but the job resolves to '{}' → '{}' — run compare again",
                 plan.header.source_root,
                 plan.header.target_root,
-                label(&sv),
-                label(&tv)
+                label(sv),
+                label(tv)
             ),
         );
     }
@@ -333,14 +392,18 @@ use crate::obs::progress::ApplyOutcome;
         }
         let blockers = wr.blockers();
         if !blockers.is_empty() {
-            return refuse(
+            return refuse_apply(
+                ctx,
+                ops.len(),
                 "caps",
                 blockers.iter().map(|i| i.render()).collect::<Vec<_>>().join("; "),
             );
         }
         let acks = wr.needs_ack();
         if !acks.is_empty() && !accept_caps {
-            return refuse(
+            return refuse_apply(
+                ctx,
+                ops.len(),
                 "caps",
                 format!(
                     "this apply degrades on capabilities the backends lack — rerun with --accept-caps to consent:\n  {}",
@@ -351,8 +414,8 @@ use crate::obs::progress::ApplyOutcome;
     }
     let verdict = crate::pipeline::guard::run_all_vfs(
         ops,
-        &sv,
-        &tv,
+        sv,
+        tv,
         plan.header.source_entries,
         plan.header.target_entries,
         &job.guards(acknowledged),
@@ -370,10 +433,10 @@ use crate::obs::progress::ApplyOutcome;
         }
         return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
     }
-    let ap = apply::apply_vfs(ops, &sv, &tv, &job.apply_opts(trash, verbose), ctx);
+    let ap = apply::apply_vfs(ops, sv, tv, &job.apply_opts(trash, verbose), ctx);
     // A cancelled run does not refresh the archive: the user asked to "stop now", and re-reporting conflicts next round is safe anyway
     if ap.errors == 0 && !ap.cancelled && job.mode == "sync" {
-        refresh_archive_with(job, plan, ctx);
+        refresh_archive_with(job, plan, sv, &super::effective_scan_opts(job, sv, tv), ctx);
     }
     let out = ApplyOutcome { cancelled: ctx.ctl.cancelled(), ..ap };
     ctx.sink.emit(ProgressEvent::Summary {

@@ -93,6 +93,28 @@ pub fn apply_with(
     apply_vfs(ops, &sv, &tv, opt, ctx)
 }
 
+/// The Copy/Update lane's parallel width.
+///
+/// `pref` is what the job asked for, but a copy holds a stream open on **both** roots at once, so
+/// the narrower backend governs. This is not tuning: for a backend that means its limit, exceeding
+/// it is not slower, it is an error. FTP has one control connection, so a second concurrent
+/// transfer fails outright with "Data connection is already open" and that file never lands — a
+/// four-wide default silently reduced every `ftp://` run to one file copied and the rest errored.
+///
+/// The `Vfs` trait has always documented this clamp ("pool width, scan hash width, apply copy width
+/// all clamp to it"); the scan lane honoured it and this one did not.
+pub fn copy_width(
+    pref: usize,
+    src: &crate::fs::vfs::VfsCaps,
+    tgt: &crate::fs::vfs::VfsCaps,
+    has_dup: bool,
+) -> usize {
+    if has_dup {
+        return 1;
+    }
+    pref.min(src.max_parallel_streams.min(tgt.max_parallel_streams)).max(1)
+}
+
 /// v0.9 M1 → v0.10 VFS: the execution body with progress/cancel/pause, now over a
 /// backend pair. Five serial phases: Moves → **Copy/Update (parallel)** → Chmod →
 /// Delete → DeleteDir (deepest-first within the class). Updates with delta enabled
@@ -229,7 +251,7 @@ pub fn apply_vfs(
     // The same (side, path) appearing twice (a plan shouldn't generate that, but flipping direction by hand can) → parallel would race on the write, so force sequential
     let mut seen = std::collections::HashSet::new();
     let has_dup = copies.iter().any(|o| !seen.insert((o.side == Side::Source, o.path.as_str())));
-    let width = if has_dup { 1 } else { opt.parallel };
+    let width = copy_width(opt.parallel, &source.caps(), &target.caps(), has_dup);
 
     run_class(&moves, 1, &sh, &pp, &acc);
     run_class(&copies, width, &sh, &pp, &acc);

@@ -11,6 +11,10 @@
 //! `roots` opens root phrases, `archive` refreshes the sync-mode archive after a successful apply.
 
 pub mod archive;
+/// The pipeline contract as executable cases — the twin of `fs::vfs::conformance`, one layer up.
+/// `cfg(test)` for the same reason `fs::vfs::memory` is: a fixture must not ship in the binary.
+#[cfg(test)]
+pub mod e2e;
 pub mod local;
 pub mod peer;
 pub mod roots;
@@ -35,6 +39,47 @@ pub fn scan_opts(job: &Job) -> scan::ScanOptions {
     let filter = crate::pipeline::filter::PathFilter::build_full(&job.include, &job.exclude, &job.deletable);
     let r = job.rigor_resolved();
     scan::ScanOptions { hash: r.hash, sampled: r.sampled, use_cache: r.use_cache, symlinks_direct: job.symlinks == "direct", filter }
+}
+
+/// The scan options a comparison across **these two roots** actually runs at.
+///
+/// `scan_opts` answers "what did the job ask for"; this answers "what can the pair deliver", and
+/// every caller that touches a real pair of backends wants the second. A sampled digest is
+/// `~`-prefixed precisely so it can only ever match another sampled digest, so when either backend
+/// cannot do ranged reads, *both* sides read in full — a one-sided upgrade would make an identical
+/// file look different, which is the exact kind of lie this tool exists not to tell.
+///
+/// It is one function, rather than `scan_opts` plus a narrowing step spelled out per site, because
+/// the archive is compared against exactly these digests and so has to be written at exactly this
+/// tier. While the two were derived separately they drifted: the comparison upgraded to full, the
+/// archive refresh rescanned the source alone and kept sampling, and every file over the sampling
+/// floor became permanently unequal — surfacing as a delete-versus-edit conflict no policy can
+/// resolve. Leaving the narrowing as a separate call anyone could forget is how that happened.
+pub fn effective_scan_opts(
+    job: &Job,
+    sv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    tv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+) -> scan::ScanOptions {
+    let mut opt = scan_opts(job);
+    if opt.sampled && !(sv.caps().ranged_read.yes() && tv.caps().ranged_read.yes()) {
+        opt.sampled = false;
+    }
+    opt
+}
+
+/// The `none` | `sampled` | `full` vocabulary, from the options that produced a scan.
+///
+/// One mapping, three readers: the snapshot header stamps it (`Header.vfs.evidence_effective`), the
+/// archive is checked against it on the way back in, and the peer lane sends it to the far side as
+/// `--evidence`. Spelled out separately, those drift into disagreeing about what a tier is called.
+pub fn evidence_label(opt: &scan::ScanOptions) -> &'static str {
+    if !opt.hash {
+        "none"
+    } else if opt.sampled {
+        "sampled"
+    } else {
+        "full"
+    }
 }
 
 /// Whether this job executes on a peer over ssh rather than here.

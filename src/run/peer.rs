@@ -167,6 +167,55 @@ mod link_tests {
     }
 }
 
+#[cfg(test)]
+mod filter_tests {
+    use super::remote_scan_args;
+    use crate::job::Job;
+
+    fn job_with(include: &[&str], exclude: &[&str]) -> Job {
+        Job {
+            mode: "mirror".into(),
+            source: r"D:\src".into(),
+            target: "peer://mac/Users/ben/dst".into(),
+            include: include.iter().map(|s| s.to_string()).collect(),
+            exclude: exclude.iter().map(|s| s.to_string()).collect(),
+            ..Job::default()
+        }
+    }
+
+    fn pairs<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+        args.windows(2)
+            .filter(|w| w[0] == flag)
+            .map(|w| w[1].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn every_exclude_crosses_the_link() {
+        let a = remote_scan_args(&job_with(&[], &["*/big_temp/", "*/*.log"]), "/Users/ben/dst");
+        assert_eq!(pairs(&a, "--exclude"), vec!["*/big_temp/", "*/*.log"]);
+        assert_eq!(pairs(&a, "--junk"), vec!["none"]);
+    }
+
+    /// The whole filter has to cross, not half of it.
+    ///
+    /// `include` is an allowlist: with one set, everything outside it is *not part of this job*.
+    /// The local side applies it. If the far side never hears about it, the far side reports files
+    /// the local filter hid — and because they are then "on the target and not on the source",
+    /// `mirror` proposes a `Delete` for every one of them. That is the exact failure the sibling
+    /// `--junk none` line three lines up exists to prevent, and it is data loss, not a cosmetic
+    /// asymmetry.
+    #[test]
+    fn every_include_crosses_the_link_too() {
+        let a = remote_scan_args(&job_with(&["*/keep/", "/docs/"], &[]), "/Users/ben/dst");
+        assert_eq!(
+            pairs(&a, "--include"),
+            vec!["*/keep/", "/docs/"],
+            "an allowlist that binds only the local root turns every unlisted remote file into a deletion"
+        );
+    }
+}
+
 /// Stage 1: probe reachability + schema agreement + the remote OS (which decides the shell dialect).
 ///
 /// It takes `ctx` for the sake of the schema-mismatch warning: that one has to reach the UI **during compare**.
@@ -206,6 +255,46 @@ pub fn probe_peer(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -> 
     })
 }
 
+/// The `scan` the far side is told to run, as a value — so what crosses the link can be asserted
+/// without one.
+///
+/// **Both roots must be filtered by the same rule**, and that governs everything below: the whole
+/// mask crosses (`--include` as well as `--exclude`), and `--junk none` stops the remote adding its
+/// own CLI default on top of rules the job already spells out in full. A rule binding one root only
+/// is the shape that gets a tree proposed for deletion — with `include` dropped, the far side
+/// reports files the local filter hid, and `mirror` reads those as "on the target, not on the
+/// source".
+///
+/// The rigor knobs go over **resolved**, because a preset name is not enough: details may have
+/// overridden it.
+fn remote_scan_args(job: &Job, rroot: &str) -> Vec<String> {
+    // The job's own tier, not a narrowed one: this process holds no handle on the far root, so there
+    // is no second backend to negotiate down to.
+    let opt = scan_opts(job);
+    let mut a: Vec<String> = vec![
+        "scan".into(),
+        rroot.to_string(),
+        "--evidence".into(),
+        super::evidence_label(&opt).into(),
+        "--cache".into(),
+        (if opt.use_cache { "on" } else { "off" }).into(),
+        "--junk".into(),
+        "none".into(),
+    ];
+    for inc in &job.include {
+        a.push("--include".into());
+        a.push(inc.clone());
+    }
+    for ex in &job.exclude {
+        a.push("--exclude".into());
+        a.push(ex.clone());
+    }
+    if job.symlinks == "direct" {
+        a.push("--symlinks-direct".into());
+    }
+    a
+}
+
 /// The same detailed variant for the remote pipeline: the remote snapshot is a complete table pulled back over ssh,
 /// so the evidence layer (both sides' size/mtime, identical items) is just as computable here as for a local job.
 pub fn compare_peer_job_detailed(
@@ -219,27 +308,7 @@ use crate::obs::progress::PhaseProgress;
 
     // 2) Remote scan (hashing on the remote's own disk — far faster than pulling the data over UNC)
     // The remote is passed the **resolved** knobs explicitly (a preset name isn't enough — details may have overridden it)
-    let rr = job.rigor_resolved();
-    let mut scan_args: Vec<String> = vec![
-        "scan".into(),
-        link.rroot.clone(),
-        "--evidence".into(),
-        (if !rr.hash { "none" } else if rr.sampled { "sampled" } else { "full" }).into(),
-        "--cache".into(),
-        (if rr.use_cache { "on" } else { "off" }).into(),
-    ];
-    // `--junk none`: the job's `exclude` already carries every junk pattern it wants, so letting the
-    // remote add its own CLI default on top would make the two sides filter differently — and a rule
-    // that applies to only one root is the shape that gets a tree proposed for deletion.
-    scan_args.push("--junk".into());
-    scan_args.push("none".into());
-    for ex in &job.exclude {
-        scan_args.push("--exclude".into());
-        scan_args.push(ex.clone());
-    }
-    if job.symlinks == "direct" {
-        scan_args.push("--symlinks-direct".into());
-    }
+    let scan_args = remote_scan_args(job, &link.rroot);
     ctx.checkpoint()?;
     // The remote scans on its own disk, so locally all we can show is "in progress" — totals zeroed, the label spells out who we are waiting on
     let _pp_rs = PhaseProgress::begin(ctx, Phase::ScanTarget, Some(format!("ssh:{} {}", link.host, link.rroot)), 0, 0);
@@ -509,7 +578,19 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
     }
 
     if errors == 0 && !ctx.ctl.cancelled() && job.mode == "sync" {
-        refresh_archive_with(job, plan_full, ctx);
+        // A peer job's source is a root this process owns, so opening it is local work, not a
+        // second handshake. A failure here used to return silently; an archive that did not get
+        // refreshed changes what the next run concludes, so it says so.
+        match super::roots::resolve_root(&job.source) {
+            // The peer lane has no local handle on the far root, so no joint-tier narrowing applies
+            // and never did: its comparison runs at the job's own tier, and the archive matches it.
+            Ok(sv) => refresh_archive_with(job, plan_full, &sv, &scan_opts(job), ctx),
+            Err(e) => ctx.log(
+                crate::model::event::LogLevel::Warn,
+                "run",
+                format!("[{name}] archive not refreshed — the source root would not open: {e}"),
+            ),
+        }
     }
     ctx.sink.emit(ProgressEvent::Summary {
         ts_ms: crate::foundation::time::now_ms(),
