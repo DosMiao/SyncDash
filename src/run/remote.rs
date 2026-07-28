@@ -93,6 +93,16 @@ pub struct RemoteLink {
     /// with a warning nobody had a reason to expect.
     pub mount: Option<std::path::PathBuf>,
     pub shell: crate::transfer::remote::RemoteShell,
+    /// The live ssh session, held for the whole stage. The old transport handshook once per
+    /// command; a compare stage runs several.
+    pub session: crate::transfer::remote::PeerSession,
+}
+
+impl RemoteLink {
+    /// Build one remote syncdash command line for this peer's shell dialect.
+    fn cmd(&self, args: &[String]) -> String {
+        crate::transfer::remote::remote_cmd(self.shell, &self.exe, args)
+    }
 }
 
 /// Pull the link out of a `peer://` target phrase.
@@ -124,7 +134,8 @@ fn link_of(job: &Job) -> std::io::Result<(String, String, String, Option<std::pa
 pub fn probe_remote(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<RemoteLink> {
     let (host, exe, rroot, mount) = link_of(job)?;
     let (host, exe, rroot) = (host.as_str(), exe.as_str(), rroot.as_str());
-    let probe = crate::transfer::remote::ssh_capture(host, &format!("{exe} probe"))?;
+    let session = crate::transfer::remote::PeerSession::open(&job.target)?;
+    let probe = session.capture(&format!("{exe} probe"))?;
     let pv: serde_json::Value = serde_json::from_slice(&probe)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad probe output: {e}")))?;
     if pv["schema"].as_u64() != Some(crate::model::table::SCHEMA as u64) {
@@ -150,6 +161,7 @@ pub fn probe_remote(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -
         rroot: rroot.to_string(),
         mount,
         shell: crate::transfer::remote::RemoteShell::from_os(&remote_os),
+        session,
     })
 }
 /// The same detailed variant for the remote pipeline: the remote snapshot is a complete table pulled back over ssh,
@@ -189,7 +201,7 @@ use crate::obs::progress::PhaseProgress;
     ctx.checkpoint()?;
     // The remote scans on its own disk, so locally all we can show is "in progress" — totals zeroed, the label spells out who we are waiting on
     let _pp_rs = PhaseProgress::begin(ctx, Phase::ScanTarget, Some(format!("ssh:{} {}", link.host, link.rroot)), 0, 0);
-    let table_bytes = crate::transfer::remote::ssh_capture(&link.host, &crate::transfer::remote::remote_cmd(link.shell, &link.exe, &scan_args))?;
+    let table_bytes = link.session.capture(&link.cmd(&scan_args))?;
     let t = Snapshot::from_reader(std::io::BufReader::new(&table_bytes[..]))?;
 
     // 3) Local scan + compare (the local source side goes through the mount-point gate too)
@@ -279,7 +291,7 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
     }
 
     let link = probe_remote(name, job, ctx)?;
-    let (host, exe, rroot, shell) = (link.host.as_str(), link.exe.as_str(), link.rroot.as_str(), link.shell);
+    let (host, rroot, shell) = (link.host.as_str(), link.rroot.as_str(), link.shell);
     // Packing and the pull-back only look at the finalised subset; the full plan is used only for the archive refresh (dropping conflicted paths needs all of it)
     let plan = Plan { header: plan_full.header.clone(), ops: sel_ops.to_vec() };
 
@@ -310,7 +322,7 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
                 args.push("--file".into());
                 args.push(r.clone());
             }
-            match crate::transfer::remote::ssh_capture(host, &crate::transfer::remote::remote_cmd(shell, exe, &args)) {
+            match link.session.capture(&link.cmd(&args)) {
                 Ok(bytes) => {
                     let mut m = std::collections::HashMap::new();
                     for line in String::from_utf8_lossy(&bytes).lines() {
@@ -359,11 +371,17 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         ctx.checkpoint()?;
         let tar_len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
         let pp_ship = PhaseProgress::begin(ctx, Phase::Ship, Some(format!("→ ssh:{host}")), 1, tar_len);
-        let recv_cmd = crate::transfer::remote::remote_cmd(shell, exe, &["recv".into(), rpkg.clone()]);
-        let ship = crate::transfer::remote::ssh_run_with_stdin(host, &recv_cmd, &tmp);
+        let recv_cmd = link.cmd(&["recv".into(), rpkg.clone()]);
+        // Bytes are counted as they leave, not assumed once the transfer returns: the old
+        // transport handed the file to a child process and learned nothing until it exited, so a
+        // multi-gigabyte package sat at 0% for its whole duration.
+        let ship = link.session.send_file(&recv_cmd, &tmp, &mut |n| {
+            pp_ship.add_bytes(n, &rpkg);
+            // Cancel now stops the upload instead of letting it run to completion unwatched
+            ctx.checkpoint()
+        });
         let _ = std::fs::remove_file(&tmp);
         ship?;
-        pp_ship.add_bytes(tar_len, &rpkg);
         pp_ship.item_done(&rpkg);
         bytes_done_total += sum.bytes;
 
@@ -376,7 +394,7 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         if verbose {
             ap_args.push("-v".into());
         }
-        let ok = crate::transfer::remote::ssh_run(host, &crate::transfer::remote::remote_cmd(shell, exe, &ap_args))?;
+        let ok = link.session.run_status(&link.cmd(&ap_args))?;
         if ok {
             done += sum.ops;
         } else {

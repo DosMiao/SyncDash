@@ -13,10 +13,9 @@
 //! to this backend — two worker threads, entered only through `block_on` from engine
 //! threads; the trait stays sync and the engine never sees an async type.
 //!
-//! Read half only for now: every write-side method reports `Unsupported` naming the
-//! milestone. The write lane (staged uploads, rename-into-place, setstat) lands next.
+//! The handshake is not here: connect, host-key check and the auth chain live in `fs::ssh`,
+//! shared with the peer lane, which reaches the same hosts with the same keys.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -28,15 +27,13 @@ use super::{
     VDirEntry, VMeta, Vfs, VfsCaps, WriteHint, WriteStaged,
 };
 
-use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, StatusCode};
 
+use crate::fs::ssh::HostCheck;
 
-mod conn;
 mod staged;
 
-use conn::{map_connect_err, HostCheck};
 use staged::{SftpRead, SftpStaged};
 
 pub struct SftpBackend {
@@ -471,6 +468,10 @@ impl Vfs for SftpBackend {
 }
 
 /// The whole connect sequence, async side. Returns (session, sftp, root_abs, server line).
+///
+/// The handshake itself — connect, host-key check, auth chain — is `fs::ssh`, shared with the peer
+/// lane. What is left here is the part that is actually sftp: requesting the subsystem and
+/// resolving the login home when the phrase named no path.
 async fn connect_and_open(
     host: &str,
     port: u16,
@@ -480,105 +481,9 @@ async fn connect_and_open(
     root_spec: &str,
     display: &str,
 ) -> VfsResult<(russh::client::Handle<HostCheck>, SftpSession, String, String)> {
-    let config = Arc::new(russh::client::Config::default());
-    let handler = HostCheck { host: host.to_string(), port };
-
-    let mut session = match tokio::time::timeout(
-        timeout,
-        russh::client::connect(config, (host, port), handler),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(map_connect_err(e, host, display)),
-        Err(_) => {
-            return Err(VfsError::new(
-                VfsErrorKind::Transient,
-                format!("connecting to {host}:{port} timed out after {timeout:?}"),
-            ))
-        }
-    };
-
-    // Auth chain, most-specific first; every failed rung is named in the final error.
-    let mut tried: Vec<String> = Vec::new();
-    let mut authed = false;
-
-    let mut key_candidates: Vec<(PathBuf, bool)> = Vec::new(); // (path, explicit)
-    if let Some(k) = &creds.keyfile {
-        key_candidates.push((k.clone(), true));
-    } else {
-        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
-            let ssh = PathBuf::from(home).join(".ssh");
-            for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
-                let p = ssh.join(name);
-                if p.is_file() {
-                    key_candidates.push((p, false));
-                }
-            }
-        }
-    }
-    for (path, explicit) in key_candidates {
-        match load_secret_key(&path, creds.passphrase.as_deref()) {
-            Ok(key) => {
-                let hash = session
-                    .best_supported_rsa_hash()
-                    .await
-                    .ok()
-                    .flatten()
-                    .flatten();
-                let k = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
-                match session.authenticate_publickey(user, k).await {
-                    Ok(r) if r.success() => {
-                        authed = true;
-                        tried.push(format!("key {} ✓", path.display()));
-                        break;
-                    }
-                    Ok(_) => tried.push(format!("key {} (server refused)", path.display())),
-                    Err(e) => tried.push(format!("key {} ({e})", path.display())),
-                }
-            }
-            Err(e) => {
-                let head = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|s| s.lines().next().map(|l| l.to_string()))
-                    .unwrap_or_default();
-                let hint = if head.contains("PuTTY") {
-                    " — this is a PuTTY .ppk; export an OpenSSH-format key with puttygen"
-                } else if head.starts_with("ssh-") || head.starts_with("ecdsa-") {
-                    " — this is a PUBLIC key; point at the private one"
-                } else {
-                    ""
-                };
-                let line = format!("key {} unreadable: {e}{hint}", path.display());
-                if explicit {
-                    return Err(VfsError::new(VfsErrorKind::Auth, line));
-                }
-                tried.push(line);
-            }
-        }
-    }
-
-    if !authed {
-        if let Some(pw) = &creds.password {
-            match session.authenticate_password(user, pw.clone()).await {
-                Ok(r) if r.success() => {
-                    authed = true;
-                    tried.push("password ✓".into());
-                }
-                Ok(_) => tried.push("password (server refused)".into()),
-                Err(e) => tried.push(format!("password ({e})")),
-            }
-        } else {
-            tried.push("password (none stored — syncdash cred set can add one)".into());
-        }
-    }
-
-    if !authed {
-        return Err(VfsError::new(
-            VfsErrorKind::Auth,
-            format!("authentication to {user}@{host} failed; tried: {}", tried.join("; ")),
-        ));
-    }
+    let session = crate::fs::ssh::connect(host, port, user, creds, timeout, display).await?;
+    let auth = session.auth_summary();
+    let session = session.handle;
 
     let channel = session
         .channel_open_session()
@@ -600,7 +505,7 @@ async fn connect_and_open(
         format!("/{root_spec}")
     };
 
-    let server_line = format!("sftp v3 via ssh, auth: {}", tried.last().cloned().unwrap_or_default());
+    let server_line = format!("sftp v3 via ssh, auth: {auth}");
     Ok((session, sftp, root_abs.trim_end_matches('/').to_string(), server_line))
 }
 
