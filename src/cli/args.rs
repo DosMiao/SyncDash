@@ -249,7 +249,6 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: CredCmd,
     },
-    /// Network-mount housekeeping for smb:// roots
     /// Connect to a root and print its full capability sheet (what preflight will reason from)
     Caps {
         /// A root phrase: a local path, smb://…, sftp://…, ftp://…
