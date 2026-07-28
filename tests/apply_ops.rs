@@ -542,3 +542,32 @@ fn an_on_machine_root_still_uses_the_central_trash_store() {
     assert!(!t.join(".syncdash").exists(), "a local root needs no in-root retention area");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// The copy lane's width is a negotiation, not a preference.
+///
+/// A backend that declares `max_parallel_streams: 1` means it: FTP carries one control connection,
+/// so a second concurrent transfer does not queue behind the first, it fails with "Data connection
+/// is already open" and that file never lands. Verified against a live server — before the clamp a
+/// three-file mirror over `ftp://` reported "1 done, 2 error(s)".
+#[test]
+fn the_copy_lane_never_exceeds_what_a_backend_declares() {
+    use syncdash::fs::vfs::{Vfs, VfsCaps};
+
+    // Borrow a real backend's sheet and vary only the one field under test, so the case cannot
+    // drift out of shape when `VfsCaps` gains a member.
+    let base = syncdash::fs::vfs::local::LocalVfs::new(std::env::temp_dir()).caps();
+    let caps = |n: usize| VfsCaps { max_parallel_streams: n, ..base.clone() };
+    let w = |pref, s, t| apply::copy_width(pref, &caps(s), &caps(t), false);
+
+    assert_eq!(w(4, 1, 4), 1, "a single-stream source governs the pair");
+    assert_eq!(w(4, 4, 1), 1, "and so does a single-stream target");
+    assert_eq!(w(4, 16, 16), 4, "a generous backend leaves the job's preference alone");
+    assert_eq!(w(8, 4, 4), 4, "asking for more than the backends allow is still clamped");
+    assert_eq!(w(1, 16, 16), 1, "asking for less is honoured — the clamp is a ceiling, not a floor");
+    assert_eq!(w(0, 16, 16), 1, "width is never zero, or the lane would do nothing at all");
+    assert_eq!(
+        apply::copy_width(4, &caps(16), &caps(16), true),
+        1,
+        "a duplicate (side, path) still forces sequential: two workers would race on one write"
+    );
+}
