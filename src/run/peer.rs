@@ -14,13 +14,14 @@ use crate::model::table::Snapshot;
 
 /// Remote pipeline (the v0.6 end-to-end over ssh): ssh probe → remote-local scan (table collected from stdout) → local scan → compare
 /// → pack the target side and ship it over ssh to apply-pack → write the source side straight through the mounted path → refresh the archive on a successful sync.
-pub fn run_remote_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
-    run_remote_job_with(name, job, do_apply, verbose, acknowledged, &crate::obs::progress::RunCtx::null())
+pub fn run_peer_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
+    run_peer_job_with(name, job, do_apply, verbose, acknowledged, &crate::obs::progress::RunCtx::null())
 }
+
 /// v0.9 M1/M3: the remote pipeline = a compare stage plus an apply stage (desktop calls each over its own IPC round; the CLI runs both end-to-end here).
 /// PhaseStart at each stage boundary, cooperation points between stages, a Summary terminal state; byte-level counting inside the
 /// ssh transfer and kill-on-cancel are explicitly deferred (M1 step 8).
-pub fn run_remote_job_with(
+pub fn run_peer_job_with(
     name: &str,
     job: &Job,
     do_apply: bool,
@@ -28,7 +29,7 @@ pub fn run_remote_job_with(
     acknowledged: bool,
     ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<(u64, u64, u64, u64)> {
-    let plan = match super::compare_remote_job_with(name, job, ctx) {
+    let plan = match super::compare_peer_job_with(name, job, ctx) {
         Ok(p) => p,
         Err(e) => {
             // Cancelled in the compare stage: the terminal state must still be visible (the desktop closes out on Summary)
@@ -60,11 +61,12 @@ pub fn run_remote_job_with(
         .cloned()
         .collect();
     let t0 = std::time::Instant::now();
-    let rec = crate::obs::runlog::Recorder::start(name, "remote-apply", ctx, &ops);
-    let out = apply_remote_job_with(name, job, &plan, &ops, verbose, acknowledged, &rec.ctx)?;
+    let rec = crate::obs::runlog::Recorder::start(name, &super::run_kind(job, "apply"), ctx, &ops);
+    let out = apply_peer_job_with(name, job, &plan, &ops, verbose, acknowledged, &rec.ctx)?;
     rec.finish(&out, t0.elapsed().as_millis() as u64);
     Ok((out.done, out.skipped, out.errors, plan.header.conflict_count))
 }
+
 fn emit_cancel_summary(ctx: &crate::obs::progress::RunCtx, t0: std::time::Instant) {
     ctx.sink.emit(crate::model::event::ProgressEvent::Summary {
         ts_ms: crate::foundation::time::now_ms(),
@@ -77,6 +79,7 @@ fn emit_cancel_summary(ctx: &crate::obs::progress::RunCtx, t0: std::time::Instan
         cancelled: true,
     });
 }
+
 /// Remote connection parameters (the product of a probe). The desktop's compare and apply are two independent IPC rounds
 /// with no connection kept in between — the apply stage probes again (one ssh round trip, which doubles as a reachability preflight).
 pub struct RemoteLink {
@@ -92,16 +95,35 @@ pub struct RemoteLink {
     /// `remote_root`, nothing said the two named one tree, and a missing mount skipped those ops
     /// with a warning nobody had a reason to expect.
     pub mount: Option<std::path::PathBuf>,
-    pub shell: crate::transfer::remote::RemoteShell,
+    pub shell: crate::transfer::peer::RemoteShell,
     /// The live ssh session, held for the whole stage. The old transport handshook once per
     /// command; a compare stage runs several.
-    pub session: crate::transfer::remote::PeerSession,
+    pub session: crate::transfer::peer::PeerSession,
 }
 
 impl RemoteLink {
     /// Build one remote syncdash command line for this peer's shell dialect.
     fn cmd(&self, args: &[String]) -> String {
-        crate::transfer::remote::remote_cmd(self.shell, &self.exe, args)
+        crate::transfer::peer::remote_cmd(self.shell, &self.exe, args)
+    }
+}
+
+/// Restore a peer root to the absolute path the far side will resolve.
+///
+/// The phrase grammar strips the leading `/` — right for `sftp://` and `smb://`, where the root is
+/// a segment inside a session or a share, and wrong here: a peer root is a path on the far
+/// machine's own filesystem and the far syncdash resolves it against *its* working directory. Sent
+/// as `Users/ben/x` it lands at `~/Users/ben/x`, which is a path that generally does not exist —
+/// so the run reads an empty tree and mirror proposes deleting everything in the source.
+///
+/// A drive letter is already absolute (a Windows peer takes `C:\…` verbatim); everything else lost
+/// a `/` on the way in and gets it back.
+fn absolute_remote_root(root: &str) -> String {
+    let b = root.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        root.to_string()
+    } else {
+        format!("/{root}")
     }
 }
 
@@ -121,9 +143,28 @@ fn link_of(job: &Job) -> std::io::Result<(String, String, String, Option<std::pa
     Ok((
         r.host.clone(),
         r.opt("exe").filter(|e| !e.is_empty()).unwrap_or("syncdash").to_string(),
-        r.root.clone(),
+        absolute_remote_root(&r.root),
         r.opt("mount").filter(|m| !m.is_empty()).map(std::path::PathBuf::from),
     ))
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::absolute_remote_root;
+
+    /// Caught on real hardware: the far side was sent `Users/xuanbomiao/x` and resolved it against
+    /// the login home. A peer root has to arrive as the absolute path it was written as.
+    #[test]
+    fn a_posix_peer_root_gets_its_leading_slash_back() {
+        assert_eq!(absolute_remote_root("Users/ben/Code"), "/Users/ben/Code");
+        assert_eq!(absolute_remote_root("srv/data"), "/srv/data");
+    }
+
+    #[test]
+    fn a_windows_peer_root_is_already_absolute() {
+        assert_eq!(absolute_remote_root("C:/Users/ben"), "C:/Users/ben");
+        assert_eq!(absolute_remote_root(r"D:\Code"), r"D:\Code");
+    }
 }
 
 /// Stage 1: probe reachability + schema agreement + the remote OS (which decides the shell dialect).
@@ -131,10 +172,10 @@ fn link_of(job: &Job) -> std::io::Result<(String, String, String, Option<std::pa
 /// It takes `ctx` for the sake of the schema-mismatch warning: that one has to reach the UI **during compare**.
 /// Going through the macro and the global registry, no sink is installed during compare (only apply starts a Recorder),
 /// so this line in particular would fall back to stderr — which in a windowed desktop build is the same as saying nothing.
-pub fn probe_remote(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<RemoteLink> {
+pub fn probe_peer(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<RemoteLink> {
     let (host, exe, rroot, mount) = link_of(job)?;
     let (host, exe, rroot) = (host.as_str(), exe.as_str(), rroot.as_str());
-    let session = crate::transfer::remote::PeerSession::open(&job.target)?;
+    let session = crate::transfer::peer::PeerSession::open(&job.target)?;
     let probe = session.capture(&format!("{exe} probe"))?;
     let pv: serde_json::Value = serde_json::from_slice(&probe)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad probe output: {e}")))?;
@@ -160,20 +201,21 @@ pub fn probe_remote(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -
         exe: exe.to_string(),
         rroot: rroot.to_string(),
         mount,
-        shell: crate::transfer::remote::RemoteShell::from_os(&remote_os),
+        shell: crate::transfer::peer::RemoteShell::from_os(&remote_os),
         session,
     })
 }
+
 /// The same detailed variant for the remote pipeline: the remote snapshot is a complete table pulled back over ssh,
 /// so the evidence layer (both sides' size/mtime, identical items) is just as computable here as for a local job.
-pub fn compare_remote_job_detailed(
+pub fn compare_peer_job_detailed(
     name: &str,
     job: &Job,
     ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<CompareOutcome> {
     use crate::model::event::Phase;
 use crate::obs::progress::PhaseProgress;
-    let link = probe_remote(name, job, ctx)?;
+    let link = probe_peer(name, job, ctx)?;
 
     // 2) Remote scan (hashing on the remote's own disk — far faster than pulling the data over UNC)
     // The remote is passed the **resolved** knobs explicitly (a preset name isn't enough — details may have overridden it)
@@ -229,9 +271,10 @@ use crate::obs::progress::PhaseProgress;
     let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
     Ok(CompareOutcome { plan, source: s, target: t })
 }
+
 /// The plan health check for a remote job (used by the desktop confirmation sheet): the deletion-share gate only —
 /// disk space and the marker live on the remote machine; we cannot check them locally and must not pretend we did.
-pub fn preflight_remote_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::pipeline::guard::Verdict {
+pub fn preflight_peer_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::pipeline::guard::Verdict {
     let g = job.guards(acknowledged);
     let st = crate::pipeline::guard::stats::stat_plan(ops);
     let mut gv = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
@@ -239,9 +282,10 @@ pub fn preflight_remote_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bo
     crate::pipeline::guard::ratio::check_delete_ratio("source", &st.source, plan.header.source_entries, &g, &mut gv);
     gv
 }
+
 /// v0.9 M3: the **apply stage** of a remote job — `ops` is the subset the user finalised in the diff table (direction flips / check marks already applied).
 /// Probe again → health check → pack the selection → ship the package over ssh → remote apply-pack → pull the source side back → refresh → Summary.
-pub fn apply_remote_job_with(
+pub fn apply_peer_job_with(
     name: &str,
     job: &Job,
     plan: &Plan,
@@ -251,7 +295,7 @@ pub fn apply_remote_job_with(
     ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
     let t0 = std::time::Instant::now();
-    let r = apply_remote_inner(name, job, plan, ops, verbose, acknowledged, ctx, t0);
+    let r = apply_peer_inner(name, job, plan, ops, verbose, acknowledged, ctx, t0);
     if let Err(e) = &r {
         if crate::obs::progress::is_cancelled(e) {
             emit_cancel_summary(ctx, t0);
@@ -259,8 +303,9 @@ pub fn apply_remote_job_with(
     }
     r
 }
+
 #[allow(clippy::too_many_arguments)]
-fn apply_remote_inner(
+fn apply_peer_inner(
     name: &str,
     job: &Job,
     plan_full: &Plan,
@@ -275,7 +320,7 @@ fn apply_remote_inner(
 use crate::obs::progress::{ApplyOutcome, PhaseProgress};
 
     // Plan health check: remote disk space is unknowable, but an accident like "delete most of the other side" can be caught locally
-    let gv = preflight_remote_job(job, plan_full, sel_ops, acknowledged);
+    let gv = preflight_peer_job(job, plan_full, sel_ops, acknowledged);
     if !gv.report(name) {
         for b in &gv.blockers {
             ctx.sink.emit(ProgressEvent::Error {
@@ -290,7 +335,7 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         return Ok(ApplyOutcome { done: 0, skipped: sel_ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false });
     }
 
-    let link = probe_remote(name, job, ctx)?;
+    let link = probe_peer(name, job, ctx)?;
     let (host, rroot, shell) = (link.host.as_str(), link.rroot.as_str(), link.shell);
     // Packing and the pull-back only look at the finalised subset; the full plan is used only for the archive refresh (dropping conflicted paths needs all of it)
     let plan = Plan { header: plan_full.header.clone(), ops: sel_ops.to_vec() };
@@ -363,7 +408,7 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
                 format!("[{name}] packed {} B, delta saved {} B", sum.bytes, sum.delta_saved),
             );
         }
-        let rpkg = if shell == crate::transfer::remote::RemoteShell::PowerShell {
+        let rpkg = if shell == crate::transfer::peer::RemoteShell::PowerShell {
             format!("syncdash-{}.tar", crate::foundation::time::now_ms()) // relative path → the remote home directory
         } else {
             format!("/tmp/syncdash-{}.tar", crate::foundation::time::now_ms())
