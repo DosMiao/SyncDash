@@ -24,6 +24,7 @@ pub fn cancel_run(state: tauri::State<'_, Arc<RunState>>) -> bool {
         None => false,
     }
 }
+
 /// Pause/resume the active run (elapsed stops growing while paused, the RootLock heartbeat keeps beating)
 #[tauri::command]
 pub fn pause_run(state: tauri::State<'_, Arc<RunState>>, paused: bool) -> bool {

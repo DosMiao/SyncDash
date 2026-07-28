@@ -1,24 +1,26 @@
 //! scan: walk a root and produce a snapshot table — the first of the three stages.
 //!
 //! Two lanes behind one entry point. `scan_root` asks the backend for `as_local()`: a real
-//! directory takes `local`, the walkdir + rayon + mmap fast path; anything else takes `remote`,
-//! the generic lane driven entirely through the `Vfs` trait. Both speak the same filter contract
-//! and the same exclusion accounting, and both emit the same events — the difference is only how
-//! bytes are reached.
+//! directory takes `local`, the walkdir + rayon + mmap fast path; anything else takes `vfs`,
+//! the generic lane driven entirely through the `Vfs` trait. The split is which primitives are
+//! available, not how far away the bytes are — an SMB root the OS has mounted takes `local`.
+//!
+//! Both speak the same filter contract and the same exclusion accounting, and both emit the same
+//! events; the difference is only how bytes are reached.
 //!
 //! Content evidence is blake3, cached by `(path, size, mtime)` in `store::hashcache` so an
 //! unchanged tree is not re-read. `digest` holds the sampled variant used by the fast tier.
 
 pub mod digest;
 pub mod local;
-pub mod remote;
+pub mod vfs;
 
 use std::path::Path;
 
 use crate::model::table::Snapshot;
 
 use local::scan_impl;
-use remote::scan_vfs;
+use vfs::scan_vfs;
 
 pub struct ScanOptions {
     pub hash: bool,
@@ -35,6 +37,7 @@ pub struct ScanOptions {
     /// Filter with FFS semantics (see filter.rs); the default exclusions are built in
     pub filter: crate::pipeline::filter::PathFilter,
 }
+
 /// Scan progress (P2-6). The same amount of information as syncthing's `FolderScanProgress`:
 /// phase + bytes done/total + rate, enough for the frontend to draw a bar and estimate the time remaining.
 #[derive(Clone, Copy, Debug)]
@@ -46,10 +49,12 @@ pub struct ScanProgress {
     pub bytes_done: u64,
     pub mib_per_s: f64,
 }
+
 pub type ProgressFn<'a> = &'a (dyn Fn(ScanProgress) + Sync);
 pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
     scan_impl(root, opt, None, None)
 }
+
 pub fn scan_with_progress(
     root: &Path,
     opt: &ScanOptions,
@@ -57,6 +62,7 @@ pub fn scan_with_progress(
 ) -> std::io::Result<Snapshot> {
     scan_impl(root, opt, progress, None)
 }
+
 /// v0.9 M1 unified-foundation entry point: cancel/pause/ProgressEvent event stream (see progress.rs).
 /// The old ScanProgress callback shape (P2-6) is kept as-is —— both paths share the same scan_impl.
 pub fn scan_ctx(
@@ -67,6 +73,7 @@ pub fn scan_ctx(
 ) -> std::io::Result<Snapshot> {
     scan_impl(root, opt, None, Some((ctx, phase)))
 }
+
 /// Route a root to the right scan lane: a local (or locally-translated) root keeps the
 /// existing walkdir+mmap fast path byte-for-byte; everything else runs the generic VFS
 /// lane. Both lanes speak the same filter contract and the same exclusion accounting —

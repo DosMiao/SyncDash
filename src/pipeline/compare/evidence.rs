@@ -27,6 +27,7 @@ pub struct SideMeta {
     #[ts(type = "number")]
     pub mtime_ms: i64,
 }
+
 /// Measured state of both sides, one-to-one with `plan.ops[i]` (the absent side is None)
 #[derive(Serialize, Deserialize, Clone, Default, Debug, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
@@ -34,6 +35,7 @@ pub struct RowMeta {
     pub src: Option<SideMeta>,
     pub dst: Option<SideMeta>,
 }
+
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Evidence {
     /// Length is always exactly plan.ops.len()
@@ -42,6 +44,7 @@ pub struct Evidence {
     pub equal_count: u64,
     pub equal_bytes: u64,
 }
+
 /// "Evidence" beyond the plan: measured size/mtime of both sides per row + a count of equal items.
 ///
 /// Why these two fields are not simply stuffed into `Op`: there are thirty-odd `Op { .. }` struct
@@ -92,6 +95,7 @@ pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &Compa
     }
     Evidence { metas, equal_count, equal_bytes }
 }
+
 /// One "identical on both sides" record. It is not in the plan — it is not an action, it is evidence.
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
@@ -105,6 +109,7 @@ pub struct SameRow {
     #[ts(type = "number")]
     pub other_mtime_ms: i64,
 }
+
 /// Files judged equal on both sides, paged in source-side path order.
 /// The data behind FFS's "22,631" button at the bottom: when a file does not appear in the diff table,
 /// you must be able to confirm it is "equal" rather than "never scanned at all".
@@ -144,6 +149,7 @@ pub fn same_page(
     }
     (total, out)
 }
+
 /// Per-row direction flip in the GUI (the semantic core of the same interaction FFS has). Returns None = this op cannot be reversed (move/dir/conflict/note).
 /// - Reverse of Copy: instead of pushing the file over, delete the "extra" one (the side that has it falls in line with the side that lacks it)
 /// - Reverse of Update: let the other side's content win

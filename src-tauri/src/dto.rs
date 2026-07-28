@@ -31,6 +31,7 @@ pub(crate) struct JobDto {
     /// 1:N: the effective target list (a single-target job = one entry). When >1 the frontend shows the target selector
     pub(crate) targets: Vec<String>,
 }
+
 #[derive(Serialize, Deserialize, Clone, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct PlanDto {
@@ -51,6 +52,7 @@ pub(crate) struct PlanDto {
     #[ts(type = "number")]
     pub(crate) equal_bytes: u64,
 }
+
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct ApplyDto {
@@ -64,6 +66,7 @@ pub(crate) struct ApplyDto {
     pub(crate) bytes_copied: u64,
     pub(crate) cancelled: bool,
 }
+
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct PreflightDto {
@@ -71,6 +74,7 @@ pub(crate) struct PreflightDto {
     pub(crate) blockers: Vec<String>,
     pub(crate) warnings: Vec<String>,
 }
+
 #[derive(Serialize, Default, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct PathInfo {
@@ -78,6 +82,7 @@ pub(crate) struct PathInfo {
     pub(crate) is_dir: bool,
     pub(crate) has_marker: bool,
 }
+
 #[derive(Serialize, Default, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct PathVerdict {
@@ -114,6 +119,7 @@ pub(crate) struct JobFileSchemaDto {
     #[ts(type = "number")]
     pub(crate) current: u32,
 }
+
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JunkPresetDto {
@@ -123,6 +129,7 @@ pub(crate) struct JunkPresetDto {
     pub(crate) patterns: Vec<String>,
     pub(crate) default_on: bool,
 }
+
 /// Legacy status-bar event (a transitional shim until the M2 frontend lands)
 #[derive(Serialize, Clone, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]

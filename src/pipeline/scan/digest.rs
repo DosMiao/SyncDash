@@ -17,6 +17,7 @@ pub(super) fn effective_read(size: u64, sampled: bool) -> u64 {
         size
     }
 }
+
 pub(super) fn sampled_digest(path: &Path, size: u64) -> std::io::Result<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path)?;
@@ -37,6 +38,7 @@ pub(super) fn sampled_digest(path: &Path, size: u64) -> std::io::Result<String> 
     }
     Ok(format!("~{}", hasher.finalize().to_hex()))
 }
+
 pub(super) fn sampled_digest_vfs(vfs: &dyn crate::fs::vfs::Vfs, rel: &str, size: u64) -> Result<String, crate::fs::vfs::error::VfsError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&size.to_le_bytes());
@@ -48,6 +50,7 @@ pub(super) fn sampled_digest_vfs(vfs: &dyn crate::fs::vfs::Vfs, rel: &str, size:
     // the two lanes must produce identical digests for identical content
     Ok(format!("~{}", hasher.finalize().to_hex()))
 }
+
 pub(super) fn full_hash_vfs(
     vfs: &dyn crate::fs::vfs::Vfs,
     rel: &str,

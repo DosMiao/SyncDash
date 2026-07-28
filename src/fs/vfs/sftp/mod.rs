@@ -45,6 +45,7 @@ pub struct SftpBackend {
     connect_gate: Mutex<()>,
     server_line: Mutex<Option<String>>,
 }
+
 struct Conn {
     /// Kept alive for the session's sake; the sftp channel is what we talk to.
     _session: russh::client::Handle<HostCheck>,
@@ -52,6 +53,7 @@ struct Conn {
     /// Absolute server-side root ('/'-separated, no trailing '/').
     root_abs: String,
 }
+
 impl SftpBackend {
     pub fn new(spec: RemoteSpec, creds: Arc<dyn CredentialProvider>) -> SftpBackend {
         let timeout = spec
@@ -148,6 +150,7 @@ impl SftpBackend {
     }
 
 }
+
 /// An attributes packet that asserts NOTHING. Never use `FileAttributes::default()`
 /// for setstat: that crate's Default is `size: Some(0), uid/gid: Some(0),
 /// permissions: Some(0o777|DIR), mtime: Some(0)` — sent as-is it TRUNCATES the file
@@ -165,6 +168,7 @@ pub(super) fn attrs_none() -> FileAttributes {
         mtime: None,
     }
 }
+
 fn meta_of(a: &FileAttributes) -> VMeta {
     let kind = if a.is_dir() {
         EntryKind::Dir
@@ -183,6 +187,7 @@ fn meta_of(a: &FileAttributes) -> VMeta {
         link: None,
     }
 }
+
 pub(super) fn map_sftp_err(what: &str, e: russh_sftp::client::error::Error) -> VfsError {
     use russh_sftp::client::error::Error as E;
     match e {

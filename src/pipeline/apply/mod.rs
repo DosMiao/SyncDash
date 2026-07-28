@@ -55,6 +55,7 @@ pub struct ApplyOptions {
     /// saturate the uplink, and going wider only worsens queueing on the far end. Clamped to 1..=16.
     pub parallel: usize,
 }
+
 impl Default for ApplyOptions {
     fn default() -> Self {
         ApplyOptions {
@@ -70,9 +71,11 @@ impl Default for ApplyOptions {
         }
     }
 }
+
 pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOptions) -> (u64, u64, u64) {
     apply_with(ops, source_root, target_root, opt, &RunCtx::null()).into_tuple()
 }
+
 /// The path-shaped entry: wraps both roots in LocalVfs and runs the one generic lane.
 /// Kept so every existing caller (and test) works unchanged — local behavior through
 /// the VFS lane is pinned by the whole apply test suite passing as-is.
@@ -89,6 +92,7 @@ pub fn apply_with(
         std::sync::Arc::new(crate::fs::vfs::local::LocalVfs::new(target_root.to_path_buf()));
     apply_vfs(ops, &sv, &tv, opt, ctx)
 }
+
 /// v0.9 M1 → v0.10 VFS: the execution body with progress/cancel/pause, now over a
 /// backend pair. Five serial phases: Moves → **Copy/Update (parallel)** → Chmod →
 /// Delete → DeleteDir (deepest-first within the class). Updates with delta enabled

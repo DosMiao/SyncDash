@@ -24,6 +24,7 @@ pub(super) struct SftpRead {
     pub(super) timeout: Duration,
     pub(super) file: russh_sftp::client::fs::File,
 }
+
 impl std::io::Read for SftpRead {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         use tokio::io::AsyncReadExt;
@@ -35,6 +36,7 @@ impl std::io::Read for SftpRead {
         }
     }
 }
+
 impl ReadStream for SftpRead {
     fn block_size(&self) -> usize {
         // FFS measured ~16×30000B as the knee of the SFTP throughput curve; russh-sftp
@@ -42,6 +44,7 @@ impl ReadStream for SftpRead {
         480 * 1024
     }
 }
+
 /// The staged write on an sftp root: temp name in the destination's own directory
 /// (server-side rename stays same-volume), opened CREATE|EXCL so the server's own
 /// O_EXCL refuses collisions, landed by unlink-then-rename (v3 rename refuses an
@@ -57,6 +60,7 @@ pub(super) struct SftpStaged {
     pub(super) hint: WriteHint,
     pub(super) committed: bool,
 }
+
 impl SftpStaged {
     fn block<F, T>(&self, what: &str, fut: F) -> VfsResult<T>
     where
@@ -70,6 +74,7 @@ impl SftpStaged {
         }
     }
 }
+
 impl WriteStaged for SftpStaged {
     fn write(&mut self, buf: &[u8]) -> VfsResult<()> {
         use tokio::io::AsyncWriteExt;
@@ -181,6 +186,7 @@ impl WriteStaged for SftpStaged {
         Ok(report)
     }
 }
+
 impl Drop for SftpStaged {
     fn drop(&mut self) {
         if !self.committed {

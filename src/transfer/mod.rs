@@ -5,4 +5,4 @@
 //! verifies before it executes anything.
 
 pub mod pack;
-pub mod remote;
+pub mod peer;

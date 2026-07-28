@@ -19,6 +19,7 @@ pub(super) enum DirOutcome {
     NotEmpty { sample: Vec<String> },
     Failed(std::io::Error),
 }
+
 pub(super) fn try_delete_dir_vfs(
     exec: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     rel: &str,

@@ -43,6 +43,7 @@ pub enum ConflictPolicy {
     /// Newer mtime wins; the older one is simply overwritten (no copy kept)
     Newer,
 }
+
 #[derive(Clone, Copy)]
 pub struct CompareOptions {
     /// Default true: NTFS and APFS are both case-insensitive by default
@@ -58,6 +59,7 @@ pub struct CompareOptions {
     /// Only the *hashless* judgment uses it — content evidence always wins over timestamps.
     pub mtime_window_ms: i64,
 }
+
 impl Default for CompareOptions {
     fn default() -> Self {
         CompareOptions {
@@ -69,6 +71,7 @@ impl Default for CompareOptions {
         }
     }
 }
+
 /// Conflict-copy name: `report.pdf` → `report.sync-conflict-20260726-143000-WIN01.pdf`
 /// (isomorphic to syncthing's naming, so a human recognizes it at a glance and both sides' filters can spot it)
 pub fn conflict_name(path: &str, host: &str, at_ms: u64) -> String {
@@ -79,13 +82,16 @@ pub fn conflict_name(path: &str, host: &str, at_ms: u64) -> String {
     let host = safe_host(host);
     format!("{dir}{stem}{CONFLICT_INFIX}{ts}-{host}{ext}")
 }
+
 /// A conflict copy must not itself take part in sync/conflict decisions (syncthing `isConflict`, :2224)
 pub fn is_conflict_copy(path: &str) -> bool {
     base_name(path).contains(CONFLICT_INFIX)
 }
+
 fn push_copy(ops: &mut Vec<Op>, side: Side, e: &Entry, reason: &str) {
     ops.push(Op { side, action: Action::Copy, path: e.path.clone(), from: None, size: Some(e.size), mtime_ms: Some(e.mtime_ms), hash: e.hash.clone(), link: None, mode: None, reason: reason.into() });
 }
+
 pub fn compare(source: &Snapshot, target: &Snapshot, mode: &str, archive: Option<&Snapshot>, resolve_newer: bool, copts: &CompareOptions) -> Plan {
     let ci = copts.case_insensitive;
     let win = copts.mtime_window_ms;

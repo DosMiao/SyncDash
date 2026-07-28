@@ -14,16 +14,20 @@ pub struct Marker {
     #[serde(default)]
     pub note: String,
 }
+
 pub fn marker_path(root: &Path) -> PathBuf {
     root.join(MARKER_NAME)
 }
+
 pub fn has_marker(root: &Path) -> bool {
     marker_path(root).is_file()
 }
+
 pub fn read_marker(root: &Path) -> Option<Marker> {
     let text = std::fs::read_to_string(marker_path(root)).ok()?;
     serde_json::from_str(&text).ok()
 }
+
 /// Write the marker (`syncdash mark`). If one already exists, keep its content and report it — never overwrite.
 pub fn write_marker(root: &Path, job: &str, note: &str) -> std::io::Result<(PathBuf, bool)> {
     let p = marker_path(root);

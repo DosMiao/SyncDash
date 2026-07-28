@@ -317,6 +317,7 @@ fn mode_of(md: &std::fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
     Some(md.mode() & 0o7777)
 }
+
 #[cfg(not(unix))]
 fn mode_of(_md: &std::fs::Metadata) -> Option<u32> {
     None
@@ -327,6 +328,7 @@ fn file_id_of(md: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     Some(format!("{}:{}", md.dev(), md.ino()))
 }
+
 #[cfg(not(unix))]
 fn file_id_of(_md: &std::fs::Metadata) -> Option<String> {
     None
@@ -341,6 +343,7 @@ impl std::io::Read for LocalRead {
         self.file.read(buf)
     }
 }
+
 impl ReadStream for LocalRead {
     fn block_size(&self) -> usize {
         1024 * 1024

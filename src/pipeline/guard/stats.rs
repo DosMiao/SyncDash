@@ -12,12 +12,14 @@ pub struct SideStats {
     pub delete_dirs: u64,
     pub moves: u64,
 }
+
 #[derive(Default, Clone, Debug)]
 pub struct PlanStats {
     pub source: SideStats,
     pub target: SideStats,
     pub conflicts: u64,
 }
+
 pub fn stat_plan(ops: &[Op]) -> PlanStats {
     let mut st = PlanStats::default();
     for op in ops {

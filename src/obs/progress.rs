@@ -110,6 +110,7 @@ impl RunCtl {
 pub fn cancelled_err() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled by user")
 }
+
 pub fn is_cancelled(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::Interrupted
 }

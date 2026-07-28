@@ -30,6 +30,7 @@ pub fn list_same(
     let (total, rows) = compare::evidence::same_page(&c.source, &c.target, &job.compare_opts(), &query, offset, limit.min(2000));
     Ok(SamePage { total, rows, job: c.job.clone() })
 }
+
 /// Export the current view as CSV. Escaping happens exactly once, here, and the output is UTF-8 **with a BOM** —
 /// without the BOM Excel interprets the file in the local code page and non-ASCII paths turn into mojibake.
 #[tauri::command]
@@ -90,6 +91,7 @@ pub fn export_csv(
     w.flush().map_err(|e| e.to_string())?;
     Ok(ops.len())
 }
+
 /// The public literals for enums follow serde (Action/Side are both marked rename_all = "snake_case"),
 /// so delete_dir in the CSV is the same word the plan JSONL and the event stream write.
 fn json_token<T: Serialize>(v: &T) -> String {

@@ -28,6 +28,7 @@ pub fn check_space(label: &str, root: &Path, need: u64, min_free_pct: f64, v: &m
         ));
     }
 }
+
 /// Run every gate in one pass. `source_entries` / `target_entries` come from the two snapshots.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_space_vfs(

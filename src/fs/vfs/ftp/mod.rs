@@ -44,9 +44,11 @@ pub(super) struct Feats {
     pub(super) mfmt: bool,
     pub(super) rest: bool,
 }
+
 pub(super) struct FtpConn {
     stream: FtpStream,
 }
+
 pub(super) type ConnSlot = Arc<Mutex<Option<FtpConn>>>;
 pub struct FtpBackend {
     spec: RemoteSpec,
@@ -55,6 +57,7 @@ pub struct FtpBackend {
     conn: ConnSlot,
     feats: OnceLock<Feats>,
 }
+
 pub(super) fn map_ftp_err(what: &str, e: FtpError) -> VfsError {
     match e {
         FtpError::ConnectionError(io) => {
@@ -72,6 +75,7 @@ pub(super) fn map_ftp_err(what: &str, e: FtpError) -> VfsError {
         other => VfsError::new(VfsErrorKind::Protocol, format!("{what}: {other}")),
     }
 }
+
 impl FtpBackend {
     pub fn new(spec: RemoteSpec, creds: Arc<dyn CredentialProvider>) -> FtpBackend {
         let timeout = spec
@@ -151,6 +155,7 @@ impl FtpBackend {
         Ok(out)
     }
 }
+
 fn meta_of(f: &FtpFile) -> VMeta {
     let kind = if f.is_directory() {
         EntryKind::Dir
@@ -168,6 +173,7 @@ fn meta_of(f: &FtpFile) -> VMeta {
         link: f.symlink().map(|p| p.to_string_lossy().into_owned()),
     }
 }
+
 impl Vfs for FtpBackend {
     fn caps(&self) -> VfsCaps {
         let f = self.feats.get().copied();

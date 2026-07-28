@@ -31,6 +31,7 @@ pub fn reveal(path: String) -> Result<(), String> {
     }
     Ok(())
 }
+
 /// When-finished action (same as FFS): sleep / shutdown. The countdown and confirmation both happen in the frontend before this is called.
 #[tauri::command]
 pub fn post_sync_action(kind: String) -> Result<(), String> {

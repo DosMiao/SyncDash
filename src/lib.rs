@@ -37,11 +37,18 @@
 //! GUI, and the two are kept in step by hand — see `foundation::fmt`.
 //!
 //! Two shape rules, both taken from the reference project:
-//! - A single-file domain stays flat at its parent (`transfer/remote.rs`); only a multi-file
-//!   domain earns a directory. Nesting for its own sake just lengthens paths.
+//! - A single-file domain stays flat at its parent (`boot.rs`, `pipeline/filter.rs`); only a
+//!   multi-file domain earns a directory. Nesting for its own sake just lengthens paths.
 //! - **No re-export hubs.** Every `mod.rs` carries real content, and callers write the full path
 //!   (`foundation::fmt::human_bytes`, never a re-export from wherever happens to be convenient).
 //!   A barrel erases who depends on whom, which is precisely what this layering exists to show.
+//!
+//! One word to keep straight, because it used to name two opposite things. A **peer** job is one
+//! the far side's own syncdash executes (`peer://`, `run::peer`, `transfer::peer`); everything
+//! else runs in this process, however distant its roots — an `sftp://` root is reached over a
+//! network but read and written *here*, down `pipeline::scan::vfs`. "Remote" answered both
+//! questions and so answered neither; it survives only in the run-log's stored `kind` strings,
+//! where changing it would make a user's existing history read differently.
 
 pub mod foundation;
 

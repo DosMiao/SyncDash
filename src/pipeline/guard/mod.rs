@@ -46,16 +46,19 @@ pub struct Guards {
     /// User allowed it through explicitly (--i-know); only lets the health-check gates pass, marker/space still block
     pub acknowledged: bool,
 }
+
 impl Default for Guards {
     fn default() -> Self {
         Guards { require_marker: false, min_free_pct: 0.01, max_delete_ratio: 0.5, acknowledged: false }
     }
 }
+
 /// The verdict of one preflight. Non-empty `blockers` = refuse to run.
 pub struct Verdict {
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
 }
+
 impl Verdict {
     pub fn ok(&self) -> bool {
         self.blockers.is_empty()
@@ -71,6 +74,7 @@ impl Verdict {
         self.ok()
     }
 }
+
 /// `run_all` over a backend pair: the same gates, with root and space checks going
 /// through the VFS (an sftp root honestly reports "cannot determine" instead of a number).
 pub fn run_all_vfs(
@@ -94,6 +98,7 @@ pub fn run_all_vfs(
     check_delete_ratio("source", &st.source, source_entries, g, &mut v);
     v
 }
+
 pub fn run_all(
     ops: &[Op],
     source_root: &Path,

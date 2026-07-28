@@ -28,15 +28,18 @@ pub fn list_jobs() -> Vec<JobDto> {
         })
         .collect()
 }
+
 #[tauri::command]
 pub fn jobs_dir() -> String {
     syncdash::foundation::dirs::jobs_dir().display().to_string()
 }
+
 /// M5: the editor reads the full Job (the list_jobs DTO is only a summary)
 #[tauri::command]
 pub fn get_job(name: String) -> Result<job::Job, String> {
     job::load(&name).map(|(_, j)| j).map_err(|e| e.to_string())
 }
+
 /// What a brand-new job starts from, including the default-on junk presets already materialized into
 /// `exclude`. The editor asks for this instead of keeping its own copy: a hand-written mirror of
 /// `Job::default()` is a second source of truth for engine policy, and it had already drifted — an empty
@@ -46,12 +49,14 @@ pub fn get_job(name: String) -> Result<job::Job, String> {
 pub fn default_job() -> job::Job {
     job::Job::default()
 }
+
 #[tauri::command]
 pub fn job_file_schema(name: String) -> Result<JobFileSchemaDto, String> {
     job::file_schema(&name)
         .map(|on_disk| JobFileSchemaDto { on_disk, current: job::SCHEMA })
         .map_err(|e| e.to_string())
 }
+
 /// M5: save a job (create, or overwrite the TOML of the same name)
 #[tauri::command]
 pub fn save_job(name: String, job: job::Job) -> Result<String, String> {
@@ -60,6 +65,7 @@ pub fn save_job(name: String, job: job::Job) -> Result<String, String> {
     }
     job::save_job(name.trim(), &job).map(|p| p.display().to_string()).map_err(|e| e.to_string())
 }
+
 /// M5: delete the job's config file (not a single byte of data is touched)
 #[tauri::command]
 pub fn delete_job(name: String) -> Result<(), String> {

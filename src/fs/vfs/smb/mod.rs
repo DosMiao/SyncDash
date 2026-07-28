@@ -34,6 +34,7 @@ pub struct SmbBackend {
     inner: OnceLock<LocalVfs>,
     connect_gate: Mutex<()>,
 }
+
 impl SmbBackend {
     pub fn new(spec: RemoteSpec, creds: Arc<dyn CredentialProvider>) -> VfsResult<SmbBackend> {
         let mut segs = spec.root.splitn(2, '/');
@@ -57,6 +58,7 @@ impl SmbBackend {
         })
     }
 }
+
 impl Vfs for SmbBackend {
     fn caps(&self) -> VfsCaps {
         // Full local semantics — that is the entire point of the translation route — but read off

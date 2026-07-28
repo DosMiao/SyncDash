@@ -12,6 +12,7 @@ use super::schedule::Shared;
 pub(super) fn default_trash() -> PathBuf {
     crate::store::trash::trash_root().join(crate::foundation::time::now_ms().to_string())
 }
+
 pub(super) fn move_to_trash(file: &Path, rel: &str, trash: &Path) -> std::io::Result<()> {
     let dest = join_native(trash, rel);
     if let Some(p) = dest.parent() {
@@ -26,6 +27,7 @@ pub(super) fn move_to_trash(file: &Path, rel: &str, trash: &Path) -> std::io::Re
         }
     }
 }
+
 /// Archive the original before it is overwritten/deleted (trash or .version_syncDash).
 ///
 /// Three routes, chosen by two independent questions:

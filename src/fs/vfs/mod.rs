@@ -359,12 +359,12 @@ pub fn open(phrase: &str, creds: &Arc<dyn CredentialProvider>) -> VfsResult<Arc<
             Ok(Arc::new(ftp::FtpBackend::new(r, creds.clone())))
         }
         // A peer root is not something this process opens: the far side's own syncdash reads and
-        // writes it, and `run::remote` drives that over ssh. Reaching here means a caller took a
+        // writes it, and `run::peer` drives that over ssh. Reaching here means a caller took a
         // peer job down the in-process lane, which would sync against the wrong filesystem.
         RootSpec::Remote(r) if spec::is_peer_scheme(&r.scheme) => Err(VfsError::new(
             VfsErrorKind::Unsupported,
             format!(
-                "{} names a peer root — the syncdash on the far side owns it, so there is no backend to open here (run::remote drives it)",
+                "{} names a peer root — the syncdash on the far side owns it, so there is no backend to open here (run::peer drives it)",
                 r.display()
             ),
         )),

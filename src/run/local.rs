@@ -34,6 +34,7 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx, accep
     let tv = resolve_root(&job.target)?;
     compare_resolved(job, &sv, &tv, ctx, accept_caps)
 }
+
 /// Compare two roots that are already open. Split out from `compare_job_detailed` so the phrase
 /// layer and the comparison are separable: everything below here works on backends, not spellings,
 /// which is what lets the VFS lane be exercised against an in-memory root.
@@ -170,6 +171,7 @@ pub fn compare_resolved(
     };
     Ok(CompareOutcome { plan, source: s, target: t })
 }
+
 /// The escalation rule: when the two signals fight (the sampled digest says "identical", mtime says "touched"), believe neither silently —
 /// **escalate that file to a full hash on both sides** and rule again. This shrinks the blind spot of fast/standard from
 /// "any change outside the sampling window" to "outside the sampling window *and* timestamp-preserving" (≈ the timestomp case).
@@ -249,6 +251,7 @@ fn escalate_sampled_disagreements(
     }
     plan
 }
+
 /// Run the gates without executing — the GUI calls this before raising the confirmation sheet, so the refusal
 /// reasons are shown to the person in full instead of landing only on a stderr nobody reads.
 pub fn preflight_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::pipeline::guard::Verdict {
@@ -261,6 +264,7 @@ pub fn preflight_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> 
         &job.guards(acknowledged),
     )
 }
+
 /// v0.9 M1: apply orchestration with an event stream — the Apply phase (apply_with reports its own totals and
 /// byte-by-byte progress) → the Refresh phase → the Summary terminal state.
 pub fn apply_job_guarded_with(
@@ -384,6 +388,7 @@ use crate::obs::progress::ApplyOutcome;
     });
     out
 }
+
 /// End-to-end run for local/mounted-disk jobs (the body of the original CLI run). Returns (done, skipped, errors, conflicts).
 pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool, accept_caps: bool) -> std::io::Result<(u64, u64, u64, u64)> {
     // 1:N (the original requirement): one source → each target compared and executed independently.
@@ -403,6 +408,7 @@ pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, ackno
     }
     Ok(tot)
 }
+
 pub fn run_local_single(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool, accept_caps: bool) -> std::io::Result<(u64, u64, u64, u64)> {
     let plan = compare_job_detailed(job, &crate::obs::progress::RunCtx::null(), accept_caps)?.plan;
     crate::log_info!("run", "[{name}] {} op(s), {} conflict(s)", plan.header.op_count, plan.header.conflict_count);

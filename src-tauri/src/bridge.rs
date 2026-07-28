@@ -29,6 +29,7 @@ pub(crate) struct RunEvent {
     #[serde(flatten)]
     ev: ProgressEvent,
 }
+
 pub(crate) fn legacy_phase(p: Phase) -> &'static str {
     match p {
         Phase::ScanSource => "scan-source",
@@ -41,6 +42,7 @@ pub(crate) fn legacy_phase(p: Phase) -> &'static str {
         Phase::Refresh => "refreshing",
     }
 }
+
 pub(crate) fn legacy_shim(app: &tauri::AppHandle, ev: &ProgressEvent) {
     match ev {
         ProgressEvent::PhaseStart { phase, label, .. } => {
@@ -79,6 +81,7 @@ pub(crate) fn legacy_shim(app: &tauri::AppHandle, ev: &ProgressEvent) {
         _ => {}
     }
 }
+
 /// ProgressSink → Tauri events. Progress events are throttled to ≥100ms apiece (= the FFS chart sampling rate),
 /// PhaseStart/Totals/Error/Paused/Resumed/Summary pass straight through.
 pub(crate) struct TauriSink {
@@ -87,6 +90,7 @@ pub(crate) struct TauriSink {
     purpose: &'static str,
     last_progress_ms: AtomicU64,
 }
+
 impl ProgressSink for TauriSink {
     fn emit(&self, ev: ProgressEvent) {
         if let ProgressEvent::Progress { ts_ms, .. } = &ev {
@@ -100,6 +104,7 @@ impl ProgressSink for TauriSink {
         let _ = self.app.emit("run-progress", RunEvent { run_id: self.run_id, purpose: self.purpose, ev });
     }
 }
+
 pub(crate) fn make_ctx(app: &tauri::AppHandle, run_id: u64, ctl: Arc<RunCtl>, purpose: &'static str) -> RunCtx {
     RunCtx::new(
         ctl,

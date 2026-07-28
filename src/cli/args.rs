@@ -22,6 +22,7 @@ pub enum Mode {
     Sync,
     Enrich,
 }
+
 #[derive(Subcommand)]
 pub enum Cmd {
     /// Print this machine's environment info (used for remote probing: this is what runs over ssh on the far side)
@@ -285,6 +286,7 @@ pub enum Cmd {
         verbose: bool,
     },
 }
+
 #[derive(Subcommand)]
 pub enum CredCmd {
     /// Store the password for a remote phrase (prompts without echo; secrets never touch argv or job files)
@@ -302,11 +304,13 @@ pub enum CredCmd {
     /// Connect once and report what happened, step by step
     Test { phrase: String },
 }
+
 #[derive(Subcommand)]
 pub enum NetCmd {
     /// Release the private smb mount points this tool created (macOS; Windows sessions are device-less)
     Umount,
 }
+
 #[derive(Subcommand)]
 pub enum LogsCmd {
     /// List runs (newest → oldest). **Including interrupted runs** — the ones missing from the index, with only a directory left
@@ -342,6 +346,7 @@ pub enum LogsCmd {
     /// Print the log directory's location
     Dir,
 }
+
 #[derive(Subcommand)]
 pub enum TrashCmd {
     /// List every trash batch (time, file count, size)

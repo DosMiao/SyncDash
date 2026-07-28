@@ -23,6 +23,7 @@ pub(super) struct FtpRead {
     pub(super) data: Option<Box<dyn Read + Send>>,
     pub(super) finished: bool,
 }
+
 impl FtpRead {
     fn finish(&mut self, aborted: bool) {
         if self.finished {
@@ -36,6 +37,7 @@ impl FtpRead {
         }
     }
 }
+
 impl Read for FtpRead {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let Some(data) = self.data.as_mut() else {
@@ -50,16 +52,19 @@ impl Read for FtpRead {
         }
     }
 }
+
 impl ReadStream for FtpRead {
     fn block_size(&self) -> usize {
         64 * 1024 // libcurl-era measurement: FTP data arrives in ~64 KiB strides
     }
 }
+
 impl Drop for FtpRead {
     fn drop(&mut self) {
         self.finish(true);
     }
 }
+
 pub(super) struct FtpStaged {
     pub(super) conn: ConnSlot,
     pub(super) feats: Feats,
@@ -70,6 +75,7 @@ pub(super) struct FtpStaged {
     pub(super) hint: WriteHint,
     pub(super) committed: bool,
 }
+
 impl WriteStaged for FtpStaged {
     fn write(&mut self, buf: &[u8]) -> VfsResult<()> {
         let data = self.data.as_mut().expect("write after seal");
@@ -186,6 +192,7 @@ impl WriteStaged for FtpStaged {
         Ok(report)
     }
 }
+
 impl Drop for FtpStaged {
     fn drop(&mut self) {
         if !self.committed {

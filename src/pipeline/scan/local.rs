@@ -17,19 +17,23 @@ fn file_id(md: &std::fs::Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     Some(format!("{}:{}", md.dev(), md.ino()))
 }
+
 #[cfg(not(unix))]
 fn file_id(_md: &std::fs::Metadata) -> Option<String> {
     None
 }
+
 #[cfg(unix)]
 fn unix_mode(md: &std::fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
     Some(md.mode() & 0o7777)
 }
+
 #[cfg(not(unix))]
 fn unix_mode(_md: &std::fs::Metadata) -> Option<u32> {
     None
 }
+
 fn mtime_ms(md: &std::fs::Metadata) -> i64 {
     md.modified()
         .ok()
@@ -37,6 +41,7 @@ fn mtime_ms(md: &std::fs::Metadata) -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
 pub(super) fn scan_impl(
     root: &Path,
     opt: &ScanOptions,

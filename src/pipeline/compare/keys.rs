@@ -14,6 +14,7 @@ pub(super) fn files_equal(a: &Entry, b: &Entry, win_ms: i64) -> bool {
     }
     a.size == b.size && (a.mtime_ms - b.mtime_ms).abs() <= win_ms
 }
+
 /// Which generation of archive entry `r` the content of `e` corresponds to:
 /// `Some(0)` = matches what the archive currently records, `Some(n)` = the n-th historic generation, `None` = the archive has never seen it.
 /// The lower the generation number the newer it is — this is what lets "one generation behind" be told apart from "concurrent edit" (P1-3).
@@ -24,6 +25,7 @@ pub(super) fn generation_of(e: &Entry, r: &Entry, win_ms: i64) -> Option<usize> 
     let h = e.hash.as_deref()?;
     r.prev.as_ref()?.iter().position(|x| x == h).map(|i| i + 1)
 }
+
 /// Normalized key → entry; on a collision (NFD/NFC or case twins) the first one seen is kept and recorded
 pub(super) fn map_of<'a>(snap: &'a Snapshot, kind: EntryKind, ci: bool) -> (BTreeMap<String, &'a Entry>, Vec<String>) {
     let mut m: BTreeMap<String, &Entry> = BTreeMap::new();

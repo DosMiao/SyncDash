@@ -32,6 +32,7 @@ pub(super) fn name_rules_of(h: &Header) -> NameRules {
         }
     }
 }
+
 /// How badly a Windows-semantics root handles this path. Ordered by blast radius.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum WinNameFault {
@@ -43,6 +44,7 @@ pub(super) enum WinNameFault {
     /// Creating, reading and deleting all work; other Windows software cannot cope.
     Unusable,
 }
+
 /// Why this relative path cannot be handled faithfully on a Windows-semantics root.
 ///
 /// The three faults differ in blast radius and the reason text says which — a plan that claims
@@ -76,6 +78,7 @@ pub(super) fn win_name_fault(rel: &str) -> Option<(WinNameFault, String)> {
         (fault, r)
     })
 }
+
 pub(super) fn win_invalid_reason(rel: &str) -> Option<String> {
     // COM0/LPT0 are absent from the Microsoft list but Explorer treats them as reserved too
     // (syncthing carries the same two extras, with the same note).

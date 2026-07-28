@@ -6,7 +6,7 @@
 //! `vfs` is the virtual filesystem a sync root lives on — local disk today, SMB/SFTP/FTP
 //! backends behind the same trait; its write side wraps `staged` rather than reimplementing it.
 //! `ssh` is the authenticated session both things that ride ssh share: the `sftp://` backend and
-//! `transfer::remote`'s peer lane, which used to reach the same hosts with the same keys by two
+//! `transfer::peer`'s peer lane, which used to reach the same hosts with the same keys by two
 //! different means.
 
 pub mod lock;

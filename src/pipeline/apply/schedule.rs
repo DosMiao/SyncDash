@@ -48,6 +48,7 @@ pub(super) struct Shared<'a> {
     pub(super) mtime_fixes: Mutex<Vec<(bool, String, i64, i64)>>,
     pub(super) delta_saved: AtomicU64,
 }
+
 impl<'a> Shared<'a> {
     pub(super) fn exec_other(&self, side: &Side) -> (&std::sync::Arc<dyn crate::fs::vfs::Vfs>, &std::sync::Arc<dyn crate::fs::vfs::Vfs>) {
         match side {
@@ -84,12 +85,14 @@ impl<'a> Shared<'a> {
         Ok(())
     }
 }
+
 #[derive(Default)]
 pub(super) struct Counters {
     pub(super) done: AtomicU64,
     pub(super) skipped: AtomicU64,
     pub(super) errors: AtomicU64,
 }
+
 /// Run one class of ops. width==1 runs sequentially on the current thread; otherwise a scoped thread pool
 /// (an AtomicUsize work-ticket index rather than range splitting — one big file can't drag a worker into a long tail).
 /// No rayon: verify's blake3 already runs in rayon's global pool, and nesting would oversubscribe and tangle the pause semantics.

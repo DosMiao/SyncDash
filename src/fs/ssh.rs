@@ -1,7 +1,7 @@
 //! One ssh session, shared by everything that rides ssh.
 //!
 //! Two things in this crate speak ssh and they used to do it by different means: `vfs::sftp` opened
-//! a russh session in-process, while `transfer::remote` shelled out to the `ssh` binary and quoted
+//! a russh session in-process, while `transfer::peer` shelled out to the `ssh` binary and quoted
 //! commands for whatever shell the far side runs. Same hosts, same keys, same `known_hosts` — two
 //! implementations, one of which needed OpenSSH installed and could not be cancelled or measured.
 //!
@@ -28,6 +28,7 @@ pub enum HostCheckError {
     Unknown { fingerprint: String },
     Changed { fingerprint: String },
 }
+
 impl std::fmt::Display for HostCheckError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -37,6 +38,7 @@ impl std::fmt::Display for HostCheckError {
         }
     }
 }
+
 impl std::error::Error for HostCheckError {}
 impl From<russh::Error> for HostCheckError {
     fn from(e: russh::Error) -> Self {
@@ -51,6 +53,7 @@ pub struct HostCheck {
     pub host: String,
     pub port: u16,
 }
+
 impl russh::client::Handler for HostCheck {
     type Error = HostCheckError;
 

@@ -53,15 +53,19 @@ impl Default for AppSettings {
 fn default_level() -> LogLevel {
     LogLevel::Info
 }
+
 fn default_keep_days() -> u64 {
     30
 }
+
 fn default_max_total_mb() -> u64 {
     512
 }
+
 fn default_log_compare() -> String {
     "summary".into()
 }
+
 fn default_true() -> bool {
     true
 }

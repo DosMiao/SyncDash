@@ -33,6 +33,7 @@ pub fn check_root(label: &str, root: &Path, require_marker: bool, v: &mut Verdic
         }
     }
 }
+
 /// The same three-level judgment for a VFS root (syncthing's folder-marker defense):
 /// unreachable / not-a-directory → blocker; marker demanded but absent → blocker;
 /// empty and unmarked → warning. Distinguishing "the mount is not up" from "the user

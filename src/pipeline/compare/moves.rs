@@ -20,6 +20,7 @@ pub struct MovePair {
     /// the resulting content is still correct, but the attribution is uncertain; reason must say so honestly, never feign certainty.
     pub candidates: usize,
 }
+
 /// Move pairing. Pairing priority (in the spirit of FFS's "same-directory rename merge"):
 ///   1) same parent dir (rename in place)  2) same file name (whole directory relocated)  3) any same hash
 ///
@@ -80,6 +81,7 @@ pub(super) fn detect_moves<'a>(
     let rest_dels = dels.into_iter().filter(|d| !used.contains(&d.path)).collect();
     (moves, rest_adds, rest_dels)
 }
+
 /// The reason for a move op: an ambiguous pairing states the candidate count honestly
 pub(super) fn move_reason(base: &str, m: &MovePair) -> String {
     if m.candidates > 1 {

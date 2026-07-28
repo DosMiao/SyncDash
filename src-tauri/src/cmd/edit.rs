@@ -11,6 +11,7 @@ fn norm_root(p: &str) -> String {
     let s = s.trim_end_matches('/');
     s.to_string()
 }
+
 /// Live health check for the editor: whether the path exists, whether it is a directory, whether it
 /// carries a mount-point marker, and how the two roots relate (identical / nested). A mistyped path costs
 /// too much to be reported only in the status bar once Compare runs.
@@ -84,12 +85,14 @@ pub fn inspect_paths(source: String, target: String) -> PathVerdict {
     }
     v
 }
+
 /// Ad-hoc mask matching for the UI funnel. The frontend **does not write its own glob** — the FFS mask
 /// semantics have exactly one implementation, in filter.rs, so a mask tried out in the UI behaves identically once written into the job's exclude.
 #[tauri::command]
 pub fn mask_match(masks: Vec<String>, paths: Vec<String>) -> Vec<bool> {
     syncdash::pipeline::filter::mask_hits(&masks, &paths)
 }
+
 /// The junk presets, patterns and all. The frontend **does not carry its own copy of these lists** —
 /// the editor's checkboxes write literally what the engine would have applied, which is the whole
 /// reason a checkbox can now be trusted to describe what a job excludes.

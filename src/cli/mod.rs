@@ -50,6 +50,7 @@ pub(crate) fn write_out<F: Fn(&mut dyn std::io::Write) -> std::io::Result<()>>(o
         }
     }
 }
+
 /// v0.9 M5: with egui retired, GUI = the Tauri desktop app. Look for syncdash-desktop next to this binary and launch it;
 /// if it isn't there, say plainly where to get it instead of exiting silently.
 fn launch_desktop() -> std::io::Result<i32> {
@@ -70,6 +71,7 @@ fn launch_desktop() -> std::io::Result<i32> {
         }
     }
 }
+
 pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
     let cmd = match cli.cmd {
         Some(c) => c,

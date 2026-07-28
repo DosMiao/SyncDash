@@ -170,6 +170,7 @@ impl Default for Job {
 fn default_true() -> bool {
     true
 }
+
 /// Current job-file schema. Bump when a load-time migration is added, and give the migration a
 /// `schema < N` guard — the version is what tells "the user deleted this rule" apart from
 /// "this file predates the rule", which no amount of inspecting the contents can.
@@ -177,15 +178,19 @@ pub const SCHEMA: u32 = 3;
 fn default_schema() -> u32 {
     1 // no `schema` key in the file = written before versioning existed = needs the v1 migration
 }
+
 fn default_min_free() -> f64 {
     0.01
 }
+
 fn default_max_delete_ratio() -> f64 {
     0.5
 }
+
 fn default_conflict() -> String {
     "report".into()
 }
+
 fn default_max_conflicts() -> i32 {
     5
 }

@@ -22,10 +22,10 @@ SyncDash/
 │   ├─ fs/                    L0  staged (atomic write) · lock · vfs/ (one root = one backend)
 │   ├─ store/                 L1  settings · trash · version · hashcache · mtimefix · migrate
 │   ├─ obs/                   L1  progress · logging · runlog
-│   ├─ pipeline/              L2  scan/ · compare/ · apply/ · guard/ (directories) · filter
-│   ├─ transfer/              L2  remote · pack
+│   ├─ pipeline/              L2  scan/ (local · vfs) · compare/ · apply/ · guard/ · filter
+│   ├─ transfer/              L2  peer (the ssh lane) · pack
 │   ├─ job/                   L3  the Job schema · territory · junk presets · rigor
-│   ├─ run/                   L3  the orchestrator: local · remote · roots · archive, behind one transport router
+│   ├─ run/                   L3  the orchestrator: local · peer · roots · archive, behind one transport router
 │   ├─ boot.rs                L3  process startup: worker pool, settings, progress sink (both shells)
 │   ├─ cli/                   L4  args (the --help contract) · dispatch
 │   └─ main.rs                L4  CLI bin (29 lines: parse, dispatch, exit)
@@ -36,6 +36,7 @@ SyncDash/
 │   ├─ ui/                    main window: App.tsx owns session state, components/ render, hooks/ isolate effects
 │   ├─ progress/              the run sub-window (own entry point; run state lives in a ref, see its header)
 │   └─ styles.css             the whole design token layer — every size and color in the app resolves here
+│                             (values follow GitHub Primer; changing one means re-running the contrast audit)
 ├─ Script/gen-types.mjs       type generation entry point (`npm run gen:types`)
 ├─ index.html                 main-window entry point (the sub-window's is progress.html)
 ├─ dist/                      frontend build output — deliberately committed to git (no node on Mac, see "Build")
@@ -44,10 +45,21 @@ SyncDash/
 ```
 
 Dependencies point **downward only**, and this is checked rather than asserted: Tarjan over the
-comment-stripped sources reports no strongly-connected component larger than one and no edge pointing
-up the ladder.
+comment-stripped **files** reports no strongly-connected component larger than one. Two things that
+reading `use crate::` will not show, both accepted rather than engineered away: the `log_*!` macros are
+`#[macro_export]` and expand to `$crate::obs::logging::emit`, so `fs::lock` and `fs::vfs::local` carry an
+edge to L1 that no `use` declares (each header says why); and counting those, the *directory* graph has
+one cycle, `fs → obs → store → fs`. Being able to log from anywhere is worth more than an acyclic
+directory graph — but it is a cycle, and the file-level claim is the one that holds unqualified.
 
-Two shape rules: a **single-file domain stays flat at its parent** (`transfer/remote.rs`, `run.rs`) —
+One word to keep straight, because it used to name two opposite things. A **peer** job is one the far
+side's own syncdash executes (`peer://`, `run::peer`, `transfer::peer`); everything else runs in this
+process however distant its roots — an `sftp://` root is reached over a network but read and written
+*here*, down `pipeline::scan::vfs`. "Remote" answered both questions and so answered neither; it
+survives only in the run log's stored `kind` strings, where changing it would make existing history
+read differently.
+
+Two shape rules: a **single-file domain stays flat at its parent** (`boot.rs`, `pipeline/filter.rs`) —
 only a multi-file domain earns a directory, because nesting for its own sake only lengthens paths. And
 **no re-export hubs**: every `mod.rs` carries real content and callers write the full path
 (`foundation::fmt::human_bytes`), since a barrel erases who depends on whom, which is the one thing
@@ -98,7 +110,7 @@ syncdash-desktop                                 # Tauri desktop app (the main G
 One TOML per job, kept in `%APPDATA%\syncdash\jobs\` (mac: `~/.config/syncdash/jobs/`):
 
 ```toml
-schema = 2                 # job-file schema; a file without it is migrated on load (junk presets -> exclude)
+schema = 3                 # job-file schema; older files migrate on load (junk presets -> exclude, then remote_host -> peer://)
 mode = "sync"              # mirror | sync | enrich
 source = 'D:\Code\Utilities\flight'
 target = '\\192.168.0.115\xuanbomiao\Code\Utilities\flight'
@@ -174,7 +186,10 @@ stats bar (items / selected / bytes to transfer / conflicts) → **Synchronize**
 checked. Frontend: Vite + React 19, styled by the hand-written token layer in `typescript/styles.css` — no UI
 or styling library. Every size and color resolves through that one file, with a hard floor of 11px type and
 4.5:1 contrast; the whole window scales through the webview's own zoom (Ctrl +/-/0), not a font knob, so
-borders and layout scale with the text.
+borders and layout scale with the text. Both themes are defined there and follow the OS through
+`prefers-color-scheme`; the values are GitHub Primer's, except where Primer's own hues miss the contrast
+floor on the hover surface and take a darker step. Changing any color means re-running the audit against
+`--bg`, `--bg-2` and `--bg-3` — several hues clear the first and fail the third.
 
 Added in v0.3.2: **per-row direction flip** (click the row's action to toggle; the semantics are precomputed by the
 core's `reverse_op`: copy↔delete are inverses, update swaps sides; a flipped row gets a tinted background and a
@@ -420,12 +435,22 @@ correct for the reality of "one hub, many spokes".
 has already left room for it architecturally (tables are first-class, and one table per endpoint follows
 naturally).
 
-The remote pipeline (set `remote_host`/`remote_root`/`remote_exe` in the job): `run` automatically goes
-ssh probe → **the remote scans its own disk** (no pulling data over UNC to hash it; an order of magnitude faster
-on large territories) → compare locally → the target-side pack is delivered over ssh stdin → `apply-pack` on the
-remote (with lock/trash/verify built in) → the source-side pull-back lands directly through the mounted path →
-archive refresh. `gen-jobs --remote-host mac --remote-root-base /Users/xxx/Code` can generate remote-pipeline jobs
-for every territory in one shot.
+The peer pipeline — a target named `peer://`, meaning the far side's own syncdash owns that root:
+
+```
+target = "peer://mac/Users/ben/Code|exe=~/bin/syncdash|mount=\mac\share\Code"
+```
+
+`run` then goes ssh probe → **the peer scans its own disk** (no pulling data over UNC to hash it; an order of
+magnitude faster on large territories) → compare locally → the target-side pack is delivered over ssh → `apply-pack`
+on the peer (with lock/trash/verify built in) → the source-side pull-back lands through the `mount=` path →
+archive refresh. `gen-jobs --remote-host mac --remote-root-base /Users/xxx/Code` generates peer jobs for every
+territory in one shot.
+
+`mount=` is the pull direction and is optional: declared and reachable, the source-side ops run through it;
+declared but unreachable, they are skipped naming the mount; undeclared, they are skipped saying how to enable it.
+A job written before this grammar (schema ≤ 2, with `remote_host`/`remote_root`/`remote_exe`) migrates on load,
+carrying both roots across so it keeps doing exactly what it did.
 
 ## Relationship to CodeSync (FFS)
 

@@ -60,6 +60,7 @@ fn lower_thread_priority() {
         SetThreadPriority(GetCurrentThread(), -1);
     }
 }
+
 #[cfg(target_os = "linux")]
 fn lower_thread_priority() {
     // nice on Linux is per-thread
@@ -67,6 +68,7 @@ fn lower_thread_priority() {
         libc::nice(3);
     }
 }
+
 #[cfg(all(unix, not(target_os = "linux")))]
 fn lower_thread_priority() {
     // nice() on macOS is process-wide; touching it would drag the UI down with it —— so don't
