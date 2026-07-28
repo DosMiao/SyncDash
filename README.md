@@ -18,8 +18,8 @@ Why not just keep using FFS / rsync / Unison:
 SyncDash/
 ├─ src/                       syncdash core library + CLI bin — one directory per layer
 │   ├─ foundation/            L0  fmt · time · path · text · names · dirs   (zero in-crate deps)
-│   ├─ model/                 L0  plan · event · table · chunk · vclock     (vocabulary, no I/O)
-│   ├─ fs/                    L0  staged (atomic write) · lock
+│   ├─ model/                 L0  plan · event · table · chunk              (vocabulary, no I/O)
+│   ├─ fs/                    L0  staged (atomic write) · lock · vfs/ (one root = one backend)
 │   ├─ store/                 L1  settings · trash · version
 │   ├─ obs/                   L1  progress · logging · runlog
 │   ├─ pipeline/              L2  scan · compare · apply · filter · guard
@@ -478,9 +478,9 @@ real line numbers on both sides). What landed:
   (caught at the plan stage rather than blowing up at apply).
 - **`shortcutFile` (:1253)** → `Action::Chmod`: no re-transfer when the content is identical and only the
   permission bits differ.
-- **`lib/protocol/vector.go` → [src/vclock.rs](src/vclock.rs)**: the version-vector math core (with exhaustive
-  verification of its algebraic properties). **It has not taken over archive attribution yet** — true N-way is
-  v1.0's convergence engineering, see "Multi-endpoint".
+- **`lib/protocol/vector.go`**: a version-vector math core was ported and exhaustively verified, then **deleted**
+  — it sat unreferenced for the whole of v0.9 while the config key that would have activated it was never built.
+  True N-way is v1.0's convergence engineering; see "Multi-endpoint". The port is in git history if that day comes.
 
 Explicitly **not** copied: the BEP protocol stack / TLS / device discovery / relaying / NAT traversal (going with
 ssh + SMB is a deliberate simplification), a resident daemon (it would break the core promise of "dry-run by
@@ -529,11 +529,12 @@ strategy is worth reading, but adopting it means going resident).
       (`watch_interval_secs`/`--watch`); the real remote pipeline for remote jobs in the GUI; **egui retired and deleted** (see the GUI section above)
 - **The roadmap is fully complete**. The only remaining long-range direction is version-vector P2P (see
   "Multi-endpoint" — an explicit non-goal unless direct writes bypassing the hub appear).
-  The mathematical prerequisite is in place: [src/vclock.rs](src/vclock.rs) is a complete implementation rewritten
-  from the semantics of syncthing's `lib/protocol/vector.go` (`update` monotonicity, `merge` as least upper bound,
-  and antisymmetry of the comparison relation all exhaustively verified), but **it has not taken over archive
-  attribution yet** — true N-way requires maintaining the vectors precisely after every apply and guaranteeing
-  convergence, and that is v1.0's engineering.
+  The mathematical groundwork was done and then removed: a complete version-vector implementation rewritten from
+  the semantics of syncthing's `lib/protocol/vector.go` (`update` monotonicity, `merge` as least upper bound, and
+  antisymmetry of the comparison relation all exhaustively verified) lived in `src/model/vclock.rs` through v0.9
+  without ever being wired to archive attribution. It was deleted rather than kept as scaffolding — true N-way
+  requires maintaining the vectors precisely after every apply and guaranteeing convergence, and that is v1.0's
+  engineering. Recover it from git history when that work starts.
 
 ## Build
 
