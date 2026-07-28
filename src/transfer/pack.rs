@@ -259,11 +259,10 @@ pub fn apply_pack(
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("plan hash mismatch: manifest {} vs actual {got}", manifest.plan_blake3)));
     }
 
-    // Parse the plan
-    let tmp_plan = std::env::temp_dir().join(format!("syncdash-plan-{}.jsonl", std::process::id()));
-    std::fs::write(&tmp_plan, &plan_bytes)?;
-    let plan = Plan::load(&tmp_plan)?;
-    let _ = std::fs::remove_file(&tmp_plan);
+    // Parse the plan straight from the bytes we just verified. It used to go out to a temp file
+    // named only by pid and come back through Plan::load, which meant two apply_pack calls in one
+    // process shared a path — one deleting the file the other was still reading.
+    let plan = Plan::from_reader(std::io::BufReader::new(&plan_bytes[..]))?;
 
     for op in &plan.ops {
         if !is_safe_rel(&op.path) || op.from.as_deref().map(|f| !is_safe_rel(f)).unwrap_or(false) {

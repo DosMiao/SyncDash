@@ -133,7 +133,6 @@ pub fn compare_job_with(job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::i
 /// `accept_caps` = the user consented (--accept-caps / a ticked confirmation box) to the
 /// NeedsAck lines of the capability report. Without consent a degraded run refuses to start.
 pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx, accept_caps: bool) -> std::io::Result<CompareOutcome> {
-    use crate::model::event::Phase;
     // The single pipeline handles a single target only: multi-target jobs are derived through for_target first (the CLI run loop / the desktop target picker)
     job.validate_multi_target().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     if job.targets.len() > 1 {
@@ -147,12 +146,26 @@ pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx, accep
     // errors surface here, never mid-scan.
     let sv = resolve_root(&job.source)?;
     let tv = resolve_root(&job.target)?;
+    compare_resolved(job, &sv, &tv, ctx, accept_caps)
+}
+
+/// Compare two roots that are already open. Split out from `compare_job_detailed` so the phrase
+/// layer and the comparison are separable: everything below here works on backends, not spellings,
+/// which is what lets the VFS lane be exercised against an in-memory root.
+pub fn compare_resolved(
+    job: &Job,
+    sv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    tv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    ctx: &crate::obs::progress::RunCtx,
+    accept_caps: bool,
+) -> std::io::Result<CompareOutcome> {
+    use crate::model::event::Phase;
     let mut opt = scan_opts(job);
     // P0-2: root reachability + mount-point marker. When the share isn't mounted, target is often an empty directory,
     // and comparing as usual yields a plan that either "wipes the other side" or "re-sends everything".
     let mut v = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-    crate::pipeline::guard::check_root_vfs("source", &sv, job.require_marker, &mut v);
-    crate::pipeline::guard::check_root_vfs("target", &tv, job.require_marker, &mut v);
+    crate::pipeline::guard::check_root_vfs("source", sv, job.require_marker, &mut v);
+    crate::pipeline::guard::check_root_vfs("target", tv, job.require_marker, &mut v);
     for w in &v.warnings {
         // v0.10: Log{Warn} replaces the Error{action:"warning"} hack —
         // with a real level, a warning no longer has to masquerade as an "error that doesn't count"
@@ -977,4 +990,111 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         bytes_copied: bytes_done_total,
         cancelled: ctx.ctl.cancelled(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::vfs::memory::MemVfs;
+    use crate::fs::vfs::Vfs;
+    use crate::obs::progress::RunCtx;
+    use std::sync::Arc;
+
+    fn roots() -> (Arc<dyn Vfs>, Arc<dyn Vfs>) {
+        (Arc::new(MemVfs::new("src")) as Arc<dyn Vfs>, Arc::new(MemVfs::new("tgt")) as Arc<dyn Vfs>)
+    }
+
+    /// The generic VFS lane end to end: `as_local()` is None on both sides, so this drives
+    /// `scan_vfs` rather than the walkdir fast path, then compares and plans.
+    #[test]
+    fn vfs_lane_compares_and_classifies_every_drift() {
+        let sv = MemVfs::new("cmp-src");
+        let tv = MemVfs::new("cmp-tgt");
+        // byte-identical on both sides — must produce no op at all
+        sv.seed_file("a/same.bin", 10_000, 1_000_000);
+        tv.seed_file("a/same.bin", 10_000, 1_000_000);
+        // source-only -> copy; target-only -> delete (mirror)
+        sv.seed_file("a/new.bin", 5_000, 1_000_000);
+        tv.seed_file("a/gone.bin", 7_000, 1_000_000);
+        // same path, different size -> update
+        sv.seed_file("a/changed.bin", 9_000, 2_000_000);
+        tv.seed_file("a/changed.bin", 8_000, 1_000_000);
+        // an excluded directory on both sides must be pruned AND counted
+        sv.seed_file("skipme/x.bin", 100, 0);
+        tv.seed_file("skipme/x.bin", 100, 0);
+
+        let mut j = Job::default();
+        j.mode = "mirror".into();
+        j.rigor = "standard".into();
+        j.exclude = vec!["skipme/".into()];
+        let (sv, tv) = (Arc::new(sv) as Arc<dyn Vfs>, Arc::new(tv) as Arc<dyn Vfs>);
+        let out = compare_resolved(&j, &sv, &tv, &RunCtx::null(), false).unwrap();
+
+        assert_eq!(out.source.header.excluded_dirs, 1, "a pruned subtree must be counted, never silent");
+        assert_eq!(out.target.header.excluded_dirs, 1);
+        assert!(out.source.header.vfs.is_some(), "a VFS root's snapshot must carry its self-description");
+        assert!(
+            !out.source.entries.iter().any(|e| e.path.starts_with("skipme")),
+            "pruned content must not enter the table"
+        );
+
+        let mut kinds: Vec<(String, String)> = out
+            .plan
+            .ops
+            .iter()
+            .map(|o| (format!("{:?}", o.action).to_lowercase(), o.path.clone()))
+            .collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            vec![
+                ("copy".to_string(), "a/new.bin".to_string()),
+                ("delete".to_string(), "a/gone.bin".to_string()),
+                ("update".to_string(), "a/changed.bin".to_string()),
+            ],
+            "same.bin must compare equal; the three drifts must each classify"
+        );
+    }
+
+    /// A backend that cannot serve ranged reads degrades the sampled evidence tier. That must
+    /// cost an explicit consent, and the consented degradation must ride on the snapshot.
+    #[test]
+    fn degraded_caps_demand_consent_and_land_on_the_table() {
+        let sv = MemVfs::new("ack-src");
+        let tv = MemVfs::new("ack-tgt").without(|c| c.ranged_read = crate::fs::vfs::Support::No);
+        // Big enough that the sampled tier would sample, identical on both sides
+        sv.seed_file("big.bin", 5 * 1024 * 1024, 1_000);
+        tv.seed_file("big.bin", 5 * 1024 * 1024, 1_000);
+        let mut j = Job::default();
+        j.mode = "mirror".into();
+        j.rigor = "fast".into(); // the sampled tier
+        let (sv, tv) = (Arc::new(sv) as Arc<dyn Vfs>, Arc::new(tv) as Arc<dyn Vfs>);
+
+        let e = match compare_resolved(&j, &sv, &tv, &RunCtx::null(), false) {
+            Err(e) => e,
+            Ok(_) => panic!("a degraded run must refuse without consent"),
+        };
+        assert!(e.to_string().contains("--accept-caps"), "{e}");
+
+        // With consent: BOTH sides upgrade to full — a one-sided upgrade would make the
+        // identical file look different — and the plan stays empty.
+        let out = compare_resolved(&j, &sv, &tv, &RunCtx::null(), true).unwrap();
+        assert_eq!(out.source.header.vfs.as_ref().unwrap().evidence_effective, "full");
+        assert_eq!(out.target.header.vfs.as_ref().unwrap().evidence_effective, "full");
+        assert!(
+            !out.target.header.vfs.as_ref().unwrap().degraded.is_empty(),
+            "the consented degradation must ride on the snapshot"
+        );
+        assert_eq!(out.plan.ops.len(), 0, "identical content must not produce ops after the joint upgrade");
+    }
+
+    /// An unknown scheme is a hard error at resolution, never a silent local path.
+    #[test]
+    fn resolve_refuses_an_unknown_scheme() {
+        let e = match resolve_root("sfpt://typo/data") {
+            Err(e) => e,
+            Ok(_) => panic!("an unknown scheme must not resolve"),
+        };
+        assert!(e.to_string().contains("unknown scheme"), "{e}");
+    }
 }

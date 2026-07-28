@@ -44,5 +44,12 @@ suppaftp = { version = "10", features = ["rustls-ring"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Integration tests under tests/ link the crate but resolve their own imports, so the
+# crates they touch directly have to be named again here.
+[dev-dependencies]
+tar = "0.4"
+blake3 = { version = "1", features = ["mmap", "rayon"] }
+serde_json = "1"
+
 [profile.release]
 lto = true

@@ -32,6 +32,8 @@ pub mod smb;
 
 #[cfg(test)]
 pub mod conformance;
+#[cfg(test)]
+pub mod memory;
 
 use std::path::Path;
 use std::sync::Arc;
