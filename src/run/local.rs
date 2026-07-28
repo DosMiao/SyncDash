@@ -259,8 +259,7 @@ pub fn preflight_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> 
         ops,
         Path::new(&plan.header.source_root),
         Path::new(&plan.header.target_root),
-        plan.header.source_entries,
-        plan.header.target_entries,
+        &plan.header,
         &job.guards(acknowledged),
     )
 }
@@ -353,8 +352,7 @@ use crate::obs::progress::ApplyOutcome;
         ops,
         &sv,
         &tv,
-        plan.header.source_entries,
-        plan.header.target_entries,
+        &plan.header,
         &job.guards(acknowledged),
     );
     if !verdict.report("preflight") {

@@ -171,6 +171,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The reason `scan_impl` aborts instead of counting: walkdir emits a directory before it
+    /// descends, so a directory it cannot read is already in the table with zero children — and
+    /// compare cannot tell "no children" from "children deleted". Under mirror that is a delete
+    /// for every file the other side still holds. On macOS the everyday cause is TCC, not a chmod:
+    /// ~/Desktop, ~/Documents and every external volume are gated by default.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_subdirectory_aborts_the_scan_rather_than_reading_as_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = mk_tree("denied", 3);
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("secret.txt"), b"x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // root ignores the mode bits, so the precondition would be silently absent there. Say so
+        // rather than reporting a pass that proved nothing.
+        let denied = std::fs::read_dir(&locked).is_err();
+        if denied {
+            match scan(&root, &opts()) {
+                Ok(s) => panic!(
+                    "an unreadable subtree scanned clean with {} entries — that table says the tree is empty",
+                    s.entries.len()
+                ),
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains("refusing to emit a half table"), "{msg}");
+                    assert!(msg.contains("locked"), "the refusal must name what it could not read: {msg}");
+                }
+            }
+        }
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(denied, "precondition absent: this process can read a 0o000 directory (running as root?)");
+    }
+
+    /// The other half of the same rule: a *vanished* entry is a race, not an unreadable tree, so it
+    /// stays non-fatal — but it must still reach the header, because the guards judge the plan long
+    /// after the snapshot is gone.
+    #[test]
+    fn a_clean_scan_reports_no_walk_errors() {
+        let root = mk_tree("clean", 4);
+        let snap = scan(&root, &opts()).unwrap();
+        assert_eq!(snap.header.walk_errors, 0);
+        assert!(snap.header.walk_err_samples.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn scan_ctx_cancels_midway() {
         let root = mk_tree("cancel", 50);

@@ -43,6 +43,10 @@ fn plan_of(target_root: &str, ops: Vec<Op>) -> Plan {
             target_entries: 0,
             source_excluded: 0,
             target_excluded: 0,
+            source_walk_errors: 0,
+            target_walk_errors: 0,
+            source_walk_err_samples: Vec::new(),
+            target_walk_err_samples: Vec::new(),
         },
         ops,
     }

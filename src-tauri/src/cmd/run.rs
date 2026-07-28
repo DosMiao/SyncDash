@@ -55,7 +55,19 @@ pub async fn compare_job(
         let ctx = make_ctx(&app, run_id, ctl, "compare");
         // Take over the process-level log outlet during compare too: the diagnostics in `trash`/`lock`/`scan`
         // that cannot reach a ctx go through the macro registry, and without installing here they fall back to stderr — in a windowed build that means never said.
-        let _log_guard = syncdash::obs::progress::install(ctx.sink.clone());
+        //
+        // **Layer, never replace.** `install` swaps the whole outlet, so handing it the Tauri sink
+        // bare unhooks `AppLogSink` for exactly the window in which the scan reports what it could
+        // not read — the run that most needs a durable record is the one that leaves none. Apply
+        // already gets this right through `runlog::Recorder`; `progress::current`'s own doc comment
+        // states the rule. A `None` here is a real absence (no outlet was installed at startup),
+        // not a failure to paper over.
+        let outlet: Arc<dyn syncdash::obs::progress::ProgressSink> =
+            match syncdash::obs::progress::current() {
+                Some(prev) => Arc::new(syncdash::obs::logging::MultiSink::new(vec![ctx.sink.clone(), prev])),
+                None => ctx.sink.clone(),
+            };
+        let _log_guard = syncdash::obs::progress::install(outlet);
         let t0 = std::time::Instant::now();
         let ts_ms = syncdash::foundation::time::now_ms() as i64;
         // M3: remote jobs take the remote pipeline (scanning on the remote's own disk) instead of silently falling into the local one

@@ -218,6 +218,28 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { border-color
    here instead of pushing the whole review row (and the app) wider than the window */
 .tablewrap { flex: 1; overflow: auto; min-width: 0; }
 
+/* The scan-fault banner. Deliberately in the flow above the review row rather than in the status
+   bar: the status line is overwritten by the next message, and this fact has to survive until the
+   user acts on it. It states that part of a root was not read, which makes every "missing" row in
+   the table below it unreliable — so it sits between the toolbar and the evidence it qualifies. */
+.scanfault {
+  margin: 0 12px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--c-red);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--c-red) 10%, var(--bg));
+  color: var(--text-1);
+  font-size: var(--fs-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.scanfault b { color: var(--c-red); }
+/* The samples are paths, so they wrap and scroll rather than widening the app */
+.scanfault ul { margin: 0; padding-left: 16px; max-height: 88px; overflow-y: auto; min-width: 0; }
+.scanfault li { color: var(--text-2); overflow-wrap: anywhere; }
+
 /* macOS immersive title bar: top drag strip plus room for the traffic lights */
 .dragstrip { display: none; }
 body.mac .dragstrip {

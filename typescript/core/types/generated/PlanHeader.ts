@@ -9,4 +9,16 @@ source_entries: number, target_entries: number,
  * Entries excluded by the filter on both sides (dirs + files). Exclusion must be visible: the UI uses this to spell out
  * "how much did not take part in the compare" — never a swallowed tree hiding behind "both sides match ✓".
  */
-source_excluded: number, target_excluded: number, };
+source_excluded: number, target_excluded: number, 
+/**
+ * Entries the walk could not read on each side. The sibling of `*_excluded` and the more
+ * dangerous one: an exclusion is a choice, this is a tree the scan could not see, and compare
+ * cannot tell the two apart from the entries alone — both read as "absent on this side".
+ * Carried onto the plan because preflight runs against the plan long after the snapshots are
+ * gone, and a plan that cannot say its scan was incomplete cannot be judged.
+ */
+source_walk_errors: number, target_walk_errors: number, 
+/**
+ * Sampled failures, so the refusal names what could not be read rather than only counting.
+ */
+source_walk_err_samples: Array<string>, target_walk_err_samples: Array<string>, };

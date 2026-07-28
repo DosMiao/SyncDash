@@ -24,6 +24,17 @@ pub struct Header {
     /// Files excluded by the filter
     #[serde(default)]
     pub excluded_files: u64,
+    /// Entries the walk could not read and skipped. Distinct from `excluded_*`: an exclusion is a
+    /// choice the user made, this is a tree the scan could not see. Both are equally invisible to
+    /// compare — a skipped entry reads as "absent on this side", which under mirror is a delete —
+    /// so the count has to cross the module boundary and reach the guards, not just a log line.
+    /// Only races survive to here; anything structural aborts the scan (see `scan::local`).
+    #[serde(default)]
+    pub walk_errors: u64,
+    /// Up to five sampled walk failures, so the guard's refusal can name what it could not read
+    /// instead of just counting.
+    #[serde(default)]
+    pub walk_err_samples: Vec<String>,
     /// A VFS root's self-description (None for plain local roots): protocol, display
     /// root, mtime precision, the evidence tier this scan *actually* ran, and any
     /// declared degradations — the snapshot must say for itself how its evidence was
@@ -199,6 +210,8 @@ mod tests {
             hashed: true,
             excluded_dirs: 3,
             excluded_files: 4,
+            walk_errors: 0,
+            walk_err_samples: Vec::new(),
             vfs: None,
         }
     }

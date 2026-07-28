@@ -155,12 +155,37 @@ pub(super) fn scan_impl(
                     ),
                 ));
             }
+            // Past the root the same rule holds, and for the same reason. walkdir emits a
+            // directory before it descends, so a directory it then fails to read is already in
+            // the table — with zero children. Counting and continuing leaves a structurally
+            // valid snapshot that says the subtree is empty, and mirror turns that into a delete
+            // for every file the other side still has.
+            //
+            // NotFound is the one honest exception: an entry that vanished between being listed
+            // and being read is a scan race, not an unreadable tree. Everything else — EPERM from
+            // a TCC-gated directory (~/Desktop, ~/Documents, any external volume), an ACL, a
+            // dropped mount — means a subtree exists that this scan cannot see, and a table that
+            // omits it is a table that lies. A loop error carries no io_error at all and aborts
+            // for the same reason.
             Err(e) => {
+                let kind = e.io_error().map(|io| io.kind());
+                if kind != Some(std::io::ErrorKind::NotFound) {
+                    return Err(std::io::Error::new(
+                        kind.unwrap_or(std::io::ErrorKind::Other),
+                        format!(
+                            "scan of '{}' aborted at '{}': {e} — refusing to emit a half table (its missing subtrees would read as deletions)",
+                            root.display(),
+                            // Not unwrap_or_default: an empty string reads as "the root", which is
+                            // the one place this cannot have happened. Say that the path is unknown.
+                            e.path().map(|p| p.display().to_string()).unwrap_or_else(|| "<path unavailable>".into()),
+                        ),
+                    ));
+                }
                 walk_errors += 1;
                 if walk_err_samples.len() < 5 {
                     walk_err_samples.push(format!(
                         "{}: {e}",
-                        e.path().map(|p| p.display().to_string()).unwrap_or_default()
+                        e.path().map(|p| p.display().to_string()).unwrap_or_else(|| "<path unavailable>".into())
                     ));
                 }
                 continue;
@@ -412,6 +437,8 @@ pub(super) fn scan_impl(
             hashed: opt.hash,
             excluded_dirs: excl_dirs.get(),
             excluded_files: excl_files.get(),
+            walk_errors,
+            walk_err_samples,
             vfs: None,
         },
         entries,

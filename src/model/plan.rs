@@ -93,6 +93,22 @@ pub struct PlanHeader {
     #[serde(default)]
     #[ts(type = "number")]
     pub target_excluded: u64,
+    /// Entries the walk could not read on each side. The sibling of `*_excluded` and the more
+    /// dangerous one: an exclusion is a choice, this is a tree the scan could not see, and compare
+    /// cannot tell the two apart from the entries alone — both read as "absent on this side".
+    /// Carried onto the plan because preflight runs against the plan long after the snapshots are
+    /// gone, and a plan that cannot say its scan was incomplete cannot be judged.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub source_walk_errors: u64,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub target_walk_errors: u64,
+    /// Sampled failures, so the refusal names what could not be read rather than only counting.
+    #[serde(default)]
+    pub source_walk_err_samples: Vec<String>,
+    #[serde(default)]
+    pub target_walk_err_samples: Vec<String>,
 }
 
 pub struct Plan {
@@ -149,6 +165,10 @@ mod tests {
             target_entries: 9,
             source_excluded: 2,
             target_excluded: 3,
+            source_walk_errors: 0,
+            target_walk_errors: 0,
+            source_walk_err_samples: Vec::new(),
+            target_walk_err_samples: Vec::new(),
         }
     }
 

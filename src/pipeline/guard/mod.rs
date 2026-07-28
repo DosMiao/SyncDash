@@ -12,6 +12,10 @@
 //!    syncthing has no equivalent (it syncs continuously; there is no "one big plan"), but our
 //!    explicit model suits this gate well: it also catches a wrong filter, swapped source and
 //!    target, and typo'd paths.
+//! 4. **Scan completeness** (`scan`) — refuse a plan whose scan could not read part of a root.
+//!    The other three judge the plan; this one judges the evidence underneath it, because an
+//!    entry that was never read is indistinguishable from an entry that was deleted, and the
+//!    ratio gate only notices when the unread part is most of the root.
 //!
 //! `caps` is the fourth thing this module does, and the one the header used to leave out: the
 //! capability report listing every gap between what a job asks for and what the two backends can
@@ -23,15 +27,17 @@ pub mod caps;
 pub mod marker;
 pub mod ratio;
 pub mod roots;
+pub mod scan;
 pub mod space;
 pub mod stats;
 
 use std::path::Path;
 
-use crate::model::plan::Op;
+use crate::model::plan::{Op, PlanHeader};
 
 use ratio::check_delete_ratio;
 use roots::{check_root, check_root_vfs};
+use scan::check_scan_complete;
 use space::{check_space, check_space_vfs};
 use stats::stat_plan;
 
@@ -81,8 +87,7 @@ pub fn run_all_vfs(
     ops: &[Op],
     source: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     target: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
-    source_entries: u64,
-    target_entries: u64,
+    head: &PlanHeader,
     g: &Guards,
 ) -> Verdict {
     let mut v = Verdict { blockers: Vec::new(), warnings: Vec::new() };
@@ -91,20 +96,24 @@ pub fn run_all_vfs(
     if !v.ok() {
         return v; // with a root unavailable, the later checks are meaningless
     }
+    check_scan_complete("source", head.source_walk_errors, &head.source_walk_err_samples, g, &mut v);
+    check_scan_complete("target", head.target_walk_errors, &head.target_walk_err_samples, g, &mut v);
     let st = stat_plan(ops);
     check_space_vfs("target", target, st.target.write_bytes, g.min_free_pct, &mut v);
     check_space_vfs("source", source, st.source.write_bytes, g.min_free_pct, &mut v);
-    check_delete_ratio("target", &st.target, target_entries, g, &mut v);
-    check_delete_ratio("source", &st.source, source_entries, g, &mut v);
+    check_delete_ratio("target", &st.target, head.target_entries, g, &mut v);
+    check_delete_ratio("source", &st.source, head.source_entries, g, &mut v);
     v
 }
 
+/// The plan header carries every number the gates judge — entry counts, exclusions, walk errors —
+/// so it is passed whole rather than unpacked at the call site. Two `u64` parameters in a row is
+/// exactly the shape that lets source and target be handed over swapped.
 pub fn run_all(
     ops: &[Op],
     source_root: &Path,
     target_root: &Path,
-    source_entries: u64,
-    target_entries: u64,
+    head: &PlanHeader,
     g: &Guards,
 ) -> Verdict {
     let mut v = Verdict { blockers: Vec::new(), warnings: Vec::new() };
@@ -113,10 +122,12 @@ pub fn run_all(
     if !v.ok() {
         return v; // with a root unavailable, the later checks are meaningless
     }
+    check_scan_complete("source", head.source_walk_errors, &head.source_walk_err_samples, g, &mut v);
+    check_scan_complete("target", head.target_walk_errors, &head.target_walk_err_samples, g, &mut v);
     let st = stat_plan(ops);
     check_space("target", target_root, st.target.write_bytes, g.min_free_pct, &mut v);
     check_space("source", source_root, st.source.write_bytes, g.min_free_pct, &mut v);
-    check_delete_ratio("target", &st.target, target_entries, g, &mut v);
-    check_delete_ratio("source", &st.source, source_entries, g, &mut v);
+    check_delete_ratio("target", &st.target, head.target_entries, g, &mut v);
+    check_delete_ratio("source", &st.source, head.source_entries, g, &mut v);
     v
 }

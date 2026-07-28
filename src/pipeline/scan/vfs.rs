@@ -242,6 +242,8 @@ pub(super) fn scan_vfs(
             hashed: opt.hash,
             excluded_dirs: excl_dirs,
             excluded_files: excl_files,
+            walk_errors,
+            walk_err_samples,
             vfs: Some(super::vfs_note(vfs.as_ref(), opt, sampled)),
         },
         entries,
