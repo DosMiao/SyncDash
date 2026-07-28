@@ -87,16 +87,6 @@ pub struct Entry {
 /// refreshed the archive" case and costs only a few dozen extra bytes per entry.
 pub const ARCHIVE_GENERATIONS: usize = 3;
 
-impl Entry {
-    /// Whether the current content equals **any generation this entry has recorded**
-    pub fn matches_any_generation(&self, hash: &str) -> bool {
-        if self.hash.as_deref() == Some(hash) {
-            return true;
-        }
-        self.prev.as_ref().map(|v| v.iter().any(|h| h == hash)).unwrap_or(false)
-    }
-}
-
 /// Roll a new archive generation: push the old archive's hash for the same path onto the `prev` chain.
 /// `fresh` is the freshly scanned snapshot (rewritten in place); `old` is the previous archive.
 pub fn roll_generations(fresh: &mut [Entry], old: &[Entry]) {

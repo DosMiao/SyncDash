@@ -11,7 +11,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::foundation::names::{TEMP_LIFETIME_MS, TEMP_PREFIX};
+use crate::foundation::names::TEMP_PREFIX;
 
 /// Whether a file name (no directory part) is one of our temp files
 pub fn is_temp_name(file_name: &str) -> bool {
@@ -138,32 +138,6 @@ impl Drop for Staged {
             let _ = std::fs::remove_file(&self.tmp);
         }
     }
-}
-
-/// Clean up over-age leftover temp files under root. Returns how many were deleted.
-/// Only call this inside an explicit write flow (scan does not by default, to avoid writing to a read-only mount by accident).
-pub fn sweep_stale_temps(root: &Path, now_ms: i64) -> u64 {
-    let mut n = 0u64;
-    let walker = walkdir::WalkDir::new(root).follow_links(false).into_iter();
-    for item in walker.flatten() {
-        if !item.file_type().is_file() {
-            continue;
-        }
-        let name = item.file_name().to_string_lossy();
-        if !is_temp_name(&name) {
-            continue;
-        }
-        let age_ok = item
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .map(|t| now_ms - crate::foundation::time::systime_ms(t) > TEMP_LIFETIME_MS)
-            .unwrap_or(false);
-        if age_ok && std::fs::remove_file(item.path()).is_ok() {
-            n += 1;
-        }
-    }
-    n
 }
 
 #[cfg(test)]

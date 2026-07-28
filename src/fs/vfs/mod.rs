@@ -25,7 +25,6 @@ pub mod error;
 pub mod spec;
 
 pub mod cred;
-pub mod fake;
 pub mod ftp;
 pub mod local;
 pub mod sftp;
@@ -37,10 +36,9 @@ pub mod conformance;
 use std::path::Path;
 use std::sync::Arc;
 
-pub use error::{as_vfs_error, VfsError, VfsErrorKind, VfsResult};
-pub use spec::{RemoteSpec, RootSpec};
-
-pub use crate::model::table::EntryKind;
+use crate::model::table::EntryKind;
+use error::{VfsError, VfsErrorKind, VfsResult};
+use spec::{RemoteSpec, RootSpec};
 
 /// A live probe result. `model::table::Entry` is the *table* format; `VMeta` is what
 /// the filesystem said just now.
@@ -308,30 +306,12 @@ pub trait CredentialProvider: Send + Sync {
     fn credentials_for(&self, spec: &RemoteSpec) -> VfsResult<Credentials>;
 }
 
-/// Headless default: only what the phrase itself carries (keyfile path, agent flag).
-/// Never invents or prompts; backends that then still need a secret raise `Auth`
-/// naming `syncdash cred set "<phrase>"` as the fix.
-pub struct NoPrompt;
-
-impl CredentialProvider for NoPrompt {
-    fn credentials_for(&self, spec: &RemoteSpec) -> VfsResult<Credentials> {
-        Ok(Credentials {
-            password: None,
-            keyfile: spec.opt("key").map(std::path::PathBuf::from),
-            passphrase: None,
-            use_agent: spec.has_flag("agent"),
-            anonymous: spec.user.as_deref() == Some("anonymous"),
-        })
-    }
-}
-
-/// Route a root phrase to a live backend. Local, fake and smb roots resolve today;
+/// Route a root phrase to a live backend. Local and smb roots resolve today;
 /// sftp/ftp land in their milestones and report `Unsupported` (with the plan spelled
 /// out) until then — never a silent local fallback.
 pub fn open(phrase: &str, creds: &Arc<dyn CredentialProvider>) -> VfsResult<Arc<dyn Vfs>> {
     match spec::parse(phrase) {
         RootSpec::Local(p) => Ok(Arc::new(local::LocalVfs::new(p))),
-        RootSpec::Fake(raw) => Ok(Arc::new(fake::FakeVfs::from_phrase(&raw)?)),
         RootSpec::Remote(r) if r.scheme == "smb" => {
             Ok(Arc::new(smb::SmbBackend::new(r, creds.clone())?))
         }

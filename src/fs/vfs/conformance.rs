@@ -1,13 +1,13 @@
-//! The backend contract as executable checks. Every `Vfs` implementation — local,
-//! fake, and each protocol backend to come — runs this same suite; passing it is
-//! the admission ticket. Seeding happens *through the write API itself*, so the
-//! suite needs nothing but a factory producing fresh empty roots.
+//! The backend contract as executable checks. Every `Vfs` implementation runs this
+//! same suite; passing it is the admission ticket. Seeding happens *through the write
+//! API itself*, so the suite needs nothing but a factory producing fresh empty roots.
 
 use std::io::Read;
 use std::sync::Arc;
 
+use crate::model::table::EntryKind;
 use super::error::VfsErrorKind;
-use super::{EntryKind, Support, Vfs, WriteHint};
+use super::{Support, Vfs, WriteHint};
 use crate::foundation::names::TEMP_PREFIX;
 
 /// Run the whole contract. `mk` must return a **fresh, empty** root each call.
@@ -204,7 +204,6 @@ fn staged_read_back_returns_written_bytes(v: Arc<dyn Vfs>) {
 #[cfg(test)]
 mod suite {
     use super::*;
-    use crate::fs::vfs::fake::FakeVfs;
     use crate::fs::vfs::local::LocalVfs;
 
     #[test]
@@ -222,43 +221,5 @@ mod suite {
         for d in dirs {
             let _ = std::fs::remove_dir_all(&d);
         }
-    }
-
-    #[test]
-    fn fake_backend_conforms() {
-        // The registry maps one phrase to one shared tree, so each sub-test's fresh
-        // empty root needs a fresh phrase
-        let mut n = 0;
-        run_all(&mut || {
-            n += 1;
-            Arc::new(FakeVfs::from_phrase(&format!("fake://conformance-{n}")).unwrap()) as Arc<dyn Vfs>
-        });
-    }
-
-    #[test]
-    fn fake_backend_conforms_with_sftp_shaped_knobs() {
-        // rename refuses overwrite, second-granular mtimes — the SFTP profile
-        let mut n = 0;
-        run_all(&mut || {
-            n += 1;
-            Arc::new(
-                FakeVfs::from_phrase(&format!("fake://sftpish-{n}?no_rename_overwrite&precision_ms=1000")).unwrap(),
-            ) as Arc<dyn Vfs>
-        });
-    }
-
-    #[test]
-    fn fake_backend_conforms_with_ftp_shaped_knobs() {
-        // no ranged reads, no mtime setting, no symlinks, no read-back, minute mtimes — the LIST-only FTP profile
-        let mut n = 0;
-        run_all(&mut || {
-            n += 1;
-            Arc::new(
-                FakeVfs::from_phrase(&format!(
-                    "fake://ftpish-{n}?no_ranged_read&no_set_mtime&no_symlink&no_read_back&no_fsync&no_unix_mode&precision_ms=60000"
-                ))
-                .unwrap(),
-            ) as Arc<dyn Vfs>
-        });
     }
 }

@@ -27,8 +27,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::foundation::names::{
-    RUNLOG_INDEX_FILE as INDEX_FILE, RUNLOG_PLAN_FILE as PLAN_FILE,
-    RUNLOG_SUMMARY_FILE as SUMMARY_FILE,
+    RUNLOG_ERRORS_FILE, RUNLOG_INDEX_FILE as INDEX_FILE, RUNLOG_ITEMS_FILE,
+    RUNLOG_PLAN_FILE as PLAN_FILE, RUNLOG_RUN_FILE, RUNLOG_SUMMARY_FILE as SUMMARY_FILE,
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
@@ -95,29 +95,6 @@ fn safe_component(s: &str) -> bool {
 }
 
 
-/// unix ms → `YYYYMMDD-HHMMSS` (UTC). Directory names have to sort, and that is not worth a chrono/time dependency.
-/// Rendering local time is the frontend's job (`main.ts` already has `relTime`); the data always carries `ts_ms`.
-fn stamp(ms: i64) -> String {
-    let secs = ms.div_euclid(1000);
-    let sod = secs.rem_euclid(86_400);
-    let (h, mi, s) = (sod / 3600, (sod % 3600) / 60, sod % 60);
-    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
-    format!("{y:04}{m:02}{d:02}-{h:02}{mi:02}{s:02}")
-}
-
-/// days since 1970-01-01 → (year, month, day). Howard Hinnant's `civil_from_days`.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
 
 
 /// Tallies the makeup of the error detail in passing — the source of summary's "3 warnings, 2 errors".
@@ -164,7 +141,7 @@ impl Recorder {
     pub fn start(name: &str, kind: &str, base: &RunCtx, ops: &[Op]) -> Recorder {
         let cfg = crate::store::settings::load();
         let ts_ms = crate::foundation::time::now_ms() as i64;
-        let run_id = format!("{}-{}-{}", stamp(ts_ms), sanitize(name), sanitize(kind));
+        let run_id = format!("{}-{}-{}", crate::foundation::time::stamp_compact(ts_ms), sanitize(name), sanitize(kind));
         let dir = cfg.resolved_log_dir().join(&run_id);
         let tally = Arc::new(Tally::default());
 
@@ -392,9 +369,9 @@ pub fn artifact_lines(run_id: &str, which: &str, max: usize) -> Vec<String> {
         return Vec::new();
     }
     let file = match which {
-        "run" => FileSink::RUN,
-        "errors" => FileSink::ERRORS,
-        "items" => FileSink::ITEMS,
+        "run" => RUNLOG_RUN_FILE,
+        "errors" => RUNLOG_ERRORS_FILE,
+        "items" => RUNLOG_ITEMS_FILE,
         "plan" => PLAN_FILE,
         "summary" => SUMMARY_FILE,
         _ => return Vec::new(),
@@ -585,16 +562,16 @@ mod tests {
 
     #[test]
     fn stamp_matches_known_unix_times() {
-        assert_eq!(stamp(0), "19700101-000000");
-        assert_eq!(stamp(946_684_800_000), "20000101-000000"); // 2000-01-01T00:00:00Z
-        assert_eq!(stamp(1_000_000_000_000), "20010909-014640"); // the classic billionth second
-        assert_eq!(stamp(1_709_164_800_000), "20240229-000000"); // leap day
+        assert_eq!(crate::foundation::time::stamp_compact(0), "19700101-000000");
+        assert_eq!(crate::foundation::time::stamp_compact(946_684_800_000), "20000101-000000"); // 2000-01-01T00:00:00Z
+        assert_eq!(crate::foundation::time::stamp_compact(1_000_000_000_000), "20010909-014640"); // the classic billionth second
+        assert_eq!(crate::foundation::time::stamp_compact(1_709_164_800_000), "20240229-000000"); // leap day
     }
 
     #[test]
     fn stamps_sort_chronologically() {
         // Directory names must sort lexicographically as they stand — the entire reason for not pulling in chrono
-        let mut v = vec![stamp(1_000_000_000_000), stamp(0), stamp(946_684_800_000)];
+        let mut v = vec![crate::foundation::time::stamp_compact(1_000_000_000_000), crate::foundation::time::stamp_compact(0), crate::foundation::time::stamp_compact(946_684_800_000)];
         v.sort();
         assert_eq!(v, vec!["19700101-000000", "20000101-000000", "20010909-014640"]);
     }
