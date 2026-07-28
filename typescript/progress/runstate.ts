@@ -4,9 +4,13 @@
 // and the sample series reaches thousands of entries. The window re-renders on its own cadence (500 ms
 // for the readouts, 100 ms for the graphs), which is where FFS puts the throttle.
 
-export type PhaseName =
-  | 'scan-source' | 'scan-target' | 'compare' | 'apply'
-  | 'pack' | 'ship' | 'verify' | 'refresh';
+import type { LogLevel } from '../core/types/generated/LogLevel';
+import type { Phase } from '../core/types/generated/Phase';
+import type { ProgressEvent } from '../core/types/generated/ProgressEvent';
+
+/// The engine's phase names, not a copy of them. A phase added in Rust becomes a missing key in
+/// PHASE_LABEL below — a compile error, rather than a blank cell at runtime.
+export type PhaseName = Phase;
 
 export const PHASE_LABEL: Record<PhaseName, string> = {
   'scan-source': 'Scan source',
@@ -19,19 +23,25 @@ export const PHASE_LABEL: Record<PhaseName, string> = {
   'refresh': 'Refresh archive',
 };
 
+/// The `run-progress` payload: the engine's `ProgressEvent` plus the two fields the Tauri shell
+/// wraps it in. Every field below is optional because the arms of that union are read structurally
+/// here rather than narrowed on `kind` — but the *names and spellings* come from the generated
+/// type, so a renamed or removed variant is a compile error rather than a blank readout.
+export type EventKind = ProgressEvent['kind'];
+
 export interface RunEv {
   run_id: number;
   /// "compare" | "apply" — this window only accepts apply (compare progress is shown inline in the main
   /// window; without the filter, the automatic re-check compare after a sync would hijack the result
   /// window into a forever-spinning "comparing")
   purpose?: string;
-  kind: 'phase_start' | 'totals' | 'progress' | 'error' | 'log' | 'item_result' | 'paused' | 'resumed' | 'summary';
-  /// kind='log' only: info | warn | error
-  level?: 'info' | 'warn' | 'error';
+  kind: EventKind;
+  /// kind='log' only
+  level?: LogLevel;
   /// kind='log' only: module name (run / pack / lock…)
   scope?: string;
   ts_ms: number;
-  phase?: PhaseName;
+  phase?: Phase;
   label?: string | null;
   items_total?: number;
   bytes_total?: number;

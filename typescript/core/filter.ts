@@ -3,8 +3,8 @@
 // FFS semantics, carried over verbatim: **the view is the action set** — a row hidden by any of these
 // filters does not run. That is why this lives in one place and why finalIdx() below intersects with it.
 
-import { category, eff, rowMtime, rowSize, sortVal } from './plan';
-import type { Chip, PlanDto, Sort } from './plan';
+import { category, eff, rowMtime, rowSize } from './plan';
+import type { Chip, PlanDto } from './plan';
 
 /// P3 funnel: a view filter over the **current compare result** (no rescan).
 /// Mask matching goes back to Rust (filter::mask_hits); size/age are plain numbers and stay in the frontend.
@@ -21,7 +21,6 @@ export interface VisibleInput {
   vfilter: ViewFilter;
   /// Per-op "hit by a mask" result from Rust; an empty array means "no mask filtering"
   maskHit: boolean[];
-  sort: Sort | null;
 }
 
 export function funnelActive(v: ViewFilter): number {
@@ -43,9 +42,11 @@ function matchesOv(path: string, ovFilter: string | null): boolean {
   return path === ovFilter || path.startsWith(ovFilter + '/');
 }
 
-/// The visible index list, in display order. One full-table scan plus an optional sort; callers memoize it.
+/// The visible index list, in **plan order** — membership only. Display order (sorting, and the
+/// directory grouping that has to agree with it) belongs to core/grouping.ts, so that the two cannot
+/// contradict each other. One full-table scan; callers memoize it.
 export function computeVisible(inp: VisibleInput): number[] {
-  const { plan, flipped, chips, ovFilter, vfilter, maskHit, sort } = inp;
+  const { plan, flipped, chips, ovFilter, vfilter, maskHit } = inp;
   const n = plan.ops.length;
   const q = inp.search.toLowerCase();
   const MB = 1024 * 1024;
@@ -70,20 +71,6 @@ export function computeVisible(inp: VisibleInput): number[] {
     }
     out.push(i);
   }
-
-  if (sort) {
-    const { key, dir } = sort;
-    // Precompute the sort keys once: the comparator runs n·log n times, and computing keys inside it
-    // means hundreds of thousands of eff()/metaOf() calls plus string allocations
-    const miss = new Int8Array(n), num = new Float64Array(n);
-    const str: string[] = new Array(n);
-    for (const i of out) { const [a, b, c] = sortVal(plan, flipped, i, key); miss[i] = a; num[i] = b; str[i] = c; }
-    out.sort((a, b) =>
-      (miss[a] - miss[b])                                            // missing always last, direction never flips it
-      || (num[a] - num[b]) * dir
-      || (str[a] < str[b] ? -dir : str[a] > str[b] ? dir : 0)
-      || a - b);                                                     // ties keep the plan's original order
-  }
   return out;
 }
 
@@ -91,9 +78,11 @@ export function computeVisible(inp: VisibleInput): number[] {
 /// This also closes a quiet hole in the pre-v0.9 behavior, where filtering with the search box still let
 /// hidden rows ride along on Synchronize.
 ///
-/// Returned in **plan order**, never in the view's sort order: this list is what apply_job executes, and
-/// the plan's order is the engine's order (a directory delete has to follow the children inside it).
-/// The CSV export deliberately uses the visible order instead — that one is a snapshot of the view.
+/// Returned in **plan order**, never in the view's display order: this list is what apply_job
+/// executes, and the plan's order is the engine's order (a directory delete has to follow the
+/// children inside it). Never hand it a PlanLayout's `order` — that one is core/grouping.ts's answer
+/// to "what should the screen look like", which is a different question. The CSV export deliberately
+/// does use the display order — that one is a snapshot of the view.
 export function finalIdx(visible: number[], checked: boolean[]): number[] {
   const vis = new Set(visible);
   const out: number[] = [];
