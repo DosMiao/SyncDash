@@ -47,6 +47,10 @@ fn plan_of(target_root: &str, ops: Vec<Op>) -> Plan {
             target_walk_errors: 0,
             source_walk_err_samples: Vec::new(),
             target_walk_err_samples: Vec::new(),
+            source_icloud_stubs: 0,
+            target_icloud_stubs: 0,
+            source_icloud_stub_samples: Vec::new(),
+            target_icloud_stub_samples: Vec::new(),
         },
         ops,
     }

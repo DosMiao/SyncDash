@@ -217,6 +217,27 @@ mod tests {
         let snap = scan(&root, &opts()).unwrap();
         assert_eq!(snap.header.walk_errors, 0);
         assert!(snap.header.walk_err_samples.is_empty());
+        assert_eq!(snap.header.icloud_stubs, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An evicted iCloud file leaves a `.<name>.icloud` plist where the real name was. Nothing in
+    /// the entry itself says "placeholder" — it is a small real file — so without this the snapshot
+    /// records the stub and records the original as absent, and mirror deletes the real copy on the
+    /// other side. Name-shaped, hence testable off macOS too.
+    #[test]
+    fn an_icloud_placeholder_is_counted_and_sampled() {
+        let root = mk_tree("icloud", 1);
+        std::fs::write(root.join("sub").join(".Report.pdf.icloud"), b"<plist/>").unwrap();
+        // A dotfile that merely ends in .icloud-ish text must not trip it
+        std::fs::write(root.join("sub").join("notes.icloud.txt"), b"x").unwrap();
+        let snap = scan(&root, &opts()).unwrap();
+        assert_eq!(snap.header.icloud_stubs, 1, "exactly the placeholder, not its neighbour");
+        assert!(
+            snap.header.icloud_stub_samples.iter().any(|s| s.ends_with(".Report.pdf.icloud")),
+            "the sample must name the placeholder: {:?}",
+            snap.header.icloud_stub_samples
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -35,6 +35,18 @@ pub struct Header {
     /// instead of just counting.
     #[serde(default)]
     pub walk_err_samples: Vec<String>,
+    /// `.<name>.icloud` placeholders: the file's contents are not on this disk and its real name is
+    /// not in this table. Syncing one copies a few hundred bytes of plist over the real file on the
+    /// other side, so this blocks rather than warns.
+    #[serde(default)]
+    pub icloud_stubs: u64,
+    #[serde(default)]
+    pub icloud_stub_samples: Vec<String>,
+    /// Files evicted in place (macOS `SF_DATALESS`). Unlike a stub these still carry the true name,
+    /// size and mtime, so nothing is lost — but reading one downloads it, which is worth saying
+    /// before a full-rigor scan hydrates an entire library.
+    #[serde(default)]
+    pub dataless_files: u64,
     /// A VFS root's self-description (None for plain local roots): protocol, display
     /// root, mtime precision, the evidence tier this scan *actually* ran, and any
     /// declared degradations — the snapshot must say for itself how its evidence was
@@ -212,6 +224,9 @@ mod tests {
             excluded_files: 4,
             walk_errors: 0,
             walk_err_samples: Vec::new(),
+            icloud_stubs: 0,
+            icloud_stub_samples: Vec::new(),
+            dataless_files: 0,
             vfs: None,
         }
     }

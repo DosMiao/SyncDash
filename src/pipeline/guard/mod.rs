@@ -37,7 +37,7 @@ use crate::model::plan::{Op, PlanHeader};
 
 use ratio::check_delete_ratio;
 use roots::{check_root, check_root_vfs};
-use scan::check_scan_complete;
+use scan::{check_materialized, check_scan_complete};
 use space::{check_space, check_space_vfs};
 use stats::stat_plan;
 
@@ -98,6 +98,8 @@ pub fn run_all_vfs(
     }
     check_scan_complete("source", head.source_walk_errors, &head.source_walk_err_samples, g, &mut v);
     check_scan_complete("target", head.target_walk_errors, &head.target_walk_err_samples, g, &mut v);
+    check_materialized("source", head.source_icloud_stubs, &head.source_icloud_stub_samples, g, &mut v);
+    check_materialized("target", head.target_icloud_stubs, &head.target_icloud_stub_samples, g, &mut v);
     let st = stat_plan(ops);
     check_space_vfs("target", target, st.target.write_bytes, g.min_free_pct, &mut v);
     check_space_vfs("source", source, st.source.write_bytes, g.min_free_pct, &mut v);
@@ -124,6 +126,8 @@ pub fn run_all(
     }
     check_scan_complete("source", head.source_walk_errors, &head.source_walk_err_samples, g, &mut v);
     check_scan_complete("target", head.target_walk_errors, &head.target_walk_err_samples, g, &mut v);
+    check_materialized("source", head.source_icloud_stubs, &head.source_icloud_stub_samples, g, &mut v);
+    check_materialized("target", head.target_icloud_stubs, &head.target_icloud_stub_samples, g, &mut v);
     let st = stat_plan(ops);
     check_space("target", target_root, st.target.write_bytes, g.min_free_pct, &mut v);
     check_space("source", source_root, st.source.write_bytes, g.min_free_pct, &mut v);

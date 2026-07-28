@@ -109,6 +109,18 @@ pub struct PlanHeader {
     pub source_walk_err_samples: Vec<String>,
     #[serde(default)]
     pub target_walk_err_samples: Vec<String>,
+    /// iCloud placeholders seen on each side. Carried for the same reason as the walk errors: the
+    /// gate runs against the plan, and by then the snapshots are gone.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub source_icloud_stubs: u64,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub target_icloud_stubs: u64,
+    #[serde(default)]
+    pub source_icloud_stub_samples: Vec<String>,
+    #[serde(default)]
+    pub target_icloud_stub_samples: Vec<String>,
 }
 
 pub struct Plan {
@@ -169,6 +181,10 @@ mod tests {
             target_walk_errors: 0,
             source_walk_err_samples: Vec::new(),
             target_walk_err_samples: Vec::new(),
+            source_icloud_stubs: 0,
+            target_icloud_stubs: 0,
+            source_icloud_stub_samples: Vec::new(),
+            target_icloud_stub_samples: Vec::new(),
         }
     }
 

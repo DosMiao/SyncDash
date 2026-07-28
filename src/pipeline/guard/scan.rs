@@ -41,9 +41,66 @@ pub fn check_scan_complete(
     }
 }
 
+/// Refuse a plan built over iCloud placeholders.
+///
+/// A `.<name>.icloud` stub is not a damaged file, it is a *different* file: a few hundred bytes of
+/// plist standing where the real one was. The scan cannot see the original, so mirror reads it as
+/// deleted and plans a copy of the stub plus a delete of the real copy on the other side. The
+/// original survives in the trash store until it is pruned, and every counter still reports success.
+///
+/// Excluding the stub does not help and is worth saying out loud, because it is the obvious move:
+/// the delete is driven by the absence of the real name, so hiding the stub only removes the hint.
+pub fn check_materialized(
+    label: &str,
+    stubs: u64,
+    samples: &[String],
+    g: &Guards,
+    v: &mut Verdict,
+) {
+    if stubs == 0 {
+        return;
+    }
+    let named = if samples.is_empty() {
+        String::new()
+    } else {
+        format!(" For example: {}.", samples.join(" | "))
+    };
+    let msg = format!(
+        "{label}: {stubs} file(s) are iCloud placeholders — their contents are not on this disk, \
+         and their real names are absent from this side's table.{named} Synchronizing would copy \
+         the placeholder over the real file on the other side and delete the original. Excluding \
+         them does not help: the delete comes from the missing name, not from the placeholder."
+    );
+    if g.acknowledged {
+        v.warnings.push(format!("{msg} (allowed by --i-know)"));
+    } else {
+        v.blockers.push(format!(
+            "{msg} Download them first (Finder, or `brctl download <path>`), or exclude the whole tree."
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeholders_block_and_say_why_excluding_them_will_not_help() {
+        let mut v = Verdict { blockers: vec![], warnings: vec![] };
+        let s = ["Docs/.Report.pdf.icloud".to_string()];
+        check_materialized("source", 1, &s, &Guards::default(), &mut v);
+        assert_eq!(v.blockers.len(), 1);
+        assert!(v.blockers[0].contains("Docs/.Report.pdf.icloud"));
+        // The remedy has to be in the message: the obvious move (exclude it) is the wrong one.
+        assert!(v.blockers[0].contains("Excluding them does not help"));
+    }
+
+    #[test]
+    fn a_materialized_tree_says_nothing() {
+        let mut v = Verdict { blockers: vec![], warnings: vec![] };
+        check_materialized("source", 0, &[], &Guards::default(), &mut v);
+        assert!(v.ok() && v.warnings.is_empty());
+    }
 
     #[test]
     fn a_complete_scan_says_nothing() {

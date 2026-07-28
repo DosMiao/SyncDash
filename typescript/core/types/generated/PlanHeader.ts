@@ -21,4 +21,9 @@ source_walk_errors: number, target_walk_errors: number,
 /**
  * Sampled failures, so the refusal names what could not be read rather than only counting.
  */
-source_walk_err_samples: Array<string>, target_walk_err_samples: Array<string>, };
+source_walk_err_samples: Array<string>, target_walk_err_samples: Array<string>, 
+/**
+ * iCloud placeholders seen on each side. Carried for the same reason as the walk errors: the
+ * gate runs against the plan, and by then the snapshots are gone.
+ */
+source_icloud_stubs: number, target_icloud_stubs: number, source_icloud_stub_samples: Array<string>, target_icloud_stub_samples: Array<string>, };

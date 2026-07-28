@@ -34,6 +34,35 @@ fn unix_mode(_md: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
+/// macOS marks a file whose contents have been evicted to iCloud but whose name, size and mtime
+/// remain. Reading one hydrates it — a full-rigor scan of a photo library would pull every byte
+/// back down. Not a correctness problem (the bytes that arrive are the right bytes), which is why
+/// it is reported and not refused.
+#[cfg(target_os = "macos")]
+fn is_dataless(md: &std::fs::Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    const SF_DATALESS: u32 = 0x4000_0000; // sys/stat.h: "file is dataless object"
+    md.st_flags() & SF_DATALESS != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_dataless(_md: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// The *other* iCloud eviction shape, and the dangerous one. When a file is evicted the real name
+/// can disappear entirely and be replaced by a `.<name>.icloud` sidecar — a few hundred bytes of
+/// plist. Nothing about that entry says "placeholder": it is a real file with a real size, so the
+/// snapshot records the stub and records the original as *absent*. Against a backup that still
+/// holds the original, mirror then plans a copy of the stub and a delete of the real file.
+///
+/// Matched on the name alone. Looking for the missing sibling would be the obvious test and it
+/// cannot be done here: the walk is streaming, so the directory's full name set does not exist yet
+/// at the moment this entry is judged.
+fn is_icloud_stub(name: &str) -> bool {
+    name.starts_with('.') && name.ends_with(".icloud") && name.len() > ".icloud".len() + 1
+}
+
 fn mtime_ms(md: &std::fs::Metadata) -> i64 {
     md.modified()
         .ok()
@@ -87,6 +116,11 @@ pub(super) fn scan_impl(
     // (a skipped entry is equivalent to "absent on this side" during compare —— an invisible fault that can produce a catastrophic plan)
     let mut walk_errors = 0u64;
     let mut walk_err_samples: Vec<String> = Vec::new();
+    // iCloud eviction, counted separately from walk errors because the remedy is different:
+    // `brctl download` or an exclusion, not a permission.
+    let mut icloud_stubs = 0u64;
+    let mut icloud_stub_samples: Vec<String> = Vec::new();
+    let mut dataless_files = 0u64;
 
     // Exclusions must be visible: pruned directories/files are counted into the snapshot header so the UI can state "this much never took part in the comparison".
     // (Lesson learned: the default exclusions silently swallowed .git while the UI still said "both sides identical ✓" —— never again)
@@ -235,6 +269,18 @@ pub(super) fn scan_impl(
                 entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None, link: target, prev: None });
             }
         } else {
+            // Both iCloud eviction shapes, judged before the entry is recorded. Neither is an
+            // exclusion and neither can be fixed by one: the stub's danger comes from the *absence*
+            // of the real name, and excluding the stub only removes the visible hint while leaving
+            // the delete in place.
+            if is_icloud_stub(crate::foundation::path::base_name(&rel)) {
+                icloud_stubs += 1;
+                if icloud_stub_samples.len() < 5 {
+                    icloud_stub_samples.push(rel.clone());
+                }
+            } else if is_dataless(&md) {
+                dataless_files += 1;
+            }
             let size = md.len();
             // P1-4: the filesystem once stored a different value than the mtime we asked for (FAT's 2-second granularity
             // / SMB truncation); convert it back to what we meant so compare need not lean on a tolerance
@@ -439,6 +485,9 @@ pub(super) fn scan_impl(
             excluded_files: excl_files.get(),
             walk_errors,
             walk_err_samples,
+            icloud_stubs,
+            icloud_stub_samples,
+            dataless_files,
             vfs: None,
         },
         entries,

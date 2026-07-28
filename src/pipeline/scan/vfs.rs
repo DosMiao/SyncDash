@@ -244,6 +244,12 @@ pub(super) fn scan_vfs(
             excluded_files: excl_files,
             walk_errors,
             walk_err_samples,
+            // iCloud eviction is a property of a local macOS filesystem. A root reached over
+            // sftp/smb/ftp has no such state to report, and inventing a zero that means "checked
+            // and found none" would be a different claim from "not applicable here".
+            icloud_stubs: 0,
+            icloud_stub_samples: Vec::new(),
+            dataless_files: 0,
             vfs: Some(super::vfs_note(vfs.as_ref(), opt, sampled)),
         },
         entries,

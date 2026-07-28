@@ -118,6 +118,8 @@ use syncdash::pipeline::compare::evidence::SideMeta;
             source_excluded: 0, target_excluded: 0,
             source_walk_errors: 0, target_walk_errors: 0,
             source_walk_err_samples: Vec::new(), target_walk_err_samples: Vec::new(),
+            source_icloud_stubs: 0, target_icloud_stubs: 0,
+            source_icloud_stub_samples: Vec::new(), target_icloud_stub_samples: Vec::new(),
         };
         let ops = vec![Op {
             side: Side::Target,
@@ -160,6 +162,8 @@ use syncdash::pipeline::compare::evidence::SideMeta;
             source_excluded: 0, target_excluded: 0,
             source_walk_errors: 0, target_walk_errors: 0,
             source_walk_err_samples: Vec::new(), target_walk_err_samples: Vec::new(),
+            source_icloud_stubs: 0, target_icloud_stubs: 0,
+            source_icloud_stub_samples: Vec::new(), target_icloud_stub_samples: Vec::new(),
         };
         export_csv(out.display().to_string(), h2, ops2, one_sided, vec![false]).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
