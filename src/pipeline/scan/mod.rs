@@ -1,7 +1,7 @@
 //! scan: walk a root and produce a snapshot table — the first of the three stages.
 //!
 //! Two lanes behind one entry point. `scan_root` asks the backend for `as_local()`: a real
-//! directory takes `local`, the walkdir + rayon + mmap fast path; anything else takes `vfs`,
+//! directory takes `local`, the walkdir + rayon fast path; anything else takes `vfs`,
 //! the generic lane driven entirely through the `Vfs` trait. The split is which primitives are
 //! available, not how far away the bytes are — an SMB root the OS has mounted takes `local`.
 //!
@@ -75,7 +75,7 @@ pub fn scan_ctx(
 }
 
 /// Route a root to the right scan lane: a local (or locally-translated) root keeps the
-/// existing walkdir+mmap fast path byte-for-byte; everything else runs the generic VFS
+/// existing walkdir fast path byte-for-byte; everything else runs the generic VFS
 /// lane. Both lanes speak the same filter contract and the same exclusion accounting —
 /// the differential tests pin those numbers against each other.
 pub fn scan_root(

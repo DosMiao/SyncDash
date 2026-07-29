@@ -43,6 +43,32 @@
 //!   (`foundation::fmt::human_bytes`, never a re-export from wherever happens to be convenient).
 //!   A barrel erases who depends on whom, which is precisely what this layering exists to show.
 //!
+//! # No file is ever memory-mapped
+//!
+//! `blake3` is depended on without its `mmap` and `rayon` features on purpose, which makes
+//! `update_mmap`, `update_mmap_rayon` and `update_rayon` compile errors rather than conventions.
+//! Every hash that reaches a file's bytes reaches them through an explicit `File::read` loop or a
+//! `Vfs` read stream. (`blake3::hash` over a buffer already in memory is untouched by this — the
+//! hazard is the mapping, not the hashing.)
+//!
+//! Reading a mapped page whose backing file was truncated, or whose volume went away, raises
+//! **SIGBUS**. That is a signal, not an `io::Error`: the surrounding `?` and `Err` arms are
+//! unreachable and the process is killed outright. On macOS a mounted SMB/AFP share under
+//! `/Volumes` is an ordinary local path, so a Wi-Fi roam was enough to trigger it. In `apply` the
+//! consequence is not a lost hash — the process dies mid-write holding both root heartbeat locks,
+//! `fs::lock::RootLock::drop` never runs, and the locks are left on disk for a human to clear. The
+//! answer is not a SIGBUS handler in a process that writes user files; it is to not map the file,
+//! so a vanishing file arrives as the ordinary `Err` each site already handles.
+//!
+//! This is paid for. Measured on a 15-core M-series with the file in page cache, `update_mmap_rayon`
+//! hashes at ~19 GiB/s against ~1.9 GiB/s for a single-threaded read loop. Blake3 gets no
+//! intra-file multicore any more; ~1.9 GiB/s becomes the ceiling, above most disks but far below
+//! cache. The cost was accepted rather than gated on a probed `Medium`, because `Medium::FixedDisk`
+//! would narrow the window without closing it (a read error or a detached volume still raises
+//! SIGBUS on a fixed disk), `Medium::Unknown` is a normal probe result that would silently lose the
+//! fast path anyway, and correctness outranks throughput here by the priority order this tool is
+//! built on.
+//!
 //! One word to keep straight, because it used to name two opposite things. A **peer** job is one
 //! the far side's own syncdash executes (`peer://`, `run::peer`, `transfer::peer`); everything
 //! else runs in this process, however distant its roots — an `sftp://` root is reached over a

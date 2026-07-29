@@ -29,7 +29,7 @@ pub(super) struct Shared<'a> {
     /// Whether the central trash store may take each side's deletions.
     ///
     /// A separate question from `local_of`, and the reason this field exists: `\\nas\share` is a
-    /// real local path, so delta and mmap do apply to it — but it is on another machine, so a
+    /// real local path, so the delta lane does apply to it — but it is on another machine, so a
     /// move into the store on this one copies every deleted file across the network first.
     pub(super) source_trash_ok: bool,
     pub(super) target_trash_ok: bool,
@@ -95,7 +95,10 @@ pub(super) struct Counters {
 
 /// Run one class of ops. width==1 runs sequentially on the current thread; otherwise a scoped thread pool
 /// (an AtomicUsize work-ticket index rather than range splitting — one big file can't drag a worker into a long tail).
-/// No rayon: verify's blake3 already runs in rayon's global pool, and nesting would oversubscribe and tangle the pause semantics.
+/// Not rayon: `checkpoint()` parks its caller in a 100ms sleep loop for the entire length of a
+/// pause, and these are threads of our own to park. Handing them to the global pool would mean a
+/// user pressing Pause pins rayon workers for as long as they like. (This used to be justified by
+/// verify's blake3 occupying that pool already; it no longer does — nothing here maps a file.)
 pub(super) fn run_class(class: &[&Op], width: usize, sh: &Shared, pp: &PhaseProgress, acc: &Counters) {
     if class.is_empty() {
         return;
