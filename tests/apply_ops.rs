@@ -323,6 +323,40 @@ fn delta_update_handles_shrinking_files() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// The paranoid tier on a local root. Both lanes used to read the staged file back through
+/// `update_mmap_rayon`; both now use a chunked read, and neither had a test. The payloads are
+/// deliberately larger than the 8 MiB read granularity so the loop runs more than once — a
+/// single-shot read would satisfy a smaller fixture either way.
+#[test]
+fn verify_reads_the_staged_file_back_in_both_lanes() {
+    let base = tmproot("verify");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+
+    let mut fresh = vec![0u8; 10 * 1024 * 1024];
+    for (i, b) in fresh.iter_mut().enumerate() {
+        *b = (i % 253) as u8;
+    }
+    // The delta lane needs an existing target that differs from the source only in a short stretch
+    let mut updated = fresh.clone();
+    updated[7_000_000..7_002_000].fill(0xCD);
+    std::fs::write(s.join("new.bin"), &fresh).unwrap();
+    std::fs::write(s.join("patched.bin"), &updated).unwrap();
+    std::fs::write(t.join("patched.bin"), &fresh).unwrap();
+
+    let mut o = opts(base.join("trash"));
+    o.verify = true;
+    o.delta = true;
+    let ops = [op(Action::Copy, "new.bin"), op(Action::Update, "patched.bin")];
+    let (done, _, errors) = apply::apply(&ops, &s, &t, &o);
+
+    assert_eq!((done, errors), (2, 0), "a readback matching the copy stream is not an error");
+    assert_eq!(std::fs::read(t.join("new.bin")).unwrap(), fresh, "generic lane must land byte-exact under verify");
+    assert_eq!(std::fs::read(t.join("patched.bin")).unwrap(), updated, "delta lane must land byte-exact under verify");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 // v0.9 M1: parallelism / progress / cancellation
 
 fn collecting_ctx() -> (RunCtx, Arc<Mutex<Vec<ProgressEvent>>>) {
