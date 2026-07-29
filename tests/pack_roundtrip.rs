@@ -29,7 +29,7 @@ fn write(root: &Path, rel: &str, body: &[u8]) {
 fn plan_of(target_root: &str, ops: Vec<Op>) -> Plan {
     Plan {
         header: PlanHeader {
-            schema: 1,
+            schema: syncdash::model::plan::PLAN_SCHEMA,
             kind: "plan".into(),
             mode: "mirror".into(),
             generated_at_ms: 0,
@@ -43,6 +43,14 @@ fn plan_of(target_root: &str, ops: Vec<Op>) -> Plan {
             target_entries: 0,
             source_excluded: 0,
             target_excluded: 0,
+            source_walk_errors: 0,
+            target_walk_errors: 0,
+            source_walk_err_samples: Vec::new(),
+            target_walk_err_samples: Vec::new(),
+            source_icloud_stubs: 0,
+            target_icloud_stubs: 0,
+            source_icloud_stub_samples: Vec::new(),
+            target_icloud_stub_samples: Vec::new(),
         },
         ops,
     }

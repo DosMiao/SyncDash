@@ -9,10 +9,24 @@ use crate::foundation::text::norm_key;
 use crate::model::table::{Entry, EntryKind, Snapshot};
 
 pub(super) fn files_equal(a: &Entry, b: &Entry, win_ms: i64) -> bool {
+    // Evidence that was asked for and not obtained must never resolve to "equal". The size+mtime
+    // line below is the *intended* judgment when hashing was not requested; reaching it because a
+    // read failed is a silent downgrade, and it is the one direction that loses data — a file whose
+    // content changed under a preserved size and mtime would be declared identical forever.
+    // Answering "not equal" here is the safe half; the decision sites turn it into a Conflict so it
+    // is not merely re-copied every run.
+    if a.hash_failed || b.hash_failed {
+        return false;
+    }
     if let (Some(ha), Some(hb)) = (&a.hash, &b.hash) {
         return ha == hb;
     }
     a.size == b.size && (a.mtime_ms - b.mtime_ms).abs() <= win_ms
+}
+
+/// Whether this pair cannot be judged on content because one side's content could not be read.
+pub(super) fn evidence_missing(a: &Entry, b: &Entry) -> bool {
+    a.hash_failed || b.hash_failed
 }
 
 /// Which generation of archive entry `r` the content of `e` corresponds to:

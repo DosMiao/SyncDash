@@ -75,6 +75,7 @@ mod tests {
             size: 42,
             mtime_ms: 1_700_000_000_000,
             hash: hash.map(String::from),
+            hash_failed: false,
             file_id: None,
             mode: None,
             link: None,

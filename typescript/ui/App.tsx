@@ -28,6 +28,7 @@ import type { RunRecord } from '../core/types/generated/RunRecord';
 import { useStatus } from './hooks/useStatus';
 import { useZoomControl } from './hooks/useZoomControl';
 import { ComparePanel } from './components/ComparePanel';
+import { ScanFaultBanner } from './components/ScanFaultBanner';
 import { ConfirmSheet } from './components/ConfirmSheet';
 import { FilterBar } from './components/FilterBar';
 import { FunnelPopover } from './components/FunnelPopover';
@@ -75,6 +76,10 @@ interface CmpEv {
   items_total?: number;
   bytes_done?: number;
   bytes_total?: number;
+  /// Present on `error` events only: `action` names the failing stage ("walk" = the scan could not
+  /// read a directory), `message` carries the engine's own wording
+  action?: string;
+  message?: string;
 }
 
 function readHistory(): string[] {
@@ -567,6 +572,15 @@ export function App() {
   useEffect(() => {
     const un = listen<CmpEv>('run-progress', (ev) => {
       const e = ev.payload;
+      // A `log` event carries no phase, so the phase guard below would drop it. Errors do carry
+      // one, but the guard used to sit above every branch and there was no branch to reach:
+      // `phase_start` and `progress` were the only two, and a scan that could not read a directory
+      // produced an event nothing was listening for.
+      if (e.kind === 'error') {
+        if (e.purpose && e.purpose !== 'compare') return;
+        setStatus(`${e.action === 'walk' ? 'Scan could not read' : 'Error'}: ${e.message ?? ''}`, 'err');
+        return;
+      }
       if (!e.phase) return;
       if (e.purpose && e.purpose !== 'compare') return; // apply events belong to the progress window
       if (e.kind === 'phase_start') {
@@ -608,7 +622,7 @@ export function App() {
       }
     });
     return () => { un.then((f) => f()); };
-  }, []);
+  }, [setStatus]);
 
   // P1: drag a directory onto a path box.
   // Tauri v2 has dragDropEnabled on by default, so HTML5 drop events never reach the webview — you must
@@ -866,6 +880,7 @@ export function App() {
               }}
             />
           )}
+          {plan && <ScanFaultBanner header={plan.header} />}
           <div className="reviewrow">
             <Overview
               plan={plan}

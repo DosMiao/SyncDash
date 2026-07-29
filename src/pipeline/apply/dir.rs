@@ -34,8 +34,15 @@ pub(super) fn try_delete_dir_vfs(
         Err(_) => {}
     }
     // Non-empty: walk what is left (engine-side DFS, one read_dir per directory).
-    // Regular files decide deletability, exactly as the walkdir lane did; symlinks and
-    // directories go along with the tree when it is removed.
+    //
+    // Symlinks count exactly as files do. Letting directories "go along with the tree" is right —
+    // an empty directory carries nothing — but a symlink is content: it is the only record of where
+    // it pointed, and it cannot be reconstructed from the other side once unlinked. Excluding it
+    // from `count` meant a directory whose leftovers were *only* symlinks had count == 0, sailed
+    // past the guard below, and had every link removed through `exec.remove_file` — not preserved,
+    // not versioned, not in the trash. With `symlinks = "exclude"` (the default) those links are
+    // invisible to both snapshots as well, so nothing anywhere recorded what was destroyed. Deleting
+    // one `Foo.app` was enough: every `Versions/Current -> A` inside it went that way.
     let mut sample = Vec::new();
     let mut all_deletable = true;
     let mut count = 0usize;
@@ -55,7 +62,7 @@ pub(super) fn try_delete_dir_vfs(
                     dirs.push(child_rel.clone());
                     stack.push(child_rel);
                 }
-                EntryKind::File => {
+                EntryKind::File | EntryKind::Symlink => {
                     count += 1;
                     let deletable = filter.map(|f| f.is_deletable(&child_rel)).unwrap_or(false);
                     if !deletable {
@@ -66,7 +73,6 @@ pub(super) fn try_delete_dir_vfs(
                     }
                     files.push(child_rel);
                 }
-                EntryKind::Symlink => files.push(child_rel),
             }
         }
     }

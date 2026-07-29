@@ -24,6 +24,35 @@ pub struct Header {
     /// Files excluded by the filter
     #[serde(default)]
     pub excluded_files: u64,
+    /// Entries the walk could not read and skipped. Distinct from `excluded_*`: an exclusion is a
+    /// choice the user made, this is a tree the scan could not see. Both are equally invisible to
+    /// compare — a skipped entry reads as "absent on this side", which under mirror is a delete —
+    /// so the count has to cross the module boundary and reach the guards, not just a log line.
+    /// Only races survive to here; anything structural aborts the scan (see `scan::local`).
+    #[serde(default)]
+    pub walk_errors: u64,
+    /// Up to five sampled walk failures, so the guard's refusal can name what it could not read
+    /// instead of just counting.
+    #[serde(default)]
+    pub walk_err_samples: Vec<String>,
+    /// `.<name>.icloud` placeholders: the file's contents are not on this disk and its real name is
+    /// not in this table. Syncing one copies a few hundred bytes of plist over the real file on the
+    /// other side, so this blocks rather than warns.
+    #[serde(default)]
+    pub icloud_stubs: u64,
+    #[serde(default)]
+    pub icloud_stub_samples: Vec<String>,
+    /// Symlinks the scan saw and did not record, because `symlinks = "exclude"` (the default).
+    /// Counted for the same reason `excluded_*` is: an exclusion has to be visible. A macOS tree is
+    /// made of links — every `.app`, every framework, every Homebrew prefix — so "0 differences"
+    /// over a tree full of them is a claim the snapshot was not entitled to make.
+    #[serde(default)]
+    pub skipped_symlinks: u64,
+    /// Files evicted in place (macOS `SF_DATALESS`). Unlike a stub these still carry the true name,
+    /// size and mtime, so nothing is lost — but reading one downloads it, which is worth saying
+    /// before a full-rigor scan hydrates an entire library.
+    #[serde(default)]
+    pub dataless_files: u64,
     /// A VFS root's self-description (None for plain local roots): protocol, display
     /// root, mtime precision, the evidence tier this scan *actually* ran, and any
     /// declared degradations — the snapshot must say for itself how its evidence was
@@ -70,6 +99,18 @@ pub struct Entry {
     pub mtime_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    /// Content evidence was asked for on this entry and could not be obtained — the file exists but
+    /// could not be read (an ACL, a TCC denial on the file rather than its directory, a share that
+    /// dropped mid-scan).
+    ///
+    /// It cannot be inferred from `hash: None`, which also means "hashing was never requested", and
+    /// the two must not be confused: the first is a degraded judgment, the second is the intended
+    /// one. The header's `hashed` flag records what was *asked for*, so it says `true` for both.
+    /// Without this field a file whose content changed but whose size and mtime were preserved — a
+    /// restore, `touch -r`, an SMB mtime round-trip — was silently declared identical and never
+    /// synced again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hash_failed: bool,
     /// unix: dev:inode; empty on windows for now. Only corroborates same-machine moves; across machines we rely on hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_id: Option<String>,
@@ -179,6 +220,7 @@ mod tests {
             size,
             mtime_ms: 1_700_000_000_000,
             hash: hash.map(String::from),
+            hash_failed: false,
             file_id: None,
             mode: None,
             link: None,
@@ -199,6 +241,12 @@ mod tests {
             hashed: true,
             excluded_dirs: 3,
             excluded_files: 4,
+            walk_errors: 0,
+            walk_err_samples: Vec::new(),
+            icloud_stubs: 0,
+            icloud_stub_samples: Vec::new(),
+            dataless_files: 0,
+            skipped_symlinks: 0,
             vfs: None,
         }
     }

@@ -89,15 +89,46 @@ impl From<std::io::Error> for VfsError {
         } {
             return VfsError { kind, detail: format!("{e} — {hint}"), source: Some(Box::new(e)) };
         }
+        // The Darwin counterpart of the block above: errnos std does not give a distinct
+        // ErrorKind, where the difference is actionable.
+        //
+        // **EPERM is deliberately not classified here.** It is the errno a TCC denial produces —
+        // ~/Desktop, ~/Documents, an external volume — but it is equally the errno for chmod of a
+        // file you do not own, a sticky directory, and a `chflags uchg` file. Asserting "grant Full
+        // Disk Access" on every EPERM would be a guess, and a wrong one often enough to send the
+        // user after a checkbox that is not the problem. It stays PermissionDenied via the shared
+        // match, with Privacy & Security offered as *one* possibility in the wording.
+        #[cfg(target_os = "macos")]
+        if let Some((kind, hint)) = match e.raw_os_error() {
+            // ESTALE: a /Volumes share that dropped and remounted. The handle is dead, the volume
+            // is not — retrying is the correct response, and classifying it Io meant a network
+            // blip was reported as a permanent local failure.
+            Some(70) => Some((VfsErrorKind::Transient, "the network volume was remounted and this handle is stale; it will be retried on the next run")),
+            // EPERM, only where the shared match would already say PermissionDenied — this adds
+            // the possibilities, it does not claim one.
+            Some(1) => Some((VfsErrorKind::PermissionDenied, "not permitted: the file may be locked (chflags uchg), owned by another user, or the app may need Full Disk Access in System Settings > Privacy & Security")),
+            _ => None,
+        } {
+            return VfsError { kind, detail: format!("{e} — {hint}"), source: Some(Box::new(e)) };
+        }
         let kind = match e.kind() {
             K::NotFound => VfsErrorKind::NotFound,
             K::PermissionDenied => VfsErrorKind::PermissionDenied,
             K::AlreadyExists => VfsErrorKind::AlreadyExists,
             K::DirectoryNotEmpty => VfsErrorKind::NotEmpty,
             K::Interrupted => VfsErrorKind::Cancelled,
+            // A volume mounted read-only (an NTFS external, a DMG, a Time Machine snapshot) is a
+            // permission problem, not an unclassified I/O one — every op against it will fail the
+            // same way, so it must read as a refusal rather than as bad luck.
+            K::ReadOnlyFilesystem => VfsErrorKind::PermissionDenied,
+            // A stale handle is the portable spelling of the ESTALE case above.
+            K::StaleNetworkFileHandle => VfsErrorKind::Transient,
             K::TimedOut | K::ConnectionReset | K::ConnectionAborted | K::BrokenPipe
             | K::ConnectionRefused | K::HostUnreachable | K::NetworkUnreachable
             | K::NetworkDown => VfsErrorKind::Transient,
+            // StorageFull, QuotaExceeded and CrossesDevices stay Io on purpose: they are real,
+            // permanent, local failures. They are named here so the next reader knows they were
+            // considered rather than missed.
             _ => VfsErrorKind::Io,
         };
         let detail = e.to_string();
@@ -147,6 +178,39 @@ mod tests {
         assert_eq!(io.kind(), std::io::ErrorKind::Interrupted);
         let v2: VfsError = std::io::Error::new(std::io::ErrorKind::Interrupted, "stop").into();
         assert_eq!(v2.kind, VfsErrorKind::Cancelled);
+    }
+
+    /// A `/Volumes` share that dropped and remounted mid-run leaves stale handles. That is the
+    /// classic macOS sync interruption and it is recoverable, so it must not be reported as a
+    /// permanent local failure the way the unclassified `Io` bucket would.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stale_handle_from_a_remounted_share_is_transient() {
+        let v: VfsError = std::io::Error::from_raw_os_error(70).into(); // ESTALE, per sys/errno.h
+        assert_eq!(v.kind, VfsErrorKind::Transient);
+        assert!(v.detail.contains("remounted"), "{}", v.detail);
+    }
+
+    /// EPERM must stay PermissionDenied and must **not** assert a cause. It is what a TCC denial
+    /// produces, and equally what a chflags-locked file, a sticky directory and a foreign-owned
+    /// file produce — naming Full Disk Access as the answer would send the user after the wrong
+    /// checkbox most of the time. The wording offers the possibilities; the classification does
+    /// not pick one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn eperm_offers_causes_without_claiming_one() {
+        let v: VfsError = std::io::Error::from_raw_os_error(1).into();
+        assert_eq!(v.kind, VfsErrorKind::PermissionDenied);
+        assert!(v.detail.contains("Full Disk Access"), "the remedy has to be reachable: {}", v.detail);
+        assert!(v.detail.contains("may"), "but it must be offered, not asserted: {}", v.detail);
+    }
+
+    /// A read-only volume (an NTFS external, a mounted DMG, a Time Machine snapshot) fails every
+    /// op the same way. That is a refusal, not bad luck.
+    #[test]
+    fn a_read_only_volume_reads_as_a_refusal() {
+        let v: VfsError = std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem).into();
+        assert_eq!(v.kind, VfsErrorKind::PermissionDenied);
     }
 
     /// The single most common Windows sync failure: an open Office document / running binary.

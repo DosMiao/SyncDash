@@ -111,11 +111,15 @@ use syncdash::pipeline::compare::evidence::SideMeta;
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("plan.csv");
         let header = PlanHeader {
-            schema: 1, kind: "plan".into(), mode: "mirror".into(), generated_at_ms: 0,
+            schema: syncdash::model::plan::PLAN_SCHEMA, kind: "plan".into(), mode: "mirror".into(), generated_at_ms: 0,
             source_root: r"D:\S".into(), source_host: "h".into(),
             target_root: r"E:\T".into(), target_host: "h".into(),
             op_count: 1, conflict_count: 0, source_entries: 1, target_entries: 1,
             source_excluded: 0, target_excluded: 0,
+            source_walk_errors: 0, target_walk_errors: 0,
+            source_walk_err_samples: Vec::new(), target_walk_err_samples: Vec::new(),
+            source_icloud_stubs: 0, target_icloud_stubs: 0,
+            source_icloud_stub_samples: Vec::new(), target_icloud_stub_samples: Vec::new(),
         };
         let ops = vec![Op {
             side: Side::Target,
@@ -151,11 +155,15 @@ use syncdash::pipeline::compare::evidence::SideMeta;
             size: Some(5), mtime_ms: None, hash: None, link: None, mode: None, reason: "gone".into(),
         }];
         let h2 = PlanHeader {
-            schema: 1, kind: "plan".into(), mode: "mirror".into(), generated_at_ms: 0,
+            schema: syncdash::model::plan::PLAN_SCHEMA, kind: "plan".into(), mode: "mirror".into(), generated_at_ms: 0,
             source_root: "/s".into(), source_host: "h".into(),
             target_root: "/t".into(), target_host: "h".into(),
             op_count: 1, conflict_count: 0, source_entries: 1, target_entries: 1,
             source_excluded: 0, target_excluded: 0,
+            source_walk_errors: 0, target_walk_errors: 0,
+            source_walk_err_samples: Vec::new(), target_walk_err_samples: Vec::new(),
+            source_icloud_stubs: 0, target_icloud_stubs: 0,
+            source_icloud_stub_samples: Vec::new(), target_icloud_stub_samples: Vec::new(),
         };
         export_csv(out.display().to_string(), h2, ops2, one_sided, vec![false]).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();

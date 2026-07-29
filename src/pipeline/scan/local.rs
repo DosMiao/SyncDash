@@ -1,7 +1,10 @@
-//! The local lane: walkdir + rayon + mmap over a real directory.
+//! The local lane: walkdir + rayon over a real directory.
 //!
 //! Kept byte-for-byte on the fast path — this is what runs for the overwhelming majority of
 //! scans, and the parallel hashing here is the reason a cold scan of a large tree is bearable.
+//! Parallelism is per *file*, not within one: hashing reads through an explicit loop rather than
+//! mapping the file, because a mapped page whose backing store goes away kills the process with
+//! SIGBUS instead of returning an error (see the hashing section for the full reasoning).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,6 +35,35 @@ fn unix_mode(md: &std::fs::Metadata) -> Option<u32> {
 #[cfg(not(unix))]
 fn unix_mode(_md: &std::fs::Metadata) -> Option<u32> {
     None
+}
+
+/// macOS marks a file whose contents have been evicted to iCloud but whose name, size and mtime
+/// remain. Reading one hydrates it — a full-rigor scan of a photo library would pull every byte
+/// back down. Not a correctness problem (the bytes that arrive are the right bytes), which is why
+/// it is reported and not refused.
+#[cfg(target_os = "macos")]
+fn is_dataless(md: &std::fs::Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    const SF_DATALESS: u32 = 0x4000_0000; // sys/stat.h: "file is dataless object"
+    md.st_flags() & SF_DATALESS != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_dataless(_md: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// The *other* iCloud eviction shape, and the dangerous one. When a file is evicted the real name
+/// can disappear entirely and be replaced by a `.<name>.icloud` sidecar — a few hundred bytes of
+/// plist. Nothing about that entry says "placeholder": it is a real file with a real size, so the
+/// snapshot records the stub and records the original as *absent*. Against a backup that still
+/// holds the original, mirror then plans a copy of the stub and a delete of the real file.
+///
+/// Matched on the name alone. Looking for the missing sibling would be the obvious test and it
+/// cannot be done here: the walk is streaming, so the directory's full name set does not exist yet
+/// at the moment this entry is judged.
+fn is_icloud_stub(name: &str) -> bool {
+    name.starts_with('.') && name.ends_with(".icloud") && name.len() > ".icloud".len() + 1
 }
 
 fn mtime_ms(md: &std::fs::Metadata) -> i64 {
@@ -87,6 +119,12 @@ pub(super) fn scan_impl(
     // (a skipped entry is equivalent to "absent on this side" during compare —— an invisible fault that can produce a catastrophic plan)
     let mut walk_errors = 0u64;
     let mut walk_err_samples: Vec<String> = Vec::new();
+    // iCloud eviction, counted separately from walk errors because the remedy is different:
+    // `brctl download` or an exclusion, not a permission.
+    let mut icloud_stubs = 0u64;
+    let mut icloud_stub_samples: Vec<String> = Vec::new();
+    let mut dataless_files = 0u64;
+    let mut skipped_symlinks = 0u64;
 
     // Exclusions must be visible: pruned directories/files are counted into the snapshot header so the UI can state "this much never took part in the comparison".
     // (Lesson learned: the default exclusions silently swallowed .git while the UI still said "both sides identical ✓" —— never again)
@@ -122,13 +160,16 @@ pub(super) fn scan_impl(
         });
 
     // Phase 1: serial walk to collect entries (metadata is fast); phase 2: parallel hashing with rayon (the lesson from FFS
-    // parallel_scan: with many small files the bottleneck is serial I/O). Large files split further via mmap_rayon; small ones use a plain mmap to avoid oversubscription.
+    // parallel_scan: with many small files the bottleneck is serial I/O). Every file is read through the same chunked loop, so the parallelism is across files and the buffer is sized to the file.
     struct PendingFile {
         rel: String,
         abs: std::path::PathBuf,
         size: u64,
         mt: i64,
         hash: Option<String>, // cache hit
+        /// Set when hashing was attempted and failed: distinct from `hash: None`, which also covers
+        /// "hashing was never requested". Only the first is a degraded judgment.
+        hash_failed: bool,
         file_id: Option<String>,
         mode: Option<u32>,
     }
@@ -155,12 +196,37 @@ pub(super) fn scan_impl(
                     ),
                 ));
             }
+            // Past the root the same rule holds, and for the same reason. walkdir emits a
+            // directory before it descends, so a directory it then fails to read is already in
+            // the table — with zero children. Counting and continuing leaves a structurally
+            // valid snapshot that says the subtree is empty, and mirror turns that into a delete
+            // for every file the other side still has.
+            //
+            // NotFound is the one honest exception: an entry that vanished between being listed
+            // and being read is a scan race, not an unreadable tree. Everything else — EPERM from
+            // a TCC-gated directory (~/Desktop, ~/Documents, any external volume), an ACL, a
+            // dropped mount — means a subtree exists that this scan cannot see, and a table that
+            // omits it is a table that lies. A loop error carries no io_error at all and aborts
+            // for the same reason.
             Err(e) => {
+                let kind = e.io_error().map(|io| io.kind());
+                if kind != Some(std::io::ErrorKind::NotFound) {
+                    return Err(std::io::Error::new(
+                        kind.unwrap_or(std::io::ErrorKind::Other),
+                        format!(
+                            "scan of '{}' aborted at '{}': {e} — refusing to emit a half table (its missing subtrees would read as deletions)",
+                            root.display(),
+                            // Not unwrap_or_default: an empty string reads as "the root", which is
+                            // the one place this cannot have happened. Say that the path is unknown.
+                            e.path().map(|p| p.display().to_string()).unwrap_or_else(|| "<path unavailable>".into()),
+                        ),
+                    ));
+                }
                 walk_errors += 1;
                 if walk_err_samples.len() < 5 {
                     walk_err_samples.push(format!(
                         "{}: {e}",
-                        e.path().map(|p| p.display().to_string()).unwrap_or_default()
+                        e.path().map(|p| p.display().to_string()).unwrap_or_else(|| "<path unavailable>".into())
                     ));
                 }
                 continue;
@@ -200,16 +266,31 @@ pub(super) fn scan_impl(
         };
         if item.file_type().is_dir() {
             if opt.filter.pass_dir(&rel).0 {
-                entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None, link: None, prev: None });
+                entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, hash_failed: false, file_id: None, mode: None, link: None, prev: None });
             }
         } else if item.file_type().is_symlink() {
+            if !opt.symlinks_direct {
+                skipped_symlinks += 1;
+            }
             if opt.symlinks_direct {
                 let target = std::fs::read_link(item.path())
                     .ok()
                     .map(|t| t.to_string_lossy().into_owned());
-                entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, file_id: None, mode: None, link: target, prev: None });
+                entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, hash_failed: false, file_id: None, mode: None, link: target, prev: None });
             }
         } else {
+            // Both iCloud eviction shapes, judged before the entry is recorded. Neither is an
+            // exclusion and neither can be fixed by one: the stub's danger comes from the *absence*
+            // of the real name, and excluding the stub only removes the visible hint while leaving
+            // the delete in place.
+            if is_icloud_stub(crate::foundation::path::base_name(&rel)) {
+                icloud_stubs += 1;
+                if icloud_stub_samples.len() < 5 {
+                    icloud_stub_samples.push(rel.clone());
+                }
+            } else if is_dataless(&md) {
+                dataless_files += 1;
+            }
             let size = md.len();
             // P1-4: the filesystem once stored a different value than the mtime we asked for (FAT's 2-second granularity
             // / SMB truncation); convert it back to what we meant so compare need not lean on a tolerance
@@ -228,7 +309,7 @@ pub(super) fn scan_impl(
                     }
                 }
             }
-            pending.push(PendingFile { rel, abs: item.path().to_path_buf(), size, mt, hash, file_id: file_id(&md), mode: unix_mode(&md) });
+            pending.push(PendingFile { rel, abs: item.path().to_path_buf(), size, mt, hash, hash_failed: false, file_id: file_id(&md), mode: unix_mode(&md) });
             if let Some(pp) = &pp {
                 pp.item_done(&pending.last().unwrap().rel);
             }
@@ -269,7 +350,8 @@ pub(super) fn scan_impl(
     if opt.hash {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        const BIG_FILE: u64 = 32 * 1024 * 1024;
+        /// Read granularity, and therefore how often cancel/pause is honoured mid-file.
+        const READ_CHUNK: u64 = 8 * 1024 * 1024;
         // Only cache misses are actually read; the progress bar is only accurate if it counts their bytes
         let bytes_total: u64 = pending.iter().filter(|p| p.hash.is_none()).map(|p| p.size).sum();
         let files_total = pending.len() as u64;
@@ -300,10 +382,22 @@ pub(super) fn scan_impl(
                     }
                 });
             }
-            // Files ≥32MB are no longer mmap-hashed in one shot: that would make "cancel" wait for the in-flight large file
-            // to finish reading (a OneDrive cloud placeholder would first have to hydrate whole, possibly a several-minute wait).
-            // The chunked read loop puts a cancel/pause checkpoint every 8MiB; this gives up blake3's intra-file multicore,
-            // but the outer file-level parallelism remains, the disk is almost always the bottleneck, and the throughput difference sinks into the noise.
+            // Every file is read through the same chunked loop, whatever its size. Two reasons, and
+            // the second is why the small-file mmap fast path is gone:
+            //
+            // Cancellation. An mmap'd hash finishes the whole file before it can be interrupted (a
+            // cloud placeholder would have to hydrate entirely first, possibly minutes). A
+            // checkpoint every READ_CHUNK gives up blake3's intra-file multicore, but file-level
+            // parallelism remains and the disk is almost always the bottleneck.
+            //
+            // Durability. Reading a mapped page whose backing file was truncated, or whose volume
+            // disappeared, raises **SIGBUS** — a signal, not an io::Error — so the Err arm below
+            // was unreachable and the process simply died: no dialog, no run-log summary, both root
+            // locks left on disk because Drop never runs. On macOS a mounted SMB/AFP share under
+            // /Volumes is an ordinary path and takes this lane, so a Wi-Fi roam mid-scan was enough.
+            // The answer is not a SIGBUS handler in a process that writes user files; it is to not
+            // map the file, so a vanishing file is an ordinary Err the hash-error path already
+            // knows how to record.
             pending.par_iter_mut().for_each(|p| {
                 if let Some(pp) = &pp {
                     if pp.checkpoint().is_err() {
@@ -316,6 +410,7 @@ pub(super) fn scan_impl(
                         match sampled_digest(&p.abs, p.size) {
                             Ok(d) => p.hash = Some(d),
                             Err(e) => {
+                                p.hash_failed = true;
                                 hash_err_count.fetch_add(1, Ordering::Relaxed);
                                 if let Some(pp) = &pp {
                                     pp.error(&p.rel, "hash", side, &e.to_string());
@@ -331,30 +426,30 @@ pub(super) fn scan_impl(
                         return;
                     }
                     let mut hasher = blake3::Hasher::new();
-                    let res = if p.size >= BIG_FILE {
-                        (|| -> std::io::Result<()> {
-                            use std::io::Read;
-                            let mut f = std::fs::File::open(&p.abs)?;
-                            let mut buf = vec![0u8; 8 * 1024 * 1024];
-                            loop {
-                                if let Some(pp) = &pp {
-                                    pp.checkpoint()?;
-                                }
-                                let n = f.read(&mut buf)?;
-                                if n == 0 {
-                                    break;
-                                }
-                                hasher.update(&buf[..n]);
+                    let res = (|| -> std::io::Result<()> {
+                        use std::io::Read;
+                        let mut f = std::fs::File::open(&p.abs)?;
+                        // Sized to the file, capped at the checkpoint interval: a tree of small
+                        // files must not allocate 8MiB per rayon worker.
+                        let cap = p.size.clamp(1, READ_CHUNK) as usize;
+                        let mut buf = vec![0u8; cap];
+                        loop {
+                            if let Some(pp) = &pp {
+                                pp.checkpoint()?;
                             }
-                            Ok(())
-                        })()
-                    } else {
-                        hasher.update_mmap(&p.abs).map(|_| ())
-                    };
+                            let n = f.read(&mut buf)?;
+                            if n == 0 {
+                                break;
+                            }
+                            hasher.update(&buf[..n]);
+                        }
+                        Ok(())
+                    })();
                     match res {
                         Ok(_) => p.hash = Some(hasher.finalize().to_hex().to_string()),
                         Err(e) if crate::obs::progress::is_cancelled(&e) => return, // cancellation is not a hash error
                         Err(e) => {
+                            p.hash_failed = true;
                             hash_err_count.fetch_add(1, Ordering::Relaxed);
                             if let Some(pp) = &pp {
                                 pp.error(&p.rel, "hash", side, &e.to_string());
@@ -387,7 +482,7 @@ pub(super) fn scan_impl(
         }
     }
     for p in pending {
-        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, file_id: p.file_id, mode: p.mode, link: None, prev: None });
+        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, hash_failed: p.hash_failed, file_id: p.file_id, mode: p.mode, link: None, prev: None });
     }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -412,6 +507,12 @@ pub(super) fn scan_impl(
             hashed: opt.hash,
             excluded_dirs: excl_dirs.get(),
             excluded_files: excl_files.get(),
+            walk_errors,
+            walk_err_samples,
+            icloud_stubs,
+            icloud_stub_samples,
+            dataless_files,
+            skipped_symlinks,
             vfs: None,
         },
         entries,
