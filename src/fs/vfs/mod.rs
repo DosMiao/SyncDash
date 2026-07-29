@@ -253,12 +253,12 @@ pub trait WriteStaged: Send {
     /// SFTP downloads in the wild).
     fn staged_len(&self) -> VfsResult<u64>;
     /// Re-read the staged content (verify_writes). Only when `caps().read_back` says Yes.
+    ///
+    /// Every backend verifies through this one stream, local included. There used to be a
+    /// `local_path()` escape hatch that let a real local path be verified by mmap+rayon instead,
+    /// which is ~10x faster on cached bytes and could also kill the process with SIGBUS — see the
+    /// crate header. Losing it costs the paranoid tier a second single-threaded blake3 pass.
     fn open_staged_read(&self) -> VfsResult<Box<dyn ReadStream>>;
-    /// Escape hatch: when the staged file is a real local path, verification uses
-    /// mmap+rayon on it instead of a streaming re-read.
-    fn local_path(&self) -> Option<&Path> {
-        None
-    }
     /// Atomically move the staged file onto the destination. The engine has already
     /// cleared/preserved the old file per plan. Consumes self.
     fn commit(self: Box<Self>) -> VfsResult<CommitReport>;
@@ -275,8 +275,8 @@ pub trait Vfs: Send + Sync {
     /// lock ownership. For a local root this is the root string exactly as spelled
     /// (existing caches must keep hitting).
     fn identity(&self) -> String;
-    /// Local escape hatch: a real directory the engine may touch with std::fs,
-    /// walkdir and mmap. `Some` routes the whole fast path.
+    /// Local escape hatch: a real directory the engine may touch with std::fs and
+    /// walkdir. `Some` routes the whole fast path.
     fn as_local(&self) -> Option<&Path> {
         None
     }

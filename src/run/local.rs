@@ -210,9 +210,21 @@ fn escalate_sampled_disagreements(
     // The same no-hash window compare uses — a backend with coarser mtimes widens both together
     let slack_ms: i64 = job.compare_opts().mtime_window_ms;
 
+    /// Read granularity for the escalation re-read.
+    const READ_CHUNK: u64 = 8 * 1024 * 1024;
+
     fn full_hash(p: &Path) -> std::io::Result<String> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(p)?;
         let mut h = blake3::Hasher::new();
-        h.update_mmap(p)?;
+        let mut buf = vec![0u8; f.metadata()?.len().clamp(1, READ_CHUNK) as usize];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
         Ok(h.finalize().to_hex().to_string())
     }
     let tmap: std::collections::HashMap<&str, &crate::model::table::Entry> = t

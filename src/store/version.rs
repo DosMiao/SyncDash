@@ -65,9 +65,21 @@ fn mtime_ms_of(md: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+/// Read granularity for hashing an original before it is archived.
+const READ_CHUNK: u64 = 8 * 1024 * 1024;
+
 fn hash_file(p: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(p)?;
     let mut h = blake3::Hasher::new();
-    h.update_mmap_rayon(p)?;
+    let mut buf = vec![0u8; f.metadata()?.len().clamp(1, READ_CHUNK) as usize];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
     Ok(h.finalize().to_hex().to_string())
 }
 

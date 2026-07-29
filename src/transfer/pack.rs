@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 
 pub const PACK_VERSION: u32 = 2;
 
+/// Read granularity for hashing a delta base off the target root.
+const READ_CHUNK: u64 = 8 * 1024 * 1024;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PayloadEntry {
     pub rel: String,
@@ -332,21 +335,34 @@ pub fn apply_pack(
                     crate::log_error!("pack", "ERR  delta blob hash mismatch: {rel}");
                     continue;
                 }
+                use std::io::{Seek, SeekFrom};
                 let base_path = target_root.join(to_native(&rel));
+                // One handle hashes the base and then serves the recipe's seeks — the steps below
+                // seek absolutely, so nothing has to rewind it.
                 let mut bh = blake3::Hasher::new();
-                if bh.update_mmap_rayon(&base_path).is_err() {
+                let opened = (|| -> std::io::Result<std::fs::File> {
+                    let mut f = std::fs::File::open(&base_path)?;
+                    let mut hbuf = vec![0u8; f.metadata()?.len().clamp(1, READ_CHUNK) as usize];
+                    loop {
+                        let n = f.read(&mut hbuf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        bh.update(&hbuf[..n]);
+                    }
+                    Ok(f)
+                })();
+                let Ok(mut basef) = opened else {
                     extract_errors += 1;
                     crate::log_error!("pack", "ERR  delta base missing/unreadable: {rel}");
                     continue;
-                }
+                };
                 let base_hex = bh.finalize().to_hex().to_string();
                 if meta.base_hash.as_deref() != Some(base_hex.as_str()) {
                     extract_errors += 1;
                     crate::log_error!("pack", "ERR  delta base changed since chunk table: {rel} — rerun to repack");
                     continue;
                 }
-                use std::io::{Seek, SeekFrom};
-                let mut basef = std::fs::File::open(&base_path)?;
                 let mut out = std::fs::File::create(&dst)?;
                 let mut fh = blake3::Hasher::new();
                 let mut buf = vec![0u8; 1 << 16];

@@ -92,6 +92,71 @@ fn packs_and_applies_a_copy() {
     assert_eq!(std::fs::read(tgt.join("two.bin")).unwrap(), vec![7u8; 5000]);
 }
 
+fn update_op(rel: &str) -> Op {
+    Op { action: Action::Update, ..copy_op(rel) }
+}
+
+fn body(seed: u32, len: usize) -> Vec<u8> {
+    (0..len as u32).map(|i| (i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 13) as u8).collect()
+}
+
+/// Pack `rel` as a delta against the copy the target already holds.
+fn pack_delta(src: &Path, tgt: &Path, out: &Path, rel: &str) -> pack::PackSummary {
+    let base = syncdash::model::chunk::chunk_file(tgt, rel).unwrap();
+    let plan = plan_of(&tgt.to_string_lossy(), vec![update_op(rel)]);
+    pack::pack(&plan, src, out, Some(&[(rel.to_string(), base)].into_iter().collect())).unwrap()
+}
+
+/// The delta lane end to end — the half of this module the roundtrip above never reached.
+///
+/// `apply_pack` hashes the base off the target root and then re-reads it through the recipe. Both
+/// used to be separate opens with the hash coming from `update_mmap_rayon`; they are one handle and
+/// a chunked read now. The payload is deliberately larger than the 8 MiB read granularity so the
+/// hash loop runs more than once.
+#[test]
+fn packs_and_applies_a_delta() {
+    let src = tmp("src-delta");
+    let tgt = tmp("tgt-delta");
+    let out = tmp("pkg-delta").join("p.tar");
+
+    let old = body(0, 10 * 1024 * 1024);
+    let mut new = old.clone();
+    new[6_000_000..6_001_000].fill(0xAB);
+    write(&tgt, "big.bin", &old);
+    write(&src, "big.bin", &new);
+
+    let summary = pack_delta(&src, &tgt, &out, "big.bin");
+    assert!(summary.delta_saved > 0, "an edited stretch must ride as a delta, not as the whole file");
+
+    let (done, _skipped, errors) = pack::apply_pack(&out, Some(&tgt), true, false, false).unwrap();
+    assert_eq!((done, errors), (1, 0), "a matching base must reassemble without error");
+    assert_eq!(std::fs::read(tgt.join("big.bin")).unwrap(), new, "reassembly must be byte-exact");
+}
+
+/// A recipe is only meaningful against the exact bytes it was computed from. If the target moved on
+/// after the chunk table was taken, patching it would splice two different files together — so the
+/// base hash has to catch it, and the whole package aborts rather than landing part of itself.
+#[test]
+fn a_delta_base_that_changed_is_refused() {
+    let src = tmp("src-stale");
+    let tgt = tmp("tgt-stale");
+    let out = tmp("pkg-stale").join("p.tar");
+
+    let old = body(1, 10 * 1024 * 1024);
+    let mut new = old.clone();
+    new[5_000_000..5_001_000].fill(0xCD);
+    write(&tgt, "big.bin", &old);
+    write(&src, "big.bin", &new);
+    pack_delta(&src, &tgt, &out, "big.bin");
+
+    let mut drifted = old.clone();
+    drifted[10..20].fill(0xEE);
+    write(&tgt, "big.bin", &drifted);
+
+    assert!(pack::apply_pack(&out, Some(&tgt), true, false, false).is_err(), "a stale base must abort the package");
+    assert_eq!(std::fs::read(tgt.join("big.bin")).unwrap(), drifted, "and nothing may have been written");
+}
+
 /// Dry run is the default posture everywhere else in this tool; a package is no exception.
 #[test]
 fn dry_run_writes_nothing() {

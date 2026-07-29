@@ -15,6 +15,10 @@ use super::platform::{exists_no_follow, read_mtime_ms, set_mode, set_mtime};
 use super::preserve::preserve;
 use super::schedule::Shared;
 
+/// Read granularity for the local re-read in the delta lane, and therefore how often
+/// cancel/pause is honoured mid-file. Same 8 MiB the scan lane reads in.
+const READ_CHUNK: u64 = 8 * 1024 * 1024;
+
 /// Execute a single op through the VFS pair. Cancel/pause are honored at chunk
 /// boundaries via `pp.checkpoint()`; a cancel returns Interrupted, and the staged
 /// write's Drop contract guarantees no debris at the destination on either backend.
@@ -54,7 +58,16 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                             staged.seal(sh.opt.fsync)?;
                             if sh.opt.verify {
                                 let mut hasher = blake3::Hasher::new();
-                                hasher.update_mmap_rayon(staged.path())?;
+                                let mut f = std::fs::File::open(staged.path())?;
+                                let mut buf = vec![0u8; total.clamp(1, READ_CHUNK) as usize];
+                                loop {
+                                    pp.checkpoint()?;
+                                    let n = std::io::Read::read(&mut f, &mut buf)?;
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    hasher.update(&buf[..n]);
+                                }
                                 let got = hasher.finalize().to_hex().to_string();
                                 if got != h {
                                     return Err(std::io::Error::new(
@@ -133,24 +146,18 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
             // Verification runs on the staged file: readback vs the copy stream — a failure never becomes the final file
             if let Some(h) = hasher {
                 let expect = h.finalize().to_hex().to_string();
-                let got = if let Some(p) = w.local_path() {
-                    let mut hh = blake3::Hasher::new();
-                    hh.update_mmap_rayon(p)?;
-                    hh.finalize().to_hex().to_string()
-                } else {
-                    let mut rs = w.open_staged_read()?;
-                    let mut hh = blake3::Hasher::new();
-                    let mut b2 = vec![0u8; block];
-                    loop {
-                        pp.checkpoint()?;
-                        let n = std::io::Read::read(&mut rs, &mut b2)?;
-                        if n == 0 {
-                            break;
-                        }
-                        hh.update(&b2[..n]);
+                let mut rs = w.open_staged_read()?;
+                let mut hh = blake3::Hasher::new();
+                let mut b2 = vec![0u8; block];
+                loop {
+                    pp.checkpoint()?;
+                    let n = std::io::Read::read(&mut rs, &mut b2)?;
+                    if n == 0 {
+                        break;
                     }
-                    hh.finalize().to_hex().to_string()
-                };
+                    hh.update(&b2[..n]);
+                }
+                let got = hh.finalize().to_hex().to_string();
                 if got != expect {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,

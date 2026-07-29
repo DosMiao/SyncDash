@@ -283,8 +283,12 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
 - `scan` writes to stdout by default (ssh-friendly: `ssh mac syncdash scan ~/Data > mac.jsonl`).
 - `apply` is **dry-run by default**; only `--apply` touches anything. Deleted or overwritten files go first into
   the local `%LOCALAPPDATA%\syncdash\trash\<timestamp>\` (mac: `~/.cache/syncdash/trash/...`), never destroyed in place.
-- Hashing is BLAKE3 (mmap+rayon, multi-core) with a cache: if `(path,size,mtime)` is unchanged the previous result
+- Hashing is BLAKE3 with a cache: if `(path,size,mtime)` is unchanged the previous result
   is reused; the cache lives in the local user directory and never pollutes the scanned directory.
+  Files are **read, never memory-mapped** — a mapped page whose file was truncated or whose volume
+  disappeared raises SIGBUS, which kills the process outright instead of returning an error, and in
+  `apply` that leaves both root locks on disk. The multi-core gain is given up deliberately;
+  parallelism is per-file, not intra-file. See the `src/lib.rs` header.
 
 ## Semantics of the three modes
 
@@ -563,7 +567,7 @@ list directly). It takes over once its behavior has earned trust.
   breaks transitivity); pairing on content hash gives us stronger evidence, so we keep what we have. FFS collapses
   same-directory renames into a single displayed row — queued for v0.3.
 - **parallel_scan.cpp**: parallel traversal of the directory tree (we currently do serial walkdir + rayon hashing
-  within a single file) — queued for v0.3.
+  across files, serial within one file) — queued for v0.3.
 
 ## Borrowed from the Syncthing source (`.docs/syncthing` @ `119d5e72`, MPL-2.0 — re-implemented from the semantics, no code copied)
 

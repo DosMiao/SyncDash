@@ -1,7 +1,7 @@
 //! The local backend: std::fs + the existing `fs::staged::Staged`, nothing reinvented.
 //!
 //! `as_local()` returns the root, which routes scan down the existing
-//! walkdir+mmap fast path — this impl is what the *generic* engine lanes use, and
+//! walkdir fast path — this impl is what the *generic* engine lanes use, and
 //! its write side deliberately wraps the very same `Staged` the direct lane uses,
 //! so local behavior cannot drift between lanes.
 //!
@@ -391,10 +391,6 @@ impl WriteStaged for LocalStaged {
     fn open_staged_read(&self) -> VfsResult<Box<dyn ReadStream>> {
         let s = self.staged.as_ref().expect("read after commit");
         Ok(Box::new(LocalRead { file: std::fs::File::open(s.path())? }))
-    }
-
-    fn local_path(&self) -> Option<&Path> {
-        self.staged.as_ref().map(|s| s.path())
     }
 
     fn commit(mut self: Box<Self>) -> VfsResult<CommitReport> {
