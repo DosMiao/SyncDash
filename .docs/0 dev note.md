@@ -101,21 +101,3 @@ audit over comment cross all part over my code D:\Code\AlexQuant\Dev\Desktop, by
 
 
 上个版本在这里 m83524a57f1ebc0914e109605100420ed8f8eff37，写一个release log, 说明从这个版本到现在，介绍增/删了什么功能，修复了那些bug（大略就行）
-
-To DO:
-
-Dataservice里面endpoints的修复
-
-
-Holding pipeline, overview vs holding table , unsubscribe(stop dumbping holding table update when not on holding table)
-
-Watchlist页面的渲染修复/效率提升
-
-Performace panel re-design
-
-
-
-I am trying to upgrade my app's liquid glass for a real visual effect:
-1. target visual is this project .libs\liquid-glass-studio-main. I want to mitigate every page container, floating panel container, dropdownlist's conatiner and etc all be will be that effect
-2. now there is alreay a large portion of some revise done, but the rendering is so weird and actually broken my visual, I dont think the current implementation is correct.
-3. Please consider if current architecture is good or bad, we may need change arch if this arch is not suitable for compatible of both windows (intel chip) and mac (m4 chip).
