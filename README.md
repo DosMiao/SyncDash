@@ -671,17 +671,26 @@ strategy is worth reading, but adopting it means going resident).
 
 ## Build
 
-**Windows**: double-click `builder.bat` ([1] Dev HMR / [2] Desktop / [3] CLI / [4] All), or by hand:
+Double-click `builder.bat` on Windows or `builder.command` on macOS. Both are thin
+launchers for the same Rust project Builder under `tools/builder/`, backed by the
+shared core in the sibling `Experience/builder` repository. The complete `Code` tree
+therefore keeps its normal relative layout.
 
-```bash
-npm run build && cargo build --release -p syncdash-desktop   # desktop app
-cargo build --release -p syncdash                            # CLI
+The menu provides `[1] Dev`, `[2] Desktop`, `[3] CLI`, `[4] All`, `[5] Installer`,
+`[R] Run Desktop`, `[6] Kill`, `[7] Unlock`, and `[8] Clean`. The macOS menu also has
+`[A] App Self` and `[V] Reveal`. Named commands are stable for automation:
+
+```text
+builder.bat build desktop
+builder.command build cli
+builder.bat build all
+builder.bat doctor
 ```
 
-The menu carries a second row as well: `[R]` launches the desktop executable already built, `[5]` and `[6]` kill a
-running instance and then wait for its file locks to clear, and `[7]` runs `cargo clean` over the workspace — which
-does **not** touch `dist/`, that being a committed artifact the Mac cannot regenerate. Each phase is timed and each
-artifact is printed as a ctrl-clickable link with its size.
+`--dry-run --host windows|macos` prints either platform's complete command plan
+without building, killing, cleaning, installing, or launching anything. `clean` does
+**not** touch `dist/`, because it is a committed artifact the Mac can consume without
+Node. Each phase is timed and each artifact path and size is reported.
 
 **Every build frees the binary it is about to write first**, which is not politeness but a requirement: cargo links
 straight over `target\release\syncdash-desktop.exe`, so an app left open ends the build at the link step with
@@ -690,11 +699,11 @@ without asking — it is a viewer over the library and relaunches in a second. A
 reported, and killing it takes an explicit *y*: the CLI can be halfway through an `apply`, holding the root
 heartbeat lock and writing files, and a failed build is much the cheaper of the two outcomes.
 
-**Mac (no node required)**: the `dist/` frontend output ships with git and Tauri embeds it at compile time, so
-pure cargo produces the complete GUI:
+**Mac Desktop/CLI/All (no Node required)**: the `dist/` frontend output ships with git
+and Tauri embeds it at compile time, so those actions remain pure Cargo:
 
 ```bash
-bash builder.command     # = cargo build --release -p syncdash-desktop -p syncdash
+bash builder.command build all
 ```
 
 After changing the frontend (typescript/, index.html): run `npm run build` once on Windows and commit dist/ along

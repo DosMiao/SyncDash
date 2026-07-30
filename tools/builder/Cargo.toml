@@ -1,0 +1,10 @@
+[package]
+name = "syncdash-builder"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+builder-core = { path = "../../../../Experience/builder/crates/builder-core" }
+
+[workspace]
