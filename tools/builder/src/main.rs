@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use builder_core::{
-    parse_common_args, project_root_from_manifest, BuildError, BuildResult, Host, Menu, MenuEntry,
-    MenuSection, Runtime,
+    format_duration, normalize_standard_command, parse_common_args, parse_tier_selection,
+    print_standard_info, project_root_from_manifest, standard_project_command, BuildError,
+    BuildResult, BuildTier as Tier, Host, InfoLine, Runtime,
 };
 
 const PROJECT_NAME: &str = "SyncDash";
@@ -34,17 +36,19 @@ fn run() -> BuildResult<()> {
     match command.as_slice() {
         [action] if action == "quit" => Ok(()),
         [action] if action == "dev" => dev(&runtime),
-        [action, target] if action == "build" && target == "desktop" => build_desktop(&runtime),
         [action, target] if action == "build" && target == "cli" => build_cli(&runtime),
-        [action, target] if action == "build" && target == "all" => build_all(&runtime),
         [action, target] if action == "build" && target == "installer" => build_installer(&runtime),
-        [action, target] if action == "run" && target == "desktop" => run_desktop(&runtime),
+        [action, selection] if action == "build" => {
+            build_tiers(&runtime, &parse_tier_selection(selection)?)
+        }
+        [action, tier] if action == "run" => run_tier(&runtime, tier),
         [action] if action == "kill" => kill_only(&runtime),
         [action] if action == "unlock" => kill_and_unlock(&runtime),
         [action] if action == "clean" => clean(&runtime),
         [action] if action == "app-self" => build_app_self(&runtime),
         [action] if action == "reveal" => reveal(&runtime),
         [action] if action == "doctor" => doctor(&runtime),
+        [action] if action == "info" => info(&runtime),
         [action] if action == "help" => {
             print_help();
             Ok(())
@@ -57,128 +61,20 @@ fn run() -> BuildResult<()> {
 }
 
 fn interactive_command(runtime: &Runtime) -> BuildResult<Vec<String>> {
-    let build = [
-        MenuEntry {
-            key: "1",
-            label: "Dev",
-            detail: "tauri dev, HMR",
-        },
-        MenuEntry {
-            key: "2",
-            label: "Desktop",
-            detail: "GUI release",
-        },
-        MenuEntry {
-            key: "3",
-            label: "CLI",
-            detail: "syncdash, no Node",
-        },
-        MenuEntry {
-            key: "4",
-            label: "All",
-            detail: "Desktop + CLI",
-        },
-        MenuEntry {
-            key: "5",
-            label: "Installer",
-            detail: "NSIS or .app + .dmg",
-        },
-    ];
-    let bundle = [
-        MenuEntry {
-            key: "A",
-            label: "App Self",
-            detail: ".app -> /Applications",
-        },
-        MenuEntry {
-            key: "V",
-            label: "Reveal",
-            detail: "open bundle output",
-        },
-    ];
-    let utility = [
-        MenuEntry {
-            key: "R",
-            label: "Run Desktop",
-            detail: "kill + launch",
-        },
-        MenuEntry {
-            key: "6",
-            label: "Kill",
-            detail: "desktop + CLI + dev port",
-        },
-        MenuEntry {
-            key: "7",
-            label: "Unlock",
-            detail: "kill + release locks",
-        },
-        MenuEntry {
-            key: "8",
-            label: "Clean",
-            detail: "cargo target; keep dist/",
-        },
-        MenuEntry {
-            key: "Q",
-            label: "Quit",
-            detail: "",
-        },
-    ];
-    let sections = if runtime.host() == Host::Macos {
-        vec![
-            MenuSection {
-                title: "Build",
-                entries: &build,
-            },
-            MenuSection {
-                title: "Bundle",
-                entries: &bundle,
-            },
-            MenuSection {
-                title: "Utility",
-                entries: &utility,
-            },
-        ]
-    } else {
-        vec![
-            MenuSection {
-                title: "Build",
-                entries: &build,
-            },
-            MenuSection {
-                title: "Utility",
-                entries: &utility,
-            },
-        ]
-    };
-    let choice = Menu {
-        title: "SyncDash Builder",
-        root: runtime.root(),
-        sections: &sections,
-        prompt: "Choice [1-8 R Q]",
-        default: "2",
-    }
-    .choose()?;
-    Ok(normalize_command(&[choice]))
+    standard_project_command(runtime, "SyncDash Builder")
 }
 
 fn normalize_command(input: &[String]) -> Vec<String> {
-    let command: Vec<String> = input.iter().map(|part| part.to_ascii_lowercase()).collect();
-    let normalized: &[&str] = match command.as_slice() {
-        [value] if value == "1" => &["dev"],
-        [value] if value == "2" => &["build", "desktop"],
-        [value] if value == "3" => &["build", "cli"],
-        [value] if value == "4" => &["build", "all"],
-        [value] if value == "5" => &["build", "installer"],
-        [value] if value == "6" => &["kill"],
-        [value] if value == "7" => &["unlock"],
-        [value] if value == "8" => &["clean"],
-        [value] if value == "r" => &["run", "desktop"],
-        [value] if value == "a" => &["app-self"],
-        [value] if value == "v" => &["reveal"],
-        [value] if value == "q" => &["quit"],
-        _ => return command,
-    };
-    normalized.iter().map(|part| (*part).to_owned()).collect()
+    let command = normalize_standard_command(input);
+    match command.as_slice() {
+        [action, target] if action == "build" && target == "desktop" => {
+            vec!["build".to_owned(), "dist".to_owned()]
+        }
+        [action, target] if action == "run" && target == "desktop" => {
+            vec!["run".to_owned(), "dist".to_owned()]
+        }
+        _ => command,
+    }
 }
 
 fn release_dir(runtime: &Runtime) -> PathBuf {
@@ -193,12 +89,40 @@ fn cli_binary(runtime: &Runtime) -> PathBuf {
     release_dir(runtime).join(format!("syncdash{}", runtime.host().exe_suffix()))
 }
 
+fn tier_root(runtime: &Runtime) -> PathBuf {
+    runtime.path("target/builder-tiers")
+}
+
+fn tier_dir(runtime: &Runtime, tier: Tier) -> PathBuf {
+    tier_root(runtime).join(tier.key())
+}
+
+fn tier_desktop_binary(runtime: &Runtime, tier: Tier) -> PathBuf {
+    tier_dir(runtime, tier).join(format!(
+        "SyncDash-{}{}",
+        tier.output_label(),
+        runtime.host().exe_suffix()
+    ))
+}
+
+fn tier_cli_binary(runtime: &Runtime, tier: Tier) -> PathBuf {
+    tier_dir(runtime, tier).join(format!("syncdash{}", runtime.host().exe_suffix()))
+}
+
 fn free_desktop(runtime: &Runtime) -> BuildResult<()> {
     println!();
     println!("  [Kill] Freeing syncdash-desktop ...");
     match runtime.host() {
         Host::Windows => {
-            runtime.kill_named(&["syncdash-desktop"], "syncdash-desktop")?;
+            runtime.kill_named(
+                &[
+                    "syncdash-desktop",
+                    "syncdash-dist",
+                    "syncdash-max",
+                    "syncdash-release",
+                ],
+                "syncdash-desktop",
+            )?;
         }
         Host::Macos => {
             let needles = [
@@ -256,22 +180,50 @@ fn dev(runtime: &Runtime) -> BuildResult<()> {
     runtime.run("npx", ["tauri", "dev"], runtime.root(), &[])
 }
 
-fn build_desktop(runtime: &Runtime) -> BuildResult<()> {
+fn build_tiers(runtime: &Runtime, tiers: &[Tier]) -> BuildResult<()> {
+    if tiers.is_empty() {
+        return Err(BuildError::new("at least one build tier is required"));
+    }
     match runtime.host() {
         Host::Windows => runtime.ensure_node_modules(runtime.root())?,
         Host::Macos => require_committed_dist(runtime)?,
     }
     free_desktop(runtime)?;
+    free_cli(runtime)?;
     runtime.wait_unlocked(&desktop_binary(runtime))?;
+    runtime.wait_unlocked(&cli_binary(runtime))?;
     runtime.total(|| {
+        let frontend_steps = usize::from(runtime.host() == Host::Windows);
+        let step_count = frontend_steps + tiers.len() * 2;
+        let mut step = 1;
         if runtime.host() == Host::Windows {
-            frontend_step(runtime, "[1/2]")?;
-            desktop_step(runtime, "[2/2]")?;
-        } else {
-            desktop_step(runtime, "[1/1]")?;
+            frontend_step(runtime, &format!("[{step}/{step_count}]"))?;
+            step += 1;
         }
-        runtime.print_artifact(&desktop_binary(runtime), "DESKTOP OK - syncdash-desktop")?;
-        runtime.launch(&desktop_binary(runtime))
+        let mut results: Vec<(Tier, Duration, u64, u64)> = Vec::new();
+        for tier in tiers.iter().copied() {
+            let environment = tier.release_environment(runtime.host());
+            let started = std::time::Instant::now();
+            desktop_step(runtime, &format!("[{step}/{step_count}]"), &environment)?;
+            step += 1;
+            cli_step(runtime, &format!("[{step}/{step_count}]"), &environment)?;
+            step += 1;
+            let (desktop_mb, cli_mb) = pack_tier(runtime, tier)?;
+            results.push((tier, started.elapsed(), desktop_mb, cli_mb));
+        }
+
+        println!();
+        println!("  ===== SELECTED TIERS BUILT OK =====");
+        for (tier, elapsed, desktop_mb, cli_mb) in results {
+            println!(
+                "  {:<9} {}  desktop {} MB  cli {} MB",
+                tier.output_label(),
+                format_duration(elapsed),
+                desktop_mb,
+                cli_mb
+            );
+        }
+        Ok(())
     })
 }
 
@@ -279,33 +231,10 @@ fn build_cli(runtime: &Runtime) -> BuildResult<()> {
     runtime.require_program("cargo")?;
     free_cli(runtime)?;
     runtime.wait_unlocked(&cli_binary(runtime))?;
+    let environment = Tier::Dist.release_environment(runtime.host());
     runtime.total(|| {
-        cli_step(runtime, "[1/1]")?;
+        cli_step(runtime, "[1/1]", &environment)?;
         runtime.print_artifact(&cli_binary(runtime), "CLI OK - syncdash")
-    })
-}
-
-fn build_all(runtime: &Runtime) -> BuildResult<()> {
-    match runtime.host() {
-        Host::Windows => runtime.ensure_node_modules(runtime.root())?,
-        Host::Macos => require_committed_dist(runtime)?,
-    }
-    free_desktop(runtime)?;
-    free_cli(runtime)?;
-    runtime.wait_unlocked(&desktop_binary(runtime))?;
-    runtime.wait_unlocked(&cli_binary(runtime))?;
-    runtime.total(|| {
-        if runtime.host() == Host::Windows {
-            frontend_step(runtime, "[1/3]")?;
-            desktop_step(runtime, "[2/3]")?;
-            cli_step(runtime, "[3/3]")?;
-        } else {
-            desktop_step(runtime, "[1/2]")?;
-            cli_step(runtime, "[2/2]")?;
-        }
-        runtime.print_artifact(&desktop_binary(runtime), "DESKTOP OK - syncdash-desktop")?;
-        runtime.print_artifact(&cli_binary(runtime), "CLI OK - syncdash")?;
-        runtime.launch(&desktop_binary(runtime))
     })
 }
 
@@ -317,7 +246,11 @@ fn frontend_step(runtime: &Runtime, counter: &str) -> BuildResult<()> {
         .map(|_| ())
 }
 
-fn desktop_step(runtime: &Runtime, counter: &str) -> BuildResult<()> {
+fn desktop_step(
+    runtime: &Runtime,
+    counter: &str,
+    environment: &[(String, Option<String>)],
+) -> BuildResult<()> {
     runtime
         .phase(
             &format!("{counter} CARGO - syncdash-desktop, release"),
@@ -326,30 +259,61 @@ fn desktop_step(runtime: &Runtime, counter: &str) -> BuildResult<()> {
                     "cargo",
                     ["build", "--release", "-p", "syncdash-desktop"],
                     runtime.root(),
-                    &[],
+                    environment,
                 )
             },
         )
         .map(|_| ())
 }
 
-fn cli_step(runtime: &Runtime, counter: &str) -> BuildResult<()> {
+fn cli_step(
+    runtime: &Runtime,
+    counter: &str,
+    environment: &[(String, Option<String>)],
+) -> BuildResult<()> {
     runtime
         .phase(&format!("{counter} CARGO - syncdash, release"), || {
             runtime.run(
                 "cargo",
                 ["build", "--release", "-p", "syncdash"],
                 runtime.root(),
-                &[],
+                environment,
             )
         })
         .map(|_| ())
+}
+
+fn pack_tier(runtime: &Runtime, tier: Tier) -> BuildResult<(u64, u64)> {
+    let directory = tier_dir(runtime, tier);
+    runtime.remove_directory(&directory)?;
+    runtime.create_directory(&directory)?;
+    let desktop = tier_desktop_binary(runtime, tier);
+    let cli = tier_cli_binary(runtime, tier);
+    runtime.copy_file(&desktop_binary(runtime), &desktop)?;
+    runtime.copy_file(&cli_binary(runtime), &cli)?;
+    if runtime.host() == Host::Macos {
+        runtime.run(
+            "chmod",
+            ["+x".as_ref(), desktop.as_os_str(), cli.as_os_str()],
+            runtime.root(),
+            &[],
+        )?;
+    }
+    let desktop_mb = runtime.file_size_mb(&desktop)?;
+    let cli_mb = runtime.file_size_mb(&cli)?;
+    runtime.print_artifact(
+        &desktop,
+        &format!("PACKAGED - SyncDash {}", tier.output_label()),
+    )?;
+    runtime.print_artifact(&cli, &format!("CLI - SyncDash {}", tier.output_label()))?;
+    Ok((desktop_mb, cli_mb))
 }
 
 fn build_installer(runtime: &Runtime) -> BuildResult<()> {
     runtime.ensure_node_modules(runtime.root())?;
     free_desktop(runtime)?;
     runtime.wait_unlocked(&desktop_binary(runtime))?;
+    let environment = Tier::Release.release_environment(runtime.host());
     match runtime.host() {
         Host::Windows => runtime.total(|| {
             runtime.phase("INSTALLER - Vite bundle + exe + NSIS setup", || {
@@ -357,7 +321,7 @@ fn build_installer(runtime: &Runtime) -> BuildResult<()> {
                     "npx",
                     ["tauri", "build", "--bundles", "nsis"],
                     runtime.root(),
-                    &[],
+                    &environment,
                 )
             })?;
             let setup = newest_windows_setup(runtime, &release_dir(runtime).join("bundle/nsis"))?;
@@ -371,7 +335,7 @@ fn build_installer(runtime: &Runtime) -> BuildResult<()> {
                     "npx",
                     ["tauri", "build", "--bundles", "app,dmg"],
                     runtime.root(),
-                    &[],
+                    &environment,
                 )
             })?;
             let bundle = release_dir(runtime).join("bundle");
@@ -388,13 +352,14 @@ fn build_app_self(runtime: &Runtime) -> BuildResult<()> {
     }
     runtime.ensure_node_modules(runtime.root())?;
     free_desktop(runtime)?;
+    let environment = Tier::Max.release_environment(runtime.host());
     runtime.total(|| {
         runtime.phase("SELF-USE APP - tauri build (.app)", || {
             runtime.run(
                 "npx",
                 ["tauri", "build", "--bundles", "app"],
                 runtime.root(),
-                &[],
+                &environment,
             )
         })?;
         let app = runtime.newest_entry(&release_dir(runtime).join("bundle/macos"), ".app")?;
@@ -403,9 +368,19 @@ fn build_app_self(runtime: &Runtime) -> BuildResult<()> {
     })
 }
 
-fn run_desktop(runtime: &Runtime) -> BuildResult<()> {
+fn run_tier(runtime: &Runtime, value: &str) -> BuildResult<()> {
+    let binary = if value.eq_ignore_ascii_case("dev") {
+        if runtime.host() != Host::Windows {
+            return Err(BuildError::new(
+                "the macOS dev binary depends on its Vite server and cannot be relaunched standalone",
+            ));
+        }
+        runtime.path("target/debug/syncdash-desktop.exe")
+    } else {
+        tier_desktop_binary(runtime, Tier::parse(value)?)
+    };
     free_desktop(runtime)?;
-    runtime.launch(&desktop_binary(runtime))
+    runtime.launch(&binary)
 }
 
 fn kill_only(runtime: &Runtime) -> BuildResult<()> {
@@ -420,10 +395,17 @@ fn kill_and_unlock(runtime: &Runtime) -> BuildResult<()> {
         Host::Windows => {
             runtime.wait_unlocked(&desktop_binary(runtime))?;
             runtime.wait_unlocked(&runtime.path("target/debug/syncdash-desktop.exe"))?;
-            runtime.wait_unlocked(&cli_binary(runtime))
+            runtime.wait_unlocked(&cli_binary(runtime))?;
+            for tier in [Tier::Dist, Tier::Max, Tier::Release] {
+                runtime.wait_unlocked(&tier_desktop_binary(runtime, tier))?;
+                runtime.wait_unlocked(&tier_cli_binary(runtime, tier))?;
+            }
+            Ok(())
         }
         Host::Macos => {
             runtime.kill_installed_app(Path::new("/Applications/SyncDash.app"))?;
+            let removed = runtime.purge_appledouble()?;
+            println!("  Removed {removed} AppleDouble files.");
             Ok(())
         }
     }
@@ -443,16 +425,34 @@ fn clean(runtime: &Runtime) -> BuildResult<()> {
 }
 
 fn reveal(runtime: &Runtime) -> BuildResult<()> {
-    if runtime.host() != Host::Macos {
-        return Err(BuildError::new("reveal is available only on macOS"));
-    }
     let bundle = release_dir(runtime).join("bundle");
     let selected = if bundle.join("dmg").is_dir() {
         bundle.join("dmg")
+    } else if tier_root(runtime).is_dir() {
+        tier_root(runtime)
     } else {
-        bundle.join("macos")
+        release_dir(runtime)
     };
     runtime.reveal(&selected)
+}
+
+fn info(runtime: &Runtime) -> BuildResult<()> {
+    let extra = [
+        InfoLine {
+            suffix: "build cli",
+            detail: "build only the standalone CLI using Dist settings",
+        },
+        InfoLine {
+            suffix: "app-self",
+            detail: "macOS: build, verify, and install the self-use app",
+        },
+        InfoLine {
+            suffix: "clean",
+            detail: "clean Cargo outputs while preserving committed dist/",
+        },
+    ];
+    print_standard_info(runtime, PROJECT_NAME, &extra);
+    Ok(())
 }
 
 fn doctor(runtime: &Runtime) -> BuildResult<()> {
@@ -473,6 +473,10 @@ fn doctor(runtime: &Runtime) -> BuildResult<()> {
         "  [ok] npm:   {}",
         runtime.require_program("npm")?.display()
     );
+    println!(
+        "  [ok] npx:   {}",
+        runtime.require_program("npx")?.display()
+    );
     println!("SyncDash builder doctor passed.");
     Ok(())
 }
@@ -488,10 +492,14 @@ fn print_help() {
         "SyncDash builder\n\n\
          Commands:\n\
            dev\n\
-           build desktop|cli|all|installer\n\
-           run desktop\n\
-           kill | unlock | clean | doctor\n\
-           app-self | reveal             macOS only\n\n\
+           build dist|max|release|12|13|23|123|installer\n\
+           build desktop                 legacy alias for Dist\n\
+           build cli                     standalone CLI only\n\
+           run dev|dist|max|release\n\
+           run desktop                   legacy alias for Dist\n\
+           kill | unlock | clean | doctor | info\n\
+           app-self                      macOS only\n\
+           reveal\n\n\
          Global flags:\n\
            --dry-run\n\
            --host windows|macos           with --dry-run only"
@@ -504,7 +512,8 @@ mod tests {
 
     #[test]
     fn menu_aliases_map_to_stable_commands() {
-        assert_eq!(normalize_command(&["4".to_owned()]), ["build", "all"]);
-        assert_eq!(normalize_command(&["r".to_owned()]), ["run", "desktop"]);
+        assert_eq!(normalize_command(&["4".to_owned()]), ["build", "installer"]);
+        assert_eq!(normalize_command(&["123".to_owned()]), ["build", "123"]);
+        assert_eq!(normalize_command(&["s".to_owned()]), ["run", "dist"]);
     }
 }

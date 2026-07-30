@@ -676,16 +676,25 @@ launchers for the same Rust project Builder under `tools/builder/`, backed by th
 shared core in the sibling `Experience/builder` repository. The complete `Code` tree
 therefore keeps its normal relative layout.
 
-The menu provides `[1] Dev`, `[2] Desktop`, `[3] CLI`, `[4] All`, `[5] Installer`,
-`[R] Run Desktop`, `[6] Kill`, `[7] Unlock`, and `[8] Clean`. The macOS menu also has
-`[A] App Self` and `[V] Reveal`. Named commands are stable for automation:
+The common Build row is `[D] Dev`, `[1] Dist`, `[2] Max`, `[3] Release`, and
+`[4] Installer`. Enter `12`, `13`, `23`, or `123` to build those tiers
+sequentially; there is no ambiguous `All` action. Every optimized tier packages the
+desktop and matching CLI together under `target/builder-tiers/<tier>/`.
+
+The Run row is `[V]` Dev on Windows plus `[S]` Dist, `[M]` Max, and `[R]` Release.
+Utilities are `[K]` Kill, `[U]` Unlock, `[C]` Clean, `[O]` Doctor, `[I]` Info,
+`[B]` Reveal, and `[Q]` Quit. macOS also has `[A] Install App`. Named commands are
+stable for automation:
 
 ```text
-builder.bat build desktop
+builder.bat build dist
 builder.command build cli
-builder.bat build all
+builder.bat build 123
 builder.bat doctor
 ```
+
+`build desktop` and `run desktop` remain legacy aliases for Dist. `build cli` remains
+the explicit standalone-CLI shortcut and uses the Dist policy.
 
 `--dry-run --host windows|macos` prints either platform's complete command plan
 without building, killing, cleaning, installing, or launching anything. `clean` does
@@ -699,11 +708,12 @@ without asking — it is a viewer over the library and relaunches in a second. A
 reported, and killing it takes an explicit *y*: the CLI can be halfway through an `apply`, holding the root
 heartbeat lock and writing files, and a failed build is much the cheaper of the two outcomes.
 
-**Mac Desktop/CLI/All (no Node required)**: the `dist/` frontend output ships with git
-and Tauri embeds it at compile time, so those actions remain pure Cargo:
+**Mac Dist/Max/Release and standalone CLI (no Node required)**: the `dist/` frontend
+output ships with git and Tauri embeds it at compile time, so those actions remain
+pure Cargo:
 
 ```bash
-bash builder.command build all
+bash builder.command build 123
 ```
 
 After changing the frontend (typescript/, index.html): run `npm run build` once on Windows and commit dist/ along
