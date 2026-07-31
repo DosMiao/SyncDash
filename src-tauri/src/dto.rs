@@ -37,13 +37,12 @@ pub(crate) struct JobDto {
 pub(crate) struct PlanDto {
     pub(crate) header: PlanHeader,
     pub(crate) ops: Vec<Op>,
-    /// One entry per op: rows that can be flipped carry the reverse op, the rest are null
-    pub(crate) reversed: Vec<Option<Op>>,
     /// One entry per op: the size/mtime measured on both sides at compare time (for the table columns and sorting).
-    /// A parallel array rather than extra fields on Op — Op literals appear in thirty-odd places in compare.rs,
-    /// and that would change the on-disk plan JSONL format. The op shape preflight/apply receive stays unchanged.
+    /// Copy rows already carry their sole side's size/mtime in `Op`, so their entry is null and the
+    /// frontend reconstructs it. This matters at six figures: two nested JSON objects per copy row
+    /// otherwise account for most of WebKit's retained allocations.
     #[serde(default)]
-    pub(crate) metas: Vec<compare::evidence::RowMeta>,
+    pub(crate) metas: Vec<Option<compare::evidence::RowMeta>>,
     /// Count/bytes of the files judged equal on both sides (the denominator of "showing X of Y")
     #[serde(default)]
     #[ts(type = "number")]

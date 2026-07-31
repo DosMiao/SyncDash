@@ -86,15 +86,25 @@ pub async fn compare_job(
             r.as_ref().err().map(syncdash::obs::progress::is_cancelled).unwrap_or(false),
         );
         let out = r.map_err(user_err)?;
-        let reversed = out.plan.ops.iter().map(compare::evidence::reverse_op).collect();
         // Evidence layer: measured size/mtime on both sides + equal-item counts. It shares the same
         // norm_key/files_equal as compare(), so the definitions cannot drift apart.
         let ev = compare::evidence::evidence(&out.source, &out.target, &out.plan, &job.compare_opts());
+        let metas = ev
+            .metas
+            .into_iter()
+            .zip(&out.plan.ops)
+            .map(|(meta, op)| {
+                if matches!(op.action, Action::Copy) && op.size.is_some() && op.mtime_ms.is_some() {
+                    None
+                } else {
+                    Some(meta)
+                }
+            })
+            .collect();
         let dto = PlanDto {
             header: out.plan.header,
             ops: out.plan.ops,
-            reversed,
-            metas: ev.metas,
+            metas,
             equal_count: ev.equal_count,
             equal_bytes: ev.equal_bytes,
         };

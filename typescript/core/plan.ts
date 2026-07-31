@@ -13,9 +13,8 @@ export type OpDto = Op;
 export interface PlanDto {
   header: PlanHeader;
   ops: OpDto[];
-  reversed: (OpDto | null)[];
-  /// Measured size/mtime for both sides, one entry per op (produced by compare::evidence on the Rust side)
-  metas: RowMeta[];
+  /// Measured size/mtime for both sides. Copy rows are null because Op already carries their sole side.
+  metas: (RowMeta | null)[];
   equal_count: number;
   equal_bytes: number;
 }
@@ -51,13 +50,54 @@ export const SORT_LABEL: Record<SortKey, string> = {
 /// Same value as MTIME_SLACK_MS on the Rust side: FAT/SMB timestamp granularity — under 2 s is not an "update"
 export const MTIME_SLACK = 2000;
 
+// A 250k-row comparison used to ship a second complete Op for every reversible row. Besides
+// duplicating paths and reasons across the Tauri JSON boundary, WebKit had to retain both object
+// graphs and peaked above 1 GB before the table first painted. Reversal is needed only for rows the
+// user explicitly flips, so derive and cache those few objects lazily from the original operation.
+const reverseCache = new WeakMap<OpDto, OpDto | null>();
+
+function reverseOp(op: OpDto): OpDto | null {
+  if (reverseCache.has(op)) return reverseCache.get(op) ?? null;
+  const side = op.side === 'source' ? 'target' : 'source';
+  const reason = `flipped(${op.reason})`;
+  let out: OpDto | null;
+  switch (op.action) {
+    case 'copy':
+      out = {
+        ...op, side, action: 'delete', from: null, mtime_ms: null,
+        hash: null, link: null, reason,
+      };
+      break;
+    case 'update':
+      out = {
+        ...op, side, from: null, size: null, mtime_ms: null, hash: null, reason,
+      };
+      break;
+    case 'delete':
+      out = { ...op, side, action: 'copy', from: null, mtime_ms: null, reason };
+      break;
+    default:
+      out = null;
+  }
+  reverseCache.set(op, out);
+  return out;
+}
+
 /// The op currently in effect for this row (once flipped, the reversed one)
 export function eff(plan: PlanDto, flipped: boolean[], i: number): OpDto {
-  return flipped[i] && plan.reversed[i] ? plan.reversed[i]! : plan.ops[i];
+  const op = plan.ops[i];
+  return flipped[i] ? (reverseOp(op) ?? op) : op;
 }
 
 export function metaOf(plan: PlanDto, i: number): RowMeta {
-  return plan.metas?.[i] ?? { src: null, dst: null };
+  const sent = plan.metas?.[i];
+  if (sent) return sent;
+  const op = plan.ops[i];
+  if (op.action === 'copy' && op.size != null && op.mtime_ms != null) {
+    const one = { size: op.size, mtime_ms: op.mtime_ms };
+    return op.side === 'target' ? { src: one, dst: null } : { src: null, dst: one };
+  }
+  return { src: null, dst: null };
 }
 
 /// Conflicts and notes are reports, not actions: they can neither be checked nor reversed
@@ -66,7 +106,8 @@ export function selectable(op: OpDto): boolean {
 }
 
 export function canFlip(plan: PlanDto, i: number): boolean {
-  return !!plan.reversed[i] && selectable(plan.ops[i]);
+  const action = plan.ops[i].action;
+  return action === 'copy' || action === 'update' || action === 'delete';
 }
 
 /// Never returns 'all' — that chip is the *absence* of a filter, not a category — so the return type

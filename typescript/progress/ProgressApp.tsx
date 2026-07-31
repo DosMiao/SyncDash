@@ -44,7 +44,6 @@ export function ProgressApp() {
   whenFinRef.current = whenFin;
 
   useEffect(() => {
-    if (navigator.userAgent.includes('Macintosh')) document.body.classList.add('mac');
     // This window opens fresh each run, so it has to re-assert the scale the main window is using
     void applyZoom(readZoom());
   }, []);

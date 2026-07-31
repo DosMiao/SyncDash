@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, ChevronUp } from 'lucide-react';
 import { baseOf, dirOf, fmtTime, fullPath, humanSize } from '../../core/format';
 import { canFlip, eff, metaOf, newerSide, rowAction, selectable, sidePaths } from '../../core/plan';
@@ -16,6 +16,7 @@ interface Props {
   rowPlan: RowSpec[];
   visible: number[];
   pathMode: 'rel' | 'full';
+  grouped: boolean;
   sort: Sort | null;
   collapsedDirs: Set<string>;
   /// The scroll container, owned by whoever rendered this table. Both the virtual window and the
@@ -193,7 +194,7 @@ function timeCell(sm: SideMeta | null, tint: boolean): Cell {
 
 export function PlanTable(props: Props) {
   const {
-    plan, flipped, checked, rowPlan, visible, pathMode, sort, collapsedDirs, resetKey, wrap,
+    plan, flipped, checked, rowPlan, visible, pathMode, grouped, sort, collapsedDirs, resetKey, wrap,
     onToggleRow, onToggleMany, onFlip, onFoldDir, onSort, onContextRow,
   } = props;
 
@@ -207,9 +208,29 @@ export function PlanTable(props: Props) {
   const cols = COLS.filter((c) => c.w[mode] !== undefined);
   const shown = new Set<ColId>(cols.map((c) => c.id));
   const nCols = cols.length;
+  const tableMinWidth = minWidth(cols, mode);
 
-  const selectableVisible = visible.filter((i) => selectable(eff(plan, flipped, i)));
-  const allChecked = selectableVisible.length > 0 && selectableVisible.every((i) => checked[i]);
+  const colGroup = () => (
+    <colgroup>
+      {cols.map((c) => {
+        const w = c.w[mode];
+        return <col key={c.id} style={w != null ? { width: w } : undefined} />;
+      })}
+    </colgroup>
+  );
+
+  // Scrolling updates this component's local virtual-window state every animation frame. These two
+  // full-plan passes used to run on every one of those renders; at several hundred thousand rows,
+  // trackpad momentum allocated another multi-megabyte index array per frame until WebKit hit
+  // memory pressure and painted the window black.
+  const selectableVisible = useMemo(
+    () => visible.filter((i) => selectable(eff(plan, flipped, i))),
+    [plan, flipped, visible],
+  );
+  const allChecked = useMemo(
+    () => selectableVisible.length > 0 && selectableVisible.every((i) => checked[i]),
+    [selectableVisible, checked],
+  );
 
   /// Where "this side is newer" gets painted: the claim is about the mtime, so it takes the most
   /// specific of that side's columns still on screen, falling back to the path once the narrowest
@@ -218,44 +239,14 @@ export function PlanTable(props: Props) {
   const newerCol = (side: 's' | 't'): ColId =>
     (shown.has(`${side}.mtime`) ? `${side}.mtime` : shown.has(`${side}.size`) ? `${side}.size` : `${side}.path`);
 
-  return (
-    <table className="plantable" style={{ minWidth: minWidth(cols, mode) }}>
-      <colgroup>
-        {cols.map((c) => {
-          const w = c.w[mode];
-          return <col key={c.id} style={w != null ? { width: w } : undefined} />;
-        })}
-      </colgroup>
-      <thead ref={theadRef}>
-        <tr>
-          {cols.map((c) => (
-            <th key={c.id} className={c.cls} title={c.headTitle}>
-              {c.id === 'chk' ? (
-                <TriCheckbox
-                  checked={allChecked}
-                  title="Select all / none (current view)"
-                  onChange={(v) => onToggleMany(selectableVisible, v)}
-                />
-              ) : (
-                <>
-                  <SortHead k={c.id} sort={sort} onSort={onSort} />
-                  {(c.adopts?.[mode] ?? []).map((k) => (
-                    <span key={k}> · <SortHead k={k} sort={sort} onSort={onSort} /></span>
-                  ))}
-                </>
-              )}
-            </th>
-          ))}
-        </tr>
-      </thead>
-      <tbody ref={bodyRef}>
-        {win.padTop > 0 && <tr className="vspacer"><td colSpan={nCols} style={{ height: win.padTop }} /></tr>}
+  const rows = (
+    <tbody ref={bodyRef}>
         {rowPlan.slice(win.from, win.to).map((spec, k) => {
           // Zebra striping keys off the real row index, not :nth-child — otherwise the stripes flip as
           // the window scrolls
           const alt = (win.from + k) % 2 === 1;
 
-          if (spec.kind === 'grp') {
+          if (typeof spec !== 'number') {
             // sel and bytes are computed once when the layout is built, not per render: this row is
             // re-rendered on every scroll frame it is on screen
             const { sel, bytes } = spec;
@@ -286,8 +277,9 @@ export function PlanTable(props: Props) {
             );
           }
 
-          const i = spec.i;
+          const i = spec;
           const op = eff(plan, flipped, i);
+          const groupDir = grouped ? dirOf(op.path) : null;
           const flippable = canFlip(plan, i);
           const act = rowAction(op);
           const [sp, tp] = sidePaths(op);
@@ -300,7 +292,7 @@ export function PlanTable(props: Props) {
           // path tooltip absorbs its numbers — dropped information always lands on the same side.
           const pathCell = (pv: string | null, root: string, sm: SideMeta | null, side: 's' | 't'): Cell => {
             if (!pv) return { cls: 'mono dim' };
-            const text = spec.groupDir !== null && dirOf(pv) === spec.groupDir
+            const text = groupDir !== null && dirOf(pv) === groupDir
               ? baseOf(pv)
               : pathMode === 'full' ? fullPath(root, pv) : pv;
             const abs = fullPath(root, pv);
@@ -353,7 +345,7 @@ export function PlanTable(props: Props) {
           return (
             <tr
               key={`r:${i}`}
-              className={[!checked[i] && 'off', flipped[i] && 'flip', spec.groupDir !== null && 'ingrp', alt && 'alt']
+              className={[!checked[i] && 'off', flipped[i] && 'flip', groupDir !== null && 'ingrp', alt && 'alt']
                 .filter(Boolean).join(' ')}
               onContextMenu={(e) => { e.preventDefault(); onContextRow(i, e.clientX, e.clientY); }}
             >
@@ -368,8 +360,49 @@ export function PlanTable(props: Props) {
             </tr>
           );
         })}
-        {win.padBottom > 0 && <tr className="vspacer"><td colSpan={nCols} style={{ height: win.padBottom }} /></tr>}
-      </tbody>
-    </table>
+    </tbody>
+  );
+
+  // `useVirtualRows` maps the complete logical list onto a bounded physical canvas. Do not put the
+  // logical total or row offset directly into CSS: that recreates a multi-million-pixel render space
+  // even though only one screenful of rows is mounted.
+  return (
+    <div
+      className="vtable-canvas"
+      style={{ minWidth: tableMinWidth, height: win.canvasHeight }}
+    >
+      <table className="plantable vtable-head">
+        {colGroup()}
+        <thead ref={theadRef}>
+          <tr>
+            {cols.map((c) => (
+              <th key={c.id} className={c.cls} title={c.headTitle}>
+                {c.id === 'chk' ? (
+                  <TriCheckbox
+                    checked={allChecked}
+                    title="Select all / none (current view)"
+                    onChange={(v) => onToggleMany(selectableVisible, v)}
+                  />
+                ) : (
+                  <>
+                    <SortHead k={c.id} sort={sort} onSort={onSort} />
+                    {(c.adopts?.[mode] ?? []).map((k) => (
+                      <span key={k}> · <SortHead k={k} sort={sort} onSort={onSort} /></span>
+                    ))}
+                  </>
+                )}
+              </th>
+            ))}
+          </tr>
+        </thead>
+      </table>
+      <table
+        className="plantable vtable-body"
+        style={{ transform: `translate3d(0, ${win.bodyTop}px, 0)` }}
+      >
+        {colGroup()}
+        {rows}
+      </table>
+    </div>
   );
 }

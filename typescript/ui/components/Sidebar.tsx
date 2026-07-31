@@ -35,7 +35,7 @@ export function Sidebar(props: Props) {
 
   return (
     <aside className="sidebar">
-      <div className="brand" data-tauri-drag-region>Sync<span>Dash</span></div>
+      <div className="brand">Sync<span>Dash</span></div>
       <div className="joblist">
         {jobs.map((j) => (
           <div

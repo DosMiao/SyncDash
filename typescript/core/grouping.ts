@@ -15,9 +15,13 @@ import type { PlanDto, Sort } from './plan';
 
 /// One rendered line. A flat array of these is what the virtual scroller consumes: it measures one
 /// row and one group row, so the two kinds must stay distinguishable and the array must stay flat.
+// A normal row is just its plan index. Keeping `{ kind: 'row', i, groupDir }` for every visible
+// item looked harmless at 20k rows, but a large compare can hold hundreds of thousands: the
+// "virtual" table then retained one extra JS object per row before it rendered a single line.
+// Group headers need metadata and stay objects; member rows recover their directory from the op.
 export type RowSpec =
-  | { kind: 'grp'; dir: string; items: number[]; sel: number[]; bytes: number }
-  | { kind: 'row'; i: number; groupDir: string | null };
+  | number
+  | { kind: 'grp'; dir: string; items: number[]; sel: number[]; bytes: number };
 
 export interface GroupSpec {
   dir: string;
@@ -182,11 +186,13 @@ export function buildLayout(inp: LayoutInput): PlanLayout {
 /// The flat line list the table renders. Split from buildLayout so that folding a directory — which
 /// changes only which member rows are emitted — costs one O(n) pass instead of redoing the sort.
 export function flattenLayout(layout: PlanLayout, collapsed: ReadonlySet<string>): RowSpec[] {
-  if (!layout.groups) return layout.order.map((i) => ({ kind: 'row', i, groupDir: null }));
+  // `number[]` is already a valid RowSpec[] and is immutable by contract. In flat mode this avoids
+  // both a full-size copy and one object allocation per visible operation.
+  if (!layout.groups) return layout.order;
   const out: RowSpec[] = [];
   for (const g of layout.groups) {
     out.push({ kind: 'grp', dir: g.dir, items: g.items, sel: g.sel, bytes: g.bytes });
-    if (!collapsed.has(g.dir)) for (const i of g.items) out.push({ kind: 'row', i, groupDir: g.dir });
+    if (!collapsed.has(g.dir)) for (const i of g.items) out.push(i);
   }
   return out;
 }

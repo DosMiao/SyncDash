@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useState } from 'react';
+import { projectVirtualGeometry } from './virtualGeometry';
 import type { RefObject } from 'react';
 import type { RowSpec } from '../../core/grouping';
 
@@ -6,13 +7,11 @@ import type { RowSpec } from '../../core/grouping';
 //
 // One diff row = <tr> + up to 9 <td> + checkbox + action cell. Thousands of those in a live <table> cost
 // seconds just to build and to recompute column widths — and a chip switch, a keystroke in the search box,
-// or folding one directory redoes all of it. So we mount only the viewport's rows and pad above and below
-// with spacer rows that stretch the scrollbar to the real height: render cost drops from O(whole table) to
-// O(one screen).
+// or folding one directory redoes all of it. So we mount only the viewport's rows inside a bounded
+// scroll canvas: render cost and browser-facing geometry both stay finite.
 //
-// Row heights are measured from the live DOM rather than hard-coded, so a change to the type scale or to
-// the row padding — or the user zooming the whole webview — corrects itself on the next frame instead of
-// drifting rows out of place.
+// Row heights are measured from the live DOM rather than hard-coded. The measurement runs when a row
+// layout is mounted or replaced, so CSS changes do not silently make the logical offsets drift.
 //
 // core/grouping.ts decides what the lines are; this hook only decides which of them are on screen.
 
@@ -31,8 +30,10 @@ function rowAt(rowTop: Float64Array, n: number, y: number): number {
 export interface VirtualWindow {
   from: number;
   to: number;
-  padTop: number;
-  padBottom: number;
+  /// Physical coordinate for the translated one-screen body table.
+  bodyTop: number;
+  /// Bounded height assigned to the actual DOM canvas.
+  canvasHeight: number;
 }
 
 /// `wrap` is the scroll container, which the table does not own — it is handed down from whoever
@@ -53,7 +54,10 @@ export function useVirtualRows(
     const n = rowPlan.length;
     const arr = new Float64Array(n + 1);
     let y = 0;
-    for (let k = 0; k < n; k++) { arr[k] = y; y += rowPlan[k].kind === 'grp' ? metrics.grp : metrics.row; }
+    for (let k = 0; k < n; k++) {
+      arr[k] = y;
+      y += typeof rowPlan[k] === 'number' ? metrics.row : metrics.grp;
+    }
     arr[n] = y;
     return arr;
   }, [rowPlan, metrics.row, metrics.grp]);
@@ -63,21 +67,34 @@ export function useVirtualRows(
   useEffect(() => {
     const el = wrap;
     if (!el) return;
-    let pending = false;
+    let raf: number | null = null;
     const onScroll = () => {
-      if (pending) return;
-      pending = true;
-      requestAnimationFrame(() => { pending = false; setView((v) => ({ ...v, top: el.scrollTop })); });
+      if (raf !== null) return;
+      raf = requestAnimationFrame(() => {
+        raf = null;
+        const top = el.scrollTop;
+        setView((v) => (v.top === top ? v : { ...v, top }));
+      });
     };
-    const ro = new ResizeObserver(() => setView((v) => ({ ...v, height: el.clientHeight })));
+    const ro = new ResizeObserver(() => {
+      const height = el.clientHeight;
+      setView((v) => (v.height === height ? v : { ...v, height }));
+    });
     el.addEventListener('scroll', onScroll, { passive: true });
     ro.observe(el);
     setView({ top: el.scrollTop, height: el.clientHeight });
-    return () => { el.removeEventListener('scroll', onScroll); ro.disconnect(); };
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      ro.disconnect();
+      if (raf !== null) cancelAnimationFrame(raf);
+    };
   }, [wrap]);
 
-  // Measure after every commit. Returning the identical state object when nothing moved is what keeps
-  // this from looping: React bails out of the re-render, so there is no measure → setState → measure cycle.
+  // Measure once for each row layout. This effect deliberately does not run after its own metrics
+  // update: React 19 can keep a layout-effect state update in the current commit lane, so merely
+  // returning the old state from the updater is not enough to prevent a nested-update loop (#185).
+  // Zooming the webview does not change CSS-pixel offsetHeight, while every operation that can change
+  // which row shapes exist replaces rowPlan and triggers a fresh measurement.
   useLayoutEffect(() => {
     const body = bodyRef.current;
     if (!body) return;
@@ -90,14 +107,26 @@ export function useVirtualRows(
       if (Math.abs(row - m.row) < 0.5 && Math.abs(grp - m.grp) < 0.5 && Math.abs(head - m.head) < 0.5) return m;
       return { row, grp, head };
     });
-  });
+  }, [rowPlan]);
 
   const n = rowPlan.length;
-  if (n === 0) return { from: 0, to: 0, padTop: 0, padBottom: 0 };
+  if (n === 0) return { from: 0, to: 0, bodyTop: metrics.head, canvasHeight: metrics.head };
 
-  // Inside the scrolled content, tbody starts at the height of the sticky header
-  const top = Math.max(0, view.top - metrics.head);
+  const geometry = projectVirtualGeometry({
+    logicalBodyHeight: rowTop[n],
+    headHeight: metrics.head,
+    viewportHeight: view.height,
+    scrollTop: view.top,
+  });
+  const top = geometry.logicalBodyTop;
   const from = Math.max(0, rowAt(rowTop, n, top) - OVERSCAN);
   const to = Math.min(n, rowAt(rowTop, n, top + view.height) + 1 + OVERSCAN);
-  return { from, to, padTop: rowTop[from], padBottom: rowTop[n] - rowTop[to] };
+
+  // Align the selected logical row with its projected physical viewport position. When the list is
+  // shorter than the cap, physicalScroll === logicalScroll and this reduces to `head + rowTop[from]`.
+  // On a huge list the table still moves only within the bounded canvas.
+  const bodyTop = Math.round(
+    geometry.physicalScroll + metrics.head + rowTop[from] - geometry.logicalScroll,
+  );
+  return { from, to, bodyTop, canvasHeight: geometry.canvasHeight };
 }

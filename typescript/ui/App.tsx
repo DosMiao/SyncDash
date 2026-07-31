@@ -542,7 +542,6 @@ export function App() {
   // Init
 
   useEffect(() => {
-    if (navigator.userAgent.includes('Macintosh')) document.body.classList.add('mac');
     (async () => {
       try {
         const list = await refreshJobs();
@@ -786,7 +785,6 @@ export function App() {
 
   return (
     <>
-      <div className="dragstrip" data-tauri-drag-region />
       <div className="app">
         <Sidebar
           jobs={jobs}
@@ -923,6 +921,7 @@ export function App() {
                   rowPlan={rowPlan}
                   visible={visible}
                   pathMode={pathMode}
+                  grouped={grouped}
                   sort={sort}
                   collapsedDirs={collapsedDirs}
                   wrap={tableWrap}

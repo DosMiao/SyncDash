@@ -5,9 +5,9 @@
 //! that already exists — neither can change what a sync does.
 //!
 //! `reverse_op` is the exception, and the header used to claim otherwise. Its output is not a
-//! description: `cmd::run` precomputes it into the DTO, and when the user flips a row the frontend
-//! builds the apply payload from the reversed op. A field dropped there is a field dropped from a
-//! write. That mistaken "this file is inert" line is why it went unexamined.
+//! description: the desktop mirrors these semantics lazily when a user flips a row and builds the
+//! apply payload from that result. A field dropped by either implementation is a field dropped
+//! from a write. That mistaken "this file is inert" line is why it went unexamined.
 
 
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ pub struct Evidence {
 ///
 /// Why these two fields are not simply stuffed into `Op`: there are thirty-odd `Op { .. }` struct
 /// literals in this file, so adding a field means touching thirty-odd sites, and it would change the
-/// plan JSONL on-disk format and the CLI behavior. We use a parallel array like `PlanDto.reversed`, leaving `compare()` untouched.
+/// plan JSONL on-disk format and the CLI behavior. We use a parallel array, leaving `compare()` untouched.
 ///
 /// The criteria share `norm_key` / `files_equal` with `compare()`, so they cannot drift.
 pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &CompareOptions) -> Evidence {
@@ -162,10 +162,10 @@ pub fn same_page(
 ///
 /// **Built by overriding a clone, not by listing fields.** Each arm used to construct an `Op` from
 /// scratch, which meant every field nobody thought to name was silently dropped — `link` and `mode`
-/// both arrived as `None`. That is not display-only: `cmd::run` precomputes these into the DTO and
-/// the frontend builds the apply payload from the flipped op, so a flipped symlink Update took the
-/// content-copy lane instead of `make_symlink`. Spelling it `..op.clone()` means the next field
-/// added to `Op` is carried here by default and only a deliberate override can drop it.
+/// both arrived as `None`. That is not display-only: the frontend builds the apply payload from the
+/// flipped op, so a flipped symlink Update took the content-copy lane instead of `make_symlink`.
+/// Spelling it `..op.clone()` means the next field added to `Op` is carried here by default and only
+/// a deliberate override can drop it.
 pub fn reverse_op(op: &Op) -> Option<Op> {
     let other = match op.side {
         Side::Source => Side::Target,

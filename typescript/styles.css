@@ -213,10 +213,27 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { border-color
    window edge. */
 .app { display: grid; grid-template-columns: 252px minmax(0, 1fr); }
 .main { display: flex; flex-direction: column; height: 100vh; min-width: 0; }
+.fatal-root {
+  height: 100vh;
+  padding: 32px;
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: var(--sans);
+}
+.fatal-root h1 { margin: 0 0 12px; font-size: var(--fs-lg); }
+.fatal-root p { max-width: 760px; color: var(--text-2); overflow-wrap: anywhere; }
 .reviewrow { flex: 1; display: flex; min-height: 0; min-width: 0; }
 /* min-width 0 so the flex item can go below the table's min-width — the table then scrolls in
    here instead of pushing the whole review row (and the app) wider than the window */
-.tablewrap { flex: 1; overflow: auto; min-width: 0; }
+.tablewrap {
+  flex: 1;
+  overflow: auto;
+  min-width: 0;
+  /* React replaces the mounted row window while scrolling. The browser must not counter-adjust
+     scrollTop around those replacements, and momentum at either edge must stay inside this pane. */
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+}
 
 /* The scan-fault banner. Deliberately in the flow above the review row rather than in the status
    bar: the status line is overwritten by the next message, and this fact has to survive until the
@@ -239,18 +256,6 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { border-color
 /* The samples are paths, so they wrap and scroll rather than widening the app */
 .scanfault ul { margin: 0; padding-left: 16px; max-height: 88px; overflow-y: auto; min-width: 0; }
 .scanfault li { color: var(--text-2); overflow-wrap: anywhere; }
-
-/* macOS immersive title bar: top drag strip plus room for the traffic lights */
-.dragstrip { display: none; }
-body.mac .dragstrip {
-  display: block;
-  position: fixed;
-  top: 0; left: 0; right: 0;
-  height: 34px;
-  z-index: 50;
-}
-body.mac .app { padding-top: 0; }
-body.mac .brand { padding-left: 62px; padding-top: 10px; }
 
 .btn {
   display: inline-flex;
@@ -710,15 +715,31 @@ tr.grp .gmeta { color: var(--text-2); margin-left: 10px; font-size: var(--fs-mic
    name: :first-of-type would mean "the first td in the row", which is always the checkbox. */
 tr.ingrp td.c-path-s { padding-left: 28px; }
 
-/* Virtual scrolling: only the screenful of rows in the viewport is mounted, and spacer rows
-   above and below stretch the scrollbar to the real height. That requires equal row heights and
-   column widths independent of "which rows are mounted".
+/* Virtual scrolling: only the screenful of rows in the viewport is mounted. A bounded canvas owns
+   the physical scroll range; the hook projects it onto the complete logical row range. The body
+   table stays one screen tall and moves only inside that bounded coordinate space.
+   That requires equal row heights and column widths independent of "which rows are mounted".
    Which columns exist and how wide they are lives in PlanTable.tsx (COLS): both change with the
    container width, so the component owns them — including min-width, which is the current column
    set's pinned total plus a floor per path column. Below it the table holds its width and scrolls
    sideways instead of crushing the paths to nothing, and because the floor moves with the set it is
    a real constraint in every mode rather than only the narrowest one. */
 .plantable { table-layout: fixed; }
+.vtable-canvas { position: relative; width: 100%; }
+.vtable-head {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--bg-2);
+}
+.vtable-head thead th { position: static; }
+.vtable-body {
+  position: absolute;
+  top: 0;
+  left: 0;
+  contain: layout paint style;
+  will-change: transform;
+}
 
 /* Row height must stay constant — a wrap in any column throws off the precomputed height and
    rows drift out of place. Under fixed layout, overflow is not clipped automatically and smears
@@ -731,9 +752,6 @@ tr.ingrp td.c-path-s { padding-left: 28px; }
 .plantable thead th { overflow: hidden; text-overflow: ellipsis; }
 
 /* Spacer rows only hold height: no borders, padding, zebra stripes, or hover colour */
-.plantable tr.vspacer, .plantable tr.vspacer:hover { background: none; }
-.plantable tr.vspacer td { padding: 0; border: 0; }
-
 .placeholder {
   display: flex;
   flex-direction: column;
