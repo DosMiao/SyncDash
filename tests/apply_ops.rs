@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use syncdash::fs::vfs::error::VfsResult;
+use syncdash::fs::vfs::error::{VfsError, VfsErrorKind, VfsResult};
 use syncdash::fs::vfs::{
     Medium, ReadStream, VDirEntry, VMeta, VfsCaps, WriteHint, WriteStaged,
 };
@@ -185,7 +185,95 @@ fn update_preserves_old_content_in_trash() {
     let (done, _, errors) = apply::apply(&[op(Action::Update, "f.txt")], &s, &t, &opts(tr.clone()));
     assert_eq!((done, errors), (1, 0));
     assert_eq!(std::fs::read(t.join("f.txt")).unwrap(), b"new");
-    assert_eq!(std::fs::read(tr.join("f.txt")).unwrap(), b"old", "old version must be recoverable");
+    assert_eq!(
+        std::fs::read(tr.join("target/f.txt")).unwrap(),
+        b"old",
+        "old version must be recoverable"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn central_trash_keeps_source_and_target_originals_in_separate_namespaces() {
+    let base = tmproot("trash-sides");
+    let (s, t, tr) = (base.join("s"), base.join("t"), base.join("trash"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(s.join("same.txt"), b"source original").unwrap();
+    std::fs::write(t.join("same.txt"), b"target original").unwrap();
+    let mut source_delete = op(Action::Delete, "same.txt");
+    source_delete.side = Side::Source;
+
+    let out = apply::apply_with(
+        &[source_delete, op(Action::Delete, "same.txt")],
+        &s,
+        &t,
+        &opts(tr.clone()),
+        &RunCtx::null(),
+    );
+
+    assert_eq!((out.done, out.errors), (2, 0));
+    assert_eq!(
+        std::fs::read(tr.join("source/same.txt")).unwrap(),
+        b"source original"
+    );
+    assert_eq!(
+        std::fs::read(tr.join("target/same.txt")).unwrap(),
+        b"target original"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn duplicate_mutations_are_rejected_before_any_original_is_moved() {
+    let base = tmproot("trash-duplicate");
+    let (s, t, tr) = (base.join("s"), base.join("t"), base.join("trash"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(t.join("same.txt"), b"must survive").unwrap();
+
+    let out = apply::apply_with(
+        &[
+            op(Action::Delete, "same.txt"),
+            op(Action::Delete, "same.txt"),
+        ],
+        &s,
+        &t,
+        &opts(tr.clone()),
+        &RunCtx::null(),
+    );
+
+    assert_eq!((out.done, out.errors), (0, 1));
+    assert_eq!(std::fs::read(t.join("same.txt")).unwrap(), b"must survive");
+    assert!(!tr.exists());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn move_refuses_a_destination_that_appeared_after_compare() {
+    let base = tmproot("move-destination-drift");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(t.join("old.txt"), b"planned source").unwrap();
+    std::fs::write(t.join("new.txt"), b"post-compare occupant").unwrap();
+    let mut moving = op(Action::Move, "new.txt");
+    moving.from = Some("old.txt".into());
+
+    let out = apply::apply_with(
+        &[moving],
+        &s,
+        &t,
+        &opts(base.join("trash")),
+        &RunCtx::null(),
+    );
+
+    assert_eq!((out.done, out.errors), (0, 1));
+    assert_eq!(std::fs::read(t.join("old.txt")).unwrap(), b"planned source");
+    assert_eq!(
+        std::fs::read(t.join("new.txt")).unwrap(),
+        b"post-compare occupant"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -218,8 +306,8 @@ fn readonly_files_delete_and_update_like_git_objects() {
     assert!(!t.join("gone.bin").exists(), "the read-only file must really be gone");
     assert_eq!(std::fs::read(t.join("upd.bin")).unwrap(), b"new");
     // and both originals are still recoverable from the trash
-    assert_eq!(std::fs::read(tr.join("gone.bin")).unwrap(), b"old");
-    assert_eq!(std::fs::read(tr.join("upd.bin")).unwrap(), b"old");
+    assert_eq!(std::fs::read(tr.join("target/gone.bin")).unwrap(), b"old");
+    assert_eq!(std::fs::read(tr.join("target/upd.bin")).unwrap(), b"old");
 
     // The assertions above pass on unix without exercising anything: `rm` of a 0444 file succeeds,
     // so the retry never fires and "errors == 0" proves nothing about the code this test names.
@@ -229,7 +317,11 @@ fn readonly_files_delete_and_update_like_git_objects() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(tr.join("gone.bin")).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(tr.join("target/gone.bin"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(
             mode, 0o444,
             "preserving a read-only file must not widen it (0o{mode:o}); on unix the retry is not the remedy and must not run"
@@ -518,17 +610,18 @@ fn delete_dirs_deepest_first_regardless_of_input_order() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A root with a real path that is **not on this machine** — the `\\nas\share` shape.
+/// A root with a real path that cannot reach the configured central trash by rename. A mounted
+/// `\\nas\share` and an external local volume share this shape even though their media differ.
 ///
 /// This exact combination is where the cross-volume trash bug lived: `as_local()` is `Some`, so
 /// delta, mmap hashing and the version store all correctly apply, while the central trash store
-/// sits on the other side of a network link. Only a wrapper can stand in for it; a real one needs
-/// a real share, and `memory::MemVfs` cannot (it has no path at all, so it never took this route).
-struct OffMachine(syncdash::fs::vfs::local::LocalVfs);
+/// sits on the other side of a network link. The wrapper also lets the route report be tested
+/// without depending on whatever volumes happen to be mounted on the test machine.
+struct InRootOnly(syncdash::fs::vfs::local::LocalVfs, Medium);
 
-impl syncdash::fs::vfs::Vfs for OffMachine {
+impl syncdash::fs::vfs::Vfs for InRootOnly {
     fn caps(&self) -> VfsCaps {
-        VfsCaps { medium: Medium::NetworkShare, local_trash: false, ..self.0.caps() }
+        VfsCaps { medium: self.1, local_trash: false, ..self.0.caps() }
     }
     fn display(&self) -> String {
         self.0.display()
@@ -586,6 +679,105 @@ impl syncdash::fs::vfs::Vfs for OffMachine {
     }
 }
 
+struct RenameDrift(InRootOnly);
+
+impl syncdash::fs::vfs::Vfs for RenameDrift {
+    fn caps(&self) -> VfsCaps {
+        self.0.caps()
+    }
+    fn display(&self) -> String {
+        self.0.display()
+    }
+    fn identity(&self) -> String {
+        self.0.identity()
+    }
+    fn as_local(&self) -> Option<&std::path::Path> {
+        self.0.as_local()
+    }
+    fn connect(&self) -> VfsResult<()> {
+        self.0.connect()
+    }
+    fn stat(&self, rel: &str) -> VfsResult<Option<VMeta>> {
+        self.0.stat(rel)
+    }
+    fn read_dir(&self, rel: &str) -> VfsResult<Vec<VDirEntry>> {
+        self.0.read_dir(rel)
+    }
+    fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>> {
+        self.0.open_read(rel)
+    }
+    fn read_range(&self, rel: &str, off: u64, len: u32) -> VfsResult<Vec<u8>> {
+        self.0.read_range(rel, off, len)
+    }
+    fn read_link(&self, rel: &str) -> VfsResult<String> {
+        self.0.read_link(rel)
+    }
+    fn mkdir_all(&self, rel: &str) -> VfsResult<()> {
+        self.0.mkdir_all(rel)
+    }
+    fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
+        self.0.open_write(rel, hint)
+    }
+    fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
+        if from_rel == "old.txt" && to_rel == "new.txt" {
+            std::fs::write(self.as_local().unwrap().join(to_rel), b"raced occupant")?;
+            return Err(VfsError::new(
+                VfsErrorKind::Io,
+                "forced rename fallback after destination drift",
+            ));
+        }
+        self.0.rename(from_rel, to_rel)
+    }
+    fn remove_file(&self, rel: &str) -> VfsResult<()> {
+        self.0.remove_file(rel)
+    }
+    fn remove_dir(&self, rel: &str) -> VfsResult<()> {
+        self.0.remove_dir(rel)
+    }
+    fn set_mtime(&self, rel: &str, mtime_ms: i64) -> VfsResult<()> {
+        self.0.set_mtime(rel, mtime_ms)
+    }
+    fn set_mode(&self, rel: &str, mode: u32) -> VfsResult<()> {
+        self.0.set_mode(rel, mode)
+    }
+    fn make_symlink(&self, rel: &str, target: &str) -> VfsResult<()> {
+        self.0.make_symlink(rel, target)
+    }
+    fn free_space(&self) -> VfsResult<Option<(u64, u64)>> {
+        self.0.free_space()
+    }
+}
+
+#[test]
+fn move_fallback_rechecks_destination_before_staging_a_copy() {
+    let base = tmproot("move-fallback-drift");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(t.join("old.txt"), b"planned source").unwrap();
+    let source: Arc<dyn syncdash::fs::vfs::Vfs> =
+        Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s));
+    let target: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(RenameDrift(InRootOnly(
+        syncdash::fs::vfs::local::LocalVfs::new(t.clone()),
+        Medium::FixedDisk,
+    )));
+    let mut moving = op(Action::Move, "new.txt");
+    moving.from = Some("old.txt".into());
+
+    let out = apply::apply_vfs(
+        &[moving],
+        &source,
+        &target,
+        &opts(base.join("trash")),
+        &RunCtx::null(),
+    );
+
+    assert_eq!((out.done, out.errors), (0, 1));
+    assert_eq!(std::fs::read(t.join("old.txt")).unwrap(), b"planned source");
+    assert_eq!(std::fs::read(t.join("new.txt")).unwrap(), b"raced occupant");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// The bug: preserving an original chose its route from `as_local()`, so a share took the central
 /// trash store, the same-volume rename into it failed, and `move_to_trash` fell back to
 /// `fs::copy` — **downloading every deleted file** before removing it. A mirror clearing 50 GB
@@ -602,7 +794,10 @@ fn an_off_machine_root_preserves_in_place_instead_of_downloading() {
     let sv: Arc<dyn syncdash::fs::vfs::Vfs> =
         Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s.clone()));
     let tv: Arc<dyn syncdash::fs::vfs::Vfs> =
-        Arc::new(OffMachine(syncdash::fs::vfs::local::LocalVfs::new(t.clone())));
+        Arc::new(InRootOnly(
+            syncdash::fs::vfs::local::LocalVfs::new(t.clone()),
+            Medium::NetworkShare,
+        ));
     let out = apply::apply_vfs(
         &[op(Action::Update, "f.txt")],
         &sv,
@@ -614,7 +809,10 @@ fn an_off_machine_root_preserves_in_place_instead_of_downloading() {
     assert_eq!(std::fs::read(t.join("f.txt")).unwrap(), b"new");
 
     // Nothing crossed the link: the central store never sees this root's originals
-    assert!(!tr.join("f.txt").exists(), "the original must not be copied off the root");
+    assert!(
+        !tr.join("target/f.txt").exists(),
+        "the original must not be copied off the root"
+    );
 
     // …it was renamed into the root's own retention area instead, recoverable with any browser
     let kept = std::fs::read_dir(t.join(".syncdash").join("trash"))
@@ -624,6 +822,63 @@ fn an_off_machine_root_preserves_in_place_instead_of_downloading() {
         .find(|p| p.exists())
         .expect("the original must be kept under <root>/.syncdash/trash/<run>/");
     assert_eq!(std::fs::read(kept).unwrap(), b"old", "old version must still be recoverable");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn an_external_local_root_reports_the_in_root_preservation_path() {
+    let base = tmproot("external-retention-report");
+    let (s, t, tr) = (base.join("s"), base.join("external"), base.join("central-trash"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(s.join("f.txt"), b"new").unwrap();
+    std::fs::write(t.join("f.txt"), b"old").unwrap();
+
+    let sv: Arc<dyn syncdash::fs::vfs::Vfs> =
+        Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s));
+    let tv: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(InRootOnly(
+        syncdash::fs::vfs::local::LocalVfs::new(t.clone()),
+        Medium::RemovableDisk,
+    ));
+    let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let copy = events.clone();
+    let ctx = RunCtx::new(RunCtl::new(), Arc::new(move |event| copy.lock().unwrap().push(event)));
+    let out = apply::apply_vfs(
+        &[op(Action::Update, "f.txt")],
+        &sv,
+        &tv,
+        &opts(tr.clone()),
+        &ctx,
+    );
+    assert_eq!((out.done, out.errors), (1, 0));
+
+    let messages: Vec<String> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            ProgressEvent::Log { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .collect();
+    let report = messages
+        .iter()
+        .find(|message| message.starts_with("trash (target in-root;"))
+        .expect("the actual in-root route must be reported");
+    assert!(report.contains(&t.join(".syncdash").join("trash").display().to_string()), "{report}");
+    assert!(!report.contains(&tr.display().to_string()), "the central path was not used: {report}");
+    assert!(
+        !messages.iter().any(|message| message.starts_with("trash (central;")),
+        "no central-trash report may be emitted when preservation stayed in-root: {messages:?}"
+    );
+
+    let kept = std::fs::read_dir(t.join(".syncdash").join("trash"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("f.txt"))
+        .find(|path| path.exists())
+        .expect("the reported in-root original must exist");
+    assert_eq!(std::fs::read(kept).unwrap(), b"old");
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -638,10 +893,23 @@ fn an_on_machine_root_still_uses_the_central_trash_store() {
     std::fs::write(s.join("f.txt"), b"new").unwrap();
     std::fs::write(t.join("f.txt"), b"old").unwrap();
 
-    let (done, _, errors) = apply::apply(&[op(Action::Update, "f.txt")], &s, &t, &opts(tr.clone()));
-    assert_eq!((done, errors), (1, 0));
-    assert_eq!(std::fs::read(tr.join("f.txt")).unwrap(), b"old");
+    let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let copy = events.clone();
+    let ctx = RunCtx::new(RunCtl::new(), Arc::new(move |event| copy.lock().unwrap().push(event)));
+    let out = apply::apply_with(
+        &[op(Action::Update, "f.txt")],
+        &s,
+        &t,
+        &opts(tr.clone()),
+        &ctx,
+    );
+    assert_eq!((out.done, out.errors), (1, 0));
+    assert_eq!(std::fs::read(tr.join("target/f.txt")).unwrap(), b"old");
     assert!(!t.join(".syncdash").exists(), "a local root needs no in-root retention area");
+    assert!(events.lock().unwrap().iter().any(|event| matches!(event, ProgressEvent::Log {
+        message,
+        ..
+    } if message.starts_with("trash (central;") && message.contains(&tr.display().to_string()))));
     let _ = std::fs::remove_dir_all(&base);
 }
 

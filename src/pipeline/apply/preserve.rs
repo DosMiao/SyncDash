@@ -1,10 +1,11 @@
 //! Where the previous content goes before it is overwritten or deleted.
 //!
-//! Local roots use the trash store; a remote root cannot, so its preserve area is a rename inside
-//! the root itself. Versioning, when enabled, layers on top of both.
+//! A root uses the central trash only when it can rename into that store. Mounted shares, protocol
+//! roots, and external local volumes preserve by rename inside themselves. Versioning, when
+//! enabled, layers on top of both.
 
-use std::path::{Path, PathBuf};
 use crate::foundation::path::join_native;
+use std::path::{Path, PathBuf};
 
 use crate::model::plan::{Op, Side};
 use crate::obs::progress::PhaseProgress;
@@ -25,11 +26,23 @@ pub(super) fn move_to_trash(
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p)?;
     }
+    refuse_existing(&dest, rel)?;
     match crate::fs::rename_force(file, &dest) {
         Ok(_) => Ok(()),
         // Cross-volume: stage a cancellable copy beside the trash destination, then remove the
         // original only after the complete copy lands.
         Err(_) => copy_to_trash(file, &dest, rel, fsync, pp),
+    }
+}
+
+fn refuse_existing(dest: &Path, rel: &str) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("refusing to overwrite an existing retained original: {rel}"),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -40,6 +53,7 @@ fn copy_to_trash(
     fsync: bool,
     pp: &PhaseProgress,
 ) -> std::io::Result<()> {
+    refuse_existing(dest, rel)?;
     let metadata = std::fs::metadata(file)?;
     pp.add_total_bytes(metadata.len());
     pp.checkpoint()?;
@@ -57,6 +71,7 @@ fn copy_to_trash(
     }
     staged.seal(fsync)?;
     std::fs::set_permissions(staged.path(), metadata.permissions())?;
+    refuse_existing(dest, rel)?;
     staged.commit()?;
     crate::fs::remove_file_force(file)
 }
@@ -69,7 +84,7 @@ fn copy_to_trash(
 ///   `<root>/.version_syncDash/`, so it stays a move *within* the root and is safe anywhere a
 ///   path exists, share or not.
 /// - **Can the central trash store take it?** (`local_trash`) — that store lives on this machine.
-///   A move into it from a share or another local disk is cross-volume, and `move_to_trash`
+///   A move into it from a share or another local volume is cross-volume, and `move_to_trash`
 ///   answers a failed rename by copying every byte before removal. Those roots take the in-root
 ///   retention area instead, which is the same rename a genuinely remote root gets.
 ///
@@ -94,16 +109,31 @@ pub(super) fn preserve(
             return w.as_mut().unwrap().preserve(&op.path, &dst, newer, why);
         }
         if sh.trash_reaches(&op.side) {
-            return move_to_trash(&dst, &op.path, &sh.trash, sh.opt.fsync, pp);
+            let side = if op.side == Side::Source {
+                "source"
+            } else {
+                "target"
+            };
+            let retained_rel = format!("{side}/{}", op.path);
+            move_to_trash(&dst, &retained_rel, &sh.trash, sh.opt.fsync, pp)?;
+            sh.note_central_preservation();
+            return Ok(());
         }
     }
-    // Off-machine root — mounted share or protocol backend alike: rename into
-    // <root>/.syncdash/trash/<run_ms>/<rel>, on the far side, nothing transferred.
-    let keep_rel = format!("{}/{}", sh.remote_keep_rel, op.path);
+    // A root the central store cannot reach — external local volume, mounted share, or protocol
+    // backend — keeps the original under itself, so preservation remains a same-root rename.
+    let keep_rel = format!("{}/{}", sh.in_root_keep_rel, op.path);
+    if exec.stat(&keep_rel)?.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("refusing to overwrite an existing retained original: {keep_rel}"),
+        ));
+    }
     if let Some(parent) = crate::foundation::path::parent(&keep_rel) {
         sh.ensure_dir(&op.side, exec, parent)?;
     }
     exec.rename(&op.path, &keep_rel)?;
+    sh.note_in_root_preservation(&op.side);
     Ok(())
 }
 
@@ -172,6 +202,26 @@ mod tests {
         assert!(src.exists());
         assert!(!dest.exists());
         assert!(std::fs::read_dir(dest.parent().unwrap()).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_existing_retained_original_is_never_replaced() {
+        let dir = root("collision");
+        let src = dir.join("old.bin");
+        let trash = dir.join("trash");
+        let dest = trash.join("target/old.bin");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"second original").unwrap();
+        std::fs::write(&dest, b"first original").unwrap();
+        let ctx = RunCtx::new(RunCtl::new(), Arc::new(|_| {}));
+        let pp = PhaseProgress::begin(&ctx, Phase::Apply, None, 1, 0);
+
+        let error = move_to_trash(&src, "target/old.bin", &trash, false, &pp).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&src).unwrap(), b"second original");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"first original");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

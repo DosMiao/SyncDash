@@ -6,7 +6,7 @@
 //! by another machine, so the ordering is re-derived here.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::model::plan::Op;
@@ -34,10 +34,13 @@ pub(super) struct Shared<'a> {
     pub(super) source_trash_ok: bool,
     pub(super) target_trash_ok: bool,
     pub(super) trash: PathBuf,
-    /// The in-root retention area for remote sides: `.syncdash/trash/<run_ms>` under
-    /// the executing root — originals move there by RENAME on the far side, nothing
-    /// is downloaded. Named in the preflight report before it is ever used.
-    pub(super) remote_keep_rel: String,
+    /// The in-root retention area for every side that cannot rename into the central store:
+    /// `.syncdash/trash/<run_ms>` under that root. This includes protocol roots, mounted shares,
+    /// and external local volumes.
+    pub(super) in_root_keep_rel: String,
+    pub(super) central_preserved: AtomicBool,
+    pub(super) source_in_root_preserved: AtomicBool,
+    pub(super) target_in_root_preserved: AtomicBool,
     pub(super) ver_source: Mutex<Option<crate::store::version::VersionWriter>>,
     pub(super) ver_target: Mutex<Option<crate::store::version::VersionWriter>>,
     /// Directories already ensured on each side this run (spares one round-trip per file on remote roots)
@@ -68,6 +71,28 @@ impl<'a> Shared<'a> {
         match side {
             Side::Target => self.target_trash_ok,
             Side::Source => self.source_trash_ok,
+        }
+    }
+
+    pub(super) fn note_central_preservation(&self) {
+        self.central_preserved.store(true, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_in_root_preservation(&self, side: &Side) {
+        match side {
+            Side::Source => self.source_in_root_preserved.store(true, Ordering::Relaxed),
+            Side::Target => self.target_in_root_preserved.store(true, Ordering::Relaxed),
+        }
+    }
+
+    pub(super) fn central_preservation_used(&self) -> bool {
+        self.central_preserved.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn in_root_preservation_used(&self, side: &Side) -> bool {
+        match side {
+            Side::Source => self.source_in_root_preserved.load(Ordering::Relaxed),
+            Side::Target => self.target_in_root_preserved.load(Ordering::Relaxed),
         }
     }
 

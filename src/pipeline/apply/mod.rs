@@ -115,10 +115,52 @@ pub fn copy_width(
     pref.min(src.max_parallel_streams.min(tgt.max_parallel_streams)).max(1)
 }
 
+fn in_root_retention_display(sh: &Shared<'_>, side: &Side) -> String {
+    if let Some(root) = sh.local_of(side) {
+        crate::foundation::path::join_native(root, &sh.in_root_keep_rel)
+            .display()
+            .to_string()
+    } else {
+        let exec = match side {
+            Side::Source => sh.source,
+            Side::Target => sh.target,
+        };
+        format!("{}/{}", exec.display().trim_end_matches('/'), sh.in_root_keep_rel)
+    }
+}
+
+fn report_preservation_routes(sh: &Shared<'_>) {
+    use crate::model::event::LogLevel;
+
+    if sh.central_preservation_used() {
+        sh.ctx.log(
+            LogLevel::Info,
+            "apply",
+            format!(
+                "trash (central; deleted/overwritten originals kept at): {}",
+                sh.trash.display()
+            ),
+        );
+    }
+    for (side, label) in [(Side::Source, "source"), (Side::Target, "target")] {
+        if sh.in_root_preservation_used(&side) {
+            sh.ctx.log(
+                LogLevel::Info,
+                "apply",
+                format!(
+                    "trash ({label} in-root; deleted/overwritten originals kept at): {}",
+                    in_root_retention_display(sh, &side)
+                ),
+            );
+        }
+    }
+}
+
 /// Plans can come from files or another process, so every executable relative path is validated at
 /// the last common boundary before any backend is opened. A local backend ultimately joins strings
 /// onto its root; allowing `..`, an absolute path, or a drive prefix here would escape that root.
 fn validate_op_paths(ops: &[Op]) -> Result<(), String> {
+    let mut mutations = std::collections::HashSet::new();
     for op in ops.iter().filter(|op| !matches!(op.action, Action::Conflict | Action::Note)) {
         if !crate::foundation::path::is_safe_rel(&op.path) {
             return Err(format!("unsafe operation path: {}", op.path));
@@ -130,6 +172,21 @@ fn validate_op_paths(ops: &[Op]) -> Result<(), String> {
             if !crate::foundation::path::is_safe_rel(from) {
                 return Err(format!("unsafe move source path: {from}"));
             }
+        }
+        if matches!(
+            op.action,
+            Action::Copy | Action::Update | Action::Move | Action::Delete
+        ) && !mutations.insert((op.side == Side::Source, op.path.as_str()))
+        {
+            return Err(format!(
+                "duplicate mutation for {} path: {}",
+                if op.side == Side::Source {
+                    "source"
+                } else {
+                    "target"
+                },
+                op.path
+            ));
         }
     }
     Ok(())
@@ -252,11 +309,14 @@ pub fn apply_vfs(
         source_trash_ok,
         target_trash_ok,
         trash,
-        remote_keep_rel: format!(
+        in_root_keep_rel: format!(
             "{}/trash/{}",
             crate::foundation::names::APP_DIR,
             crate::foundation::time::now_ms()
         ),
+        central_preserved: std::sync::atomic::AtomicBool::new(false),
+        source_in_root_preserved: std::sync::atomic::AtomicBool::new(false),
+        target_in_root_preserved: std::sync::atomic::AtomicBool::new(false),
         ver_source: Mutex::new(None),
         ver_target: Mutex::new(None),
         mkdir_memo: Mutex::new(std::collections::HashSet::new()),
@@ -337,7 +397,7 @@ pub fn apply_vfs(
     if delta_saved > 0 {
         println!("delta: {} not re-written", crate::foundation::fmt::human_bytes(delta_saved));
     }
-    let any_remote_side = sh.source_local.is_none() || sh.target_local.is_none();
+    report_preservation_routes(&sh);
     let (src_local_path, tgt_local_path) = (sh.source_local.clone(), sh.target_local.clone());
     if let Some(w) = sh.ver_source.into_inner().unwrap() {
         let side_ops: Vec<Op> = ops.iter().filter(|o| o.side == Side::Source).cloned().collect();
@@ -356,12 +416,6 @@ pub fn apply_vfs(
         }
     }
     let done = acc.done.load(Ordering::Relaxed);
-    if !opt.versioning && done > 0 {
-        println!("trash (deleted/overwritten files kept at): {}", sh.trash.display());
-    }
-    if done > 0 && any_remote_side {
-        println!("remote retention (originals renamed on the far side): <root>/{}", sh.remote_keep_rel);
-    }
     let mut out = ApplyOutcome {
         done,
         skipped: acc.skipped.load(Ordering::Relaxed),

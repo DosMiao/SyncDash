@@ -393,7 +393,7 @@ fn preserved_of(v: &Arc<dyn Vfs>, trash: &std::path::Path) -> Vec<String> {
             collect_vfs(v, &format!("{base}/{}", run.name), "", &mut out);
         }
     }
-    collect_fs(trash, "", &mut out);
+    collect_fs(&trash.join("target"), "", &mut out);
 
     out.sort();
     out

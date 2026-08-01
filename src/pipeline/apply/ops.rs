@@ -226,12 +226,30 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
         }
         Action::Move => {
             let from = op.from.as_deref().unwrap_or_default();
+            if exec.stat(&op.path)?.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "move destination appeared after compare; refusing to overwrite it: {}",
+                        op.path
+                    ),
+                ));
+            }
             if let Some(parent) = crate::foundation::path::parent(&op.path) {
                 sh.ensure_dir(&op.side, exec, parent)?;
             }
             match exec.rename(from, &op.path) {
                 Ok(_) => Ok(()),
                 Err(_) => {
+                    if exec.stat(&op.path)?.is_some() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "move destination appeared during execution; refusing to overwrite it: {}",
+                                op.path
+                            ),
+                        ));
+                    }
                     // Cross-volume fallback: copy within the same root, still atomic.
                     let moving = exec.stat(from)?.ok_or_else(|| {
                         std::io::Error::new(std::io::ErrorKind::NotFound, format!("move source disappeared: {from}"))
@@ -254,6 +272,15 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                     }
                     pp.revise_total_bytes(moving.size, copied);
                     w.seal(sh.opt.fsync)?;
+                    if exec.stat(&op.path)?.is_some() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "move destination appeared during copy; refusing to overwrite it: {}",
+                                op.path
+                            ),
+                        ));
+                    }
                     let _ = w.commit()?;
                     Ok(exec.remove_file(from)?)
                 }
