@@ -178,10 +178,10 @@ export function applyReviewKey(
 ): string {
   return JSON.stringify([
     'apply',
-    owner.compare_id,
-    owner.job_id,
-    owner.config_revision,
-    owner.target_index,
+    owner.identity.compare_run_id,
+    owner.identity.job_id,
+    owner.identity.config_revision,
+    owner.identity.target_index,
     jobId,
     configRevision,
     targetIndex,

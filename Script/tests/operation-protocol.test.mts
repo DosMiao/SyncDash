@@ -14,11 +14,13 @@ import {
 import type { CompareOwner } from '../../typescript/core/types/generated/CompareOwner.ts';
 
 const owner: CompareOwner = {
-  compare_id: 41,
-  job_id: 'job-stable-id',
+  identity: {
+    compare_run_id: 41,
+    job_id: 'job-stable-id',
+    config_revision: 'revision-7',
+    target_index: 2,
+  },
   job_name: 'photos',
-  config_revision: 'revision-7',
-  target_index: 2,
 };
 const selected = [{ index: 3, flipped: false }, { index: 9, flipped: true }];
 

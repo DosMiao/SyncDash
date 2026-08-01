@@ -42,14 +42,16 @@ import { useRunScopeController } from './hooks/useRunScopeController';
 import { useZoomControl } from './hooks/useZoomControl';
 import {
   activeSession as sessionForSelection,
+  compareScopeKey,
   EMPTY_COMPARE_REPOSITORY,
   invalidateJobRevision,
   invalidateSession,
   invalidateJobSession,
   ownerMatchesSelection,
-  rebindSessionOwner,
+  refreshRetainedSession,
   reconcileRefreshedJobSession,
   reconcileSavedJobSession,
+  retainRestoredSession,
   retainSuccessfulSession,
   successfulSession,
   snapshotJob,
@@ -518,7 +520,7 @@ export function App() {
     retained: ReturnType<typeof sessionForSelection>,
     announce = true,
   ) => {
-    const ticket = restoreRequest.current.start(`${job.job_id}\0${targetIndex}\0${job.config_revision}`);
+    const ticket = restoreRequest.current.start(compareScopeKey(job.job_id, targetIndex, job.config_revision));
     const publish = (restored: PlanDto | null) => {
       if (!restoreRequest.current.owns(ticket) || !restored) return;
       const selected = selectionRef.current;
@@ -528,7 +530,7 @@ export function App() {
         restored.ops.map((operation) => isExecutableOperation(operation)),
         restored.ops.map(() => false),
       );
-      setCompareRepository((repository) => retainSuccessfulSession(repository, session));
+      setCompareRepository((repository) => retainRestoredSession(repository, session));
       if (announce) setStatus(`${job.name} · restored ${restored.ops.length} compare items`);
     };
     const failed = (error: unknown) => {
@@ -539,22 +541,18 @@ export function App() {
       void ipc.restoreCompare(job.job_id, targetIndex).then(publish).catch(failed);
       return;
     }
-    void ipc.touchCompare(retained.plan.owner).then(async (backendOwner) => {
+    void ipc.touchCompare(retained.plan.owner).then((backendOwner) => {
       if (!restoreRequest.current.owns(ticket)) return;
       if (!backendOwner) {
         setCompareRepository((repository) => invalidateSession(repository, retained.plan.owner));
         if (announce) setStatus(`${job.name} · retained result expired — Compare again`, 'err');
         return;
       }
-      if (backendOwner.compare_id === retained.plan.owner.compare_id) {
-        setCompareRepository((repository) => rebindSessionOwner(
-          retainSuccessfulSession(repository, retained),
-          retained.plan.owner,
-          backendOwner,
-        ));
-        return;
-      }
-      publish(await ipc.restoreCompare(job.job_id, targetIndex));
+      setCompareRepository((repository) => refreshRetainedSession(
+        repository,
+        retained.plan.owner,
+        backendOwner,
+      ));
     }).catch(failed);
   }, [setStatus]);
 
@@ -595,6 +593,11 @@ export function App() {
     if (showProgress) setCompareActive(true);
     try {
       const comparedPlan = await ipc.compareJob(authorizationToken);
+      restoreRequest.current.invalidateOwner(compareScopeKey(
+        comparedPlan.owner.identity.job_id,
+        comparedPlan.owner.identity.target_index,
+        comparedPlan.owner.identity.config_revision,
+      ));
       const freshFlips = comparedPlan.ops.map(() => false);
       setCompareRepository((repository) => retainSuccessfulSession(
         repository,
@@ -613,13 +616,13 @@ export function App() {
       let refreshProblem: unknown = null;
       try {
         const list = await refreshJobs(name);
-        refreshedJob = list.find((job) => job.job_id === comparedPlan.owner.job_id) ?? null;
+        refreshedJob = list.find((job) => job.job_id === comparedPlan.owner.identity.job_id) ?? null;
         setCompareRepository((repository) => reconcileRefreshedJobSession(
           repository,
           {
-            jobId: comparedPlan.owner.job_id,
+            jobId: comparedPlan.owner.identity.job_id,
             name: comparedPlan.owner.job_name,
-            configRevision: comparedPlan.owner.config_revision,
+            configRevision: comparedPlan.owner.identity.config_revision,
           },
           refreshedJob,
         ));
@@ -627,10 +630,10 @@ export function App() {
         refreshProblem = error;
       }
       const selected = selectionRef.current;
-      const selectedJob = selected.job?.job_id === comparedPlan.owner.job_id && !refreshProblem
+      const selectedJob = selected.job?.job_id === comparedPlan.owner.identity.job_id && !refreshProblem
         ? refreshedJob
         : selected.job;
-      if (selectedBeforeRefresh.job?.job_id === comparedPlan.owner.job_id && !refreshProblem) {
+      if (selectedBeforeRefresh.job?.job_id === comparedPlan.owner.identity.job_id && !refreshProblem) {
         if (!refreshedJob) {
           setSelectedTargetIndex(0);
           resetResultWorkspace();

@@ -10,7 +10,8 @@ import {
   invalidateSession,
   reconcileRefreshedJobSession,
   reconcileSavedJobSession,
-  rebindSessionOwner,
+  refreshRetainedSession,
+  retainRestoredSession,
   retainSuccessfulSession,
   successfulSession,
   targetForSelection,
@@ -24,8 +25,16 @@ import type { JobDto } from '../../typescript/core/types/generated/JobDto.ts';
 import type { JobSaveDto } from '../../typescript/core/types/generated/JobSaveDto.ts';
 import { selectedRows } from '../../typescript/core/plan.ts';
 
-function owner(jobName: string, targetIndex: number, revision: string, compareId = 1, jobId = `id-${jobName}`): CompareOwner {
-  return { compare_id: compareId, job_id: jobId, job_name: jobName, target_index: targetIndex, config_revision: revision };
+function owner(jobName: string, targetIndex: number, revision: string, compareRunId = 1, jobId = `id-${jobName}`): CompareOwner {
+  return {
+    identity: {
+      compare_run_id: compareRunId,
+      job_id: jobId,
+      target_index: targetIndex,
+      config_revision: revision,
+    },
+    job_name: jobName,
+  };
 }
 
 function plan(o: CompareOwner): PlanDto {
@@ -58,11 +67,11 @@ function retain(
   jobName: string,
   targetIndex: number,
   revision: string,
-  compareId: number,
+  compareRunId: number,
 ): CompareRepository {
   return retainSuccessfulSession(
     repository,
-    successfulSession(plan(owner(jobName, targetIndex, revision, compareId)), [true], [false]),
+    successfulSession(plan(owner(jobName, targetIndex, revision, compareRunId)), [true], [false]),
   );
 }
 
@@ -72,8 +81,8 @@ test('switching among jobs and targets restores every retained review session', 
   let repository = retain(EMPTY_COMPARE_REPOSITORY, 'A', 1, 'rev-a', 1);
   repository = retain(repository, 'B', 0, 'rev-b', 2);
 
-  assert.equal(activeSession(repository, a, 1)?.plan.owner.compare_id, 1);
-  assert.equal(activeSession(repository, b, 0)?.plan.owner.compare_id, 2);
+  assert.equal(activeSession(repository, a, 1)?.plan.owner.identity.compare_run_id, 1);
+  assert.equal(activeSession(repository, b, 0)?.plan.owner.identity.compare_run_id, 2);
   assert.equal(targetForSelection(repository, a), 1);
   assert.equal(targetForSelection(repository, b), 0);
 });
@@ -102,7 +111,7 @@ test('the repository is LRU bounded and a failed compare has no state transition
   repository = touchSession(repository, job('job-0', 'rev-0'), 0);
 
   const unchangedAfterFailure = repository;
-  assert.equal(activeSession(unchangedAfterFailure, job('job-0', 'rev-0'), 0)?.plan.owner.compare_id, 0);
+  assert.equal(activeSession(unchangedAfterFailure, job('job-0', 'rev-0'), 0)?.plan.owner.identity.compare_run_id, 0);
 
   repository = retain(repository, 'new-job', 0, 'new-rev', 100);
   assert.equal(repository.sessions.length, COMPARE_SESSION_CAPACITY);
@@ -116,9 +125,11 @@ test('a newer successful compare replaces only the same job-target-revision key'
   repository = retain(repository, 'A', 0, 'rev-a', 3);
 
   assert.equal(repository.sessions.length, 2);
-  assert.equal(activeSession(repository, job('A', 'rev-a', ['a0', 'a1']), 0)?.plan.owner.compare_id, 3);
-  assert.equal(activeSession(repository, job('A', 'rev-a', ['a0', 'a1']), 1)?.plan.owner.compare_id, 2);
-  const withoutTargetZero = invalidateSession(repository, owner('A', 0, 'rev-a', 999));
+  assert.equal(activeSession(repository, job('A', 'rev-a', ['a0', 'a1']), 0)?.plan.owner.identity.compare_run_id, 3);
+  assert.equal(activeSession(repository, job('A', 'rev-a', ['a0', 'a1']), 1)?.plan.owner.identity.compare_run_id, 2);
+  const unchangedForDifferentRun = invalidateSession(repository, owner('A', 0, 'rev-a', 999));
+  assert.equal(unchangedForDifferentRun, repository);
+  const withoutTargetZero = invalidateSession(repository, owner('A', 0, 'rev-a', 3));
   assert.equal(activeSession(withoutTargetZero, job('A', 'rev-a', ['a0', 'a1']), 0), null);
   assert.ok(activeSession(withoutTargetZero, job('A', 'rev-a', ['a0', 'a1']), 1));
 });
@@ -160,8 +171,8 @@ test('effective mutation invalidates only the affected job revision while a no-o
     mutation('renamed', 'Renamed', 'rev-a', 'id-A', 'A'),
     original,
   );
-  assert.equal(activeSession(renamed, job('Renamed', 'rev-a', ['target'], 'id-A'), 0)?.plan.owner.compare_id, 1);
-  assert.equal(renamed.sessions.find((session) => session.plan.owner.job_id === 'id-A')?.plan.owner.job_name, 'Renamed');
+  assert.equal(activeSession(renamed, job('Renamed', 'rev-a', ['target'], 'id-A'), 0)?.plan.owner.identity.compare_run_id, 1);
+  assert.equal(renamed.sessions.find((session) => session.plan.owner.identity.job_id === 'id-A')?.plan.owner.job_name, 'Renamed');
   assert.ok(activeSession(renamed, job('B', 'rev-a'), 0));
 
   assert.equal(invalidateJobRevision(repository, 'missing', 'rev-a'), repository);
@@ -188,11 +199,34 @@ test('touch rebinds a renamed owner without changing the compare result identity
   const repository = retain(EMPTY_COMPARE_REPOSITORY, 'A', 0, 'rev-a', 7);
   const previous = owner('A', 0, 'rev-a', 7);
   const current = { ...previous, job_name: 'Renamed' };
-  const rebound = rebindSessionOwner(repository, previous, current);
+  const rebound = refreshRetainedSession(repository, previous, current);
 
   assert.equal(rebound.sessions[0].plan.owner.job_name, 'Renamed');
-  assert.equal(rebound.sessions[0].plan.owner.compare_id, 7);
-  assert.equal(rebound.sessions[0].plan.owner.job_id, 'id-A');
+  assert.equal(rebound.sessions[0].plan.owner.identity.compare_run_id, 7);
+  assert.equal(rebound.sessions[0].plan.owner.identity.job_id, 'id-A');
+});
+
+test('a delayed touch cannot replace or expire a newer result for the same scope', () => {
+  const olderOwner = owner('A', 0, 'rev-a', 7);
+  const newerRepository = retain(EMPTY_COMPARE_REPOSITORY, 'A', 0, 'rev-a', 8);
+
+  assert.equal(refreshRetainedSession(newerRepository, olderOwner, olderOwner), newerRepository);
+  assert.equal(invalidateSession(newerRepository, olderOwner), newerRepository);
+  assert.equal(
+    activeSession(newerRepository, job('A', 'rev-a'), 0)?.plan.owner.identity.compare_run_id,
+    8,
+  );
+});
+
+test('a delayed restore cannot replace a result published while restoration was in flight', () => {
+  const newerRepository = retain(EMPTY_COMPARE_REPOSITORY, 'A', 0, 'rev-a', 8);
+  const restoredOlder = successfulSession(plan(owner('A', 0, 'rev-a', 7)), [true], [false]);
+
+  assert.equal(retainRestoredSession(newerRepository, restoredOlder), newerRepository);
+  assert.equal(
+    activeSession(newerRepository, job('A', 'rev-a'), 0)?.plan.owner.identity.compare_run_id,
+    8,
+  );
 });
 
 test('the apply payload contains only authenticated row decisions', () => {

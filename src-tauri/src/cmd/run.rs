@@ -18,15 +18,17 @@ use crate::auth::{
 };
 use crate::autoscan::{AutoApplyTicket, AutoScanController};
 use crate::bridge::{make_ctx, RunEvent, RunEventRepository};
+use crate::compare_results::{
+    validate_retained_compare, CompareResultRepository, SuccessfulCompareResult,
+};
 use crate::dto::{
-    ApplyDto, AuthorizationDto, CapabilityIssueDto, CompareOwner, OperationReviewDto, PlanDto,
-    ReviewStatus, SelectedRowDto,
+    ApplyDto, AuthorizationDto, CapabilityIssueDto, CompareIdentity, CompareOwner,
+    OperationReviewDto, PlanDto, ReviewStatus, SelectedRowDto,
 };
 use crate::state::{
     begin_run, begin_run_command, begin_run_for_launch, end_run, finish_run_command,
     release_progress_launch, request_cancel, resolve_selected_ops, resolve_target, set_paused,
-    user_err, validate_cached_compare, CachedCompare, CompareProvenance, ResultKey,
-    ResultRepository, RunState,
+    user_err, RunState,
 };
 
 use super::require_main_window;
@@ -45,14 +47,14 @@ struct ActiveRunGuard {
 struct RunCommandGuard(Arc<RunState>);
 
 struct AppliedResultGuard {
-    results: Arc<ResultRepository>,
+    results: Arc<CompareResultRepository>,
     job_id: String,
     config_revision: String,
     invalidate_on_drop: bool,
 }
 
 impl AppliedResultGuard {
-    fn new(results: Arc<ResultRepository>, job_id: &str, config_revision: &str) -> Self {
+    fn new(results: Arc<CompareResultRepository>, job_id: &str, config_revision: &str) -> Self {
         Self {
             results,
             job_id: job_id.to_string(),
@@ -70,9 +72,6 @@ impl Drop for AppliedResultGuard {
     fn drop(&mut self) {
         if self.invalidate_on_drop {
             self.results
-                .0
-                .lock()
-                .unwrap()
                 .invalidate_revision(&self.job_id, &self.config_revision);
         }
     }
@@ -142,7 +141,7 @@ struct PreparedApply {
     ops: Vec<Op>,
 }
 
-struct CachedApplyPlan {
+struct RetainedApplyPlan {
     loaded: LoadedTarget,
     owner: CompareOwner,
     plan: Plan,
@@ -301,7 +300,9 @@ fn validate_exact_binding(
     if authorized.target_index != current.target_index {
         return Err("The authorized target changed — review again".into());
     }
-    if !same_compare_identity(authorized.owner.as_ref(), current.owner.as_ref()) {
+    if authorized.owner.as_ref().map(|owner| &owner.identity)
+        != current.owner.as_ref().map(|owner| &owner.identity)
+    {
         return Err("The authorized Compare result changed — review Apply again".into());
     }
     if authorized.plan_digest != current.plan_digest {
@@ -323,24 +324,6 @@ fn validate_exact_binding(
         return Err("The AutoScan ticket authority changed — wait for a fresh trigger".into());
     }
     Ok(())
-}
-
-fn same_compare_identity(left: Option<&CompareOwner>, right: Option<&CompareOwner>) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => {
-            left.compare_id == right.compare_id
-                && left.job_id == right.job_id
-                && left.target_index == right.target_index
-                && left.config_revision == right.config_revision
-        }
-        _ => false,
-    }
-}
-
-fn with_current_job_name(mut owner: CompareOwner, job_name: &str) -> CompareOwner {
-    owner.job_name = job_name.to_string();
-    owner
 }
 
 fn same_auto_apply_authority(
@@ -452,7 +435,7 @@ pub async fn compare_job(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RunState>>,
-    results: tauri::State<'_, Arc<ResultRepository>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
     events: tauri::State<'_, Arc<RunEventRepository>>,
     authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
     autoscan: tauri::State<'_, Arc<AutoScanController>>,
@@ -518,11 +501,13 @@ pub async fn compare_job(
         let outcome = result.map_err(user_err)?;
         let plan_digest = outcome.plan.digest();
         let mut owner = CompareOwner {
-            compare_id: run_id,
-            job_id: loaded.full_job.job_id.clone(),
+            identity: CompareIdentity {
+                compare_run_id: run_id,
+                job_id: loaded.full_job.job_id.clone(),
+                target_index: loaded.target_index,
+                config_revision: loaded.config_revision.clone(),
+            },
             job_name: loaded.job_name.clone(),
-            target_index: loaded.target_index,
-            config_revision: loaded.config_revision.clone(),
         };
         let evidence = compare::evidence::evidence(
             &outcome.source,
@@ -551,16 +536,16 @@ pub async fn compare_job(
             identical_bytes: evidence.identical_bytes,
         };
 
-        let mut repository = results.0.lock().unwrap();
-        let (current_name, current_job) = job::load_by_id(&owner.job_id).map_err(|error| {
-            format!(
-                "Job '{}' was deleted or replaced while Compare was running: {error}",
-                owner.job_name
-            )
-        })?;
+        let (current_name, current_job) =
+            job::load_by_id(&owner.identity.job_id).map_err(|error| {
+                format!(
+                    "Job '{}' was deleted or replaced while Compare was running: {error}",
+                    owner.job_name
+                )
+            })?;
         let current_revision = job::config_revision(&current_job)
             .map_err(|error| format!("Job '{}': {error}", owner.job_name))?;
-        if current_revision != owner.config_revision {
+        if current_revision != owner.identity.config_revision {
             return Err(format!(
                 "Job '{}' changed while Compare was running — run Compare again",
                 owner.job_name
@@ -568,17 +553,15 @@ pub async fn compare_job(
         }
         owner.job_name = current_name;
         dto.owner = owner.clone();
-        repository.insert(CachedCompare {
-            provenance: CompareProvenance {
-                owner: owner.clone(),
+        results
+            .insert_version(SuccessfulCompareResult::from_plan(
                 plan_digest,
-            },
-            plan: dto.clone(),
-            source: outcome.source,
-            target: outcome.target,
-            compare_options: outcome.compare_options,
-        });
-        drop(repository);
+                dto.clone(),
+                outcome.source,
+                outcome.target,
+                outcome.compare_options,
+            ))
+            .map_err(|error| error.to_string())?;
         // Registration is opportunistic: a stop/rearm may have made this an ordinary interactive
         // Compare while it ran. Keep returning and caching the successful result; only a later
         // AutoScan completion needs the exact pending-ticket association.
@@ -590,64 +573,56 @@ pub async fn compare_job(
 }
 
 fn prepare_apply(
-    results: &ResultRepository,
+    results: &CompareResultRepository,
     requested_owner: &CompareOwner,
     selected: Vec<SelectedRowDto>,
 ) -> Result<PreparedApply, String> {
-    prepare_cached_apply(load_cached_apply(results, requested_owner)?, selected)
+    prepare_retained_apply(load_retained_apply(results, requested_owner)?, selected)
 }
 
-fn load_cached_apply(
-    results: &ResultRepository,
+fn load_retained_apply(
+    results: &CompareResultRepository,
     requested_owner: &CompareOwner,
-) -> Result<CachedApplyPlan, String> {
-    let (job_name, full_job) = job::load_by_id(&requested_owner.job_id).map_err(|error| {
-        format!("The Compare result's job was deleted or replaced — run Compare again: {error}")
-    })?;
-    let loaded = load_target(job_name, full_job, Some(requested_owner.target_index))?;
-    if loaded.config_revision != requested_owner.config_revision {
+) -> Result<RetainedApplyPlan, String> {
+    let (job_name, full_job) =
+        job::load_by_id(&requested_owner.identity.job_id).map_err(|error| {
+            format!("The Compare result's job was deleted or replaced — run Compare again: {error}")
+        })?;
+    let loaded = load_target(
+        job_name,
+        full_job,
+        Some(requested_owner.identity.target_index),
+    )?;
+    if loaded.config_revision != requested_owner.identity.config_revision {
         return Err(format!(
             "Job '{}' changed since this Compare — run Compare again",
             loaded.job_name
         ));
     }
-    let (mut owner, header, plan_ops, plan_digest) = {
-        let mut repository = results.0.lock().unwrap();
-        let key = ResultKey::new(
-            &loaded.full_job.job_id,
-            loaded.target_index,
-            &loaded.config_revision,
-        );
-        let cached = repository.get(&key);
-        validate_cached_compare(
-            cached.map(|result| &result.provenance),
-            requested_owner,
-            &loaded.full_job.job_id,
-            &loaded.job_name,
-            loaded.target_index,
-            &loaded.config_revision,
-            None,
-        )?;
-        let cached = cached.expect("validated cached compare must exist");
-        (
-            cached.provenance.owner.clone(),
-            cached.plan.header.clone(),
-            cached.plan.ops.clone(),
-            cached.provenance.plan_digest.clone(),
-        )
-    };
-    // Names are presentation, not provenance. Normalize the cloned owner to the registry's current
-    // label so a pure rename still forms a valid binding while every authority-bearing field stays
-    // pinned to the cached compare identity.
-    owner = with_current_job_name(owner, &loaded.job_name);
+    results.rebind_job_name(&loaded.full_job.job_id, &loaded.job_name);
+    let retained = results
+        .get_exact(&requested_owner.identity)
+        .map_err(|error| error.to_string())?;
+    validate_retained_compare(
+        retained.as_ref(),
+        requested_owner,
+        &loaded.full_job.job_id,
+        &loaded.job_name,
+        loaded.target_index,
+        &loaded.config_revision,
+        None,
+    )?;
+    let retained = retained.expect("successful validation requires a retained Compare result");
+    let owner = retained.owner().clone();
     let plan = Plan {
-        header,
-        ops: plan_ops,
+        header: retained.plan_header().clone(),
+        ops: retained.plan_operations().to_vec(),
     };
+    let plan_digest = retained.plan_digest().to_string();
     if plan.digest() != plan_digest {
-        return Err("The cached Compare plan changed — run Compare again".into());
+        return Err("The retained Compare plan changed — run Compare again".into());
     }
-    Ok(CachedApplyPlan {
+    Ok(RetainedApplyPlan {
         loaded,
         owner,
         plan,
@@ -655,16 +630,16 @@ fn load_cached_apply(
     })
 }
 
-fn prepare_cached_apply(
-    cached: CachedApplyPlan,
+fn prepare_retained_apply(
+    retained_plan: RetainedApplyPlan,
     selected: Vec<SelectedRowDto>,
 ) -> Result<PreparedApply, String> {
-    let ops = resolve_selected_ops(&cached.plan.ops, &selected)?;
+    let ops = resolve_selected_ops(&retained_plan.plan.ops, &selected)?;
     Ok(PreparedApply {
-        loaded: cached.loaded,
-        owner: cached.owner,
-        plan: cached.plan,
-        plan_digest: cached.plan_digest,
+        loaded: retained_plan.loaded,
+        owner: retained_plan.owner,
+        plan: retained_plan.plan,
+        plan_digest: retained_plan.plan_digest,
         selected,
         ops,
     })
@@ -690,19 +665,19 @@ fn server_owned_selection(ops: &[Op]) -> Result<Vec<SelectedRowDto>, String> {
 }
 
 fn prepare_autoscan_apply(
-    results: &ResultRepository,
+    results: &CompareResultRepository,
     ticket: &AutoApplyTicket,
 ) -> Result<PreparedApply, String> {
-    let cached = load_cached_apply(results, &ticket.owner)?;
-    if cached.loaded.full_job.job_id != ticket.job_id
-        || cached.loaded.config_revision != ticket.config_revision
-        || cached.loaded.target_index != ticket.target_index
-        || !same_compare_identity(Some(&cached.owner), Some(&ticket.owner))
+    let retained_plan = load_retained_apply(results, &ticket.owner)?;
+    if retained_plan.loaded.full_job.job_id != ticket.job_id
+        || retained_plan.loaded.config_revision != ticket.config_revision
+        || retained_plan.loaded.target_index != ticket.target_index
+        || retained_plan.owner.identity != ticket.owner.identity
     {
         return Err("The completed AutoScan ticket no longer owns this Compare result".into());
     }
-    let selected = server_owned_selection(&cached.plan.ops)?;
-    prepare_cached_apply(cached, selected)
+    let selected = server_owned_selection(&retained_plan.plan.ops)?;
+    prepare_retained_apply(retained_plan, selected)
 }
 
 fn apply_facts(prepared: &PreparedApply) -> Result<ApplyFacts, String> {
@@ -733,7 +708,7 @@ fn apply_binding(
             if ticket.job_id != prepared.loaded.full_job.job_id
                 || ticket.config_revision != prepared.loaded.config_revision
                 || ticket.target_index != prepared.loaded.target_index
-                || !same_compare_identity(Some(&ticket.owner), Some(&prepared.owner))
+                || ticket.owner.identity != prepared.owner.identity
             {
                 return Err(
                     "The AutoScan ticket no longer matches its authenticated Compare result"
@@ -796,7 +771,7 @@ fn autoscan_health_refusals(facts: &ApplyFacts) -> Vec<String> {
 pub async fn review_apply(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<RunState>>,
-    results: tauri::State<'_, Arc<ResultRepository>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
     authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
     owner: CompareOwner,
     selected: Vec<SelectedRowDto>,
@@ -857,7 +832,7 @@ pub async fn review_apply(
 pub async fn authorize_autoscan_apply(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<RunState>>,
-    results: tauri::State<'_, Arc<ResultRepository>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
     authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
     autoscan: tauri::State<'_, Arc<AutoScanController>>,
     generation: u64,
@@ -901,8 +876,8 @@ pub async fn authorize_autoscan_apply(
     .map_err(|error| error.to_string())?
 }
 
-fn revalidate_cached_before_apply(
-    results: &ResultRepository,
+fn revalidate_retained_before_apply(
+    results: &CompareResultRepository,
     prepared: &PreparedApply,
     state: &RunState,
     launch_id: Option<u64>,
@@ -911,15 +886,11 @@ fn revalidate_cached_before_apply(
     // any result/auth/run lock, so an external TOML edit cannot ride an old in-memory Job into the
     // reservation. The core reopens roots once more after reservation and enforces exact consent.
     let _current = reload_prepared_target(&prepared.loaded)?;
-    let mut repository = results.0.lock().unwrap();
-    let key = ResultKey::new(
-        &prepared.loaded.full_job.job_id,
-        prepared.loaded.target_index,
-        &prepared.loaded.config_revision,
-    );
-    let cached = repository.get(&key);
-    validate_cached_compare(
-        cached.map(|result| &result.provenance),
+    let retained = results
+        .get_exact(&prepared.owner.identity)
+        .map_err(|error| error.to_string())?;
+    validate_retained_compare(
+        retained.as_ref(),
         &prepared.owner,
         &prepared.loaded.full_job.job_id,
         &prepared.loaded.job_name,
@@ -936,7 +907,7 @@ pub async fn apply_job(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RunState>>,
-    results: tauri::State<'_, Arc<ResultRepository>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
     events: tauri::State<'_, Arc<RunEventRepository>>,
     authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
     autoscan: tauri::State<'_, Arc<AutoScanController>>,
@@ -1003,7 +974,7 @@ pub async fn apply_job(
                 return Err((verdict.blockers.join("\n"), false));
             }
             let consent = CapabilityConsent::ExactDigest(current_binding.capability_digest.clone());
-            let reserve = || revalidate_cached_before_apply(&results, &prepared, &st, launch_id);
+            let reserve = || revalidate_retained_before_apply(&results, &prepared, &st, launch_id);
             let (run_id, ctl) = match auto_apply_ticket.as_ref() {
                 Some(ticket) => autoscan.consume_authorized_with(ticket, reserve),
                 None => reserve(),
@@ -1100,11 +1071,13 @@ mod tests {
 
     fn owner() -> CompareOwner {
         CompareOwner {
-            compare_id: 7,
-            job_id: "job-a".into(),
+            identity: CompareIdentity {
+                compare_run_id: 7,
+                job_id: "job-a".into(),
+                target_index: 1,
+                config_revision: "revision-a".into(),
+            },
             job_name: "photos".into(),
-            target_index: 1,
-            config_revision: "revision-a".into(),
         }
     }
 
@@ -1178,9 +1151,10 @@ mod tests {
         let expected = binding();
         assert!(validate_exact_binding(&expected, &expected).is_ok());
 
-        let rebound_owner = with_current_job_name(owner(), "archive");
+        let mut rebound_owner = owner();
+        rebound_owner.job_name = "archive".into();
         assert_eq!(rebound_owner.job_name, "archive");
-        assert!(same_compare_identity(Some(&owner()), Some(&rebound_owner)));
+        assert_eq!(owner().identity, rebound_owner.identity);
 
         let mut renamed = expected.clone();
         renamed.job_name = "archive".into();
@@ -1209,7 +1183,7 @@ mod tests {
         changed.health_digest = "health-b".into();
         assert!(validate_exact_binding(&expected, &changed).is_err());
         changed = expected.clone();
-        changed.owner.as_mut().unwrap().compare_id += 1;
+        changed.owner.as_mut().unwrap().identity.compare_run_id += 1;
         assert!(validate_exact_binding(&expected, &changed).is_err());
 
         let mut autoscan = expected.clone();

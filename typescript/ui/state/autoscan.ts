@@ -79,9 +79,9 @@ export function monitorOwnsAutoScanResult(
   owner: CompareOwner,
 ): boolean {
   return monitorOwnsAutoScanTicket(status, active, ticket)
-    && owner.job_id === ticket.jobId
-    && owner.config_revision === ticket.configRevision
-    && owner.target_index === ticket.targetIndex;
+    && owner.identity.job_id === ticket.jobId
+    && owner.identity.config_revision === ticket.configRevision
+    && owner.identity.target_index === ticket.targetIndex;
 }
 
 export function monitorOwnsAutoScanTicket(

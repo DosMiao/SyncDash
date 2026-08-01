@@ -8,8 +8,9 @@ use tauri::Emitter;
 
 use crate::auth::AuthorizationStore;
 use crate::autoscan::AutoScanController;
+use crate::compare_results::CompareResultRepository;
 use crate::dto::{JobDeleteDto, JobDetailDto, JobDto, JobFileSchemaDto, JobSaveDto};
-use crate::state::{with_run_idle, ResultRepository, RunState};
+use crate::state::{with_run_idle, RunState};
 
 use super::require_main_window;
 
@@ -94,7 +95,7 @@ pub fn save_job(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     run_state: tauri::State<'_, Arc<RunState>>,
-    results: tauri::State<'_, Arc<ResultRepository>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
     autoscan: tauri::State<'_, Arc<AutoScanController>>,
     authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
     name: String,
@@ -135,11 +136,10 @@ pub fn save_job(
     }
     match saved.effect {
         job::JobMutationEffect::Renamed => {
-            let mut repository = results.0.lock().unwrap();
             if expected_revision.as_deref() == Some(saved.config_revision.as_str()) {
-                repository.rebind_job_name(&saved.job_id, &saved.name);
+                results.rebind_job_name(&saved.job_id, &saved.name);
             } else if let Some(expected_revision) = expected_revision.as_deref() {
-                repository.invalidate_revision(&saved.job_id, expected_revision);
+                results.invalidate_revision(&saved.job_id, expected_revision);
             }
         }
         job::JobMutationEffect::Updated => {
@@ -147,11 +147,7 @@ pub fn save_job(
                 .as_deref()
                 .expect("an updated job must carry its expected revision");
             if expected_revision != saved.config_revision {
-                results
-                    .0
-                    .lock()
-                    .unwrap()
-                    .invalidate_revision(&saved.job_id, expected_revision);
+                results.invalidate_revision(&saved.job_id, expected_revision);
             }
         }
         job::JobMutationEffect::Created | job::JobMutationEffect::NoOp => {}
@@ -172,7 +168,7 @@ pub fn delete_job(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     run_state: tauri::State<'_, Arc<RunState>>,
-    results: tauri::State<'_, Arc<ResultRepository>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
     autoscan: tauri::State<'_, Arc<AutoScanController>>,
     authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
     name: String,
@@ -190,7 +186,7 @@ pub fn delete_job(
     if let Some(status) = autoscan_status {
         let _ = app.emit("autoscan-status", status);
     }
-    results.0.lock().unwrap().invalidate_job(&deleted.job_id);
+    results.invalidate_job(&deleted.job_id);
     Ok(JobDeleteDto {
         job_id: deleted.job_id,
         name: deleted.name,

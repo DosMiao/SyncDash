@@ -62,22 +62,24 @@ pub(crate) struct JobDeleteDto {
     pub(crate) effect: syncdash::job::JobMutationEffect,
 }
 
-/// Immutable provenance for one successful comparison.
-///
-/// The frontend carries this value with the plan. Commands that read cached evidence or can write
-/// files require an exact match, so changing selection cannot silently reinterpret an old plan.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+/// Stable authority-bearing identity for one successful Compare run.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
-pub(crate) struct CompareOwner {
+pub(crate) struct CompareIdentity {
     #[ts(type = "number")]
-    pub(crate) compare_id: u64,
-    /// Stable registry identity. `job_name` is only the current display/lookup label and may change
-    /// while this comparison remains valid.
+    pub(crate) compare_run_id: u64,
     pub(crate) job_id: String,
-    pub(crate) job_name: String,
     #[ts(type = "number")]
     pub(crate) target_index: usize,
     pub(crate) config_revision: String,
+}
+
+/// A stable Compare identity paired with its current presentation label.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct CompareOwner {
+    pub(crate) identity: CompareIdentity,
+    pub(crate) job_name: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, ts_rs::TS)]
@@ -102,7 +104,7 @@ pub(crate) struct PlanDto {
 }
 
 /// One reviewed plan row submitted for preflight/apply. The backend reconstructs the operation from
-/// the cached plan; the frontend never gets to submit an independent write instruction.
+/// the exact retained plan; the frontend never gets to submit an independent write instruction.
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct SelectedRowDto {

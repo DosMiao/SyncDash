@@ -2,6 +2,6 @@
 
 /**
  * One reviewed plan row submitted for preflight/apply. The backend reconstructs the operation from
- * the cached plan; the frontend never gets to submit an independent write instruction.
+ * the exact retained plan; the frontend never gets to submit an independent write instruction.
  */
 export type SelectedRowDto = { index: number, flipped: boolean, };

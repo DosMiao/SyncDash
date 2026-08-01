@@ -43,9 +43,9 @@ impl AutoScanBinding {
     }
 
     pub(crate) fn owns_compare(&self, owner: &CompareOwner) -> bool {
-        owner.job_id == self.job_id
-            && owner.config_revision == self.config_revision
-            && owner.target_index == self.target_index
+        owner.identity.job_id == self.job_id
+            && owner.identity.config_revision == self.config_revision
+            && owner.identity.target_index == self.target_index
     }
 }
 
@@ -160,7 +160,7 @@ impl AutoApplyTicket {
             && self.job_id == other.job_id
             && self.config_revision == other.config_revision
             && self.target_index == other.target_index
-            && same_compare_identity(&self.owner, &other.owner)
+            && self.owner.identity == other.owner.identity
     }
 
     fn rebind_name(&mut self, job_name: &str) {
@@ -184,7 +184,7 @@ struct AutoApplyTicketRecord {
 
 struct AutoScanShared {
     status: AutoScanStatusDto,
-    pending_compare_min_id: Option<u64>,
+    pending_compare_min_run_id: Option<u64>,
     pending_compare_owner: Option<CompareOwner>,
     auto_apply_ticket: Option<AutoApplyTicketRecord>,
 }
@@ -225,7 +225,7 @@ impl AutoScanController {
         let initial = AutoScanStatusDto::starting(generation, &binding);
         let shared = Arc::new(Mutex::new(AutoScanShared {
             status: initial.clone(),
-            pending_compare_min_id: None,
+            pending_compare_min_run_id: None,
             pending_compare_owner: None,
             auto_apply_ticket: None,
         }));
@@ -396,7 +396,7 @@ impl AutoScanController {
                     "This AutoScan ticket has no successful server-recorded Compare result"
                         .to_string()
                 })?;
-                if !same_compare_identity(recorded, supplied) {
+                if recorded.identity != supplied.identity {
                     return Err(
                         "The supplied Compare result was not produced for this AutoScan ticket"
                             .into(),
@@ -417,7 +417,7 @@ impl AutoScanController {
         // observe the pending trigger, and a status query can recover either side of this edge.
         shared.status.active_ticket = None;
         shared.status.pending_trigger = None;
-        shared.pending_compare_min_id = None;
+        shared.pending_compare_min_run_id = None;
         shared.pending_compare_owner = None;
         shared.auto_apply_ticket = None;
         if let (true, true, Some(mut owner)) =
@@ -447,7 +447,7 @@ impl AutoScanController {
 
     /// Associate a freshly cached successful Compare with the currently pending trigger. This is
     /// the server-side bridge that prevents a caller from promoting an older cached owner by merely
-    /// supplying its public compare id to `complete_autoscan`.
+    /// supplying its public Compare run ID to `complete_autoscan`.
     pub(crate) fn record_successful_compare(&self, owner: &CompareOwner) -> bool {
         let _gate = self.gate.lock().unwrap();
         let active_guard = self.active.lock().unwrap();
@@ -463,15 +463,15 @@ impl AutoScanController {
         let Some(pending) = shared.status.pending_trigger.as_ref() else {
             return false;
         };
-        let Some(minimum_compare_id) = shared.pending_compare_min_id else {
+        let Some(minimum_compare_run_id) = shared.pending_compare_min_run_id else {
             return false;
         };
         if shared.status.active_ticket != Some(pending.ticket_id)
             || pending.generation != active.generation
-            || pending.job_id != owner.job_id
-            || pending.config_revision != owner.config_revision
-            || pending.target_index != owner.target_index
-            || owner.compare_id < minimum_compare_id
+            || pending.job_id != owner.identity.job_id
+            || pending.config_revision != owner.identity.config_revision
+            || pending.target_index != owner.identity.target_index
+            || owner.identity.compare_run_id < minimum_compare_run_id
         {
             return false;
         }
@@ -603,13 +603,6 @@ fn active_owns_ticket(active: &ActiveAutoScan, ticket: &AutoApplyTicket) -> bool
         && active.binding.owns_compare(&ticket.owner)
 }
 
-fn same_compare_identity(left: &CompareOwner, right: &CompareOwner) -> bool {
-    left.compare_id == right.compare_id
-        && left.job_id == right.job_id
-        && left.config_revision == right.config_revision
-        && left.target_index == right.target_index
-}
-
 impl Drop for AutoScanController {
     fn drop(&mut self) {
         if let Ok(active) = self.active.get_mut() {
@@ -630,7 +623,7 @@ fn mark_shared_inactive(
     shared.status.active_ticket = None;
     shared.status.pending_trigger = None;
     shared.status.detail = detail.into();
-    shared.pending_compare_min_id = None;
+    shared.pending_compare_min_run_id = None;
     shared.pending_compare_owner = None;
     shared.auto_apply_ticket = None;
     shared.status.clone()
@@ -691,7 +684,7 @@ fn publish_trigger(
         shared.auto_apply_ticket = None;
         // A zero-delta RMW linearizes against run-id allocation. A Compare reserved before this
         // trigger can still complete interactively, but cannot be registered as this ticket's work.
-        shared.pending_compare_min_id = Some(
+        shared.pending_compare_min_run_id = Some(
             run_state
                 .seq
                 .fetch_add(0, Ordering::AcqRel)
@@ -1107,29 +1100,28 @@ mod tests {
     fn compare_ownership_includes_revision_and_target() {
         let binding = binding();
         let owner = CompareOwner {
-            compare_id: 7,
-            job_id: "job-id-photos".into(),
+            identity: crate::dto::CompareIdentity {
+                compare_run_id: 7,
+                job_id: "job-id-photos".into(),
+                config_revision: "revision-a".into(),
+                target_index: 1,
+            },
             job_name: "photos".into(),
-            config_revision: "revision-a".into(),
-            target_index: 1,
         };
         assert!(binding.owns_compare(&owner));
         assert!(binding.owns_compare(&CompareOwner {
             job_name: "renamed".into(),
             ..owner.clone()
         }));
-        assert!(!binding.owns_compare(&CompareOwner {
-            job_id: "replacement-id".into(),
-            ..owner.clone()
-        }));
-        assert!(!binding.owns_compare(&CompareOwner {
-            config_revision: "revision-b".into(),
-            ..owner.clone()
-        }));
-        assert!(!binding.owns_compare(&CompareOwner {
-            target_index: 0,
-            ..owner
-        }));
+        let mut replaced = owner.clone();
+        replaced.identity.job_id = "replacement-id".into();
+        assert!(!binding.owns_compare(&replaced));
+        let mut revised = owner.clone();
+        revised.identity.config_revision = "revision-b".into();
+        assert!(!binding.owns_compare(&revised));
+        let mut retargeted = owner;
+        retargeted.identity.target_index = 0;
+        assert!(!binding.owns_compare(&retargeted));
     }
 
     #[test]
@@ -1174,7 +1166,7 @@ mod tests {
             commands,
             shared: Arc::new(Mutex::new(AutoScanShared {
                 status,
-                pending_compare_min_id: Some(1),
+                pending_compare_min_run_id: Some(1),
                 pending_compare_owner: None,
                 auto_apply_ticket: None,
             })),
@@ -1185,11 +1177,13 @@ mod tests {
 
     fn owner() -> CompareOwner {
         CompareOwner {
-            compare_id: 8,
-            job_id: "job-id-photos".into(),
+            identity: crate::dto::CompareIdentity {
+                compare_run_id: 8,
+                job_id: "job-id-photos".into(),
+                config_revision: "revision-a".into(),
+                target_index: 1,
+            },
             job_name: "photos".into(),
-            config_revision: "revision-a".into(),
-            target_index: 1,
         }
     }
 
@@ -1217,13 +1211,13 @@ mod tests {
     fn successful_completion_requires_an_authenticated_owned_compare() {
         let (controller, receiver) = controller_waiting_for(12, false);
         let mut wrong = owner();
-        wrong.target_index = 0;
+        wrong.identity.target_index = 0;
         assert!(controller.complete(4, 12, true, None).is_err());
         assert!(controller.complete(4, 12, true, Some(&wrong)).is_err());
         assert!(receiver.try_recv().is_err());
         record_current_compare(&controller);
         let mut older = owner();
-        older.compare_id -= 1;
+        older.identity.compare_run_id -= 1;
         assert!(controller.complete(4, 12, true, Some(&older)).is_err());
         controller.complete(4, 12, true, Some(&owner())).unwrap();
         assert!(matches!(
@@ -1247,11 +1241,11 @@ mod tests {
             .shared
             .lock()
             .unwrap()
-            .pending_compare_min_id = Some(9);
+            .pending_compare_min_run_id = Some(9);
 
         assert!(!controller.record_successful_compare(&owner()));
         let mut current = owner();
-        current.compare_id = 9;
+        current.identity.compare_run_id = 9;
         assert!(controller.record_successful_compare(&current));
         assert!(controller.complete(4, 24, true, Some(&owner())).is_err());
         assert!(controller.complete(4, 24, true, Some(&current)).is_ok());

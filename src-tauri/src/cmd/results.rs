@@ -7,34 +7,36 @@ use syncdash::job;
 use syncdash::model::plan::{Op, PlanHeader};
 use syncdash::pipeline::compare;
 
+use crate::compare_results::{validate_retained_compare, CompareResultRepository};
 use crate::dto::PlanDto;
 use crate::dto::{CompareOwner, IdenticalPage};
-use crate::state::{resolve_target, validate_cached_compare, ResultKey, ResultRepository};
+use crate::state::resolve_target;
 
-/// Touch a locally retained owner without sending its potentially large plan through the webview.
-/// Returning a different owner means the backend has a newer successful compare for this key.
+/// Confirm that one exact locally retained result still exists without crossing its large plan.
 #[tauri::command]
 pub fn touch_compare(
-    results: tauri::State<'_, Arc<ResultRepository>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
     owner: CompareOwner,
 ) -> Result<Option<CompareOwner>, String> {
-    let (job_name, full_job) = match job::load_by_id(&owner.job_id) {
+    let (job_name, full_job) = match job::load_by_id(&owner.identity.job_id) {
         Ok(job) => job,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
     let config_revision =
         job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
-    if owner.config_revision != config_revision {
+    if owner.identity.config_revision != config_revision {
         return Ok(None);
     }
-    let (target_index, _) = resolve_target(&full_job, Some(owner.target_index))?;
-    let key = ResultKey::new(&full_job.job_id, target_index, &config_revision);
-    let mut repository = results.0.lock().unwrap();
-    repository.rebind_job_name(&full_job.job_id, &job_name);
-    Ok(repository
-        .get(&key)
-        .map(|cached| cached.provenance.owner.clone()))
+    let (target_index, _) = resolve_target(&full_job, Some(owner.identity.target_index))?;
+    if target_index != owner.identity.target_index || full_job.job_id != owner.identity.job_id {
+        return Ok(None);
+    }
+    results.rebind_job_name(&full_job.job_id, &job_name);
+    Ok(results
+        .get_exact(&owner.identity)
+        .map_err(|error| error.to_string())?
+        .map(|retained| retained.owner().clone()))
 }
 
 /// Restore the most recent successful result for the authoritative job/target/revision. The
@@ -42,7 +44,7 @@ pub fn touch_compare(
 /// pretending that old filesystem evidence is still current.
 #[tauri::command]
 pub fn restore_compare(
-    results: tauri::State<'_, Arc<ResultRepository>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
     job_id: String,
     target_index: Option<usize>,
 ) -> Result<Option<PlanDto>, String> {
@@ -50,31 +52,33 @@ pub fn restore_compare(
     let config_revision =
         job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
     let (target_index, _) = resolve_target(&full_job, target_index)?;
-    let key = ResultKey::new(&full_job.job_id, target_index, &config_revision);
-    let mut repository = results.0.lock().unwrap();
-    repository.rebind_job_name(&full_job.job_id, &job_name);
-    Ok(repository.get(&key).map(|cached| cached.plan.clone()))
+    results.rebind_job_name(&full_job.job_id, &job_name);
+    Ok(results
+        .latest_for(&full_job.job_id, target_index, &config_revision)
+        .map_err(|error| error.to_string())?
+        .map(|retained| retained.plan()))
 }
 
 /// Pagination for the "Identical" panel from that result's retained snapshots — no rescan.
 #[tauri::command]
 pub fn list_identical(
-    results: tauri::State<'_, Arc<ResultRepository>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
     owner: CompareOwner,
     query: String,
     offset: usize,
     limit: usize,
 ) -> Result<IdenticalPage, String> {
-    let (job_name, full_job) = job::load_by_id(&owner.job_id).map_err(|e| e.to_string())?;
+    let (job_name, full_job) =
+        job::load_by_id(&owner.identity.job_id).map_err(|e| e.to_string())?;
     let config_revision =
         job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
-    let (target_index, _) = resolve_target(&full_job, Some(owner.target_index))?;
-    let key = ResultKey::new(&full_job.job_id, target_index, &config_revision);
-    let mut repository = results.0.lock().unwrap();
-    repository.rebind_job_name(&full_job.job_id, &job_name);
-    let cached = repository.get(&key);
-    validate_cached_compare(
-        cached.map(|result| &result.provenance),
+    let (target_index, _) = resolve_target(&full_job, Some(owner.identity.target_index))?;
+    results.rebind_job_name(&full_job.job_id, &job_name);
+    let retained = results
+        .get_exact(&owner.identity)
+        .map_err(|error| error.to_string())?;
+    validate_retained_compare(
+        retained.as_ref(),
         &owner,
         &full_job.job_id,
         &job_name,
@@ -82,12 +86,11 @@ pub fn list_identical(
         &config_revision,
         None,
     )?;
-    let cached_result =
-        cached.expect("successful repository validation requires a cached comparison");
+    let retained = retained.expect("successful validation requires a retained Compare result");
     let (total, rows) = compare::evidence::identical_page(
-        &cached_result.source,
-        &cached_result.target,
-        &cached_result.compare_options,
+        retained.source(),
+        retained.target(),
+        retained.compare_options(),
         &query,
         offset,
         limit.min(2000),

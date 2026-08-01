@@ -30,12 +30,12 @@ export function identicalResultRequestKey(
   query: string,
   offset: number,
 ): string {
-  // job_name is a mutable display label; the remaining owner fields are the evidence identity.
+  // job_name is mutable presentation; identity is the complete evidence authority.
   return [
-    owner.compare_id,
-    owner.job_id,
-    owner.target_index,
-    owner.config_revision,
+    owner.identity.compare_run_id,
+    owner.identity.job_id,
+    owner.identity.target_index,
+    owner.identity.config_revision,
     query,
     offset,
   ].join('\0');

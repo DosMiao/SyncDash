@@ -22,15 +22,24 @@ export function successfulSession(plan: PlanDto, checked: boolean[], flipped: bo
 }
 
 function sameKey(left: CompareOwner, right: CompareOwner): boolean {
-  return left.job_id === right.job_id
-    && left.target_index === right.target_index
-    && left.config_revision === right.config_revision;
+  return left.identity.job_id === right.identity.job_id
+    && left.identity.target_index === right.identity.target_index
+    && left.identity.config_revision === right.identity.config_revision;
+}
+
+function sameIdentity(left: CompareOwner, right: CompareOwner): boolean {
+  return sameKey(left, right)
+    && left.identity.compare_run_id === right.identity.compare_run_id;
 }
 
 export interface JobIdentitySnapshot {
   jobId: string;
   name: string;
   configRevision: string;
+}
+
+export function compareScopeKey(jobId: string, targetIndex: number, configRevision: string): string {
+  return `${jobId}\0${targetIndex}\0${configRevision}`;
 }
 
 export function snapshotJob(job: JobDto): JobIdentitySnapshot {
@@ -56,11 +65,21 @@ export function retainSuccessfulSession(
   return { sessions };
 }
 
+export function retainRestoredSession(
+  repository: CompareRepository,
+  session: CompareSession,
+): CompareRepository {
+  if (repository.sessions.some((candidate) => sameKey(candidate.plan.owner, session.plan.owner))) {
+    return repository;
+  }
+  return retainSuccessfulSession(repository, session);
+}
+
 export function ownerMatchesSelection(owner: CompareOwner, job: JobDto | null, targetIndex: number): boolean {
   return !!job
-    && owner.job_id === job.job_id
-    && owner.target_index === targetIndex
-    && owner.config_revision === job.config_revision;
+    && owner.identity.job_id === job.job_id
+    && owner.identity.target_index === targetIndex
+    && owner.identity.config_revision === job.config_revision;
 }
 
 export function activeSession(
@@ -99,12 +118,12 @@ export function updateSession(
 
 export function targetForSelection(repository: CompareRepository, job: JobDto): number {
   const session = repository.sessions.find((candidate) => (
-    candidate.plan.owner.job_id === job.job_id
-    && candidate.plan.owner.config_revision === job.config_revision
-    && candidate.plan.owner.target_index >= 0
-    && candidate.plan.owner.target_index < job.targets.length
+    candidate.plan.owner.identity.job_id === job.job_id
+    && candidate.plan.owner.identity.config_revision === job.config_revision
+    && candidate.plan.owner.identity.target_index >= 0
+    && candidate.plan.owner.identity.target_index < job.targets.length
   ));
-  return session?.plan.owner.target_index ?? 0;
+  return session?.plan.owner.identity.target_index ?? 0;
 }
 
 export function invalidateJobRevision(
@@ -113,8 +132,8 @@ export function invalidateJobRevision(
   configRevision: string,
 ): CompareRepository {
   const sessions = repository.sessions.filter((session) => (
-    session.plan.owner.job_id !== jobId
-    || session.plan.owner.config_revision !== configRevision
+    session.plan.owner.identity.job_id !== jobId
+    || session.plan.owner.identity.config_revision !== configRevision
   ));
   return sessions.length === repository.sessions.length ? repository : { sessions };
 }
@@ -123,12 +142,12 @@ export function invalidateSession(
   repository: CompareRepository,
   owner: CompareOwner,
 ): CompareRepository {
-  const sessions = repository.sessions.filter((session) => !sameKey(session.plan.owner, owner));
+  const sessions = repository.sessions.filter((session) => !sameIdentity(session.plan.owner, owner));
   return sessions.length === repository.sessions.length ? repository : { sessions };
 }
 
 export function invalidateJobSession(repository: CompareRepository, jobId: string): CompareRepository {
-  const sessions = repository.sessions.filter((session) => session.plan.owner.job_id !== jobId);
+  const sessions = repository.sessions.filter((session) => session.plan.owner.identity.job_id !== jobId);
   return sessions.length === repository.sessions.length ? repository : { sessions };
 }
 
@@ -143,11 +162,11 @@ export function reconcileRefreshedJobSession(
   let changed = false;
   const sessions: CompareSession[] = [];
   for (const session of repository.sessions) {
-    if (session.plan.owner.job_id !== previous.jobId) {
+    if (session.plan.owner.identity.job_id !== previous.jobId) {
       sessions.push(session);
       continue;
     }
-    if (session.plan.owner.config_revision !== refreshedJob.config_revision) {
+    if (session.plan.owner.identity.config_revision !== refreshedJob.config_revision) {
       changed = true;
       continue;
     }
@@ -169,12 +188,12 @@ export function reconcileSavedJobSession(
   let changed = false;
   const sessions: CompareSession[] = [];
   for (const session of repository.sessions) {
-    if (session.plan.owner.job_id !== original.jobId) {
+    if (session.plan.owner.identity.job_id !== original.jobId) {
       sessions.push(session);
       continue;
     }
     if (saved.config_revision !== original.configRevision
-      && session.plan.owner.config_revision === original.configRevision) {
+      && session.plan.owner.identity.config_revision === original.configRevision) {
       changed = true;
       continue;
     }
@@ -185,25 +204,22 @@ export function reconcileSavedJobSession(
   return changed ? { sessions } : repository;
 }
 
-/// Replace the mutable label in a retained frontend owner after `touch_compare` resolves it through
-/// the registry identity. The authenticated key and compare id must be unchanged.
-export function rebindSessionOwner(
+/// Refresh one exact retained result after the backend confirms its evidence still exists. A delayed
+/// response must not replace a newer result that has since been published for the same scope.
+export function refreshRetainedSession(
   repository: CompareRepository,
   previousOwner: CompareOwner,
   currentOwner: CompareOwner,
 ): CompareRepository {
-  if (!sameKey(previousOwner, currentOwner) || previousOwner.compare_id !== currentOwner.compare_id) {
-    return repository;
-  }
-  const index = repository.sessions.findIndex((session) => (
-    sameKey(session.plan.owner, previousOwner)
-    && session.plan.owner.compare_id === previousOwner.compare_id
-  ));
-  if (index < 0 || repository.sessions[index].plan.owner.job_name === currentOwner.job_name) return repository;
+  if (!sameIdentity(previousOwner, currentOwner)) return repository;
+  const index = repository.sessions.findIndex((session) => sameIdentity(session.plan.owner, previousOwner));
+  if (index < 0) return repository;
+  if (index === 0 && repository.sessions[0].plan.owner.job_name === currentOwner.job_name) return repository;
   const sessions = [...repository.sessions];
-  sessions[index] = {
-    ...sessions[index],
-    plan: { ...sessions[index].plan, owner: currentOwner },
-  };
+  const [session] = sessions.splice(index, 1);
+  const refreshed = session.plan.owner.job_name === currentOwner.job_name
+    ? session
+    : { ...session, plan: { ...session.plan, owner: currentOwner } };
+  sessions.unshift(refreshed);
   return { sessions };
 }

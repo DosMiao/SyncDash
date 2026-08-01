@@ -81,7 +81,7 @@ export function useRunScopeController(
   }, [maskDraft, maskDraftPending]);
 
   const planIdentity = plan
-    ? `${plan.owner.compare_id}\0${plan.owner.job_id}\0${plan.owner.target_index}\0${plan.owner.config_revision}`
+    ? `${plan.owner.identity.compare_run_id}\0${plan.owner.identity.job_id}\0${plan.owner.identity.target_index}\0${plan.owner.identity.config_revision}`
     : '';
   useEffect(() => {
     setSearchDraft(searchQuery);

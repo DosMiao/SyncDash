@@ -79,10 +79,10 @@ impl OperationBinding {
                 let owner = self.owner.as_ref().ok_or_else(|| {
                     "An Apply authorization must identify its Compare result".to_string()
                 })?;
-                if owner.job_id != self.job_id
+                if owner.identity.job_id != self.job_id
                     || owner.job_name != self.job_name
-                    || owner.config_revision != self.config_revision
-                    || owner.target_index != self.target_index
+                    || owner.identity.config_revision != self.config_revision
+                    || owner.identity.target_index != self.target_index
                 {
                     return Err("The Apply authorization does not match its Compare owner".into());
                 }
@@ -98,7 +98,7 @@ impl OperationBinding {
                         if ticket.job_id == self.job_id
                             && ticket.config_revision == self.config_revision
                             && ticket.target_index == self.target_index
-                            && same_compare_identity(&ticket.owner, owner) => {}
+                            && ticket.owner.identity == owner.identity => {}
                     (AuthorizationPurpose::ApplyInteractive, Some(_)) => {
                         return Err(
                             "An interactive Apply cannot carry AutoScan ticket authority".into(),
@@ -491,13 +491,6 @@ impl AuthorizationStore {
     }
 }
 
-fn same_compare_identity(left: &CompareOwner, right: &CompareOwner) -> bool {
-    left.compare_id == right.compare_id
-        && left.job_id == right.job_id
-        && left.config_revision == right.config_revision
-        && left.target_index == right.target_index
-}
-
 fn issue_record(
     binding: OperationBinding,
     selected: Vec<SelectedRowDto>,
@@ -599,11 +592,13 @@ mod tests {
 
     fn owner() -> CompareOwner {
         CompareOwner {
-            compare_id: 9,
-            job_id: "job-a".into(),
+            identity: crate::dto::CompareIdentity {
+                compare_run_id: 9,
+                job_id: "job-a".into(),
+                config_revision: "revision-a".into(),
+                target_index: 1,
+            },
             job_name: "photos".into(),
-            config_revision: "revision-a".into(),
-            target_index: 1,
         }
     }
 
@@ -802,7 +797,7 @@ mod tests {
             .is_err());
 
         let mut wrong_owner = binding(AuthorizationPurpose::ApplyInteractive);
-        wrong_owner.owner.as_mut().unwrap().job_id = "another-job".into();
+        wrong_owner.owner.as_mut().unwrap().identity.job_id = "another-job".into();
         assert!(store
             .challenge(ChallengeSpec {
                 binding: wrong_owner,

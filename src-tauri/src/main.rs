@@ -3,7 +3,8 @@
 //!
 //! - `dto` — the wire types ts-rs exports to the frontend
 //! - `bridge` — the typed progress event stream shared by both windows
-//! - `state` — single-run mutual exclusion and the bounded compare-result repository
+//! - `compare_results` — exact, versioned retention for successful Compare results
+//! - `state` — single-run mutual exclusion
 //! - `cmd` — the commands themselves, grouped by what they act on
 //!
 //! Heavy work goes through `spawn_blocking`; window-creating commands must be `async fn`, because
@@ -16,6 +17,7 @@ mod auth;
 mod autoscan;
 mod bridge;
 mod cmd;
+mod compare_results;
 mod dto;
 mod state;
 
@@ -24,7 +26,8 @@ use std::sync::Arc;
 use auth::AuthorizationStore;
 use autoscan::AutoScanController;
 use bridge::RunEventRepository;
-use state::{ResultRepository, RunState};
+use compare_results::CompareResultRepository;
+use state::RunState;
 
 fn main() {
     // A windowed build has no console — the only home for diagnostics outside a run (settings parse
@@ -79,7 +82,7 @@ fn main() {
         .manage(Arc::new(RunState::default()))
         .manage(Arc::new(AuthorizationStore::default()))
         .manage(Arc::new(AutoScanController::default()))
-        .manage(Arc::new(ResultRepository::default()))
+        .manage(Arc::new(CompareResultRepository::default()))
         .manage(Arc::new(RunEventRepository::default()))
         .manage(app_log)
         .invoke_handler(tauri::generate_handler![

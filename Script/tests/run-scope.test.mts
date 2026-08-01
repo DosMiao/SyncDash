@@ -151,17 +151,31 @@ test('run-scope panel preference migrates once and writes only the current key',
 
 test('identical request identity fences every provenance dimension, query, and page', () => {
   const owner: CompareOwner = {
-    compare_id: 7,
-    job_id: 'job-id',
+    identity: {
+      compare_run_id: 7,
+      job_id: 'job-id',
+      target_index: 2,
+      config_revision: 'revision',
+    },
     job_name: 'Display Name',
-    target_index: 2,
-    config_revision: 'revision',
   };
   const baseline = identicalResultRequestKey(owner, 'docs', 300);
-  assert.notEqual(identicalResultRequestKey({ ...owner, compare_id: 8 }, 'docs', 300), baseline);
-  assert.notEqual(identicalResultRequestKey({ ...owner, job_id: 'other' }, 'docs', 300), baseline);
-  assert.notEqual(identicalResultRequestKey({ ...owner, target_index: 3 }, 'docs', 300), baseline);
-  assert.notEqual(identicalResultRequestKey({ ...owner, config_revision: 'new' }, 'docs', 300), baseline);
+  assert.notEqual(identicalResultRequestKey({
+    ...owner,
+    identity: { ...owner.identity, compare_run_id: 8 },
+  }, 'docs', 300), baseline);
+  assert.notEqual(identicalResultRequestKey({
+    ...owner,
+    identity: { ...owner.identity, job_id: 'other' },
+  }, 'docs', 300), baseline);
+  assert.notEqual(identicalResultRequestKey({
+    ...owner,
+    identity: { ...owner.identity, target_index: 3 },
+  }, 'docs', 300), baseline);
+  assert.notEqual(identicalResultRequestKey({
+    ...owner,
+    identity: { ...owner.identity, config_revision: 'new' },
+  }, 'docs', 300), baseline);
   assert.notEqual(identicalResultRequestKey(owner, 'src', 300), baseline);
   assert.notEqual(identicalResultRequestKey(owner, 'docs', 600), baseline);
 });

@@ -43,11 +43,13 @@ function status(overrides: Partial<AutoScanStatusDto> = {}): AutoScanStatusDto {
 }
 
 const owner = {
-  compare_id: 17,
-  job_id: 'job-id-photos',
+  identity: {
+    compare_run_id: 17,
+    job_id: 'job-id-photos',
+    config_revision: 'rev-2',
+    target_index: 1,
+  },
   job_name: 'photos',
-  config_revision: 'rev-2',
-  target_index: 1,
 };
 
 test('monitor ownership is independent of whichever job or target the user is viewing', () => {
@@ -56,9 +58,18 @@ test('monitor ownership is independent of whichever job or target the user is vi
   assert.equal(monitorOwnsAutoScanResult(status({ active: false }), ticket, ticket, owner), false);
   assert.equal(monitorOwnsAutoScanResult(status({ generation: 10 }), ticket, ticket, owner), false);
   assert.equal(monitorOwnsAutoScanResult(status(), { ...ticket, ticketId: 4 }, ticket, owner), false);
-  assert.equal(monitorOwnsAutoScanResult(status(), ticket, ticket, { ...owner, job_id: 'replacement' }), false);
-  assert.equal(monitorOwnsAutoScanResult(status(), ticket, ticket, { ...owner, config_revision: 'old' }), false);
-  assert.equal(monitorOwnsAutoScanResult(status(), ticket, ticket, { ...owner, target_index: 0 }), false);
+  assert.equal(monitorOwnsAutoScanResult(status(), ticket, ticket, {
+    ...owner,
+    identity: { ...owner.identity, job_id: 'replacement' },
+  }), false);
+  assert.equal(monitorOwnsAutoScanResult(status(), ticket, ticket, {
+    ...owner,
+    identity: { ...owner.identity, config_revision: 'old' },
+  }), false);
+  assert.equal(monitorOwnsAutoScanResult(status(), ticket, ticket, {
+    ...owner,
+    identity: { ...owner.identity, target_index: 0 },
+  }), false);
   assert.equal(statusCanOwnAutoScanTrigger(status({ latest_ticket_id: 4 }), ticket), false);
 });
 

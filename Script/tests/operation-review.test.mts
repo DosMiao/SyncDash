@@ -20,11 +20,13 @@ import type { OperationReviewDto } from '../../typescript/core/types/generated/O
 import type { CompareOwner } from '../../typescript/core/types/generated/CompareOwner.ts';
 
 const owner: CompareOwner = {
-  compare_id: 71,
-  job_id: 'job-id',
+  identity: {
+    compare_run_id: 71,
+    job_id: 'job-id',
+    config_revision: 'revision-3',
+    target_index: 1,
+  },
   job_name: 'before-rename',
-  config_revision: 'revision-3',
-  target_index: 1,
 };
 
 function review(overrides: Partial<OperationReviewDto> = {}): OperationReviewDto {
@@ -147,7 +149,22 @@ test('keys fence semantic mutation and selected-set changes while preserving a p
   const base = applyReviewKey(owner, 'job-id', 'revision-3', 1, selected);
   assert.equal(base, applyReviewKey({ ...owner, job_name: 'after-rename' }, 'job-id', 'revision-3', 1, selected));
   assert.equal(base, applyReviewKey(owner, 'job-id', 'revision-3', 1, [...selected].reverse()));
-  assert.notEqual(base, applyReviewKey({ ...owner, compare_id: 72 }, 'job-id', 'revision-3', 1, selected));
+  assert.notEqual(base, applyReviewKey({
+    ...owner,
+    identity: { ...owner.identity, compare_run_id: 72 },
+  }, 'job-id', 'revision-3', 1, selected));
+  assert.notEqual(base, applyReviewKey({
+    ...owner,
+    identity: { ...owner.identity, job_id: 'replacement-id' },
+  }, 'job-id', 'revision-3', 1, selected));
+  assert.notEqual(base, applyReviewKey({
+    ...owner,
+    identity: { ...owner.identity, config_revision: 'revision-4' },
+  }, 'job-id', 'revision-3', 1, selected));
+  assert.notEqual(base, applyReviewKey({
+    ...owner,
+    identity: { ...owner.identity, target_index: 0 },
+  }, 'job-id', 'revision-3', 1, selected));
   assert.notEqual(base, applyReviewKey(owner, 'replacement-id', 'revision-3', 1, selected));
   assert.notEqual(base, applyReviewKey(owner, 'job-id', 'revision-4', 1, selected));
   assert.notEqual(base, applyReviewKey(owner, 'job-id', 'revision-3', 0, selected));
