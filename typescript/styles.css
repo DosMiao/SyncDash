@@ -6,12 +6,12 @@
  * 1. **Contrast conveys how important something is, not where it sits.** Anything you have to
  *    read in order to make a decision gets --text-2 at minimum. --text-3 is the *disabled*
  *    tier, not a dim tier: it measures ~3.5:1 light / 4.1:1 dark, so it is only ever correct
- *    where being faint is itself the meaning (a greyed-out control, a button with nothing to
+ *    where being faint is itself the meaning (a grayed-out control, a button with nothing to
  *    do). Reason columns, counts, sizes and timestamps are data — they stay on --text-2.
  * 2. **Nothing below 11px, and no opacity on text.** Dimming by alpha stacks on whatever the
- *    colour already was and lands wherever it lands; dimming by *token* is a number you can
- *    check. Rows and chips that need to recede change colour, not alpha.
- * 3. **No literal colour outside the token block, and no literal px font-size outside the
+ *    color already was and lands wherever it lands; dimming by *token* is a number you can
+ *    check. Rows and chips that need to recede change color, not alpha.
+ * 3. **No literal color outside the token block, and no literal px font-size outside the
  *    --fs-* scale.** A rule that needs a value the scale does not have is a sign the scale is
  *    wrong, not the rule.
  * 4. **A control states what it is. Why and how live in `title`.** On-screen prose costs the
@@ -47,12 +47,12 @@
   --lh-tight: 1.3;
   --lh: 1.45;
 
-  /* The five action hues — copy, update, move, delete, conflict. That is the whole vocabulary a
-     plan row has, and the .k-* classes below hand it to all three surfaces that speak it. Each is
+  /* Five semantic hues cover executable result types and conflicts; Note deliberately stays neutral.
+     The .result-type-* classes hand the same vocabulary to every result surface. Each hue is
      set per theme, because SyncDash spends these mostly as **text**: the row's action label, the
      newer-side timestamp, warning lines, the group directory. Light takes a darker step than Primer
      publishes — its own success/attention/done values measure 4.29–4.48:1 against the hover surface,
-     just under the floor. Measured, not assumed. Used as a solid fill (an active chip) they pair
+     just under the floor. Measured, not assumed. When used as a solid status fill they pair
      with --on-accent, measured at 5.19:1 worst case light / 5.63:1 dark. */
   --c-blue: #0969da;
   --c-orange: #7d4e00;
@@ -78,7 +78,7 @@
   --shadow-lg: 0 24px 64px rgba(31, 35, 40, 0.2);
   --scrim: rgba(31, 35, 40, 0.4);
 
-  /* Text sitting on a solid accent or status fill — the run button, an active chip, AutoScan. It flips
+  /* Text sitting on a solid accent or status fill — the run button, an active date preset, AutoScan. It flips
      with the theme because the fill does: on the light theme's deep blue, white reads 6.7:1 and
      near-black only 3.1:1; on the dark theme's pale blue those numbers swap (2.7 vs 7.1). */
   --on-accent: #ffffff;
@@ -107,9 +107,9 @@
 
     --on-accent: #04121f;
 
-    /* The canvas is the whole point. #0d1117 has half the luminance of the neutral grey it
+    /* The canvas is the whole point. #0d1117 has half the luminance of the neutral gray it
        replaces (0.0058 vs 0.0117) — the surface *steps* and the border contrast are near
-       identical either way, so what reads as "grey" is simply how bright the page is. */
+       identical either way, so what reads as "gray" is simply how bright the page is. */
     --bg: #0d1117;
     --bg-2: #161b22;
     --bg-3: #21262d;
@@ -141,7 +141,7 @@ body {
   /* This is a tool window, not a web page: page-wide drag selection and the context menu are
      ours to manage */
   user-select: none;
-  /* Subpixel AA smears coloured fringes against a dark background; grayscale AA is what every
+  /* Subpixel AA smears colored fringes against a dark background; grayscale AA is what every
      desktop UI ships. Only takes effect on WebKit/Blink, which is both of our targets. */
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -169,7 +169,7 @@ input, textarea { user-select: text; }
 }
 .spacer { flex: 1; min-width: 0; }
 
-/* Three levels, and each differs from the one above in **size, weight and colour** — not in one
+/* Three levels, and each differs from the one above in **size, weight and color** — not in one
    of the three. The rule this replaces (`.thin`) resolved to the same 12px/--text-2 as the field
    label beside it, so a setting's name and its explanation were literally indistinguishable.
    Anything that explains uses .hint; anything that names uses .field-label. */
@@ -180,7 +180,7 @@ input, textarea { user-select: text; }
 .field-label { font-size: var(--fs-base); font-weight: 600; color: var(--text-1); }
 .hint { font-size: var(--fs-micro); font-weight: 400; color: var(--text-2); line-height: 1.5; }
 
-/* The other half of "not grey". Primer's surface *step* is 1.09:1 — the same as the one it
+/* The other half of "not gray". Primer's surface *step* is 1.09:1 — the same as the one it
    replaces — so a nested panel is never legible as a panel by its fill alone. What makes it read
    is the border enclosing it. Every settings group, every grouped list, sits in one of these. */
 
@@ -238,14 +238,13 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { border-color
   padding: 32px;
   background: var(--bg);
   color: var(--text-1);
-  font-family: var(--sans);
+  font-family: var(--font);
 }
 .fatal-root h1 { margin: 0 0 12px; font-size: var(--fs-lg); }
 .fatal-root p { max-width: 760px; color: var(--text-2); overflow-wrap: anywhere; }
-.reviewrow { flex: 1; display: flex; min-height: 0; min-width: 0; }
-/* min-width 0 so the flex item can go below the table's min-width — the table then scrolls in
-   here instead of pushing the whole review row (and the app) wider than the window */
-.tablewrap {
+.results-layout { flex: 1; display: flex; min-height: 0; min-width: 0; }
+/* min-width 0 lets the table scroll here instead of widening the entire result workspace. */
+.results-viewport {
   flex: 1;
   overflow: auto;
   min-width: 0;
@@ -255,7 +254,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { border-color
   overscroll-behavior: contain;
 }
 
-/* The scan-fault banner. Deliberately in the flow above the review row rather than in the status
+/* The scan-fault banner. Deliberately in the flow above the result workspace rather than in the status
    bar: the status line is overwritten by the next message, and this fact has to survive until the
    user acts on it. It states that part of a root was not read, which makes every "missing" row in
    the table below it unreliable — so it sits between the toolbar and the evidence it qualifies. */
@@ -263,7 +262,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { border-color
   margin: 0 12px 8px;
   padding: 8px 10px;
   border: 1px solid var(--c-red);
-  border-radius: var(--radius);
+  border-radius: var(--r);
   background: color-mix(in srgb, var(--c-red) 10%, var(--bg));
   color: var(--text-1);
   font-size: var(--fs-sm);
@@ -298,7 +297,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { border-color
    the surface only */
 .btn:hover:not(:disabled) { background: var(--bg-3); }
 .btn:active:not(:disabled) { transform: translateY(1px); }
-/* Disabled by colour, not opacity: alpha over a tinted button lands somewhere unpredictable,
+/* Disabled by color, not opacity: alpha over a tinted button lands somewhere unpredictable,
    and a disabled control still has to be readable enough to say what it would do */
 .btn:disabled { color: var(--text-3); border-color: var(--border); background: var(--bg-2); }
 
@@ -319,9 +318,8 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { border-color
 /* The run button carries the mode as its whole label, so it gets the weight to match */
 .btn.mode-btn { font-weight: 700; letter-spacing: 0.8px; padding: 0 18px; }
 
-/* Secondary controls: same token set as .btn, one step shorter and tighter so the filter row
-   does not out-weigh the primary Compare / run pair above it */
-.filterbar .btn, .cmp-panel .btn, .sp-head .btn, .fp-btns .btn {
+/* Result-workspace controls are one step shorter than the primary Compare / run pair. */
+.result-bar .btn, .cmp-panel .btn, .identical-results-head .btn, .advanced-filters-buttons .btn {
   min-height: var(--ctl-h-sm); padding: 0 10px; font-size: var(--fs-sm); flex: none;
 }
 
@@ -375,17 +373,13 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { border-color
    and hit target. */
 input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; flex: none; }
 
-/* The five hues as a class you can put on anything, and one local variable — the same "one rule,
-   one variable" the old .badge block used, now shared by the three surfaces that speak this
-   vocabulary: a row's action cell, the category chips and the toolbar stats. An element with no
-   k-* class gets the fallback spelled out at each var() site, which is how the 'All' chip and the
-   bytes/flips stat segments stay neutral without needing a class of their own. */
-.k-copy     { --k: var(--c-green); }
-.k-update   { --k: var(--c-orange); }
-.k-move     { --k: var(--c-blue); }
-.k-delete   { --k: var(--c-red); }
-.k-conflict { --k: var(--c-purple); }
-.k-note     { --k: var(--text-2); }
+/* Note remains deliberately neutral instead of borrowing an executable action hue. */
+.result-type-copy     { --result-type-color: var(--c-green); }
+.result-type-update   { --result-type-color: var(--c-orange); }
+.result-type-move     { --result-type-color: var(--c-blue); }
+.result-type-delete   { --result-type-color: var(--c-red); }
+.result-type-conflict { --result-type-color: var(--c-purple); }
+.result-type-note     { --result-type-color: var(--text-2); }
 
 .chip {
   display: inline-flex;
@@ -394,35 +388,24 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
   white-space: nowrap;
   padding: 3px 10px;
   border-radius: var(--r-pill);
-  border: 1px solid var(--k, var(--border-strong));
+  border: 1px solid var(--border-strong);
   background: transparent;
-  color: var(--k, var(--text-2));
+  color: var(--text-2);
   font-size: var(--fs-sm);
   font-variant-numeric: tabular-nums;
   transition: background 0.12s, border-color 0.12s, color 0.12s;
 }
-/* --bg-3 is the surface the five hues were calibrated against (see the palette block): hue text on
-   it measures 4.54:1 at the worst of the five. The obvious alternative — a 14% hue wash, the mix the
-   old badge used — fails, because 14% blue into --bg-2 drops blue text to 4.02:1. */
 .chip:hover { background: var(--bg-3); }
-/* A solid status fill is exactly what --on-accent exists for (see its comment). White on the five
-   light hues measures 5.19–7.39:1; #04121f on the five dark hues, 5.63–7.49:1. The 'All' chip has no
-   category, so every var(--k, …) falls through to --accent and it keeps the fill it always had. */
-.chip.on { background: var(--k, var(--accent)); border-color: var(--k, var(--accent)); color: var(--on-accent); font-weight: 600; }
-/* A count of zero is muted by colour, not opacity: 0.35 alpha on top of --text-2 landed near 1.6:1.
-   :not(.on) is load-bearing — you can switch on a category that has no items, and a --text-3 fill
-   under --on-accent measures 3.45:1. An on-and-empty chip keeps its hue and says so loudly. */
-.chip.zero:not(.on) { --k: var(--text-3); border-color: var(--border); }
+.chip.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
 
-/* No pill: at one row per file the border and the tint were thousands of stacked rectangles
-   competing with the paths, which are what you actually read. Colour and a glyph carry the same
-   five categories the pill carried, and the pill carried nothing else. */
+/* At one row per file, borders become thousands of competing rectangles. A glyph and semantic
+   color preserve the result type while leaving paths dominant. */
 .act {
   display: flex;
   align-items: center;
   gap: 4px;
   min-width: 0;
-  color: var(--k, var(--text-2));
+  color: var(--result-type-color, var(--text-2));
   font-size: var(--fs-sm);
   font-weight: 500;
   line-height: var(--lh-tight);
@@ -513,7 +496,7 @@ tr.flip .act-dir { outline: 1px dashed currentColor; outline-offset: 1px; border
 .jrow2 .dot.ok { color: var(--c-green); }
 .jrow2 .dot.warn { color: var(--c-orange); }
 .jrow2 .dot.err { color: var(--c-red); }
-/* A run older than a week: the age *is* the warning, so it is said in colour rather than words */
+/* A run older than a week: the age *is* the warning, so it is said in color rather than words */
 .jrow2.stale { color: var(--c-red); }
 
 .jedit { position: absolute; top: 8px; right: 8px; background: none; border: none; color: var(--text-2); padding: 0 2px; flex: none; display: inline-flex; }
@@ -562,14 +545,12 @@ tr.flip .act-dir { outline: 1px dashed currentColor; outline-offset: 1px; border
   font-size: var(--fs-sm);
 }
 
-/* One count and its icon. Zeros recede by colour rather than alpha — the number still has to be
+/* One count and its icon. Zeros recede by color rather than alpha — the number still has to be
    readable to say "nothing of this kind". */
 .st { display: inline-flex; gap: 3px; align-items: center; }
-/* var(--k) with no k-* class on the segment is invalid at computed-value time, and `color` inherits
-   — so it lands on .stats's own --text-2, which is how the bytes and flips segments stay neutral
-   without a class. The five category segments carry k-copy … k-conflict and take the hue. */
-.st b { font-weight: 600; color: var(--k, currentColor); }
-/* Must stay after .st b to win — a zero is a zero whatever category it belongs to */
+/* Neutral totals inherit .stats; executable result segments receive a result-type color. */
+.st b { font-weight: 600; color: var(--result-type-color, currentColor); }
+/* Must stay after .st b so zero remains muted regardless of result type. */
 .st.zero, .st.zero b { color: var(--text-3); }
 
 .pathline { display: flex; flex-direction: column; gap: 5px; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: var(--fs-sm); min-width: 0; }
@@ -629,66 +610,160 @@ tr.flip .act-dir { outline: 1px dashed currentColor; outline-offset: 1px; border
 .cfgpill .ck { color: var(--text-2); }
 .cfgpill .cv { font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* Two clusters that wrap between, never through, each other: "narrow the list" (search +
-   category chips) and "tools" (.fb-actions | .fb-right). On a narrow window the bar becomes two
-   tidy rows — filtering on top, tools below with the display-mode group still right-aligned —
-   instead of chips folding into a column between fixed blocks while the right side runs off
-   screen. */
-.filterbar {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px 8px;
-  padding: 6px 12px;
+/* Compare results are ordered by meaning: result set, query/view controls, then the execution
+   scope they produce. The scope summary spans the bar because it must remain visible when the
+   side panel is collapsed. */
+.result-bar {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.8fr) minmax(0, 1.2fr);
+  grid-template-areas:
+    "primary primary"
+    "query view"
+    "scope scope";
+  align-items: start;
+  gap: 6px 10px;
+  padding: 6px 12px 8px;
   background: var(--bg-2);
   border-bottom: 1px solid var(--border);
+  min-width: 0;
 }
-.search {
-  flex: 1 1 220px;
-  min-width: 200px;
-  max-width: 320px;
-  min-height: var(--ctl-h-sm);
-  padding: 4px 8px;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--border-strong);
-  background: var(--bg);
-  color: var(--text-1);
-  font-family: var(--mono);
-  font-size: var(--fs-sm);
-  outline: none;
+.result-bar-primary { grid-area: primary; display: flex; align-items: center; gap: 8px; min-width: 0; }
+.result-bar-primary-actions { margin-left: auto; flex: none; }
+.result-bar-tabs { display: flex; align-items: stretch; gap: 2px; min-width: 0; }
+.result-bar-tab {
+  display: inline-flex; align-items: center; gap: 6px; min-height: var(--ctl-h);
+  padding: 0 10px; border: 0; border-bottom: 2px solid transparent; border-radius: var(--r-sm) var(--r-sm) 0 0;
+  background: transparent; color: var(--text-2); font-size: var(--fs-base); white-space: nowrap;
 }
-.search::placeholder { color: var(--text-3); }
-.search:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.result-bar-tab:hover { color: var(--text-1); background: var(--bg-3); }
+.result-bar-tab.is-active { color: var(--accent); border-bottom-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.result-bar-tab-count { font-variant-numeric: tabular-nums; }
 
-.chips { display: flex; gap: 5px; flex-wrap: wrap; min-width: 0; }
-/* View actions (funnel / identical / CSV) move as one block when the bar wraps */
-.fb-actions { display: flex; gap: 5px; flex-wrap: wrap; flex: none; }
-/* The display-mode group carries the auto margin, not the fold button inside it: fold is
-   unmounted while a sort is active, and a margin on an element that is not there pushes nothing. */
-.fb-right { display: flex; gap: 5px; margin-left: auto; flex: none; flex-wrap: wrap; justify-content: flex-end; }
+.result-bar-query { grid-area: query; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.result-bar-search-wrap { flex: 1; min-width: 180px; }
+.result-bar-search {
+  width: 100%; min-width: 0; min-height: var(--ctl-h-sm); padding: 4px 8px;
+  border: 1px solid var(--border-strong); border-radius: var(--r-sm);
+  background: var(--bg); color: var(--text-1); font-family: var(--mono); font-size: var(--fs-sm); outline: none;
+}
+.result-bar-search::placeholder { color: var(--text-3); }
+.result-bar-search:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.advanced-filters-trigger.has-active-scope { border-color: var(--c-green); color: var(--c-green); }
+.control-count {
+  min-width: 17px; padding: 0 4px; border-radius: var(--r-pill);
+  background: var(--c-green); color: var(--on-accent); font-size: var(--fs-micro); text-align: center;
+}
 
-.overview { width: 236px; flex: none; background: var(--bg-2); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
-.overview.collapsed { width: 28px; }
-.overview.collapsed .ov-body { display: none; }
-.ov-toggle { width: 100%; padding: 6px 0; }
-.ov-body { flex: 1; overflow-y: auto; padding: 4px 6px; }
+.result-bar-scope {
+  grid-area: scope; display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center; gap: 8px 12px; min-width: 0; padding: 5px 7px;
+  border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg);
+}
+.result-bar-scope-description { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.result-bar-scope-title { color: var(--text-2); font-size: var(--fs-sm); font-weight: 600; white-space: nowrap; }
+.result-bar-scope-badges { display: flex; gap: 4px; min-width: 0; flex-wrap: wrap; }
+.result-bar-scope-badge {
+  display: inline-flex; align-items: baseline; gap: 4px; max-width: 260px; padding: 2px 7px;
+  border: 1px solid var(--accent); border-radius: var(--r-pill); color: var(--text-1);
+  background: var(--accent-soft); font: inherit; font-size: var(--fs-micro); text-align: left;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.result-bar-scope-badge:not(.is-neutral):hover { background: var(--bg-3); }
+.result-bar-scope-badge svg { flex: none; }
+.result-bar-scope-badge.is-neutral { border-color: var(--border); background: var(--bg-2); color: var(--text-2); }
+.result-bar-scope-badge-label { color: var(--text-2); font-weight: 600; }
+.result-bar-scope-counts { display: flex; align-items: stretch; gap: 0; margin: 0; }
+.result-bar-scope-count { display: grid; gap: 1px; min-width: 68px; padding: 0 8px; border-left: 1px solid var(--border); }
+.result-bar-scope-count dt { color: var(--text-2); font-size: var(--fs-micro); }
+.result-bar-scope-count dd { margin: 0; color: var(--text-1); font-size: var(--fs-sm); font-weight: 600; font-variant-numeric: tabular-nums; }
+.result-bar-scope-count-selected dd { color: var(--accent); }
 
-.ov-head { font-size: var(--fs-sm); color: var(--text-2); display: flex; align-items: center; justify-content: space-between; padding: 2px 2px 5px; }
-.ov-clear:hover { color: var(--c-red); }
+.result-bar-view { grid-area: view; display: flex; align-items: center; justify-content: flex-end; gap: 5px; flex-wrap: wrap; min-width: 0; }
+.segmented-control { display: inline-flex; align-items: stretch; min-height: var(--ctl-h-sm); border: 1px solid var(--border-strong); border-radius: var(--r-sm); overflow: hidden; }
+.segmented-label, .segmented-option {
+  display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 0 7px;
+  border: 0; border-right: 1px solid var(--border); background: var(--surface); color: var(--text-2); font-size: var(--fs-sm); white-space: nowrap;
+}
+.segmented-option:last-child { border-right: 0; }
+.segmented-option:hover { background: var(--bg-3); color: var(--text-1); }
+.segmented-option.is-active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.segmented-option:focus-visible {
+  position: relative; z-index: 1; border-radius: 0;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.segmented-label { background: var(--bg-2); font-weight: 600; }
 
-.ovrow { padding: 4px 6px; border-radius: var(--r-sm); font-size: var(--fs-sm); margin-bottom: 2px; }
-.ovrow:hover, .ovrow:focus-within { background: var(--bg-3); }
-.ovrow.on { background: var(--bg-3); outline: 1px solid var(--accent); }
-.ovrow .l1 { display: flex; gap: 5px; align-items: center; }
-.ovrow .chev { width: 12px; color: var(--text-2); flex: none; display: inline-flex; }
-.ovrow .chev button { display: inline-flex; background: none; border: none; padding: 0; color: inherit; }
-.ovrow .chev button:hover { color: var(--text-1); }
-.ovrow .ov-filter { display: flex; align-items: center; gap: 5px; flex: 1; min-width: 0; border: 0; padding: 0; background: none; color: var(--text-1); text-align: left; }
-.ovrow .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ovrow .ct { color: var(--text-2); font-size: var(--fs-micro); font-variant-numeric: tabular-nums; flex: none; }
-.ovbar { height: 3px; background: var(--bg-3); border-radius: 2px; margin-top: 4px; overflow: hidden; }
-.ovbar > div { height: 100%; background: var(--accent); }
-.ovchild { margin-left: 16px; }
+/* Run Scope is an execution facet, not a second file browser. Counts and bars are shares of all
+   differences; transfer and deletion bytes remain separately named secondary facts. */
+.run-scope-panel {
+  width: 268px; flex: none; display: flex; flex-direction: column; min-width: 0;
+  background: var(--bg-2); border-right: 1px solid var(--border);
+}
+.run-scope-panel.collapsed { width: 30px; }
+.run-scope-panel.collapsed .run-scope-body { display: none; }
+.run-scope-toggle { width: 100%; padding: 6px 0; border-bottom: 1px solid var(--border-subtle); }
+.run-scope-body { flex: 1; min-height: 0; overflow-y: auto; padding: 5px 7px 8px; }
+.run-scope-head, .run-scope-section-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 0; }
+.run-scope-head { min-height: var(--ctl-h); color: var(--text-1); font-size: var(--fs-sm); font-weight: 600; }
+.run-scope-clear-all, .run-scope-clear-folder {
+  display: inline-flex; align-items: center; gap: 3px; padding: 0; border: 0;
+  background: transparent; color: var(--accent); font-size: var(--fs-micro); white-space: nowrap;
+}
+.run-scope-clear-all:hover, .run-scope-clear-folder:hover:not(:disabled) { text-decoration: underline; }
+.run-scope-clear-folder:disabled { color: var(--text-3); }
+.run-scope-section { padding: 8px 0; border-top: 1px solid var(--border-subtle); }
+.run-scope-section-title { margin: 0 0 5px; color: var(--text-2); font-size: var(--fs-micro); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+.run-scope-section-head .run-scope-section-title { margin-bottom: 0; }
+.run-scope-any, .run-scope-facet {
+  width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  min-height: var(--ctl-h-sm); padding: 3px 7px; border: 1px solid transparent; border-radius: var(--r-sm);
+  background: transparent; color: var(--text-1); font-size: var(--fs-sm); text-align: left;
+}
+.run-scope-any { margin: 2px 0 4px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.run-scope-any:hover, .run-scope-facet:hover { background: var(--bg-3); }
+.run-scope-any.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.run-scope-facets { display: grid; gap: 2px; }
+.run-scope-facet.on { border-color: var(--result-type-color, var(--accent)); background: color-mix(in srgb, var(--result-type-color, var(--accent)) 12%, transparent); color: var(--result-type-color, var(--accent)); font-weight: 600; }
+.run-scope-facet.zero:not(.on) { color: var(--text-3); }
+.run-scope-facet:disabled { cursor: default; }
+.run-scope-facet-label { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+.run-scope-facet-count { color: var(--text-2); font-variant-numeric: tabular-nums; flex: none; }
+.run-scope-facet.on .run-scope-facet-count { color: inherit; }
+.run-scope-folders { display: flex; flex-direction: column; gap: 5px; }
+.run-scope-folder-current { display: flex; align-items: baseline; gap: 5px; padding: 4px 6px; border-radius: var(--r-sm); color: var(--text-2); font-size: var(--fs-micro); min-width: 0; }
+.run-scope-folder-current.on { background: var(--accent-soft); color: var(--accent); }
+.run-scope-folder-current strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-scope-folder-list { display: flex; flex-direction: column; gap: 2px; }
+.run-scope-folder { border-radius: var(--r-sm); min-width: 0; }
+.run-scope-folder:hover, .run-scope-folder:focus-within { background: var(--bg-3); }
+.run-scope-folder.on { background: var(--accent-soft); outline: 1px solid var(--accent); }
+.run-scope-folder-select {
+  width: 100%; display: flex; flex-direction: column; align-items: stretch; gap: 1px;
+  min-width: 0; padding: 4px 5px 5px; border: 0; border-radius: inherit;
+  background: transparent; color: var(--text-1); text-align: left;
+}
+.run-scope-folder-main { display: flex; align-items: center; gap: 5px; min-width: 0; padding-left: calc(var(--run-scope-depth, 0) * 14px); }
+.run-scope-folder-chevron {
+  width: 24px; min-height: 24px; color: var(--text-2); flex: none;
+  display: inline-flex; align-items: center; justify-content: center; border-radius: var(--r-sm);
+}
+.run-scope-folder-chevron.expandable { cursor: pointer; }
+.run-scope-folder-chevron.expandable:hover { background: var(--bg); color: var(--text-1); }
+.run-scope-folder-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); }
+.run-scope-folder-count { color: var(--text-2); font-size: var(--fs-micro); font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
+.run-scope-folder-share { display: flex; flex-direction: column; gap: 1px; padding-left: calc(29px + var(--run-scope-depth, 0) * 14px); color: var(--text-2); font-size: var(--fs-micro); }
+.run-scope-folder-bytes { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-scope-folder-bar { display: block; height: 3px; margin: 4px 0 0 calc(29px + var(--run-scope-depth, 0) * 14px); overflow: hidden; border-radius: 2px; background: var(--bg-3); }
+.run-scope-folder-bar > span { display: block; height: 100%; background: var(--accent); }
+.run-scope-empty { margin: 4px 0; color: var(--text-2); font-size: var(--fs-sm); }
+
+@media (max-width: 960px) {
+  .result-bar {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "primary" "query" "view" "scope";
+  }
+  .result-bar-view { justify-content: flex-start; }
+}
 
 table { width: 100%; border-collapse: collapse; }
 
@@ -710,7 +785,7 @@ td { user-select: text; }
    :nth-child counts "which row in the window", so the whole pattern flips on every scroll */
 tbody tr.alt { background: var(--bg-2); }
 tbody tr:hover { background: var(--bg-3); }
-/* An unticked row recedes by colour, never by alpha — the reason column still has to be
+/* An unticked row recedes by color, never by alpha — the reason column still has to be
    readable to explain why you unticked it */
 tbody tr.off td { color: var(--text-2); }
 tbody tr.off td.c-reason, tbody tr.off td.c-size, tbody tr.off td.c-time { color: var(--text-3); }
@@ -727,7 +802,7 @@ td.c-size { text-align: right; color: var(--text-2); font-variant-numeric: tabul
 td.c-reason { color: var(--text-2); font-size: var(--fs-sm); }
 .c-time { text-align: right; white-space: nowrap; }
 td.c-time { color: var(--text-2); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
-/* Only the Identical panel still fuses size and time into one cell */
+/* Identical uses this shared width for each source/target timestamp column. */
 .c-meta { width: 160px; text-align: right; white-space: nowrap; }
 td.c-meta { color: var(--text-2); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
 /* The newer side, wherever the responsive ladder has left it. PlanTable picks the cell (the most
@@ -799,7 +874,7 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 .plantable td.c-time, .plantable td.c-size { overflow: hidden; text-overflow: ellipsis; }
 .plantable thead th { overflow: hidden; text-overflow: ellipsis; }
 
-/* Spacer rows only hold height: no borders, padding, zebra stripes, or hover colour */
+/* Spacer rows only hold height: no borders, padding, zebra stripes, or hover color */
 .placeholder {
   display: flex;
   flex-direction: column;
@@ -817,22 +892,24 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 .placeholder-desc { font-size: var(--fs-base); max-width: 420px; user-select: text; }
 .logempty { color: var(--text-2); padding: 20px; text-align: center; }
 
-.samepanel { display: flex; flex-direction: column; height: 100%; min-width: 0; }
-.sp-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; padding: 8px 10px; background: var(--bg-2); border-bottom: 1px solid var(--border); font-size: var(--fs-sm); }
-.sp-head h2 { font-size: var(--fs-sm); font-weight: 600; }
-.sp-head .sp-q {
+.identical-results-panel { display: flex; flex-direction: column; height: 100%; min-width: 0; }
+.identical-results-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; padding: 8px 10px; background: var(--bg-2); border-bottom: 1px solid var(--border); font-size: var(--fs-sm); }
+.identical-results-head h2 { font-size: var(--fs-sm); font-weight: 600; }
+.identical-results-drift-legend { display: inline-flex; align-items: center; gap: 5px; color: var(--text-2); font-size: var(--fs-micro); }
+.identical-results-drift-legend i { width: 7px; height: 7px; border-radius: 50%; background: var(--c-orange); flex: none; }
+.identical-results-head .identical-results-search {
   flex: 1 1 200px; min-width: 160px; max-width: 280px; padding: 4px 8px;
   border-radius: var(--r-sm); border: 1px solid var(--border-strong);
   background: var(--bg); color: var(--text-1); font-family: var(--mono); font-size: var(--fs-sm); outline: none;
 }
-.sp-head .sp-q:focus { border-color: var(--accent); box-shadow: var(--ring); }
-.sp-head .sp-count { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--text-2); }
-.sametable { width: 100%; border-collapse: collapse; }
-.sametable thead th { position: sticky; top: 0; background: var(--bg-2); text-align: left; padding: 6px 10px; font-size: var(--fs-sm); color: var(--text-2); border-bottom: 1px solid var(--border-strong); font-weight: 600; }
-.sametable td { padding: 4px 10px; border-bottom: 1px solid var(--border-subtle); font-size: var(--fs-sm); }
-.sametable tr:hover { background: var(--bg-3); }
-.sametable td.c-meta.drift { color: var(--c-orange); }
-.sp-more { margin: 12px auto; }
+.identical-results-head .identical-results-search:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.identical-results-head .identical-results-count { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--text-2); }
+.identical-results-table { width: 100%; border-collapse: collapse; }
+.identical-results-table thead th { position: sticky; top: 0; background: var(--bg-2); text-align: left; padding: 6px 10px; font-size: var(--fs-sm); color: var(--text-2); border-bottom: 1px solid var(--border-strong); font-weight: 600; }
+.identical-results-table td { padding: 4px 10px; border-bottom: 1px solid var(--border-subtle); font-size: var(--fs-sm); }
+.identical-results-table tr:hover { background: var(--bg-3); }
+.identical-results-table td.c-meta.drift { color: var(--c-orange); }
+.identical-results-more { margin: 12px auto; }
 
 .cmp-panel { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; }
 .cmp-panel .cmp-title { color: var(--text-2); font-size: var(--fs-md); letter-spacing: 1px; }
@@ -1090,7 +1167,7 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 }
 
 /* A field row: name on top, control under it, one short line of explanation under that. The three
-   differ in size, weight and colour — see the typographic-roles block. */
+   differ in size, weight and color — see the typographic-roles block. */
 .ed-field { display: flex; flex-direction: column; gap: 5px; }
 .ed-field-head { display: flex; align-items: center; gap: 6px; }
 .ed-field input[type="text"], .ed-field input[type="number"], .ed-field select, .ed-field textarea {
@@ -1129,9 +1206,7 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 
 /* A number or a fixed set of options is never as wide as a path. Left unconstrained they stretch
    the full pane and the form reads as a column of identical bars. */
-/* ed-kind-*, not k-*: k-* is the plan-category hue family (k-copy, k-update, …) and means one
-   thing. This is a different axis — what sort of control the field renders — and sharing the
-   prefix would put two unrelated vocabularies in one namespace. */
+/* ed-kind-* describes an editor control type, not a compare result type. */
 .ed-field.ed-kind-num input, .ed-field.ed-kind-select select { max-width: 240px; }
 
 .ed-help { display: inline-flex; padding: 0; border: none; background: none; color: var(--text-2); flex: none; }
@@ -1184,25 +1259,25 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 .junkbox .jb-count { color: var(--text-2); font-size: var(--fs-micro); font-variant-numeric: tabular-nums; flex: none; }
 
 /* Positioned by JS through the CSSOM — under a CSP nonce a style="" attribute is blocked */
-.funnelpop {
+.advanced-filters-popover {
   position: fixed; z-index: 115; width: 400px; max-width: calc(100vw - 12px); max-height: calc(100vh - 12px); padding: 12px 14px;
   background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r);
   box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 9px; overflow-y: auto; overscroll-behavior: contain;
 }
-.fp-head { display: flex; align-items: baseline; gap: 8px; font-size: var(--fs-md); font-weight: 600; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
-.fp-row { display: flex; flex-direction: column; gap: 5px; font-size: var(--fs-sm); }
-.fp-row > span:first-child { color: var(--text-2); font-size: var(--fs-sm); }
-.fp-row textarea, .fp-row input[type="number"] {
+.advanced-filters-head { display: flex; align-items: baseline; gap: 8px; font-size: var(--fs-md); font-weight: 600; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+.advanced-filters-row { display: flex; flex-direction: column; gap: 5px; font-size: var(--fs-sm); }
+.advanced-filters-row > span:first-child { color: var(--text-2); font-size: var(--fs-sm); }
+.advanced-filters-row textarea, .advanced-filters-row input[type="number"] {
   background: var(--bg); color: var(--text-1); border: 1px solid var(--border-strong);
   border-radius: var(--r-sm); padding: 5px 8px; font-size: var(--fs-base); outline: none;
 }
-.fp-row textarea { min-height: 64px; resize: vertical; font-family: var(--mono); font-size: var(--fs-sm); }
-.fp-row textarea:focus, .fp-row input:focus { border-color: var(--accent); box-shadow: var(--ring); }
-.fp-pair { display: flex; gap: 6px; }
-.fp-pair input { width: 100%; min-width: 0; }
-.fp-chips { display: flex; gap: 5px; flex-wrap: wrap; }
-.fp-stat { font-size: var(--fs-sm); min-height: 18px; color: var(--text-2); }
-.fp-btns { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; padding-top: 4px; }
+.advanced-filters-row textarea { min-height: 64px; resize: vertical; font-family: var(--mono); font-size: var(--fs-sm); }
+.advanced-filters-row textarea:focus, .advanced-filters-row input:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.advanced-filters-pair { display: flex; gap: 6px; }
+.advanced-filters-pair input { width: 100%; min-width: 0; }
+.advanced-filters-presets { display: flex; gap: 5px; flex-wrap: wrap; }
+.advanced-filters-stat { font-size: var(--fs-sm); min-height: 18px; color: var(--text-2); }
+.advanced-filters-buttons { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; padding-top: 4px; }
 
 .menu-panel {
   position: fixed;
@@ -1365,20 +1440,26 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
   }
   .sidefoot span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .main { height: auto; min-height: 0; }
-  .toolbar, .pathline, .filterbar { padding-left: 8px; padding-right: 8px; }
+  .toolbar, .pathline, .result-bar { padding-left: 8px; padding-right: 8px; }
   .tb-side { width: 100%; margin-left: 0; }
-  .search { flex-basis: 100%; width: 100%; min-width: 0; max-width: none; }
-  .chips, .fb-actions, .fb-right { width: 100%; }
-  .fb-right { margin-left: 0; justify-content: flex-start; }
-  .reviewrow { flex-direction: column; }
-  .overview {
+  .result-bar-primary { flex-wrap: wrap; }
+  .result-bar-primary-actions { margin-left: 0; }
+  .result-bar-query { flex-wrap: wrap; }
+  .result-bar-search-wrap { flex-basis: 100%; }
+  .result-bar-scope { grid-template-columns: minmax(0, 1fr); }
+  .result-bar-scope-description { align-items: flex-start; flex-direction: column; }
+  .result-bar-scope-counts { width: 100%; }
+  .result-bar-scope-count { flex: 1; }
+  .result-bar-view { justify-content: flex-start; }
+  .results-layout { flex-direction: column; }
+  .run-scope-panel {
     width: 100%;
-    max-height: 120px;
+    max-height: 240px;
     border-right: 0;
     border-bottom: 1px solid var(--border);
   }
-  .overview.collapsed { width: 100%; max-height: 28px; }
-  .ov-body { min-height: 0; }
+  .run-scope-panel.collapsed { width: 100%; max-height: 30px; }
+  .run-scope-body { min-height: 0; }
   .cmp-panel { justify-content: flex-start; padding: 12px 8px; overflow: auto; }
   .cmp-rows { width: 100%; }
   .cmp-rows .stagerow.cmp2 {
@@ -1424,10 +1505,10 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
   .mrow span:first-child { width: 100%; }
   .capability-card .capability-severity { width: 100%; margin-left: 0; }
   .capability-card dl > div { grid-template-columns: 1fr; gap: 1px; }
-  .funnelpop { padding: 10px; }
-  .fp-pair { flex-wrap: wrap; }
-  .sp-head .sp-count { margin-left: 0; }
-  .sametable { min-width: 600px; }
+  .advanced-filters-popover { padding: 10px; }
+  .advanced-filters-pair { flex-wrap: wrap; }
+  .identical-results-head .identical-results-count { margin-left: 0; }
+  .identical-results-table { min-width: 600px; }
   .submenu-panel { top: 100%; right: 0; left: auto; margin: 2px 0 0; }
   .status { flex-wrap: wrap; gap: 4px 8px; padding: 5px 8px; }
   .statusmsg { flex: 1 1 220px; }

@@ -145,7 +145,7 @@ pub fn inspect_paths(source: String, target: String) -> PathVerdict {
     v
 }
 
-/// Ad-hoc mask matching for the UI funnel. The frontend **does not write its own glob** — the FFS mask
+/// Ad-hoc mask matching for Advanced Filters. The frontend **does not write its own glob** — the FFS mask
 /// semantics have exactly one implementation, in filter.rs, so a mask tried out in the UI behaves identically once written into the job's exclude.
 #[tauri::command]
 pub fn mask_match(masks: Vec<String>, paths: Vec<String>) -> Vec<bool> {

@@ -1,39 +1,29 @@
-// Row semantics of a compare result: which op a row currently carries, which side it touches, how it
-// is categorized, labelled and sorted. Every one of these used to read a module-global `plan`/`flipped`
-// in main.ts; they now take the state explicitly so a React render can call them from anywhere.
-
 import type { Op } from './types/generated/Op';
-import type { CompareOwner } from './types/generated/CompareOwner';
-import type { PlanHeader } from './types/generated/PlanHeader';
+import type { PlanDto as GeneratedPlanDto } from './types/generated/PlanDto';
 import type { RowMeta } from './types/generated/RowMeta';
 import type { SelectedRowDto } from './types/generated/SelectedRowDto';
 
-export type OpDto = Op;
+export type PlanOperation = Op;
+export type PlanDto = GeneratedPlanDto;
 
-/// Return value of `compare_job`. The Rust side generates a DTO of the same name (PlanDto.ts),
-/// but there `header` is a `PlanHeader` reference; keeping the shape identical here is enough.
-export interface PlanDto {
-  owner: CompareOwner;
-  header: PlanHeader;
-  ops: OpDto[];
-  /// Measured size/mtime for both sides. Copy rows are null because Op already carries their sole side.
-  metas: (RowMeta | null)[];
-  equal_count: number;
-  equal_bytes: number;
+export const RESULT_TYPES = ['copy', 'update', 'move', 'delete', 'conflict', 'note'] as const;
+export type ResultType = typeof RESULT_TYPES[number];
+export interface ResultTypeDefinition {
+  group: 'action' | 'report';
+  label: string;
+  pluralLabel: string;
 }
+export const RESULT_TYPE_DEFINITIONS: Record<ResultType, ResultTypeDefinition> = {
+  copy: { group: 'action', label: 'Copy', pluralLabel: 'Copies' },
+  update: { group: 'action', label: 'Update', pluralLabel: 'Updates' },
+  move: { group: 'action', label: 'Move', pluralLabel: 'Moves' },
+  delete: { group: 'action', label: 'Delete', pluralLabel: 'Deletes' },
+  conflict: { group: 'report', label: 'Conflict', pluralLabel: 'Conflicts' },
+  note: { group: 'report', label: 'Note', pluralLabel: 'Notes' },
+};
 
-/// The six things a plan row can be — the whole vocabulary the UI colours and draws. `Chip` is this
-/// set minus `note` (which category() folds into conflict) plus an `all` pseudo-entry, so the two
-/// are deliberately separate names derived from one list rather than two hand-kept unions.
-export type Kind = 'copy' | 'update' | 'move' | 'delete' | 'conflict' | 'note';
-export type Chip = 'all' | Exclude<Kind, 'note'>;
-export const CHIPS: [Chip, string][] = [
-  ['all', 'All'], ['copy', 'Copy'], ['update', 'Update'], ['move', 'Move'], ['delete', 'Delete'], ['conflict', 'Conflict/Note'],
-];
-
-/// The direction the bytes move. Null nowhere in this type — a row that has no direction (a report)
-/// carries `null` at the site that asks for one.
-export type Dir = 'right' | 'left';
+/// The side on which an executable operation runs. Reports carry `null` at the call site.
+export type ActionDirection = 'right' | 'left';
 
 /// One key per sortable column. The two path keys are per-side rather than one shared 'path': the
 /// table shows the source and the target path in separate columns, and a row missing that side has
@@ -50,46 +40,48 @@ export const SORT_LABEL: Record<SortKey, string> = {
   reason: 'reason',
 };
 
-/// Same value as MTIME_SLACK_MS on the Rust side: FAT/SMB timestamp granularity — under 2 s is not an "update"
-export const MTIME_SLACK = 2000;
+/// Same value as `MTIME_SLACK_MS` on the Rust side: FAT/SMB timestamp granularity.
+export const MTIME_SLACK_MS = 2000;
 
 // A 250k-row comparison used to ship a second complete Op for every reversible row. Besides
 // duplicating paths and reasons across the Tauri JSON boundary, WebKit had to retain both object
 // graphs and peaked above 1 GB before the table first painted. Reversal is needed only for rows the
 // user explicitly flips, so derive and cache those few objects lazily from the original operation.
-const reverseCache = new WeakMap<OpDto, OpDto | null>();
+const reverseCache = new WeakMap<PlanOperation, PlanOperation | null>();
 
-function reverseOp(op: OpDto): OpDto | null {
-  if (reverseCache.has(op)) return reverseCache.get(op) ?? null;
-  const side = op.side === 'source' ? 'target' : 'source';
-  const reason = `flipped(${op.reason})`;
-  let out: OpDto | null;
-  switch (op.action) {
+function reverseOperation(operation: PlanOperation): PlanOperation | null {
+  if (reverseCache.has(operation)) return reverseCache.get(operation) ?? null;
+  const side = operation.side === 'source' ? 'target' : 'source';
+  const reason = `flipped(${operation.reason})`;
+  let reversedOperation: PlanOperation | null;
+  switch (operation.action) {
     case 'copy':
-      out = {
-        ...op, side, action: 'delete', from: null, mtime_ms: null,
+      reversedOperation = {
+        ...operation, side, action: 'delete', from: null, mtime_ms: null,
         hash: null, link: null, reason,
       };
       break;
     case 'update':
-      out = {
-        ...op, side, from: null, size: null, mtime_ms: null, hash: null, reason,
+      reversedOperation = {
+        ...operation, side, from: null, size: null, mtime_ms: null, hash: null, reason,
       };
       break;
     case 'delete':
-      out = { ...op, side, action: 'copy', from: null, mtime_ms: null, reason };
+      reversedOperation = {
+        ...operation, side, action: 'copy', from: null, mtime_ms: null, hash: null, reason,
+      };
       break;
     default:
-      out = null;
+      reversedOperation = null;
   }
-  reverseCache.set(op, out);
-  return out;
+  reverseCache.set(operation, reversedOperation);
+  return reversedOperation;
 }
 
-/// The op currently in effect for this row (once flipped, the reversed one)
-export function eff(plan: PlanDto, flipped: boolean[], i: number): OpDto {
-  const op = plan.ops[i];
-  return flipped[i] ? (reverseOp(op) ?? op) : op;
+/// Returns the original or user-reversed operation currently represented by a row.
+export function effectiveOperation(plan: PlanDto, flipped: boolean[], index: number): PlanOperation {
+  const operation = plan.ops[index];
+  return flipped[index] ? (reverseOperation(operation) ?? operation) : operation;
 }
 
 /// The apply boundary carries decisions, not operations. Rust reconstructs each row from the
@@ -98,76 +90,79 @@ export function selectedRows(indices: number[], flipped: boolean[]): SelectedRow
   return indices.map((index) => ({ index, flipped: flipped[index] === true }));
 }
 
-export function metaOf(plan: PlanDto, i: number): RowMeta {
-  const sent = plan.metas?.[i];
-  if (sent) return sent;
-  const op = plan.ops[i];
-  if (op.action === 'copy' && op.size != null && op.mtime_ms != null) {
-    const one = { size: op.size, mtime_ms: op.mtime_ms };
-    return op.side === 'target' ? { src: one, dst: null } : { src: null, dst: one };
+export function rowMetadata(plan: PlanDto, index: number): RowMeta {
+  const metadata = plan.metas?.[index];
+  if (metadata) return metadata;
+  const operation = plan.ops[index];
+  if (operation.action === 'copy' && operation.size != null && operation.mtime_ms != null) {
+    const existingSide = { size: operation.size, mtime_ms: operation.mtime_ms };
+    return operation.side === 'target'
+      ? { src: existingSide, dst: null }
+      : { src: null, dst: existingSide };
   }
   return { src: null, dst: null };
 }
 
-/// Conflicts and notes are reports, not actions: they can neither be checked nor reversed
-export function selectable(op: OpDto): boolean {
-  return op.action !== 'conflict' && op.action !== 'note';
+/// Execution eligibility comes from the exhaustive result vocabulary, so facets and Apply cannot
+/// acquire independent definitions of which rows are reports.
+export function isExecutableOperation(operation: PlanOperation): boolean {
+  return RESULT_TYPE_DEFINITIONS[resultTypeOf(operation)].group === 'action';
 }
 
-export function canFlip(plan: PlanDto, i: number): boolean {
-  const action = plan.ops[i].action;
+export function canReverseOperation(plan: PlanDto, index: number): boolean {
+  const action = plan.ops[index].action;
   return action === 'copy' || action === 'update' || action === 'delete';
 }
 
-/// Never returns 'all' — that chip is the *absence* of a filter, not a category — so the return type
-/// says so, and rowAction() below can use it without having to rule the pseudo-entry back out.
-export function category(op: OpDto): Exclude<Chip, 'all'> {
-  switch (op.action) {
+/// Engine-level chmod and directory deletion retain their precise row labels while joining the
+/// broader Update and Delete result types respectively.
+export function resultTypeOf(operation: PlanOperation): ResultType {
+  switch (operation.action) {
     case 'copy': return 'copy';
     case 'update': case 'chmod': return 'update';
     case 'move': return 'move';
     case 'delete': case 'delete_dir': return 'delete';
-    default: return 'conflict';
+    case 'conflict': return 'conflict';
+    case 'note': return 'note';
   }
 }
 
 /// The paths that **currently exist** on the source / target side for this row (state at compare time, not after the run):
 /// copy exists only on the origin side; delete only on the side being deleted; for move the executing side is still `from` while the other is already `path`;
 /// update/chmod/conflict/note exist on both sides.
-export function sidePaths(op: OpDto): [string | null, string | null] {
-  const execOnTarget = op.side === 'target';
-  switch (op.action) {
+export function sidePaths(operation: PlanOperation): [string | null, string | null] {
+  const executesOnTarget = operation.side === 'target';
+  switch (operation.action) {
     case 'copy':
-      return execOnTarget ? [op.path, null] : [null, op.path];
+      return executesOnTarget ? [operation.path, null] : [null, operation.path];
     case 'move': {
-      const cur = op.from ?? op.path;
-      return execOnTarget ? [op.path, cur] : [cur, op.path];
+      const currentPath = operation.from ?? operation.path;
+      return executesOnTarget
+        ? [operation.path, currentPath]
+        : [currentPath, operation.path];
     }
     case 'delete':
     case 'delete_dir':
-      return execOnTarget ? [null, op.path] : [op.path, null];
+      return executesOnTarget ? [null, operation.path] : [operation.path, null];
     default:
-      return [op.path, op.path];
+      return [operation.path, operation.path];
   }
 }
 
-/// The verb a row states. Separate from `category()` because two actions share a category but not a
+/// The verb a row states. Separate from `resultTypeOf()` because two actions share a type but not a
 /// verb: chmod is an update and delete_dir is a delete, and both should still say what they are.
-const LABEL: Record<OpDto['action'], string> = {
+const ACTION_LABEL: Record<PlanOperation['action'], string> = {
   copy: 'copy', update: 'update', chmod: 'chmod', move: 'move',
   delete: 'delete', delete_dir: 'delete', conflict: 'conflict', note: 'note',
 };
 
-/// What the action cell states: the direction the bytes move, the category its glyph and colour come
-/// from, and the verb. The cell composes them as [dir][kind] label.
-///
-/// `dir` is null exactly for the two reports — "is a report" is already what selectable() decides,
-/// so there is one definition of it rather than two lists that can drift.
-export function rowAction(op: OpDto): { dir: Dir | null; kind: Kind; label: string } {
+/// Reports have no execution direction; `isExecutableOperation()` reads that classification from
+/// `RESULT_TYPE_DEFINITIONS`.
+export function describeRowAction(operation: PlanOperation): { direction: ActionDirection | null; resultType: ResultType; label: string } {
   return {
-    dir: selectable(op) ? (op.side === 'target' ? 'right' : 'left') : null,
-    kind: op.action === 'note' ? 'note' : category(op),
-    label: LABEL[op.action],
+    direction: isExecutableOperation(operation) ? (operation.side === 'target' ? 'right' : 'left') : null,
+    resultType: resultTypeOf(operation),
+    label: ACTION_LABEL[operation.action],
   };
 }
 
@@ -176,8 +171,8 @@ export function rowAction(op: OpDto): { dir: Dir | null; kind: Kind; label: stri
 /// serde string instead would order it `chmod < conflict < copy < delete < delete_dir < move`,
 /// which is alphabetical trivia, not a ladder anyone means. If the Rust ranks change, this drifts —
 /// that is the cost of a column the engine does not send us.
-export function actionRank(op: OpDto): number {
-  switch (op.action) {
+export function actionRank(operation: PlanOperation): number {
+  switch (operation.action) {
     case 'move': return 0;
     case 'copy': case 'update': return 1;
     case 'chmod': return 2;
@@ -224,39 +219,60 @@ export function keySpec(key: SortKey): KeySpec {
 /// direction) so "things that aren't there" don't steal attention. Numeric keys compare as numbers — the
 /// old code zero-padded size/mtime to 20-char strings, two allocations per comparator call, i.e. hundreds
 /// of thousands of them for one pass over a few thousand rows
-export function sortVal(plan: PlanDto, flipped: boolean[], i: number, key: SortKey): [number, number, string] {
-  const op = eff(plan, flipped, i);
-  const m = metaOf(plan, i);
+export function sortValue(plan: PlanDto, flipped: boolean[], index: number, key: SortKey): [number, number, string] {
+  const operation = effectiveOperation(plan, flipped, index);
+  const metadata = rowMetadata(plan, index);
   switch (key) {
-    // Per-side paths, not op.path: the column shows what sidePaths() put in it, and for a move that
+    // Per-side paths, not operation.path: the column shows what sidePaths() put in it, and for a move that
     // is the origin on one side and the destination on the other
-    case 's.path': { const p = sidePaths(op)[0]; return [p ? 0 : 1, 0, p ? p.toLowerCase() : '']; }
-    case 't.path': { const p = sidePaths(op)[1]; return [p ? 0 : 1, 0, p ? p.toLowerCase() : '']; }
-    case 'action': return [0, actionRank(op), ''];
-    case 's.size': return [m.src ? 0 : 1, m.src?.size ?? 0, ''];
-    case 's.mtime': return [m.src ? 0 : 1, m.src?.mtime_ms ?? 0, ''];
-    case 't.size': return [m.dst ? 0 : 1, m.dst?.size ?? 0, ''];
-    case 't.mtime': return [m.dst ? 0 : 1, m.dst?.mtime_ms ?? 0, ''];
-    case 'reason': return [0, 0, op.reason.toLowerCase()];
+    case 's.path': {
+      const sourcePath = sidePaths(operation)[0];
+      return [sourcePath ? 0 : 1, 0, sourcePath ? sourcePath.toLowerCase() : ''];
+    }
+    case 't.path': {
+      const targetPath = sidePaths(operation)[1];
+      return [targetPath ? 0 : 1, 0, targetPath ? targetPath.toLowerCase() : ''];
+    }
+    case 'action': return [0, actionRank(operation), ''];
+    case 's.size': return [metadata.src ? 0 : 1, metadata.src?.size ?? 0, ''];
+    case 's.mtime': return [metadata.src ? 0 : 1, metadata.src?.mtime_ms ?? 0, ''];
+    case 't.size': return [metadata.dst ? 0 : 1, metadata.dst?.size ?? 0, ''];
+    case 't.mtime': return [metadata.dst ? 0 : 1, metadata.dst?.mtime_ms ?? 0, ''];
+    case 'reason': return [0, 0, operation.reason.toLowerCase()];
   }
 }
 
-/// Bytes and time this row involves: take the larger/newer of the two sides ("how big and how new is the file behind this row")
-export function rowSize(plan: PlanDto, flipped: boolean[], i: number): number {
-  const m = metaOf(plan, i);
-  return Math.max(eff(plan, flipped, i).size ?? 0, m.src?.size ?? 0, m.dst?.size ?? 0);
+/// Largest size represented by either side of the compare row.
+export function rowSize(plan: PlanDto, flipped: boolean[], index: number): number {
+  const metadata = rowMetadata(plan, index);
+  return Math.max(
+    effectiveOperation(plan, flipped, index).size ?? 0,
+    metadata.src?.size ?? 0,
+    metadata.dst?.size ?? 0,
+  );
 }
 
-export function rowMtime(plan: PlanDto, i: number): number {
-  const m = metaOf(plan, i);
-  return Math.max(m.src?.mtime_ms ?? 0, m.dst?.mtime_ms ?? 0);
+/// Bytes that actually cross from the winning side for a copy/update. A reversed update deliberately
+/// clears Op.size because its original evidence belongs to the other direction, so consult the
+/// immutable per-side compare metadata according to the effective destination instead.
+export function rowTransferBytes(plan: PlanDto, flipped: boolean[], index: number): number {
+  const operation = effectiveOperation(plan, flipped, index);
+  if (operation.action !== 'copy' && operation.action !== 'update') return 0;
+  const metadata = rowMetadata(plan, index);
+  const origin = operation.side === 'target' ? metadata.src : metadata.dst;
+  return Math.max(0, origin?.size ?? operation.size ?? 0);
+}
+
+export function rowModifiedTime(plan: PlanDto, index: number): number {
+  const metadata = rowMetadata(plan, index);
+  return Math.max(metadata.src?.mtime_ms ?? 0, metadata.dst?.mtime_ms ?? 0);
 }
 
 /// Which side is meaningfully newer, for the tinted meta column ('' = within the slack, i.e. the same age)
-export function newerSide(plan: PlanDto, i: number): '' | 's' | 't' {
-  const m = metaOf(plan, i);
-  if (!m.src || !m.dst) return '';
-  if (m.src.mtime_ms - m.dst.mtime_ms > MTIME_SLACK) return 's';
-  if (m.dst.mtime_ms - m.src.mtime_ms > MTIME_SLACK) return 't';
+export function newerSide(plan: PlanDto, index: number): '' | 's' | 't' {
+  const metadata = rowMetadata(plan, index);
+  if (!metadata.src || !metadata.dst) return '';
+  if (metadata.src.mtime_ms - metadata.dst.mtime_ms > MTIME_SLACK_MS) return 's';
+  if (metadata.dst.mtime_ms - metadata.src.mtime_ms > MTIME_SLACK_MS) return 't';
   return '';
 }

@@ -86,7 +86,7 @@ fn main() {
             cmd::jobs::list_jobs, cmd::jobs::jobs_dir, cmd::jobs::get_job, cmd::jobs::default_job, cmd::jobs::job_file_schema, cmd::jobs::save_job, cmd::jobs::delete_job,
             cmd::autoscan::start_autoscan, cmd::autoscan::stop_autoscan, cmd::autoscan::autoscan_status, cmd::autoscan::complete_autoscan,
             cmd::edit::inspect_paths, cmd::edit::mask_match, cmd::edit::junk_presets,
-            cmd::results::touch_compare, cmd::results::restore_compare, cmd::results::list_same, cmd::results::export_csv,
+            cmd::results::touch_compare, cmd::results::restore_compare, cmd::results::list_identical, cmd::results::export_csv,
             cmd::logs::run_history, cmd::logs::last_syncs, cmd::logs::run_detail, cmd::logs::log_runs, cmd::logs::log_artifact, cmd::logs::log_dir_path, cmd::logs::app_log_tail, cmd::logs::get_settings, cmd::logs::save_settings,
             cmd::shell::reveal, cmd::shell::post_sync_action, cmd::shell::open_progress_window, cmd::shell::cancel_progress_launch, cmd::shell::close_progress_launch, cmd::shell::close_progress_window,
             cmd::run::review_compare, cmd::run::approve_operation, cmd::run::compare_job, cmd::run::review_apply, cmd::run::authorize_autoscan_apply, cmd::run::apply_job, cmd::run::replay_run_events, cmd::run::cancel_run, cmd::run::pause_run

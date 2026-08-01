@@ -55,7 +55,7 @@ export function togglePreset(p: JunkPresetDto, text: string, on: boolean): strin
 }
 
 /// Append entries that are not already present, folded the way the engine folds them. Used by the row
-/// context menu and by the funnel's "write to job exclude" — both of which now write into the same list
+/// context menu and by Advanced Filters' "Write to Job Exclude" — both write into the same list
 /// the presets live in, so a mask that happens to equal a preset pattern lights that preset's box up
 /// rather than being pasted next to it.
 export function addExcludeEntries(existing: string[], add: string[]): { next: string[]; added: string[] } {

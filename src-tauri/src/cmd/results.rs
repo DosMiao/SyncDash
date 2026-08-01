@@ -8,7 +8,7 @@ use syncdash::model::plan::{Op, PlanHeader};
 use syncdash::pipeline::compare;
 
 use crate::dto::PlanDto;
-use crate::dto::{CompareOwner, SamePage};
+use crate::dto::{CompareOwner, IdenticalPage};
 use crate::state::{resolve_target, validate_cached_compare, ResultKey, ResultRepository};
 
 /// Touch a locally retained owner without sending its potentially large plan through the webview.
@@ -58,17 +58,17 @@ pub fn restore_compare(
 
 /// Pagination for the "Identical" panel from that result's retained snapshots — no rescan.
 #[tauri::command]
-pub fn list_same(
+pub fn list_identical(
     results: tauri::State<'_, Arc<ResultRepository>>,
     owner: CompareOwner,
     query: String,
     offset: usize,
     limit: usize,
-) -> Result<SamePage, String> {
+) -> Result<IdenticalPage, String> {
     let (job_name, full_job) = job::load_by_id(&owner.job_id).map_err(|e| e.to_string())?;
     let config_revision =
         job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
-    let (target_index, job) = resolve_target(&full_job, Some(owner.target_index))?;
+    let (target_index, _) = resolve_target(&full_job, Some(owner.target_index))?;
     let key = ResultKey::new(&full_job.job_id, target_index, &config_revision);
     let mut repository = results.0.lock().unwrap();
     repository.rebind_job_name(&full_job.job_id, &job_name);
@@ -82,23 +82,21 @@ pub fn list_same(
         &config_revision,
         None,
     )?;
-    let c = cached.expect("successful repository validation requires a cached comparison");
-    let (total, rows) = compare::evidence::same_page(
-        &c.source,
-        &c.target,
-        &job.compare_opts(),
+    let cached_result =
+        cached.expect("successful repository validation requires a cached comparison");
+    let (total, rows) = compare::evidence::identical_page(
+        &cached_result.source,
+        &cached_result.target,
+        &cached_result.compare_options,
         &query,
         offset,
         limit.min(2000),
     );
-    Ok(SamePage {
-        total,
-        rows,
-        job: job_name,
-    })
+    Ok(IdenticalPage { total, rows })
 }
 
-/// Export the current view as CSV. Escaping happens exactly once, here, and the output is UTF-8 **with a BOM** —
+/// Export caller-selected Run Scope rows in display order. Escaping happens exactly once, here, and
+/// the output is UTF-8 **with a BOM** —
 /// without the BOM Excel interprets the file in the local code page and non-ASCII paths turn into mojibake.
 #[tauri::command]
 pub fn export_csv(

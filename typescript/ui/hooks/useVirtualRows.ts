@@ -6,7 +6,7 @@ import type { RowSpec } from '../../core/grouping';
 // Virtual scrolling for the diff table body.
 //
 // One diff row = <tr> + up to 9 <td> + checkbox + action cell. Thousands of those in a live <table> cost
-// seconds just to build and to recompute column widths — and a chip switch, a keystroke in the search box,
+// seconds just to build and to recompute column widths — and a result-type facet, a search keystroke,
 // or folding one directory redoes all of it. So we mount only the viewport's rows inside a bounded
 // scroll canvas: render cost and browser-facing geometry both stay finite.
 //

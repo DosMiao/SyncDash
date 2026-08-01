@@ -63,7 +63,7 @@ function draw(cv: HTMLCanvasElement, s: RunState, key: 'b' | 'i', total: number)
     ctx.lineTo(X(s.samples[s.samples.length - 1].t), Y(lastV));
     ctx.strokeStyle = cAccent; ctx.lineWidth = 1.5; ctx.stroke();
     ctx.lineTo(X(s.samples[s.samples.length - 1].t), Y(0)); ctx.closePath();
-    // globalAlpha rather than appending '33' to the colour string: that assumed --accent is always
+    // globalAlpha rather than appending '33' to the color string: that assumed --accent is always
     // a 6-digit hex, which a token written as rgb() or color-mix() would silently break
     ctx.fillStyle = cAccent;
     ctx.globalAlpha = 0.2;

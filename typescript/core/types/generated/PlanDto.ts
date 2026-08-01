@@ -13,6 +13,6 @@ export type PlanDto = { header: PlanHeader, ops: Array<Op>,
  */
 metas: Array<RowMeta | null>,
 /**
- * Count/bytes of the files judged equal on both sides (the denominator of "showing X of Y")
+ * Count/bytes of files this comparison judged identical on both sides.
  */
-equal_count: number, equal_bytes: number, owner: CompareOwner, };
+identical_count: number, identical_bytes: number, owner: CompareOwner, };

@@ -309,7 +309,7 @@ export function Menu({ trigger, children, disabled, title, align = 'start', clas
 export interface ContextPoint { x: number; y: number }
 
 /// A context menu opened at a point. Its contents are the same layer of MenuItems a Menu takes,
-/// so a row's right-click menu and a toolbar dropdown cannot drift apart in look or behaviour.
+/// so a row's right-click menu and a toolbar dropdown cannot drift apart in look or behavior.
 export function ContextMenu({ at, onClose, children }: {
   at: ContextPoint;
   onClose: () => void;

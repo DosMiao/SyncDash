@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildLayout, flattenLayout, layoutDirs } from '../../typescript/core/grouping.ts';
+import { buildLayout, flattenLayout, layoutFolderPaths } from '../../typescript/core/grouping.ts';
 import type { FolderNode, PlanLayout, RowSpec } from '../../typescript/core/grouping.ts';
-import type { OpDto, PlanDto, Sort } from '../../typescript/core/plan.ts';
+import type { PlanDto, PlanOperation, Sort } from '../../typescript/core/plan.ts';
 
-function op(path: string, patch: Partial<OpDto> = {}): OpDto {
+function operation(path: string, patch: Partial<PlanOperation> = {}): PlanOperation {
   return {
     side: 'target',
     action: 'copy',
@@ -17,7 +17,7 @@ function op(path: string, patch: Partial<OpDto> = {}): OpDto {
   };
 }
 
-function plan(ops: OpDto[]): PlanDto {
+function plan(ops: PlanOperation[]): PlanDto {
   return {
     owner: {} as PlanDto['owner'],
     // Grouping never reads the header. Keep the fixture focused on the paths and row metadata that
@@ -25,16 +25,16 @@ function plan(ops: OpDto[]): PlanDto {
     header: {} as PlanDto['header'],
     ops,
     metas: ops.map(() => null),
-    equal_count: 0,
-    equal_bytes: 0,
+    identical_count: 0,
+    identical_bytes: 0,
   };
 }
 
-function layoutOf(p: PlanDto, flipped: boolean[] = [], sort: Sort | null = null): PlanLayout {
+function layoutOf(result: PlanDto, flipped: boolean[] = [], sort: Sort | null = null): PlanLayout {
   return buildLayout({
-    plan: p,
+    plan: result,
     flipped,
-    visible: p.ops.map((_, i) => i),
+    inScopeIndices: result.ops.map((_, index) => index),
     grouped: true,
     sort,
   });
@@ -51,42 +51,45 @@ function allFolders(tree: FolderNode[] | null): FolderNode[] {
   return out;
 }
 
-function folder(layout: PlanLayout, dir: string): FolderNode {
-  const hits = allFolders(layout.tree).filter((node) => node.dir === dir);
-  assert.equal(hits.length, 1, `expected exactly one folder node for ${JSON.stringify(dir)}`);
+function folder(layout: PlanLayout, folderPath: string): FolderNode {
+  const hits = allFolders(layout.folderTree).filter((node) => node.path === folderPath);
+  assert.equal(hits.length, 1, `expected exactly one folder node for ${JSON.stringify(folderPath)}`);
   return hits[0];
 }
 
-function members(layout: PlanLayout, dir: string): number[] {
-  const node = folder(layout, dir);
-  return layout.order.slice(node.start, node.end);
+function members(layout: PlanLayout, folderPath: string): number[] {
+  const node = folder(layout, folderPath);
+  return layout.displayOrder.slice(node.start, node.end);
 }
 
-function rowTags(p: PlanDto, rows: RowSpec[]): string[] {
+function rowTags(result: PlanDto, rows: RowSpec[]): string[] {
   return rows.map((row) => (
     typeof row === 'number'
-      ? `row:${p.ops[row].path}`
-      : `folder:${row.dir || '(root)'}@${row.depth}`
+      ? `row:${result.ops[row].path}`
+      : `folder:${row.folderPath || 'Root Level'}@${row.depth}`
   ));
 }
 
 function assertPermutation(actual: number[], expected: number[]): void {
   assert.equal(new Set(actual).size, actual.length, 'the DFS order must not duplicate operations');
-  assert.deepEqual([...actual].sort((a, b) => a - b), [...expected].sort((a, b) => a - b));
+  assert.deepEqual(
+    [...actual].sort((left, right) => left - right),
+    [...expected].sort((left, right) => left - right),
+  );
 }
 
 test('recursive layout synthesizes every intermediate folder while root files stay a sibling group', () => {
-  const p = plan([
-    op('root.txt'),
-    op('docs/readme.md'),
-    op('docs/api/v1/openapi.json'),
-    op('docs/api/v2/schema.json'),
-    op('src/internal/cache.bin'),
+  const result = plan([
+    operation('root.txt'),
+    operation('docs/readme.md'),
+    operation('docs/api/v1/openapi.json'),
+    operation('docs/api/v2/schema.json'),
+    operation('src/internal/cache.bin'),
   ]);
-  const layout = layoutOf(p);
+  const layout = layoutOf(result);
 
-  assert.deepEqual(layout.tree?.map((node) => node.dir), ['', 'docs', 'src']);
-  assert.deepEqual(layoutDirs(layout), [
+  assert.deepEqual(layout.folderTree?.map((node) => node.path), ['', 'docs', 'src']);
+  assert.deepEqual(layoutFolderPaths(layout), [
     '',
     'docs',
     'docs/api',
@@ -96,7 +99,7 @@ test('recursive layout synthesizes every intermediate folder while root files st
     'src/internal',
   ]);
   assert.deepEqual(
-    allFolders(layout.tree).map((node) => [node.dir, node.depth]),
+    allFolders(layout.folderTree).map((node) => [node.path, node.depth]),
     [
       ['', 0],
       ['docs', 0],
@@ -109,18 +112,18 @@ test('recursive layout synthesizes every intermediate folder while root files st
   );
 
   const root = folder(layout, '');
-  assert.deepEqual(root.direct, [0], 'the (root) pseudo-folder owns root files only');
-  assert.deepEqual(root.children, [], 'top-level real folders are siblings, not children of (root)');
+  assert.deepEqual(root.directIndices, [0], 'the Root Level pseudo-folder owns root files only');
+  assert.deepEqual(root.children, [], 'top-level real folders are siblings, not children of Root Level');
   assert.deepEqual(members(layout, ''), [0]);
-  assert.deepEqual(folder(layout, 'docs').direct, [1]);
-  assert.deepEqual(folder(layout, 'docs/api').direct, []);
-  assert.deepEqual(folder(layout, 'docs/api/v1').direct, [2]);
-  assert.deepEqual(folder(layout, 'docs/api/v2').direct, [3]);
-  assert.deepEqual(folder(layout, 'src/internal').direct, [4]);
-  assertPermutation(layout.order, [0, 1, 2, 3, 4]);
+  assert.deepEqual(folder(layout, 'docs').directIndices, [1]);
+  assert.deepEqual(folder(layout, 'docs/api').directIndices, []);
+  assert.deepEqual(folder(layout, 'docs/api/v1').directIndices, [2]);
+  assert.deepEqual(folder(layout, 'docs/api/v2').directIndices, [3]);
+  assert.deepEqual(folder(layout, 'src/internal').directIndices, [4]);
+  assertPermutation(layout.displayOrder, [0, 1, 2, 3, 4]);
 
-  assert.deepEqual(rowTags(p, flattenLayout(layout, new Set())), [
-    'folder:(root)@0',
+  assert.deepEqual(rowTags(result, flattenLayout(layout, new Set())), [
+    'folder:Root Level@0',
     'row:root.txt',
     'folder:docs@0',
     'row:docs/readme.md',
@@ -136,59 +139,59 @@ test('recursive layout synthesizes every intermediate folder while root files st
 });
 
 test('collapse hides exactly one folder subtree at each depth and leaves siblings alone', () => {
-  const p = plan([
-    op('root.txt'),
-    op('a/own.txt'),
-    op('a/b/own.txt'),
-    op('a/b/c/leaf.txt'),
-    op('z/peer.txt'),
+  const result = plan([
+    operation('root.txt'),
+    operation('a/own.txt'),
+    operation('a/b/own.txt'),
+    operation('a/b/c/leaf.txt'),
+    operation('z/peer.txt'),
   ]);
-  const layout = layoutOf(p);
+  const layout = layoutOf(result);
 
-  assert.deepEqual(rowTags(p, flattenLayout(layout, new Set(['a/b/c']))), [
-    'folder:(root)@0', 'row:root.txt',
+  assert.deepEqual(rowTags(result, flattenLayout(layout, new Set(['a/b/c']))), [
+    'folder:Root Level@0', 'row:root.txt',
     'folder:a@0', 'row:a/own.txt',
     'folder:a/b@1', 'row:a/b/own.txt',
     'folder:a/b/c@2',
     'folder:z@0', 'row:z/peer.txt',
   ]);
-  assert.deepEqual(rowTags(p, flattenLayout(layout, new Set(['a/b']))), [
-    'folder:(root)@0', 'row:root.txt',
+  assert.deepEqual(rowTags(result, flattenLayout(layout, new Set(['a/b']))), [
+    'folder:Root Level@0', 'row:root.txt',
     'folder:a@0', 'row:a/own.txt',
     'folder:a/b@1',
     'folder:z@0', 'row:z/peer.txt',
   ]);
-  assert.deepEqual(rowTags(p, flattenLayout(layout, new Set(['a']))), [
-    'folder:(root)@0', 'row:root.txt',
+  assert.deepEqual(rowTags(result, flattenLayout(layout, new Set(['a']))), [
+    'folder:Root Level@0', 'row:root.txt',
     'folder:a@0',
     'folder:z@0', 'row:z/peer.txt',
   ]);
-  assert.deepEqual(rowTags(p, flattenLayout(layout, new Set(['']))), [
-    'folder:(root)@0',
+  assert.deepEqual(rowTags(result, flattenLayout(layout, new Set(['']))), [
+    'folder:Root Level@0',
     'folder:a@0', 'row:a/own.txt',
     'folder:a/b@1', 'row:a/b/own.txt',
     'folder:a/b/c@2', 'row:a/b/c/leaf.txt',
     'folder:z@0', 'row:z/peer.txt',
-  ], 'folding (root) must not fold its top-level folder siblings');
+  ], 'folding Root Level must not fold its top-level folder siblings');
 });
 
 test('folder intervals aggregate descendants without copying them into every ancestor', () => {
-  const p = plan([
-    op('a/own.bin', { size: 2 }),
-    op('a/b/child.bin', { action: 'update', size: 3 }),
-    op('a/b/report.txt', { action: 'conflict', size: 5 }),
-    op('a/b/c/leaf.bin', { action: 'delete', size: 7 }),
-    op('sibling/note.txt', { action: 'note', size: 11 }),
+  const result = plan([
+    operation('a/own.bin', { size: 2 }),
+    operation('a/b/child.bin', { action: 'update', size: 3 }),
+    operation('a/b/report.txt', { action: 'conflict', size: 5 }),
+    operation('a/b/c/leaf.bin', { action: 'delete', size: 7 }),
+    operation('sibling/note.txt', { action: 'note', size: 11 }),
   ]);
-  const layout = layoutOf(p);
-  const a = folder(layout, 'a');
-  const ab = folder(layout, 'a/b');
-  const abc = folder(layout, 'a/b/c');
+  const layout = layoutOf(result);
+  const folderA = folder(layout, 'a');
+  const folderAB = folder(layout, 'a/b');
+  const folderABC = folder(layout, 'a/b/c');
   const sibling = folder(layout, 'sibling');
 
-  assert.deepEqual(a.direct, [0]);
-  assert.deepEqual(ab.direct, [1, 2]);
-  assert.deepEqual(abc.direct, [3]);
+  assert.deepEqual(folderA.directIndices, [0]);
+  assert.deepEqual(folderAB.directIndices, [1, 2]);
+  assert.deepEqual(folderABC.directIndices, [3]);
   assert.deepEqual(members(layout, 'a'), [0, 1, 2, 3]);
   assert.deepEqual(members(layout, 'a/b'), [1, 2, 3]);
   assert.deepEqual(members(layout, 'a/b/c'), [3]);
@@ -196,10 +199,10 @@ test('folder intervals aggregate descendants without copying them into every anc
 
   assert.deepEqual(
     [
-      [a.count, a.selectable, a.bytes],
-      [ab.count, ab.selectable, ab.bytes],
-      [abc.count, abc.selectable, abc.bytes],
-      [sibling.count, sibling.selectable, sibling.bytes],
+      [folderA.count, folderA.executableCount, folderA.bytes],
+      [folderAB.count, folderAB.executableCount, folderAB.bytes],
+      [folderABC.count, folderABC.executableCount, folderABC.bytes],
+      [sibling.count, sibling.executableCount, sibling.bytes],
     ],
     [
       [4, 3, 17],
@@ -208,21 +211,29 @@ test('folder intervals aggregate descendants without copying them into every anc
       [1, 0, 11],
     ],
   );
-  for (const node of [a, ab, abc, sibling]) {
+  for (const node of [folderA, folderAB, folderABC, sibling]) {
     assert.equal(node.count, node.end - node.start);
   }
-  assert.ok(a.start <= ab.start && ab.end <= a.end, 'child intervals must nest inside their parent');
-  assert.ok(ab.start <= abc.start && abc.end <= ab.end, 'deep child intervals must stay nested');
-  assert.ok(a.end <= sibling.start, 'sibling intervals must not overlap');
-  assert.deepEqual(
-    layout.order.slice(a.start, a.end).filter((i) => !['conflict', 'note'].includes(p.ops[i].action)),
-    [0, 1, 3],
-    'a parent checkbox maps its interval to selectable descendants only',
+  assert.ok(
+    folderA.start <= folderAB.start && folderAB.end <= folderA.end,
+    'child intervals must nest inside their parent',
   );
-  assertPermutation(layout.order, [0, 1, 2, 3, 4]);
+  assert.ok(
+    folderAB.start <= folderABC.start && folderABC.end <= folderAB.end,
+    'deep child intervals must stay nested',
+  );
+  assert.ok(folderA.end <= sibling.start, 'sibling intervals must not overlap');
+  assert.deepEqual(
+    layout.displayOrder
+      .slice(folderA.start, folderA.end)
+      .filter((index) => !['conflict', 'note'].includes(result.ops[index].action)),
+    [0, 1, 3],
+    'a parent checkbox maps its interval to executable descendants only',
+  );
+  assertPermutation(layout.displayOrder, [0, 1, 2, 3, 4]);
 
   const renderedA = flattenLayout(layout, new Set()).find(
-    (row): row is Exclude<RowSpec, number> => typeof row !== 'number' && row.dir === 'a',
+    (row): row is Exclude<RowSpec, number> => typeof row !== 'number' && row.folderPath === 'a',
   );
   assert.ok(renderedA);
   assert.deepEqual(
@@ -230,76 +241,76 @@ test('folder intervals aggregate descendants without copying them into every anc
       start: renderedA.start,
       end: renderedA.end,
       count: renderedA.count,
-      selectable: renderedA.selectable,
+      executableCount: renderedA.executableCount,
       bytes: renderedA.bytes,
     },
-    { start: a.start, end: a.end, count: 4, selectable: 3, bytes: 17 },
+    { start: folderA.start, end: folderA.end, count: 4, executableCount: 3, bytes: 17 },
   );
 });
 
 test('action sorting can reorder flipped subtrees without changing folder membership', () => {
-  const p = plan([
-    op('alpha/deep/copy.bin', { action: 'copy', size: 10 }),
-    op('beta/deep/delete.bin', { action: 'delete', size: 20 }),
+  const result = plan([
+    operation('alpha/deep/copy.bin', { action: 'copy', size: 10 }),
+    operation('beta/deep/delete.bin', { action: 'delete', size: 20 }),
   ]);
   const actionAsc: Sort = { key: 'action', dir: 1 };
 
-  const before = layoutOf(p, [false, false], actionAsc);
-  assert.deepEqual(layoutDirs(before), ['alpha', 'alpha/deep', 'beta', 'beta/deep']);
-  assert.deepEqual(before.order, [0, 1]);
+  const before = layoutOf(result, [false, false], actionAsc);
+  assert.deepEqual(layoutFolderPaths(before), ['alpha', 'alpha/deep', 'beta', 'beta/deep']);
+  assert.deepEqual(before.displayOrder, [0, 1]);
   assert.deepEqual(members(before, 'alpha'), [0]);
   assert.deepEqual(members(before, 'beta'), [1]);
 
   // copy -> delete and delete -> copy. The aggregate action rank swaps the two top-level folders,
   // but a display sort must never turn the sorted value into the row's directory identity.
-  const after = layoutOf(p, [true, true], actionAsc);
-  assert.deepEqual(layoutDirs(after), ['beta', 'beta/deep', 'alpha', 'alpha/deep']);
-  assert.deepEqual(after.order, [1, 0]);
+  const after = layoutOf(result, [true, true], actionAsc);
+  assert.deepEqual(layoutFolderPaths(after), ['beta', 'beta/deep', 'alpha', 'alpha/deep']);
+  assert.deepEqual(after.displayOrder, [1, 0]);
   assert.deepEqual(members(after, 'alpha'), [0]);
   assert.deepEqual(members(after, 'beta'), [1]);
-  assertPermutation(after.order, [0, 1]);
+  assertPermutation(after.displayOrder, [0, 1]);
 });
 
 test('a cross-directory move is grouped by its destination path, not by a side-specific sort path', () => {
-  const p = plan([
-    op('new/deep/moved.txt', {
+  const result = plan([
+    operation('new/deep/moved.txt', {
       side: 'source',
       action: 'move',
       from: 'old/place/moved.txt',
       size: 4,
     }),
-    op('middle/other.txt', { size: 2 }),
+    operation('middle/other.txt', { size: 2 }),
   ]);
-  const layout = layoutOf(p, [false, false], { key: 's.path', dir: 1 });
-  const dirs = layoutDirs(layout);
+  const layout = layoutOf(result, [false, false], { key: 's.path', dir: 1 });
+  const folderPaths = layoutFolderPaths(layout);
 
-  assert.ok(dirs.includes('new'));
-  assert.ok(dirs.includes('new/deep'));
-  assert.ok(!dirs.includes('old'));
-  assert.ok(!dirs.includes('old/place'));
-  assert.deepEqual(folder(layout, 'new/deep').direct, [0]);
+  assert.ok(folderPaths.includes('new'));
+  assert.ok(folderPaths.includes('new/deep'));
+  assert.ok(!folderPaths.includes('old'));
+  assert.ok(!folderPaths.includes('old/place'));
+  assert.deepEqual(folder(layout, 'new/deep').directIndices, [0]);
   assert.deepEqual(members(layout, 'new'), [0]);
-  assertPermutation(layout.order, [0, 1]);
+  assertPermutation(layout.displayOrder, [0, 1]);
 });
 
 test('delete_dir is a distinct self row inside the folder its checkbox controls', () => {
-  const p = plan([
-    op('a/b', { action: 'delete_dir', size: null }),
-    op('a/b/child.txt', { action: 'delete', size: 3 }),
-    op('a', { action: 'delete_dir', size: null }),
+  const result = plan([
+    operation('a/b', { action: 'delete_dir', size: null }),
+    operation('a/b/child.txt', { action: 'delete', size: 3 }),
+    operation('a', { action: 'delete_dir', size: null }),
   ]);
-  const layout = layoutOf(p);
-  const dirs = layoutDirs(layout);
+  const layout = layoutOf(result);
+  const folderPaths = layoutFolderPaths(layout);
 
-  assert.equal(dirs.filter((dir) => dir === 'a').length, 1);
-  assert.equal(dirs.filter((dir) => dir === 'a/b').length, 1);
-  assert.ok(!dirs.includes(''), 'a top-level directory operation is not a root-file row');
-  assert.deepEqual(folder(layout, 'a').direct, [2], 'delete_dir a belongs to the a folder itself');
-  assert.deepEqual(folder(layout, 'a/b').direct, [0, 1], 'delete_dir a/b and its child share the a/b subtree');
-  assert.deepEqual(folder(layout, 'a').children.map((node) => node.dir), ['a/b']);
+  assert.equal(folderPaths.filter((folderPath) => folderPath === 'a').length, 1);
+  assert.equal(folderPaths.filter((folderPath) => folderPath === 'a/b').length, 1);
+  assert.ok(!folderPaths.includes(''), 'a top-level directory operation is not a root-file row');
+  assert.deepEqual(folder(layout, 'a').directIndices, [2], 'delete_dir a belongs to the a folder itself');
+  assert.deepEqual(folder(layout, 'a/b').directIndices, [0, 1], 'delete_dir a/b and its child share the a/b subtree');
+  assert.deepEqual(folder(layout, 'a').children.map((node) => node.path), ['a/b']);
   assert.deepEqual(members(layout, 'a'), [2, 0, 1]);
   assert.deepEqual(members(layout, 'a/b'), [0, 1]);
-  assert.equal(folder(layout, 'a').selectable, 3);
-  assert.equal(folder(layout, 'a/b').selectable, 2);
-  assertPermutation(layout.order, [0, 1, 2]);
+  assert.equal(folder(layout, 'a').executableCount, 3);
+  assert.equal(folder(layout, 'a/b').executableCount, 2);
+  assertPermutation(layout.displayOrder, [0, 1, 2]);
 });

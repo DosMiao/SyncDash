@@ -2,7 +2,7 @@
 // a command name typo is then a compile error here instead of a rejected promise at click time.
 
 import { invoke } from '@tauri-apps/api/core';
-import type { PlanDto, OpDto } from './plan';
+import type { PlanDto, PlanOperation } from './plan';
 import type { RunEventEnvelope } from './runEvents';
 import {
   applyAuthorizationArgs,
@@ -30,13 +30,13 @@ import type { PathVerdict } from './types/generated/PathVerdict';
 import type { PlanHeader } from './types/generated/PlanHeader';
 import type { RowMeta } from './types/generated/RowMeta';
 import type { RunRecord } from './types/generated/RunRecord';
-import type { SamePage } from './types/generated/SamePage';
-import type { SameRow } from './types/generated/SameRow';
+import type { IdenticalPage } from './types/generated/IdenticalPage';
+import type { IdenticalRow } from './types/generated/IdenticalRow';
 import type { SelectedRowDto } from './types/generated/SelectedRowDto';
 
 export type { AuthorizationDto, JobDeleteDto, JobDetailDto, JobFull, JobSaveDto, JunkPresetDto, OperationReviewDto };
 
-export type { SameRow, SamePage };
+export type { IdenticalRow, IdenticalPage };
 
 // Jobs
 
@@ -169,10 +169,10 @@ export const maskMatch = (masks: string[], paths: string[]) =>
 /// describe what the job excludes.
 export const junkPresets = () => invoke<JunkPresetDto[]>('junk_presets');
 
-export const listSame = (owner: CompareOwner, query: string, offset: number, limit: number) =>
-  invoke<SamePage>('list_same', { owner, query, offset, limit });
+export const listIdentical = (owner: CompareOwner, query: string, offset: number, limit: number) =>
+  invoke<IdenticalPage>('list_identical', { owner, query, offset, limit });
 
-export const exportCsv = (path: string, header: PlanHeader, ops: OpDto[], metas: RowMeta[], checked: boolean[]) =>
+export const exportCsv = (path: string, header: PlanHeader, ops: PlanOperation[], metas: RowMeta[], checked: boolean[]) =>
   invoke<number>('export_csv', { path, header, ops, metas, checked });
 
 export const reveal = (path: string) => invoke<void>('reveal', { path });

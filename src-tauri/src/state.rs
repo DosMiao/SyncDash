@@ -29,6 +29,7 @@ pub(crate) struct CachedCompare {
     pub(crate) plan: PlanDto,
     pub(crate) source: syncdash::model::table::Snapshot,
     pub(crate) target: syncdash::model::table::Snapshot,
+    pub(crate) compare_options: syncdash::pipeline::compare::CompareOptions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -550,12 +551,13 @@ mod tests {
                 header: plan_header,
                 ops: Vec::new(),
                 metas: Vec::new(),
-                equal_count: 0,
-                equal_bytes: 0,
+                identical_count: 0,
+                identical_bytes: 0,
                 owner,
             },
             source: snapshot("/source"),
             target: snapshot("/target"),
+            compare_options: syncdash::pipeline::compare::CompareOptions::default(),
         }
     }
 

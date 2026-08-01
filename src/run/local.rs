@@ -283,7 +283,7 @@ pub fn compare_resolved_with_consent(
     // Disagreement escalation: in the sampled evidence tier, a file whose digests match but whose mtimes differ by >2s may not simply be ruled identical (the knob can turn this off)
     let rr = job.rigor_resolved();
     let plan = if rr.sampled && rr.escalate {
-        escalate_sampled_disagreements(job, plan, &s, &t, ctx, sv, tv, &pp)?
+        escalate_sampled_disagreements(job, plan, &mut s, &mut t, ctx, sv, tv, &pp)?
     } else {
         plan
     };
@@ -292,6 +292,7 @@ pub fn compare_resolved_with_consent(
         plan,
         source: s,
         target: t,
+        compare_options: copts,
     })
 }
 
@@ -304,8 +305,8 @@ pub fn compare_resolved_with_consent(
 fn escalate_sampled_disagreements(
     job: &Job,
     mut plan: Plan,
-    s: &Snapshot,
-    t: &Snapshot,
+    s: &mut Snapshot,
+    t: &mut Snapshot,
     ctx: &crate::obs::progress::RunCtx,
     source: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     target: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
@@ -357,28 +358,50 @@ fn escalate_sampled_disagreements(
         }
         Ok(h.finalize().to_hex().to_string())
     }
-    let tmap: std::collections::HashMap<&str, &crate::model::table::Entry> = t
+    let target_by_path: std::collections::HashMap<&str, (usize, &crate::model::table::Entry)> = t
         .entries
         .iter()
-        .filter(|e| e.kind == EntryKind::File)
-        .map(|e| (e.path.as_str(), e))
+        .enumerate()
+        .filter(|(_, entry)| entry.kind == EntryKind::File)
+        .map(|(index, entry)| (entry.path.as_str(), (index, entry)))
         .collect();
-    let suspects: Vec<(&crate::model::table::Entry, &crate::model::table::Entry)> = s
+    let suspects: Vec<(
+        usize,
+        usize,
+        crate::model::table::Entry,
+        crate::model::table::Entry,
+    )> = s
         .entries
         .iter()
-        .filter(|e| e.kind == EntryKind::File)
-        .filter_map(|se| tmap.get(se.path.as_str()).map(|te| (se, *te)))
-        .filter(|(se, te)| match (&se.hash, &te.hash) {
-            (Some(a), Some(b)) => {
-                a.starts_with('~') && a == b && (se.mtime_ms - te.mtime_ms).abs() > slack_ms
+        .enumerate()
+        .filter(|(_, entry)| entry.kind == EntryKind::File)
+        .filter_map(|(source_index, source_entry)| {
+            target_by_path
+                .get(source_entry.path.as_str())
+                .map(|(target_index, target_entry)| {
+                    (
+                        source_index,
+                        *target_index,
+                        source_entry.clone(),
+                        (*target_entry).clone(),
+                    )
+                })
+        })
+        .filter(|(_, _, source_entry, target_entry)| {
+            match (&source_entry.hash, &target_entry.hash) {
+                (Some(a), Some(b)) => {
+                    a.starts_with('~')
+                        && a == b
+                        && (source_entry.mtime_ms - target_entry.mtime_ms).abs() > slack_ms
+                }
+                _ => false,
             }
-            _ => false,
         })
         .collect();
     if suspects.is_empty() {
         return Ok(plan);
     }
-    let bytes_total = suspects.iter().fold(0u64, |total, (source, target)| {
+    let bytes_total = suspects.iter().fold(0u64, |total, (_, _, source, target)| {
         total
             .saturating_add(source.size)
             .saturating_add(target.size)
@@ -395,69 +418,87 @@ fn escalate_sampled_disagreements(
     // One VFS object can represent a single protocol session (FTP is the canonical case), so
     // escalation must not open multiple suspects concurrently behind that backend's back. The
     // set is normally empty or one item; sequential reads are the safe and realistic schedule.
-    let extra: Vec<Op> = suspects
+    let escalated: Vec<(usize, usize, String, String, Option<Op>)> = suspects
         .iter()
-        .map(|(se, te)| -> std::io::Result<Option<Op>> {
-            let hs = full_hash(source, "source", &se.path, pp)?;
-            let ht = full_hash(target, "target", &te.path, pp)?;
-            let op = if hs == ht {
-                None
-            } else {
-                let reason = "escalated: sampled digests equal, mtime differs, full hashes differ";
-                match job.mode.as_str() {
-                    // mirror: source wins unconditionally
-                    "mirror" => Some(Op {
-                        side: Side::Target,
-                        action: Action::Update,
-                        path: se.path.clone(),
-                        from: None,
-                        size: Some(se.size),
-                        mtime_ms: Some(se.mtime_ms),
-                        hash: Some(hs),
-                        link: None,
-                        mode: None,
-                        reason: reason.into(),
-                    }),
-                    // sync: both sides differ in content with no attribution → report the conflict honestly, a human rules
-                    "sync" => Some(Op {
-                        side: Side::Target,
-                        action: Action::Conflict,
-                        path: se.path.clone(),
-                        from: None,
-                        size: Some(se.size),
-                        mtime_ms: Some(se.mtime_ms),
-                        hash: None,
-                        link: None,
-                        mode: None,
-                        reason: reason.into(),
-                    }),
-                    // enrich: update only when source is strictly newer
-                    _ => {
-                        if se.mtime_ms > te.mtime_ms + slack_ms {
-                            Some(Op {
-                                side: Side::Target,
-                                action: Action::Update,
-                                path: se.path.clone(),
-                                from: None,
-                                size: Some(se.size),
-                                mtime_ms: Some(se.mtime_ms),
-                                hash: Some(hs),
-                                link: None,
-                                mode: None,
-                                reason: reason.into(),
-                            })
-                        } else {
-                            None
+        .map(
+            |(source_index, target_index, se, te)| -> std::io::Result<(
+                usize,
+                usize,
+                String,
+                String,
+                Option<Op>,
+            )> {
+                let hs = full_hash(source, "source", &se.path, pp)?;
+                let ht = full_hash(target, "target", &te.path, pp)?;
+                let op = if hs == ht {
+                    None
+                } else {
+                    let reason =
+                        "escalated: sampled digests equal, mtime differs, full hashes differ";
+                    match job.mode.as_str() {
+                        // mirror: source wins unconditionally
+                        "mirror" => Some(Op {
+                            side: Side::Target,
+                            action: Action::Update,
+                            path: se.path.clone(),
+                            from: None,
+                            size: Some(se.size),
+                            mtime_ms: Some(se.mtime_ms),
+                            hash: Some(hs.clone()),
+                            link: None,
+                            mode: None,
+                            reason: reason.into(),
+                        }),
+                        // sync: both sides differ in content with no attribution → report the conflict honestly, a human rules
+                        "sync" => Some(Op {
+                            side: Side::Target,
+                            action: Action::Conflict,
+                            path: se.path.clone(),
+                            from: None,
+                            size: Some(se.size),
+                            mtime_ms: Some(se.mtime_ms),
+                            hash: None,
+                            link: None,
+                            mode: None,
+                            reason: reason.into(),
+                        }),
+                        // enrich: update only when source is strictly newer
+                        _ => {
+                            if se.mtime_ms > te.mtime_ms + slack_ms {
+                                Some(Op {
+                                    side: Side::Target,
+                                    action: Action::Update,
+                                    path: se.path.clone(),
+                                    from: None,
+                                    size: Some(se.size),
+                                    mtime_ms: Some(se.mtime_ms),
+                                    hash: Some(hs.clone()),
+                                    link: None,
+                                    mode: None,
+                                    reason: reason.into(),
+                                })
+                            } else {
+                                None
+                            }
                         }
                     }
-                }
-            };
-            pp.item_done(&se.path);
-            Ok(op)
-        })
-        .collect::<std::io::Result<Vec<_>>>()?
+                };
+                pp.item_done(&se.path);
+                Ok((*source_index, *target_index, hs, ht, op))
+            },
+        )
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    // The returned snapshots are the retained comparison evidence. Once escalation has measured a
+    // stronger full hash, keep it there so every later evidence view reaches the same verdict as
+    // the plan instead of re-reading the obsolete sampled digest.
+    for (source_index, target_index, source_hash, target_hash, _) in &escalated {
+        s.entries[*source_index].hash = Some(source_hash.clone());
+        t.entries[*target_index].hash = Some(target_hash.clone());
+    }
+    let extra: Vec<Op> = escalated
         .into_iter()
-        .flatten()
+        .filter_map(|(_, _, _, _, operation)| operation)
         .collect();
     if !extra.is_empty() {
         ctx.log(LogLevel::Warn, "compare", format!("escalation confirmed {} file(s) really do differ in content (changes outside the sampling window); added to the plan", extra.len()));
@@ -1098,7 +1139,7 @@ mod tests {
 
     #[test]
     fn escalation_read_failure_aborts_instead_of_retaining_identical() {
-        let (source, target, source_snapshot, target_snapshot, plan, job) =
+        let (source, target, mut source_snapshot, mut target_snapshot, plan, job) =
             escalation_fixture("read-failure");
         std::fs::remove_file(source.join("suspect.bin")).unwrap();
         let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1116,8 +1157,8 @@ mod tests {
         let error = match escalate_sampled_disagreements(
             &job,
             plan,
-            &source_snapshot,
-            &target_snapshot,
+            &mut source_snapshot,
+            &mut target_snapshot,
             &ctx,
             &source_vfs,
             &target_vfs,
@@ -1158,7 +1199,7 @@ mod tests {
 
     #[test]
     fn escalation_honors_cancellation_before_reopening_files() {
-        let (source, target, source_snapshot, target_snapshot, plan, job) =
+        let (source, target, mut source_snapshot, mut target_snapshot, plan, job) =
             escalation_fixture("cancel");
         let ctl = RunCtl::new();
         ctl.request_cancel();
@@ -1174,8 +1215,8 @@ mod tests {
         let error = match escalate_sampled_disagreements(
             &job,
             plan,
-            &source_snapshot,
-            &target_snapshot,
+            &mut source_snapshot,
+            &mut target_snapshot,
             &ctx,
             &source_vfs,
             &target_vfs,
@@ -1240,8 +1281,8 @@ mod tests {
         let plan = escalate_sampled_disagreements(
             &job,
             plan,
-            &source_snapshot,
-            &target_snapshot,
+            &mut source_snapshot,
+            &mut target_snapshot,
             &ctx,
             &source,
             &target,
@@ -1253,6 +1294,13 @@ mod tests {
         assert_eq!(plan.ops.len(), 1);
         assert_eq!(plan.ops[0].action, Action::Update);
         assert!(plan.ops[0].reason.starts_with("escalated:"));
+        let evidence = compare::evidence::evidence(
+            &source_snapshot,
+            &target_snapshot,
+            &plan,
+            &job.compare_opts(),
+        );
+        assert_eq!(evidence.identical_count, 0);
     }
 
     /// The generic VFS lane end to end: `as_local()` is None on both sides, so this drives

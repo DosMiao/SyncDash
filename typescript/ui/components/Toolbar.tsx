@@ -7,30 +7,29 @@ import {
 } from 'lucide-react';
 import { MODE_HINT, RIGOR_HINT } from '../../core/jobfields';
 import { humanSize } from '../../core/format';
-import { MARK } from '../icons';
+import { RESULT_TYPE_ICON } from '../icons';
 import type { ReactNode } from 'react';
 import type { JobDto } from '../../core/types/generated/JobDto';
 import type { AutoScanStatusDto } from '../../core/ipc';
 import { autoScanButtonLabel } from '../state/autoscan';
 
-export interface PlanStats {
-  copy: number;
-  upd: number;
-  mv: number;
-  del: number;
-  conflicts: number;
-  bytes: number;
-  flips: number;
+export interface SelectedRunStats {
+  copyCount: number;
+  updateCount: number;
+  moveCount: number;
+  deleteCount: number;
+  transferBytes: number;
+  reversedCount: number;
 }
 
-interface Props {
+interface ToolbarProps {
   job: JobDto | null;
   hasPlan: boolean;
-  /// Count of what would actually run (checked ∩ visible) — the same set the confirm sheet totals
-  finalCount: number;
-  stats: PlanStats | null;
+  executableCount: number;
+  stats: SelectedRunStats | null;
   busy: boolean;
   canSync: boolean;
+  applyBlockedMessage: string | null;
   /// Global backend monitor. It deliberately does not follow `job`: switching the selected view must
   /// not silently stop or relabel work that remains armed for another job.
   watchStatus: AutoScanStatusDto | null;
@@ -41,19 +40,34 @@ interface Props {
   onToggleWatch: () => void;
 }
 
-/// One count and its icon (same semantics as the FFS bottom bar). A zero recedes by colour rather
+/// One count and its icon (same semantics as the FFS bottom bar). A zero recedes by color rather
 /// than alpha — it still has to be readable to say "nothing of this kind", which is itself an answer.
-function Seg({ cls, icon, n, title }: { cls?: string; icon: ReactNode; n: number | string; title: string }) {
-  const zero = n === 0 || n === '0 B';
+function RunStat(props: { className?: string; icon: ReactNode; value: number | string; title: string }) {
+  const { className, icon, value, title } = props;
+  const zero = value === 0 || value === '0 B';
   return (
-    <span className={'st' + (cls ? ' ' + cls : '') + (zero ? ' zero' : '')} title={title}>
-      {icon}<b>{n}</b>
+    <span className={'st' + (className ? ` ${className}` : '') + (zero ? ' zero' : '')} title={title}>
+      {icon}<b>{value}</b>
     </span>
   );
 }
 
-export function Toolbar(props: Props) {
-  const { job, hasPlan, finalCount, stats, busy, canSync, watchStatus, watchPending, onCompare, onSync, onToggleLog, onToggleWatch } = props;
+export function Toolbar(props: ToolbarProps) {
+  const {
+    job,
+    hasPlan,
+    executableCount,
+    stats,
+    busy,
+    canSync,
+    applyBlockedMessage,
+    watchStatus,
+    watchPending,
+    onCompare,
+    onSync,
+    onToggleLog,
+    onToggleWatch,
+  } = props;
   const watchActive = watchStatus?.active === true;
   const watchMode = watchActive ? watchStatus.mode : null;
   const watchLabel = autoScanButtonLabel(watchStatus, watchPending);
@@ -80,15 +94,14 @@ export function Toolbar(props: Props) {
 
         {stats && (
           <span className="stats">
-            {/* Same glyph and same hue as the matching chip and the matching row, from one map */}
-            <Seg cls="k-copy" icon={MARK.copy} n={stats.copy} title="Copy" />
-            <Seg cls="k-update" icon={MARK.update} n={stats.upd} title="Update" />
-            <Seg cls="k-move" icon={MARK.move} n={stats.mv} title="Move (no re-transfer)" />
-            <Seg cls="k-delete" icon={MARK.delete} n={stats.del} title="Delete (into the trash)" />
-            <Seg cls="k-conflict" icon={MARK.conflict} n={stats.conflicts} title="Conflict" />
-            {/* No hue class: these two are not categories, so they inherit the stats bar's own colour */}
-            <Seg icon={<Sigma size={12} />} n={humanSize(stats.bytes) || '0 B'} title="Bytes to transfer" />
-            {stats.flips > 0 && <Seg icon={<ArrowLeftRight size={12} />} n={stats.flips} title="Reversed direction" />}
+            <RunStat className="result-type-copy" icon={RESULT_TYPE_ICON.copy} value={stats.copyCount} title="Copy" />
+            <RunStat className="result-type-update" icon={RESULT_TYPE_ICON.update} value={stats.updateCount} title="Update" />
+            <RunStat className="result-type-move" icon={RESULT_TYPE_ICON.move} value={stats.moveCount} title="Move (No Re-transfer)" />
+            <RunStat className="result-type-delete" icon={RESULT_TYPE_ICON.delete} value={stats.deleteCount} title="Delete (Into the Trash)" />
+            <RunStat icon={<Sigma size={12} />} value={humanSize(stats.transferBytes) || '0 B'} title="Bytes to Transfer" />
+            {stats.reversedCount > 0 && (
+              <RunStat icon={<ArrowLeftRight size={12} />} value={stats.reversedCount} title="Reversed Direction" />
+            )}
           </span>
         )}
 
@@ -100,7 +113,11 @@ export function Toolbar(props: Props) {
           disabled={busy || !canSync}
           title={job
             ? `${job.mode}: ${MODE_HINT[job.mode] ?? ''}${job.versioning ? ' · versioning on' : ''}`
-              + `${hasPlan ? `\nRuns ${finalCount} checked items (F9)` : '\nCompare first'}`
+              + `${hasPlan
+                ? canSync
+                  ? `\nRuns ${executableCount} checked items (F9)`
+                  : `\nUnavailable: ${applyBlockedMessage ?? 'review the current result'}`
+                : '\nCompare first'}`
             : undefined}
           onClick={onSync}
         >{job ? job.mode.toUpperCase() : 'No job'}</button>

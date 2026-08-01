@@ -8,28 +8,28 @@ import { PathVerdictBox } from './PathVerdictBox';
 import type { JobDto } from '../../core/types/generated/JobDto';
 import type { JobFull, JunkPresetDto } from '../../core/ipc';
 
-interface Props {
+interface PathLineProps {
   job: JobDto | null;
   /// Full config behind the selected job, for the pill row (JobDto carries only what the list needs)
-  cfgJob: JobFull | null;
+  jobConfiguration: JobFull | null;
   busy: boolean;
   /// Keep target navigation available so a pending review can be abandoned, while preventing root
   /// and config mutations from racing the review request.
   reviewing: boolean;
-  selTarget: number;
+  selectedTargetIndex: number;
   pathHistory: string[];
   /// Which root input the Tauri drag handler is currently hovering, if any
-  dropOn: 'source' | 'target' | null;
+  dropTargetKey: 'source' | 'target' | null;
   /// Registers this row as a drop region: the drag handler hit-tests the inputs inside it
-  scopeRef: (el: HTMLElement | null) => void;
+  scopeRef: (element: HTMLElement | null) => void;
   onCommit: (which: 'source' | 'target', value: string) => void;
   onBrowse: (which: 'source' | 'target') => void;
   onSwap: () => void;
-  onSelectTarget: (i: number) => void;
+  onSelectTarget: (index: number) => void;
   onEditGroup: (group: string) => void;
 }
 
-const pct = (v: number) => `${Math.round(v * 100)}%`;
+const formatPercentage = (value: number) => `${Math.round(value * 100)}%`;
 
 /// Config overview on the main screen: only the settings that change the outcome; clicking a pill jumps
 /// to the matching editor group. Data comes from get_job as a full Job — JobDto is left alone so we don't
@@ -37,14 +37,16 @@ const pct = (v: number) => `${Math.round(v * 100)}%`;
 /// `exclude` is the whole exclude policy now, so this pill can answer "what does this job exclude" by
 /// naming the presets rather than reporting a count of opaque strings. A preset only counts as on when
 /// every one of its patterns is present; a partly-present one is called out as such rather than rounded.
-function filterSummary(j: JobFull, presets: JunkPresetDto[]): string {
-  if (!j.exclude.length) return 'nothing excluded';
-  if (!presets.length) return `${j.exclude.length} excluded`;
-  const s = summarizePresets(j.exclude, presets);
-  const parts = [...s.on];
-  for (const p of s.partial) parts.push(`${p.label} ${p.present}/${p.total}`);
-  if (s.custom) parts.push(`${s.custom} custom`);
-  return parts.length ? parts.join(' · ') : `${j.exclude.length} excluded`;
+function filterSummary(job: JobFull, presets: JunkPresetDto[]): string {
+  if (!job.exclude.length) return 'nothing excluded';
+  if (!presets.length) return `${job.exclude.length} excluded`;
+  const summary = summarizePresets(job.exclude, presets);
+  const parts = [...summary.on];
+  for (const partial of summary.partial) {
+    parts.push(`${partial.label} ${partial.present}/${partial.total}`);
+  }
+  if (summary.custom) parts.push(`${summary.custom} custom`);
+  return parts.length ? parts.join(' · ') : `${job.exclude.length} excluded`;
 }
 
 interface Pill { key: string; value: string; group: string; title: string }
@@ -52,57 +54,57 @@ interface Pill { key: string; value: string; group: string; title: string }
 /// A pill states the setting and its value; what the value *means* is in the tooltip. These sit on
 /// the main screen, where a parenthetical explanation costs a column of the diff table to say
 /// something you only need once.
-function configPills(j: JobFull, presets: JunkPresetDto[]): Pill[] {
+function configPills(job: JobFull, presets: JunkPresetDto[]): Pill[] {
   const pills: Pill[] = [
     {
       key: 'Filters',
-      value: filterSummary(j, presets) + (j.include.length ? ` · ${j.include.length} allowed` : ''),
+      value: filterSummary(job, presets) + (job.include.length ? ` · ${job.include.length} allowed` : ''),
       group: 'Filters',
       title: 'Which junk presets are on, plus any hand-written rules. Whatever the filter removes is counted in the status bar.',
     },
     {
       key: 'Conflicts',
-      value: j.on_conflict + (j.on_conflict === 'copy' ? ` ≤${j.max_conflicts}` : ''),
+      value: job.on_conflict + (job.on_conflict === 'copy' ? ` ≤${job.max_conflicts}` : ''),
       group: 'Behavior',
       title: 'What happens when both sides changed since the last run.\nreport = list them and change nothing · copy = keep both sides · newer = the newer file wins',
     },
     {
       key: 'Versioning',
-      value: j.versioning ? 'on' : 'off',
+      value: job.versioning ? 'on' : 'off',
       group: 'Behavior',
       title: 'On: replaced and deleted files are kept under .version_syncDash in each root.\nOff: deletes go to the local trash instead.',
     },
     {
       key: 'Gates',
-      value: `≤${pct(j.max_delete_ratio)} del · ≥${pct(j.min_free_pct)} free${j.require_marker ? ' · marker' : ''}`,
+      value: `≤${formatPercentage(job.max_delete_ratio)} del · ≥${formatPercentage(job.min_free_pct)} free${job.require_marker ? ' · marker' : ''}`,
       group: 'Guardrails',
-      title: `A run is blocked if it would delete more than ${pct(j.max_delete_ratio)} of the target, or if free disk is under ${pct(j.min_free_pct)}.`
-        + (j.require_marker ? '\nBoth roots must also carry a .syncdash-root marker.' : ''),
+      title: `A run is blocked if it would delete more than ${formatPercentage(job.max_delete_ratio)} of the target, or if free disk is under ${formatPercentage(job.min_free_pct)}.`
+        + (job.require_marker ? '\nBoth roots must also carry a .syncdash-root marker.' : ''),
     },
     {
       key: 'AutoScan',
-      value: j.watch_interval_secs ? `${j.watch_interval_secs}s${j.watch_auto_apply ? ' · auto' : ''}` : 'off',
+      value: job.watch_interval_secs ? `${job.watch_interval_secs}s${job.watch_auto_apply ? ' · auto' : ''}` : 'off',
       group: 'AutoScan',
-      title: j.watch_interval_secs
-        ? `Compares every ${j.watch_interval_secs}s${j.watch_auto_apply ? ' and runs the result automatically' : ' and waits for you to review'}.`
+      title: job.watch_interval_secs
+        ? `Compares every ${job.watch_interval_secs}s${job.watch_auto_apply ? ' and runs the result automatically' : ' and waits for you to review'}.`
         : 'No scheduled comparison.',
     },
   ];
-  if (j.mode === 'sync') {
+  if (job.mode === 'sync') {
     pills.push({
       key: 'Archive',
-      value: j.archive ? 'set' : 'none',
+      value: job.archive ? 'set' : 'none',
       group: 'Basics',
-      title: j.archive
-        ? `Last-run table: ${j.archive}`
+      title: job.archive
+        ? `Last-run table: ${job.archive}`
         : 'Without an archive, sync mode cannot tell a delete from a file that was never there — deletes and moves are not attributed.',
     });
   }
   // The link used to live in three job fields; it is in the target phrase now, which the box above
   // already shows in full. So the pill reports only what the phrase does not make obvious: that
   // this job pushes to a peer, and whether it declared a mount to pull back through.
-  if (j.target?.startsWith('peer://')) {
-    const mounted = /\|mount=/.test(j.target);
+  if (job.target?.startsWith('peer://')) {
+    const mounted = /\|mount=/.test(job.target);
     pills.push({
       key: 'Peer',
       value: mounted ? 'push + pull' : 'push only',
@@ -118,27 +120,30 @@ function configPills(j: JobFull, presets: JunkPresetDto[]): Pill[] {
 /// The two roots on the main screen are **editable** (same as FFS): Enter or blur writes them back to the
 /// job TOML. No "just tweak it in memory" — once the two roots in the plan header disagree with what the
 /// job file says, run logs and archive refresh both point in the wrong direction.
-export function PathLine(props: Props) {
-  const { job, cfgJob, busy, reviewing, selTarget, pathHistory, dropOn, scopeRef, onCommit, onBrowse, onSwap, onSelectTarget, onEditGroup } = props;
+export function PathLine(props: PathLineProps) {
+  const { job, jobConfiguration, busy, reviewing, selectedTargetIndex, pathHistory, dropTargetKey, scopeRef, onCommit, onBrowse, onSwap, onSelectTarget, onEditGroup } = props;
   const mutationBusy = busy || reviewing;
 
   const targets = job ? (job.targets && job.targets.length ? job.targets : [job.target]) : [];
-  const targetValue = targets[selTarget] ?? '';
-  const [src, setSrc] = useState(job?.source ?? '');
-  const [tgt, setTgt] = useState(targetValue);
+  const targetValue = targets[selectedTargetIndex] ?? '';
+  const [sourceDraft, setSourceDraft] = useState(job?.source ?? '');
+  const [targetDraft, setTargetDraft] = useState(targetValue);
   const suppressSourceBlur = useRef(false);
   const suppressTargetBlur = useRef(false);
 
   // Re-seed whenever the job (or the selected target of a 1:N job) changes underneath the box
-  useEffect(() => { setSrc(job?.source ?? ''); }, [job?.name, job?.source]);
-  useEffect(() => { setTgt(targetValue); }, [job?.name, targetValue]);
+  useEffect(() => { setSourceDraft(job?.source ?? ''); }, [job?.name, job?.source]);
+  useEffect(() => { setTargetDraft(targetValue); }, [job?.name, targetValue]);
 
-  const verdict = usePathVerdict(src, tgt, !!job);
+  const verdict = usePathVerdict(sourceDraft, targetDraft, !!job);
   const presets = useJunkPresets();
 
-  const cls = (which: 'source' | 'target') => {
-    const base = pathState(which === 'source' ? verdict?.source : verdict?.target, which === 'source' ? src : tgt);
-    return ['mono', base, dropOn === which ? 'dropon' : ''].filter(Boolean).join(' ');
+  const inputClassName = (which: 'source' | 'target') => {
+    const base = pathState(
+      which === 'source' ? verdict?.source : verdict?.target,
+      which === 'source' ? sourceDraft : targetDraft,
+    );
+    return ['mono', base, dropTargetKey === which ? 'dropon' : ''].filter(Boolean).join(' ');
   };
 
   return (
@@ -147,30 +152,30 @@ export function PathLine(props: Props) {
         <span className="plabel">source</span>
         <input
           type="text"
-          className={cls('source')}
+          className={inputClassName('source')}
           data-drop="1"
           data-root="source"
           list="sd-paths"
           spellCheck={false}
           placeholder="Select a job, then edit here"
           disabled={!job || mutationBusy}
-          title={src}
-          value={src}
-          onChange={(e) => setSrc(e.target.value)}
+          title={sourceDraft}
+          value={sourceDraft}
+          onChange={(event) => setSourceDraft(event.target.value)}
           // change fires only on Enter or blur — nothing is written to disk while typing
           onBlur={() => {
             if (suppressSourceBlur.current) { suppressSourceBlur.current = false; return; }
-            onCommit('source', src);
+            onCommit('source', sourceDraft);
           }}
-          onKeyDown={(e) => {
-            const action = rootEditKeyAction(e.key);
+          onKeyDown={(event) => {
+            const action = rootEditKeyAction(event.key);
             if (!action) return;
-            e.preventDefault();
+            event.preventDefault();
             if (action === 'revert') {
               suppressSourceBlur.current = true;
-              setSrc(job?.source ?? '');
+              setSourceDraft(job?.source ?? '');
             }
-            (e.target as HTMLInputElement).blur();
+            (event.target as HTMLInputElement).blur();
           }}
         />
         <button className="pbtn" title="Browse…" disabled={!job || mutationBusy} onClick={() => onBrowse('source')}>
@@ -185,28 +190,28 @@ export function PathLine(props: Props) {
         <span className="plabel">target</span>
         <input
           type="text"
-          className={cls('target')}
+          className={inputClassName('target')}
           data-drop="1"
           data-root="target"
           list="sd-paths"
           spellCheck={false}
           disabled={!job || mutationBusy}
-          title={tgt}
-          value={tgt}
-          onChange={(e) => setTgt(e.target.value)}
+          title={targetDraft}
+          value={targetDraft}
+          onChange={(event) => setTargetDraft(event.target.value)}
           onBlur={() => {
             if (suppressTargetBlur.current) { suppressTargetBlur.current = false; return; }
-            onCommit('target', tgt);
+            onCommit('target', targetDraft);
           }}
-          onKeyDown={(e) => {
-            const action = rootEditKeyAction(e.key);
+          onKeyDown={(event) => {
+            const action = rootEditKeyAction(event.key);
             if (!action) return;
-            e.preventDefault();
+            event.preventDefault();
             if (action === 'revert') {
               suppressTargetBlur.current = true;
-              setTgt(targetValue);
+              setTargetDraft(targetValue);
             }
-            (e.target as HTMLInputElement).blur();
+            (event.target as HTMLInputElement).blur();
           }}
         />
         <button className="pbtn" title="Browse…" disabled={!job || mutationBusy} onClick={() => onBrowse('target')}>
@@ -216,12 +221,12 @@ export function PathLine(props: Props) {
           <select
             className="target-sel"
             title="Multi-target job: pick the target to work on"
-            value={selTarget}
+            value={selectedTargetIndex}
             disabled={busy}
-            onChange={(e) => onSelectTarget(Number(e.target.value) || 0)}
+            onChange={(event) => onSelectTarget(Number(event.target.value) || 0)}
           >
-            {targets.map((t, i) => (
-              <option key={i} value={i}>target {i + 1}/{targets.length}: {t}</option>
+            {targets.map((target, index) => (
+              <option key={index} value={index}>target {index + 1}/{targets.length}: {target}</option>
             ))}
           </select>
         )}
@@ -230,21 +235,21 @@ export function PathLine(props: Props) {
       {/* Path history is a native datalist (keyboard-friendly, no custom popup layer); it lives here so
           both root boxes and the editor's path fields can reference it by id. */}
       <datalist id="sd-paths">
-        {pathHistory.map((p) => <option key={p} value={p} />)}
+        {pathHistory.map((path) => <option key={path} value={path} />)}
       </datalist>
 
       <PathVerdictBox verdict={job ? verdict : null} className="pwarn" />
 
       <div className="cfgline">
-        {cfgJob && configPills(cfgJob, presets).map((p) => (
+        {jobConfiguration && configPills(jobConfiguration, presets).map((pill) => (
           <button
-            key={p.key}
+            key={pill.key}
             className="cfgpill"
-            title={`${p.title}\n\nClick to edit — opens ${p.group}.`}
+            title={`${pill.title}\n\nClick to edit — opens ${pill.group}.`}
             disabled={mutationBusy}
-            onClick={() => onEditGroup(p.group)}
+            onClick={() => onEditGroup(pill.group)}
           >
-            <span className="ck">{p.key}</span><span className="cv">{p.value}</span>
+            <span className="ck">{pill.key}</span><span className="cv">{pill.value}</span>
           </button>
         ))}
       </div>
