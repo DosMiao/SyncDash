@@ -40,8 +40,8 @@ SyncDash/
 ├─ Script/gen-types.mjs       type generation entry point (`npm run gen:types`)
 ├─ index.html                 main-window entry point (the sub-window's is progress.html)
 ├─ dist/                      frontend build output — deliberately committed to git (no node on Mac, see "Build")
-├─ builder.bat                Windows build menu (Dev / Desktop / CLI / All, plus run and kill/unlock/clean)
-└─ builder.command            Mac build script (pure cargo)
+├─ builder.bat                Windows launcher for the shared project Builder
+└─ builder.command            macOS launcher for the shared project Builder
 ```
 
 Dependencies point **downward only**, and this is checked rather than asserted: Tarjan over the
@@ -495,8 +495,8 @@ falls back to copy+delete (and gives up move detection).
 ## Remote mode (v0.4, implemented and verified on real machines)
 
 1. `ssh <host> syncdash probe` — probe the far side: OS/arch/version/schema; if the binary isn't there it prints
-   installation guidance (both machines have the Rust toolchain, so `cargo build --release` suffices; or just copy
-   the binary across the shared drive).
+   installation guidance (from that checkout use `builder.bat build cli` on Windows or
+   `./builder.command build cli` on macOS; alternatively copy the binary across the shared drive).
 2. `ssh <host> syncdash scan <root>` — collect the table off stdout. The far side is handed the job's
    **whole** filter (`--include` and `--exclude` both, plus `--junk none` so it adds no preset of its own)
    and the resolved rigor knobs. Both roots must be filtered by the same rule: a mask that binds only one
@@ -750,8 +750,10 @@ therefore keeps its normal relative layout.
 
 The common Build row is `[D] Dev`, `[1] Dist`, `[2] Max`, `[3] Release`, and
 `[4] Installer`. Enter `12`, `13`, `23`, or `123` to build those tiers
-sequentially; there is no ambiguous `All` action. Every optimized tier packages the
-desktop and matching CLI together under `target/builder-tiers/<tier>/`.
+sequentially; there is no ambiguous `All` action. Every optimized tier builds and
+packages only the Desktop artifact under `target/builder-tiers/<tier>/`. The phase
+name identifies the selected tier, and the command log prints the Builder's selected
+Cargo release-profile and CPU overrides before execution.
 
 The Run row is `[V]` Dev on Windows plus `[S]` Dist, `[M]` Max, and `[R]` Release.
 Utilities are `[K]` Kill, `[U]` Unlock, `[C]` Clean, `[O]` Doctor, `[I]` Info,
@@ -765,24 +767,27 @@ builder.bat build 123
 builder.bat doctor
 ```
 
-`build desktop` and `run desktop` remain legacy aliases for Dist. `build cli` remains
-the explicit standalone-CLI shortcut and uses the Dist policy.
+`build desktop` and `run desktop` remain legacy aliases for Dist. `build cli` is the
+only standalone-CLI build path, uses the Dist policy, and writes
+`target/release/syncdash[.exe]`; it is not run implicitly by `build 1`, `build 2`,
+`build 3`, or `build 123`.
 
 `--dry-run --host windows|macos` prints either platform's complete command plan
 without building, killing, cleaning, installing, or launching anything. `clean` does
 **not** touch `dist/`, because it is a committed artifact the Mac can consume without
 Node. Each phase is timed and each artifact path and size is reported.
 
-**Every build frees the binary it is about to write first**, which is not politeness but a requirement: cargo links
-straight over `target\release\syncdash-desktop.exe`, so an app left open ends the build at the link step with
-`Access is denied. (os error 5)`. The two binaries are handled differently, though. The desktop shell is killed
-without asking — it is a viewer over the library and relaunches in a second. A running `syncdash.exe` is only
-reported, and killing it takes an explicit *y*: the CLI can be halfway through an `apply`, holding the root
-heartbeat lock and writing files, and a failed build is much the cheaper of the two outcomes.
+**Every build frees only the binary it is about to write**, which is not politeness but a requirement: Cargo links
+straight over `target\release\syncdash-desktop.exe`, so an app left open ends a Desktop build at the link step with
+`Access is denied. (os error 5)`. The Desktop shell is killed without asking—it is a viewer over the library and
+relaunches in a second. Numbered Desktop tiers never inspect or stop `syncdash.exe`. The explicit `build cli`,
+`kill`, `unlock`, and `clean` paths report a running CLI and require an explicit *y* before stopping it: the CLI can
+be halfway through an `apply`, holding the root heartbeat lock and writing files, and a failed build is much the
+cheaper of the two outcomes.
 
-**Mac Dist/Max/Release and standalone CLI (no Node required)**: the `dist/` frontend
-output ships with git and Tauri embeds it at compile time, so those actions remain
-pure Cargo:
+**Mac Dist/Max/Release and standalone CLI require no Node**: the Desktop tiers consume
+the committed `dist/` that Tauri embeds at compile time. The standalone CLI is an
+independent pure-Cargo build and does not consume the frontend:
 
 ```bash
 bash builder.command build 123

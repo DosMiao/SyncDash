@@ -36,14 +36,13 @@ Inherited conventions live in the reference project and apply here unchanged:
 
 ## Commands
 
+- Builder workflow: from the repository root, use the project Builder for every build, dev session, installer, and artifact launch; direct checks/tests/typechecks remain allowed, and real Builder actions require current user authorization.
+- Basic commands: Windows `.\builder.bat <suffix>`; macOS `./builder.command <suffix>`; begin with `info`, then use `dev`, `build dist|max|release|123|installer`, `run dist|max|release`, or SyncDash-only `build cli`.
+- Full Builder skill: before any Builder or maintenance action, read `../../Experience/builder/skills/builder-workflow/SKILL.md`.
 - Verification after any edit — the whole story, no other tier: `cargo check --workspace`, `cargo test --workspace`, `npm run typecheck`. Done when all three pass with **zero warnings**.
 - After changing ANY `#[ts(export)]` type (`src/**` or `src-tauri/src/dto.rs`): `npm run gen:types` (= `node Script/gen-types.mjs`). Without it the frontend silently compiles against a stale shape.
-- Any project build, development launch, optimized tier, installer, or launch of an existing artifact must use the repository Builder: `.\builder.bat <suffix>` on Windows or `./builder.command <suffix>` on macOS. Use `info` to discover suffixes; common examples are `dev`, `build dist|max|release|installer`, `build 123`, and `run dist|max|release`, while `build cli` builds only the standalone CLI. Do not assemble an equivalent project build with raw `cargo build` or `npx tauri ...` commands. The verification and type-generation commands documented here remain direct; `npm run build` is allowed only for the separately documented committed-`dist/` refresh, never as a substitute for a desktop Builder command.
-- Windows `builder.bat` and macOS `builder.command` are thin launchers for the one Rust adapter under `tools/builder`, using the shared core in the sibling `Experience/builder` repository. Builder tiers `[1]` Dist, `[2]` Max, and `[3]` Release remain pure Cargo on macOS over the committed `dist/` and need no Node; `[D]` Dev and `[A]` Install App do, because Tauri runs `beforeBuildCommand` on both. Compact inputs such as `123` build the selected tiers sequentially.
-- The root package is the **CLI**. A bare `cargo build --release` never builds the desktop — `-p syncdash-desktop` is required, and forgetting it leaves a stale GUI binary that looks like a code bug.
 - After any frontend change run `npm run build` and commit `dist/` with it: Tauri embeds `dist/` at compile time and the Mac cannot regenerate it.
 - `cargo test` does NOT refresh `target/release/syncdash.exe` — rebuild before any binary-level test.
-- The user may have the app open: cargo links straight over the exe, so a build dies at the link step with `Access is denied. (os error 5)`. The desktop shell is disposable and may be killed; a running `syncdash.exe` may be mid-`apply`, holding a root heartbeat lock and writing files — report it and ask, never kill it silently.
 - Don't launch the GUI to "check" a change unasked. Interactive acceptance is the user's, on their machine, often while they are using it.
 - The user tests in their own build and always completes rebuild + restart. Never attribute a persisting bug to staleness — debug the actual code path.
 
