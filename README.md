@@ -234,10 +234,19 @@ v0.9 "Progress & Polish" (behavior parameters cross-checked against the FFS 14.1
 - **AutoScan while SyncDash is open**: the desktop backend, not the webview, owns its lifecycle and binds every
   trigger to one exact job identity, revision and target. A pure rename rebinds the displayed name without resetting
   the watcher generation; delete/recreate cannot inherit the old ticket even if the name and configuration match.
+  The monitor is global rather than navigation-owned: switching jobs or targets leaves it armed, the toolbar always
+  names the job actually being watched, and the first click stops that monitor before a later click may arm the
+  currently selected job. Every pending trigger is retained in the status snapshot with a monotonic per-generation
+  ticket cursor, so listener-start races, a remounted webview and delayed same-generation responses cannot lose,
+  resurrect or cross-wire work. Inactive status retains an orderable generation/cursor tombstone for the same reason.
   On macOS, two local roots use FSEvents change hints plus periodic
   full verification; remote roots and platforms without a native adapter report an explicit interval-polling
   fallback. A change event is never treated as a complete snapshot: every trigger still runs Compare, and a failed
-  or stale ticket does not advance the durable native cursor. `watch_interval_secs` is the polling / maximum full
+  or stale ticket does not advance the durable native cursor. The backend records the exact post-trigger Compare ID
+  against the pending ticket; submitting an older public result owner cannot promote it. AutoApply then claims that
+  completed ticket once, reconstructs every executable non-conflict/non-note row on the server with no UI filters or
+  direction flips, and requires both a clean health report and an exact prior session grant before issuing a one-use
+  authorization. `watch_interval_secs` is the polling / maximum full
   verification interval; CLI `run --watch [--interval N] [--auto-apply]` remains a foreground timed loop.
 - **Remote jobs now take the real remote pipeline in the GUI** (they used to fall silently into the local
   pipeline, re-hashing over UNC an order of magnitude slower); ssh badge in the sidebar.

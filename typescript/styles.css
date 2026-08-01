@@ -547,6 +547,8 @@ tr.flip .act-dir { outline: 1px dashed currentColor; outline-offset: 1px; border
    which keeps working per line — on a narrow window the pair drops to its own row, still
    right-aligned. */
 .tb-side { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-left: auto; }
+.toolbar .autoscan-btn { min-width: 0; max-width: min(280px, calc(100vw - 24px)); }
+.autoscan-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Wrap-tolerant: the segments reflow instead of tearing mid-number */
 .stats {

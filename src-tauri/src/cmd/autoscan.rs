@@ -1,7 +1,6 @@
 //! AutoScan commands. The main webview may arm or complete backend-owned work; it cannot invent a
 //! different job revision/target and it never receives authority to write from this module.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use syncdash::fs::vfs::spec::{parse, RootSpec};
@@ -10,6 +9,22 @@ use crate::autoscan::{
     configured_interval, AutoScanBinding, AutoScanController, AutoScanStatusDto,
 };
 use crate::dto::CompareOwner;
+use crate::state::{begin_run_command, finish_run_command, RunState};
+
+struct AutoScanCommandGuard(Arc<RunState>);
+
+impl AutoScanCommandGuard {
+    fn begin(state: Arc<RunState>) -> Self {
+        begin_run_command(&state);
+        Self(state)
+    }
+}
+
+impl Drop for AutoScanCommandGuard {
+    fn drop(&mut self) {
+        finish_run_command(&self.0);
+    }
+}
 
 fn require_main(window: &tauri::WebviewWindow) -> Result<(), String> {
     if window.label() == "main" {
@@ -24,19 +39,21 @@ pub fn start_autoscan(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     controller: tauri::State<'_, Arc<AutoScanController>>,
-    name: String,
+    run_state: tauri::State<'_, Arc<RunState>>,
     expected_job_id: String,
     expected_revision: String,
     target_index: usize,
 ) -> Result<AutoScanStatusDto, String> {
     require_main(&window)?;
-    let (job_name, full_job) =
-        syncdash::job::load_named(&name).map_err(|error| error.to_string())?;
-    if full_job.job_id != expected_job_id {
-        return Err(format!(
-            "Job '{job_name}' was replaced before AutoScan started — refresh it and try again"
-        ));
-    }
+    // Cross the same short gate as Compare/Apply before reading the registry. A concurrent save
+    // either finishes first or sees this command in flight, so it cannot leave a freshly armed
+    // generation bound to the revision that existed just before its mutation.
+    let _command = AutoScanCommandGuard::begin(run_state.inner().clone());
+    let (job_name, full_job) = syncdash::job::load_by_id(&expected_job_id).map_err(|error| {
+        format!(
+            "The selected job was deleted or replaced before AutoScan started — refresh it and try again: {error}"
+        )
+    })?;
     let revision = syncdash::job::config_revision(&full_job)
         .map_err(|error| format!("Job '{job_name}': {error}"))?;
     if revision != expected_revision {
@@ -52,13 +69,12 @@ pub fn start_autoscan(
     let job = full_job.for_target(&target);
     job.validate()?;
     let local_roots = match (parse(&job.source), parse(&job.target)) {
-        (RootSpec::Local(source), RootSpec::Local(target)) => {
-            Some((PathBuf::from(source), PathBuf::from(target)))
-        }
+        (RootSpec::Local(source), RootSpec::Local(target)) => Some((source, target)),
         _ => None,
     };
     Ok(controller.start(
         app,
+        run_state.inner().clone(),
         AutoScanBinding {
             job_id: full_job.job_id.clone(),
             job_name,

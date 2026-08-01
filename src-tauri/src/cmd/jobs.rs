@@ -88,6 +88,7 @@ pub fn job_file_schema(name: String) -> Result<JobFileSchemaDto, String> {
         .map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn save_job(
     window: tauri::WebviewWindow,
@@ -102,7 +103,7 @@ pub fn save_job(
     expected_revision: Option<String>,
 ) -> Result<JobSaveDto, String> {
     require_main_window(&window)?;
-    let saved = with_run_idle(run_state.inner(), "Saving jobs", || {
+    let (saved, autoscan_status) = with_run_idle(run_state.inner(), "Saving jobs", || {
         let saved = job::save_job(
             &name,
             &job,
@@ -113,18 +114,31 @@ pub fn save_job(
         if mutation_revokes_authority(saved.effect) {
             authorizations.revoke_job(&saved.job_id);
         }
-        Ok(saved)
+        let autoscan_status = match saved.effect {
+            job::JobMutationEffect::Renamed
+                if expected_revision.as_deref() == Some(saved.config_revision.as_str()) =>
+            {
+                autoscan.rebind_job_name(&saved.job_id, &saved.name)
+            }
+            job::JobMutationEffect::Renamed | job::JobMutationEffect::Updated => {
+                autoscan.stop_if_job_id(&saved.job_id)
+            }
+            job::JobMutationEffect::Created | job::JobMutationEffect::NoOp => None,
+            job::JobMutationEffect::Deleted => {
+                unreachable!("save cannot produce a deleted outcome")
+            }
+        };
+        Ok((saved, autoscan_status))
     })?;
+    if let Some(status) = autoscan_status {
+        let _ = app.emit("autoscan-status", status);
+    }
     match saved.effect {
         job::JobMutationEffect::Renamed => {
             let mut repository = results.0.lock().unwrap();
             if expected_revision.as_deref() == Some(saved.config_revision.as_str()) {
                 repository.rebind_job_name(&saved.job_id, &saved.name);
-                if let Some(status) = autoscan.rebind_job_name(&saved.job_id, &saved.name) {
-                    let _ = app.emit("autoscan-status", status);
-                }
             } else if let Some(expected_revision) = expected_revision.as_deref() {
-                autoscan.stop_if_job_id(&saved.job_id);
                 repository.invalidate_revision(&saved.job_id, expected_revision);
             }
         }
@@ -133,7 +147,6 @@ pub fn save_job(
                 .as_deref()
                 .expect("an updated job must carry its expected revision");
             if expected_revision != saved.config_revision {
-                autoscan.stop_if_job_id(&saved.job_id);
                 results
                     .0
                     .lock()
@@ -153,9 +166,11 @@ pub fn save_job(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn delete_job(
     window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
     run_state: tauri::State<'_, Arc<RunState>>,
     results: tauri::State<'_, Arc<ResultRepository>>,
     autoscan: tauri::State<'_, Arc<AutoScanController>>,
@@ -165,13 +180,16 @@ pub fn delete_job(
     expected_revision: String,
 ) -> Result<JobDeleteDto, String> {
     require_main_window(&window)?;
-    let deleted = with_run_idle(run_state.inner(), "Deleting jobs", || {
+    let (deleted, autoscan_status) = with_run_idle(run_state.inner(), "Deleting jobs", || {
         let deleted = job::delete_job(&name, &expected_job_id, &expected_revision)
             .map_err(|error| error.to_string())?;
         authorizations.revoke_job(&deleted.job_id);
-        Ok(deleted)
+        let autoscan_status = autoscan.stop_if_job_id(&deleted.job_id);
+        Ok((deleted, autoscan_status))
     })?;
-    autoscan.stop_if_job_id(&deleted.job_id);
+    if let Some(status) = autoscan_status {
+        let _ = app.emit("autoscan-status", status);
+    }
     results.0.lock().unwrap().invalidate_job(&deleted.job_id);
     Ok(JobDeleteDto {
         job_id: deleted.job_id,

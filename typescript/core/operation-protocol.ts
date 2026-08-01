@@ -1,10 +1,14 @@
 import type { CompareOwner } from './types/generated/CompareOwner';
 import type { SelectedRowDto } from './types/generated/SelectedRowDto';
 
-export function reviewCompareArgs(name: string, expectedJobId: string, targetIndex?: number) {
+export function startAutoScanArgs(expectedJobId: string, expectedRevision: string, targetIndex: number) {
+  return { expectedJobId, expectedRevision, targetIndex };
+}
+
+export function reviewCompareArgs(expectedJobId: string, targetIndex?: number) {
   return targetIndex === undefined
-    ? { name, expectedJobId }
-    : { name, expectedJobId, targetIndex };
+    ? { expectedJobId }
+    : { expectedJobId, targetIndex };
 }
 
 export function approveOperationArgs(
@@ -31,8 +35,8 @@ export function reviewApplyArgs(owner: CompareOwner, selected: SelectedRowDto[])
   return { owner, selected };
 }
 
-export function unattendedApplyAuthorizationArgs(owner: CompareOwner, selected: SelectedRowDto[]) {
-  return { owner, selected };
+export function autoScanApplyAuthorizationArgs(generation: number, ticketId: number) {
+  return { generation, ticketId };
 }
 
 export function applyAuthorizationArgs(authorizationToken: string, launchId?: number) {

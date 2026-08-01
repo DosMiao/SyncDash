@@ -89,7 +89,7 @@ fn main() {
             cmd::results::touch_compare, cmd::results::restore_compare, cmd::results::list_same, cmd::results::export_csv,
             cmd::logs::run_history, cmd::logs::last_syncs, cmd::logs::run_detail, cmd::logs::log_runs, cmd::logs::log_artifact, cmd::logs::log_dir_path, cmd::logs::app_log_tail, cmd::logs::get_settings, cmd::logs::save_settings,
             cmd::shell::reveal, cmd::shell::post_sync_action, cmd::shell::open_progress_window, cmd::shell::cancel_progress_launch, cmd::shell::close_progress_launch, cmd::shell::close_progress_window,
-            cmd::run::review_compare, cmd::run::approve_operation, cmd::run::compare_job, cmd::run::review_apply, cmd::run::authorize_unattended_apply, cmd::run::apply_job, cmd::run::replay_run_events, cmd::run::cancel_run, cmd::run::pause_run
+            cmd::run::review_compare, cmd::run::approve_operation, cmd::run::compare_job, cmd::run::review_apply, cmd::run::authorize_autoscan_apply, cmd::run::apply_job, cmd::run::replay_run_events, cmd::run::cancel_run, cmd::run::pause_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running SyncDash");

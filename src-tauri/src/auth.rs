@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use syncdash::pipeline::guard::caps::CapabilityScope;
 
+use crate::autoscan::AutoApplyTicket;
 use crate::dto::{CompareOwner, SelectedRowDto};
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -22,7 +23,7 @@ const GRANT_CAPACITY: usize = 32;
 pub(crate) enum AuthorizationPurpose {
     CompareInteractive,
     ApplyInteractive,
-    ApplyUnattended,
+    ApplyAutoScan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,6 +39,7 @@ pub(crate) struct OperationBinding {
     pub(crate) decision_digest: Option<String>,
     pub(crate) health_digest: String,
     pub(crate) capability_digest: String,
+    pub(crate) auto_apply_ticket: Option<AutoApplyTicket>,
 }
 
 impl OperationBinding {
@@ -61,13 +63,14 @@ impl OperationBinding {
                 if self.owner.is_some()
                     || self.plan_digest.is_some()
                     || self.decision_digest.is_some()
+                    || self.auto_apply_ticket.is_some()
                 {
                     return Err(
                         "A Compare authorization cannot carry an Apply plan or selection".into(),
                     );
                 }
             }
-            AuthorizationPurpose::ApplyInteractive | AuthorizationPurpose::ApplyUnattended => {
+            AuthorizationPurpose::ApplyInteractive | AuthorizationPurpose::ApplyAutoScan => {
                 if self.scope != CapabilityScope::ApplyWrite {
                     return Err(
                         "An Apply authorization must use apply-write capability scope".into(),
@@ -89,6 +92,27 @@ impl OperationBinding {
                 if self.decision_digest.as_deref().is_none_or(str::is_empty) {
                     return Err("An Apply authorization must bind an exact operation set".into());
                 }
+                match (self.purpose, self.auto_apply_ticket.as_ref()) {
+                    (AuthorizationPurpose::ApplyInteractive, None) => {}
+                    (AuthorizationPurpose::ApplyAutoScan, Some(ticket))
+                        if ticket.job_id == self.job_id
+                            && ticket.config_revision == self.config_revision
+                            && ticket.target_index == self.target_index
+                            && same_compare_identity(&ticket.owner, owner) => {}
+                    (AuthorizationPurpose::ApplyInteractive, Some(_)) => {
+                        return Err(
+                            "An interactive Apply cannot carry AutoScan ticket authority".into(),
+                        )
+                    }
+                    (AuthorizationPurpose::ApplyAutoScan, None) => {
+                        return Err("An AutoScan Apply must bind its exact completed ticket".into())
+                    }
+                    _ => {
+                        return Err(
+                            "The AutoScan ticket does not match its Apply authorization".into()
+                        )
+                    }
+                }
             }
         }
         Ok(())
@@ -102,7 +126,7 @@ impl OperationBinding {
                     return Err("A Compare authorization cannot carry selected operations".into());
                 }
             }
-            AuthorizationPurpose::ApplyInteractive | AuthorizationPurpose::ApplyUnattended => {
+            AuthorizationPurpose::ApplyInteractive | AuthorizationPurpose::ApplyAutoScan => {
                 if selected.is_empty() {
                     return Err(
                         "An Apply authorization must bind at least one selected operation".into(),
@@ -189,9 +213,9 @@ impl AuthorizationStore {
     }
 
     fn challenge_at(&self, spec: ChallengeSpec, now: Instant) -> Result<(String, u64), String> {
-        if spec.binding.purpose == AuthorizationPurpose::ApplyUnattended {
+        if spec.binding.purpose == AuthorizationPurpose::ApplyAutoScan {
             return Err(
-                "An unattended Apply cannot create a review challenge; it requires an exact session grant"
+                "An AutoScan Apply cannot create a review challenge; it requires an exact completed ticket and session grant"
                     .into(),
             );
         }
@@ -297,7 +321,7 @@ impl AuthorizationStore {
             }
             if !grant.allow_unattended {
                 state.authorizations.retain(|authorization| {
-                    authorization.binding.purpose != AuthorizationPurpose::ApplyUnattended
+                    authorization.binding.purpose != AuthorizationPurpose::ApplyAutoScan
                         || !grant.allows(&authorization.binding, false)
                 });
             }
@@ -328,7 +352,7 @@ impl AuthorizationStore {
     ) -> Result<(AuthorizationRecord, u64), String> {
         if binding.purpose != AuthorizationPurpose::CompareInteractive {
             return Err(
-                "Only Compare can be authorized directly; Apply requires a review challenge or an exact unattended session grant"
+                "Only Compare can be authorized directly; Apply requires a review challenge or an exact AutoScan ticket"
                     .into(),
             );
         }
@@ -340,22 +364,26 @@ impl AuthorizationStore {
         Ok((authorization, wall_expiry_ms(AUTHORIZATION_TTL)))
     }
 
-    pub(crate) fn authorize_unattended(
+    pub(crate) fn authorize_autoscan(
         &self,
         binding: OperationBinding,
         selected: Vec<SelectedRowDto>,
     ) -> Result<(AuthorizationRecord, u64), String> {
-        self.authorize_unattended_at(binding, selected, Instant::now())
+        self.authorize_autoscan_at(binding, selected, Instant::now())
     }
 
-    fn authorize_unattended_at(
+    fn authorize_autoscan_at(
         &self,
         binding: OperationBinding,
         selected: Vec<SelectedRowDto>,
         now: Instant,
     ) -> Result<(AuthorizationRecord, u64), String> {
-        if binding.purpose != AuthorizationPurpose::ApplyUnattended {
-            return Err("Only an unattended Apply can use an unattended session grant".into());
+        if binding.purpose != AuthorizationPurpose::ApplyAutoScan
+            || binding.auto_apply_ticket.is_none()
+        {
+            return Err(
+                "Only an exact completed AutoScan ticket can use AutoApply authority".into(),
+            );
         }
         let authorization = issue_record(binding, selected, false, now)?;
         let mut state = self.0.lock().unwrap();
@@ -366,7 +394,7 @@ impl AuthorizationStore {
             .position(|grant| grant.allows(&authorization.binding, true))
         else {
             return Err(
-                "This unattended Apply has no exact session grant — review Apply interactively"
+                "This AutoScan Apply has no exact session grant — review Apply interactively"
                     .into(),
             );
         };
@@ -392,7 +420,7 @@ impl AuthorizationStore {
         let authorization = self.take_authorization(token, now)?;
         if !matches!(
             authorization.binding.purpose,
-            AuthorizationPurpose::ApplyInteractive | AuthorizationPurpose::ApplyUnattended
+            AuthorizationPurpose::ApplyInteractive | AuthorizationPurpose::ApplyAutoScan
         ) {
             return Err("This operation authorization does not permit Apply".into());
         }
@@ -435,7 +463,7 @@ impl AuthorizationStore {
 
     pub(crate) fn grant_allows(&self, binding: &OperationBinding, unattended: bool) -> bool {
         if binding.validate_shape().is_err()
-            || (unattended && binding.purpose != AuthorizationPurpose::ApplyUnattended)
+            || (unattended && binding.purpose != AuthorizationPurpose::ApplyAutoScan)
         {
             return false;
         }
@@ -461,6 +489,13 @@ impl AuthorizationStore {
             .retain(|record| record.binding.job_id != job_id);
         state.grants.retain(|record| record.job_id != job_id);
     }
+}
+
+fn same_compare_identity(left: &CompareOwner, right: &CompareOwner) -> bool {
+    left.compare_id == right.compare_id
+        && left.job_id == right.job_id
+        && left.config_revision == right.config_revision
+        && left.target_index == right.target_index
 }
 
 fn issue_record(
@@ -579,10 +614,22 @@ mod tests {
         }]
     }
 
+    fn auto_apply_ticket() -> AutoApplyTicket {
+        AutoApplyTicket {
+            generation: 4,
+            ticket_id: 12,
+            job_id: "job-a".into(),
+            job_name: "photos".into(),
+            config_revision: "revision-a".into(),
+            target_index: 1,
+            owner: owner(),
+        }
+    }
+
     fn binding(purpose: AuthorizationPurpose) -> OperationBinding {
         let applies = matches!(
             purpose,
-            AuthorizationPurpose::ApplyInteractive | AuthorizationPurpose::ApplyUnattended
+            AuthorizationPurpose::ApplyInteractive | AuthorizationPurpose::ApplyAutoScan
         );
         OperationBinding {
             scope: if applies {
@@ -600,6 +647,8 @@ mod tests {
             decision_digest: applies.then(|| decision_digest(&selection()).unwrap()),
             health_digest: "health-a".into(),
             capability_digest: "caps-a".into(),
+            auto_apply_ticket: (purpose == AuthorizationPurpose::ApplyAutoScan)
+                .then(auto_apply_ticket),
         }
     }
 
@@ -680,7 +729,7 @@ mod tests {
         };
         let (challenge, _) = store.challenge(spec).unwrap();
         store.approve(&challenge, false, true, true, false).unwrap();
-        let expected = binding(AuthorizationPurpose::ApplyUnattended);
+        let expected = binding(AuthorizationPurpose::ApplyAutoScan);
         assert!(store.grant_allows(&expected, false));
         assert!(!store.grant_allows(&expected, true));
         let mut renamed = expected.clone();
@@ -814,7 +863,7 @@ mod tests {
             .unwrap();
         store.approve(&allow, false, true, true, true).unwrap();
         let (outstanding, _) = store
-            .authorize_unattended(binding(AuthorizationPurpose::ApplyUnattended), selection())
+            .authorize_autoscan(binding(AuthorizationPurpose::ApplyAutoScan), selection())
             .unwrap();
 
         let (downgrade, _) = store
@@ -829,28 +878,28 @@ mod tests {
 
         assert_eq!(store.0.lock().unwrap().grants.len(), 1);
         assert!(store.grant_allows(&binding(AuthorizationPurpose::ApplyInteractive), false));
-        assert!(!store.grant_allows(&binding(AuthorizationPurpose::ApplyUnattended), true));
+        assert!(!store.grant_allows(&binding(AuthorizationPurpose::ApplyAutoScan), true));
         assert!(store
-            .consume(&outstanding.token, AuthorizationPurpose::ApplyUnattended,)
+            .consume(&outstanding.token, AuthorizationPurpose::ApplyAutoScan,)
             .is_err());
         assert!(store
-            .authorize_unattended(binding(AuthorizationPurpose::ApplyUnattended), selection(),)
+            .authorize_autoscan(binding(AuthorizationPurpose::ApplyAutoScan), selection(),)
             .is_err());
     }
 
     #[test]
-    fn unattended_lookup_requires_an_unattended_apply_binding() {
+    fn autoscan_authority_requires_both_a_completed_ticket_and_session_grant() {
         let store = AuthorizationStore::default();
         assert!(store
             .challenge(ChallengeSpec {
-                binding: binding(AuthorizationPurpose::ApplyUnattended),
+                binding: binding(AuthorizationPurpose::ApplyAutoScan),
                 selected: selection(),
                 requires_health_ack: false,
                 requires_capability_ack: false,
             })
             .is_err());
         assert!(store
-            .authorize_unattended(binding(AuthorizationPurpose::ApplyUnattended), selection(),)
+            .authorize_autoscan(binding(AuthorizationPurpose::ApplyAutoScan), selection(),)
             .is_err());
         let (challenge, _) = store
             .challenge(ChallengeSpec {
@@ -863,18 +912,24 @@ mod tests {
         store.approve(&challenge, false, true, true, true).unwrap();
 
         assert!(!store.grant_allows(&binding(AuthorizationPurpose::ApplyInteractive), true));
-        assert!(store.grant_allows(&binding(AuthorizationPurpose::ApplyUnattended), true));
+        assert!(store.grant_allows(&binding(AuthorizationPurpose::ApplyAutoScan), true));
         assert!(store
             .authorize_direct(
-                binding(AuthorizationPurpose::ApplyUnattended),
+                binding(AuthorizationPurpose::ApplyAutoScan),
                 selection(),
                 false,
             )
             .is_err());
         let (authorization, _) = store
-            .authorize_unattended(binding(AuthorizationPurpose::ApplyUnattended), selection())
+            .authorize_autoscan(binding(AuthorizationPurpose::ApplyAutoScan), selection())
             .unwrap();
         assert!(!authorization.acknowledged_health);
+
+        let mut missing_ticket = binding(AuthorizationPurpose::ApplyAutoScan);
+        missing_ticket.auto_apply_ticket = None;
+        assert!(store
+            .authorize_autoscan(missing_ticket, selection())
+            .is_err());
     }
 
     #[test]
@@ -889,7 +944,7 @@ mod tests {
             })
             .unwrap();
         store.approve(&challenge, false, false, true, true).unwrap();
-        assert!(store.grant_allows(&binding(AuthorizationPurpose::ApplyUnattended), true));
+        assert!(store.grant_allows(&binding(AuthorizationPurpose::ApplyAutoScan), true));
 
         let (compare, _) = store
             .challenge(ChallengeSpec {

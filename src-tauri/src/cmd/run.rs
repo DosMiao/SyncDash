@@ -16,6 +16,7 @@ use crate::auth::{
     health_digest, AuthorizationPurpose, AuthorizationRecord, AuthorizationStore, ChallengeSpec,
     OperationBinding,
 };
+use crate::autoscan::{AutoApplyTicket, AutoScanController};
 use crate::bridge::{make_ctx, RunEvent, RunEventRepository};
 use crate::dto::{
     ApplyDto, AuthorizationDto, CapabilityIssueDto, CompareOwner, OperationReviewDto, PlanDto,
@@ -141,6 +142,13 @@ struct PreparedApply {
     ops: Vec<Op>,
 }
 
+struct CachedApplyPlan {
+    loaded: LoadedTarget,
+    owner: CompareOwner,
+    plan: Plan,
+    plan_digest: String,
+}
+
 struct ApplyFacts {
     unacknowledged: Verdict,
     acknowledged: Verdict,
@@ -148,16 +156,12 @@ struct ApplyFacts {
 }
 
 fn load_review_target(
-    name: &str,
     expected_job_id: &str,
     target_index: Option<usize>,
 ) -> Result<LoadedTarget, String> {
-    let (job_name, full_job) = job::load_named(name).map_err(|error| error.to_string())?;
-    if full_job.job_id != expected_job_id {
-        return Err(format!(
-            "Job '{job_name}' was replaced — refresh it and review Compare again"
-        ));
-    }
+    let (job_name, full_job) = job::load_by_id(expected_job_id).map_err(|error| {
+        format!("The selected job was deleted or replaced — refresh it and review Compare again: {error}")
+    })?;
     load_target(job_name, full_job, target_index)
 }
 
@@ -238,6 +242,7 @@ fn compare_binding(loaded: &LoadedTarget, capabilities: &CapReport) -> Operation
         decision_digest: None,
         health_digest: health_digest(&empty, &empty),
         capability_digest: capabilities.consent_digest(CapabilityScope::CompareRead),
+        auto_apply_ticket: None,
     }
 }
 
@@ -311,6 +316,12 @@ fn validate_exact_binding(
     if authorized.capability_digest != current.capability_digest {
         return Err("The backend capability report changed — review the operation again".into());
     }
+    if !same_auto_apply_authority(
+        authorized.auto_apply_ticket.as_ref(),
+        current.auto_apply_ticket.as_ref(),
+    ) {
+        return Err("The AutoScan ticket authority changed — wait for a fresh trigger".into());
+    }
     Ok(())
 }
 
@@ -327,12 +338,27 @@ fn same_compare_identity(left: Option<&CompareOwner>, right: Option<&CompareOwne
     }
 }
 
+fn with_current_job_name(mut owner: CompareOwner, job_name: &str) -> CompareOwner {
+    owner.job_name = job_name.to_string();
+    owner
+}
+
+fn same_auto_apply_authority(
+    left: Option<&AutoApplyTicket>,
+    right: Option<&AutoApplyTicket>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.same_authority(right),
+        _ => false,
+    }
+}
+
 #[tauri::command]
 pub async fn review_compare(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<RunState>>,
     authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
-    name: String,
     expected_job_id: String,
     target_index: Option<usize>,
 ) -> Result<OperationReviewDto, String> {
@@ -341,7 +367,7 @@ pub async fn review_compare(
     let _command = RunCommandGuard::begin(st);
     let authorizations = authorizations.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let loaded = load_review_target(&name, &expected_job_id, target_index)?;
+        let loaded = load_review_target(&expected_job_id, target_index)?;
         let capabilities = match run::compare_capabilities(&loaded.job) {
             Ok(capabilities) => capabilities,
             Err(error) => {
@@ -420,6 +446,7 @@ pub fn approve_operation(
     Ok(authorization_dto(authorization, expires_at_ms))
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn compare_job(
     window: tauri::WebviewWindow,
@@ -428,6 +455,7 @@ pub async fn compare_job(
     results: tauri::State<'_, Arc<ResultRepository>>,
     events: tauri::State<'_, Arc<RunEventRepository>>,
     authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
+    autoscan: tauri::State<'_, Arc<AutoScanController>>,
     authorization_token: String,
 ) -> Result<PlanDto, String> {
     require_main_window(&window)?;
@@ -436,6 +464,7 @@ pub async fn compare_job(
     let results = results.inner().clone();
     let events = events.inner().clone();
     let authorizations = authorizations.inner().clone();
+    let autoscan = autoscan.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let authorization = authorizations.consume(
             &authorization_token,
@@ -540,11 +569,19 @@ pub async fn compare_job(
         owner.job_name = current_name;
         dto.owner = owner.clone();
         repository.insert(CachedCompare {
-            provenance: CompareProvenance { owner, plan_digest },
+            provenance: CompareProvenance {
+                owner: owner.clone(),
+                plan_digest,
+            },
             plan: dto.clone(),
             source: outcome.source,
             target: outcome.target,
         });
+        drop(repository);
+        // Registration is opportunistic: a stop/rearm may have made this an ordinary interactive
+        // Compare while it ran. Keep returning and caching the successful result; only a later
+        // AutoScan completion needs the exact pending-ticket association.
+        let _ = autoscan.record_successful_compare(&owner);
         Ok(dto)
     })
     .await
@@ -556,6 +593,13 @@ fn prepare_apply(
     requested_owner: &CompareOwner,
     selected: Vec<SelectedRowDto>,
 ) -> Result<PreparedApply, String> {
+    prepare_cached_apply(load_cached_apply(results, requested_owner)?, selected)
+}
+
+fn load_cached_apply(
+    results: &ResultRepository,
+    requested_owner: &CompareOwner,
+) -> Result<CachedApplyPlan, String> {
     let (job_name, full_job) = job::load_by_id(&requested_owner.job_id).map_err(|error| {
         format!("The Compare result's job was deleted or replaced — run Compare again: {error}")
     })?;
@@ -566,7 +610,7 @@ fn prepare_apply(
             loaded.job_name
         ));
     }
-    let (owner, header, plan_ops, plan_digest) = {
+    let (mut owner, header, plan_ops, plan_digest) = {
         let mut repository = results.0.lock().unwrap();
         let key = ResultKey::new(
             &loaded.full_job.job_id,
@@ -591,6 +635,10 @@ fn prepare_apply(
             cached.provenance.plan_digest.clone(),
         )
     };
+    // Names are presentation, not provenance. Normalize the cloned owner to the registry's current
+    // label so a pure rename still forms a valid binding while every authority-bearing field stays
+    // pinned to the cached compare identity.
+    owner = with_current_job_name(owner, &loaded.job_name);
     let plan = Plan {
         header,
         ops: plan_ops,
@@ -598,15 +646,62 @@ fn prepare_apply(
     if plan.digest() != plan_digest {
         return Err("The cached Compare plan changed — run Compare again".into());
     }
-    let ops = resolve_selected_ops(&plan.ops, &selected)?;
-    Ok(PreparedApply {
+    Ok(CachedApplyPlan {
         loaded,
         owner,
         plan,
         plan_digest,
+    })
+}
+
+fn prepare_cached_apply(
+    cached: CachedApplyPlan,
+    selected: Vec<SelectedRowDto>,
+) -> Result<PreparedApply, String> {
+    let ops = resolve_selected_ops(&cached.plan.ops, &selected)?;
+    Ok(PreparedApply {
+        loaded: cached.loaded,
+        owner: cached.owner,
+        plan: cached.plan,
+        plan_digest: cached.plan_digest,
         selected,
         ops,
     })
+}
+
+fn server_owned_selection(ops: &[Op]) -> Result<Vec<SelectedRowDto>, String> {
+    let selected: Vec<SelectedRowDto> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| !matches!(op.action, Action::Conflict | Action::Note))
+        .map(|(index, _)| SelectedRowDto {
+            index,
+            flipped: false,
+        })
+        .collect();
+    if selected.is_empty() {
+        return Err(
+            "AutoScan found no executable operations; unattended Apply will not run a no-op plan"
+                .into(),
+        );
+    }
+    Ok(selected)
+}
+
+fn prepare_autoscan_apply(
+    results: &ResultRepository,
+    ticket: &AutoApplyTicket,
+) -> Result<PreparedApply, String> {
+    let cached = load_cached_apply(results, &ticket.owner)?;
+    if cached.loaded.full_job.job_id != ticket.job_id
+        || cached.loaded.config_revision != ticket.config_revision
+        || cached.loaded.target_index != ticket.target_index
+        || !same_compare_identity(Some(&cached.owner), Some(&ticket.owner))
+    {
+        return Err("The completed AutoScan ticket no longer owns this Compare result".into());
+    }
+    let selected = server_owned_selection(&cached.plan.ops)?;
+    prepare_cached_apply(cached, selected)
 }
 
 fn apply_facts(prepared: &PreparedApply) -> Result<ApplyFacts, String> {
@@ -630,7 +725,31 @@ fn apply_binding(
     prepared: &PreparedApply,
     facts: &ApplyFacts,
     purpose: AuthorizationPurpose,
+    auto_apply_ticket: Option<&AutoApplyTicket>,
 ) -> Result<OperationBinding, String> {
+    let auto_apply_ticket = auto_apply_ticket
+        .map(|ticket| {
+            if ticket.job_id != prepared.loaded.full_job.job_id
+                || ticket.config_revision != prepared.loaded.config_revision
+                || ticket.target_index != prepared.loaded.target_index
+                || !same_compare_identity(Some(&ticket.owner), Some(&prepared.owner))
+            {
+                return Err(
+                    "The AutoScan ticket no longer matches its authenticated Compare result"
+                        .to_string(),
+                );
+            }
+            Ok(AutoApplyTicket {
+                generation: ticket.generation,
+                ticket_id: ticket.ticket_id,
+                job_id: prepared.loaded.full_job.job_id.clone(),
+                job_name: prepared.loaded.job_name.clone(),
+                config_revision: prepared.loaded.config_revision.clone(),
+                target_index: prepared.loaded.target_index,
+                owner: prepared.owner.clone(),
+            })
+        })
+        .transpose()?;
     Ok(OperationBinding {
         scope: CapabilityScope::ApplyWrite,
         purpose,
@@ -645,6 +764,7 @@ fn apply_binding(
         capability_digest: facts
             .capabilities
             .consent_digest(CapabilityScope::ApplyWrite),
+        auto_apply_ticket,
     })
 }
 
@@ -661,6 +781,14 @@ fn apply_review_messages(facts: &ApplyFacts) -> (Vec<String>, Vec<String>, bool)
     warnings.sort();
     warnings.dedup();
     (blockers, warnings, requires_health_ack)
+}
+
+fn autoscan_health_refusals(facts: &ApplyFacts) -> Vec<String> {
+    let mut messages = facts.unacknowledged.blockers.clone();
+    messages.extend(facts.unacknowledged.warnings.clone());
+    messages.sort();
+    messages.dedup();
+    messages
 }
 
 #[tauri::command]
@@ -694,7 +822,12 @@ pub async fn review_apply(
             return Ok(blocked_review(blockers, warnings, &facts.capabilities));
         }
         let requires_capability_ack = !facts.capabilities.needs_ack().is_empty();
-        let binding = apply_binding(&prepared, &facts, AuthorizationPurpose::ApplyInteractive)?;
+        let binding = apply_binding(
+            &prepared,
+            &facts,
+            AuthorizationPurpose::ApplyInteractive,
+            None,
+        )?;
         let (challenge_id, expires_at_ms) = authorizations.challenge(ChallengeSpec {
             binding,
             selected: prepared.selected,
@@ -720,26 +853,30 @@ pub async fn review_apply(
 }
 
 #[tauri::command]
-pub async fn authorize_unattended_apply(
+pub async fn authorize_autoscan_apply(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<RunState>>,
     results: tauri::State<'_, Arc<ResultRepository>>,
     authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
-    owner: CompareOwner,
-    selected: Vec<SelectedRowDto>,
+    autoscan: tauri::State<'_, Arc<AutoScanController>>,
+    generation: u64,
+    ticket_id: u64,
 ) -> Result<AuthorizationDto, String> {
     require_main_window(&window)?;
     let st = state.inner().clone();
     let _command = RunCommandGuard::begin(st);
     let results = results.inner().clone();
     let authorizations = authorizations.inner().clone();
+    let autoscan = autoscan.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let prepared = prepare_apply(&results, &owner, selected)?;
+        let ticket = autoscan.claim_completed_auto_apply(generation, ticket_id)?;
+        let prepared = prepare_autoscan_apply(&results, &ticket)?;
         let facts = apply_facts(&prepared)?;
-        if !facts.unacknowledged.ok() {
+        let health_refusals = autoscan_health_refusals(&facts);
+        if !health_refusals.is_empty() {
             return Err(format!(
-                "Unattended Apply cannot acknowledge plan-health warnings:\n{}",
-                facts.unacknowledged.blockers.join("\n")
+                "AutoScan Apply requires a completely clean health review:\n{}",
+                health_refusals.join("\n")
             ));
         }
         let blockers = capability_blockers(&facts.capabilities);
@@ -747,9 +884,16 @@ pub async fn authorize_unattended_apply(
             return Err(blockers.join("\n"));
         }
         reload_prepared_target(&prepared.loaded)?;
-        let binding = apply_binding(&prepared, &facts, AuthorizationPurpose::ApplyUnattended)?;
-        let (authorization, expires_at_ms) =
-            authorizations.authorize_unattended(binding, prepared.selected)?;
+        let binding = apply_binding(
+            &prepared,
+            &facts,
+            AuthorizationPurpose::ApplyAutoScan,
+            Some(&ticket),
+        )?;
+        let selected = prepared.selected;
+        let (authorization, expires_at_ms) = autoscan.authorize_claim(&ticket, || {
+            authorizations.authorize_autoscan(binding, selected)
+        })?;
         Ok(authorization_dto(authorization, expires_at_ms))
     })
     .await
@@ -785,6 +929,7 @@ fn revalidate_cached_before_apply(
     begin_run_for_launch(state, launch_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn apply_job(
     window: tauri::WebviewWindow,
@@ -793,6 +938,7 @@ pub async fn apply_job(
     results: tauri::State<'_, Arc<ResultRepository>>,
     events: tauri::State<'_, Arc<RunEventRepository>>,
     authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
+    autoscan: tauri::State<'_, Arc<AutoScanController>>,
     authorization_token: String,
     launch_id: Option<u64>,
 ) -> Result<ApplyDto, String> {
@@ -802,6 +948,7 @@ pub async fn apply_job(
     let results = results.inner().clone();
     let events = events.inner().clone();
     let authorizations = authorizations.inner().clone();
+    let autoscan = autoscan.inner().clone();
     let reject_state = state.inner().clone();
     let requested_launch = launch_id;
     let run_app = app.clone();
@@ -811,6 +958,7 @@ pub async fn apply_job(
                 .consume_apply(&authorization_token)
                 .map_err(|error| (error, false))?;
             let purpose = authorization.binding.purpose;
+            let auto_apply_ticket = authorization.binding.auto_apply_ticket.clone();
             let owner =
                 authorization.binding.owner.clone().ok_or_else(|| {
                     ("The Apply authorization has no Compare owner".into(), false)
@@ -819,19 +967,31 @@ pub async fn apply_job(
                 .map_err(|error| (error, false))?;
             let facts = apply_facts(&prepared).map_err(|error| (error, false))?;
             let current_binding =
-                apply_binding(&prepared, &facts, purpose).map_err(|error| (error, false))?;
+                apply_binding(&prepared, &facts, purpose, auto_apply_ticket.as_ref())
+                    .map_err(|error| (error, false))?;
             validate_exact_binding(&authorization.binding, &current_binding)
                 .map_err(|error| (error, false))?;
             let blockers = capability_blockers(&facts.capabilities);
             if !blockers.is_empty() {
                 return Err((blockers.join("\n"), false));
             }
-            if purpose == AuthorizationPurpose::ApplyUnattended && authorization.acknowledged_health
-            {
+            if purpose == AuthorizationPurpose::ApplyAutoScan && authorization.acknowledged_health {
                 return Err((
-                    "An unattended Apply cannot acknowledge plan-health warnings".into(),
+                    "An AutoScan Apply cannot acknowledge plan-health warnings".into(),
                     false,
                 ));
+            }
+            if purpose == AuthorizationPurpose::ApplyAutoScan {
+                let health_refusals = autoscan_health_refusals(&facts);
+                if !health_refusals.is_empty() {
+                    return Err((
+                        format!(
+                            "AutoScan Apply requires a completely clean health review:\n{}",
+                            health_refusals.join("\n")
+                        ),
+                        false,
+                    ));
+                }
             }
             let verdict = if authorization.acknowledged_health {
                 &facts.acknowledged
@@ -842,8 +1002,12 @@ pub async fn apply_job(
                 return Err((verdict.blockers.join("\n"), false));
             }
             let consent = CapabilityConsent::ExactDigest(current_binding.capability_digest.clone());
-            let (run_id, ctl) = revalidate_cached_before_apply(&results, &prepared, &st, launch_id)
-                .map_err(|error| (error, false))?;
+            let reserve = || revalidate_cached_before_apply(&results, &prepared, &st, launch_id);
+            let (run_id, ctl) = match auto_apply_ticket.as_ref() {
+                Some(ticket) => autoscan.consume_authorized_with(ticket, reserve),
+                None => reserve(),
+            }
+            .map_err(|error| (error, false))?;
             let mut applied_result = AppliedResultGuard::new(
                 results.clone(),
                 &prepared.loaded.full_job.job_id,
@@ -956,12 +1120,30 @@ mod tests {
             decision_digest: Some("selection-a".into()),
             health_digest: "health-a".into(),
             capability_digest: "caps-a".into(),
+            auto_apply_ticket: None,
+        }
+    }
+
+    fn op(action: Action, path: &str) -> Op {
+        Op {
+            side: syncdash::model::plan::Side::Target,
+            action,
+            path: path.into(),
+            from: None,
+            size: None,
+            mtime_ms: None,
+            hash: None,
+            link: None,
+            mode: None,
+            reason: "test".into(),
         }
     }
 
     fn loaded(name: &str, revision: &str, target_index: usize) -> LoadedTarget {
-        let mut full_job = syncdash::job::Job::default();
-        full_job.job_id = "job-a".into();
+        let full_job = syncdash::job::Job {
+            job_id: "job-a".into(),
+            ..Default::default()
+        };
         LoadedTarget {
             job_name: name.into(),
             job: full_job.clone(),
@@ -995,6 +1177,10 @@ mod tests {
         let expected = binding();
         assert!(validate_exact_binding(&expected, &expected).is_ok());
 
+        let rebound_owner = with_current_job_name(owner(), "archive");
+        assert_eq!(rebound_owner.job_name, "archive");
+        assert!(same_compare_identity(Some(&owner()), Some(&rebound_owner)));
+
         let mut renamed = expected.clone();
         renamed.job_name = "archive".into();
         renamed.owner.as_mut().unwrap().job_name = "archive".into();
@@ -1024,6 +1210,27 @@ mod tests {
         changed = expected.clone();
         changed.owner.as_mut().unwrap().compare_id += 1;
         assert!(validate_exact_binding(&expected, &changed).is_err());
+
+        let mut autoscan = expected.clone();
+        autoscan.purpose = AuthorizationPurpose::ApplyAutoScan;
+        autoscan.auto_apply_ticket = Some(AutoApplyTicket {
+            generation: 5,
+            ticket_id: 9,
+            job_id: "job-a".into(),
+            job_name: "photos".into(),
+            config_revision: "revision-a".into(),
+            target_index: 1,
+            owner: owner(),
+        });
+        assert!(validate_exact_binding(&autoscan, &autoscan).is_ok());
+        let mut renamed = autoscan.clone();
+        let ticket = renamed.auto_apply_ticket.as_mut().unwrap();
+        ticket.job_name = "archive".into();
+        ticket.owner.job_name = "archive".into();
+        assert!(validate_exact_binding(&autoscan, &renamed).is_ok());
+        let mut changed = autoscan.clone();
+        changed.auto_apply_ticket.as_mut().unwrap().ticket_id += 1;
+        assert!(validate_exact_binding(&autoscan, &changed).is_err());
     }
 
     #[test]
@@ -1040,5 +1247,46 @@ mod tests {
         let mut replaced = loaded("photos", "revision-a", 1);
         replaced.full_job.job_id = "job-b".into();
         assert!(validate_loaded_target_unchanged(&reviewed, &replaced).is_err());
+    }
+
+    #[test]
+    fn autoscan_selection_is_server_owned_complete_ordered_and_never_flipped() {
+        let ops = vec![
+            op(Action::Copy, "copy"),
+            op(Action::Conflict, "conflict"),
+            op(Action::Note, "note"),
+            op(Action::Delete, "delete"),
+        ];
+        let selected = server_owned_selection(&ops).unwrap();
+        assert_eq!(
+            selected,
+            vec![
+                SelectedRowDto {
+                    index: 0,
+                    flipped: false,
+                },
+                SelectedRowDto {
+                    index: 3,
+                    flipped: false,
+                },
+            ]
+        );
+        assert!(server_owned_selection(&ops[1..3]).is_err());
+    }
+
+    #[test]
+    fn autoscan_health_refuses_warning_only_verdicts_deterministically() {
+        let facts = ApplyFacts {
+            unacknowledged: Verdict {
+                blockers: Vec::new(),
+                warnings: vec!["z warning".into(), "a warning".into(), "a warning".into()],
+            },
+            acknowledged: empty_verdict(),
+            capabilities: CapReport::default(),
+        };
+        assert_eq!(
+            autoscan_health_refusals(&facts),
+            vec!["a warning".to_string(), "z warning".to_string()]
+        );
     }
 }

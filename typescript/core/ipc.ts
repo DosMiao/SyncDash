@@ -7,10 +7,11 @@ import type { RunEventEnvelope } from './runEvents';
 import {
   applyAuthorizationArgs,
   approveOperationArgs,
+  autoScanApplyAuthorizationArgs,
   compareAuthorizationArgs,
   reviewApplyArgs,
   reviewCompareArgs,
-  unattendedApplyAuthorizationArgs,
+  startAutoScanArgs,
 } from './operation-protocol';
 import type { ApplyDto } from './types/generated/ApplyDto';
 import type { AppSettings } from './types/generated/AppSettings';
@@ -77,6 +78,8 @@ export interface AutoScanStatusDto {
   mode: AutoScanMode | null;
   detail: string;
   active_ticket: number | null;
+  latest_ticket_id: number;
+  pending_trigger: AutoScanTriggerDto | null;
 }
 
 export interface AutoScanTriggerDto {
@@ -91,8 +94,8 @@ export interface AutoScanTriggerDto {
   reason: AutoScanReason;
 }
 
-export const startAutoScan = (name: string, expectedJobId: string, expectedRevision: string, targetIndex: number) =>
-  invoke<AutoScanStatusDto>('start_autoscan', { name, expectedJobId, expectedRevision, targetIndex });
+export const startAutoScan = (expectedJobId: string, expectedRevision: string, targetIndex: number) =>
+  invoke<AutoScanStatusDto>('start_autoscan', startAutoScanArgs(expectedJobId, expectedRevision, targetIndex));
 export const stopAutoScan = () => invoke<AutoScanStatusDto>('stop_autoscan');
 export const autoScanStatus = () => invoke<AutoScanStatusDto>('autoscan_status');
 export const completeAutoScan = (
@@ -106,8 +109,8 @@ export const completeAutoScan = (
 
 // Compare / run
 
-export const reviewCompare = (name: string, expectedJobId: string, targetIndex?: number) =>
-  invoke<OperationReviewDto>('review_compare', reviewCompareArgs(name, expectedJobId, targetIndex));
+export const reviewCompare = (expectedJobId: string, targetIndex?: number) =>
+  invoke<OperationReviewDto>('review_compare', reviewCompareArgs(expectedJobId, targetIndex));
 
 export const approveOperation = (
   challengeId: string,
@@ -135,8 +138,8 @@ export const restoreCompare = (jobId: string, targetIndex: number) =>
 export const reviewApply = (owner: CompareOwner, selected: SelectedRowDto[]) =>
   invoke<OperationReviewDto>('review_apply', reviewApplyArgs(owner, selected));
 
-export const authorizeUnattendedApply = (owner: CompareOwner, selected: SelectedRowDto[]) =>
-  invoke<AuthorizationDto>('authorize_unattended_apply', unattendedApplyAuthorizationArgs(owner, selected));
+export const authorizeAutoScanApply = (generation: number, ticketId: number) =>
+  invoke<AuthorizationDto>('authorize_autoscan_apply', autoScanApplyAuthorizationArgs(generation, ticketId));
 
 export const applyJob = (authorizationToken: string, launchId?: number) =>
   invoke<ApplyDto>('apply_job', applyAuthorizationArgs(authorizationToken, launchId));

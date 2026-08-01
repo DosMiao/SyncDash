@@ -45,9 +45,14 @@ import {
 } from './state/compare-session';
 import type { CompareRepository, JobIdentitySnapshot } from './state/compare-session';
 import {
-  ownsFreshAutoScanResult,
-} from './state/execution-safety';
-import type { AutoScanTicket } from './state/execution-safety';
+  AutoScanTicketLedger,
+  autoScanToggleAction,
+  monitorOwnsAutoScanResult,
+  monitorOwnsAutoScanTicket,
+  reconcileAutoScanStatus,
+  statusCanOwnAutoScanTrigger,
+} from './state/autoscan';
+import type { AutoScanStatusSource, AutoScanTicket } from './state/autoscan';
 import {
   applyReviewKey,
   compareReviewKey,
@@ -103,7 +108,8 @@ interface CtxItem {
 }
 
 interface CtxState { x: number; y: number; items: CtxItem[] }
-interface CompareCompletion { plan: PlanDto; maskHit: boolean[] }
+interface CompareCompletion { plan: PlanDto }
+interface AutoScanOutcome { completion: CompareCompletion | null; owned: boolean }
 
 function readHistory(): string[] {
   try { return JSON.parse(localStorage.getItem(HIST_KEY) ?? '[]') as string[]; } catch { return []; }
@@ -128,6 +134,7 @@ export function App() {
   const restoreRequest = useRef(new RequestFence());
   const [busy, setBusy] = useState(false);
   const syncInFlight = useRef<OperationReviewTicket | null>(null);
+  const autoApplyInFlight = useRef(false);
 
   // View
   const [chips, setChips] = useState<Set<Chip>>(new Set());
@@ -195,11 +202,13 @@ export function App() {
   // AutoScan is backend-owned. The webview renders status and handles exact trigger tickets; it
   // never owns the clock or assumes that remaining mounted means the watcher is still alive.
   const [autoScanStatus, setAutoScanStatus] = useState<ipc.AutoScanStatusDto | null>(null);
-  const autoScanEnabled = useRef(false);
+  const autoScanStatusRef = useRef<ipc.AutoScanStatusDto | null>(null);
   const autoScanTicket = useRef<AutoScanTicket | null>(null);
+  const autoScanLedger = useRef(new AutoScanTicketLedger<AutoScanOutcome>());
   const autoScanControlRequest = useRef(0);
+  const [autoScanControlPending, setAutoScanControlPending] = useState<'start' | 'stop' | null>(null);
+  const autoScanControlPendingRef = useRef<'start' | 'stop' | null>(null);
   const autoScanTriggerRef = useRef<(trigger: ipc.AutoScanTriggerDto) => Promise<void>>(async () => {});
-  const watchSecs = autoScanStatus?.active ? (autoScanStatus.interval_secs ?? null) : null;
 
   const editorApi = useRef<EditorApi | null>(null);
   const { status, set: setStatus, withUndo: setStatusUndo, runUndo } = useStatus('');
@@ -346,20 +355,43 @@ export function App() {
     setMaskHit([]);
   }, []);
 
+  const acceptAutoScanStatus = useCallback((
+    incoming: ipc.AutoScanStatusDto,
+    source: AutoScanStatusSource,
+    completedTicketId?: number,
+  ) => {
+    const current = autoScanStatusRef.current;
+    const next = reconcileAutoScanStatus(current, incoming, source, completedTicketId);
+    if (!next || next === current) return false;
+    autoScanStatusRef.current = next;
+    setAutoScanStatus(next);
+    if (next.pending_trigger) void autoScanTriggerRef.current(next.pending_trigger);
+    return true;
+  }, []);
+
   const stopAutoScan = useCallback(() => {
+    if (autoScanControlPendingRef.current !== null) return;
     const request = autoScanControlRequest.current + 1;
     autoScanControlRequest.current = request;
-    autoScanEnabled.current = false;
-    autoScanTicket.current = null;
-    setAutoScanStatus(null);
+    autoScanControlPendingRef.current = 'stop';
+    setAutoScanControlPending('stop');
+    setStatus('Stopping AutoScan…');
     void ipc.stopAutoScan().then((next) => {
-      if (autoScanControlRequest.current === request) setAutoScanStatus(next);
+      if (autoScanControlRequest.current !== request) return;
+      acceptAutoScanStatus(next, 'stop');
+      autoScanTicket.current = null;
+      setStatus('AutoScan stopped');
     }).catch((error) => {
       if (autoScanControlRequest.current === request) {
         setStatus(`AutoScan could not be stopped cleanly: ${error}`, 'err');
       }
+    }).finally(() => {
+      if (autoScanControlRequest.current === request) {
+        autoScanControlPendingRef.current = null;
+        setAutoScanControlPending(null);
+      }
     });
-  }, [setStatus]);
+  }, [acceptAutoScanStatus, setStatus]);
 
   const resetNavigationUi = useCallback(() => {
     resetSafetyUi();
@@ -391,10 +423,9 @@ export function App() {
   useEffect(() => {
     if (!currentJob || currentJob.targets.length === 0 || selTarget < currentJob.targets.length) return;
     setSelTarget(0);
-    stopAutoScan();
     resetNavigationUi();
     setStatus(`'${currentJob.name}' no longer has target ${selTarget + 1}; selected target 1`);
-  }, [currentJob, selTarget, resetNavigationUi, stopAutoScan, setStatus]);
+  }, [currentJob, selTarget, resetNavigationUi, setStatus]);
 
   const invalidateCompareRevision = useCallback((jobId: string, configRevision: string) => {
     setCompareRepository((repository) => invalidateJobRevision(repository, jobId, configRevision));
@@ -427,10 +458,14 @@ export function App() {
     try {
       const hits = await ipc.maskMatch(masks, p.ops.map((_, i) => eff(p, f, i).path));
       if (!maskRequest.current.owns(ticket)) return;
+      const selected = selectionRef.current;
+      if (!ownerMatchesSelection(owner, selected.job, selected.targetIndex)) return hits;
       setMaskHit(hits);
       return hits;
     } catch (e) {
       if (!maskRequest.current.owns(ticket)) return;
+      const selected = selectionRef.current;
+      if (!ownerMatchesSelection(owner, selected.job, selected.targetIndex)) return null;
       setMaskHit([]);
       setStatus(`Mask matching failed: ${e}`, 'err');
       return null;
@@ -491,21 +526,35 @@ export function App() {
     targetIndex: number,
     autoTicket?: AutoScanTicket,
   ): Promise<CompareCompletion | null> => {
-    if (busy || editor || compareInFlight.current) return null;
-    if (autoTicket && (!autoScanEnabled.current || autoScanTicket.current?.generation !== autoTicket.generation)) return null;
+    if (busy || editor || compareInFlight.current || autoApplyInFlight.current) return null;
+    if (autoTicket && (
+      !monitorOwnsAutoScanTicket(autoScanStatusRef.current, autoScanTicket.current, autoTicket)
+      || syncInFlight.current !== null
+      || applyReviewTicket.current !== null
+      || compareReviewTicket.current !== null
+      || confirmOpen
+      || operationReviewPending(compareReview)
+      || operationReviewPending(applyReview)
+    )) return null;
     if (!autoTicket) autoScanTicket.current = null;
-    restoreRequest.current.invalidate();
+    const selectedAtStart = selectionRef.current;
+    const showProgress = !autoTicket || (
+      selectedAtStart.job?.job_id === autoTicket.jobId
+      && selectedAtStart.job.config_revision === autoTicket.configRevision
+      && selectedAtStart.targetIndex === autoTicket.targetIndex
+    );
+    if (!autoTicket) restoreRequest.current.invalidate();
     compareInFlight.current = true;
     const name = comparedJob.name;
-    resetSafetyUi();
+    if (!autoTicket) resetSafetyUi();
     setBusy(true);
-    setStatus(`Comparing '${name}' ...`);
-    setCmpStages([]);
+    setStatus(`${autoTicket ? 'AutoScan is comparing' : 'Comparing'} '${name}'…`);
+    if (showProgress) setCmpStages([]);
     cmpRate.current.clear();
-    setCmpCancelling(false);
+    if (showProgress) setCmpCancelling(false);
     cmpRunFloor.current = cmpRunId.current;
     cmpRunReady.current = false;
-    setCmpActive(true);
+    if (showProgress) setCmpActive(true);
     try {
       const p = await ipc.compareJob(authorizationToken);
       const f = p.ops.map(() => false);
@@ -513,10 +562,12 @@ export function App() {
         repository,
         successfulSession(p, p.ops.map((op) => selectable(op)), f),
       ));
-      setChips(new Set());
-      setOvFilter(null);
-      setOvExpanded(new Set());
-      setSort(null);
+      if (!autoTicket) {
+        setChips(new Set());
+        setOvFilter(null);
+        setOvExpanded(new Set());
+        setSort(null);
+      }
       // A job file can be edited outside the app while it is open. Compare used the authoritative
       // file, so refresh the list row before deciding whether the returned owner belongs on screen.
       // Snapshot first: refreshJobs may commit the new row (or null) before this continuation runs,
@@ -541,23 +592,18 @@ export function App() {
       if (selectedBeforeRefresh.job?.job_id === p.owner.job_id && !refreshProblem) {
         if (!refreshedJob) {
           setSelTarget(0);
-          stopAutoScan();
           resetNavigationUi();
           navigationWasReset = true;
         } else if (selectedBeforeRefresh.job.config_revision !== refreshedJob.config_revision) {
-          stopAutoScan();
           resetNavigationUi();
           navigationWasReset = true;
         }
       }
       const visibleHere = ownerMatchesSelection(p.owner, selectedJob, selected.targetIndex);
-      let currentMaskHit: boolean[] | null = [];
       if (visibleHere) {
         // resetNavigationUi cleared both the funnel and maskHit. Replaying masks from this render's
         // stale closure would hide rows behind an apparently empty funnel after an external edit.
-        currentMaskHit = await recomputeMasks(p, f, navigationWasReset ? [] : vfilter.masks) ?? null;
-      } else {
-        clearMasks();
+        await recomputeMasks(p, f, navigationWasReset ? [] : vfilter.masks);
       }
       // The counts bar to the right already says what was scanned and what is showing, and the
       // placeholder in the table says "identical" in full — this line only has to say the result
@@ -570,10 +616,17 @@ export function App() {
         );
       } else if (refreshProblem) {
         setStatus(`Compare finished for '${name}', but the refreshed job identity could not be read: ${refreshProblem}`, 'err');
+      } else if (autoTicket) {
+        setStatus(
+          p.ops.length === 0
+            ? `AutoScan finished for '${name}' — both sides are identical; result retained`
+            : `AutoScan finished for '${name}' — ${p.ops.length} differences retained for review`,
+          p.header.conflict_count > 0 ? 'err' : '',
+        );
       } else {
         setStatus(`Compare finished for '${name}', but its job or target changed — the result was not attached to the current view`, 'err');
       }
-      return visibleHere && !refreshProblem && currentMaskHit !== null ? { plan: p, maskHit: currentMaskHit } : null;
+      return { plan: p };
     } catch (e) {
       const cancelled = String(e) === 'cancelled';
       let suffix = '';
@@ -589,11 +642,9 @@ export function App() {
         if (selected.job?.job_id === comparedJob.jobId) {
           if (!refreshedJob) {
             setSelTarget(0);
-            stopAutoScan();
             resetNavigationUi();
             suffix = ` · '${name}' is no longer a registered job`;
           } else if (selected.job.config_revision !== refreshedJob.config_revision) {
-            stopAutoScan();
             resetNavigationUi();
             suffix = ' · refreshed the changed job configuration';
           }
@@ -601,43 +652,47 @@ export function App() {
       } catch (refreshError) {
         refreshProblem = refreshError;
       }
-      const base = cancelled ? 'Compare cancelled' : `Compare failed: ${e}`;
+      const base = cancelled ? 'Compare cancelled' : `${autoTicket ? 'AutoScan Compare' : 'Compare'} failed: ${e}`;
       if (refreshProblem) suffix = ` · job-list refresh failed: ${refreshProblem}`;
       setStatus(`${base}${suffix}`, cancelled && !refreshProblem ? '' : 'err');
       return null;
     } finally {
-      setCmpActive(false);
+      if (showProgress) setCmpActive(false);
       setBusy(false);
       cmpRunReady.current = false;
       compareInFlight.current = false;
     }
-  }, [busy, editor, vfilter.masks, clearMasks, recomputeMasks, refreshJobs, resetNavigationUi, resetSafetyUi, stopAutoScan, setStatus]);
+  }, [busy, editor, confirmOpen, compareReview, applyReview, vfilter.masks, recomputeMasks, refreshJobs, resetNavigationUi, resetSafetyUi, setStatus]);
 
   const doCompare = useCallback(async (autoTicket?: AutoScanTicket): Promise<CompareCompletion | null> => {
-    if (!currentJob || busy || editor || compareInFlight.current) return null;
+    if (busy || editor || compareInFlight.current || syncInFlight.current || autoApplyInFlight.current) return null;
+    if (!autoTicket && !currentJob) return null;
     if (!autoTicket && applyReviewTicket.current) return null;
     if (!autoTicket && operationReviewPending(compareReview)) return null;
     if (autoTicket && (
-      !autoScanEnabled.current
-      || autoScanTicket.current?.generation !== autoTicket.generation
-      || autoScanTicket.current.ticketId !== autoTicket.ticketId
+      !monitorOwnsAutoScanTicket(autoScanStatusRef.current, autoScanTicket.current, autoTicket)
+      || applyReviewTicket.current !== null
+      || compareReviewTicket.current !== null
+      || confirmOpen
+      || operationReviewPending(compareReview)
+      || operationReviewPending(applyReview)
     )) return null;
 
-    const comparedJob = snapshotJob(currentJob);
-    const targetIndex = selTarget;
+    const comparedJob: JobIdentitySnapshot = autoTicket
+      ? { jobId: autoTicket.jobId, name: autoTicket.jobName, configRevision: autoTicket.configRevision }
+      : snapshotJob(currentJob!);
+    const targetIndex = autoTicket?.targetIndex ?? selTarget;
     const key = compareReviewKey(comparedJob.jobId, comparedJob.configRevision, targetIndex);
 
     if (autoTicket) {
       setStatus(`AutoScan is reviewing Compare authorization for '${comparedJob.name}'…`);
       try {
-        const review = await ipc.reviewCompare(comparedJob.name, comparedJob.jobId, targetIndex);
-        const selection = selectionRef.current;
-        const stillOwned = autoScanEnabled.current
-          && autoScanTicket.current?.generation === autoTicket.generation
-          && autoScanTicket.current.ticketId === autoTicket.ticketId
-          && selection.job?.job_id === comparedJob.jobId
-          && selection.job.config_revision === comparedJob.configRevision
-          && selection.targetIndex === targetIndex;
+        const review = await ipc.reviewCompare(comparedJob.jobId, targetIndex);
+        const stillOwned = monitorOwnsAutoScanTicket(
+          autoScanStatusRef.current,
+          autoScanTicket.current,
+          autoTicket,
+        );
         if (!stillOwned) return null;
         const authorization = directAuthorization(review);
         if (!authorization) {
@@ -674,7 +729,7 @@ export function App() {
     dispatchCompareReview({ type: 'begin', ticket });
     setStatus(`Reviewing Compare authorization for '${comparedJob.name}'…`);
     try {
-      const review = await ipc.reviewCompare(comparedJob.name, comparedJob.jobId, targetIndex);
+      const review = await ipc.reviewCompare(comparedJob.jobId, targetIndex);
       if (!ownsOperationReviewTicket(compareReviewTicket.current, ticket, currentCompareReviewKeyRef.current)) {
         return null;
       }
@@ -716,7 +771,7 @@ export function App() {
         compareReviewFetchTicket.current = null;
       }
     }
-  }, [currentJob, busy, editor, compareReview, selTarget, runAuthorizedCompare, setStatus]);
+  }, [currentJob, busy, editor, compareReview, applyReview, confirmOpen, selTarget, runAuthorizedCompare, setStatus]);
 
   const approveCompareReview = useCallback(async () => {
     const ticket = compareReviewTicket.current;
@@ -763,6 +818,7 @@ export function App() {
       || !plan
       || !reviewKey
       || busy
+      || autoApplyInFlight.current
       || operationReviewPending(applyReview)
       || applyReviewTicket.current
       || compareReviewFetchTicket.current
@@ -812,7 +868,7 @@ export function App() {
     const ticket = applyReviewTicket.current;
     const review = applyReview.review;
     if (!ticket || !review) return;
-    if (busy || (syncInFlight.current?.generation === ticket.generation
+    if (busy || autoApplyInFlight.current || (syncInFlight.current?.generation === ticket.generation
       && syncInFlight.current.key === ticket.key)) return;
     syncInFlight.current = ticket;
     const selected = reviewedRows;
@@ -895,12 +951,11 @@ export function App() {
     setCurrentJob(j);
     setSelTarget(targetIndex);
     resetNavigationUi();
-    stopAutoScan();
     setStatus(restored
       ? `${j.name} · restored ${restored.plan.ops.length} compare items`
       : `${j.name} · ${j.mode}${j.rigor !== 'standard' ? ` · ${j.rigor}` : ''}`);
     requestResultRestore(j, targetIndex, restored);
-  }, [currentJob?.job_id, compareRepository, requestResultRestore, resetNavigationUi, stopAutoScan, setStatus]);
+  }, [currentJob?.job_id, compareRepository, requestResultRestore, resetNavigationUi, setStatus]);
 
   /// Write a root edited on the main screen back to the job TOML. Changing a root invalidates the current
   /// plan, so clear it too. For multi-target jobs, only the currently selected target changes.
@@ -940,7 +995,6 @@ export function App() {
     }
     // The mutation is committed at this point. Retire its old compare immediately, and never let a
     // later list-refresh failure make the UI claim that this successful disk write failed.
-    stopAutoScan();
     setCompareRepository((repository) => reconcileSavedJobSession(
       repository,
       saved,
@@ -966,7 +1020,6 @@ export function App() {
         await reportMutationFailure(saved.name, `Could not restore ${which}`, e);
         return;
       }
-      stopAutoScan();
       resetSafetyUi();
       try {
         await refreshJobs(saved.name);
@@ -982,7 +1035,7 @@ export function App() {
     } catch (e) {
       setStatusUndo(`${success}; refreshing the job list failed: ${e}`, 'Undo', undo, 'err');
     }
-  }, [currentJob, selTarget, pushHistory, refreshJobs, reportMutationFailure, resetSafetyUi, stopAutoScan, setStatus, setStatusUndo]);
+  }, [currentJob, selTarget, pushHistory, refreshJobs, reportMutationFailure, resetSafetyUi, setStatus, setStatusUndo]);
 
   /// The FFS ⇄ swaps the in-memory config; our jobs are named TOML files on disk, so a swap has to hit
   /// the disk — otherwise the two roots in the plan header say something different from the job file, and
@@ -1041,7 +1094,6 @@ export function App() {
       await reportMutationFailure(name, 'Swap failed', e);
       return;
     }
-    stopAutoScan();
     setCompareRepository((repository) => reconcileSavedJobSession(
       repository,
       saved,
@@ -1066,7 +1118,6 @@ export function App() {
         await reportMutationFailure(saved.name, 'Could not undo the root swap', e);
         return;
       }
-      stopAutoScan();
       resetSafetyUi();
       try {
         await refreshJobs(saved.name);
@@ -1082,7 +1133,7 @@ export function App() {
     } catch (e) {
       setStatusUndo(`${success}; refreshing the job list failed: ${e}`, 'Undo swap', undo, 'err');
     }
-  }, [refreshJobs, reportMutationFailure, resetSafetyUi, stopAutoScan, setStatus, setStatusUndo]);
+  }, [refreshJobs, reportMutationFailure, resetSafetyUi, setStatus, setStatusUndo]);
 
   /// Write an exclude back into the job's exclude list. Pruning during the scan only takes effect at the
   /// next Compare, so the message has to say so and leave an undo behind.
@@ -1114,7 +1165,6 @@ export function App() {
       await reportMutationFailure(name, 'Failed to write exclude', e);
       return;
     }
-    stopAutoScan();
     setCompareRepository((repository) => reconcileSavedJobSession(
       repository,
       saved,
@@ -1136,7 +1186,6 @@ export function App() {
         await reportMutationFailure(saved.name, 'Could not undo the exclude', e);
         return;
       }
-      stopAutoScan();
       resetSafetyUi();
       try {
         await refreshJobs(saved.name);
@@ -1152,7 +1201,7 @@ export function App() {
     } catch (e) {
       setStatusUndo(`${success}; refreshing the job list failed: ${e}`, 'Undo exclude', undo, 'err');
     }
-  }, [currentJob, refreshJobs, reportMutationFailure, resetSafetyUi, stopAutoScan, setStatus, setStatusUndo]);
+  }, [currentJob, refreshJobs, reportMutationFailure, resetSafetyUi, setStatus, setStatusUndo]);
 
   /// Export the current view (the visible set, with check state). Escaping and the BOM are handled once
   /// on the Rust side.
@@ -1459,91 +1508,182 @@ export function App() {
       targetIndex: trigger.target_index,
       autoApply: trigger.auto_apply,
     };
-    const selectedJob = selectionRef.current.job;
-    const selectedHere = selectedJob
-      && selectedJob.job_id === ticket.jobId
-      && selectedJob.config_revision === ticket.configRevision
-      && selectionRef.current.targetIndex === ticket.targetIndex;
-    if (!autoScanEnabled.current || !selectedHere || busy || compareInFlight.current) {
+    const claim = autoScanLedger.current.claim(ticket);
+    if (claim.kind === 'duplicate') return;
+    if (claim.kind === 'capacity') {
+      setStatus('AutoScan rejected a trigger because its bounded recovery ledger is full', 'err');
       try {
-        await ipc.completeAutoScan(ticket.generation, ticket.ticketId, false, null);
-      } catch {
-        // A stop/re-arm consumes the old generation. There is no current failure to surface.
+        acceptAutoScanStatus(
+          await ipc.completeAutoScan(ticket.generation, ticket.ticketId, false, null),
+          'completion',
+          ticket.ticketId,
+        );
+      } catch (error) {
+        setStatus(`AutoScan could not release the rejected trigger: ${error}`, 'err');
       }
       return;
     }
 
-    autoScanTicket.current = ticket;
-    const completion = await doCompare(ticket);
-    const currentJobForResult = selectionRef.current.job;
-    const currentSelection = currentJobForResult ? {
-      jobId: currentJobForResult.job_id,
-      configRevision: currentJobForResult.config_revision,
-      targetIndex: selectionRef.current.targetIndex,
-    } : null;
-    const owned = completion !== null && ownsFreshAutoScanResult(
-      autoScanEnabled.current,
-      autoScanTicket.current,
-      ticket,
-      completion.plan.owner,
-      currentSelection,
-    );
+    const observed = autoScanStatusRef.current;
+    if (observed?.active
+      && observed.generation === ticket.generation
+      && observed.job_id === ticket.jobId
+      && observed.config_revision === ticket.configRevision
+      && observed.target_index === ticket.targetIndex) {
+      // The trigger event is itself the newest backend cursor. Materialize it into status so a
+      // delayed completion for N cannot race an event for N+1 merely because no status event exists.
+      acceptAutoScanStatus({
+        ...observed,
+        latest_ticket_id: ticket.ticketId,
+        active_ticket: ticket.ticketId,
+        pending_trigger: trigger,
+        mode: trigger.mode,
+      }, 'event');
+    }
+
+    let outcome: AutoScanOutcome;
+    if (claim.kind === 'retry_completion') {
+      outcome = claim.outcome;
+    } else {
+      let monitor = autoScanStatusRef.current;
+      const triggerMatchesMonitor = statusCanOwnAutoScanTrigger(monitor, ticket);
+      if (!triggerMatchesMonitor) {
+        try {
+          acceptAutoScanStatus(await ipc.autoScanStatus(), 'snapshot');
+          monitor = autoScanStatusRef.current;
+        } catch (error) {
+          setStatus(`AutoScan could not verify recovered trigger ownership: ${error}`, 'err');
+        }
+      }
+
+      const monitorMatches = statusCanOwnAutoScanTrigger(monitor, ticket);
+      let completion: CompareCompletion | null = null;
+      if (monitorMatches) {
+        autoScanTicket.current = ticket;
+        completion = await doCompare(ticket);
+      }
+      const owned = completion !== null && monitorOwnsAutoScanResult(
+        autoScanStatusRef.current,
+        autoScanTicket.current,
+        ticket,
+        completion.plan.owner,
+      );
+      outcome = { completion, owned };
+      if (!autoScanLedger.current.prepareCompletion(ticket, outcome)) return;
+    }
+
+    let completionCurrent = false;
     try {
       const next = await ipc.completeAutoScan(
         ticket.generation,
         ticket.ticketId,
-        owned,
-        owned ? completion.plan.owner : null,
+        outcome.owned,
+        outcome.owned && outcome.completion ? outcome.completion.plan.owner : null,
       );
-      if (autoScanEnabled.current && next.generation === ticket.generation) {
-        setAutoScanStatus(next);
-      }
+      acceptAutoScanStatus(next, 'completion', ticket.ticketId);
+      autoScanLedger.current.completed(ticket);
+      const current = autoScanStatusRef.current;
+      completionCurrent = current?.active === true
+        && current.generation === ticket.generation
+        && current.latest_ticket_id === ticket.ticketId
+        && current.job_id === ticket.jobId
+        && current.config_revision === ticket.configRevision
+        && current.target_index === ticket.targetIndex
+        && current.active_ticket === null
+        && current.pending_trigger === null;
     } catch (error) {
-      if (autoScanEnabled.current && autoScanTicket.current?.generation === ticket.generation) {
-        setStatus(`AutoScan could not commit its compare ticket: ${error}`, 'err');
+      autoScanLedger.current.completionFailed(ticket);
+      try {
+        const recovered = await ipc.autoScanStatus();
+        const completedDespiteLostResponse = recovered.active
+          && recovered.generation === ticket.generation
+          && recovered.latest_ticket_id === ticket.ticketId
+          && recovered.job_id === ticket.jobId
+          && recovered.config_revision === ticket.configRevision
+          && recovered.target_index === ticket.targetIndex
+          && recovered.active_ticket === null
+          && recovered.pending_trigger === null;
+        if (completedDespiteLostResponse) {
+          acceptAutoScanStatus(recovered, 'completion', ticket.ticketId);
+          autoScanLedger.current.completed(ticket);
+          completionCurrent = true;
+        } else {
+          const samePending = recovered.active
+            && recovered.generation === ticket.generation
+            && recovered.pending_trigger?.ticket_id === ticket.ticketId;
+          if (samePending) {
+            // Connectivity is back and the backend proves the success was not committed. Release
+            // this cycle as failed instead of leaving the worker waiting forever or rerunning Compare.
+            try {
+              const released = await ipc.completeAutoScan(ticket.generation, ticket.ticketId, false, null);
+              acceptAutoScanStatus(released, 'completion', ticket.ticketId);
+              autoScanLedger.current.completed(ticket);
+              if (autoScanTicket.current?.generation === ticket.generation
+                && autoScanTicket.current.ticketId === ticket.ticketId) autoScanTicket.current = null;
+              setStatus(`AutoScan deferred this cycle after completion recovery failed: ${error}`, 'err');
+            } catch (releaseError) {
+              setStatus(`AutoScan could not release its recovered ticket: ${releaseError}`, 'err');
+            }
+            return;
+          } else {
+            acceptAutoScanStatus(recovered, 'snapshot');
+            autoScanLedger.current.completed(ticket);
+          }
+        }
+      } catch {
+        // Preserve the ready ledger record. Recovery can retry this completion without rescanning.
       }
-      return;
+      if (!completionCurrent) {
+        const current = autoScanStatusRef.current;
+        const stillPending = current?.active === true
+          && current.generation === ticket.generation
+          && current.pending_trigger?.ticket_id === ticket.ticketId;
+        if (!stillPending
+          && autoScanTicket.current?.generation === ticket.generation
+          && autoScanTicket.current.ticketId === ticket.ticketId) autoScanTicket.current = null;
+        if (autoScanTicket.current?.generation === ticket.generation
+          && autoScanTicket.current.ticketId === ticket.ticketId) {
+          setStatus(`AutoScan could not commit its compare ticket: ${error}`, 'err');
+        }
+        return;
+      }
     }
-    if (!owned || !completion) return;
-    autoScanTicket.current = null;
+    if (autoScanTicket.current?.generation === ticket.generation
+      && autoScanTicket.current.ticketId === ticket.ticketId) autoScanTicket.current = null;
+    if (!completionCurrent) return;
+    if (!outcome.owned || !outcome.completion) return;
 
-    const freshPlan = completion.plan;
+    const freshPlan = outcome.completion.plan;
     if (freshPlan.ops.length === 0) return;
     if (!ticket.autoApply) {
       setStatus(`AutoScan found ${freshPlan.ops.length} differences — review required`, 'err');
       return;
     }
 
-    const visibleForCycle = computeVisible({
-      plan: freshPlan,
-      flipped: EMPTY_FLAGS,
-      chips: new Set(),
-      search,
-      ovFilter: null,
-      vfilter,
-      maskHit: completion.maskHit,
-    });
-    const selected = selectedRows(
-      finalIdx(visibleForCycle, freshPlan.ops.map((op) => selectable(op))),
-      EMPTY_FLAGS,
-    );
-    if (selected.length === 0) {
-      setStatus(
-        `AutoScan found ${freshPlan.ops.length} differences, but the current filters leave no executable actions — review required`,
-        'err',
-      );
+    if (compareInFlight.current || syncInFlight.current || editor || applyReviewTicket.current || compareReviewTicket.current) {
+      setStatus(`AutoScan found ${freshPlan.ops.length} differences — another interaction owns execution; review required`, 'err');
       return;
     }
-
-    setStatus(`AutoScan found ${selected.length} visible differences — checking unattended authorization…`);
+    const applyStatus = autoScanStatusRef.current;
+    if (applyStatus?.active !== true
+      || applyStatus.generation !== ticket.generation
+      || applyStatus.latest_ticket_id !== ticket.ticketId
+      || applyStatus.job_id !== ticket.jobId
+      || applyStatus.config_revision !== ticket.configRevision
+      || applyStatus.target_index !== ticket.targetIndex
+      || applyStatus.active_ticket !== null
+      || applyStatus.pending_trigger !== null
+      || autoScanTicket.current !== null) return;
+    setStatus(`AutoScan found ${freshPlan.ops.length} differences — checking the backend-owned AutoApply ticket…`);
+    autoApplyInFlight.current = true;
     setBusy(true);
     try {
       let authorization: ipc.AuthorizationDto;
       try {
-        authorization = await ipc.authorizeUnattendedApply(freshPlan.owner, selected);
+        authorization = await ipc.authorizeAutoScanApply(ticket.generation, ticket.ticketId);
       } catch (error) {
         setStatus(
-          `Auto-sync did not run: an exact interactive session grant is required for this job, revision, target, and capability set: ${error}`,
+          `AutoApply did not run: interactive review is required for this exact job revision, target, and capability set: ${error}`,
           'err',
         );
         return;
@@ -1551,7 +1691,6 @@ export function App() {
       // Authorization failure leaves the freshly compared result intact for interactive review.
       // Once execution begins, retire it because a rejected apply may still have made partial writes.
       invalidateCompareRevision(ticket.jobId, ticket.configRevision);
-      resetSafetyUi();
       try {
         const result = await ipc.applyJob(authorization.authorization_token);
         refreshLastSyncs();
@@ -1569,47 +1708,46 @@ export function App() {
         );
       }
     } finally {
+      autoApplyInFlight.current = false;
       setBusy(false);
     }
   };
-
   useEffect(() => {
     let disposed = false;
     const removers: Array<() => void> = [];
-    void ipc.autoScanStatus().then((next) => {
+    void (async () => {
+      const installed = await Promise.allSettled([
+        listen<ipc.AutoScanStatusDto>('autoscan-status', ({ payload }) => {
+          if (disposed) return;
+          const accepted = acceptAutoScanStatus(payload, 'event');
+          if (accepted) setStatus(`AutoScan: ${payload.detail}`, payload.active ? '' : 'err');
+        }),
+        listen<ipc.AutoScanTriggerDto>('autoscan-trigger', ({ payload }) => {
+          if (!disposed) void autoScanTriggerRef.current(payload);
+        }),
+      ]);
+      for (const [index, result] of installed.entries()) {
+        if (result.status === 'fulfilled') {
+          if (disposed) result.value(); else removers.push(result.value);
+        } else if (!disposed) {
+          setStatus(
+            `AutoScan ${index === 0 ? 'status' : 'trigger'} subscription failed: ${result.reason}`,
+            'err',
+          );
+        }
+      }
       if (disposed) return;
-      autoScanEnabled.current = next.active;
-      setAutoScanStatus(next);
-    }).catch((error) => {
-      if (!disposed) setStatus(`AutoScan status is unavailable: ${error}`, 'err');
-    });
-    void listen<ipc.AutoScanStatusDto>('autoscan-status', ({ payload }) => {
-      if (disposed) return;
-      autoScanEnabled.current = payload.active;
-      setAutoScanStatus((current) => {
-        if (current?.generation === payload.generation
-          && current.mode !== 'starting'
-          && payload.mode === 'starting') return current;
-        return payload;
-      });
-      if (payload.active) setStatus(`AutoScan: ${payload.detail}`);
-    }).then((remove) => {
-      if (disposed) remove(); else removers.push(remove);
-    }).catch((error) => {
-      if (!disposed) setStatus(`AutoScan status subscription failed: ${error}`, 'err');
-    });
-    void listen<ipc.AutoScanTriggerDto>('autoscan-trigger', ({ payload }) => {
-      if (!disposed) void autoScanTriggerRef.current(payload);
-    }).then((remove) => {
-      if (disposed) remove(); else removers.push(remove);
-    }).catch((error) => {
-      if (!disposed) setStatus(`AutoScan trigger subscription failed: ${error}`, 'err');
-    });
+      try {
+        acceptAutoScanStatus(await ipc.autoScanStatus(), 'snapshot');
+      } catch (error) {
+        if (!disposed) setStatus(`AutoScan status is unavailable: ${error}`, 'err');
+      }
+    })();
     return () => {
       disposed = true;
       for (const remove of removers) remove();
     };
-  }, [setStatus]);
+  }, [acceptAutoScanStatus, setStatus]);
 
   // Keyboard.
   //
@@ -1680,37 +1818,40 @@ export function App() {
             stats={stats}
             busy={busy || reviewBusy}
             canSync={final.length > 0}
-            watchSecs={watchSecs}
-            watchMode={autoScanStatus?.active ? (autoScanStatus.mode ?? null) : null}
+            watchStatus={autoScanStatus}
+            watchPending={autoScanControlPending}
             onCompare={() => void doCompare()}
             onSync={() => void openConfirm()}
             onToggleLog={() => setLogOpen((v) => !v)}
             onToggleWatch={() => {
-              if (watchSecs !== null) { stopAutoScan(); setStatus('AutoScan stopped'); return; }
-              if (!currentJob) return;
+              const action = autoScanToggleAction(autoScanStatusRef.current, currentJob !== null);
+              if (action === 'stop') { stopAutoScan(); return; }
+              if (action !== 'start' || !currentJob || autoScanControlPendingRef.current !== null) return;
+              const monitoredJob = currentJob;
+              const monitoredTarget = selTarget;
               const request = autoScanControlRequest.current + 1;
               autoScanControlRequest.current = request;
-              autoScanEnabled.current = true;
               autoScanTicket.current = null;
-              setStatus(`Starting AutoScan for '${currentJob.name}'…`);
+              autoScanControlPendingRef.current = 'start';
+              setAutoScanControlPending('start');
+              setStatus(`Starting AutoScan for '${monitoredJob.name}'…`);
               void ipc.startAutoScan(
-                currentJob.name,
-                currentJob.job_id,
-                currentJob.config_revision,
-                selTarget,
+                monitoredJob.job_id,
+                monitoredJob.config_revision,
+                monitoredTarget,
               ).then((next) => {
-                if (autoScanControlRequest.current !== request) {
-                  void ipc.stopAutoScan();
-                  return;
+                if (autoScanControlRequest.current !== request) return;
+                if (acceptAutoScanStatus(next, 'start')) {
+                  setStatus(`AutoScan: ${next.detail}${next.auto_apply ? ' · unattended apply requires an exact prior grant' : ''}`);
                 }
-                autoScanEnabled.current = next.active;
-                setAutoScanStatus(next);
-                setStatus(`AutoScan: ${next.detail}${next.auto_apply ? ' · unattended apply requires an exact prior grant' : ''}`);
               }).catch((error) => {
                 if (autoScanControlRequest.current !== request) return;
-                autoScanEnabled.current = false;
-                setAutoScanStatus(null);
                 setStatus(`AutoScan could not start: ${error}`, 'err');
+              }).finally(() => {
+                if (autoScanControlRequest.current === request) {
+                  autoScanControlPendingRef.current = null;
+                  setAutoScanControlPending(null);
+                }
               });
             }}
           />
@@ -1732,7 +1873,6 @@ export function App() {
               if (!selected) return;
               selectionRef.current = { job: selected, targetIndex: i };
               setSelTarget(i);
-              stopAutoScan();
               resetNavigationUi();
               const t = selected.targets[i] ?? '';
               const restored = sessionForSelection(compareRepository, selected, i);
@@ -1942,7 +2082,6 @@ export function App() {
               ));
             }
             if (original && !preserveRuntime) {
-              stopAutoScan();
               resetSafetyUi();
             }
             pushHistory(job.source);
@@ -1963,7 +2102,6 @@ export function App() {
             invalidateCompareJob(deleted.job_id);
             resetSafetyUi();
             if (currentJob?.job_id === deleted.job_id) {
-              stopAutoScan();
               setCurrentJob(null);
               setSelTarget(0);
             }
@@ -1981,7 +2119,6 @@ export function App() {
             setCompareRepository((repository) => reconcileRefreshedJobSession(repository, original, refreshed));
             if (currentJob?.job_id === original.jobId
               && (!refreshed || currentJob.config_revision !== refreshed.config_revision)) {
-              stopAutoScan();
               resetNavigationUi();
             }
           }}

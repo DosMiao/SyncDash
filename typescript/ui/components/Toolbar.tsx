@@ -10,7 +10,8 @@ import { humanSize } from '../../core/format';
 import { MARK } from '../icons';
 import type { ReactNode } from 'react';
 import type { JobDto } from '../../core/types/generated/JobDto';
-import type { AutoScanMode } from '../../core/ipc';
+import type { AutoScanStatusDto } from '../../core/ipc';
+import { autoScanButtonLabel } from '../state/autoscan';
 
 export interface PlanStats {
   copy: number;
@@ -30,10 +31,10 @@ interface Props {
   stats: PlanStats | null;
   busy: boolean;
   canSync: boolean;
-  /// Seconds between scheduled scans while AutoScan is on, null when it is off. The job field behind
-  /// it is still `watch_interval_secs` — AutoScan is what this control is called on screen.
-  watchSecs: number | null;
-  watchMode: AutoScanMode | null;
+  /// Global backend monitor. It deliberately does not follow `job`: switching the selected view must
+  /// not silently stop or relabel work that remains armed for another job.
+  watchStatus: AutoScanStatusDto | null;
+  watchPending: 'start' | 'stop' | null;
   onCompare: () => void;
   onSync: () => void;
   onToggleLog: () => void;
@@ -52,7 +53,10 @@ function Seg({ cls, icon, n, title }: { cls?: string; icon: ReactNode; n: number
 }
 
 export function Toolbar(props: Props) {
-  const { job, hasPlan, finalCount, stats, busy, canSync, watchSecs, watchMode, onCompare, onSync, onToggleLog, onToggleWatch } = props;
+  const { job, hasPlan, finalCount, stats, busy, canSync, watchStatus, watchPending, onCompare, onSync, onToggleLog, onToggleWatch } = props;
+  const watchActive = watchStatus?.active === true;
+  const watchMode = watchActive ? watchStatus.mode : null;
+  const watchLabel = autoScanButtonLabel(watchStatus, watchPending);
 
   // An unknown tier shows just its name, with no dangling "·" (the rigor ladder will gain tiers later)
   const rh = job ? RIGOR_HINT[job.rigor] : undefined;
@@ -112,19 +116,23 @@ export function Toolbar(props: Props) {
         {/* A solid fill rather than the usual tinted toggle: AutoScan is the one control here that
             keeps working after you look away, so it should be legible from across the room */}
         <button
-          className={'btn' + (watchSecs !== null ? ' on-solid' : '')}
-          title={watchSecs === null
+          className={'btn autoscan-btn' + (watchActive ? ' on-solid' : '')}
+          title={!watchActive
             ? "Compare automatically while SyncDash is open"
             : watchMode === 'native_fsevents'
-              ? 'Watching both local roots with FSEvents, with periodic full verification'
+              ? `Watching '${watchStatus?.job_name ?? 'the monitored job'}' target ${(watchStatus?.target_index ?? 0) + 1} with FSEvents, with periodic full verification`
               : watchMode === 'polling'
-                ? 'Polling on the configured interval while SyncDash is open'
-                : 'Preparing backend-owned change detection'}
-          disabled={!job || (busy && watchSecs === null)}
+                ? `Polling '${watchStatus?.job_name ?? 'the monitored job'}' target ${(watchStatus?.target_index ?? 0) + 1} every ${watchStatus?.interval_secs ?? '?'}s while SyncDash is open`
+                : `Preparing backend-owned change detection for '${watchStatus?.job_name ?? 'the monitored job'}' target ${(watchStatus?.target_index ?? 0) + 1}`}
+          aria-pressed={watchActive}
+          aria-label={watchActive
+            ? `Stop AutoScan for ${watchStatus?.job_name ?? 'the monitored job'}, target ${(watchStatus?.target_index ?? 0) + 1}`
+            : 'Start AutoScan for the selected job and target'}
+          disabled={watchPending !== null || (!watchActive && (!job || busy))}
           onClick={onToggleWatch}
         >
           <Timer size={13} />
-          {watchSecs !== null ? `AutoScan ${watchSecs}s` : 'AutoScan'}
+          <span className="autoscan-label">{watchLabel}</span>
         </button>
       </div>
     </header>
