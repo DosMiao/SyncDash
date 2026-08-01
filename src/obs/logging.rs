@@ -74,6 +74,10 @@ impl ProgressSink for StderrSink {
             }
         }
     }
+
+    fn wants_progress(&self) -> bool {
+        false
+    }
 }
 
 /// Fan one event out to several sinks (desktop: TauriSink + FileSink).
@@ -88,8 +92,14 @@ impl MultiSink {
 impl ProgressSink for MultiSink {
     fn emit(&self, ev: ProgressEvent) {
         for s in &self.0 {
-            s.emit(ev.clone());
+            if !matches!(ev, ProgressEvent::Progress { .. }) || s.wants_progress() {
+                s.emit(ev.clone());
+            }
         }
+    }
+
+    fn wants_progress(&self) -> bool {
+        self.0.iter().any(|sink| sink.wants_progress())
     }
 }
 
@@ -210,6 +220,10 @@ impl ProgressSink for FileSink {
             _ => Self::put(&self.run, &line, false),
         }
     }
+
+    fn wants_progress(&self) -> bool {
+        false
+    }
 }
 
 impl Drop for FileSink {
@@ -248,6 +262,10 @@ impl ProgressSink for AppLogSink {
                 let _ = writeln!(f, "{line}");
             }
         }
+    }
+
+    fn wants_progress(&self) -> bool {
+        false
     }
 }
 
@@ -363,6 +381,36 @@ mod tests {
         m.emit(ev_log(LogLevel::Info, "x"));
         assert_eq!(sa.lock().unwrap().len(), 1);
         assert_eq!(sb.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn multi_sink_does_not_clone_progress_into_sinks_that_discard_it() {
+        struct BoundaryOnly(Arc<Mutex<Vec<ProgressEvent>>>);
+        impl ProgressSink for BoundaryOnly {
+            fn emit(&self, event: ProgressEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+
+            fn wants_progress(&self) -> bool {
+                false
+            }
+        }
+
+        let boundary_events = Arc::new(Mutex::new(Vec::new()));
+        let (collector, collected) = collecting();
+        let sink = MultiSink::new(vec![Arc::new(BoundaryOnly(boundary_events.clone())), collector]);
+        sink.emit(ProgressEvent::Progress {
+            phase: crate::model::event::Phase::ScanSource,
+            ts_ms: 1,
+            items_done: 1,
+            items_total: 2,
+            bytes_done: 3,
+            bytes_total: 4,
+            current_path: "a.txt".into(),
+        });
+
+        assert!(boundary_events.lock().unwrap().is_empty());
+        assert_eq!(collected.lock().unwrap().len(), 1);
     }
 
     #[test]

@@ -43,6 +43,28 @@ fn opts(trash: PathBuf) -> ApplyOptions {
     ApplyOptions { dry_run: false, trash: Some(trash), fsync: false, ..Default::default() }
 }
 
+#[test]
+fn an_untrusted_plan_cannot_escape_either_root() {
+    let base = tmproot("traversal");
+    let (s, t) = (base.join("s"), base.join("t"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    let outside = base.join("outside.txt");
+    std::fs::write(&outside, b"must survive").unwrap();
+
+    let out = apply::apply_with(
+        &[op(Action::Delete, "../outside.txt")],
+        &s,
+        &t,
+        &opts(base.join("trash")),
+        &RunCtx::null(),
+    );
+
+    assert_eq!((out.done, out.errors), (0, 1));
+    assert_eq!(std::fs::read(&outside).unwrap(), b"must survive");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// A ctx that collects ItemResult: the contents of the execution ledger (items.jsonl) are exactly these events
 fn ledger_ctx() -> (RunCtx, std::sync::Arc<Mutex<Vec<(String, ItemOutcome, u64)>>>) {
     let store: std::sync::Arc<Mutex<Vec<(String, ItemOutcome, u64)>>> =

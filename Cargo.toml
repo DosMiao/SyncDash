@@ -52,6 +52,11 @@ rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFDate", "CFString", "CFUUID"] }
+objc2-core-services = { version = "0.3.2", default-features = false, features = ["std", "dispatch2", "FSEvents", "libc"] }
+
 # Integration tests under tests/ link the crate but resolve their own imports, so the
 # crates they touch directly have to be named again here.
 [dev-dependencies]

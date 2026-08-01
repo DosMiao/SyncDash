@@ -28,9 +28,9 @@ pub(super) struct Shared<'a> {
     pub(super) target_local: Option<PathBuf>,
     /// Whether the central trash store may take each side's deletions.
     ///
-    /// A separate question from `local_of`, and the reason this field exists: `\\nas\share` is a
-    /// real local path, so the delta lane does apply to it — but it is on another machine, so a
-    /// move into the store on this one copies every deleted file across the network first.
+    /// A separate question from `local_of`, and the reason this field exists: a mounted share or
+    /// external disk is a real local path, so the delta lane applies, but a move into a store on
+    /// another volume would copy every deleted file first.
     pub(super) source_trash_ok: bool,
     pub(super) target_trash_ok: bool,
     pub(super) trash: PathBuf,

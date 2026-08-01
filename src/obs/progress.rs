@@ -4,8 +4,8 @@
 //! - The engine guarantees only: monotone counters, a timestamp on every event, cooperative
 //!   checkpoints. Rate (4s window) / ETA (60s window) / percentage
 //!   (bytesDone+itemsDone)/(bytesTotal+itemsTotal) are all UI-side arithmetic over the event stream.
-//! - Throttling belongs to the sink (the Tauri-side Progress class: ≥100ms per event); the engine
-//!   emits freely at file and 1MiB chunk boundaries, costing ≈two atomic adds under NullSink.
+//! - Counters update at every file and chunk boundary, while progress snapshots are sampled once
+//!   per phase every 100ms. Terminal and total events remain exact and unthrottled.
 //! - Cancel rides `io::ErrorKind::Interrupted` — it reuses the io::Result already threaded end to end, zero new error types.
 //! - Pause = a 100ms nap spin: **the stack frame stays alive ⇒ the RootLock heartbeat thread keeps
 //!   beating**, so the far machine never judges our lock abandoned (lock.rs 12s criterion). That is
@@ -20,11 +20,19 @@ use std::sync::Arc;
 
 pub trait ProgressSink: Send + Sync {
     fn emit(&self, ev: ProgressEvent);
+
+    fn wants_progress(&self) -> bool {
+        true
+    }
 }
 
 pub struct NullSink;
 impl ProgressSink for NullSink {
     fn emit(&self, _ev: ProgressEvent) {}
+
+    fn wants_progress(&self) -> bool {
+        false
+    }
 }
 
 /// Any `Fn(ProgressEvent)+Send+Sync` closure is a sink — zero-cost compatibility with the closure call shape of the parallel line P2-6
@@ -206,7 +214,10 @@ pub struct PhaseProgress<'a> {
     items_total: AtomicU64,
     bytes_done: AtomicU64,
     bytes_total: AtomicU64,
+    last_progress_ms: AtomicU64,
 }
+
+const PROGRESS_INTERVAL_MS: u64 = 100;
 
 impl<'a> PhaseProgress<'a> {
     pub fn begin(ctx: &'a RunCtx, phase: Phase, label: Option<String>, items_total: u64, bytes_total: u64) -> Self {
@@ -225,6 +236,7 @@ impl<'a> PhaseProgress<'a> {
             items_total: AtomicU64::new(items_total),
             bytes_done: AtomicU64::new(0),
             bytes_total: AtomicU64::new(bytes_total),
+            last_progress_ms: AtomicU64::new(0),
         }
     }
 
@@ -243,10 +255,10 @@ impl<'a> PhaseProgress<'a> {
         self.emit_totals(false);
     }
 
-    fn snapshot(&self, current: &str) -> ProgressEvent {
+    fn snapshot(&self, current: &str, ts_ms: u64) -> ProgressEvent {
         ProgressEvent::Progress {
             phase: self.phase,
-            ts_ms: crate::foundation::time::now_ms(),
+            ts_ms,
             items_done: self.items_done.load(Ordering::Relaxed),
             items_total: self.items_total.load(Ordering::Relaxed),
             bytes_done: self.bytes_done.load(Ordering::Relaxed),
@@ -255,14 +267,34 @@ impl<'a> PhaseProgress<'a> {
         }
     }
 
+    fn emit_progress(&self, current: &str) {
+        if !self.ctx.sink.wants_progress() {
+            return;
+        }
+        let now = crate::foundation::time::now_ms();
+        let mut last = self.last_progress_ms.load(Ordering::Relaxed);
+        loop {
+            if last != 0 && now.saturating_sub(last) < PROGRESS_INTERVAL_MS {
+                return;
+            }
+            match self.last_progress_ms.compare_exchange_weak(last, now, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => {
+                    self.ctx.sink.emit(self.snapshot(current, now));
+                    return;
+                }
+                Err(observed) => last = observed,
+            }
+        }
+    }
+
     pub fn item_done(&self, current: &str) {
         self.items_done.fetch_add(1, Ordering::Relaxed);
-        self.ctx.sink.emit(self.snapshot(current));
+        self.emit_progress(current);
     }
 
     pub fn add_bytes(&self, n: u64, current: &str) {
         self.bytes_done.fetch_add(n, Ordering::Relaxed);
-        self.ctx.sink.emit(self.snapshot(current));
+        self.emit_progress(current);
     }
 
     /// Add work discovered only while applying (for example an external-volume trash copy).
@@ -298,7 +330,10 @@ impl<'a> PhaseProgress<'a> {
     pub fn complete(&self, current: &str) {
         self.items_done.store(self.items_total.load(Ordering::Relaxed), Ordering::Relaxed);
         self.bytes_done.store(self.bytes_total.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.ctx.sink.emit(self.snapshot(current));
+        let now = crate::foundation::time::now_ms();
+        if self.ctx.sink.wants_progress() {
+            self.ctx.sink.emit(self.snapshot(current, now));
+        }
     }
 
     pub fn error(&self, path: &str, action: &str, side: &str, message: &str) {
@@ -472,7 +507,7 @@ mod tests {
             bytes_total: 300,
             ..
         }));
-        assert_eq!(evs.iter().filter(|e| matches!(e, ProgressEvent::Progress { .. })).count(), 4);
+        assert_eq!(evs.iter().filter(|e| matches!(e, ProgressEvent::Progress { .. })).count(), 1);
         assert!(evs.iter().any(|e| matches!(e, ProgressEvent::Error { .. })));
         assert!(matches!(evs.last(), Some(ProgressEvent::PhaseEnd {
             phase: Phase::ScanSource,
@@ -513,6 +548,38 @@ mod tests {
         assert!(matches!(store.lock().unwrap().last(), Some(ProgressEvent::PhaseEnd {
             phase: Phase::ScanSource,
             status: PhaseStatus::Cancelled,
+            ..
+        })));
+    }
+
+    #[test]
+    fn a_sink_that_does_not_consume_progress_still_receives_exact_boundaries() {
+        struct BoundarySink(Arc<Mutex<Vec<ProgressEvent>>>);
+        impl ProgressSink for BoundarySink {
+            fn emit(&self, ev: ProgressEvent) {
+                self.0.lock().unwrap().push(ev);
+            }
+
+            fn wants_progress(&self) -> bool {
+                false
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = RunCtx::new(RunCtl::new(), Arc::new(BoundarySink(events.clone())));
+        let progress = PhaseProgress::begin(&ctx, Phase::ScanTarget, None, 2, 300);
+        progress.item_done("a.txt");
+        progress.add_bytes(100, "a.txt");
+        progress.item_done("b.txt");
+        progress.add_bytes(200, "b.txt");
+        progress.finish().unwrap();
+
+        let events = events.lock().unwrap();
+        assert!(!events.iter().any(|event| matches!(event, ProgressEvent::Progress { .. })));
+        assert!(matches!(events.last(), Some(ProgressEvent::PhaseEnd {
+            items_done: 2,
+            bytes_done: 300,
+            status: PhaseStatus::Completed,
             ..
         })));
     }

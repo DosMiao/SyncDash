@@ -294,7 +294,33 @@ fn exfat_live_lane() {
         conformance::run_all(&mut mk);
         run_all("exfat", &mut mk)
     };
-    let precision = LocalVfs::new(base.clone()).caps().mtime_precision_ms;
+    let caps = LocalVfs::new(base.clone()).caps();
+    let precision = caps.mtime_precision_ms;
+    assert_eq!(caps.unix_mode, Support::No, "exFAT cannot preserve Unix modes");
+    #[cfg(target_os = "macos")]
+    assert_eq!(caps.symlink, Support::Yes, "macOS FSKit exFAT supports symbolic links");
+    assert_eq!(caps.file_id, Support::No, "exFAT object IDs are not durable rename evidence");
+
+    let id_probe = base.join(format!("file-id-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&id_probe);
+    std::fs::create_dir_all(&id_probe).unwrap();
+    std::fs::write(id_probe.join("empty.bin"), b"").unwrap();
+    let snapshot = crate::pipeline::scan::scan(
+        &id_probe,
+        &crate::pipeline::scan::ScanOptions {
+            hash: false,
+            sampled: false,
+            use_cache: false,
+            symlinks_direct: false,
+            filter: crate::pipeline::filter::PathFilter::build(&[], &[]),
+        },
+    )
+    .unwrap();
+    assert!(
+        snapshot.entries.iter().all(|entry| entry.file_id.is_none()),
+        "exFAT snapshots must omit unstable synthetic object IDs",
+    );
+    let _ = std::fs::remove_dir_all(&id_probe);
     for d in dirs {
         let _ = std::fs::remove_dir_all(&d);
     }

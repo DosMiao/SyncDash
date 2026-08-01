@@ -11,7 +11,7 @@ pub mod territory;
 use serde::{Deserialize, Serialize};
 
 use crate::job::rigor::RigorResolved;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
@@ -53,7 +53,7 @@ pub struct Job {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub no_hash: bool,
-    /// Rigor-level **shortcut preset**: quick | fast | standard | paranoid | custom.
+    /// Rigor-level **shortcut preset**: quick | fast | balanced | standard | paranoid | custom.
     /// A preset is just a macro over the four detail knobs below; a detail field with a value **overrides** the preset's matching axis (the UI writes all four explicitly on save).
     #[serde(default = "default_rigor")]
     pub rigor: String,
@@ -177,6 +177,31 @@ fn default_true() -> bool {
 pub const SCHEMA: u32 = 3;
 fn default_schema() -> u32 {
     1 // no `schema` key in the file = written before versioning existed = needs the v1 migration
+}
+
+/// Stable identity of one effective job configuration.
+///
+/// Hash the migrated, current-schema `Job` value rather than the TOML bytes on disk: formatting,
+/// comments, and key order are not configuration changes, while every field the engine can observe
+/// is. The domain prefix versions this canonical encoding independently of the job-file schema.
+pub fn config_revision(job: &Job) -> Result<String, String> {
+    for (field, value) in [
+        ("min_free_pct", job.min_free_pct),
+        ("max_delete_ratio", job.max_delete_ratio),
+    ] {
+        if !value.is_finite() {
+            return Err(format!(
+                "cannot identify this job configuration: {field} must be a finite number"
+            ));
+        }
+    }
+    let canonical = Job { schema: SCHEMA, ..job.clone() };
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|e| format!("cannot identify this job configuration: {e}"))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"syncdash-job-config-v1\0");
+    hasher.update(&bytes);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn default_min_free() -> f64 {
@@ -338,7 +363,7 @@ impl Job {
             dry_run: false,
             trash,
             verbose,
-            // Verify-after-write reads the resolved knob (on by default in the standard/paranoid presets; a detail knob can override)
+            // Verify-after-write reads the resolved knob (on by default in the balanced/standard/paranoid presets; a detail knob can override)
             verify: self.rigor_resolved().verify_writes,
             versioning: self.versioning,
             fsync: self.fsync,
@@ -373,18 +398,55 @@ pub fn resolve_path(name_or_path: &str) -> std::io::Result<PathBuf> {
     Ok(cand)
 }
 
+/// Resolve a registered job name without accepting a path-shaped alias. Desktop IPC always deals
+/// in names returned by `load_all`; direct paths remain a CLI-only convenience through `load`.
+fn registered_job_path(name: &str) -> std::io::Result<PathBuf> {
+    if name.is_empty()
+        || name.trim() != name
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\', ':'])
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid registered job name: {name}"),
+        ));
+    }
+    Ok(crate::foundation::dirs::jobs_dir().join(format!("{name}.toml")))
+}
+
+fn existing_registered_job_path(name: &str) -> std::io::Result<PathBuf> {
+    let path = registered_job_path(name)?;
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("job not found: {name} (looked at {})", path.display()),
+        ));
+    }
+    Ok(path)
+}
+
 /// The schema a job file declares **as it sits on disk**, before `load` migrates it.
 ///
 /// `load` returns the migrated job, so by then the difference has been erased — but a v1 file's junk
 /// rules have just been materialized into `exclude`, and anything showing that list has to be able to
 /// say those lines are not in the file yet. A file with no `schema` key predates versioning: v1.
 pub fn file_schema(name_or_path: &str) -> std::io::Result<u32> {
+    let path = resolve_path(name_or_path)?;
+    file_schema_at(&path)
+}
+
+/// Read the on-disk schema for a job registered in the jobs directory.
+pub fn file_schema_named(name: &str) -> std::io::Result<u32> {
+    file_schema_at(&existing_registered_job_path(name)?)
+}
+
+fn file_schema_at(path: &Path) -> std::io::Result<u32> {
     #[derive(Deserialize)]
     struct OnlySchema {
         #[serde(default = "default_schema")]
         schema: u32,
     }
-    let path = resolve_path(name_or_path)?;
     let text = std::fs::read_to_string(&path)?;
     let parsed: OnlySchema = toml::from_str(&text)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad job file {}: {e}", path.display())))?;
@@ -393,6 +455,16 @@ pub fn file_schema(name_or_path: &str) -> std::io::Result<u32> {
 
 pub fn load(name_or_path: &str) -> std::io::Result<(String, Job)> {
     let path = resolve_path(name_or_path)?;
+    load_path(&path)
+}
+
+/// Load exactly one job registered in the jobs directory. Unlike `load`, this never interprets the
+/// argument as a path, so an IPC caller cannot substitute an old same-stem file from elsewhere.
+pub fn load_named(name: &str) -> std::io::Result<(String, Job)> {
+    load_path(&existing_registered_job_path(name)?)
+}
+
+fn load_path(path: &Path) -> std::io::Result<(String, Job)> {
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let text = std::fs::read_to_string(&path)?;
     let mut job: Job = toml::from_str(&text)
@@ -521,13 +593,13 @@ pub fn save_job(name: &str, job: &Job) -> std::io::Result<PathBuf> {
     let job = &Job { schema: SCHEMA, ..job.clone() };
     let text = toml::to_string_pretty(job)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}")))?;
-    let path = dir.join(format!("{name}.toml"));
+    let path = registered_job_path(name)?;
     std::fs::write(&path, text)?;
     Ok(path)
 }
 
 pub fn delete_job(name: &str) -> std::io::Result<()> {
-    std::fs::remove_file(crate::foundation::dirs::jobs_dir().join(format!("{name}.toml")))
+    std::fs::remove_file(registered_job_path(name)?)
 }
 
 pub const SAMPLE: &str = r#"# <name>.toml in the jobs directory — one file, one job
@@ -542,10 +614,10 @@ target = '\\host\share\dir'             # or a root phrase: smb:// sftp:// ftp:/
 #                                       # junk presets (Windows/macOS/Linux/Developer/IDE/Office/sync tools) write
 #                                       # their patterns straight into this list, so it always reads as what runs.
 #                                       # `syncdash junk` prints the presets; `syncdash scan --junk <ids>` applies them ad hoc
-# rigor = "standard"                    # shortcut preset: quick | fast | standard | paranoid | custom
+# rigor = "standard"                    # shortcut preset: quick | fast | balanced | standard | paranoid | custom
 # --- rigor detail knobs (a value here overrides the preset's axis; the UI writes them all explicitly) ---
 # evidence = "sampled"                  # content evidence: none (0 reads) | sampled (256KB each at head/middle/tail) | full (whole file)
-# use_cache = false                     # trust the (path,size,mtime) cache? true in fast; false from standard up = a real read every round
+# use_cache = false                     # trust the (path,size,mtime) cache? true in fast/balanced; false from standard up = a real read every round
 # escalate = true                       # disagreement escalation: digests equal but mtime differs >2s -> re-verify both sides in full
 # verify_writes = true                  # verify after write: hash of the copy stream vs a re-read from disk
 # case_sensitive = false                # case-insensitive by default (the NTFS/APFS default)
@@ -575,7 +647,7 @@ target = '\\host\share\dir'             # or a root phrase: smb:// sftp:// ftp:/
 # parallel = 4                          # Copy/Update parallel width (1 = sequential; over SMB 2-4 streams basically saturate the uplink)
 #
 # --- watch (M6 scheduled scan) ---
-# watch_interval_secs = 30              # compare automatically every N seconds; the hash cache means an unchanged tree only pays the walk
+# watch_interval_secs = 30              # compare automatically every N seconds; fast/balanced let an unchanged tree reuse content evidence
 # watch_auto_apply = false              # apply automatically on differences (notify only by default)
 #
 # --- peer targets (optional) ---
@@ -784,6 +856,49 @@ mod migration_tests {
 }
 
 #[cfg(test)]
+mod revision_tests {
+    use super::*;
+
+    #[test]
+    fn registered_job_names_cannot_be_reinterpreted_as_paths() {
+        for invalid in ["../photos", "folder/photos", r"folder\photos", "/tmp/photos", "C:photos"] {
+            let error = registered_job_path(invalid).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{invalid}: {error}");
+        }
+        let path = registered_job_path("photos.archive").unwrap();
+        assert_eq!(path.file_name().unwrap(), "photos.archive.toml");
+        assert_eq!(path.parent().unwrap(), crate::foundation::dirs::jobs_dir());
+    }
+
+    #[test]
+    fn revision_is_stable_for_the_effective_job_and_changes_with_configuration() {
+        let original = Job {
+            schema: 1,
+            source: "source".into(),
+            target: "target".into(),
+            exclude: vec!["*.tmp".into()],
+            ..Default::default()
+        };
+        let current_schema = Job { schema: SCHEMA, ..original.clone() };
+
+        let revision = config_revision(&original).unwrap();
+        assert_eq!(revision.len(), 64);
+        assert_eq!(revision, config_revision(&current_schema).unwrap());
+
+        let changed = Job { exclude: vec!["*.tmp".into(), "*.bak".into()], ..current_schema };
+        assert_ne!(revision, config_revision(&changed).unwrap());
+    }
+
+    #[test]
+    fn revision_rejects_non_finite_configuration_numbers() {
+        let job = Job { min_free_pct: f64::NAN, ..Default::default() };
+        let error = config_revision(&job).unwrap_err();
+        assert!(error.contains("min_free_pct"), "{error}");
+        assert!(error.contains("finite"), "{error}");
+    }
+}
+
+#[cfg(test)]
 mod rigor_tests {
     use super::*;
 
@@ -797,6 +912,8 @@ mod rigor_tests {
         assert!(!q.hash && !q.use_cache && !q.verify_writes);
         let f = job("fast").rigor_resolved();
         assert!(f.hash && f.sampled && f.use_cache && f.escalate && !f.verify_writes);
+        let b = job("balanced").rigor_resolved();
+        assert!(b.hash && b.sampled && b.use_cache && b.escalate && b.verify_writes);
         let s = job("standard").rigor_resolved();
         assert!(s.hash && s.sampled && !s.use_cache && s.escalate && s.verify_writes);
         let p = job("paranoid").rigor_resolved();

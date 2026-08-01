@@ -115,6 +115,26 @@ pub fn copy_width(
     pref.min(src.max_parallel_streams.min(tgt.max_parallel_streams)).max(1)
 }
 
+/// Plans can come from files or another process, so every executable relative path is validated at
+/// the last common boundary before any backend is opened. A local backend ultimately joins strings
+/// onto its root; allowing `..`, an absolute path, or a drive prefix here would escape that root.
+fn validate_op_paths(ops: &[Op]) -> Result<(), String> {
+    for op in ops.iter().filter(|op| !matches!(op.action, Action::Conflict | Action::Note)) {
+        if !crate::foundation::path::is_safe_rel(&op.path) {
+            return Err(format!("unsafe operation path: {}", op.path));
+        }
+        if matches!(op.action, Action::Move) {
+            let from = op.from.as_deref().ok_or_else(|| {
+                format!("move operation is missing its source path: {}", op.path)
+            })?;
+            if !crate::foundation::path::is_safe_rel(from) {
+                return Err(format!("unsafe move source path: {from}"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// v0.9 M1 → v0.10 VFS: the execution body with progress/cancel/pause, now over a
 /// backend pair. Five serial phases: Moves → **Copy/Update (parallel)** → Chmod →
 /// Delete → DeleteDir (deepest-first within the class). Updates with delta enabled
@@ -127,6 +147,16 @@ pub fn apply_vfs(
     opt: &ApplyOptions,
     ctx: &RunCtx,
 ) -> ApplyOutcome {
+    if let Err(error) = validate_op_paths(ops) {
+        crate::log_error!("apply", "refusing plan before writes: {error}");
+        return ApplyOutcome {
+            done: 0,
+            skipped: ops.len() as u64,
+            errors: 1,
+            bytes_copied: 0,
+            cancelled: false,
+        };
+    }
     // Apply's totals are known before it starts: the UI percentage formula is valid from t=0
     let items_total = ops.iter().filter(|o| !matches!(o.action, Action::Conflict | Action::Note)).count() as u64;
     let bytes_total: u64 = ops
@@ -178,8 +208,18 @@ pub fn apply_vfs(
 
     let source_local = source.as_local().map(|p| p.to_path_buf());
     let target_local = target.as_local().map(|p| p.to_path_buf());
-    let source_trash_ok = source.caps().local_trash;
-    let target_trash_ok = target.caps().local_trash;
+    let trash = opt.trash.clone().unwrap_or_else(default_trash);
+    // `local_trash` describes the normal store, while tests/callers may supply another path.
+    // Narrow it against the actual batch directory: a cross-volume rename would otherwise fall
+    // back to copying every deleted/overwritten byte before removal.
+    let source_trash_ok = source.caps().local_trash
+        && source_local
+            .as_deref()
+            .is_some_and(|root| crate::fs::vfs::local::same_device(root, &trash));
+    let target_trash_ok = target.caps().local_trash
+        && target_local
+            .as_deref()
+            .is_some_and(|root| crate::fs::vfs::local::same_device(root, &trash));
 
     // The FFS dir_lock idea: lock both roots (with a heartbeat) before touching anything, so two machines cannot apply to the same directory at once.
     // Pause spins on 100ms instead of suspending and returning precisely so these two locks' heartbeat threads keep beating while paused.
@@ -211,7 +251,7 @@ pub fn apply_vfs(
         target_local,
         source_trash_ok,
         target_trash_ok,
-        trash: opt.trash.clone().unwrap_or_else(default_trash),
+        trash,
         remote_keep_rel: format!(
             "{}/trash/{}",
             crate::foundation::names::APP_DIR,
@@ -274,13 +314,23 @@ pub fn apply_vfs(
                 tgt_fix.push((rel, ondisk, intended));
             }
         }
-        // Keyed by identity(): a local root's identity is its path string, so the
-        // pre-VFS correction files keep working; a remote root gets its own table
+        // Local tables keep the historical path-derived filename but bind their header to the
+        // physical volume. Remote roots remain keyed by their credential-free VFS identity.
         if !src_fix.is_empty() {
-            crate::store::mtimefix::record_by_key(&sh.source.identity(), &src_fix);
+            if let Some(root) = sh.source_local.as_deref() {
+                let identity = crate::store::localid::LocalScanStateIdentity::for_root(root);
+                crate::store::mtimefix::record_local(&identity, &src_fix);
+            } else {
+                crate::store::mtimefix::record_by_key(&sh.source.identity(), &src_fix);
+            }
         }
         if !tgt_fix.is_empty() {
-            crate::store::mtimefix::record_by_key(&sh.target.identity(), &tgt_fix);
+            if let Some(root) = sh.target_local.as_deref() {
+                let identity = crate::store::localid::LocalScanStateIdentity::for_root(root);
+                crate::store::mtimefix::record_local(&identity, &tgt_fix);
+            } else {
+                crate::store::mtimefix::record_by_key(&sh.target.identity(), &tgt_fix);
+            }
         }
     }
     let delta_saved = sh.delta_saved.load(Ordering::Relaxed);

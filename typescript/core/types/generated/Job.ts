@@ -44,7 +44,7 @@ include: Array<string>,
  */
 exclude: Array<string>, no_hash: boolean, 
 /**
- * Rigor-level **shortcut preset**: quick | fast | standard | paranoid | custom.
+ * Rigor-level **shortcut preset**: quick | fast | balanced | standard | paranoid | custom.
  * A preset is just a macro over the four detail knobs below; a detail field with a value **overrides** the preset's matching axis (the UI writes all four explicitly on save).
  */
 rigor: string, 

@@ -104,11 +104,22 @@ pub fn compare_resolved(
     // Scan both sides in parallel: source and target are almost always on different disks/links (local disk vs SMB,
     // OneDrive vs an external drive), so serial execution is pure queueing — in parallel, wall clock ≈ the slower side.
     // Each side emits its own PhaseStart at the same moment, so the progress panel ticks on two rows at once.
-    let (s, t) = std::thread::scope(|sc| {
-        let hs = sc.spawn(|| scan::scan_root(&sv, &opt, ctx, Phase::ScanSource));
-        let ht = sc.spawn(|| scan::scan_root(&tv, &opt, ctx, Phase::ScanTarget));
-        (hs.join().unwrap(), ht.join().unwrap())
-    });
+    let same_device = match (sv.as_local(), tv.as_local()) {
+        (Some(source), Some(target)) => crate::fs::vfs::local::same_device(source, target),
+        _ => false,
+    };
+    let (s, t) = if same_device {
+        (
+            scan::scan_root(&sv, &opt, ctx, Phase::ScanSource),
+            scan::scan_root(&tv, &opt, ctx, Phase::ScanTarget),
+        )
+    } else {
+        std::thread::scope(|sc| {
+            let hs = sc.spawn(|| scan::scan_root(&sv, &opt, ctx, Phase::ScanSource));
+            let ht = sc.spawn(|| scan::scan_root(&tv, &opt, ctx, Phase::ScanTarget));
+            (hs.join().unwrap(), ht.join().unwrap())
+        })
+    };
     let (mut s, mut t) = (s?, t?);
     // The consented degradations ride on the snapshot itself — a table must say how its
     // evidence was gathered
@@ -192,7 +203,7 @@ pub fn compare_resolved(
 }
 
 /// The escalation rule: when the two signals fight (the sampled digest says "identical", mtime says "touched"), believe neither silently —
-/// **escalate that file to a full hash on both sides** and rule again. This shrinks the blind spot of fast/standard from
+/// **escalate that file to a full hash on both sides** and rule again. This shrinks the blind spot of fast/balanced/standard from
 /// "any change outside the sampling window" to "outside the sampling window *and* timestamp-preserving" (≈ the timestomp case).
 /// The escalation set is naturally tiny (near zero on a normal tree), so reading each one in full costs next to nothing. Local pipeline only (the remote side has no cheap way to re-read).
 fn escalate_sampled_disagreements(

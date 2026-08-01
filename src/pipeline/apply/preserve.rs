@@ -69,9 +69,9 @@ fn copy_to_trash(
 ///   `<root>/.version_syncDash/`, so it stays a move *within* the root and is safe anywhere a
 ///   path exists, share or not.
 /// - **Can the central trash store take it?** (`local_trash`) — that store lives on this machine.
-///   A move into it from a network share is cross-volume, and `move_to_trash` answers a failed
-///   rename by copying: every deleted file downloaded before it is removed. So a share takes the
-///   in-root retention area instead, which is the same rename a genuinely remote root gets.
+///   A move into it from a share or another local disk is cross-volume, and `move_to_trash`
+///   answers a failed rename by copying every byte before removal. Those roots take the in-root
+///   retention area instead, which is the same rename a genuinely remote root gets.
 ///
 /// The two used to be one test, and the second question was never asked — `VfsCaps::local_trash`
 /// was set correctly by the SMB backend and read by nobody.

@@ -7,12 +7,14 @@
 //! backends behind the same trait; its write side wraps `staged` rather than reimplementing it.
 //! `ssh` is the authenticated session both things that ride ssh share: the `sftp://` backend and
 //! `transfer::peer`'s peer lane, which used to reach the same hosts with the same keys by two
-//! different means.
+//! different means. `watch` owns optional local change triggers; their events wake a compare but
+//! never replace a verified filesystem snapshot.
 
 pub mod lock;
 pub mod ssh;
 pub mod staged;
 pub mod vfs;
+pub mod watch;
 
 use std::path::Path;
 

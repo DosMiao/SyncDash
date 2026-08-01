@@ -192,9 +192,8 @@ pub struct VfsCaps {
     ///
     /// False does **not** mean "cannot preserve" — it means "preserving here would copy the
     /// bytes off this root", so the originals are renamed into `<root>/.syncdash/trash/<run>/`
-    /// instead. That is the whole point: for a network share, a move into the local trash is a
-    /// download of every deleted file. A cross-volume move between two disks on this machine is
-    /// merely a local copy, so removable and fixed volumes both keep the central store.
+    /// instead. That prevents both network downloads and full cross-volume copies from removable
+    /// or secondary disks.
     pub local_trash: bool,
     pub case_sensitivity: CaseSense,
     /// Naming rules writes to this root must satisfy. Drives the plan-time legality

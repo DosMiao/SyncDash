@@ -9,4 +9,5 @@ pub mod dirs;
 pub mod disk;
 pub mod path;
 pub mod text;
+pub mod thread;
 pub mod time;

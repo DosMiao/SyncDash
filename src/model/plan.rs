@@ -139,6 +139,21 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Content identity of the original comparison plan.
+    ///
+    /// `write_to` is the canonical public plan encoding: header first, then one op per line, with
+    /// struct field order fixed by the Rust schema. Hashing those bytes catches any header or op
+    /// mutation while deliberately excluding desktop-only evidence/view metadata.
+    pub fn digest(&self) -> String {
+        let mut bytes = Vec::new();
+        self.write_to(&mut bytes)
+            .expect("serializing a Plan into memory cannot fail");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"syncdash-plan-v1\0");
+        hasher.update(&bytes);
+        hasher.finalize().to_hex().to_string()
+    }
+
     pub fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         writeln!(w, "{}", serde_json::to_string(&self.header)?)?;
         for op in &self.ops {
@@ -264,6 +279,22 @@ mod tests {
         assert_eq!(back.ops[0].mode, Some(0o644), "the mode SMB cannot carry must survive the plan");
         assert_eq!(back.ops[1].action, Action::Move);
         assert_eq!(back.ops[1].from.as_deref(), Some("old/two.bin"), "a move without its origin is a copy");
+    }
+
+    #[test]
+    fn digest_identifies_the_complete_serialized_plan() {
+        let plan = Plan { header: header(1), ops: vec![op(Action::Copy, "a/one.txt")] };
+        let revision = plan.digest();
+        assert_eq!(revision.len(), 64);
+
+        let mut bytes = Vec::new();
+        plan.write_to(&mut bytes).unwrap();
+        let round_trip = Plan::from_reader(std::io::BufReader::new(&bytes[..])).unwrap();
+        assert_eq!(revision, round_trip.digest(), "the public JSONL encoding is canonical");
+
+        let mut changed = round_trip;
+        changed.ops[0].reason = "different evidence".into();
+        assert_ne!(revision, changed.digest(), "any executable plan mutation must be detected");
     }
 
     /// Action and Side serialize snake_case, and the CSV export, the event stream and the plan

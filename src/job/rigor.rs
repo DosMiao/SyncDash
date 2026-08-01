@@ -24,6 +24,7 @@ impl RigorResolved {
         let (hash, sampled, use_cache, escalate, verify_writes) = match rigor {
             "quick" => (false, false, false, false, false),
             "fast" => (true, true, true, true, false),
+            "balanced" => (true, true, true, true, true),
             "paranoid" => (true, false, false, false, true),
             _ => (true, true, false, true, true), // standard / custom baseline
         };
@@ -91,6 +92,9 @@ mod tests {
 
         let f = RigorResolved::from_preset("fast");
         assert!(f.hash && f.sampled && f.use_cache && f.escalate);
+
+        let b = RigorResolved::from_preset("balanced");
+        assert!(b.hash && b.sampled && b.use_cache && b.escalate && b.verify_writes);
 
         let p = RigorResolved::from_preset("paranoid");
         assert!(p.hash && !p.sampled, "paranoid reads whole files, never windows");

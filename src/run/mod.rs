@@ -18,6 +18,7 @@ pub mod e2e;
 pub mod local;
 pub mod peer;
 pub mod roots;
+pub mod watch;
 
 use crate::job::Job;
 

@@ -10,8 +10,42 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::foundation::names::TEMP_PREFIX;
+
+static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replaced = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
 /// Whether a file name (no directory part) is one of our temp files
 pub fn is_temp_name(file_name: &str) -> bool {
@@ -32,6 +66,22 @@ pub struct Staged {
     committed: bool,
 }
 
+impl Write for Staged {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed"))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed"))?
+            .flush()
+    }
+}
+
 impl Staged {
     /// Create the temp file in dst's own directory. Same directory = same volume, which is what makes commit's rename atomic
     /// (putting it in the system temp directory would degrade into a cross-volume copy and lose atomicity).
@@ -40,13 +90,25 @@ impl Staged {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "destination has no parent directory")
         })?;
         let base = dst.file_name().and_then(|s| s.to_str()).unwrap_or("out");
-        // Carry the pid: two syncdash processes in the same directory each write their own file, never stepping on each other
-        let tmp = dir.join(format!("{TEMP_PREFIX}{base}.{}", std::process::id()));
-        // A previous interruption may have left debris under the same name
-        if tmp.exists() {
-            std::fs::remove_file(&tmp)?;
-        }
-        let file = std::fs::File::create(&tmp)?;
+        // PID separates processes; the monotonic stage ID separates simultaneous writers inside
+        // one process. The old PID-only name let two concurrent cache rewrites unlink/truncate one
+        // another's staging file and could publish the wrong generation.
+        let (tmp, file) = loop {
+            let stage_id = NEXT_STAGE_ID.fetch_add(1, Ordering::Relaxed);
+            let tmp = dir.join(format!(
+                "{TEMP_PREFIX}{base}.{}.{stage_id}",
+                std::process::id()
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Ok(file) => break (tmp, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
         Ok(Staged { tmp, dst: dst.to_path_buf(), file: Some(file), committed: false })
     }
 
@@ -125,7 +187,7 @@ impl Staged {
         if self.file.is_some() {
             self.seal(true)?;
         }
-        std::fs::rename(&self.tmp, &self.dst)?;
+        atomic_replace(&self.tmp, &self.dst)?;
         self.committed = true;
         Ok(())
     }
@@ -185,6 +247,30 @@ mod tests {
             .filter(|e| is_temp_name(&e.file_name().to_string_lossy()))
             .collect();
         assert!(leftovers.is_empty(), "Drop must clean up the temp file");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn concurrent_stages_for_one_destination_never_share_a_temp_file() {
+        let d = tmpdir("parallel-stage");
+        let dst = d.join("state.jsonl");
+        std::fs::write(&dst, b"old").unwrap();
+
+        let mut first = Staged::create(&dst).unwrap();
+        let mut second = Staged::create(&dst).unwrap();
+        assert_ne!(first.path(), second.path());
+        first.write_all(b"first").unwrap();
+        second.write_all(b"second").unwrap();
+        first.commit().unwrap();
+        second.commit().unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"second");
+        let leftovers: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .filter(|entry| is_temp_name(&entry.file_name().to_string_lossy()))
+            .collect();
+        assert!(leftovers.is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 

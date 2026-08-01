@@ -123,7 +123,8 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 eprintln!("no matching jobs");
                 return Ok(2);
             }
-            // M6 watch: the hash cache means an unchanged tree only pays the walk each tick; RootLock stops both ends acting at once
+            // M6 watch: fast/balanced jobs let unchanged content reuse the hash cache each tick;
+            // RootLock stops both ends acting at once.
             if watch {
                 let iv = interval
                     .or_else(|| list.iter().filter_map(|(_, j)| j.watch_interval_secs).min())
@@ -244,8 +245,20 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 filter: filter::PathFilter::build(&include, &excludes),
             };
             let bar = |p: scan::ScanProgress| {
-                let pct = if p.bytes_total > 0 { p.bytes_done * 100 / p.bytes_total } else { 100 };
-                eprint!("\r{} {:>3}%  {}/{}  {:.1} MiB/s   ", p.phase, pct,
+                let ratio = |done: u64, total: u64| -> u64 {
+                    if total == 0 { 0 } else { ((done.min(total) as u128 * 100) / total as u128) as u64 }
+                };
+                let file_pct = ratio(p.files_done, p.files_total);
+                let byte_pct = ratio(p.bytes_done, p.bytes_total);
+                let work_pct = match (p.files_total > 0, p.bytes_total > 0) {
+                    (true, true) => file_pct.min(byte_pct),
+                    (true, false) => file_pct,
+                    (false, true) => byte_pct,
+                    (false, false) => 0,
+                };
+                let pct = if p.complete { 100 } else { work_pct.min(99) };
+                eprint!("\r{} {:>3}%  {}/{} files  {}/{}  {:.1} MiB/s   ", p.phase, pct,
+                    p.files_done, p.files_total,
                     syncdash::foundation::fmt::human_bytes(p.bytes_done),
                     syncdash::foundation::fmt::human_bytes(p.bytes_total), p.mib_per_s);
             };

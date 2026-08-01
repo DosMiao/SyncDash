@@ -76,7 +76,8 @@ pub enum Cmd {
         /// Skip content hashing (fast, but comparison degrades to size+mtime and move detection becomes impossible)
         #[arg(long)]
         no_hash: bool,
-        /// Rigor preset: quick (0 reads) | fast (sampling + cache) | standard (really samples every file each round, the default)
+        /// Rigor preset: quick (0 reads) | fast (sampling + cache) | balanced (cache + write verification)
+        /// | standard (really samples every file each round, the default)
         /// | paranoid (reads every byte each round)
         #[arg(long, default_value = "standard")]
         rigor: String,

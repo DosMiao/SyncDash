@@ -1,7 +1,7 @@
 //! scan: walk a root and produce a snapshot table — the first of the three stages.
 //!
 //! Two lanes behind one entry point. `scan_root` asks the backend for `as_local()`: a real
-//! directory takes `local`, the walkdir + rayon fast path; anything else takes `vfs`,
+//! directory takes `local`, the platform metadata walker + rayon fast path; anything else takes `vfs`,
 //! the generic lane driven entirely through the `Vfs` trait. The split is which primitives are
 //! available, not how far away the bytes are — an SMB root the OS has mounted takes `local`.
 //!
@@ -13,6 +13,9 @@
 
 pub mod digest;
 pub mod local;
+mod local_walk;
+#[cfg(target_os = "macos")]
+mod macos_bulk;
 pub mod vfs;
 
 use std::path::Path;
@@ -22,6 +25,11 @@ use crate::model::table::Snapshot;
 use local::scan_impl;
 use vfs::scan_vfs;
 
+fn local_parallelism(root: &Path) -> usize {
+    use crate::fs::vfs::Vfs;
+    crate::fs::vfs::local::LocalVfs::new(root.to_path_buf()).caps().max_parallel_streams
+}
+
 pub struct ScanOptions {
     pub hash: bool,
     /// Sampled evidence: files ≥4MB are not read whole but get a sampled digest (size + blake3 of 256KB at head/middle/tail,
@@ -29,7 +37,7 @@ pub struct ScanOptions {
     /// only those three windows. Not a byte-for-byte equality proof —— the escalation rule (same digest, different mtime → full rehash) backstops it.
     pub sampled: bool,
     /// Whether to trust the (path,size,mtime) cache. **The ladder's decisive axis**:
-    /// fast = true (only the changed surface is really read; the unchanged surface is cache memory);
+    /// fast/balanced = true (only the changed surface is really read; the unchanged surface is cache memory);
     /// standard/paranoid = false (every file is really read this run —— "identical ✓" is measured now, not remembered).
     pub use_cache: bool,
     /// symlinks="direct": record the link itself (its target string); otherwise symlinks are ignored
@@ -38,21 +46,60 @@ pub struct ScanOptions {
     pub filter: crate::pipeline::filter::PathFilter,
 }
 
-/// Scan progress (P2-6). The same amount of information as syncthing's `FolderScanProgress`:
-/// phase + bytes done/total + rate, enough for the frontend to draw a bar and estimate the time remaining.
+/// Legacy CLI scan progress. `complete` is the only 100% boundary; byte totals alone cannot express
+/// cached or zero-byte files that are still moving through the worker queue.
 #[derive(Clone, Copy, Debug)]
 pub struct ScanProgress {
     /// "walk" (metadata traversal) | "hash" (parallel hashing)
     pub phase: &'static str,
+    pub files_done: u64,
     pub files_total: u64,
     pub bytes_total: u64,
     pub bytes_done: u64,
     pub mib_per_s: f64,
+    pub complete: bool,
 }
 
 pub type ProgressFn<'a> = &'a (dyn Fn(ScanProgress) + Sync);
+
+#[derive(Default)]
+pub(crate) struct ScanMetrics {
+    pub cache_load_ms: u64,
+    pub mtime_load_ms: u64,
+    pub walk_ms: u64,
+    pub hash_ms: u64,
+    pub finalize_ms: u64,
+    pub state_write_ms: u64,
+    pub files: u64,
+    pub cache_hits: u64,
+    pub read_bytes: u64,
+    pub workers: usize,
+}
+
+impl ScanMetrics {
+    pub fn emit(&self, ctx: &crate::obs::progress::RunCtx, side: &str, lane: &str) {
+        ctx.log(
+            crate::model::event::LogLevel::Info,
+            "scan",
+            format!(
+                "scan metrics: side={side} lane={lane} files={} cache_hits={} read_bytes={} workers={} cache_load_ms={} mtime_load_ms={} walk_ms={} hash_ms={} finalize_ms={} state_write_ms={}",
+                self.files,
+                self.cache_hits,
+                self.read_bytes,
+                self.workers,
+                self.cache_load_ms,
+                self.mtime_load_ms,
+                self.walk_ms,
+                self.hash_ms,
+                self.finalize_ms,
+                self.state_write_ms,
+            ),
+        );
+    }
+}
+
 pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
-    scan_impl(root, opt, None, None)
+    scan_impl(root, opt, None, None, local_parallelism(root))
 }
 
 pub fn scan_with_progress(
@@ -60,22 +107,22 @@ pub fn scan_with_progress(
     opt: &ScanOptions,
     progress: Option<ProgressFn<'_>>,
 ) -> std::io::Result<Snapshot> {
-    scan_impl(root, opt, progress, None)
+    scan_impl(root, opt, progress, None, local_parallelism(root))
 }
 
 /// v0.9 M1 unified-foundation entry point: cancel/pause/ProgressEvent event stream (see progress.rs).
-/// The old ScanProgress callback shape (P2-6) is kept as-is —— both paths share the same scan_impl.
+/// The legacy ScanProgress callback and event-stream path share the same scan_impl.
 pub fn scan_ctx(
     root: &Path,
     opt: &ScanOptions,
     ctx: &crate::obs::progress::RunCtx,
     phase: crate::model::event::Phase,
 ) -> std::io::Result<Snapshot> {
-    scan_impl(root, opt, None, Some((ctx, phase)))
+    scan_impl(root, opt, None, Some((ctx, phase)), local_parallelism(root))
 }
 
 /// Route a root to the right scan lane: a local (or locally-translated) root keeps the
-/// existing walkdir fast path byte-for-byte; everything else runs the generic VFS
+/// platform-native local fast path; everything else runs the generic VFS
 /// lane. Both lanes speak the same filter contract and the same exclusion accounting —
 /// the differential tests pin those numbers against each other.
 pub fn scan_root(
@@ -86,7 +133,7 @@ pub fn scan_root(
 ) -> std::io::Result<Snapshot> {
     match vfs.as_local() {
         Some(root) => {
-            let mut snap = scan_impl(root, opt, None, Some((ctx, phase)))?;
+            let mut snap = scan_impl(root, opt, None, Some((ctx, phase)), vfs.caps().max_parallel_streams)?;
             // The local lane used to leave this empty, which meant a table could not say whether
             // its root was a disk on this machine or a share on another — the very fact that
             // decides where its deletions were preserved.

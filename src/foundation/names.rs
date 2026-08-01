@@ -5,7 +5,7 @@
 //! anywhere silently disables the filter — once `.syncdash-root` is synced to the far side, an
 //! unmounted empty directory grows a marker too, and the mount-point guard fails entirely.
 
-/// Prefix for same-directory temp files. The real name is `{TEMP_PREFIX}{basename}.{pid}`.
+/// Prefix for same-directory temp files. Local names also carry the process and stage IDs.
 pub const TEMP_PREFIX: &str = ".syncdash.tmp.";
 
 /// Maximum temp-file lifetime; anything older counts as debris from a previous crash.
