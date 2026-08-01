@@ -30,8 +30,9 @@ interface Props {
   /// main screen's two roots, and unmounting clears it — which is the whole reason it is a callback ref.
   scopeRef: (el: HTMLElement | null) => void;
   apiRef: React.RefObject<EditorApi | null>;
+  busy: boolean;
   onClose: () => void;
-  onSaved: (name: string, job: JobFull) => void;
+  onSaved: (name: string, job: JobFull, configRevision: string) => void;
   onDeleted: (name: string) => void;
   onStatus: (msg: string, cls?: '' | 'err' | 'ok') => void;
 }
@@ -45,7 +46,7 @@ interface Loaded { base: JobFull; values: FormValues }
 interface SaveError { message: string; field?: string }
 
 export function JobEditor(props: Props) {
-  const { name, focusGroup, dropOn, scopeRef, apiRef, onClose, onSaved, onDeleted, onStatus } = props;
+  const { name, focusGroup, dropOn, scopeRef, apiRef, busy, onClose, onSaved, onDeleted, onStatus } = props;
   const [form, setForm] = useState<Loaded | null>(null);
   /// Set when the file on disk predates the current job schema, i.e. the exclude lines on screen were
   /// produced by the load-time migration and are not in the file yet
@@ -160,7 +161,7 @@ export function JobEditor(props: Props) {
   };
 
   const save = async () => {
-    if (!form) return;
+    if (!form || busy) return;
     const c = formToJob(form.values, form.base);
     if ('error' in c) {
       setSaveError({ message: c.error, field: c.field });
@@ -181,8 +182,8 @@ export function JobEditor(props: Props) {
     setSaveError(null);
     setSaving(true);
     try {
-      await saveJob(c.name, c.job);
-      onSaved(c.name, c.job);
+      const configRevision = await saveJob(c.name, c.job);
+      onSaved(c.name, c.job, configRevision);
     } catch (e) {
       const message = `Save failed: ${e}`;
       setSaveError({ message });
@@ -193,7 +194,7 @@ export function JobEditor(props: Props) {
   };
 
   const remove = async () => {
-    if (!name) return;
+    if (!name || busy) return;
     try {
       await deleteJob(name);
       onDeleted(name);
@@ -216,11 +217,12 @@ export function JobEditor(props: Props) {
       onClose={onClose}
       footer={
         <>
-          {name && <button className="btn danger" onClick={() => setAskDelete(true)}>Delete job</button>}
+          {name && <button className="btn danger" disabled={busy} onClick={() => setAskDelete(true)}>Delete job</button>}
           {name && (
             <button
               className="btn"
               title="Copy the schtasks command (run it yourself in an admin terminal; this app does not register system scheduled tasks for you)"
+              disabled={busy}
               onClick={() => {
                 navigator.clipboard?.writeText(schtasksCmd(name)).then(
                   () => onStatus('Scheduled-task command copied — run it in an elevated terminal (this app does not register system tasks for you)', 'ok'),
@@ -232,7 +234,7 @@ export function JobEditor(props: Props) {
           {saveError && <span className="ed-save-error" role="alert">{saveError.message}</span>}
           <span className="spacer" />
           <button className="btn" onClick={onClose}>Cancel (Esc)</button>
-          <button className="btn accent" disabled={!form || saving} onClick={save}>
+          <button className="btn accent" disabled={!form || saving || busy} onClick={save}>
             {saving ? 'Saving…' : 'Save'}
           </button>
         </>
@@ -302,7 +304,7 @@ export function JobEditor(props: Props) {
               '· Neither root is touched — no file on either side is read, moved or removed\n' +
               '· Past run logs and anything already in the trash are left alone'
             }
-            actions={[{ label: 'Delete the job file', danger: true, onConfirm: () => void remove() }]}
+            actions={[{ label: 'Delete the job file', danger: true, disabled: busy, onConfirm: () => void remove() }]}
             onCancel={() => setAskDelete(false)}
           />
         )}

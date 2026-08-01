@@ -192,6 +192,7 @@ export function PathLine(props: Props) {
             className="target-sel"
             title="Multi-target job: pick the target to work on"
             value={selTarget}
+            disabled={busy}
             onChange={(e) => onSelectTarget(Number(e.target.value) || 0)}
           >
             {targets.map((t, i) => (
@@ -215,6 +216,7 @@ export function PathLine(props: Props) {
             key={p.key}
             className="cfgpill"
             title={`${p.title}\n\nClick to edit — opens ${p.group}.`}
+            disabled={busy}
             onClick={() => onEditGroup(p.group)}
           >
             <span className="ck">{p.key}</span><span className="cv">{p.value}</span>

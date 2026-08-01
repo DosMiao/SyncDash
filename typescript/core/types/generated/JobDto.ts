@@ -4,4 +4,4 @@ export type JobDto = { name: string, mode: string, rigor: string, source: string
 /**
  * 1:N: the effective target list (a single-target job = one entry). When >1 the frontend shows the target selector
  */
-targets: Array<string>, };
+targets: Array<string>, config_revision: string, };

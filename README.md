@@ -119,7 +119,7 @@ archive = 'C:\Users\xuanb\AppData\Roaming\syncdash\archive\flight.jsonl'   # syn
 # exclude = ['*/big_temp/', '*/*.log']  # FFS syntax. THE WHOLE exclude policy besides this tool's own metadata:
 #                                       # junk presets write their patterns straight into this list, so it always
 #                                       # reads as what runs. `syncdash junk` prints them.
-# rigor = "standard"                    # quick | fast (sampled digest) | standard | paranoid (see "Rigor levels")
+# rigor = "standard"                    # quick | fast | balanced | standard | paranoid (see "Rigor levels")
 # case_sensitive = false                # case-insensitive by default (the NTFS/APFS default behavior)
 # no_hash = false
 ```
@@ -191,8 +191,9 @@ borders and layout scale with the text. Both themes are defined there and follow
 floor on the hover surface and take a darker step. Changing any color means re-running the audit against
 `--bg`, `--bg-2` and `--bg-3` — several hues clear the first and fail the third.
 
-Added in v0.3.2: **per-row direction flip** (click the row's action to toggle; the semantics are precomputed by the
-core's `reverse_op`: copy↔delete are inverses, update swaps sides; a flipped row gets a tinted background and a
+Added in v0.3.2: **per-row direction flip** (click the row's action to toggle; copy↔delete are inverses and update
+swaps sides; the frontend derives that preview lazily, while preflight/apply send only row indices + flip flags and
+the Rust core's `reverse_op` reconstructs the executable operation; a flipped row gets a tinted background and a
 dashed outline on its direction arrow), **filter chips** (all/copy/update/move/delete/conflict, live counts, each
 carrying its category's own hue and glyph, 0-item chips dimmed by token — GitDash
 style), **search box** (substring over path/from/reason), **pre-sync confirmation sheet** (per-category counts +
@@ -267,12 +268,28 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
   (FFS semantics). This fixes a quiet trap in the old behavior — filtering with the search box used to leave
   hidden-but-still-checked rows to go through with Synchronize anyway. The confirmation sheet now spells out
   "N items hidden by filters, not applied", and the stats bar switches to counting checked ∩ visible to match.
+- **Bounded last-successful compare session**: the desktop retains exactly one completed `PlanDto`, including
+  which rows are checked and which directions were reversed, and shows it only when its job, selected target and
+  captured configuration revision still match. Navigation hides a non-matching session; it does not destroy it.
+  Thus compare A → select B without comparing → return to A restores A's result, while a successful compare for B
+  replaces A in the one slot. A failed or cancelled compare never replaces the last successful one. The revision
+  is a canonical digest of the job contents, so a content-changing job-file mutation changes it and prevents the
+  old result from being restored or run; the recorded job/target/revision is provenance, not a best-effort guess
+  from the currently selected row. A no-op editor save keeps the result because its effective revision is unchanged,
+  and every Compare attempt refreshes the job row after reading an externally edited TOML — including a failed or
+  cancelled attempt, so a removed target or deleted job cannot leave a ghost selection that fails forever. Preflight/apply
+  load only that registered job name (never a same-stem path elsewhere), accept row index + flip decisions rather than
+  caller-authored operations, and reconstruct the executable subset from the cached plan before either the local or peer
+  write path can start. An empty selection is rejected before a run is reserved; in particular, AutoScan will never turn a
+  conflict/note-only result into an archive-changing zero-operation apply.
 - **Identical-items panel** (that "22,631" button along the bottom of FFS): lists the files judged identical on
   both sides, paged 300 at a time, with its own path filter; the data source is the two snapshots the last compare
   left in memory — **no rescan**. Rows whose content matches but whose timestamps drift more than 2s across the
-  two sides get the target time marked orange (a common artifact of FAT/SMB granularity). Single-slot cache,
-  overwritten when you switch jobs or re-compare; it works for remote jobs too (the remote snapshot is a complete
-  table pulled back over ssh).
+  two sides get the target time marked orange (a common artifact of FAT/SMB granularity). This cache follows the
+  same bounded, target-aware last-successful contract: selecting another job or target only hides it, and the next
+  successful compare overwrites it. Its provenance includes the effective target, so two targets of one job cannot
+  read each other's identical rows. It works for remote jobs too (the remote snapshot is a complete table pulled
+  back over ssh).
 - **CSV export**: exports the current view (including checked state and both-side size/time), escaping is done
   exactly once on the Rust side, UTF-8 **with a BOM** — without the BOM, Excel interprets it in the local code
   page and the whole column of Chinese paths turns to mojibake. The enum literals use serde's snake_case, the
@@ -287,6 +304,8 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
 - `scan` writes to stdout by default (ssh-friendly: `ssh mac syncdash scan ~/Data > mac.jsonl`).
 - `apply` is **dry-run by default**; only `--apply` touches anything. Deleted or overwritten files go first into
   the local `%LOCALAPPDATA%\syncdash\trash\<timestamp>\` (mac: `~/.cache/syncdash/trash/...`), never destroyed in place.
+  The common apply boundary rejects absolute, drive-prefixed and traversal-shaped operation paths (including a
+  move's `from`) before opening either backend, so even a hand-authored plan cannot escape its two roots.
 - Hashing is BLAKE3 with a cache: if `(path,size,mtime)` is unchanged the previous result
   is reused; the cache lives in the local user directory and never pollutes the scanned directory.
   Files are **read, never memory-mapped** — a mapped page whose file was truncated or whose volume
@@ -305,16 +324,17 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
 Equality test: if both sides have a hash → the hashes must match; otherwise sizes must be equal and
 |Δmtime| ≤ 2s (FAT/SMB time granularity).
 
-### Rigor levels (rigor) — a monotone ladder: each level actually reads more this scan
+### Rigor levels (rigor) — explicit evidence and write-verification profiles
 
 Design principle (the v0.9.3 refactor): **an "identical ✓" must be measured this scan, not remembered from
-cache**. Cache exists at exactly one level, fast (and it says so); from standard up, every file is really read
-every scan. Two cross-cutting reinforcements:
+cache** when fresh evidence is requested. `fast` and `balanced` deliberately trade that property for a warm cache;
+`balanced` adds verified writes, while `standard` and `paranoid` really read every file each scan. Two cross-cutting
+reinforcements:
 
-- **Divergence escalation** (fast/standard): when the sampled digests match but |Δmtime| > 2s, it does not call
+- **Divergence escalation** (fast/balanced/standard): when the sampled digests match but |Δmtime| > 2s, it does not call
   them equal — both sides escalate to a full hash and the verdict is redone. Verified on real hardware: 64 bytes
   changed outside the sampling window of a 400MB file, and the escalation rule caught it on the spot.
-- **Verify after write** (on by default for standard/paranoid): the expected value is **the full blake3 of this
+- **Verify after write** (on by default for balanced/standard/paranoid): the expected value is **the full blake3 of this
   copy's own stream** (the copy reads the whole file anyway, so hashing on the stream is free), re-read after it
   lands and compared; if it doesn't match, no rename. Deeply decoupled from scan evidence.
 
@@ -322,6 +342,7 @@ every scan. Two cross-cutting reinforcements:
 |---|---|---|---|---|---|
 | `quick` | 0 bytes | metadata measured this scan (size+mtime±2s) | ❌ | ❌ | structural sweeps |
 | `fast` | the sampling windows of the changed surface only (cache accelerates the unchanged surface) | the changed surface measured, the unchanged surface remembered from cache | ✅ | ❌ | cloud drives / media libraries (placeholder files hydrate only three small segments) |
+| `balanced` | the sampling windows of the changed surface only (cache accelerates the unchanged surface) | the changed surface measured, the unchanged surface remembered from cache | ✅ | ✅ | frequent external-disk syncs with safe writes |
 | `standard` (default) | **every file's sampling windows, no cache** | head/middle/tail of every file measured this scan | ✅ | ✅ | day to day |
 | `paranoid` | every byte of every file | every byte measured this scan | ✅ | ✅ | first migration / annual cold-backup audit / suspect media |
 
@@ -332,14 +353,14 @@ strictly isolated from full hashes in the cache).
 existence, path normalization, type, size/mtime, symlink target, permission bits, illegal-name preflight, archive
 attribution, apply gates):
 
-| Threat | `quick` | `fast` | `standard` | `paranoid` |
-|---|---|---|---|---|
-| Ordinary modification (changes size/mtime) | immediately | immediately | immediately | immediately |
-| Any change that touched mtime (including outside the sampling window) | immediately (metadata level only) | **immediately** (the escalation rule re-verifies in full) | **immediately** (escalation rule) | immediately |
-| A rewrite that preserves size+mtime (timestomp) | never | immediately inside the sampling window; never outside | **measured every scan** inside the sampling window; never outside | immediately |
-| Silent bitrot | never | never on the unchanged surface (cache) | **measured every scan** inside the sampling window; never outside | immediately |
-| Transfer corruption | never | never | **immediately** (verify after write) | immediately |
-| Move identity | delete+add | paired | paired | paired |
+| Threat | `quick` | `fast` | `balanced` | `standard` | `paranoid` |
+|---|---|---|---|---|---|
+| Ordinary modification (changes size/mtime) | immediately | immediately | immediately | immediately | immediately |
+| Any change that touched mtime (including outside the sampling window) | immediately (metadata level only) | **immediately** (the escalation rule re-verifies in full) | **immediately** (escalation rule) | **immediately** (escalation rule) | immediately |
+| A rewrite that preserves size+mtime (timestomp) | never | immediately inside the sampling window; never outside | immediately inside the sampling window; never outside | **measured every scan** inside the sampling window; never outside | immediately |
+| Silent bitrot | never | never on the unchanged surface (cache) | never on the unchanged surface (cache) | **measured every scan** inside the sampling window; never outside | immediately |
+| Transfer corruption | never | never | **immediately** (verify after write) | **immediately** (verify after write) | immediately |
+| Move identity | delete+add | paired | paired | paired | paired |
 
 ### Cross-platform correctness (v0.2.2)
 
@@ -634,7 +655,7 @@ strategy is worth reading, but adopting it means going resident).
 - [x] v0.2.2 rigor levels quick/standard/paranoid (verify after copy) + cross-platform correctness: NFC-normalized compare keys, case folding, Windows illegal-name preflight, unix mode recorded (with unit tests)
 - [x] v0.3 Tauri v2 desktop shell (modeled on AlexQuant Desktop: Vite+TS frontend, dual-platform builder scripts, dist committed so the Mac builds with pure cargo and no node);
       rigor levels (quick/standard/paranoid: no hash / cached hash / full re-hash + verify after copy); NFC + case-folded compare keys; Windows illegal-path preflight
-- [x] v0.3.x compare classification-matrix unit tests (the full archive-attribution matrix, 20 tests); two-phase parallel scan (rayon hashes whole files in parallel, splitting internally at ≥32MB); `compare::reverse_op` per-row direction flip (click the row's action to flip; the Tauri shell reuses the very same lib function)
+- [x] v0.3.x compare classification-matrix unit tests (the full archive-attribution matrix, 20 tests); two-phase parallel scan (rayon hashes whole files in parallel, splitting internally at ≥32MB); `compare::reverse_op` per-row direction flip (click the row's action to flip; the frontend previews it and the Tauri shell uses that same lib function to reconstruct the authenticated apply selection)
 - [x] v0.4 remote: `pack` / `apply-pack` — a tar container (plan.jsonl + payload + trailing manifest), plan blake3 + per-file blake3 + a combined hash; nothing touches target until the whole staging area verifies; reuses apply's lock/trash/verify-after-copy; unix mode restored. **Pack on Win → ship over SMB → apply-pack on Mac → remote rescan shows 0 ops; the whole flow verified on real machines**
 - [x] v0.5 `territories` / `gen-jobs`: scan for `.ffs-sync` markers and generate a `cs-<slug>.toml` per territory (sync mode + an automatic archive path) — the syncdash edition of the CodeSync generator, measured generating 11 territories; runs in parallel with FFS, the moment to switch left to the user
 - [x] v0.6 `run --all`/`--prefix`; the end-to-end ssh remote pipeline (enabled just by setting remote_host in the job; verified on real machines: dry → apply → rerun 0 ops, symlinks included); symlink policies exclude/direct (compared by target, with apply creating/replacing/deleting the link itself); renames within the same parent directory are paired first (reason distinguishes rename from move); updating the Mac via a git bundle over SMB (the channel for when the mount is offline)

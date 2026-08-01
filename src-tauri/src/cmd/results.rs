@@ -7,28 +7,34 @@ use syncdash::model::plan::{Op, PlanHeader};
 use syncdash::pipeline::compare;
 use syncdash::job;
 
-use crate::dto::SamePage;
-use crate::state::SnapCache;
+use crate::dto::{CompareOwner, SamePage};
+use crate::state::{resolve_target, validate_cached_compare, SnapCache};
 
 /// Pagination for the "Identical" panel. The data source is the snapshot left by the last compare — no rescan.
 #[tauri::command]
 pub fn list_same(
     snaps: tauri::State<'_, Arc<SnapCache>>,
-    name: String,
+    owner: CompareOwner,
     query: String,
     offset: usize,
     limit: usize,
 ) -> Result<SamePage, String> {
+    let (job_name, full_job) = job::load_named(&owner.job_name).map_err(|e| e.to_string())?;
+    let config_revision =
+        job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
+    let (target_index, job) = resolve_target(&full_job, Some(owner.target_index))?;
     let g = snaps.0.lock().unwrap();
-    let Some(c) = g.as_ref() else {
-        return Err("No compare results yet — run Compare first".into());
-    };
-    if c.job != name {
-        return Err(format!("The cache holds the snapshot for '{}'; run Compare again for '{}'", c.job, name));
-    }
-    let (_n, job) = job::load(&name).map_err(|e| e.to_string())?;
+    validate_cached_compare(
+        g.as_ref().map(|c| &c.provenance),
+        &owner,
+        &job_name,
+        target_index,
+        &config_revision,
+        None,
+    )?;
+    let c = g.as_ref().expect("successful cache validation requires a cached comparison");
     let (total, rows) = compare::evidence::same_page(&c.source, &c.target, &job.compare_opts(), &query, offset, limit.min(2000));
-    Ok(SamePage { total, rows, job: c.job.clone() })
+    Ok(SamePage { total, rows, job: job_name })
 }
 
 /// Export the current view as CSV. Escaping happens exactly once, here, and the output is UTF-8 **with a BOM** —

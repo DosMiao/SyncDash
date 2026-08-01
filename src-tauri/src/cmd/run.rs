@@ -5,16 +5,17 @@
 
 use std::sync::Arc;
 
-use syncdash::model::plan::{Action, Op, Plan};
+use syncdash::model::plan::{Action, Plan};
 use syncdash::pipeline::compare;
 use syncdash::{job, run};
 use tauri::Emitter;
 
 use crate::bridge::make_ctx;
-use crate::dto::{ApplyDto, PlanDto, PreflightDto};
+use crate::dto::{ApplyDto, CompareOwner, PlanDto, PreflightDto, SelectedRowDto};
 use crate::state::{
     begin_run, begin_run_for_launch, end_run, release_progress_launch, resolve_target, user_err,
-    CachedSnaps, RunState, SnapCache,
+    resolve_selected_ops, validate_cached_compare, CachedSnaps, CompareProvenance, RunState,
+    SnapCache,
 };
 
 #[derive(Clone, serde::Serialize)]
@@ -67,8 +68,10 @@ pub async fn compare_job(
     let st = state.inner().clone();
     let cache = snaps.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (_n, job) = job::load(&name).map_err(|e| e.to_string())?;
-        let job = resolve_target(&job, target_index)?;
+        let (job_name, full_job) = job::load_named(&name).map_err(|e| e.to_string())?;
+        let config_revision =
+            job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
+        let (target_index, job) = resolve_target(&full_job, target_index)?;
         let (run_id, ctl) = begin_run(&st)?;
         let _active_run = ActiveRunGuard(st.clone());
         let ctx = make_ctx(&app, run_id, ctl, "compare");
@@ -92,11 +95,11 @@ pub async fn compare_job(
         // M3: remote jobs take the remote pipeline (scanning on the remote's own disk) instead of silently falling into the local one
         // A degraded run without consent refuses with the NeedsAck lines; the frontend shows
         // them and re-invokes with accept_caps=true if the user agrees.
-        let r = run::compare(&name, &job, &ctx, accept_caps.unwrap_or(false));
+        let r = run::compare(&job_name, &job, &ctx, accept_caps.unwrap_or(false));
         // compare has no side effects: one index line, no directory. A 30s watch cycle = 2880 runs a day,
         // and creating a directory each time would flood the log disk.
         syncdash::obs::runlog::compare_summary(
-            &name,
+            &job_name,
             &run::run_kind(&job, "compare"),
             ts_ms,
             r.as_ref().map(|o| o.plan.ops.len() as u64).unwrap_or(0),
@@ -104,6 +107,13 @@ pub async fn compare_job(
             r.as_ref().err().map(syncdash::obs::progress::is_cancelled).unwrap_or(false),
         );
         let out = r.map_err(user_err)?;
+        let plan_digest = out.plan.digest();
+        let owner = CompareOwner {
+            compare_id: run_id,
+            job_name,
+            target_index,
+            config_revision,
+        };
         // Evidence layer: measured size/mtime on both sides + equal-item counts. It shares the same
         // norm_key/files_equal as compare(), so the definitions cannot drift apart.
         let ev = compare::evidence::evidence(&out.source, &out.target, &out.plan, &job.compare_opts());
@@ -120,14 +130,20 @@ pub async fn compare_job(
             })
             .collect();
         let dto = PlanDto {
+            owner: owner.clone(),
             header: out.plan.header,
             ops: out.plan.ops,
             metas,
             equal_count: ev.equal_count,
             equal_bytes: ev.equal_bytes,
         };
-        // Snapshots are kept for the "Identical" panel; single slot, overwritten by the next compare
-        *cache.0.lock().unwrap() = Some(CachedSnaps { job: name, source: out.source, target: out.target });
+        // Snapshots are kept for the "Identical" panel. Publish the owner, original-plan digest,
+        // and both snapshots together only after compare and evidence construction all succeeded.
+        *cache.0.lock().unwrap() = Some(CachedSnaps {
+            provenance: CompareProvenance { owner, plan_digest },
+            source: out.source,
+            target: out.target,
+        });
         Ok(dto)
     })
     .await
@@ -137,15 +153,40 @@ pub async fn compare_job(
 /// Pre-sync gate checks (disk space / deletion ratio). The frontend shows the result in the confirmation sheet,
 /// so "why won't it let me sync" has somewhere to be answered instead of only appearing on stderr.
 #[tauri::command]
-pub async fn preflight(name: String, plan: PlanDto, ops: Vec<Op>, acknowledged: bool, target_index: Option<usize>) -> Result<PreflightDto, String> {
+pub async fn preflight(
+    snaps: tauri::State<'_, Arc<SnapCache>>,
+    name: String,
+    plan: PlanDto,
+    selected: Vec<SelectedRowDto>,
+    acknowledged: bool,
+    target_index: Option<usize>,
+) -> Result<PreflightDto, String> {
+    let cache = snaps.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let (_n, job) = job::load(&name).map_err(|e| e.to_string())?;
-        let job = resolve_target(&job, target_index)?;
+        if name != plan.owner.job_name {
+            return Err(format!(
+                "This compare result belongs to job '{}', not '{}' — run Compare again",
+                plan.owner.job_name, name
+            ));
+        }
+        let (job_name, full_job) = job::load_named(&name).map_err(|e| e.to_string())?;
+        let config_revision =
+            job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
+        let (target_index, job) = resolve_target(&full_job, target_index)?;
         let full = Plan { header: plan.header.clone(), ops: plan.ops.clone() };
-        let ops: Vec<Op> = ops
-            .into_iter()
-            .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
-            .collect();
+        let plan_digest = full.digest();
+        {
+            let cached = cache.0.lock().unwrap();
+            validate_cached_compare(
+                cached.as_ref().map(|c| &c.provenance),
+                &plan.owner,
+                &job_name,
+                target_index,
+                &config_revision,
+                Some(&plan_digest),
+            )?;
+        }
+        let ops = resolve_selected_ops(&full.ops, &selected)?;
         // A peer job only gets the deletion-ratio gate: disk space and the marker live on the
         // remote machine, so checking them here would be answering about the wrong disk.
         let v = run::preflight(&job, &full, &ops, acknowledged);
@@ -159,41 +200,67 @@ pub async fn preflight(name: String, plan: PlanDto, ops: Vec<Op>, acknowledged: 
 pub async fn apply_job(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RunState>>,
+    snaps: tauri::State<'_, Arc<SnapCache>>,
     name: String,
     plan: PlanDto,
-    ops: Vec<Op>,
+    selected: Vec<SelectedRowDto>,
     acknowledged: bool,
     target_index: Option<usize>,
     accept_caps: Option<bool>,
     launch_id: Option<u64>,
 ) -> Result<ApplyDto, String> {
     let st = state.inner().clone();
+    let cache = snaps.inner().clone();
     let reject_state = state.inner().clone();
     let requested_launch = launch_id;
     let run_app = app.clone();
     let joined = tauri::async_runtime::spawn_blocking(move || -> Result<ApplyDto, (String, bool)> {
-        let (_n, job) = job::load(&name).map_err(|e| (e.to_string(), false))?;
-        let job = resolve_target(&job, target_index).map_err(|e| (e, false))?;
+        if name != plan.owner.job_name {
+            return Err((
+                format!(
+                    "This compare result belongs to job '{}', not '{}' — run Compare again",
+                    plan.owner.job_name, name
+                ),
+                false,
+            ));
+        }
+        let (job_name, full_job) =
+            job::load_named(&name).map_err(|e| (e.to_string(), false))?;
+        let config_revision = job::config_revision(&full_job)
+            .map_err(|e| (format!("Job '{job_name}': {e}"), false))?;
+        let (target_index, job) = resolve_target(&full_job, target_index).map_err(|e| (e, false))?;
         let full = Plan { header: plan.header.clone(), ops: plan.ops.clone() };
-        let ops: Vec<Op> = ops
-            .into_iter()
-            .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
-            .collect();
+        let plan_digest = full.digest();
+        // Keep the cache slot stable through the gate and run reservation. If a compare is already
+        // scanning, begin_run will reject this apply before a write; if this apply reserves first,
+        // no compare can replace the validated slot in the gap before execution starts.
+        let cached = cache.0.lock().unwrap();
+        validate_cached_compare(
+            cached.as_ref().map(|c| &c.provenance),
+            &plan.owner,
+            &job_name,
+            target_index,
+            &config_revision,
+            Some(&plan_digest),
+        )
+        .map_err(|e| (e, false))?;
+        let ops = resolve_selected_ops(&full.ops, &selected).map_err(|e| (e, false))?;
         // Touch nothing when a gate fails, and hand the reason back to the UI
         let v = run::preflight(&job, &full, &ops, acknowledged);
         if !v.ok() {
             return Err((v.blockers.join("\n"), false));
         }
         let (run_id, ctl) = begin_run_for_launch(&st, launch_id).map_err(|e| (e, false))?;
+        drop(cached);
         let _active_run = ActiveRunGuard(st.clone());
         let ctx = make_ctx(&run_app, run_id, ctl, "apply");
         // M4: every real apply writes a run-log entry (the Recorder also collects error events into the detail file)
         let t0 = std::time::Instant::now();
-        let rec = syncdash::obs::runlog::Recorder::start(&name, &run::run_kind(&job, "apply"), &ctx, &ops);
+        let rec = syncdash::obs::runlog::Recorder::start(&job_name, &run::run_kind(&job, "apply"), &ctx, &ops);
         // A degraded apply without consent refuses with the NeedsAck lines; the frontend shows
         // them and re-invokes with accept_caps=true if the user agrees.
         let out = match run::apply(
-            &name, &job, &full, &ops, None, false, acknowledged, accept_caps.unwrap_or(false), &rec.ctx,
+            &job_name, &job, &full, &ops, None, false, acknowledged, accept_caps.unwrap_or(false), &rec.ctx,
         ) {
             Ok(o) => o,
             Err(e) => return Err((user_err(e), true)),

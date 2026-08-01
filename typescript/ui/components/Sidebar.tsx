@@ -42,7 +42,7 @@ export function Sidebar(props: Props) {
             key={j.name}
             className={'job' + (currentName === j.name ? ' active' : '')}
             title={`${j.source}\n→ ${j.target}` + (j.remote ? '\n(applied by a peer syncdash over ssh)' : '')}
-            onClick={() => { if (!busy) onSelect(j); }}
+            onClick={() => { if (!busy && currentName !== j.name) onSelect(j); }}
           >
             <div className="jrow1">
               <span className="name">{j.name}</span>
@@ -52,14 +52,15 @@ export function Sidebar(props: Props) {
               <button
                 className="jedit"
                 title="Edit job"
-                onClick={(e) => { e.stopPropagation(); onEdit(j.name); }}
+                disabled={busy}
+                onClick={(e) => { e.stopPropagation(); if (!busy) onEdit(j.name); }}
               ><Pencil size={12} /></button>
             </div>
             {lastMap[j.name] && <LastRun r={lastMap[j.name]} />}
           </div>
         ))}
       </div>
-      <button className="btn newjob" onClick={onNew}><Plus size={13} /> New job</button>
+      <button className="btn newjob" disabled={busy} onClick={onNew}><Plus size={13} /> New job</button>
       <div className="sidefoot">
         <span>{appVersion}</span>
         <span>{jobsDir}</span>

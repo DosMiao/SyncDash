@@ -4,12 +4,13 @@ import { fmtTime, humanSize } from '../../core/format';
 import { listSame } from '../../core/ipc';
 import { MTIME_SLACK } from '../../core/plan';
 import type { SameRow } from '../../core/ipc';
+import type { CompareOwner } from '../../core/types/generated/CompareOwner';
 
 const PAGE = 300;
 
 /// Reads the snapshot left by the last compare, paginated. **No rescan** — both sides were just walked,
 /// and walking the trees again just to glance at the identical items would be pure waste.
-export function SamePanel({ jobName, onClose }: { jobName: string; onClose: () => void }) {
+export function SamePanel({ owner, onClose }: { owner: CompareOwner; onClose: () => void }) {
   const [q, setQ] = useState('');
   const [query, setQuery] = useState('');
   const [rows, setRows] = useState<SameRow[]>([]);
@@ -23,7 +24,7 @@ export function SamePanel({ jobName, onClose }: { jobName: string; onClose: () =
 
   const load = useCallback(async (offset: number) => {
     try {
-      const page = await listSame(jobName, query, offset, PAGE);
+      const page = await listSame(owner, query, offset, PAGE);
       setError('');
       setTotal(page.total);
       setRows((prev) => (offset === 0 ? page.rows : [...prev, ...page.rows]));
@@ -32,7 +33,7 @@ export function SamePanel({ jobName, onClose }: { jobName: string; onClose: () =
       setRows([]);
       setTotal(0);
     }
-  }, [jobName, query]);
+  }, [owner, query]);
 
   useEffect(() => { void load(0); }, [load]);
 

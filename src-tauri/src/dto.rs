@@ -30,6 +30,22 @@ pub(crate) struct JobDto {
     pub(crate) watch_auto_apply: bool,
     /// 1:N: the effective target list (a single-target job = one entry). When >1 the frontend shows the target selector
     pub(crate) targets: Vec<String>,
+    pub(crate) config_revision: String,
+}
+
+/// Immutable provenance for one successful comparison.
+///
+/// The frontend carries this value with the plan. Commands that read cached evidence or can write
+/// files require an exact match, so changing selection cannot silently reinterpret an old plan.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct CompareOwner {
+    #[ts(type = "number")]
+    pub(crate) compare_id: u64,
+    pub(crate) job_name: String,
+    #[ts(type = "number")]
+    pub(crate) target_index: usize,
+    pub(crate) config_revision: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, ts_rs::TS)]
@@ -50,6 +66,17 @@ pub(crate) struct PlanDto {
     #[serde(default)]
     #[ts(type = "number")]
     pub(crate) equal_bytes: u64,
+    pub(crate) owner: CompareOwner,
+}
+
+/// One reviewed plan row submitted for preflight/apply. The backend reconstructs the operation from
+/// the cached plan; the frontend never gets to submit an independent write instruction.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct SelectedRowDto {
+    #[ts(type = "number")]
+    pub(crate) index: usize,
+    pub(crate) flipped: bool,
 }
 
 #[derive(Serialize, ts_rs::TS)]
@@ -94,7 +121,8 @@ pub(crate) struct PathVerdict {
 // Snapshot cache (the data source for the "Identical" panel)
 //
 // compare already walked both sides in full; dropping the snapshots would force the UI to rescan just to glance at the identical items.
-// Single-slot cache: every compare overwrites it and switching jobs invalidates it; two snapshots at the 20k-entry scale run to a dozen-odd MB.
+// Single-slot cache: every *successful* compare overwrites it; merely changing the selected job does
+// not. Two snapshots at the 20k-entry scale run to a dozen-odd MB.
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct SamePage {

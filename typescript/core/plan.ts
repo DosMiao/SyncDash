@@ -3,14 +3,17 @@
 // in main.ts; they now take the state explicitly so a React render can call them from anywhere.
 
 import type { Op } from './types/generated/Op';
+import type { CompareOwner } from './types/generated/CompareOwner';
 import type { PlanHeader } from './types/generated/PlanHeader';
 import type { RowMeta } from './types/generated/RowMeta';
+import type { SelectedRowDto } from './types/generated/SelectedRowDto';
 
 export type OpDto = Op;
 
 /// Return value of `compare_job`. The Rust side generates a DTO of the same name (PlanDto.ts),
 /// but there `header` is a `PlanHeader` reference; keeping the shape identical here is enough.
 export interface PlanDto {
+  owner: CompareOwner;
   header: PlanHeader;
   ops: OpDto[];
   /// Measured size/mtime for both sides. Copy rows are null because Op already carries their sole side.
@@ -87,6 +90,12 @@ function reverseOp(op: OpDto): OpDto | null {
 export function eff(plan: PlanDto, flipped: boolean[], i: number): OpDto {
   const op = plan.ops[i];
   return flipped[i] ? (reverseOp(op) ?? op) : op;
+}
+
+/// The apply boundary carries decisions, not operations. Rust reconstructs each row from the
+/// authenticated plan and owns the executable reversal semantics.
+export function selectedRows(indices: number[], flipped: boolean[]): SelectedRowDto[] {
+  return indices.map((index) => ({ index, flipped: flipped[index] === true }));
 }
 
 export function metaOf(plan: PlanDto, i: number): RowMeta {

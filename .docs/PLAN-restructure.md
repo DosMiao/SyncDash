@@ -283,8 +283,9 @@ backends that talk to untrusted remote machines carry the thinnest tests in the 
   `plan.ts:11-12` admits it in a comment. The `run-progress` event is modelled **three times**
   (`CmpEv`, `RunEv`, and the generated union), and the contract has already drifted — `purpose`
   exists on neither generated type. Add `purpose` on the Rust side so it regenerates.
-- Fix the two state bugs: the `chmod` tally divergence, and the 1:N target switch that leaves
-  `maskHit`/`chips`/`ovFilter`/`sort` stale (7 reset sites, no two agree → one `resetPlan()`).
+- Fix the `chmod` tally divergence. The former 1:N target-switch item is complete: compare ownership
+  now lives in one bounded, provenance-checked last-successful session, making the proposed global
+  `resetPlan()` obsolete instead of adding an eighth reset path.
 - Make `ED_GROUPS` a union type. The group literals are currently consistent, but the contract is a
   bare `string` across three files with nothing to catch drift.
 - Add an ESLint config — there is none, so `react-hooks/exhaustive-deps` has never run and the one
@@ -393,7 +394,8 @@ was redistribution, not deletion, apart from Phase 1.
 independently created `core/grouping.ts` moving `RowSpec` out of `useVirtualRows` — the same
 relocation §3 Phase 6 proposed. Doing the rest would have overwritten live work. Still open:
 `App.tsx` (1047, 84 hooks), the `components/` regrouping, the CSS split, the `chmod` tally
-divergence, the 1:N stale-state bug, `ED_GROUPS` as a union, and an ESLint config.
+divergence, `ED_GROUPS` as a union, and an ESLint config. The former 1:N stale-state/reset item was
+completed later by the bounded compare-session work described in Phase 6.
 
 **Two long functions, named rather than left implicit.** `compare()` is 549 lines whose ten passes
 accumulate into shared state — splitting them is a control-flow change, not a move. `run_cli`'s

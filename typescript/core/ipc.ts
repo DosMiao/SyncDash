@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { PlanDto, OpDto } from './plan';
 import type { ApplyDto } from './types/generated/ApplyDto';
 import type { AppSettings } from './types/generated/AppSettings';
+import type { CompareOwner } from './types/generated/CompareOwner';
 import type { Job as JobFull } from './types/generated/Job';
 import type { JobDto } from './types/generated/JobDto';
 import type { JobFileSchemaDto } from './types/generated/JobFileSchemaDto';
@@ -17,6 +18,7 @@ import type { RowMeta } from './types/generated/RowMeta';
 import type { RunRecord } from './types/generated/RunRecord';
 import type { SamePage } from './types/generated/SamePage';
 import type { SameRow } from './types/generated/SameRow';
+import type { SelectedRowDto } from './types/generated/SelectedRowDto';
 
 export type { JobFull, JunkPresetDto };
 
@@ -32,7 +34,8 @@ export const defaultJob = () => invoke<JobFull>('default_job');
 /// The schema in the job file on disk, against the one this build writes. `getJob` returns the migrated
 /// job, so this is the only way to tell that the exclude lines on screen are not in the file yet.
 export const jobFileSchema = (name: string) => invoke<JobFileSchemaDto>('job_file_schema', { name });
-export const saveJob = (name: string, job: JobFull) => invoke<void>('save_job', { name, job });
+/// Returns the canonical revision of the effective configuration that was written.
+export const saveJob = (name: string, job: JobFull) => invoke<string>('save_job', { name, job });
 export const deleteJob = (name: string) => invoke<void>('delete_job', { name });
 export const jobsDir = () => invoke<string>('jobs_dir');
 
@@ -68,21 +71,21 @@ export const compareJob = (name: string, targetIndex: number) =>
 export const applyJob = (
   name: string,
   plan: PlanDto,
-  ops: OpDto[],
+  selected: SelectedRowDto[],
   acknowledged: boolean,
   targetIndex: number,
   launchId: number,
-) => withCapsConsent<ApplyDto>('apply_job', { name, plan, ops, acknowledged, targetIndex, launchId });
+) => withCapsConsent<ApplyDto>('apply_job', { name, plan, selected, acknowledged, targetIndex, launchId });
 
 /// AutoScan never grants capability consent by itself — it only reuses consent the user already gave
 /// interactively this session (a degraded run must never start on a timer without a human having seen the list)
-export const applyJobUnattended = (name: string, plan: PlanDto, ops: OpDto[], targetIndex: number) =>
+export const applyJobUnattended = (name: string, plan: PlanDto, selected: SelectedRowDto[], targetIndex: number) =>
   invoke<ApplyDto>('apply_job', {
-    name, plan, ops, acknowledged: false, targetIndex, acceptCaps: capsConsent.has(name),
+    name, plan, selected, acknowledged: false, targetIndex, acceptCaps: capsConsent.has(name),
   });
 
-export const preflight = (name: string, plan: PlanDto, ops: OpDto[], acknowledged: boolean, targetIndex: number) =>
-  invoke<PreflightDto>('preflight', { name, plan, ops, acknowledged, targetIndex });
+export const preflight = (name: string, plan: PlanDto, selected: SelectedRowDto[], acknowledged: boolean, targetIndex: number) =>
+  invoke<PreflightDto>('preflight', { name, plan, selected, acknowledged, targetIndex });
 
 export const cancelRun = () => invoke<boolean>('cancel_run');
 export const pauseRun = (paused: boolean) => invoke<void>('pause_run', { paused });
@@ -107,8 +110,8 @@ export const maskMatch = (masks: string[], paths: string[]) =>
 /// describe what the job excludes.
 export const junkPresets = () => invoke<JunkPresetDto[]>('junk_presets');
 
-export const listSame = (name: string, query: string, offset: number, limit: number) =>
-  invoke<SamePage>('list_same', { name, query, offset, limit });
+export const listSame = (owner: CompareOwner, query: string, offset: number, limit: number) =>
+  invoke<SamePage>('list_same', { owner, query, offset, limit });
 
 export const exportCsv = (path: string, header: PlanHeader, ops: OpDto[], metas: RowMeta[], checked: boolean[]) =>
   invoke<number>('export_csv', { path, header, ops, metas, checked });
