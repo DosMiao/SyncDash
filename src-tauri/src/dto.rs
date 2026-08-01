@@ -128,15 +128,3 @@ pub(crate) struct JunkPresetDto {
     pub(crate) patterns: Vec<String>,
     pub(crate) default_on: bool,
 }
-
-/// Legacy status-bar event (a transitional shim until the M2 frontend lands)
-#[derive(Serialize, Clone, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
-pub(crate) struct LegacyProgress {
-    pub(crate) phase: String,
-    pub(crate) detail: String,
-    /// Completion percentage of the hash/copy phase (0-100); boundary events use -1
-    pub(crate) pct: i32,
-    /// Reserved field: in the new stream the rate is computed by the frontend (4s sliding window), the shim no longer fakes it
-    pub(crate) rate: f64,
-}

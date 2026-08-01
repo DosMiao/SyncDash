@@ -155,18 +155,18 @@ export function FilterBar(props: Props) {
           </button>
         )}
         {grouped && (
-          <button className="btn" title="Collapse / expand all directory groups" onClick={onToggleFold}>
+          <button className="btn" title="Collapse / expand every folder in the tree" onClick={onToggleFold}>
             {anyCollapsed ? <ChevronsUpDown size={12} /> : <ChevronsDownUp size={12} />}
             {anyCollapsed ? 'Expand all' : 'Collapse all'}
           </button>
         )}
         <button
           className={'btn' + (grouped ? ' on' : '')}
-          title="Toggle: tree groups (aggregated by directory, same as FFS) ↔ flat list"
+          title="Toggle: hierarchical directory tree (parents, subfolders, files) ↔ flat list"
           onClick={onToggleGroup}
         >
           {grouped ? <FolderTree size={12} /> : <List size={12} />}
-          {grouped ? 'Tree groups' : 'Flat list'}
+          {grouped ? 'Folder tree' : 'Flat list'}
         </button>
         <button
           className="btn"

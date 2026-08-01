@@ -175,8 +175,11 @@ pub(super) fn scan_vfs(
     } else {
         0
     };
-    pp.set_totals(pending.len() as u64, bytes_to_hash);
-    pp.restart_items();
+    if opt.hash {
+        pp.restart_items_with_totals(pending.len() as u64, bytes_to_hash);
+    } else {
+        pp.set_totals(pending.len() as u64, bytes_to_hash);
+    }
 
     let hash_errors;
     if opt.hash {
@@ -251,7 +254,7 @@ pub(super) fn scan_vfs(
         crate::log_warn!("scan", "warning: {hash_errors} file(s) could not be hashed (in use / unreadable)");
     }
 
-    Ok(Snapshot {
+    let snapshot = Snapshot {
         header: Header {
             schema: SCHEMA,
             kind: "snapshot".into(),
@@ -276,5 +279,7 @@ pub(super) fn scan_vfs(
             vfs: Some(super::vfs_note(vfs.as_ref(), opt, sampled)),
         },
         entries,
-    })
+    };
+    pp.finish()?;
+    Ok(snapshot)
 }

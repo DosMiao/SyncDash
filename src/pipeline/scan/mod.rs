@@ -164,10 +164,77 @@ mod tests {
         assert_eq!(snap.entries.iter().filter(|e| e.kind == EntryKind::File).count(), 20);
         let evs = store.lock().unwrap();
         let totals = evs.iter().find_map(|e| match e {
-            ProgressEvent::Totals { items_total, bytes_total, .. } => Some((*items_total, *bytes_total)),
+            ProgressEvent::Totals { reset: true, items_total, bytes_total, .. } => Some((*items_total, *bytes_total)),
             _ => None,
         });
         assert_eq!(totals, Some((20, 2000)), "the end of the walk must yield exact totals");
+        assert!(matches!(evs.last(), Some(ProgressEvent::PhaseEnd {
+            phase: Phase::ScanSource,
+            status: crate::model::event::PhaseStatus::Completed,
+            items_done: 20,
+            items_total: 20,
+            bytes_done: 2000,
+            bytes_total: 2000,
+            ..
+        })), "a successful scan must end explicitly with its final counters");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_hash_scan_ends_with_all_discovered_items_done() {
+        let root = mk_tree("no-hash-progress", 7);
+        let store: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let s2 = store.clone();
+        let ctx = RunCtx::new(RunCtl::new(), Arc::new(move |ev| s2.lock().unwrap().push(ev)));
+        let mut opt = opts();
+        opt.hash = false;
+        scan_ctx(&root, &opt, &ctx, Phase::ScanSource).unwrap();
+        let evs = store.lock().unwrap();
+        assert!(evs.iter().any(|ev| matches!(ev, ProgressEvent::Totals {
+            reset: false,
+            items_done: 7,
+            items_total: 7,
+            ..
+        })));
+        assert!(matches!(evs.last(), Some(ProgressEvent::PhaseEnd {
+            status: crate::model::event::PhaseStatus::Completed,
+            items_done: 7,
+            items_total: 7,
+            bytes_done: 0,
+            bytes_total: 0,
+            ..
+        })));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_hash_cancellation_at_final_totals_does_not_return_a_snapshot() {
+        let root = mk_tree("no-hash-cancel-boundary", 7);
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let copy = events.clone();
+        let ctl = RunCtl::new();
+        let cancel = ctl.clone();
+        let ctx = RunCtx::new(
+            ctl,
+            Arc::new(move |ev| {
+                if matches!(&ev, ProgressEvent::Totals { phase: Phase::ScanSource, .. }) {
+                    cancel.request_cancel();
+                }
+                copy.lock().unwrap().push(ev);
+            }),
+        );
+        let mut opt = opts();
+        opt.hash = false;
+
+        match scan_ctx(&root, &opt, &ctx, Phase::ScanSource) {
+            Err(e) => assert!(is_cancelled(&e)),
+            Ok(_) => panic!("a cancelled scan must not return a snapshot"),
+        }
+        assert!(matches!(events.lock().unwrap().last(), Some(ProgressEvent::PhaseEnd {
+            phase: Phase::ScanSource,
+            status: crate::model::event::PhaseStatus::Cancelled,
+            ..
+        })));
         let _ = std::fs::remove_dir_all(&root);
     }
 

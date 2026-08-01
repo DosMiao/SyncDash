@@ -51,6 +51,19 @@ pub enum Phase {
     Verify,
     /// The archive rescan after a successful apply — a long phase that is completely invisible today
     Refresh,
+    /// Persist the refreshed sync archive after its source rescan completes.
+    Archive,
+}
+
+/// How a phase stopped. `Completed` means the phase reached its own boundary; individual apply
+/// operations may still have accumulated errors, which remain represented by Error and Summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[serde(rename_all = "lowercase")]
+pub enum PhaseStatus {
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Serialize, ts_rs::TS)]
@@ -69,13 +82,22 @@ pub enum ProgressEvent {
         #[ts(type = "number")]
         bytes_total: u64,
     },
-    /// Mid-phase refinement of the totals (scan: after the walk, before hashing starts)
+    /// Mid-phase refinement of the totals (scan: after the walk, before hashing starts).
+    /// Done counters make that gear change atomic on the wire rather than pairing the walk's
+    /// final count with the hash pass's new total and briefly claiming 100%.
     Totals {
         phase: Phase,
+        /// True when done counters intentionally start a new epoch (scan discovery → hashing).
+        /// False for a denominator refinement such as work discovered during apply.
+        reset: bool,
         #[ts(type = "number")]
         ts_ms: u64,
         #[ts(type = "number")]
+        items_done: u64,
+        #[ts(type = "number")]
         items_total: u64,
+        #[ts(type = "number")]
+        bytes_done: u64,
         #[ts(type = "number")]
         bytes_total: u64,
     },
@@ -93,6 +115,23 @@ pub enum ProgressEvent {
         #[ts(type = "number")]
         bytes_total: u64,
         current_path: String,
+    },
+    /// Explicit phase boundary. Phases may overlap (the two scans run in parallel), so another
+    /// phase starting cannot imply this one ended. Status distinguishes success, failure, and
+    /// cancellation; the unthrottled snapshot carries counters the progress throttle may drop.
+    PhaseEnd {
+        phase: Phase,
+        status: PhaseStatus,
+        #[ts(type = "number")]
+        ts_ms: u64,
+        #[ts(type = "number")]
+        items_done: u64,
+        #[ts(type = "number")]
+        items_total: u64,
+        #[ts(type = "number")]
+        bytes_done: u64,
+        #[ts(type = "number")]
+        bytes_total: u64,
     },
     /// One failure record (errors never abort the run — FFS accumulate semantics; in a windowed
     /// desktop build this is where an error first becomes visible)

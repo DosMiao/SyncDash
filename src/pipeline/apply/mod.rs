@@ -165,13 +165,15 @@ pub fn apply_vfs(
             }
             acc.skipped.fetch_add(1, Ordering::Relaxed);
         }
-        return ApplyOutcome {
+        let mut out = ApplyOutcome {
             done: 0,
             skipped: acc.skipped.load(Ordering::Relaxed),
             errors: 0,
             bytes_copied: 0,
             cancelled: false,
         };
+        out.cancelled = pp.finish().is_err() || ctx.ctl.cancelled();
+        return out;
     }
 
     let source_local = source.as_local().map(|p| p.to_path_buf());
@@ -310,11 +312,13 @@ pub fn apply_vfs(
     if done > 0 && any_remote_side {
         println!("remote retention (originals renamed on the far side): <root>/{}", sh.remote_keep_rel);
     }
-    ApplyOutcome {
+    let mut out = ApplyOutcome {
         done,
         skipped: acc.skipped.load(Ordering::Relaxed),
         errors: acc.errors.load(Ordering::Relaxed),
         bytes_copied: pp.counts().2,
         cancelled: ctx.ctl.cancelled(),
-    }
+    };
+    out.cancelled = pp.finish().is_err() || ctx.ctl.cancelled();
+    out
 }

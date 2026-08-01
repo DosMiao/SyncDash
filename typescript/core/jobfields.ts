@@ -200,7 +200,10 @@ export function jobToForm(j: JobFull, name: string): FormValues {
 /// when creating. Fields the schema does not surface are carried through from it rather than reset to a
 /// value invented here: `no_hash` is not in ED_FIELDS and it forces hashing off last in `rigor_resolved`,
 /// so rebuilding the job from a blank default quietly cleared it every time anything else was saved.
-export function formToJob(v: FormValues, base: JobFull): { name: string; job: JobFull } | { error: string } {
+export function formToJob(
+  v: FormValues,
+  base: JobFull,
+): { name: string; job: JobFull } | { error: string; field: '__name' | 'source' | 'target' } {
   const j = { ...(base as unknown as Record<string, unknown>) };
   let name = '';
   for (const f of ED_FIELDS) {
@@ -214,12 +217,13 @@ export function formToJob(v: FormValues, base: JobFull): { name: string; job: Jo
       const s = String(raw).trim();
       val = s === '' && NULLABLE_TEXT.has(f.key) ? null : s;
     }
-    if (f.key === '__name') { name = String(val ?? ''); continue; }
+    if (f.key === '__name') { name = String(val ?? '').trim(); continue; }
     j[f.key] = val;
   }
-  if (!name) return { error: 'Job name cannot be empty' };
+  if (!name) return { error: 'Job name cannot be empty', field: '__name' };
   const jf = j as unknown as JobFull;
-  if (!jf.source || !jf.target) return { error: 'source / target cannot be empty' };
+  if (!jf.source.trim()) return { error: 'Source root cannot be empty', field: 'source' };
+  if (!jf.target.trim()) return { error: 'Target root cannot be empty', field: 'target' };
   return { name, job: jf };
 }
 

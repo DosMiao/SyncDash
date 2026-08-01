@@ -65,8 +65,14 @@ async function withCapsConsent<T>(cmd: string, args: Record<string, unknown>): P
 export const compareJob = (name: string, targetIndex: number) =>
   withCapsConsent<PlanDto>('compare_job', { name, targetIndex });
 
-export const applyJob = (name: string, plan: PlanDto, ops: OpDto[], acknowledged: boolean, targetIndex: number) =>
-  withCapsConsent<ApplyDto>('apply_job', { name, plan, ops, acknowledged, targetIndex });
+export const applyJob = (
+  name: string,
+  plan: PlanDto,
+  ops: OpDto[],
+  acknowledged: boolean,
+  targetIndex: number,
+  launchId: number,
+) => withCapsConsent<ApplyDto>('apply_job', { name, plan, ops, acknowledged, targetIndex, launchId });
 
 /// AutoScan never grants capability consent by itself — it only reuses consent the user already gave
 /// interactively this session (a degraded run must never start on a timer without a human having seen the list)
@@ -80,7 +86,10 @@ export const preflight = (name: string, plan: PlanDto, ops: OpDto[], acknowledge
 
 export const cancelRun = () => invoke<boolean>('cancel_run');
 export const pauseRun = (paused: boolean) => invoke<void>('pause_run', { paused });
-export const openProgressWindow = () => invoke<void>('open_progress_window');
+export const openProgressWindow = () => invoke<number>('open_progress_window');
+export const cancelProgressLaunch = (launchId: number) => invoke<boolean>('cancel_progress_launch', { launchId });
+export const closeProgressLaunch = () => invoke<'pending' | 'active' | 'none'>('close_progress_launch');
+export const destroyProgressWindow = () => invoke<void>('close_progress_window');
 export const postSyncAction = (kind: string) => invoke<void>('post_sync_action', { kind });
 
 // Paths / filters / export

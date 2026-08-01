@@ -10,7 +10,7 @@ export type PlanDto = { header: PlanHeader, ops: Array<Op>,
  * frontend reconstructs it. This matters at six figures: two nested JSON objects per copy row
  * otherwise account for most of WebKit's retained allocations.
  */
-metas: Array<RowMeta | null>,
+metas: Array<RowMeta | null>, 
 /**
  * Count/bytes of the files judged equal on both sides (the denominator of "showing X of Y")
  */

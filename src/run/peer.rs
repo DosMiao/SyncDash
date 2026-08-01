@@ -68,15 +68,23 @@ pub fn run_peer_job_with(
 }
 
 fn emit_cancel_summary(ctx: &crate::obs::progress::RunCtx, t0: std::time::Instant) {
+    emit_apply_summary(ctx, t0, crate::obs::progress::ApplyOutcome { cancelled: true, ..Default::default() });
+}
+
+fn emit_apply_summary(
+    ctx: &crate::obs::progress::RunCtx,
+    t0: std::time::Instant,
+    out: crate::obs::progress::ApplyOutcome,
+) {
     ctx.sink.emit(crate::model::event::ProgressEvent::Summary {
         ts_ms: crate::foundation::time::now_ms(),
-        done: 0,
-        skipped: 0,
-        errors: 0,
-        bytes_done: 0,
+        done: out.done,
+        skipped: out.skipped,
+        errors: out.errors,
+        bytes_done: out.bytes_copied,
         elapsed_ms: t0.elapsed().as_millis() as u64,
         paused_ms: ctx.ctl.paused_total_ms(),
-        cancelled: true,
+        cancelled: out.cancelled,
     });
 }
 
@@ -311,9 +319,10 @@ use crate::obs::progress::PhaseProgress;
     let scan_args = remote_scan_args(job, &link.rroot);
     ctx.checkpoint()?;
     // The remote scans on its own disk, so locally all we can show is "in progress" — totals zeroed, the label spells out who we are waiting on
-    let _pp_rs = PhaseProgress::begin(ctx, Phase::ScanTarget, Some(format!("ssh:{} {}", link.host, link.rroot)), 0, 0);
+    let pp_rs = PhaseProgress::begin(ctx, Phase::ScanTarget, Some(format!("ssh:{} {}", link.host, link.rroot)), 0, 0);
     let table_bytes = link.session.capture(&link.cmd(&scan_args))?;
     let t = Snapshot::from_reader(std::io::BufReader::new(&table_bytes[..]))?;
+    pp_rs.finish()?;
 
     // 3) Local scan + compare (the local source side goes through the mount-point gate too)
     let mut v = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
@@ -329,7 +338,7 @@ use crate::obs::progress::PhaseProgress;
         (Some(p), "sync") if p.is_file() => Some(Snapshot::load(p)?),
         _ => None,
     };
-    let _pp_cmp = PhaseProgress::begin(
+    let pp_cmp = PhaseProgress::begin(
         ctx,
         Phase::Compare,
         Some(format!("{} × {} entries", s.header.entry_count, t.header.entry_count)),
@@ -338,6 +347,7 @@ use crate::obs::progress::PhaseProgress;
     );
     let copts = job.compare_opts();
     let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
+    pp_cmp.finish()?;
     Ok(CompareOutcome { plan, source: s, target: t })
 }
 
@@ -364,12 +374,19 @@ pub fn apply_peer_job_with(
     ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
     let t0 = std::time::Instant::now();
-    let r = apply_peer_inner(name, job, plan, ops, verbose, acknowledged, ctx, t0);
-    if let Err(e) = &r {
-        if crate::obs::progress::is_cancelled(e) {
-            emit_cancel_summary(ctx, t0);
-        }
+    let mut r = apply_peer_inner(name, job, plan, ops, verbose, acknowledged, ctx);
+    if let Ok(out) = &mut r {
+        out.cancelled |= ctx.ctl.cancelled();
     }
+    let terminal = match &r {
+        Ok(out) => *out,
+        Err(e) => crate::obs::progress::ApplyOutcome {
+            errors: u64::from(!crate::obs::progress::is_cancelled(e)),
+            cancelled: crate::obs::progress::is_cancelled(e) || ctx.ctl.cancelled(),
+            ..Default::default()
+        },
+    };
+    emit_apply_summary(ctx, t0, terminal);
     r
 }
 
@@ -382,7 +399,6 @@ fn apply_peer_inner(
     verbose: bool,
     acknowledged: bool,
     ctx: &crate::obs::progress::RunCtx,
-    t0: std::time::Instant,
 ) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
     use crate::model::plan::Side;
     use crate::model::event::{Phase, ProgressEvent};
@@ -477,6 +493,11 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
                 format!("[{name}] packed {} B, delta saved {} B", sum.bytes, sum.delta_saved),
             );
         }
+        pp_pack.complete("package");
+        if let Err(e) = pp_pack.finish() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         let rpkg = if shell == crate::transfer::peer::RemoteShell::PowerShell {
             format!("syncdash-{}.tar", crate::foundation::time::now_ms()) // relative path → the remote home directory
         } else {
@@ -497,10 +518,11 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         let _ = std::fs::remove_file(&tmp);
         ship?;
         pp_ship.item_done(&rpkg);
+        pp_ship.finish()?;
         bytes_done_total += sum.bytes;
 
         ctx.checkpoint()?;
-        let _pp_ra = PhaseProgress::begin(ctx, Phase::Apply, Some(format!("ssh:{host} apply-pack")), sum.ops, 0);
+        let pp_ra = PhaseProgress::begin(ctx, Phase::Apply, Some(format!("ssh:{host} apply-pack")), sum.ops, 0);
         let mut ap_args: Vec<String> = vec!["apply-pack".into(), rpkg.clone(), "--apply".into(), "--remove-pkg".into()];
         if job.versioning {
             ap_args.push("--versioning".into());
@@ -511,6 +533,16 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         let ok = link.session.run_status(&link.cmd(&ap_args))?;
         if ok {
             done += sum.ops;
+            pp_ra.complete(&rpkg);
+            if pp_ra.finish().is_err() {
+                return Ok(ApplyOutcome {
+                    done,
+                    skipped,
+                    errors,
+                    bytes_copied: bytes_done_total,
+                    cancelled: true,
+                });
+            }
         } else {
             errors += 1;
             ctx.log(crate::model::event::LogLevel::Error, "remote", format!("[{name}] remote apply-pack reported failure"));
@@ -522,6 +554,7 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
                 side: "target".into(),
                 message: "remote apply-pack reported failure".into(),
             });
+            pp_ra.fail();
         }
     }
 
@@ -584,24 +617,24 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         match super::roots::resolve_root(&job.source) {
             // The peer lane has no local handle on the far root, so no joint-tier narrowing applies
             // and never did: its comparison runs at the job's own tier, and the archive matches it.
-            Ok(sv) => refresh_archive_with(job, plan_full, &sv, &scan_opts(job), ctx),
-            Err(e) => ctx.log(
-                crate::model::event::LogLevel::Warn,
-                "run",
-                format!("[{name}] archive not refreshed — the source root would not open: {e}"),
-            ),
+            Ok(sv) => {
+                if !refresh_archive_with(job, plan_full, &sv, &scan_opts(job), ctx) && !ctx.ctl.cancelled() {
+                    errors += 1;
+                }
+            }
+            Err(e) => {
+                errors += 1;
+                ctx.sink.emit(ProgressEvent::Error {
+                    phase: Phase::Refresh,
+                    ts_ms: crate::foundation::time::now_ms(),
+                    path: job.source.clone(),
+                    action: "archive".into(),
+                    side: "source".into(),
+                    message: format!("archive not refreshed — the source root would not open: {e}"),
+                });
+            }
         }
     }
-    ctx.sink.emit(ProgressEvent::Summary {
-        ts_ms: crate::foundation::time::now_ms(),
-        done,
-        skipped,
-        errors,
-        bytes_done: bytes_done_total,
-        elapsed_ms: t0.elapsed().as_millis() as u64,
-        paused_ms: ctx.ctl.paused_total_ms(),
-        cancelled: ctx.ctl.cancelled(),
-    });
     Ok(ApplyOutcome {
         done,
         skipped,

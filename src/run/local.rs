@@ -159,7 +159,7 @@ pub fn compare_resolved(
         _ => None,
     };
     // compare itself is sub-second CPU work: report the phase boundary only, no internal counting
-    let _pp = crate::obs::progress::PhaseProgress::begin(
+    let pp = crate::obs::progress::PhaseProgress::begin(
         ctx,
         Phase::Compare,
         Some(format!("{} × {} entries", s.header.entry_count, t.header.entry_count)),
@@ -187,6 +187,7 @@ pub fn compare_resolved(
     } else {
         plan
     };
+    pp.finish()?;
     Ok(CompareOutcome { plan, source: s, target: t })
 }
 
@@ -321,6 +322,28 @@ fn refuse_apply(
     }
 }
 
+/// Every apply invocation has one terminal event, including failures before `Phase::Apply` can
+/// start. The progress window derives its running state from this boundary; without it a refused
+/// run keeps spinning after the engine has already released the run slot.
+fn finish_apply(
+    ctx: &crate::obs::progress::RunCtx,
+    t0: std::time::Instant,
+    mut out: crate::obs::progress::ApplyOutcome,
+) -> crate::obs::progress::ApplyOutcome {
+    out.cancelled |= ctx.ctl.cancelled();
+    ctx.sink.emit(crate::model::event::ProgressEvent::Summary {
+        ts_ms: crate::foundation::time::now_ms(),
+        done: out.done,
+        skipped: out.skipped,
+        errors: out.errors,
+        bytes_done: out.bytes_copied,
+        elapsed_ms: t0.elapsed().as_millis() as u64,
+        paused_ms: ctx.ctl.paused_total_ms(),
+        cancelled: out.cancelled,
+    });
+    out
+}
+
 /// v0.9 M1: apply orchestration with an event stream — the Apply phase (apply_with reports its own totals and
 /// byte-by-byte progress) → the Refresh phase → the Summary terminal state.
 pub fn apply_job_guarded_with(
@@ -336,11 +359,11 @@ pub fn apply_job_guarded_with(
     let t0 = std::time::Instant::now();
     let sv = match resolve_root(&job.source) {
         Ok(v) => v,
-        Err(e) => return refuse_apply(ctx, ops.len(), "resolve-roots", e.to_string()),
+        Err(e) => return finish_apply(ctx, t0, refuse_apply(ctx, ops.len(), "resolve-roots", e.to_string())),
     };
     let tv = match resolve_root(&job.target) {
         Ok(v) => v,
-        Err(e) => return refuse_apply(ctx, ops.len(), "resolve-roots", e.to_string()),
+        Err(e) => return finish_apply(ctx, t0, refuse_apply(ctx, ops.len(), "resolve-roots", e.to_string())),
     };
     apply_resolved(job, plan, ops, &sv, &tv, trash, verbose, acknowledged, accept_caps, t0, ctx)
 }
@@ -374,7 +397,7 @@ pub fn apply_resolved(
         v.as_local().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| v.display())
     };
     if label(sv) != plan.header.source_root || label(tv) != plan.header.target_root {
-        return refuse_apply(
+        let out = refuse_apply(
             ctx,
             ops.len(),
             "resolve-roots",
@@ -386,6 +409,7 @@ pub fn apply_resolved(
                 label(tv)
             ),
         );
+        return finish_apply(ctx, t0, out);
     }
     // Write-side capability report: gaps listed BEFORE anything is touched
     {
@@ -403,16 +427,17 @@ pub fn apply_resolved(
         }
         let blockers = wr.blockers();
         if !blockers.is_empty() {
-            return refuse_apply(
+            let out = refuse_apply(
                 ctx,
                 ops.len(),
                 "caps",
                 blockers.iter().map(|i| i.render()).collect::<Vec<_>>().join("; "),
             );
+            return finish_apply(ctx, t0, out);
         }
         let acks = wr.needs_ack();
         if !acks.is_empty() && !accept_caps {
-            return refuse_apply(
+            let out = refuse_apply(
                 ctx,
                 ops.len(),
                 "caps",
@@ -421,6 +446,7 @@ pub fn apply_resolved(
                     acks.iter().map(|i| i.render()).collect::<Vec<_>>().join("\n  ")
                 ),
             );
+            return finish_apply(ctx, t0, out);
         }
     }
     let verdict = crate::pipeline::guard::run_all_vfs(
@@ -441,25 +467,22 @@ pub fn apply_resolved(
                 message: b.clone(),
             });
         }
-        return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
+        let out = ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
+        return finish_apply(ctx, t0, out);
     }
     let ap = apply::apply_vfs(ops, sv, tv, &job.apply_opts(trash, verbose), ctx);
+    let mut out = ApplyOutcome { cancelled: ctx.ctl.cancelled(), ..ap };
     // A cancelled run does not refresh the archive: the user asked to "stop now", and re-reporting conflicts next round is safe anyway
-    if ap.errors == 0 && !ap.cancelled && job.mode == "sync" {
-        refresh_archive_with(job, plan, sv, &super::effective_scan_opts(job, sv, tv), ctx);
+    if out.errors == 0 && !out.cancelled && job.mode == "sync" {
+        let refreshed = refresh_archive_with(job, plan, sv, &super::effective_scan_opts(job, sv, tv), ctx);
+        out.cancelled = ctx.ctl.cancelled();
+        if !refreshed {
+            if !out.cancelled {
+                out.errors += 1;
+            }
+        }
     }
-    let out = ApplyOutcome { cancelled: ctx.ctl.cancelled(), ..ap };
-    ctx.sink.emit(ProgressEvent::Summary {
-        ts_ms: crate::foundation::time::now_ms(),
-        done: out.done,
-        skipped: out.skipped,
-        errors: out.errors,
-        bytes_done: out.bytes_copied,
-        elapsed_ms: t0.elapsed().as_millis() as u64,
-        paused_ms: ctx.ctl.paused_total_ms(),
-        cancelled: out.cancelled,
-    });
-    out
+    finish_apply(ctx, t0, out)
 }
 
 /// End-to-end run for local/mounted-disk jobs (the body of the original CLI run). Returns (done, skipped, errors, conflicts).
@@ -511,8 +534,9 @@ mod tests {
     use super::*;
     use crate::fs::vfs::memory::MemVfs;
     use crate::fs::vfs::Vfs;
-    use crate::obs::progress::RunCtx;
-    use std::sync::Arc;
+    use crate::model::event::ProgressEvent;
+    use crate::obs::progress::{RunCtl, RunCtx};
+    use std::sync::{Arc, Mutex};
 
     /// The generic VFS lane end to end: `as_local()` is None on both sides, so this drives
     /// `scan_vfs` rather than the walkdir fast path, then compares and plans.
@@ -606,5 +630,45 @@ mod tests {
             Ok(_) => panic!("an unknown scheme must not resolve"),
         };
         assert!(e.to_string().contains("unknown scheme"), "{e}");
+    }
+
+    #[test]
+    fn apply_resolution_refusal_emits_exactly_one_terminal_summary() {
+        let sv = Arc::new(MemVfs::new("terminal-src")) as Arc<dyn Vfs>;
+        let tv = Arc::new(MemVfs::new("terminal-tgt")) as Arc<dyn Vfs>;
+        let job = Job::default();
+        let plan = compare_resolved(&job, &sv, &tv, &RunCtx::null(), false).unwrap().plan;
+
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let copy = events.clone();
+        let ctx = RunCtx::new(RunCtl::new(), Arc::new(move |ev| copy.lock().unwrap().push(ev)));
+        let mut broken = job;
+        broken.source = "sfpt://typo/data".into();
+        let out = apply_job_guarded_with(&broken, &plan, &[], None, false, false, false, &ctx);
+
+        assert_eq!(out.errors, 1);
+        let events = events.lock().unwrap();
+        assert_eq!(events.iter().filter(|e| matches!(e, ProgressEvent::Summary { .. })).count(), 1);
+        assert!(matches!(events.last(), Some(ProgressEvent::Summary { errors: 1, cancelled: false, .. })));
+    }
+
+    #[test]
+    fn terminal_summary_observes_a_last_moment_cancel_request() {
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let copy = events.clone();
+        let ctl = RunCtl::new();
+        ctl.request_cancel();
+        let ctx = RunCtx::new(ctl, Arc::new(move |ev| copy.lock().unwrap().push(ev)));
+
+        let out = finish_apply(
+            &ctx,
+            std::time::Instant::now(),
+            crate::obs::progress::ApplyOutcome::default(),
+        );
+        assert!(out.cancelled);
+        assert!(matches!(events.lock().unwrap().last(), Some(ProgressEvent::Summary {
+            cancelled: true,
+            ..
+        })));
     }
 }

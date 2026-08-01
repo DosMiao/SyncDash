@@ -8,10 +8,28 @@ use std::sync::Arc;
 use syncdash::model::plan::{Action, Op, Plan};
 use syncdash::pipeline::compare;
 use syncdash::{job, run};
+use tauri::Emitter;
 
 use crate::bridge::make_ctx;
 use crate::dto::{ApplyDto, PlanDto, PreflightDto};
-use crate::state::{begin_run, end_run, resolve_target, user_err, RunState, CachedSnaps, SnapCache};
+use crate::state::{
+    begin_run, begin_run_for_launch, end_run, release_progress_launch, resolve_target, user_err,
+    CachedSnaps, RunState, SnapCache,
+};
+
+#[derive(Clone, serde::Serialize)]
+struct RunRejected {
+    launch_id: u64,
+    message: String,
+}
+
+struct ActiveRunGuard(Arc<RunState>);
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        end_run(&self.0);
+    }
+}
 
 /// Request cooperative cancellation of the active run. Returns whether an active run existed.
 #[tauri::command]
@@ -52,6 +70,7 @@ pub async fn compare_job(
         let (_n, job) = job::load(&name).map_err(|e| e.to_string())?;
         let job = resolve_target(&job, target_index)?;
         let (run_id, ctl) = begin_run(&st)?;
+        let _active_run = ActiveRunGuard(st.clone());
         let ctx = make_ctx(&app, run_id, ctl, "compare");
         // Take over the process-level log outlet during compare too: the diagnostics in `trash`/`lock`/`scan`
         // that cannot reach a ctx go through the macro registry, and without installing here they fall back to stderr — in a windowed build that means never said.
@@ -74,7 +93,6 @@ pub async fn compare_job(
         // A degraded run without consent refuses with the NeedsAck lines; the frontend shows
         // them and re-invokes with accept_caps=true if the user agrees.
         let r = run::compare(&name, &job, &ctx, accept_caps.unwrap_or(false));
-        end_run(&st);
         // compare has no side effects: one index line, no directory. A 30s watch cycle = 2880 runs a day,
         // and creating a directory each time would flood the log disk.
         syncdash::obs::runlog::compare_summary(
@@ -147,11 +165,15 @@ pub async fn apply_job(
     acknowledged: bool,
     target_index: Option<usize>,
     accept_caps: Option<bool>,
+    launch_id: Option<u64>,
 ) -> Result<ApplyDto, String> {
     let st = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let (_n, job) = job::load(&name).map_err(|e| e.to_string())?;
-        let job = resolve_target(&job, target_index)?;
+    let reject_state = state.inner().clone();
+    let requested_launch = launch_id;
+    let run_app = app.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || -> Result<ApplyDto, (String, bool)> {
+        let (_n, job) = job::load(&name).map_err(|e| (e.to_string(), false))?;
+        let job = resolve_target(&job, target_index).map_err(|e| (e, false))?;
         let full = Plan { header: plan.header.clone(), ops: plan.ops.clone() };
         let ops: Vec<Op> = ops
             .into_iter()
@@ -160,10 +182,11 @@ pub async fn apply_job(
         // Touch nothing when a gate fails, and hand the reason back to the UI
         let v = run::preflight(&job, &full, &ops, acknowledged);
         if !v.ok() {
-            return Err(v.blockers.join("\n"));
+            return Err((v.blockers.join("\n"), false));
         }
-        let (run_id, ctl) = begin_run(&st)?;
-        let ctx = make_ctx(&app, run_id, ctl, "apply");
+        let (run_id, ctl) = begin_run_for_launch(&st, launch_id).map_err(|e| (e, false))?;
+        let _active_run = ActiveRunGuard(st.clone());
+        let ctx = make_ctx(&run_app, run_id, ctl, "apply");
         // M4: every real apply writes a run-log entry (the Recorder also collects error events into the detail file)
         let t0 = std::time::Instant::now();
         let rec = syncdash::obs::runlog::Recorder::start(&name, &run::run_kind(&job, "apply"), &ctx, &ops);
@@ -173,13 +196,9 @@ pub async fn apply_job(
             &name, &job, &full, &ops, None, false, acknowledged, accept_caps.unwrap_or(false), &rec.ctx,
         ) {
             Ok(o) => o,
-            Err(e) => {
-                end_run(&st);
-                return Err(user_err(e));
-            }
+            Err(e) => return Err((user_err(e), true)),
         };
         rec.finish(&out, t0.elapsed().as_millis() as u64);
-        end_run(&st);
         Ok(ApplyDto {
             done: out.done,
             skipped: out.skipped,
@@ -188,6 +207,60 @@ pub async fn apply_job(
             cancelled: out.cancelled,
         })
     })
-    .await
-    .map_err(|e| e.to_string())?
+    .await;
+    let result = match joined {
+        Ok(result) => result,
+        Err(e) => {
+            let message = e.to_string();
+            if let Some(launch_id) = requested_launch {
+                // A panic before begin leaves the reservation pending; a panic after begin has
+                // consumed it (and ActiveRunGuard has already released the active slot). In both
+                // cases the same launch needs a terminal signal or its window waits forever.
+                release_progress_launch(&reject_state, launch_id);
+                let _ = app.emit(
+                    "run-rejected",
+                    RunRejected { launch_id, message: message.clone() },
+                );
+            }
+            return Err(message);
+        }
+    };
+    match result {
+        Ok(out) => Ok(out),
+        Err((message, began)) => {
+            if !began {
+                if let Some(launch_id) = requested_launch {
+                    if release_progress_launch(&reject_state, launch_id) {
+                        let _ = app.emit(
+                            "run-rejected",
+                            RunRejected { launch_id, message: message.clone() },
+                        );
+                    }
+                }
+            }
+            Err(message)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_run_guard_releases_state_during_unwind() {
+        let state = Arc::new(RunState::default());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let state = state.clone();
+            move || {
+                begin_run(&state).unwrap();
+                let _active_run = ActiveRunGuard(state.clone());
+                panic!("worker panic");
+            }
+        }));
+
+        assert!(result.is_err());
+        assert!(state.active.lock().unwrap().is_none());
+        assert!(begin_run(&state).is_ok());
+    }
 }

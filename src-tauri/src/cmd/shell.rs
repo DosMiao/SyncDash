@@ -57,27 +57,120 @@ pub fn post_sync_action(kind: String) -> Result<(), String> {
 /// on about:blank (an all-white window) and close events never get queued (it looks like "the whole app won't close").
 /// An async command runs on its own thread, so window creation is proxied through the event loop correctly.
 #[tauri::command]
-pub async fn open_progress_window(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri::Manager;
-    if let Some(w) = app.get_webview_window("progress") {
-        let _ = w.show();
-        let _ = w.set_focus();
-        return Ok(());
+pub async fn open_progress_window(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Arc<crate::state::RunState>>,
+) -> Result<u64, String> {
+    let st = state.inner().clone();
+    let launch_id = crate::state::reserve_progress_launch(&st)?;
+    match prepare_progress_window(&app, launch_id).await {
+        Ok(()) => Ok(launch_id),
+        Err(e) => {
+            crate::state::release_progress_launch(&st, launch_id);
+            Err(e)
+        }
     }
-    tauri::WebviewWindowBuilder::new(&app, "progress", tauri::WebviewUrl::App("progress.html".into()))
-        .title("SyncDash — Run")
-        .inner_size(620.0, 500.0)
-        .min_inner_size(440.0, 380.0)
-        .build()
-        .map_err(|e| e.to_string())?;
+}
+
+async fn wait_for_window_signal(
+    rx: std::sync::mpsc::Receiver<()>,
+    failure: &'static str,
+) -> Result<(), String> {
+    let received = tauri::async_runtime::spawn_blocking(move || {
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    received.map_err(|_| failure.to_string())
+}
+
+async fn prepare_progress_window(app: &tauri::AppHandle, launch_id: u64) -> Result<(), String> {
+    use tauri::{Emitter, Listener, Manager};
+
+    let window = if let Some(window) = app.get_webview_window("progress") {
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+        window
+    } else {
+        let (mounted_tx, mounted_rx) = std::sync::mpsc::sync_channel(1);
+        let mounted_listener = app.once("progress-window-mounted", move |_| {
+            let _ = mounted_tx.send(());
+        });
+        let built = tauri::WebviewWindowBuilder::new(app, "progress", tauri::WebviewUrl::App("progress.html".into()))
+            .title("SyncDash — Run")
+            .inner_size(620.0, 500.0)
+            .min_inner_size(440.0, 380.0)
+            .build()
+            .map_err(|e| e.to_string());
+        let window = match built {
+            Ok(window) => window,
+            Err(e) => {
+                app.unlisten(mounted_listener);
+                return Err(e);
+            }
+        };
+        let mounted = wait_for_window_signal(
+            mounted_rx,
+            "Progress window did not load; synchronization was not started",
+        )
+        .await;
+        app.unlisten(mounted_listener);
+        if let Err(e) = mounted {
+            let _ = window.destroy();
+            return Err(e);
+        }
+        window
+    };
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let ready_event = format!("progress-window-ready-{launch_id}");
+    let ready_listener = app.once(ready_event, move |_| {
+        let _ = ready_tx.send(());
+    });
+    if let Err(e) = window.emit("progress-window-arm", launch_id) {
+        app.unlisten(ready_listener);
+        let _ = window.destroy();
+        return Err(e.to_string());
+    }
+    let ready = wait_for_window_signal(
+        ready_rx,
+        "Progress window did not acknowledge this run; synchronization was not started",
+    )
+    .await;
+    app.unlisten(ready_listener);
+    if let Err(e) = ready {
+        let _ = window.destroy();
+        return Err(e);
+    }
     Ok(())
+}
+
+#[tauri::command]
+pub fn cancel_progress_launch(
+    state: tauri::State<'_, std::sync::Arc<crate::state::RunState>>,
+    launch_id: u64,
+) -> bool {
+    crate::state::release_progress_launch(state.inner(), launch_id)
+}
+
+#[tauri::command]
+pub fn close_progress_launch(
+    state: tauri::State<'_, std::sync::Arc<crate::state::RunState>>,
+) -> &'static str {
+    crate::state::close_progress_launch(state.inner())
 }
 
 /// Destroy the progress sub-window. Not hide: a hidden sub-window keeps the process alive after the main window closes
 #[tauri::command]
-pub async fn close_progress_window(app: tauri::AppHandle) {
+pub async fn close_progress_window(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, std::sync::Arc<crate::state::RunState>>,
+) -> Result<(), String> {
     use tauri::Manager;
-    if let Some(w) = app.get_webview_window("progress") {
-        let _ = w.destroy();
-    }
+    let result = match app.get_webview_window("progress") {
+        Some(w) => w.destroy().map_err(|e| e.to_string()),
+        None => Ok(()),
+    };
+    crate::state::finish_progress_window_close(state.inner());
+    result
 }

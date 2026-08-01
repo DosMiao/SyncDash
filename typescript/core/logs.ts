@@ -71,6 +71,11 @@ export function parseLogLine(raw: string, view: LogView): LogRow | null {
     }
     case 'phase_start':
       return { ts, level: 'info', scope: 'phase', text: `▶ ${v.phase}${v.label ? `  ${v.label}` : ''}`, hay: String(v.label ?? '') };
+    case 'phase_end': {
+      const mark = v.status === 'completed' ? '✓' : v.status === 'cancelled' ? '■' : '✕';
+      const level = v.status === 'failed' ? 'error' : 'info';
+      return { ts, level, scope: 'phase', text: `${mark} ${v.phase} · ${v.status}`, hay: String(v.phase ?? '') };
+    }
     case 'summary': {
       const t = `■ Done: ${v.done} run, ${v.skipped} skipped, ${v.errors} errors · ${humanSize(Number(v.bytes_done)) || '0 B'} · ${((Number(v.elapsed_ms)) / 1000).toFixed(1)}s${v.cancelled ? ' · cancelled' : ''}`;
       return { ts, level: Number(v.errors) ? 'error' : 'info', scope: 'final', text: t, hay: t };

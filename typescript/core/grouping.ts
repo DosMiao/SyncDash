@@ -1,66 +1,80 @@
-// Display order for the diff table: which rows, in what sequence, under which directory headings.
+// Display order for the diff table: which rows, in what sequence, under which directory nodes.
 //
-// This used to be split in two — filter.ts decided row order, App.tsx decided group order, and
-// neither could see the other. The only way to keep them consistent was to forbid one of them, which
-// is why sorting used to drop you out of the tree. Both live here now, so a sort can order rows
-// *inside* each directory and order the directories themselves by the same key.
-//
-// filter.ts still decides membership, and it returns plan order. This file is the only thing that
-// decides sequence — except finalIdx(), which deliberately ignores both: what a run executes is the
-// engine's order, because a directory delete has to follow the children inside it.
+// filter.ts decides membership and returns plan order. This file is the only display sequencer: it
+// builds a directory trie, sorts rows and sibling folders, and flattens the result for the virtual
+// table. finalIdx() deliberately ignores this order because apply must keep the engine's order (a
+// directory delete has to follow the children inside it).
 
-import { dirOf } from './format';
-import { eff, keySpec, selectable, sortVal } from './plan';
-import type { PlanDto, Sort } from './plan';
+import { baseOf, dirOf } from './format.ts';
+import { eff, keySpec, selectable, sortVal } from './plan.ts';
+import type { OpDto, PlanDto, Sort } from './plan.ts';
 
-/// One rendered line. A flat array of these is what the virtual scroller consumes: it measures one
-/// row and one group row, so the two kinds must stay distinguishable and the array must stay flat.
-// A normal row is just its plan index. Keeping `{ kind: 'row', i, groupDir }` for every visible
-// item looked harmless at 20k rows, but a large compare can hold hundreds of thousands: the
-// "virtual" table then retained one extra JS object per row before it rendered a single line.
-// Group headers need metadata and stay objects; member rows recover their directory from the op.
+/// The structural folder that owns one operation. A directory deletion targets the directory
+/// itself, while every other operation targets an entry inside its parent. Sharing this rule with
+/// the table and context menu keeps folder selection, display, and commands on the same scope.
+export function treeDirOf(op: OpDto): string {
+  return op.action === 'delete_dir' ? op.path : dirOf(op.path);
+}
+
+/// One rendered line. Normal rows stay bare plan indices: at hundreds of thousands of operations,
+/// allocating an object per file would erase much of the virtual table's memory saving. Folder
+/// rows are few enough to carry their presentation and subtree-range metadata.
 export type RowSpec =
   | number
-  | { kind: 'grp'; dir: string; items: number[]; sel: number[]; bytes: number };
+  | {
+    kind: 'folder';
+    /// Stable full relative path. Empty string is the compatibility bucket for root-level files.
+    dir: string;
+    depth: number;
+    /// The folder's descendants occupy one range in PlanLayout.order. This lets a parent checkbox
+    /// address its whole visible subtree without copying every descendant index onto every ancestor.
+    start: number;
+    end: number;
+    count: number;
+    selectable: number;
+    bytes: number;
+  };
 
-export interface GroupSpec {
+/// One node in the directory trie. `direct` owns every row exactly once; aggregates cover the
+/// complete visible subtree. The synthetic forest root is not represented. A `dir === ''` node is
+/// shown only when root-level files exist and remains a sibling of real top-level folders, matching
+/// the old `(root)` group rather than turning it into a select/collapse handle for the whole tree.
+export interface FolderNode {
   dir: string;
-  /// Every member, in display order
-  items: number[];
-  /// The members that can be checked — conflicts and notes are reports, so a group of only those
-  /// has an empty `sel` and a disabled checkbox
-  sel: number[];
-  /// Σ of the members' op sizes: "how much this group's operations move". Deliberately *not* the
-  /// same quantity as the s.size/t.size sort aggregate, which sums a measured side — the header you
-  /// clicked names a side, while this line describes the operation.
-  bytes: number;
-  /// Lowest member index, i.e. where this directory first appears in plan order. Used as the
-  /// unsorted group order and as the group comparator's tie-break, and unique because indices are.
+  depth: number;
+  direct: number[];
+  children: FolderNode[];
   first: number;
+  start: number;
+  end: number;
+  count: number;
+  selectable: number;
+  bytes: number;
+}
+
+interface WorkFolder extends FolderNode {
+  id: number;
+  children: WorkFolder[];
 }
 
 export interface PlanLayout {
-  /// Visible rows in display order — what the CSV exports and what flattenLayout walks
+  /// Visible rows in display order — what CSV exports and flattenLayout walks.
   order: number[];
-  /// null when the view is flat (grouping off)
-  groups: GroupSpec[] | null;
+  /// null when the view is flat; otherwise the roots of the real directory tree.
+  tree: FolderNode[] | null;
 }
 
 export interface LayoutInput {
   plan: PlanDto;
   flipped: boolean[];
-  /// From computeVisible(): membership, in plan order
+  /// From computeVisible(): membership, in plan order.
   visible: number[];
   grouped: boolean;
   sort: Sort | null;
 }
 
-/// Ranks two entries by their precomputed keys. `sign` scales the value comparison and nothing else:
-/// a missing side sorts last in both directions, and the caller's index tie-break stays ascending
-/// whichever way you clicked, so flipping direction never scrambles entries that compare equal.
-///
-/// A key is numeric *or* text, never both — `keySpec().kind` decides which array was filled — so the
-/// two are separate functions rather than one that reads an array it knows is empty.
+/// Ranks two entries by precomputed keys. A missing side sorts last in both directions, while the
+/// caller supplies a stable plan-order tie-break.
 type Rank = (a: number, b: number) => number;
 
 function numRank(miss: ArrayLike<number>, num: ArrayLike<number>, sign: 1 | -1): Rank {
@@ -71,24 +85,18 @@ function textRank(miss: ArrayLike<number>, text: ArrayLike<string>, sign: 1 | -1
   return (a, b) => (miss[a] - miss[b]) || (text[a] < text[b] ? -sign : text[a] > text[b] ? sign : 0);
 }
 
-/// Rows in display order, plus the directory groups when grouping is on.
+/// Rows in display order, plus a directory forest when tree grouping is on.
 ///
-/// Bucket first, then sort. Sorting first and taking contiguous runs — which is what the old code
-/// did — shatters every directory into singletons the moment you sort by anything but path. It is
-/// also slower: bucketing is an O(n) pass you need regardless, and sorting inside 2000 small buckets
-/// costs a fraction of one global sort over 20000 rows.
+/// Explicit sorts are hierarchical: direct rows are sorted inside their folder, and child folders
+/// are sorted among their siblings using a fold over each complete subtree. Without a sort, first
+/// appearance in plan order remains the ordering contract.
 export function buildLayout(inp: LayoutInput): PlanLayout {
   const { plan, flipped, visible, grouped, sort } = inp;
   const n = plan.ops.length;
 
-  // Key precompute, shared by both levels. Sized over the whole plan and filled only at visible
-  // indices, so a row's key is addressable by its plan index with no indirection. Computing keys
-  // inside the comparator instead would mean hundreds of thousands of eff()/metaOf() calls.
   const isText = !!sort && keySpec(sort.key).kind === 'text';
   const rowMiss = new Int8Array(sort ? n : 0);
   const rowNum = new Float64Array(sort && !isText ? n : 0);
-  // Allocated only for text keys: the numeric keys are the common ones, and filling 20k empty
-  // strings on every size click is pure waste
   const rowText: string[] = new Array(sort && isText ? n : 0);
   if (sort) {
     for (const i of visible) {
@@ -97,107 +105,189 @@ export function buildLayout(inp: LayoutInput): PlanLayout {
       if (isText) rowText[i] = text; else rowNum[i] = num;
     }
   }
-  // `|| a - b` makes each comparator a total order rather than merely stable: same input, same
-  // output, whatever the engine's sort does with equal elements
   const rankRow: Rank | null = !sort ? null
     : isText ? textRank(rowMiss, rowText, sort.dir) : numRank(rowMiss, rowNum, sort.dir);
   const cmpRow = rankRow && ((a: number, b: number) => rankRow(a, b) || a - b);
 
   if (!grouped) {
-    // `visible` is returned as-is when there is nothing to reorder: it is treated as immutable
-    // everywhere, and copying 20k indices to hand back the same sequence buys nothing
-    if (!cmpRow) return { order: visible, groups: null };
-    return { order: [...visible].sort(cmpRow), groups: null };
+    if (!cmpRow) return { order: visible, tree: null };
+    return { order: [...visible].sort(cmpRow), tree: null };
   }
 
-  // One group per directory — not per contiguous run. A directory holding both a copy and a delete
-  // used to produce two group rows, because the engine ranks by action before path; merging fixes
-  // that, and makes the group's dir a unique React key that survives a re-sort.
-  const byDir = new Map<string, GroupSpec>();
-  let groups: GroupSpec[] = [];
+  const roots: WorkFolder[] = [];
+  const byDir = new Map<string, WorkFolder>();
+  let nextId = 0;
+
+  const makeFolder = (dir: string, depth: number, first: number, parent: WorkFolder | null): WorkFolder => {
+    const node: WorkFolder = {
+      id: nextId++, dir, depth, direct: [], children: [], first,
+      start: 0, end: 0, count: 0, selectable: 0, bytes: 0,
+    };
+    byDir.set(dir, node);
+    if (parent) parent.children.push(node); else roots.push(node);
+    return node;
+  };
+
+  /// Ensures every ancestor of `dir` exists exactly once. The empty path is intentionally a leaf
+  /// pseudo-folder for root files, never the parent of the real top-level nodes.
+  const ensureFolder = (dir: string, first: number): WorkFolder => {
+    // The dominant large-tree case is many files sharing one directory. Avoid splitting and
+    // rebuilding every prefix for every one of those rows after the node already exists.
+    const exact = byDir.get(dir);
+    if (exact) {
+      if (first < exact.first) exact.first = first;
+      return exact;
+    }
+    if (dir === '') {
+      return makeFolder('', 0, first, null);
+    }
+    let parent: WorkFolder | null = null;
+    let full = '';
+    const parts = dir.split('/');
+    for (let depth = 0; depth < parts.length; depth++) {
+      full = full ? `${full}/${parts[depth]}` : parts[depth];
+      let node = byDir.get(full);
+      if (!node) node = makeFolder(full, depth, first, parent);
+      if (first < node.first) node.first = first;
+      parent = node;
+    }
+    return parent!;
+  };
+
   for (const i of visible) {
-    const op = eff(plan, flipped, i);
-    const dir = dirOf(op.path);
-    let g = byDir.get(dir);
-    if (!g) {
-      // `visible` is ascending, so the index that creates the group is also its minimum
-      g = { dir, items: [], sel: [], bytes: 0, first: i };
-      byDir.set(dir, g);
-      groups.push(g);
-    }
-    g.items.push(i);
-    if (selectable(op)) g.sel.push(i);
-    g.bytes += op.size ?? 0;
+    const owner = ensureFolder(treeDirOf(eff(plan, flipped, i)), i);
+    owner.direct.push(i);
   }
 
-  if (sort && cmpRow) {
-    const { fold } = keySpec(sort.key);
-    for (const g of groups) g.items.sort(cmpRow);
+  // Folder sort aggregates are held once in compact parallel arrays. Keeping a descendant-index
+  // array on every ancestor would grow as rows x path depth on exactly the large trees that need
+  // virtualisation most.
+  const folderMiss = new Int8Array(nextId);
+  const folderNum = new Float64Array(sort && !isText ? nextId : 0);
+  const folderText: string[] = new Array(sort && isText ? nextId : 0);
+  const fold = sort ? keySpec(sort.key).fold : null;
+  const rankFolder: Rank | null = !sort ? null
+    : (isText || fold === 'dir')
+      ? textRank(folderMiss, folderText, sort.dir)
+      : numRank(folderMiss, folderNum, sort.dir);
 
-    // Fold each group's members into one value, then order the groups by it. Folds never depend on
-    // the direction — a group's aggregate has to be a property of the group, or "why is this folder
-    // above that one" stops having an answer you can check.
-    const nGroups = groups.length;
-    const groupMiss = new Int8Array(nGroups);
-    const groupNum = new Float64Array(isText ? 0 : nGroups);
-    const groupText: string[] = new Array(isText || fold === 'dir' ? nGroups : 0);
-    for (let k = 0; k < nGroups; k++) {
-      const g = groups[k];
+  // Explicit postorder: VFS and long-path inputs can be thousands of directories deep, beyond the
+  // JavaScript call stack even though the path itself is valid for that backend.
+  const postorder: WorkFolder[] = [];
+  const pending: WorkFolder[] = [...roots];
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    postorder.push(node);
+    for (const child of node.children) pending.push(child);
+  }
+
+  for (let p = postorder.length - 1; p >= 0; p--) {
+    const node = postorder[p];
+    if (cmpRow) node.direct.sort(cmpRow);
+
+    // `first` was maintained while the trie was built. Do not derive it with
+    // `Math.min(...direct)`: one directory can legitimately hold hundreds of thousands of rows,
+    // and spreading that array would overflow the JS call stack.
+    let first = node.first;
+    let count = node.direct.length;
+    let selectableCount = 0;
+    let bytes = 0;
+    for (const i of node.direct) {
+      const op = eff(plan, flipped, i);
+      if (selectable(op)) selectableCount++;
+      bytes += op.size ?? 0;
+    }
+    for (const child of node.children) {
+      first = Math.min(first, child.first);
+      count += child.count;
+      selectableCount += child.selectable;
+      bytes += child.bytes;
+    }
+    node.first = first;
+    node.count = count;
+    node.selectable = selectableCount;
+    node.bytes = bytes;
+
+    if (sort && fold) {
       if (fold === 'dir') {
-        // A path column's group value is the directory itself: folding member paths is circular,
-        // and would let one missing side sink a whole directory
-        groupText[k] = g.dir.toLowerCase();
-        continue;
+        // Siblings share the same parent prefix, so their segment is the meaningful tree key.
+        folderText[node.id] = node.dir === '' ? '' : baseOf(node.dir).toLowerCase();
+      } else {
+        let missing = 1;
+        let num = fold === 'sum' ? 0 : fold === 'min' ? Infinity : -Infinity;
+        let text = '';
+        const take = (miss: number, value: number, label: string): void => {
+          if (miss) return;
+          missing = 0;
+          if (isText) {
+            if (text === '' || (fold === 'min' ? label < text : label > text)) text = label;
+          } else if (fold === 'sum') num += value;
+          else if (fold === 'min') num = Math.min(num, value);
+          else num = Math.max(num, value);
+        };
+        for (const i of node.direct) take(rowMiss[i], rowNum[i], rowText[i]);
+        for (const child of node.children) {
+          take(folderMiss[child.id], folderNum[child.id], folderText[child.id]);
+        }
+        folderMiss[node.id] = missing;
+        if (isText) folderText[node.id] = text; else folderNum[node.id] = missing ? 0 : num;
       }
-      // A group has something to show in this column if *any* member does — the row-level rule,
-      // lifted one level
-      let missing = 1;
-      let value = fold === 'sum' ? 0 : fold === 'min' ? Infinity : -Infinity;
-      let text = '';
-      for (const i of g.items) {
-        if (rowMiss[i]) continue;
-        missing = 0;
-        if (isText) {
-          const t = rowText[i];
-          if (text === '' || (fold === 'min' ? t < text : t > text)) text = t;
-        } else if (fold === 'sum') value += rowNum[i];
-        else if (fold === 'min') value = Math.min(value, rowNum[i]);
-        else value = Math.max(value, rowNum[i]);
-      }
-      groupMiss[k] = missing;
-      if (isText) groupText[k] = text; else groupNum[k] = missing ? 0 : value;
     }
-    // `fold === 'dir'` writes a directory name, so it ranks as text whatever the key's own kind says
-    const rankGroup = isText || fold === 'dir'
-      ? textRank(groupMiss, groupText, sort.dir)
-      : numRank(groupMiss, groupNum, sort.dir);
-    // Pair each group with its index into the fold arrays, so the sort never has to read back into
-    // the array it is producing. Tie-break on first appearance, unique because plan indices are.
-    const ranked = groups.map((g, k) => ({ g, k }));
-    ranked.sort((x, y) => rankGroup(x.k, y.k) || x.g.first - y.g.first);
-    groups = ranked.map((r) => r.g);
+
+    node.children.sort((a, b) => (rankFolder?.(a.id, b.id) ?? 0) || a.first - b.first);
   }
 
+  roots.sort((a, b) => (rankFolder?.(a.id, b.id) ?? 0) || a.first - b.first);
+
+  // One shared DFS order makes every subtree a compact range. It powers CSV order, recursive
+  // checkbox state, and rendering while storing each operation index only once.
   const order: number[] = [];
-  for (const g of groups) for (const i of g.items) order.push(i);
-  return { order, groups };
+  const preorder: WorkFolder[] = [];
+  for (let r = roots.length - 1; r >= 0; r--) preorder.push(roots[r]);
+  while (preorder.length > 0) {
+    const node = preorder.pop()!;
+    node.start = order.length;
+    // Do not spread: a single flat directory can hold more rows than V8 accepts as call arguments.
+    for (const i of node.direct) order.push(i);
+    // DFS makes the subtree contiguous, and count was already aggregated bottom-up.
+    node.end = node.start + node.count;
+    for (let c = node.children.length - 1; c >= 0; c--) preorder.push(node.children[c]);
+  }
+
+  return { order, tree: roots };
 }
 
-/// The flat line list the table renders. Split from buildLayout so that folding a directory — which
-/// changes only which member rows are emitted — costs one O(n) pass instead of redoing the sort.
+/// Flattens the directory forest into the virtual table's line list. Collapsing one node suppresses
+/// both its direct rows and every descendant node, while leaving check state and layout.order intact.
 export function flattenLayout(layout: PlanLayout, collapsed: ReadonlySet<string>): RowSpec[] {
-  // `number[]` is already a valid RowSpec[] and is immutable by contract. In flat mode this avoids
-  // both a full-size copy and one object allocation per visible operation.
-  if (!layout.groups) return layout.order;
+  if (!layout.tree) return layout.order;
   const out: RowSpec[] = [];
-  for (const g of layout.groups) {
-    out.push({ kind: 'grp', dir: g.dir, items: g.items, sel: g.sel, bytes: g.bytes });
-    if (!collapsed.has(g.dir)) for (const i of g.items) out.push(i);
+  const pending: FolderNode[] = [];
+  for (let r = layout.tree.length - 1; r >= 0; r--) pending.push(layout.tree[r]);
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    out.push({
+      kind: 'folder', dir: node.dir, depth: node.depth,
+      start: node.start, end: node.end, count: node.count,
+      selectable: node.selectable, bytes: node.bytes,
+    });
+    if (collapsed.has(node.dir)) continue;
+    for (const i of node.direct) out.push(i);
+    for (let c = node.children.length - 1; c >= 0; c--) pending.push(node.children[c]);
   }
   return out;
 }
 
-/// Every directory currently shown, for "Collapse all". Unique by construction — one group per dir.
+/// Every currently shown directory key, recursively, for collapse/expand-all and stale-state checks.
 export function layoutDirs(layout: PlanLayout): string[] {
-  return layout.groups ? layout.groups.map((g) => g.dir) : [];
+  if (!layout.tree) return [];
+  const out: string[] = [];
+  const pending: FolderNode[] = [];
+  for (let r = layout.tree.length - 1; r >= 0; r--) pending.push(layout.tree[r]);
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    out.push(node.dir);
+    for (let c = node.children.length - 1; c >= 0; c--) pending.push(node.children[c]);
+  }
+  return out;
 }

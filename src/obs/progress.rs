@@ -13,7 +13,7 @@
 //! - Relation to the parallel line P2-6 (scan_with_progress/ScanProgress): this module is a superset;
 //!   the blanket closure impl lets `Fn(ProgressEvent)` serve as a sink directly, and the scan side bridges the old callback shape.
 
-use crate::model::event::{LogLevel, Phase, ProgressEvent};
+use crate::model::event::{LogLevel, Phase, PhaseStatus, ProgressEvent};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -201,6 +201,7 @@ impl ApplyOutcome {
 pub struct PhaseProgress<'a> {
     ctx: &'a RunCtx,
     phase: Phase,
+    ended: bool,
     items_done: AtomicU64,
     items_total: AtomicU64,
     bytes_done: AtomicU64,
@@ -219,6 +220,7 @@ impl<'a> PhaseProgress<'a> {
         PhaseProgress {
             ctx,
             phase,
+            ended: false,
             items_done: AtomicU64::new(0),
             items_total: AtomicU64::new(items_total),
             bytes_done: AtomicU64::new(0),
@@ -226,20 +228,19 @@ impl<'a> PhaseProgress<'a> {
         }
     }
 
-    /// Shift gears within a phase (scan: the walk counts "discovered", hashing switches to "processed") — resets the done count
-    pub fn restart_items(&self) {
+    /// Shift gears atomically within a phase: scan discovery counts found files, then hashing
+    /// starts a new processed-file epoch with exact totals.
+    pub fn restart_items_with_totals(&self, items: u64, bytes: u64) {
         self.items_done.store(0, Ordering::Relaxed);
+        self.items_total.store(items, Ordering::Relaxed);
+        self.bytes_total.store(bytes, Ordering::Relaxed);
+        self.emit_totals(true);
     }
 
     pub fn set_totals(&self, items: u64, bytes: u64) {
         self.items_total.store(items, Ordering::Relaxed);
         self.bytes_total.store(bytes, Ordering::Relaxed);
-        self.ctx.sink.emit(ProgressEvent::Totals {
-            phase: self.phase,
-            ts_ms: crate::foundation::time::now_ms(),
-            items_total: items,
-            bytes_total: bytes,
-        });
+        self.emit_totals(false);
     }
 
     fn snapshot(&self, current: &str) -> ProgressEvent {
@@ -261,6 +262,42 @@ impl<'a> PhaseProgress<'a> {
 
     pub fn add_bytes(&self, n: u64, current: &str) {
         self.bytes_done.fetch_add(n, Ordering::Relaxed);
+        self.ctx.sink.emit(self.snapshot(current));
+    }
+
+    /// Add work discovered only while applying (for example an external-volume trash copy).
+    /// The Totals snapshot carries the current done counters, so changing the denominator is
+    /// atomic for consumers and never fabricates a counter reset.
+    pub fn add_total_bytes(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.bytes_total.fetch_add(n, Ordering::Relaxed);
+        self.emit_totals(false);
+    }
+
+    /// Replace one operation's planned byte contribution with the source size observed at apply
+    /// time. A source may have changed since compare, and missing plan sizes contribute zero.
+    pub fn revise_total_bytes(&self, planned: u64, actual: u64) {
+        if planned == actual {
+            return;
+        }
+        if actual > planned {
+            self.bytes_total.fetch_add(actual - planned, Ordering::Relaxed);
+        } else {
+            let decrease = planned - actual;
+            let _ = self.bytes_total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                Some(total.saturating_sub(decrease))
+            });
+        }
+        self.emit_totals(false);
+    }
+
+    /// Mark an opaque successful stage complete when its worker only returns aggregate totals
+    /// (peer pack/apply). Ordinary file/chunk loops must keep using item_done/add_bytes.
+    pub fn complete(&self, current: &str) {
+        self.items_done.store(self.items_total.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.bytes_done.store(self.bytes_total.load(Ordering::Relaxed), Ordering::Relaxed);
         self.ctx.sink.emit(self.snapshot(current));
     }
 
@@ -289,6 +326,56 @@ impl<'a> PhaseProgress<'a> {
             self.bytes_done.load(Ordering::Relaxed),
             self.bytes_total.load(Ordering::Relaxed),
         )
+    }
+
+    fn emit_end(&self, status: PhaseStatus) {
+        let (items_done, items_total, bytes_done, bytes_total) = self.counts();
+        self.ctx.sink.emit(ProgressEvent::PhaseEnd {
+            phase: self.phase,
+            status,
+            ts_ms: crate::foundation::time::now_ms(),
+            items_done,
+            items_total,
+            bytes_done,
+            bytes_total,
+        });
+    }
+
+    /// Emit one authoritative, unthrottled boundary. Consuming self makes it impossible for a call
+    /// site to announce the same phase end twice; Drop covers early `?` exits as failed/cancelled.
+    pub fn finish(mut self) -> std::io::Result<()> {
+        self.ended = true;
+        let cancelled = self.ctx.ctl.cancelled();
+        let status = if cancelled { PhaseStatus::Cancelled } else { PhaseStatus::Completed };
+        self.emit_end(status);
+        if cancelled { Err(cancelled_err()) } else { Ok(()) }
+    }
+
+    /// End a phase that returned a handled failure rather than unwinding through `?`.
+    pub fn fail(mut self) {
+        self.ended = true;
+        self.emit_end(PhaseStatus::Failed);
+    }
+
+    fn emit_totals(&self, reset: bool) {
+        self.ctx.sink.emit(ProgressEvent::Totals {
+            phase: self.phase,
+            reset,
+            ts_ms: crate::foundation::time::now_ms(),
+            items_done: self.items_done.load(Ordering::Relaxed),
+            items_total: self.items_total.load(Ordering::Relaxed),
+            bytes_done: self.bytes_done.load(Ordering::Relaxed),
+            bytes_total: self.bytes_total.load(Ordering::Relaxed),
+        });
+    }
+}
+
+impl Drop for PhaseProgress<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            let status = if self.ctx.ctl.cancelled() { PhaseStatus::Cancelled } else { PhaseStatus::Failed };
+            self.emit_end(status);
+        }
     }
 }
 
@@ -374,12 +461,59 @@ mod tests {
         prog.add_bytes(200, "b.txt");
         prog.error("b.txt", "hash", "source", "boom");
         assert_eq!(prog.counts(), (2, 2, 300, 300));
+        prog.finish().unwrap();
         let evs = store.lock().unwrap();
         assert!(matches!(evs[0], ProgressEvent::PhaseStart { phase: Phase::ScanSource, .. }));
-        assert!(matches!(evs[1], ProgressEvent::Totals { items_total: 2, bytes_total: 300, .. }));
+        assert!(matches!(evs[1], ProgressEvent::Totals {
+            reset: false,
+            items_done: 0,
+            items_total: 2,
+            bytes_done: 0,
+            bytes_total: 300,
+            ..
+        }));
         assert_eq!(evs.iter().filter(|e| matches!(e, ProgressEvent::Progress { .. })).count(), 4);
         assert!(evs.iter().any(|e| matches!(e, ProgressEvent::Error { .. })));
+        assert!(matches!(evs.last(), Some(ProgressEvent::PhaseEnd {
+            phase: Phase::ScanSource,
+            status: PhaseStatus::Completed,
+            items_done: 2,
+            items_total: 2,
+            bytes_done: 300,
+            bytes_total: 300,
+            ..
+        })));
         let json = serde_json::to_string(&evs[1]).unwrap();
         assert!(json.contains("\"kind\":\"totals\"") && json.contains("\"scan-source\""), "serde shape: {json}");
+    }
+
+    #[test]
+    fn an_unfinished_phase_emits_a_failed_boundary_on_drop() {
+        let (ctx, store) = collecting_ctx();
+        {
+            let prog = PhaseProgress::begin(&ctx, Phase::ScanTarget, None, 10, 100);
+            prog.item_done("one");
+        }
+        assert!(matches!(store.lock().unwrap().last(), Some(ProgressEvent::PhaseEnd {
+            phase: Phase::ScanTarget,
+            status: PhaseStatus::Failed,
+            items_done: 1,
+            ..
+        })));
+    }
+
+    #[test]
+    fn a_cancelled_finish_propagates_interruption() {
+        let (ctx, store) = collecting_ctx();
+        let prog = PhaseProgress::begin(&ctx, Phase::ScanSource, None, 1, 0);
+        ctx.ctl.request_cancel();
+
+        let err = prog.finish().unwrap_err();
+        assert!(is_cancelled(&err));
+        assert!(matches!(store.lock().unwrap().last(), Some(ProgressEvent::PhaseEnd {
+            phase: Phase::ScanSource,
+            status: PhaseStatus::Cancelled,
+            ..
+        })));
     }
 }

@@ -342,8 +342,11 @@ pub(super) fn scan_impl(
         } else {
             0
         };
-        pp.set_totals(pending.len() as u64, bytes_to_hash);
-        pp.restart_items();
+        if opt.hash {
+            pp.restart_items_with_totals(pending.len() as u64, bytes_to_hash);
+        } else {
+            pp.set_totals(pending.len() as u64, bytes_to_hash);
+        }
     }
 
     let hash_err_count = std::sync::atomic::AtomicU64::new(0);
@@ -494,7 +497,7 @@ pub(super) fn scan_impl(
         crate::log_warn!("scan", "warning: {hash_errors} file(s) could not be hashed (in use / unreadable)");
     }
 
-    Ok(Snapshot {
+    let snapshot = Snapshot {
         header: Header {
             schema: SCHEMA,
             kind: "snapshot".into(),
@@ -516,7 +519,11 @@ pub(super) fn scan_impl(
             vfs: None,
         },
         entries,
-    })
+    };
+    if let Some(pp) = pp {
+        pp.finish()?;
+    }
+    Ok(snapshot)
 }
 
 #[cfg(test)]

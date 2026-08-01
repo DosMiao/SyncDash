@@ -12,19 +12,23 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, Pause, Play, RefreshCw, Square, TriangleAlert } from 'lucide-react';
-import { listen } from '@tauri-apps/api/event';
+import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, ProgressBarStatus } from '@tauri-apps/api/window';
-import { cancelRun, pauseRun, postSyncAction } from '../core/ipc';
+import { cancelRun, closeProgressLaunch, destroyProgressWindow, pauseRun, postSyncAction } from '../core/ipc';
 import { humanDuration, humanSize } from '../core/format';
 import { applyZoom, readZoom } from '../core/zoom';
 import { Graph } from './Graph';
 import type { RunEv, RunState, Sample } from './runstate';
-import { PHASE_LABEL, activeNow, newRunState, percent, windowRate } from './runstate';
+import { PHASE_LABEL, activeNow, endStage, newRunState, percent, startStage, windowRate } from './runstate';
 
 const win = getCurrentWindow();
 
+interface PendingLaunch { id: number; afterRunId: number }
+interface RunRejected { launch_id: number; message: string }
+
 export function ProgressApp() {
   const run = useRef<RunState>(newRunState());
+  const pendingLaunch = useRef<PendingLaunch | null>(null);
   // Bumping this is the only thing that re-renders; the tick below decides how often that happens
   const [, forceRender] = useState(0);
   const rerender = useCallback(() => forceRender((n) => n + 1), []);
@@ -33,6 +37,7 @@ export function ProgressApp() {
   const [whenFin, setWhenFin] = useState(() => localStorage.getItem('sd.whenfin') ?? 'none');
   const [countdown, setCountdown] = useState<{ kind: string; left: number } | null>(null);
   const [errorsOpen, setErrorsOpen] = useState(false);
+  const [rejected, setRejected] = useState<string | null>(null);
   /// Where the Stop button is in its own little lifecycle. A state rather than the button's caption:
   /// the enabled test used to be `label !== '■ Stop'`, which quietly turns into "always disabled" the
   /// day anyone edits the wording.
@@ -42,6 +47,19 @@ export function ProgressApp() {
   autocloseRef.current = autoclose;
   const whenFinRef = useRef(whenFin);
   whenFinRef.current = whenFin;
+
+  const armLaunch = useCallback((id: number) => {
+    const afterRunId = run.current.runId;
+    pendingLaunch.current = { id, afterRunId };
+    const reset = newRunState();
+    reset.runId = afterRunId;
+    run.current = reset;
+    setRejected(null);
+    setStop('idle');
+    setCountdown(null);
+    rerender();
+    void emit(`progress-window-ready-${id}`);
+  }, [rerender]);
 
   useEffect(() => {
     // This window opens fresh each run, so it has to re-assert the scale the main window is using
@@ -73,9 +91,14 @@ export function ProgressApp() {
   const onEvent = useCallback((ev: RunEv) => {
     const s = run.current;
     if (ev.purpose === 'compare') return;   // compare belongs to the main-window panel; this window only shows apply
+    const pending = pendingLaunch.current;
+    if (pending && ev.run_id <= pending.afterRunId) return;
     if (ev.run_id < s.runId) return;        // late event from an already-cancelled run
     if (ev.run_id > s.runId) {
+      const closeAfterStop = s.closeAfterStop;
       run.current = newRunState(ev.run_id, ev.ts_ms);
+      run.current.closeAfterStop = closeAfterStop;
+      setRejected(null);
       setStop('idle');
       setCountdown(null);
     }
@@ -84,39 +107,64 @@ export function ProgressApp() {
     switch (ev.kind) {
       case 'phase_start': {
         const p = ev.phase!;
-        // tick off the previous phase's row
-        if (st.phase && st.phase !== p) {
-          const prev = st.stages.find((x) => x.phase === st.phase);
-          if (prev) { prev.active = false; prev.done = true; }
-        }
         st.phase = p;
         let row = st.stages.find((x) => x.phase === p);
         if (!row) { row = { phase: p, detail: '', active: true, done: false }; st.stages.push(row); }
-        row.active = true;
-        row.done = false;
+        startStage(row);
         if (ev.label) row.detail = ev.label;
-        if (p === 'apply' || p === 'pack' || p === 'ship') st.applying = true;
-        if (p === 'apply') {
-          st.totals = { items: ev.items_total ?? 0, bytes: ev.bytes_total ?? 0 };
-          st.dones = { items: 0, bytes: 0 };
-          st.samples = [{ t: activeNow(st), b: 0, i: 0 }];
-        }
+        st.applying = true;
+        // The headline meter and graphs describe one coherent active phase. Reusing apply's done
+        // counters with refresh/ship totals produced arbitrary percentages and negative rates.
+        st.totals = { items: ev.items_total ?? 0, bytes: ev.bytes_total ?? 0 };
+        st.dones = { items: 0, bytes: 0 };
+        st.samples = [{ t: activeNow(st), b: 0, i: 0 }];
+        st.currentPath = '';
         break;
       }
       case 'totals':
-        if (ev.phase === st.phase) st.totals = { items: ev.items_total ?? 0, bytes: ev.bytes_total ?? 0 };
+        if (ev.phase === st.phase) {
+          st.totals = { items: ev.items_total ?? 0, bytes: ev.bytes_total ?? 0 };
+          st.dones = ev.reset
+            ? { items: ev.items_done ?? 0, bytes: ev.bytes_done ?? 0 }
+            : {
+                items: Math.max(st.dones.items, ev.items_done ?? 0),
+                bytes: Math.max(st.dones.bytes, ev.bytes_done ?? 0),
+              };
+          const sample = { t: activeNow(st), b: st.dones.bytes, i: st.dones.items };
+          if (ev.reset) st.samples = [sample];
+          else st.samples.push(sample);
+        }
         break;
       case 'progress': {
         let row = st.stages.find((x) => x.phase === ev.phase);
         if (!row) { row = { phase: ev.phase!, detail: '', active: true, done: false }; st.stages.push(row); }
         const it = ev.items_total ?? 0, bt = ev.bytes_total ?? 0;
         row.detail = `${ev.items_done ?? 0}${it ? ` / ${it}` : ''} items · ${humanSize(ev.bytes_done ?? 0)}${bt ? ` / ${humanSize(bt)}` : ''}`;
-        if (ev.phase === 'apply') {
-          st.dones = { items: ev.items_done ?? 0, bytes: ev.bytes_done ?? 0 };
+        if (ev.phase === st.phase) {
+          // Worker events can reach the webview in a different order. Totals is the explicit epoch
+          // reset (walk → hash); inside an epoch, counters never regress.
+          st.dones = {
+            items: Math.max(st.dones.items, ev.items_done ?? 0),
+            bytes: Math.max(st.dones.bytes, ev.bytes_done ?? 0),
+          };
           st.totals = { items: ev.items_total ?? st.totals.items, bytes: ev.bytes_total ?? st.totals.bytes };
           st.currentPath = ev.current_path ?? st.currentPath;
           st.samples.push({ t: activeNow(st), b: st.dones.bytes, i: st.dones.items } as Sample);
           if (st.samples.length > 4000) st.samples.splice(0, 1000);
+        }
+        break;
+      }
+      case 'phase_end': {
+        const row = st.stages.find((x) => x.phase === ev.phase);
+        if (row) {
+          endStage(row, ev.status);
+          const it = ev.items_total ?? 0, bt = ev.bytes_total ?? 0;
+          row.detail = `${ev.items_done ?? 0}${it ? ` / ${it}` : ''} items · ${humanSize(ev.bytes_done ?? 0)}${bt ? ` / ${humanSize(bt)}` : ''}`;
+        }
+        if (ev.phase === st.phase) {
+          st.dones = { items: ev.items_done ?? st.dones.items, bytes: ev.bytes_done ?? st.dones.bytes };
+          st.totals = { items: ev.items_total ?? st.totals.items, bytes: ev.bytes_total ?? st.totals.bytes };
+          st.samples.push({ t: activeNow(st), b: st.dones.bytes, i: st.dones.items });
         }
         break;
       }
@@ -148,6 +196,7 @@ export function ProgressApp() {
         rerender();
         break;
       case 'summary': {
+        pendingLaunch.current = null;
         st.summary = ev;
         st.running = false;
         st.pausedSince = 0;
@@ -157,8 +206,12 @@ export function ProgressApp() {
           st.dones = { items: st.totals.items, bytes: st.totals.bytes };
           st.samples.push({ t: activeNow(st), b: st.dones.bytes, i: st.dones.items });
         }
+        for (const row of st.stages) row.active = false;
         const cur = st.stages.find((x) => x.phase === st.phase);
-        if (cur) { cur.active = false; cur.done = true; cur.cancelled = !!ev.cancelled; }
+        if (cur && !cur.done && !cur.failed && !cur.cancelled) {
+          cur.cancelled = !!ev.cancelled;
+          cur.failed = !ev.cancelled;
+        }
         rerender();
         if (st.closeAfterStop) { win.close().catch(() => {}); break; }
         if (ev.cancelled) break;
@@ -166,16 +219,46 @@ export function ProgressApp() {
           setTimeout(() => { if (run.current.summary) win.close().catch(() => {}); }, 1200);
           break;
         }
-        if (whenFinRef.current !== 'none' && st.applying) setCountdown({ kind: whenFinRef.current, left: 10 });
+        if ((ev.errors ?? 0) === 0 && whenFinRef.current !== 'none' && st.applying) {
+          setCountdown({ kind: whenFinRef.current, left: 10 });
+        }
         break;
       }
     }
   }, [rerender]);
 
   useEffect(() => {
-    const un = listen<RunEv>('run-progress', (e) => onEvent(e.payload));
-    return () => { un.then((f) => f()); };
-  }, [onEvent]);
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void Promise.all([
+      listen<RunEv>('run-progress', (e) => onEvent(e.payload)),
+      listen<RunRejected>('run-rejected', (e) => {
+        const pending = pendingLaunch.current;
+        if (!pending || e.payload.launch_id !== pending.id) return;
+        pendingLaunch.current = null;
+        const closeAfterStop = run.current.closeAfterStop;
+        const reset = newRunState();
+        reset.runId = pending.afterRunId;
+        run.current = reset;
+        setRejected(e.payload.message);
+        setStop('finished');
+        rerender();
+        if (closeAfterStop) destroyProgressWindow().catch(() => {});
+      }),
+      listen<number>('progress-window-arm', (e) => armLaunch(e.payload)),
+    ]).then(async (stops) => {
+      if (disposed) {
+        for (const stopListening of stops) stopListening();
+        return;
+      }
+      unlisten = () => { for (const stopListening of stops) stopListening(); };
+      await emit('progress-window-mounted');
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [armLaunch, onEvent, rerender]);
 
   // The numeric readouts step every 500ms (same divider as FFS — figures that flip ten times a second
   // are unreadable). The graphs keep their own 100ms repaint inside <Graph>, off the React tree.
@@ -191,6 +274,7 @@ export function ProgressApp() {
   useEffect(() => {
     const title = s.summary
       ? (s.summary.cancelled ? 'Stopped — SyncDash' : 'Done — SyncDash')
+      : rejected ? 'Could not start — SyncDash'
       : s.applying ? `${Math.round(pct)}% — SyncDash` : `${s.phase ? PHASE_LABEL[s.phase] : 'Running'} — SyncDash`;
     win.setTitle(title).catch(() => {});
     if (s.summary) win.setProgressBar({ status: ProgressBarStatus.None }).catch(() => {});
@@ -200,25 +284,54 @@ export function ProgressApp() {
         progress: Math.round(pct),
       }).catch(() => {});
     }
-  });
+  }, [paused, pct, rejected, s.applying, s.phase, s.summary]);
 
   // Close button = FFS semantics: while running, cooperatively cancel first and leave once Summary arrives
   useEffect(() => {
     const un = win.onCloseRequested(async (e) => {
-      const st = run.current;
-      if (st.running && !st.summary) {
-        e.preventDefault();
-        st.closeAfterStop = true;
+      e.preventDefault();
+      // React's view may still describe the previous run while a new launch is being armed. Ask
+      // the backend first: clearing a pending reservation or cancelling the matching interactive
+      // run is atomic with begin_run_for_launch, so a close can never start a headless sync.
+      run.current.closeAfterStop = true;
+      const launchState = await closeProgressLaunch().catch(() => null);
+      if (launchState === null) return;
+      let current = run.current;
+      current.closeAfterStop = true;
+      if (launchState === 'pending') {
+        pendingLaunch.current = null;
+        destroyProgressWindow().catch(() => {});
+        return;
+      }
+      if (launchState === 'active') {
+        if (current.summary) destroyProgressWindow().catch(() => {});
+        else setStop('stopping');
+        return;
+      }
+
+      // No interactive launch is pending/active. The window can still be showing an unattended
+      // apply; retain the prior cooperative-cancel behavior for that case.
+      if (current.running && !current.summary) {
         setStop('stopping');
-        if (st.pausedSince) { st.pausedSince = 0; await pauseRun(false).catch(() => {}); }
-        const had = await cancelRun().catch(() => false);
+        if (current.pausedSince) { current.pausedSince = 0; await pauseRun(false).catch(() => {}); }
+        const had = await cancelRun().catch(() => null);
+        if (had === null) return;
         if (!had) {
-          // nothing running on the engine side (Summary lost / already finished) — let the close through;
-          // never leave the window unclosable
-          st.running = false;
-          win.destroy().catch(() => {});
+          // Catch a launch reserved while cancelRun was in flight before destroying the window.
+          const racedLaunch = await closeProgressLaunch().catch(() => null);
+          if (racedLaunch === null) return;
+          current = run.current;
+          current.closeAfterStop = true;
+          if (racedLaunch === 'active') {
+            setStop('stopping');
+            return;
+          }
+          if (racedLaunch === 'pending') pendingLaunch.current = null;
+        } else {
+          return;
         }
       }
+      destroyProgressWindow().catch(() => {});
     });
     return () => { un.then((f) => f()); };
   }, []);
@@ -227,8 +340,16 @@ export function ProgressApp() {
   const nErr = s.errors.filter((e) => !e.warning).length;
   const nWarn = s.errors.length - nErr;
 
+  const countersExhausted = s.totals.items + s.totals.bytes > 0
+    && (s.totals.items === 0 || s.dones.items >= s.totals.items)
+    && (s.totals.bytes === 0 || s.dones.bytes >= s.totals.bytes);
+  // The copy loop reports its final byte before seal/fsync/verify/preserve/commit completes the
+  // item. On an external mirror, preservation may itself be a long cross-volume copy.
+  const finalizing = countersExhausted
+    || (s.totals.bytes > 0 && s.dones.bytes >= s.totals.bytes);
   const eta = (() => {
     if (s.summary) return '—';
+    if (finalizing) return 'Finalizing…';
     if (r60 && s.totals.bytes > 0 && r60.bps > 1) return humanDuration(Math.max(0, s.totals.bytes - s.dones.bytes) / r60.bps * 1000) + ' remaining';
     if (r60 && s.totals.items > 0 && r60.ips > 0.01) return humanDuration(Math.max(0, s.totals.items - s.dones.items) / r60.ips * 1000) + ' remaining';
     return 'Estimating…';
@@ -243,8 +364,9 @@ export function ProgressApp() {
             ? (s.summary.cancelled
               ? `Cancelled — ${s.summary.done} applied, ${s.summary.skipped} skipped`
               : `Done — ${s.summary.done} applied, ${s.summary.skipped} skipped, ${s.summary.errors} errors · ${humanSize(s.summary.bytes_done ?? 0)} · ${humanDuration(s.summary.elapsed_ms ?? 0)}`)
+            : rejected ? `Could not start — ${rejected}`
             : s.running
-              ? <>{paused && <><Pause size={12} /> Paused — </>}{s.phase ? PHASE_LABEL[s.phase] : ''}</>
+              ? <>{paused && <><Pause size={12} /> Paused — </>}{s.phase ? PHASE_LABEL[s.phase] : ''}{finalizing ? ' — Finalizing' : ''}</>
               : 'Waiting for a run…'}
         </span>
         <span
@@ -252,6 +374,7 @@ export function ProgressApp() {
         >
           {s.summary
             ? (s.summary.cancelled ? 'Stopped' : `${Math.round(pct)}%`)
+            : rejected ? 'Failed'
             : s.running ? (s.applying ? `${Math.round(pct)}%` : '…') : '—'}
         </span>
       </div>
@@ -260,9 +383,11 @@ export function ProgressApp() {
         {s.stages.map((row) => (
           <div key={row.phase} className={'stagerow' + (row.active ? ' active' : '') + (row.done ? ' done' : '')}>
             <span className="st-ico">
-              {row.done
-                ? (row.cancelled ? <Square size={12} /> : <Check size={13} />)
-                : <RefreshCw size={13} className={row.active ? 'spin' : ''} />}
+              {row.active ? <RefreshCw size={13} className="spin" />
+                : row.failed ? <TriangleAlert size={13} className="icon-err" />
+                  : row.cancelled ? <Square size={12} />
+                    : row.done ? <Check size={13} />
+                      : <RefreshCw size={13} />}
             </span>
             <span className="st-name">{PHASE_LABEL[row.phase]}</span>
             <span className="st-detail">{row.detail}</span>

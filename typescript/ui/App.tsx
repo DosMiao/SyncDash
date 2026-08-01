@@ -13,15 +13,16 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 
 import * as ipc from '../core/ipc';
 import { EMPTY_FILTER, computeVisible, finalIdx, funnelActive } from '../core/filter';
-import { buildLayout, flattenLayout, layoutDirs } from '../core/grouping';
+import { buildLayout, flattenLayout, layoutDirs, treeDirOf } from '../core/grouping';
 import { addExcludeEntries } from '../core/junk';
-import { baseOf, dirOf, fullPath, p2 } from '../core/format';
+import { baseOf, fullPath, p2 } from '../core/format';
 import { canFlip, eff, keySpec, metaOf, selectable, sidePaths } from '../core/plan';
+import { reduceCompareStages } from '../core/compareProgress';
 import type { Chip, PlanDto, Sort, SortKey } from '../core/plan';
+import type { CmpStage, CompareProgressEvent } from '../core/compareProgress';
 import type { ViewFilter } from '../core/filter';
 import type { PlanLayout } from '../core/grouping';
 import type { JobDto } from '../core/types/generated/JobDto';
-import type { LegacyProgress } from '../core/types/generated/LegacyProgress';
 import type { PreflightDto } from '../core/types/generated/PreflightDto';
 import type { RunRecord } from '../core/types/generated/RunRecord';
 
@@ -43,7 +44,6 @@ import { Sidebar } from './components/Sidebar';
 import { StatusBar } from './components/StatusBar';
 import { Toolbar } from './components/Toolbar';
 import { ConfirmDialog, ContextMenu, MenuDivider, MenuItem, Placeholder } from './components/ui';
-import type { CmpStage } from './components/ComparePanel';
 import type { ConfirmTotals } from './components/ConfirmSheet';
 import type { EditorApi } from './components/JobEditor';
 
@@ -51,7 +51,7 @@ const HIST_KEY = 'sd.pathhist';
 
 /// Stable identity for "no plan, nothing to lay out" — a fresh object literal here would make the
 /// flatten memo below recompute on every render
-const EMPTY_LAYOUT: PlanLayout = { order: [], groups: null };
+const EMPTY_LAYOUT: PlanLayout = { order: [], tree: null };
 
 /// One entry in a row's right-click menu. Built at open time so each closure sees the row and the
 /// plan as they were when you right-clicked — a menu is transient, and a stale entry would be worse
@@ -65,22 +65,6 @@ interface CtxItem {
 }
 
 interface CtxState { x: number; y: number; items: CtxItem[] }
-
-interface CmpEv {
-  kind: string;
-  purpose?: string;
-  phase?: string;
-  label?: string | null;
-  ts_ms?: number;
-  items_done?: number;
-  items_total?: number;
-  bytes_done?: number;
-  bytes_total?: number;
-  /// Present on `error` events only: `action` names the failing stage ("walk" = the scan could not
-  /// read a directory), `message` carries the engine's own wording
-  action?: string;
-  message?: string;
-}
 
 function readHistory(): string[] {
   try { return JSON.parse(localStorage.getItem(HIST_KEY) ?? '[]') as string[]; } catch { return []; }
@@ -104,6 +88,7 @@ export function App() {
   const [flipped, setFlipped] = useState<boolean[]>([]);
   const [maskHit, setMaskHit] = useState<boolean[]>([]);
   const [busy, setBusy] = useState(false);
+  const syncInFlight = useRef(false);
   /// The user ticked "I confirm this is correct" in the confirm sheet (same as CLI --i-know); reset on every new compare
   const [acknowledged, setAcknowledged] = useState(false);
 
@@ -149,6 +134,7 @@ export function App() {
   const [cmpCancelling, setCmpCancelling] = useState(false);
   /// Rate EMA (0.7 old + 0.3 new): the instantaneous rate swings wildly with file size
   const cmpRate = useRef(new Map<string, { t: number; b: number; ema: number }>());
+  const cmpRunId = useRef(-1);
 
   // AutoScan (the job field behind it is watch_interval_secs)
   const [watchSecs, setWatchSecs] = useState<number | null>(null);
@@ -178,6 +164,17 @@ export function App() {
   ), [plan, flipped, visible, grouped, sort]);
 
   const rowPlan = useMemo(() => flattenLayout(layout, collapsedDirs), [layout, collapsedDirs]);
+  const treeDirs = useMemo(() => layoutDirs(layout), [layout]);
+  // A filter may temporarily remove a collapsed branch. Only keys present in this layout decide
+  // whether the toolbar says Expand all; otherwise one stale path leaves the control backwards.
+  const anyCollapsed = useMemo(
+    () => treeDirs.some((dir) => collapsedDirs.has(dir)),
+    [treeDirs, collapsedDirs],
+  );
+
+  // Fold state belongs to one compare result. A new plan can reuse the same relative names for
+  // entirely different roots, so carrying old folds over would hide fresh results on arrival.
+  useEffect(() => { setCollapsedDirs(new Set()); }, [plan]);
 
   /// The stats bar counts exactly what will run (checked ∩ visible), matching the confirm sheet
   const stats = useMemo(() => {
@@ -296,14 +293,18 @@ export function App() {
 
   const doSync = useCallback(async () => {
     setConfirmOpen(false);
-    if (!currentJob || !plan || busy) return;
+    if (!currentJob || !plan || busy || syncInFlight.current) return;
+    syncInFlight.current = true;
     const ops = final.map((i) => eff(plan, flipped, i));
     setBusy(true);
     setStatus(`Synchronizing '${currentJob.name}' (${ops.length} items)...`);
     // Whether the progress window stays during a sync is its own Auto-close / When-finished business
-    ipc.openProgressWindow().catch(() => {});
+    let launchId: number | null = null;
     try {
-      const r = await ipc.applyJob(currentJob.name, plan, ops, acknowledged, selTarget);
+      // The command returns only after the new window has installed its run-progress listener.
+      // Starting apply any earlier loses the phase start/totals on a freshly opened window.
+      launchId = await ipc.openProgressWindow();
+      const r = await ipc.applyJob(currentJob.name, plan, ops, acknowledged, selTarget, launchId);
       setStatus(
         r.cancelled
           ? `Stopped: cancelled after ${r.done} run — re-checking...`
@@ -317,6 +318,9 @@ export function App() {
     } catch (e) {
       setStatus(`Synchronize failed: ${e}`, 'err');
       setBusy(false);
+    } finally {
+      if (launchId !== null) void ipc.cancelProgressLaunch(launchId);
+      syncInFlight.current = false;
     }
   }, [currentJob, plan, busy, final, flipped, acknowledged, selTarget, doCompare, refreshLastSyncs, setStatus]);
 
@@ -514,8 +518,13 @@ export function App() {
     const base = baseOf(rel);
     const dot = base.lastIndexOf('.');
     const ext = dot > 0 ? base.slice(dot + 1) : '';
-    const dir = dirOf(rel);
-    const sameDir = visible.filter((k) => dirOf(eff(plan, flipped, k).path) === dir && selectable(eff(plan, flipped, k)));
+    const dir = treeDirOf(op);
+    const sameDir = visible.filter((k) => {
+      const candidate = treeDirOf(eff(plan, flipped, k));
+      // `(root)` remains a direct-files bucket; a real folder owns its complete visible subtree.
+      const inTree = dir === '' ? candidate === '' : candidate === dir || candidate.startsWith(`${dir}/`);
+      return inTree && selectable(eff(plan, flipped, k));
+    });
     const copy = (s: string) => navigator.clipboard?.writeText(s).then(
       () => setStatus(`Copied: ${s}`),
       () => setStatus('Copy failed (clipboard unavailable)', 'err'),
@@ -534,7 +543,7 @@ export function App() {
         { sep: true, label: '' },
         { label: flipped[i] ? 'Restore original direction' : 'Reverse this row', disabled: !canFlip(plan, i), run: () => flipRow(i) },
         { label: 'Check only this item', run: () => setChecked(plan.ops.map((_, k) => k === i && selectable(eff(plan, flipped, k)))) },
-        { label: `Uncheck this directory (${sameDir.length})`, disabled: sameDir.length === 0, run: () => toggleMany(sameDir, false) },
+        { label: `${dir ? 'Uncheck this folder and subfolders' : 'Uncheck root-level items'} (${sameDir.length})`, disabled: sameDir.length === 0, run: () => toggleMany(sameDir, false) },
       ],
     });
   }, [plan, flipped, visible, currentJob, addExcludes, flipRow, toggleMany, setStatus]);
@@ -557,47 +566,36 @@ export function App() {
 
   // Progress event streams
   useEffect(() => {
-    const un = listen<LegacyProgress>('progress', (ev) => {
-      const { phase, detail, pct, rate } = ev.payload;
-      const map: Record<string, string> = {
-        'scan-source': 'Scanning source: ', 'scan-target': 'Scanning target: ', 'comparing': 'Comparing: ', 'warning': 'Warning: ',
-      };
-      const suffix = pct >= 0 ? `  ${pct}%${rate > 0 ? `  ${rate.toFixed(1)} MiB/s` : ''}` : '';
-      setStatus((map[phase] ?? phase) + detail + suffix, phase === 'warning' ? 'err' : '');
-    });
-    return () => { un.then((f) => f()); };
-  }, [setStatus]);
-
-  useEffect(() => {
-    const un = listen<CmpEv>('run-progress', (ev) => {
+    const un = listen<CompareProgressEvent>('run-progress', (ev) => {
       const e = ev.payload;
+      if (e.purpose !== 'compare' || e.run_id < cmpRunId.current) return;
+      if (e.run_id > cmpRunId.current) {
+        cmpRunId.current = e.run_id;
+        cmpRate.current.clear();
+        setCmpStages([]);
+      }
       // A `log` event carries no phase, so the phase guard below would drop it. Errors do carry
       // one, but the guard used to sit above every branch and there was no branch to reach:
       // `phase_start` and `progress` were the only two, and a scan that could not read a directory
       // produced an event nothing was listening for.
       if (e.kind === 'error') {
-        if (e.purpose && e.purpose !== 'compare') return;
         setStatus(`${e.action === 'walk' ? 'Scan could not read' : 'Error'}: ${e.message ?? ''}`, 'err');
         return;
       }
       if (!e.phase) return;
-      if (e.purpose && e.purpose !== 'compare') return; // apply events belong to the progress window
       if (e.kind === 'phase_start') {
-        setCmpStages((prev) => {
-          const done = prev.map((s) => (s.active ? { ...s, active: false, done: true } : s));
-          const found = done.find((s) => s.phase === e.phase);
-          if (found) return done.map((s) => (s.phase === e.phase ? { ...s, active: true, done: false, label: e.label ?? s.label } : s));
-          return [...done, {
-            phase: e.phase!, label: e.label ?? '', itemsDone: 0, itemsTotal: 0,
-            bytesDone: 0, bytesTotal: 0, rate: 0, active: true, done: false,
-          }];
-        });
+        setCmpStages((prev) => reduceCompareStages(prev, e));
+      } else if (e.kind === 'totals') {
+        const ts = e.ts_ms ?? Date.now();
+        const bd = e.bytes_done ?? 0;
+        cmpRate.current.set(e.phase, { t: ts, b: bd, ema: 0 });
+        setCmpStages((prev) => reduceCompareStages(prev, e));
       } else if (e.kind === 'progress') {
         const ts = e.ts_ms ?? Date.now();
         const bd = e.bytes_done ?? 0;
         const prevR = cmpRate.current.get(e.phase);
         let ema = 0;
-        if (prevR && ts > prevR.t) {
+        if (prevR && ts > prevR.t && bd >= prevR.b) {
           const inst = ((bd - prevR.b) * 1000) / (ts - prevR.t);
           ema = prevR.ema > 0 ? prevR.ema * 0.7 + inst * 0.3 : inst;
           cmpRate.current.set(e.phase, { t: ts, b: bd, ema });
@@ -606,18 +604,9 @@ export function App() {
         } else {
           ema = prevR.ema;
         }
-        setCmpStages((prev) => {
-          const patch = (s: CmpStage): CmpStage => ({
-            ...s, label: '',
-            itemsDone: e.items_done ?? 0, itemsTotal: e.items_total ?? 0,
-            bytesDone: bd, bytesTotal: e.bytes_total ?? 0, rate: ema,
-          });
-          if (prev.some((s) => s.phase === e.phase)) return prev.map((s) => (s.phase === e.phase ? patch(s) : s));
-          return [...prev, patch({
-            phase: e.phase!, label: '', itemsDone: 0, itemsTotal: 0,
-            bytesDone: 0, bytesTotal: 0, rate: 0, active: true, done: false,
-          })];
-        });
+        setCmpStages((prev) => reduceCompareStages(prev, e, ema));
+      } else if (e.kind === 'phase_end') {
+        setCmpStages((prev) => reduceCompareStages(prev, e));
       }
     });
     return () => { un.then((f) => f()); };
@@ -853,7 +842,7 @@ export function App() {
               sameOpen={sameOpen}
               grouped={grouped}
               sort={sort}
-              anyCollapsed={collapsedDirs.size > 0}
+              anyCollapsed={anyCollapsed}
               pathMode={pathMode}
               onToggleFunnel={(a) => setFunnelAnchor((cur) => (cur ? null : a))}
               onToggleSame={() => {
@@ -861,7 +850,7 @@ export function App() {
                 setSameOpen((v) => !v);
               }}
               onExportCsv={() => void exportCsv()}
-              onToggleFold={() => setCollapsedDirs((prev) => (prev.size > 0 ? new Set() : new Set(layoutDirs(layout))))}
+              onToggleFold={() => setCollapsedDirs(anyCollapsed ? new Set() : new Set(treeDirs))}
               // Grouping and sorting are independent now — a sort orders rows inside each group and
               // the groups among themselves, so this button no longer has to double as a sort clear
               onToggleGroup={() => {
@@ -919,6 +908,7 @@ export function App() {
                   flipped={flipped}
                   checked={checked}
                   rowPlan={rowPlan}
+                  displayOrder={layout.order}
                   visible={visible}
                   pathMode={pathMode}
                   grouped={grouped}

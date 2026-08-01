@@ -16,11 +16,34 @@ use crate::foundation::time::now_ms;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const PACK_VERSION: u32 = 2;
 
 /// Read granularity for hashing a delta base off the target root.
 const READ_CHUNK: u64 = 8 * 1024 * 1024;
+
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn create_staging_dir() -> std::io::Result<PathBuf> {
+    for _ in 0..16 {
+        let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "syncdash-staging-{}-{}-{sequence}",
+            std::process::id(),
+            now_ms()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique package staging directory",
+    ))
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PayloadEntry {
@@ -299,8 +322,7 @@ pub fn apply_pack(
     }
 
     // pass 2: extract payload into staging, verifying each file's hash
-    let staging = std::env::temp_dir().join(format!("syncdash-staging-{}-{}", std::process::id(), now_ms()));
-    std::fs::create_dir_all(&staging)?;
+    let staging = create_staging_dir()?;
     let by_rel: std::collections::HashMap<&str, &PayloadEntry> = manifest.payload.iter().map(|p| (p.rel.as_str(), p)).collect();
     let mut extract_errors = 0u64;
     {

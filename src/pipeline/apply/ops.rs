@@ -33,10 +33,29 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
             // symlink op: create the link itself, don't copy content (a link is metadata; atomic writes don't apply)
             if let Some(target) = &op.link {
                 if exec.stat(&op.path)?.is_some() {
-                    preserve(sh, op, exec, "overwritten", None)?;
+                    preserve(sh, op, exec, "overwritten", None, pp)?;
                 }
                 return Ok(exec.make_symlink(&op.path, target)?);
             }
+
+            // Plan sizes are exact for ordinary copy/update rows. Only pay for another stat when a
+            // legacy/package op omitted size or mtime; the final streamed count still reconciles
+            // a source that changed after compare without adding one round-trip per remote file.
+            let live_meta = if op.size.is_none() || op.mtime_ms.is_none() {
+                other.stat(&op.path)?
+            } else {
+                None
+            };
+            let planned_size = match op.size {
+                Some(size) => size,
+                None => live_meta.as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("copy source disappeared after compare: {}", op.path),
+                    )
+                })?.size,
+            };
+            pp.revise_total_bytes(op.size.unwrap_or(0), planned_size);
 
             // Delta stays a both-local affair — it reads old and new into memory and
             // patches with write_at. Preflight already disabled it otherwise; this gate
@@ -53,6 +72,7 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                     if exists_no_follow(&dst) {
                         let mut staged = crate::fs::staged::Staged::create(&dst)?;
                         if let Some((written, total, h)) = update_with_delta(&src, &dst, &mut staged)? {
+                            pp.revise_total_bytes(planned_size, total);
                             sh.delta_saved.fetch_add(total.saturating_sub(written), Ordering::Relaxed);
                             pp.add_bytes(total, &op.path);
                             staged.seal(sh.opt.fsync)?;
@@ -87,7 +107,7 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                                 set_mode(staged.path(), m)?;
                             }
                             if exists_no_follow(&dst) {
-                                preserve(sh, op, exec, "overwritten", Some(&src))?;
+                                preserve(sh, op, exec, "overwritten", Some(&src), pp)?;
                             }
                             staged.commit()?;
                             if let Some(want) = intended {
@@ -109,9 +129,9 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
             // copy stream** — not op.hash, which may be only a sampled `~` digest.
             let intended = match op.mtime_ms {
                 Some(mt) => Some(mt),
-                None => other.stat(&op.path).ok().flatten().map(|m| m.mtime_ms),
+                None => live_meta.as_ref().map(|m| m.mtime_ms),
             };
-            let hint = WriteHint { size_hint: op.size, mtime_ms: intended, mode: op.mode };
+            let hint = WriteHint { size_hint: Some(planned_size), mtime_ms: intended, mode: op.mode };
             let mut w = exec.open_write(&op.path, &hint)?;
             let mut src_stream = other.open_read(&op.path)?;
             let block = src_stream.block_size().max(w.block_size()).clamp(64 * 1024, 8 * 1024 * 1024);
@@ -131,6 +151,7 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                 copied += n as u64;
                 pp.add_bytes(n as u64, &op.path);
             }
+            pp.revise_total_bytes(planned_size, copied);
             w.seal(sh.opt.fsync)?;
 
             // Length reconciliation (FFS's finalize check — it has caught corrupt
@@ -169,7 +190,7 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
             // Archive the old file at the last moment before commit, so the window is a single rename
             if exec.stat(&op.path)?.is_some() {
                 let newer = other_local.map(|r| join_native(r, &op.path));
-                preserve(sh, op, exec, "overwritten", newer.as_deref())?;
+                preserve(sh, op, exec, "overwritten", newer.as_deref(), pp)?;
             }
             let report = w.commit()?;
 
@@ -212,12 +233,15 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                 Ok(_) => Ok(()),
                 Err(_) => {
                     // Cross-volume fallback: copy within the same root, still atomic.
-                    // Move's bytes are not part of bytes_total, so only the checkpoint hooks in.
-                    let intended = exec.stat(from).ok().flatten().map(|m| m.mtime_ms);
-                    let hint = WriteHint { size_hint: None, mtime_ms: intended, mode: None };
+                    let moving = exec.stat(from)?.ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::NotFound, format!("move source disappeared: {from}"))
+                    })?;
+                    pp.add_total_bytes(moving.size);
+                    let hint = WriteHint { size_hint: Some(moving.size), mtime_ms: Some(moving.mtime_ms), mode: None };
                     let mut w = exec.open_write(&op.path, &hint)?;
                     let mut rs = exec.open_read(from)?;
                     let mut buf = vec![0u8; rs.block_size().clamp(64 * 1024, 8 * 1024 * 1024)];
+                    let mut copied = 0u64;
                     loop {
                         pp.checkpoint()?;
                         let n = std::io::Read::read(&mut rs, &mut buf)?;
@@ -225,7 +249,10 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                             break;
                         }
                         w.write(&buf[..n])?;
+                        copied += n as u64;
+                        pp.add_bytes(n as u64, &op.path);
                     }
+                    pp.revise_total_bytes(moving.size, copied);
                     w.seal(sh.opt.fsync)?;
                     let _ = w.commit()?;
                     Ok(exec.remove_file(from)?)
@@ -235,7 +262,7 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
         Action::Delete => {
             // stat is lstat: a broken symlink still reports present, so it still gets preserved
             if exec.stat(&op.path)?.is_some() {
-                preserve(sh, op, exec, "deleted", None)?;
+                preserve(sh, op, exec, "deleted", None, pp)?;
             }
             Ok(())
         }

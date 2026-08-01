@@ -704,16 +704,25 @@ th .sortable:hover { color: var(--text-1); text-decoration: underline; }
 th .sortable.on { color: var(--accent); }
 th .sortable .sortmark { display: inline-flex; vertical-align: middle; margin-left: 2px; }
 
-/* Tree grouping (FFS group-row semantics) */
+/* Hierarchical directory tree. Folder and file rows carry a zero-based --tree-depth; the virtual
+   scroller still sees one fixed folder height because indentation is horizontal only. */
 tr.grp { background: var(--bg-2); cursor: pointer; user-select: none; }
 tr.grp:hover { background: var(--bg-3); }
 tr.grp td { padding: 5px 10px; border-top: 1px solid var(--border); font-size: var(--fs-sm); }
+tr.grp .gtree {
+  display: flex; align-items: center; width: 100%; min-width: 0;
+  padding: 0 0 0 calc(var(--tree-depth, 0) * 18px);
+  border: 0; overflow: hidden; background: none; color: inherit; font: inherit; text-align: left; white-space: nowrap; cursor: pointer;
+}
+tr.grp .gtree:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
 tr.grp .gchev { color: var(--text-2); display: inline-flex; width: 14px; vertical-align: middle; }
+tr.grp .gfolder { color: var(--accent); display: inline-flex; width: 17px; flex: none; }
 tr.grp .gdir { color: var(--accent); font-family: var(--mono); }
-tr.grp .gmeta { color: var(--text-2); margin-left: 10px; font-size: var(--fs-micro); font-variant-numeric: tabular-nums; }
-/* Rows inside a group indent under their directory heading. Hooked on the source path column by
-   name: :first-of-type would mean "the first td in the row", which is always the checkbox. */
-tr.ingrp td.c-path-s { padding-left: 28px; }
+tr.grp .gmeta { color: var(--text-2); margin-left: 10px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-micro); font-variant-numeric: tabular-nums; }
+/* A direct file is one step beyond its owning folder. Hooked on the source path column by name:
+   :first-of-type would mean the checkbox, and the target-side path may describe a move origin in a
+   different directory rather than this tree position. */
+tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 
 /* Virtual scrolling: only the screenful of rows in the viewport is mounted. A bounded canvas owns
    the physical scroll range; the hook projects it onto the complete logical row range. The body
@@ -972,6 +981,15 @@ tr.ingrp td.c-path-s { padding-left: 28px; }
 }
 .ed-field textarea { min-height: 64px; resize: vertical; font-family: var(--mono); font-size: var(--fs-sm); }
 .ed-field input:focus, .ed-field select:focus, .ed-field textarea:focus { border-color: var(--accent); box-shadow: var(--ring); }
+.ed-field input[aria-invalid="true"], .ed-field select[aria-invalid="true"], .ed-field textarea[aria-invalid="true"] {
+  border-color: var(--c-red);
+}
+@keyframes field-error-pulse {
+  0%, 100% { border-color: var(--c-red); box-shadow: none; }
+  20%, 60% { border-color: var(--c-red); box-shadow: 0 0 0 3px color-mix(in srgb, var(--c-red) 42%, transparent); }
+  40%, 80% { border-color: var(--c-red); box-shadow: 0 0 0 1px color-mix(in srgb, var(--c-red) 22%, transparent); }
+}
+.ed-field .field-error-pulse { animation: field-error-pulse 0.9s ease-out; }
 .ed-field input.good { border-color: var(--c-green); }
 .ed-field input.bad { border-color: var(--c-red); }
 .ed-field input.dropon { border-color: var(--accent); background: var(--accent-soft); }
@@ -1003,6 +1021,14 @@ tr.ingrp td.c-path-s { padding-left: 28px; }
 .ed-help-body { padding: 8px 10px; font-size: var(--fs-sm); line-height: var(--lh); color: var(--text-1); white-space: normal; max-width: 340px; }
 
 .ed-verdict { display: flex; flex-direction: column; gap: 3px; font-size: var(--fs-sm); }
+.ed-save-error {
+  color: var(--c-red);
+  font-size: var(--fs-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 420px;
+}
 
 .set-note { color: var(--text-2); padding: 4px 2px 0; }
 

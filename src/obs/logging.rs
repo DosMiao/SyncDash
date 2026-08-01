@@ -203,7 +203,7 @@ impl ProgressSink for FileSink {
                 }
             }
             // Phase boundaries and terminal states flush everything while we are here — so Ctrl-C does not take the whole tail with it
-            ProgressEvent::PhaseStart { .. } | ProgressEvent::Summary { .. } => {
+            ProgressEvent::PhaseStart { .. } | ProgressEvent::PhaseEnd { .. } | ProgressEvent::Summary { .. } => {
                 Self::put(&self.run, &line, true);
                 self.flush_all();
             }

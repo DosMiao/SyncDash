@@ -2,7 +2,7 @@
 //! syncdash core library.
 //!
 //! - `dto` — the wire types ts-rs exports to the frontend
-//! - `bridge` — the progress event stream, and the legacy shim still feeding the main window
+//! - `bridge` — the typed progress event stream shared by both windows
 //! - `state` — single-run mutual exclusion and the snapshot cache behind the "Identical" panel
 //! - `cmd` — the commands themselves, grouped by what they act on
 //!
@@ -54,7 +54,7 @@ fn main() {
             cmd::edit::inspect_paths, cmd::edit::mask_match, cmd::edit::junk_presets,
             cmd::results::list_same, cmd::results::export_csv,
             cmd::logs::run_history, cmd::logs::last_syncs, cmd::logs::run_detail, cmd::logs::log_runs, cmd::logs::log_artifact, cmd::logs::log_dir_path, cmd::logs::app_log_tail, cmd::logs::get_settings, cmd::logs::save_settings,
-            cmd::shell::reveal, cmd::shell::post_sync_action, cmd::shell::open_progress_window, cmd::shell::close_progress_window,
+            cmd::shell::reveal, cmd::shell::post_sync_action, cmd::shell::open_progress_window, cmd::shell::cancel_progress_launch, cmd::shell::close_progress_launch, cmd::shell::close_progress_window,
             cmd::run::compare_job, cmd::run::preflight, cmd::run::apply_job, cmd::run::cancel_run, cmd::run::pause_run
         ])
         .run(tauri::generate_context!())

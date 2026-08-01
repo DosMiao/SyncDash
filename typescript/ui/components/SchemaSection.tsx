@@ -26,6 +26,10 @@ export interface SchemaSectionProps {
   /// Node injected after a given field, e.g. the two-root verdict box under `target`
   after?: (key: string) => ReactNode;
   disabledField?: (key: string) => boolean;
+  /// The job editor uses these to make an invalid off-screen field discoverable. Settings leaves
+  /// both unset, so the shared renderer keeps its ordinary behaviour there.
+  autoFocusField?: string;
+  invalidField?: string;
   /// Body for a `custom` field — the junk-preset checkbox block, which edits `exclude` rather than
   /// holding a form value of its own
   renderCustom?: (f: FSpec) => ReactNode;
@@ -42,9 +46,17 @@ function Help({ text }: { text: string }) {
 }
 
 function Field({ f, props }: { f: FSpec; props: SchemaSectionProps }) {
-  const { values, set, onPick, onSwap, pathClass, droppable, disabledField, renderCustom } = props;
+  const {
+    values, set, onPick, onSwap, pathClass, droppable, disabledField, renderCustom,
+    autoFocusField, invalidField,
+  } = props;
   const v = values[f.key];
   const disabled = disabledField?.(f.key) ?? false;
+  const common = {
+    'data-field': f.key,
+    'aria-invalid': invalidField === f.key || undefined,
+    autoFocus: autoFocusField === f.key,
+  };
 
   const name = (
     <span className="ed-field-head">
@@ -59,7 +71,7 @@ function Field({ f, props }: { f: FSpec; props: SchemaSectionProps }) {
   if (f.kind === 'bool') {
     return (
       <label className="ed-field ed-check">
-        <input type="checkbox" checked={!!v} disabled={disabled} onChange={(e) => set(f.key, e.target.checked)} />
+        <input {...common} type="checkbox" checked={!!v} disabled={disabled} onChange={(e) => set(f.key, e.target.checked)} />
         <span className="ed-field-body">{name}{desc}</span>
       </label>
     );
@@ -68,22 +80,23 @@ function Field({ f, props }: { f: FSpec; props: SchemaSectionProps }) {
   let control: ReactNode;
   if (f.kind === 'select') {
     control = (
-      <select value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)}>
+      <select {...common} value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)}>
         {f.opts!.map((o) => <option key={o} value={o}>{o}</option>)}
       </select>
     );
   } else if (f.kind === 'lines') {
     control = (
-      <textarea spellCheck={false} value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)} />
+      <textarea {...common} spellCheck={false} value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)} />
     );
   } else if (f.kind === 'num') {
     control = (
-      <input type="number" step="any" value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)} />
+      <input {...common} type="number" step="any" value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)} />
     );
   } else if (f.kind === 'dir' || f.kind === 'file') {
     control = (
       <div className="pathrow">
         <input
+          {...common}
           type="text"
           className={pathClass?.(f.key) ?? ''}
           data-drop={droppable ? '1' : undefined}
@@ -113,7 +126,7 @@ function Field({ f, props }: { f: FSpec; props: SchemaSectionProps }) {
     control = renderCustom?.(f);
   } else {
     control = (
-      <input type="text" spellCheck={false} value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)} />
+      <input {...common} type="text" spellCheck={false} value={String(v ?? '')} disabled={disabled} onChange={(e) => set(f.key, e.target.value)} />
     );
   }
 

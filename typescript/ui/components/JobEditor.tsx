@@ -42,6 +42,8 @@ interface Props {
 /// would have to bail out silently, and a silent no-op on the Save button is the worst kind of dead end.
 interface Loaded { base: JobFull; values: FormValues }
 
+interface SaveError { message: string; field?: string }
+
 export function JobEditor(props: Props) {
   const { name, focusGroup, dropOn, scopeRef, apiRef, onClose, onSaved, onDeleted, onStatus } = props;
   const [form, setForm] = useState<Loaded | null>(null);
@@ -49,6 +51,8 @@ export function JobEditor(props: Props) {
   /// produced by the load-time migration and are not in the file yet
   const [migratedFrom, setMigratedFrom] = useState<number | null>(null);
   const [askDelete, setAskDelete] = useState(false);
+  const [saveError, setSaveError] = useState<SaveError | null>(null);
+  const [saving, setSaving] = useState(false);
   /// The pane is the scroll container and the drop region both; it goes through state rather than a
   /// ref so the scrollspy re-subscribes when the node actually arrives
   const [pane, setPane] = useState<HTMLDivElement | null>(null);
@@ -63,6 +67,7 @@ export function JobEditor(props: Props) {
   }, [scopeRef]);
 
   const set = useCallback((key: string, value: string | boolean) => {
+    setSaveError(null);
     setForm((f) => {
       if (!f) return f;
       const next = { ...f.values, [key]: value };
@@ -118,14 +123,17 @@ export function JobEditor(props: Props) {
     return () => { live = false; };
   }, [name]);
 
-  // Open on the section a config pill named. Instant rather than smooth: a dialog that appears
-  // already mid-glide reads as a glitch. Once only — a later re-render must not yank you back to
-  // where you came in, after you have scrolled somewhere else.
+  // Open on the section a config pill named, or Basics for an ordinary open. The pane mounts once
+  // while the async form is still empty; without this post-load jump the scrollspy can keep its
+  // temporary "last section" result even though the populated pane is at the top. Instant rather
+  // than smooth: a dialog that appears already mid-glide reads as a glitch. Once only — a later
   const jumped = useRef(false);
   useEffect(() => {
-    if (jumped.current || !form || !pane || !focusGroup || !ED_GROUPS.includes(focusGroup)) return;
+    if (jumped.current || !form || !pane) return;
+    const target = focusGroup && ED_GROUPS.includes(focusGroup) ? focusGroup : ED_GROUPS[0];
+    if (!target) return;
     jumped.current = true;
-    scrollTo(focusGroup, false);
+    scrollTo(target, false);
   }, [form, pane, focusGroup, scrollTo]);
 
   // The default-on presets arrive already written into `exclude` by `default_job()`. Seeding them here
@@ -154,12 +162,33 @@ export function JobEditor(props: Props) {
   const save = async () => {
     if (!form) return;
     const c = formToJob(form.values, form.base);
-    if ('error' in c) { onStatus(c.error, 'err'); return; }
+    if ('error' in c) {
+      setSaveError({ message: c.error, field: c.field });
+      onStatus(c.error, 'err');
+      requestAnimationFrame(() => {
+        const el = pane?.querySelector<HTMLElement>(`[data-field="${c.field}"]`);
+        el?.focus({ preventScroll: true });
+        el?.scrollIntoView({ block: 'center', inline: 'nearest' });
+        // Restart the pulse even when Save is pressed twice without editing the field in between.
+        // Toggling the class around a layout read is intentional: changing aria-invalid from true
+        // to true would not restart a CSS animation on an already-invalid input.
+        el?.classList.remove('field-error-pulse');
+        if (el) void el.offsetWidth;
+        el?.classList.add('field-error-pulse');
+      });
+      return;
+    }
+    setSaveError(null);
+    setSaving(true);
     try {
       await saveJob(c.name, c.job);
       onSaved(c.name, c.job);
     } catch (e) {
-      onStatus(`Save failed: ${e}`, 'err');
+      const message = `Save failed: ${e}`;
+      setSaveError({ message });
+      onStatus(message, 'err');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -200,9 +229,12 @@ export function JobEditor(props: Props) {
               }}
             >Copy scheduled task command</button>
           )}
+          {saveError && <span className="ed-save-error" role="alert">{saveError.message}</span>}
           <span className="spacer" />
           <button className="btn" onClick={onClose}>Cancel (Esc)</button>
-          <button className="btn accent" onClick={save}>Save</button>
+          <button className="btn accent" disabled={!form || saving} onClick={save}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
         </>
       }
     >
@@ -239,6 +271,8 @@ export function JobEditor(props: Props) {
                   onSwap={() => setForm((f) => (f ? { ...f, values: { ...f.values, source: f.values.target, target: f.values.source } } : f))}
                   pathClass={pathClass}
                   droppable
+                  autoFocusField={name ? undefined : '__name'}
+                  invalidField={saveError?.field}
                   // "Escalate on divergence" only means anything when the evidence is a sampled digest
                   disabledField={(k) => k === 'escalate' && form.values.evidence !== 'sampled'}
                   renderCustom={() => (

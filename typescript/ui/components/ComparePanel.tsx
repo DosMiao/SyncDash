@@ -1,22 +1,11 @@
-import { Check, RefreshCw, X } from 'lucide-react';
+import { Check, RefreshCw, Square, TriangleAlert, X } from 'lucide-react';
 import { humanSize } from '../../core/format';
+import type { CmpStage } from '../../core/compareProgress';
 
 export const CMP_LABEL: Record<string, string> = {
-  'scan-source': 'Scan source', 'scan-target': 'Scan target', 'compare': 'Compare', 'refresh': 'Refresh archive',
+  'scan-source': 'Scan source', 'scan-target': 'Scan target', 'compare': 'Compare',
+  'refresh': 'Refresh archive', 'archive': 'Save archive',
 };
-
-export interface CmpStage {
-  phase: string;
-  label: string;
-  itemsDone: number;
-  itemsTotal: number;
-  bytesDone: number;
-  bytesTotal: number;
-  /// Smoothed bytes/second; 0 while it is still too noisy to show
-  rate: number;
-  active: boolean;
-  done: boolean;
-}
 
 interface Props {
   stages: CmpStage[];
@@ -33,15 +22,21 @@ export function ComparePanel({ stages, cancelling, onCancel }: Props) {
       <div className="cmp-title">Comparing</div>
       <div className="cmp-rows">
         {stages.map((s) => {
-          const pct = s.done ? 100
-            : s.bytesTotal > 0 ? (s.bytesDone / s.bytesTotal) * 100
+          const rawPct = s.bytesTotal > 0 ? (s.bytesDone / s.bytesTotal) * 100
             : s.itemsTotal > 0 ? (s.itemsDone / s.itemsTotal) * 100
             : 0;
+          // 100 is a phase boundary, not a rounded counter value. The engine can finish reading
+          // bytes before it seals/verifies/commits the last item, and PhaseEnd is explicit.
+          const pct = s.done ? 100
+            : Math.min(99, Math.max(0, rawPct));
           const showPct = s.done || s.bytesTotal > 0 || s.itemsTotal > 0;
           return (
             <div key={s.phase} className={'stagerow cmp2' + (s.active ? ' active' : '') + (s.done ? ' done' : '')}>
               <span className="st-ico">
-                {s.done ? <Check size={13} /> : <RefreshCw size={13} className={s.active ? 'spin' : ''} />}
+                {s.failed ? <TriangleAlert size={13} className="icon-err" />
+                  : s.cancelled ? <Square size={12} />
+                    : s.done ? <Check size={13} />
+                      : <RefreshCw size={13} className={s.active ? 'spin' : ''} />}
               </span>
               <span className="st-name">{CMP_LABEL[s.phase] ?? s.phase}</span>
               <span className="st-bar"><i style={{ width: `${pct}%` }} /></span>

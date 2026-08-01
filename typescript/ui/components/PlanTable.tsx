@@ -1,10 +1,11 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, ChevronRight, ChevronUp } from 'lucide-react';
+import { ChevronDown, ChevronRight, ChevronUp, Folder, FolderOpen } from 'lucide-react';
 import { baseOf, dirOf, fmtTime, fullPath, humanSize } from '../../core/format';
+import { treeDirOf } from '../../core/grouping';
 import { canFlip, eff, metaOf, newerSide, rowAction, selectable, sidePaths } from '../../core/plan';
 import { DIR_ICON, MARK } from '../icons';
 import { useVirtualRows } from '../hooks/useVirtualRows';
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 import type { RowSpec } from '../../core/grouping';
 import type { PlanDto, SortKey, Sort } from '../../core/plan';
 import type { SideMeta } from '../../core/types/generated/SideMeta';
@@ -14,6 +15,9 @@ interface Props {
   flipped: boolean[];
   checked: boolean[];
   rowPlan: RowSpec[];
+  /// Every visible operation in tree display order, including descendants hidden by a collapsed
+  /// folder. Folder rows address their subtree through ranges into this one shared array.
+  displayOrder: number[];
   visible: number[];
   pathMode: 'rel' | 'full';
   grouped: boolean;
@@ -194,7 +198,7 @@ function timeCell(sm: SideMeta | null, tint: boolean): Cell {
 
 export function PlanTable(props: Props) {
   const {
-    plan, flipped, checked, rowPlan, visible, pathMode, grouped, sort, collapsedDirs, resetKey, wrap,
+    plan, flipped, checked, rowPlan, displayOrder, visible, pathMode, grouped, sort, collapsedDirs, resetKey, wrap,
     onToggleRow, onToggleMany, onFlip, onFoldDir, onSort, onContextRow,
   } = props;
 
@@ -232,6 +236,19 @@ export function PlanTable(props: Props) {
     [selectableVisible, checked],
   );
 
+  // A folder row needs the checked count of an arbitrary subtree. Prefixing the one DFS order once
+  // makes that O(1) per visible folder, instead of repeatedly scanning a 100k-file parent on every
+  // virtual-scroll render. Descendant indices themselves are materialized only when a checkbox is
+  // actually clicked.
+  const checkedPrefix = useMemo(() => {
+    const prefix = new Uint32Array(displayOrder.length + 1);
+    for (let k = 0; k < displayOrder.length; k++) {
+      const i = displayOrder[k];
+      prefix[k + 1] = prefix[k] + (checked[i] && selectable(eff(plan, flipped, i)) ? 1 : 0);
+    }
+    return prefix;
+  }, [plan, flipped, checked, displayOrder]);
+
   /// Where "this side is newer" gets painted: the claim is about the mtime, so it takes the most
   /// specific of that side's columns still on screen, falling back to the path once the narrowest
   /// rung has dropped both meta columns. Without that fallback the single most decision-critical
@@ -247,31 +264,48 @@ export function PlanTable(props: Props) {
           const alt = (win.from + k) % 2 === 1;
 
           if (typeof spec !== 'number') {
-            // sel and bytes are computed once when the layout is built, not per render: this row is
-            // re-rendered on every scroll frame it is on screen
-            const { sel, bytes } = spec;
-            const nChecked = sel.filter((i) => checked[i]).length;
+            const { bytes } = spec;
+            const nChecked = checkedPrefix[spec.end] - checkedPrefix[spec.start];
             const folded = collapsedDirs.has(spec.dir);
-            const label = spec.dir === '' ? '(root)' : spec.dir;
-            // Keyed by the dir, which is unique — one group per directory — and stable across a
-            // re-sort. An index-based key would change identity whenever the order changed, and
-            // remount every group row for nothing.
+            const isRoot = spec.dir === '';
+            const label = isRoot ? '(root)' : baseOf(spec.dir);
+            const treeStyle = { '--tree-depth': spec.depth } as CSSProperties;
+            const toggleFolder = (value: boolean) => {
+              const members: number[] = [];
+              for (let p = spec.start; p < spec.end; p++) {
+                const i = displayOrder[p];
+                if (selectable(eff(plan, flipped, i))) members.push(i);
+              }
+              onToggleMany(members, value);
+            };
             return (
-              <tr key={`g:${spec.dir}`} className="grp" onClick={() => onFoldDir(spec.dir)}>
+              <tr key={`f:${spec.dir}`} className="grp" style={treeStyle}>
                 <td className="c-chk">
                   <TriCheckbox
-                    checked={sel.length > 0 && nChecked === sel.length}
-                    indeterminate={nChecked > 0 && nChecked < sel.length}
-                    disabled={sel.length === 0}
-                    title="Check / uncheck the whole directory"
-                    stopClick
-                    onChange={(v) => onToggleMany(sel, v)}
+                    checked={spec.selectable > 0 && nChecked === spec.selectable}
+                    indeterminate={nChecked > 0 && nChecked < spec.selectable}
+                    disabled={spec.selectable === 0}
+                    title={isRoot
+                      ? 'Check / uncheck visible root-level items'
+                      : 'Check / uncheck visible items in this folder and its subfolders'}
+                    onChange={toggleFolder}
                   />
                 </td>
-                <td colSpan={nCols - 1} title={`${plan.header.source_root}\n${plan.header.target_root}\n… ${label}`}>
-                  <span className="gchev">{folded ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
-                  <span className="gdir mono">{label}</span>
-                  <span className="gmeta">{spec.items.length} items{bytes ? ` · ${humanSize(bytes)}` : ''}</span>
+                <td colSpan={nCols - 1} title={`${plan.header.source_root}\n${plan.header.target_root}\n… ${spec.dir || '(root)'}`}>
+                  <button
+                    type="button"
+                    className="gtree"
+                    aria-label={isRoot
+                      ? `${folded ? 'Show' : 'Hide'} root-level items`
+                      : `${folded ? 'Expand' : 'Collapse'} folder ${spec.dir}`}
+                    aria-expanded={!folded}
+                    onClick={() => onFoldDir(spec.dir)}
+                  >
+                    <span className="gchev">{folded ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
+                    <span className="gfolder">{folded ? <Folder size={13} /> : <FolderOpen size={13} />}</span>
+                    <span className="gdir mono">{label}</span>
+                    <span className="gmeta">{spec.count} {spec.count === 1 ? 'item' : 'items'}{bytes ? ` · ${humanSize(bytes)}` : ''}</span>
+                  </button>
                 </td>
               </tr>
             );
@@ -279,7 +313,8 @@ export function PlanTable(props: Props) {
 
           const i = spec;
           const op = eff(plan, flipped, i);
-          const groupDir = grouped ? dirOf(op.path) : null;
+          const groupDir = grouped ? treeDirOf(op) : null;
+          const treeDepth = groupDir === null || groupDir === '' ? 0 : groupDir.split('/').length - 1;
           const flippable = canFlip(plan, i);
           const act = rowAction(op);
           const [sp, tp] = sidePaths(op);
@@ -292,9 +327,12 @@ export function PlanTable(props: Props) {
           // path tooltip absorbs its numbers — dropped information always lands on the same side.
           const pathCell = (pv: string | null, root: string, sm: SideMeta | null, side: 's' | 't'): Cell => {
             if (!pv) return { cls: 'mono dim' };
-            const text = groupDir !== null && dirOf(pv) === groupDir
-              ? baseOf(pv)
-              : pathMode === 'full' ? fullPath(root, pv) : pv;
+            const folderSelf = groupDir !== null && op.action === 'delete_dir' && pv === groupDir;
+            const text = folderSelf
+              ? '(this folder)'
+              : groupDir !== null && dirOf(pv) === groupDir
+                ? baseOf(pv)
+                : pathMode === 'full' ? fullPath(root, pv) : pv;
             const abs = fullPath(root, pv);
             const metaGone = !shown.has(`${side}.size`);
             return {
@@ -347,6 +385,7 @@ export function PlanTable(props: Props) {
               key={`r:${i}`}
               className={[!checked[i] && 'off', flipped[i] && 'flip', groupDir !== null && 'ingrp', alt && 'alt']
                 .filter(Boolean).join(' ')}
+              style={groupDir === null ? undefined : ({ '--tree-depth': treeDepth } as CSSProperties)}
               onContextMenu={(e) => { e.preventDefault(); onContextRow(i, e.clientX, e.clientY); }}
             >
               {cols.map((c) => {

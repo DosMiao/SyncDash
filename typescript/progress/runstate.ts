@@ -6,6 +6,7 @@
 
 import type { LogLevel } from '../core/types/generated/LogLevel';
 import type { Phase } from '../core/types/generated/Phase';
+import type { PhaseStatus } from '../core/types/generated/PhaseStatus';
 import type { ProgressEvent } from '../core/types/generated/ProgressEvent';
 
 /// The engine's phase names, not a copy of them. A phase added in Rust becomes a missing key in
@@ -21,6 +22,7 @@ export const PHASE_LABEL: Record<PhaseName, string> = {
   'ship': 'Transfer',
   'verify': 'Verify',
   'refresh': 'Refresh archive',
+  'archive': 'Save archive',
 };
 
 /// The `run-progress` payload: the engine's `ProgressEvent` plus the two fields the Tauri shell
@@ -42,6 +44,8 @@ export interface RunEv {
   scope?: string;
   ts_ms: number;
   phase?: Phase;
+  status?: PhaseStatus;
+  reset?: boolean;
   label?: string | null;
   items_total?: number;
   bytes_total?: number;
@@ -63,8 +67,20 @@ export interface RunEv {
 /// t = active milliseconds (paused time removed)
 export interface Sample { t: number; b: number; i: number }
 
-export interface StageRow { phase: PhaseName; detail: string; active: boolean; done: boolean; cancelled?: boolean }
+export interface StageRow { phase: PhaseName; detail: string; active: boolean; done: boolean; failed?: boolean; cancelled?: boolean }
 export interface ErrRow { path: string; action: string; side: string; message: string; warning: boolean }
+
+export function startStage(row: StageRow): void {
+  row.active = true;
+  row.done = false;
+}
+
+export function endStage(row: StageRow, status: PhaseStatus | undefined): void {
+  row.active = false;
+  row.failed = !!row.failed || status === 'failed';
+  row.cancelled = !!row.cancelled || status === 'cancelled';
+  row.done = status === 'completed' && !row.failed && !row.cancelled;
+}
 
 export interface RunState {
   runId: number;
@@ -108,9 +124,14 @@ export function activeNow(s: RunState): number {
 }
 
 export function percent(s: RunState): number {
+  if (s.summary && !s.summary.cancelled && (s.summary.errors ?? 0) === 0) return 100;
   const denom = s.totals.bytes + s.totals.items;
   if (denom <= 0) return 0;
-  return Math.min(100, (s.dones.bytes + s.dones.items) * 100 / denom);
+  const raw = Math.max(0, (s.dones.bytes + s.dones.items) * 100 / denom);
+  // Bytes can finish before fsync, verify, preservation, commit, and the remaining metadata ops.
+  // A live 100 is therefore a false terminal claim; Summary is the one run-complete boundary.
+  if (s.running && !s.summary) return Math.min(99, Math.floor(raw));
+  return Math.min(100, raw);
 }
 
 /// Differencing the sample series over a sliding window. When the window is not yet full, use the actual

@@ -1,12 +1,14 @@
 {
   "name": "syncdash",
   "version": "0.3.0",
+  "type": "module",
   "private": true,
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
+    "test:frontend": "node --test Script/tests/*.test.mts",
     "gen:types": "node Script/gen-types.mjs"
   },
   "dependencies": {

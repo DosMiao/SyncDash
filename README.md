@@ -200,10 +200,14 @@ bytes, deletions highlighted in red), **keyboard shortcuts** (Ctrl/⌘+R compare
 synchronize, Esc close overlay), **immersive Mac title bar**.
 
 v0.9 "Progress & Polish" (behavior parameters cross-checked against the FFS 14.10 source; plan in plans/ffs-ui):
-- **Standalone progress sub-window** (the same one FFS has): during compare it shows live item/byte counts for
-  both sides being scanned; during apply, dual cumulative graphs (bytes + items), a 4s sliding-window rate, a 60s
-  sliding-window ETA, a big percentage `(bytesDone+itemsDone)/(bytesTotal+itemsTotal)`, done/remaining, the
-  current file, the percentage in the window title + Windows taskbar progress.
+- **Phase-aware progress**: compare shows both concurrent scans inline; synchronize uses a standalone window with
+  phase-local item/byte counters, dual cumulative graphs, a 4s sliding-window rate, a 60s sliding-window ETA,
+  done/remaining, and the current file. Active work is capped at 99% and switches to “Finalizing” after its measured
+  counters are exhausted; only the explicit terminal event may show 100%. Each interactive run reserves a launch ID
+  and the window acknowledges that exact ID after its listeners are ready, so fast or duplicate starts cannot lose or
+  cross-wire their opening phase, totals, or rejection. Closing before the first event cancels that reservation. Cross-volume
+  preservation (notably an external mirror copying old content into central trash) joins the byte total and uses the
+  same chunk-level pause/cancel checkpoints; archive-refresh failures become run errors rather than a green Summary.
 - **Pause/Continue** (the engine spin-pauses: elapsed time freezes while the RootLock heartbeat keeps beating, so
   the machine on the other end won't mistake it for an abandoned lock), **Stop = cooperative cancel** (responds
   between chunks; atomic writes guarantee the destination never holds a half-written file and leaves zero
@@ -225,8 +229,8 @@ v0.9 "Progress & Polish" (behavior parameters cross-checked against the FFS 14.1
   pipeline, re-hashing over UNC an order of magnitude slower); ssh badge in the sidebar.
 - **The old egui UI has been retired and deleted** (removed as agreed once Tauri reached feature parity; the bare
   CLI and `syncdash gui` now launch the desktop app, and the workspace release build went ~2.5min → ~56s).
-- Engine foundation: a unified `ProgressEvent` stream (PhaseStart/Totals/Progress/Error/Paused/Resumed/Summary,
-  with throttling owned by the sink); **five-phase apply**, with the Copy/Update phases parallelized (`parallel`,
+- Engine foundation: a unified `ProgressEvent` stream (PhaseStart/Totals/Progress/PhaseEnd/Error/Paused/Resumed/Summary,
+  with progress throttled independently per phase and every completed/failed/cancelled boundary delivered); **five-phase apply**, with the Copy/Update phases parallelized (`parallel`,
   default 4; 2-4 streams saturate the uplink on SMB; Update with delta enabled keeps a serial lane to avoid memory
   spikes); DeleteDir is deepest-first within its class.
 
@@ -396,7 +400,8 @@ it** (delete it here too)? The only reliable criterion is **an archive of the st
 differences as conflicts, and merely reports suspected moves (`possible-move-needs-archive`) — better to do less
 than to do the wrong thing.
 An archive is just an ordinary snapshot table: **after a successful sync, rescan either side and save it, then
-pass it with `--archive` next time** (v0.3 automates this step).
+pass it with `--archive` next time** (v0.3 automates this step). The refreshed table is written beside the archive,
+flushed, and atomically replaced; a write failure or cancellation before commit leaves the previous archive intact.
 
 **An archive is only usable against digests of its own evidence tier.** A sampled digest is `~`-prefixed
 precisely so it can never compare equal to a full hash, so an archive gathered at one tier and read at another
