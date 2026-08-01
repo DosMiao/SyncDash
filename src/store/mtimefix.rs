@@ -92,6 +92,9 @@ pub fn load(root: &Path) -> HashMap<String, (i64, i64)> {
 pub(crate) fn load_local(
     identity: &super::localid::LocalScanStateIdentity,
 ) -> HashMap<String, (i64, i64)> {
+    if !identity.persistent_reuse() {
+        return HashMap::new();
+    }
     load_bound_from_file(
         &local_file_for_key(identity.cache_key()),
         identity.binding(),
@@ -153,6 +156,9 @@ pub(crate) fn record_local(
     fixes: &[(String, i64, i64)],
 ) -> super::StateWriteStatus {
     if fixes.is_empty() {
+        return super::StateWriteStatus::Unchanged;
+    }
+    if !identity.persistent_reuse() {
         return super::StateWriteStatus::Unchanged;
     }
     let file = local_file_for_key(identity.cache_key());
@@ -229,6 +235,9 @@ pub(crate) fn reconcile_local(
     matched: &std::collections::HashSet<String>,
     retain_absent: &std::collections::HashSet<String>,
 ) -> super::StateWriteStatus {
+    if !identity.persistent_reuse() {
+        return super::StateWriteStatus::Unchanged;
+    }
     let file = local_file_for_key(identity.cache_key());
     match reconcile_bound_file(
         &file,
@@ -435,6 +444,53 @@ mod tests {
                 .is_empty()
         );
         cleanup(&file);
+    }
+
+    #[test]
+    fn nondurable_local_identity_neither_loads_nor_rewrites_mtime_corrections() {
+        let key = format!(
+            "nondurable-mtimefix-{}-{}",
+            std::process::id(),
+            crate::foundation::time::now_ms()
+        );
+        let binding = b"injected-reused-device-binding".to_vec();
+        let durable = crate::store::localid::LocalScanStateIdentity::injected(
+            key.clone(),
+            binding.clone(),
+            true,
+        );
+        let nondurable =
+            crate::store::localid::LocalScanStateIdentity::injected(key.clone(), binding, false);
+        let file = local_file_for_key(&key);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        record_bound_file(
+            &file,
+            durable.binding(),
+            HashMap::new(),
+            &[("old.txt".into(), 1_000, 1_500)],
+        )
+        .unwrap();
+
+        assert!(load_local(&nondurable).is_empty());
+        assert_eq!(
+            record_local(&nondurable, &[("new.txt".into(), 2_000, 2_500)]),
+            crate::store::StateWriteStatus::Unchanged
+        );
+        assert_eq!(
+            reconcile_local(
+                &nondurable,
+                &HashMap::new(),
+                &[],
+                crate::store::ScanCoverage::Complete,
+                &std::collections::HashSet::new(),
+                &std::collections::HashSet::new(),
+            ),
+            crate::store::StateWriteStatus::Unchanged
+        );
+        let loaded = load_local(&durable);
+        assert_eq!(loaded.get("old.txt"), Some(&(1_000, 1_500)));
+        assert!(!loaded.contains_key("new.txt"));
+        let _ = std::fs::remove_file(file);
     }
 
     #[test]

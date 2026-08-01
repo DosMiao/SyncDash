@@ -92,6 +92,9 @@ pub fn load(root: &Path) -> HashCache {
 }
 
 pub(crate) fn load_local(identity: &super::localid::LocalScanStateIdentity) -> HashCache {
+    if !identity.persistent_reuse() {
+        return HashMap::new();
+    }
     load_bound_from_file(
         &local_file_for_key(identity.cache_key()),
         identity.binding(),
@@ -183,6 +186,9 @@ pub(crate) fn save_local(
     coverage: super::ScanCoverage,
     retain_absent: &std::collections::HashSet<String>,
 ) -> super::StateWriteStatus {
+    if !identity.persistent_reuse() {
+        return super::StateWriteStatus::Unchanged;
+    }
     let file = local_file_for_key(identity.cache_key());
     let prior = if coverage == super::ScanCoverage::Partial || !retain_absent.is_empty() {
         let Some((map, _)) = read_bound_best_effort(&file, identity.binding()) else {
@@ -498,6 +504,52 @@ mod tests {
             Some("aaa")
         );
         cleanup(&file);
+    }
+
+    #[test]
+    fn nondurable_local_identity_neither_loads_nor_rewrites_persistent_cache() {
+        let key = format!(
+            "nondurable-hashcache-{}-{}",
+            std::process::id(),
+            crate::foundation::time::now_ms()
+        );
+        let binding = b"injected-reused-device-binding".to_vec();
+        let durable = crate::store::localid::LocalScanStateIdentity::injected(
+            key.clone(),
+            binding.clone(),
+            true,
+        );
+        let nondurable = crate::store::localid::LocalScanStateIdentity::injected(
+            key.clone(),
+            binding.clone(),
+            false,
+        );
+        let file = local_file_for_key(&key);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        write_complete(
+            &file,
+            durable.binding(),
+            &[entry("old.txt", Some("old-hash"))],
+        );
+
+        assert!(load_local(&nondurable).is_empty());
+        assert_eq!(
+            save_local(
+                &nondurable,
+                &[entry("new.txt", Some("new-hash"))],
+                crate::store::ScanCoverage::Complete,
+                &std::collections::HashSet::new(),
+            ),
+            crate::store::StateWriteStatus::Unchanged
+        );
+        assert_eq!(
+            load_local(&durable)
+                .get("old.txt")
+                .map(|row| row.2.as_str()),
+            Some("old-hash")
+        );
+        assert!(!load_local(&durable).contains_key("new.txt"));
+        let _ = std::fs::remove_file(file);
     }
 
     #[test]

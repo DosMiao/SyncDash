@@ -7,9 +7,9 @@
 use crate::foundation::path::join_native;
 use std::path::{Path, PathBuf};
 
+use super::schedule::Shared;
 use crate::model::plan::{Op, Side};
 use crate::obs::progress::PhaseProgress;
-use super::schedule::Shared;
 
 pub(super) fn default_trash() -> PathBuf {
     crate::store::trash::trash_root().join(crate::foundation::time::now_ms().to_string())
@@ -71,6 +71,7 @@ fn copy_to_trash(
     }
     staged.seal(fsync)?;
     std::fs::set_permissions(staged.path(), metadata.permissions())?;
+    staged.resync_metadata_if_requested()?;
     refuse_existing(dest, rel)?;
     staged.commit()?;
     crate::fs::remove_file_force(file)
@@ -98,7 +99,11 @@ pub(super) fn preserve(
     if let Some(root) = sh.local_of(&op.side) {
         let dst = join_native(root, &op.path);
         if sh.opt.versioning {
-            let slot = if op.side == Side::Source { &sh.ver_source } else { &sh.ver_target };
+            let slot = if op.side == Side::Source {
+                &sh.ver_source
+            } else {
+                &sh.ver_target
+            };
             let mut w = slot.lock().unwrap();
             if w.is_none() {
                 *w = Some(crate::store::version::VersionWriter::begin(root)?);
@@ -142,7 +147,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("syncdash-preserve-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("syncdash-preserve-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -158,7 +164,10 @@ mod tests {
         std::fs::write(&src, &content).unwrap();
         let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let copy = events.clone();
-        let ctx = RunCtx::new(RunCtl::new(), Arc::new(move |ev| copy.lock().unwrap().push(ev)));
+        let ctx = RunCtx::new(
+            RunCtl::new(),
+            Arc::new(move |ev| copy.lock().unwrap().push(ev)),
+        );
         let pp = PhaseProgress::begin(&ctx, Phase::Apply, None, 1, 0);
 
         copy_to_trash(&src, &dest, "old.bin", false, &pp).unwrap();
@@ -198,7 +207,10 @@ mod tests {
         assert!(crate::obs::progress::is_cancelled(&err));
         assert!(src.exists());
         assert!(!dest.exists());
-        assert!(std::fs::read_dir(dest.parent().unwrap()).unwrap().next().is_none());
+        assert!(std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .next()
+            .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

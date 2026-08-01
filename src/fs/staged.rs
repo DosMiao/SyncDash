@@ -16,6 +16,27 @@ use crate::foundation::names::TEMP_PREFIX;
 
 static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(unix)]
+fn os_name_digest(name: &std::ffi::OsStr) -> blake3::Hash {
+    use std::os::unix::ffi::OsStrExt;
+    blake3::hash(name.as_bytes())
+}
+
+#[cfg(windows)]
+fn os_name_digest(name: &std::ffi::OsStr) -> blake3::Hash {
+    use std::os::windows::ffi::OsStrExt;
+    let mut hasher = blake3::Hasher::new();
+    for unit in name.encode_wide() {
+        hasher.update(&unit.to_le_bytes());
+    }
+    hasher.finalize()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_name_digest(name: &std::ffi::OsStr) -> blake3::Hash {
+    blake3::hash(name.to_string_lossy().as_bytes())
+}
+
 #[cfg(not(windows))]
 fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::rename(source, destination)
@@ -32,7 +53,11 @@ fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     }
 
     let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     let replaced = unsafe {
         MoveFileExW(
             source.as_ptr(),
@@ -45,6 +70,124 @@ fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Rename `source` to `destination` only if the destination is still absent.
+/// A preceding existence check is not sufficient: another process can create the destination
+/// between that check and a normal replacing rename.
+#[cfg(target_os = "macos")]
+pub(crate) fn atomic_rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL")
+    })?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination path contains NUL",
+        )
+    })?;
+    if unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn atomic_rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL")
+    })?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination path contains NUL",
+        )
+    })?;
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn atomic_rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
+pub(crate) fn atomic_rename_noreplace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this platform",
+    ))
+}
+
+/// Persist directory-entry changes after an atomic local rename. Unix requires an explicit fsync
+/// of the containing directory; syncing only the file does not make the new name crash-durable.
+#[cfg(unix)]
+pub(crate) fn sync_directory(directory: &Path) -> std::io::Result<()> {
+    std::fs::File::open(directory)?.sync_all()
+}
+
+/// Both Windows rename primitives above use `MOVEFILE_WRITE_THROUGH`, which is the namespace
+/// durability request available for these operations. There is no additional portable parent
+/// directory flush to issue through `std`.
+#[cfg(windows)]
+pub(crate) fn sync_directory(_directory: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn sync_directory(_directory: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "directory fsync is unavailable on this platform",
+    ))
 }
 
 /// Whether a file name (no directory part) is one of our temp files
@@ -64,20 +207,25 @@ pub struct Staged {
     dst: PathBuf,
     file: Option<std::fs::File>,
     committed: bool,
+    sync_parent_on_commit: bool,
 }
 
 impl Write for Staged {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.file
             .as_mut()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed"))?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed")
+            })?
             .write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.file
             .as_mut()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed"))?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed")
+            })?
             .flush()
     }
 }
@@ -87,16 +235,26 @@ impl Staged {
     /// (putting it in the system temp directory would degrade into a cross-volume copy and lose atomicity).
     pub fn create(dst: &Path) -> std::io::Result<Staged> {
         let dir = dst.parent().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "destination has no parent directory")
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "destination has no parent directory",
+            )
         })?;
-        let base = dst.file_name().and_then(|s| s.to_str()).unwrap_or("out");
+        let basename = dst
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("out"));
+        // Do not embed the whole basename: a perfectly valid NAME_MAX destination would make its
+        // staging name too long. The digest is a bounded diagnostic hint; PID + monotonic ID and
+        // create_new provide the actual collision exclusion.
+        let basename_digest = os_name_digest(basename).to_hex();
+        let basename_digest = &basename_digest.as_str()[..16];
         // PID separates processes; the monotonic stage ID separates simultaneous writers inside
         // one process. The old PID-only name let two concurrent cache rewrites unlink/truncate one
         // another's staging file and could publish the wrong generation.
         let (tmp, file) = loop {
             let stage_id = NEXT_STAGE_ID.fetch_add(1, Ordering::Relaxed);
             let tmp = dir.join(format!(
-                "{TEMP_PREFIX}{base}.{}.{stage_id}",
+                "{TEMP_PREFIX}stage.{basename_digest}.{}.{stage_id}",
                 std::process::id()
             ));
             match std::fs::OpenOptions::new()
@@ -109,7 +267,13 @@ impl Staged {
                 Err(error) => return Err(error),
             }
         };
-        Ok(Staged { tmp, dst: dst.to_path_buf(), file: Some(file), committed: false })
+        Ok(Staged {
+            tmp,
+            dst: dst.to_path_buf(),
+            file: Some(file),
+            committed: false,
+            sync_parent_on_commit: false,
+        })
     }
 
     /// Path of the temp file (hash verification and mtime are applied to it; it becomes the final file only after commit)
@@ -117,22 +281,30 @@ impl Staged {
         &self.tmp
     }
 
+    /// A caller may set mtime/mode on the sealed staging path before publication. When durable
+    /// writes were requested, persist those post-seal metadata changes without paying a second
+    /// file fsync for staged writes whose metadata was never touched.
+    pub(crate) fn resync_metadata_if_requested(&self) -> std::io::Result<()> {
+        if self.sync_parent_on_commit {
+            std::fs::File::open(&self.tmp)?.sync_all()?;
+        }
+        Ok(())
+    }
+
     /// Write the reader's entire content into the staged file
     pub fn write_all_from(&mut self, r: &mut dyn std::io::Read) -> std::io::Result<u64> {
-        let f = self
-            .file
-            .as_mut()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed"))?;
+        let f = self.file.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed")
+        })?;
         std::io::copy(r, f)
     }
 
     /// Write a run of data at a given offset (delta transfer: patch only the chunks that differ)
     pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> std::io::Result<()> {
         use std::io::Seek;
-        let f = self
-            .file
-            .as_mut()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed"))?;
+        let f = self.file.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed")
+        })?;
         f.seek(std::io::SeekFrom::Start(offset))?;
         f.write_all(buf)
     }
@@ -149,10 +321,9 @@ impl Staged {
         on_chunk: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
     ) -> std::io::Result<u64> {
         use std::io::Read;
-        let f = self
-            .file
-            .as_mut()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed"))?;
+        let f = self.file.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed")
+        })?;
         let mut reader = std::fs::File::open(src)?;
         let mut buf = vec![0u8; 1024 * 1024];
         let mut total = 0u64;
@@ -171,6 +342,7 @@ impl Staged {
     /// Flush the data to disk and close the handle.
     /// **Must be called before commit**: on Windows a rename fails while a write handle is open on the source or the destination.
     pub fn seal(&mut self, fsync: bool) -> std::io::Result<()> {
+        self.sync_parent_on_commit |= fsync;
         if let Some(mut f) = self.file.take() {
             f.flush()?;
             if fsync {
@@ -189,6 +361,22 @@ impl Staged {
         }
         atomic_replace(&self.tmp, &self.dst)?;
         self.committed = true;
+        if self.sync_parent_on_commit {
+            sync_directory(self.dst.parent().expect("Staged::create checked parent"))?;
+        }
+        Ok(())
+    }
+
+    /// Atomically publish the staged file only while the final name remains absent.
+    pub fn commit_noreplace(mut self) -> std::io::Result<()> {
+        if self.file.is_some() {
+            self.seal(true)?;
+        }
+        atomic_rename_noreplace(&self.tmp, &self.dst)?;
+        self.committed = true;
+        if self.sync_parent_on_commit {
+            sync_directory(self.dst.parent().expect("Staged::create checked parent"))?;
+        }
         Ok(())
     }
 }
@@ -239,7 +427,11 @@ mod tests {
             s.write_all_from(&mut &b"half written..."[..]).unwrap();
             // drop without committing — simulating a mid-write failure
         }
-        assert_eq!(std::fs::read(&dst).unwrap(), b"original", "dst must never see partial content");
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"original",
+            "dst must never see partial content"
+        );
         // the temp file must not survive either
         let leftovers: Vec<_> = std::fs::read_dir(&d)
             .unwrap()
@@ -275,6 +467,72 @@ mod tests {
     }
 
     #[test]
+    fn no_replace_commit_preserves_a_destination_that_appeared_after_staging() {
+        let d = tmpdir("no-replace");
+        let dst = d.join("f.txt");
+        let mut staged = Staged::create(&dst).unwrap();
+        staged.write_all_from(&mut &b"planned move"[..]).unwrap();
+        staged.seal(true).unwrap();
+
+        std::fs::write(&dst, b"external writer").unwrap();
+        let error = staged
+            .commit_noreplace()
+            .expect_err("an occupied name must be refused atomically");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"external writer");
+        assert!(
+            std::fs::read_dir(&d)
+                .unwrap()
+                .flatten()
+                .all(|entry| !is_temp_name(&entry.file_name().to_string_lossy())),
+            "the refused stage must clean up its temp file",
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn concurrent_no_replace_publish_has_exactly_one_complete_winner() {
+        let d = tmpdir("no-replace-race");
+        let dst = d.join("winner.bin");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let payloads = [vec![0x31; 256 * 1024], vec![0xa7; 256 * 1024]];
+        let mut threads = Vec::new();
+
+        for payload in payloads.clone() {
+            let dst = dst.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut staged = Staged::create(&dst).unwrap();
+                staged.write_all(&payload).unwrap();
+                staged.seal(true).unwrap();
+                barrier.wait();
+                staged.commit_noreplace()
+            }));
+        }
+
+        let outcomes: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        let loser = outcomes
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .expect("one publication must lose");
+        assert_eq!(loser.kind(), std::io::ErrorKind::AlreadyExists);
+        let landed = std::fs::read(&dst).unwrap();
+        assert!(payloads.iter().any(|payload| payload == &landed));
+        assert!(
+            std::fs::read_dir(&d)
+                .unwrap()
+                .flatten()
+                .all(|entry| !is_temp_name(&entry.file_name().to_string_lossy())),
+            "the losing stage must remove its temporary file",
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn new_file_absent_until_commit() {
         let d = tmpdir("newfile");
         let dst = d.join("brand-new.bin");
@@ -283,7 +541,24 @@ mod tests {
             s.write_all_from(&mut &b"xyz"[..]).unwrap();
             assert!(!dst.exists(), "destination must not appear before commit");
         }
-        assert!(!dst.exists(), "abandoned write must not create the destination");
+        assert!(
+            !dst.exists(),
+            "abandoned write must not create the destination"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn near_name_max_destination_uses_a_bounded_staging_name() {
+        let d = tmpdir("long-basename");
+        let dst = d.join("x".repeat(240));
+        let mut staged = Staged::create(&dst).expect("temp name must not repeat the long basename");
+        let temp_name = staged.path().file_name().unwrap().to_string_lossy();
+        assert!(temp_name.len() < 100, "unbounded temp name: {temp_name}");
+        staged.write_all(b"long-name payload").unwrap();
+        staged.seal(true).unwrap();
+        staged.commit().unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"long-name payload");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -297,7 +572,10 @@ mod tests {
         s.seal(false).unwrap();
         s.commit().unwrap();
         let mut got = Vec::new();
-        std::fs::File::open(&dst).unwrap().read_to_end(&mut got).unwrap();
+        std::fs::File::open(&dst)
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
         assert_eq!(&got, b"AAAZZAAAAA");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -312,18 +590,28 @@ mod tests {
         {
             let mut s = Staged::create(&dst).unwrap();
             let mut seen = 0u64;
-            let total = s.copy_from(&src, &mut |c| { seen += c.len() as u64; Ok(()) }).unwrap();
+            let total = s
+                .copy_from(&src, &mut |c| {
+                    seen += c.len() as u64;
+                    Ok(())
+                })
+                .unwrap();
             assert_eq!(total, 3 * 1024 * 1024 + 123);
             assert_eq!(seen, total);
             s.seal(false).unwrap();
             s.commit().unwrap();
         }
-        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 3 * 1024 * 1024 + 123);
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().len(),
+            3 * 1024 * 1024 + 123
+        );
         // abort: call stop after the first chunk → dst unchanged, zero temp debris
         std::fs::write(&dst, b"keep me").unwrap();
         {
             let mut s = Staged::create(&dst).unwrap();
-            let res = s.copy_from(&src, &mut |_| Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stop")));
+            let res = s.copy_from(&src, &mut |_| {
+                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "stop"))
+            });
             assert!(res.is_err());
         }
         assert_eq!(std::fs::read(&dst).unwrap(), b"keep me");

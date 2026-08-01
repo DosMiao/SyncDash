@@ -331,6 +331,11 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
   move's `from`) before opening either backend, so even a hand-authored plan cannot escape its two roots.
 - Hashing is BLAKE3 with a cache: if `(path,size,mtime)` is unchanged the previous result
   is reused; the cache lives in the local user directory and never pollutes the scanned directory.
+  Local on-disk cache reuse is enabled only when the OS supplies durable volume evidence: a macOS
+  volume UUID, Linux filesystem UUID or boot-scoped non-reused `statx` mount ID, or Windows volume
+  GUID. Mount paths, ordinary device/mount numbers, UNC fallbacks and failed probes are diagnostics,
+  not identity; those roots scan cold instead of accepting state from replacement media. File IDs
+  are likewise admitted only for a positive list of filesystems with understood stable-inode semantics.
   VFS cache identities normalize only scheme and host; case-sensitive usernames and root paths stay
   distinct. Error-free scans prune absent rows inside the configured filter domain while retaining
   deliberately excluded rows; a walk error conservatively retains every unseen row. State I/O remains
@@ -470,7 +475,12 @@ pairing, to handle whole-directory renames). Measured:
 {"side":"target","action":"move","path":"moved/old_name.dat","from":"old_name.dat","reason":"move-detected-by-hash"}
 ```
 
-One `rename` on target and it's done, zero re-transfer for large files. Scanning with `--no-hash` automatically
+One `rename` on target and it's done, zero re-transfer for large files. Apply first atomically claims the
+exact source name into a same-directory hold, verifies the Compare evidence, and publishes with a native
+no-replace rename. Only an explicit cross-device error selects the copy path; that path stages and verifies
+the complete payload, publishes no-replace, and removes only the claimed hold—never whatever may have
+reappeared at the original name. Rollback either restores the source or reports the exact recoverable hold,
+and `fsync=true` also persists the affected local directory entries. Scanning with `--no-hash` automatically
 falls back to copy+delete (and gives up move detection).
 
 ## Remote mode (v0.4, implemented and verified on real machines)
