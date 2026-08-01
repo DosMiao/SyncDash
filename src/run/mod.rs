@@ -25,10 +25,68 @@ use crate::job::Job;
 use crate::model::plan::{Op, Plan};
 use crate::model::table::Snapshot;
 
-use local::{apply_job_guarded_with, compare_job_detailed, preflight_job, run_local_job};
-use peer::{apply_peer_job_with, compare_peer_job_detailed, preflight_peer_job, run_peer_job};
-pub use roots::resolve_root;
 use crate::pipeline::scan;
+use local::{
+    apply_job_guarded_with, compare_job_detailed, compare_job_detailed_with_consent, preflight_job,
+    run_local_job,
+};
+use peer::{compare_peer_job_detailed, preflight_peer_job, run_peer_job};
+pub use roots::resolve_root;
+
+#[derive(Clone, Debug)]
+pub struct ApplyRequirements {
+    pub verdict: crate::pipeline::guard::Verdict,
+    pub capabilities: crate::pipeline::guard::caps::CapReport,
+}
+
+/// The point an Apply reached relative to the first operation that may change synchronized state.
+///
+/// Desktop keeps a reviewed Compare result after a refusal only when the engine proves it stopped
+/// at `BeforeWrite`. Counters and error messages cannot provide that proof: a first write can fail
+/// with the same zero-done outcome as a capability gate, and peer transport errors can happen on
+/// either side of the remote `apply-pack` invocation.
+#[derive(Debug)]
+pub enum ApplyExecution {
+    BeforeWrite(ApplyCompletion),
+    WriteStarted(ApplyCompletion),
+}
+
+#[derive(Debug)]
+pub enum ApplyCompletion {
+    Outcome(crate::obs::progress::ApplyOutcome),
+    Error(std::io::Error),
+}
+
+impl ApplyExecution {
+    pub(crate) fn rejected(outcome: crate::obs::progress::ApplyOutcome) -> Self {
+        Self::BeforeWrite(ApplyCompletion::Outcome(outcome))
+    }
+
+    pub(crate) fn started(outcome: crate::obs::progress::ApplyOutcome) -> Self {
+        Self::WriteStarted(ApplyCompletion::Outcome(outcome))
+    }
+
+    pub(crate) fn failed_before_write(error: std::io::Error) -> Self {
+        Self::BeforeWrite(ApplyCompletion::Error(error))
+    }
+
+    pub(crate) fn failed_after_write(error: std::io::Error) -> Self {
+        Self::WriteStarted(ApplyCompletion::Error(error))
+    }
+
+    pub fn writes_started(&self) -> bool {
+        matches!(self, Self::WriteStarted(_))
+    }
+
+    pub fn into_result(self) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
+        match self {
+            Self::BeforeWrite(ApplyCompletion::Outcome(outcome))
+            | Self::WriteStarted(ApplyCompletion::Outcome(outcome)) => Ok(outcome),
+            Self::BeforeWrite(ApplyCompletion::Error(error))
+            | Self::WriteStarted(ApplyCompletion::Error(error)) => Err(error),
+        }
+    }
+}
 
 /// Rigor level → scan options. A monotone ladder: each tier = **more actually read this round**,
 /// and the meaning of "identical ✓" climbs from "metadata measured" to "every byte measured".
@@ -37,9 +95,16 @@ use crate::pipeline::scan;
 /// standard really reads every file's sampling window this round (no cache — not memory, a measurement taken now)
 /// paranoid really reads every byte of every file this round
 pub fn scan_opts(job: &Job) -> scan::ScanOptions {
-    let filter = crate::pipeline::filter::PathFilter::build_full(&job.include, &job.exclude, &job.deletable);
+    let filter =
+        crate::pipeline::filter::PathFilter::build_full(&job.include, &job.exclude, &job.deletable);
     let r = job.rigor_resolved();
-    scan::ScanOptions { hash: r.hash, sampled: r.sampled, use_cache: r.use_cache, symlinks_direct: job.symlinks == "direct", filter }
+    scan::ScanOptions {
+        hash: r.hash,
+        sampled: r.sampled,
+        use_cache: r.use_cache,
+        symlinks_direct: job.symlinks == "direct",
+        filter,
+    }
 }
 
 /// The scan options a comparison across **these two roots** actually runs at.
@@ -104,7 +169,11 @@ pub fn is_peer_job(job: &Job) -> bool {
 /// vocabularies. The single producer is here, so the day that migration is written, this is the
 /// only line that changes.
 pub fn run_kind(job: &Job, verb: &str) -> String {
-    if is_peer_job(job) { format!("remote-{verb}") } else { verb.to_string() }
+    if is_peer_job(job) {
+        format!("remote-{verb}")
+    } else {
+        verb.to_string()
+    }
 }
 
 /// Compare, whichever side does the scanning.
@@ -114,13 +183,36 @@ pub fn compare(
     ctx: &crate::obs::progress::RunCtx,
     accept_caps: bool,
 ) -> std::io::Result<CompareOutcome> {
+    compare_with_capability_consent(
+        name,
+        job,
+        ctx,
+        &crate::pipeline::guard::caps::CapabilityConsent::explicit_cli(accept_caps),
+    )
+}
+
+pub fn compare_with_capability_consent(
+    name: &str,
+    job: &Job,
+    ctx: &crate::obs::progress::RunCtx,
+    consent: &crate::pipeline::guard::caps::CapabilityConsent,
+) -> std::io::Result<CompareOutcome> {
     validate_job(job)?;
     if is_peer_job(job) {
         // The peer scans its own disk and sends back a table; capability consent is a property of
         // the roots this process opens, so it has nothing to apply to.
         compare_peer_job_detailed(name, job, ctx)
     } else {
-        compare_job_detailed(job, ctx, accept_caps)
+        compare_job_detailed_with_consent(job, ctx, consent)
+    }
+}
+
+pub fn compare_capabilities(job: &Job) -> std::io::Result<crate::pipeline::guard::caps::CapReport> {
+    validate_job(job)?;
+    if is_peer_job(job) {
+        Ok(crate::pipeline::guard::caps::CapReport::default())
+    } else {
+        local::compare_capabilities(job)
     }
 }
 
@@ -139,6 +231,23 @@ pub fn preflight(
     }
 }
 
+pub fn apply_requirements(
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    acknowledged: bool,
+) -> std::io::Result<ApplyRequirements> {
+    validate_job(job)?;
+    if is_peer_job(job) {
+        Ok(ApplyRequirements {
+            verdict: preflight_peer_job(job, plan, ops, acknowledged),
+            capabilities: peer::apply_capabilities(job, ops),
+        })
+    } else {
+        local::apply_requirements(job, plan, ops, acknowledged)
+    }
+}
+
 /// Apply, whichever side does the writing.
 #[allow(clippy::too_many_arguments)] // every one is a distinct decision the caller has already made
 pub fn apply(
@@ -152,11 +261,96 @@ pub fn apply(
     accept_caps: bool,
     ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
-    validate_job(job)?;
+    apply_with_capability_consent(
+        name,
+        job,
+        plan,
+        ops,
+        trash,
+        verbose,
+        acknowledged,
+        &crate::pipeline::guard::caps::CapabilityConsent::explicit_cli(accept_caps),
+        ctx,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_with_capability_consent(
+    name: &str,
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    trash: Option<std::path::PathBuf>,
+    verbose: bool,
+    acknowledged: bool,
+    consent: &crate::pipeline::guard::caps::CapabilityConsent,
+    ctx: &crate::obs::progress::RunCtx,
+) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
+    apply_with_capability_consent_classified(
+        name,
+        job,
+        plan,
+        ops,
+        trash,
+        verbose,
+        acknowledged,
+        consent,
+        ctx,
+    )
+    .into_result()
+}
+
+/// Apply with an explicit mutation boundary. New interactive callers should use this form so a
+/// refused run can preserve its reviewed Compare result without guessing from text or counters.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_with_capability_consent_classified(
+    name: &str,
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    trash: Option<std::path::PathBuf>,
+    verbose: bool,
+    acknowledged: bool,
+    consent: &crate::pipeline::guard::caps::CapabilityConsent,
+    ctx: &crate::obs::progress::RunCtx,
+) -> ApplyExecution {
+    if let Err(error) = validate_job(job) {
+        return ApplyExecution::failed_before_write(error);
+    }
     if is_peer_job(job) {
-        apply_peer_job_with(name, job, plan, ops, verbose, acknowledged, ctx)
+        let capabilities = peer::apply_capabilities(job, ops);
+        let blockers = capabilities.blockers();
+        if !blockers.is_empty() {
+            return ApplyExecution::failed_before_write(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                blockers
+                    .iter()
+                    .map(|item| item.render())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
+        if !capabilities.consent_satisfied(
+            crate::pipeline::guard::caps::CapabilityScope::ApplyWrite,
+            consent,
+        ) {
+            return ApplyExecution::failed_before_write(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "peer apply capability limitations require exact review or --accept-caps",
+            ));
+        }
+        peer::apply_peer_job_with_classified(name, job, plan, ops, verbose, acknowledged, ctx)
     } else {
-        Ok(apply_job_guarded_with(job, plan, ops, trash, verbose, acknowledged, accept_caps, ctx))
+        local::apply_job_guarded_with_consent_classified(
+            job,
+            plan,
+            ops,
+            trash,
+            verbose,
+            acknowledged,
+            consent,
+            ctx,
+        )
     }
 }
 
@@ -198,14 +392,26 @@ pub fn describe_root(phrase: &str) -> std::io::Result<String> {
         let _ = writeln!(out, "server:    {info}");
     }
     let _ = writeln!(out, "protocol:  {}", c.protocol);
-    let _ = writeln!(out, "local lane: {}", if v.as_local().is_some() { "yes (fast path)" } else { "no (generic VFS lane)" });
+    let _ = writeln!(
+        out,
+        "local lane: {}",
+        if v.as_local().is_some() {
+            "yes (fast path)"
+        } else {
+            "no (generic VFS lane)"
+        }
+    );
     // The medium and the trash destination are printed together because one decides the other,
     // and "where do my deleted files go" is the question this sheet most often has to answer.
     let _ = writeln!(
         out,
         "medium:    {}  (preserved originals → {})",
         c.medium.as_str(),
-        if c.local_trash { "this machine's trash store" } else { "<root>/.syncdash/trash/<run>/, by rename" }
+        if c.local_trash {
+            "this machine's trash store"
+        } else {
+            "<root>/.syncdash/trash/<run>/, by rename"
+        }
     );
     let _ = writeln!(out, "mtime precision: {} ms", c.mtime_precision_ms);
     let _ = writeln!(out, "name rules: {}{}", c.name_rules.as_str(), match c.name_rules {
@@ -220,10 +426,24 @@ pub fn describe_root(phrase: &str) -> std::io::Result<String> {
         crate::fs::vfs::Support::No => "NO",
         crate::fs::vfs::Support::Unknown => "unknown",
     };
-    let _ = writeln!(out, "set_mtime {}  fsync {}  rename_overwrite {}  ranged_read {}  write_at {}",
-        cap(c.set_mtime), cap(c.fsync), cap(c.rename_overwrite), cap(c.ranged_read), cap(c.write_at));
-    let _ = writeln!(out, "unix_mode {}  symlink {}  file_id {}  free_space {}  read_back {}",
-        cap(c.unix_mode), cap(c.symlink), cap(c.file_id), cap(c.free_space), cap(c.read_back));
+    let _ = writeln!(
+        out,
+        "set_mtime {}  fsync {}  rename_overwrite {}  ranged_read {}  write_at {}",
+        cap(c.set_mtime),
+        cap(c.fsync),
+        cap(c.rename_overwrite),
+        cap(c.ranged_read),
+        cap(c.write_at)
+    );
+    let _ = writeln!(
+        out,
+        "unix_mode {}  symlink {}  file_id {}  free_space {}  read_back {}",
+        cap(c.unix_mode),
+        cap(c.symlink),
+        cap(c.file_id),
+        cap(c.free_space),
+        cap(c.read_back)
+    );
     let _ = write!(out, "parallel streams: up to {}", c.max_parallel_streams);
     Ok(out)
 }
@@ -243,7 +463,13 @@ pub fn compare_job_with(job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::i
 }
 
 /// Execute the selected ops; on complete success in sync mode, refresh the archive (conflicted paths are dropped from it, so the conflict is reported again next time).
-pub fn apply_job(job: &Job, plan: &Plan, ops: &[Op], trash: Option<std::path::PathBuf>, verbose: bool) -> (u64, u64, u64) {
+pub fn apply_job(
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    trash: Option<std::path::PathBuf>,
+    verbose: bool,
+) -> (u64, u64, u64) {
     apply_job_guarded(job, plan, ops, trash, verbose, false, false)
 }
 
@@ -258,11 +484,25 @@ pub fn apply_job_guarded(
     acknowledged: bool,
     accept_caps: bool,
 ) -> (u64, u64, u64) {
-    apply_job_guarded_with(job, plan, ops, trash, verbose, acknowledged, accept_caps, &crate::obs::progress::RunCtx::null()).into_tuple()
+    apply_job_guarded_with(
+        job,
+        plan,
+        ops,
+        trash,
+        verbose,
+        acknowledged,
+        accept_caps,
+        &crate::obs::progress::RunCtx::null(),
+    )
+    .into_tuple()
 }
 
 /// v0.9 M3: the **compare stage** of a remote job — the desktop's `compare_job` routes remote jobs straight here
 /// instead of silently dropping into the local pipeline (which would pull the data over UNC and rehash it: an order of magnitude slower, and semantically wrong).
-pub fn compare_peer_job_with(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<Plan> {
+pub fn compare_peer_job_with(
+    name: &str,
+    job: &Job,
+    ctx: &crate::obs::progress::RunCtx,
+) -> std::io::Result<Plan> {
     compare_peer_job_detailed(name, job, ctx).map(|o| o.plan)
 }

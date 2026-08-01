@@ -111,6 +111,83 @@ pub(crate) struct SelectedRowDto {
     pub(crate) flipped: bool,
 }
 
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum ReviewStatus {
+    DirectAuthorized,
+    ConfirmationRequired,
+    Blocked,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum CapabilitySeverityDto {
+    Block,
+    NeedsAck,
+    Info,
+}
+
+impl From<syncdash::pipeline::guard::caps::CapSeverity> for CapabilitySeverityDto {
+    fn from(value: syncdash::pipeline::guard::caps::CapSeverity) -> Self {
+        match value {
+            syncdash::pipeline::guard::caps::CapSeverity::Block => Self::Block,
+            syncdash::pipeline::guard::caps::CapSeverity::NeedsAck => Self::NeedsAck,
+            syncdash::pipeline::guard::caps::CapSeverity::Info => Self::Info,
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct CapabilityIssueDto {
+    pub(crate) feature: String,
+    pub(crate) side: String,
+    pub(crate) severity: CapabilitySeverityDto,
+    pub(crate) requested: String,
+    pub(crate) actual: String,
+    pub(crate) effect: String,
+}
+
+impl From<&syncdash::pipeline::guard::caps::CapItem> for CapabilityIssueDto {
+    fn from(value: &syncdash::pipeline::guard::caps::CapItem) -> Self {
+        Self {
+            feature: value.feature.clone(),
+            side: value.side.clone(),
+            severity: value.severity.into(),
+            requested: value.requested.clone(),
+            actual: value.actual.clone(),
+            effect: value.effect.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct AuthorizationDto {
+    pub(crate) authorization_token: String,
+    #[ts(type = "number")]
+    pub(crate) expires_at_ms: u64,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct OperationReviewDto {
+    pub(crate) status: ReviewStatus,
+    pub(crate) authorization: Option<AuthorizationDto>,
+    pub(crate) challenge_id: Option<String>,
+    #[ts(type = "number | null")]
+    pub(crate) expires_at_ms: Option<u64>,
+    pub(crate) blockers: Vec<String>,
+    pub(crate) warnings: Vec<String>,
+    pub(crate) capabilities: Vec<CapabilityIssueDto>,
+    pub(crate) requires_health_ack: bool,
+    pub(crate) requires_capability_ack: bool,
+    pub(crate) can_remember_for_session: bool,
+    pub(crate) can_allow_unattended: bool,
+}
+
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct ApplyDto {
@@ -123,15 +200,6 @@ pub(crate) struct ApplyDto {
     #[ts(type = "number")]
     pub(crate) bytes_copied: u64,
     pub(crate) cancelled: bool,
-}
-
-#[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
-pub(crate) struct PreflightDto {
-    pub(crate) ok: bool,
-    pub(crate) acknowledgeable: bool,
-    pub(crate) blockers: Vec<String>,
-    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]

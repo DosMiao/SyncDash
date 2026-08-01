@@ -120,7 +120,7 @@ export function Toolbar(props: Props) {
               : watchMode === 'polling'
                 ? 'Polling on the configured interval while SyncDash is open'
                 : 'Preparing backend-owned change detection'}
-          disabled={!job}
+          disabled={!job || (busy && watchSecs === null)}
           onClick={onToggleWatch}
         >
           <Timer size={13} />

@@ -296,12 +296,16 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
   result because its effective revision is unchanged; a pure rename preserves and relabels that result, while deleting
   and recreating the same name produces a new identity that cannot see it. Every Compare attempt refreshes the job row after reading an
   externally edited TOML — including a failed or cancelled attempt, so a removed target or deleted job cannot leave a
-  ghost selection that fails forever. Preflight/apply
-  load only that registered job name (never a same-stem path elsewhere), prove its stable identity against the compare
-  owner, accept row index + flip decisions rather than
-  caller-authored operations, and reconstruct the executable subset from the cached plan before either the local or peer
-  write path can start. An empty selection is rejected before a run is reserved; in particular, AutoScan will never turn a
-  conflict/note-only result into an archive-changing zero-operation apply.
+  ghost selection that fails forever. Compare and Apply use a structured review protocol rather than caller-owned
+  consent flags: the backend probes current health/capabilities, binds the job ID, revision, target, retained Compare
+  owner, plan digest and normalized row decisions into an expiring one-use authorization, then recomputes those facts
+  immediately before reserving execution. The webview sends only that token to the execution command; it cannot send a
+  plan, acknowledge a different capability report, or replay the token. Session grants are process-local and scoped to
+  the exact job/revision/target/capability digest; unattended Apply still requires a fresh, server-reconstructed action
+  set and refuses health warnings. Apply also exposes a typed mutation boundary: a proven pre-write rejection keeps the
+  retained Compare result available for another review, while any path that may have started a write invalidates it.
+  An empty selection is rejected before a run is reserved; in particular, AutoScan will never turn a conflict/note-only
+  result into an archive-changing zero-operation apply.
 - **Identical-items panel** (that "22,631" button along the bottom of FFS): lists the files judged identical on
   both sides, paged 300 at a time, with its own path filter; the data source is the two snapshots the last compare
   left in memory — **no rescan**. Rows whose content matches but whose timestamps drift more than 2s across the

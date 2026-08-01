@@ -1,8 +1,12 @@
 import { humanSize } from '../../core/format';
-import { preflightAllowsApply } from '../state/execution-safety';
+import {
+  operationReviewCanSubmit,
+  type ApprovalChoices,
+  type OperationReviewState,
+} from '../state/operation-review';
+import { OperationReviewDetails } from './OperationReviewSheet';
 import { Sheet } from './ui';
 import type { JobDto } from '../../core/types/generated/JobDto';
-import type { PreflightDto } from '../../core/types/generated/PreflightDto';
 
 export interface ConfirmTotals {
   copy: number;
@@ -19,28 +23,37 @@ export interface ConfirmTotals {
 interface Props {
   job: JobDto;
   totals: ConfirmTotals;
-  preflight: PreflightDto | null;
-  preflightError: string | null;
-  acknowledged: boolean;
-  onAcknowledge: (v: boolean) => void;
+  reviewState: OperationReviewState;
+  choices: ApprovalChoices;
+  onChoices: (choices: ApprovalChoices) => void;
   onCancel: () => void;
   onConfirm: () => void;
 }
 
 export function ConfirmSheet(props: Props) {
-  const { job, totals: t, preflight, preflightError, acknowledged, onAcknowledge, onCancel, onConfirm } = props;
-  const blocked = !!preflight && !preflight.ok;
-  const canApply = preflightAllowsApply(preflight, preflightError, acknowledged);
+  const { job, totals: t, reviewState, choices, onChoices, onCancel, onConfirm } = props;
+  const blocked = reviewState.review?.status === 'blocked';
+  const canApply = operationReviewCanSubmit(reviewState, choices);
+  const actionLabel = reviewState.phase === 'reviewing'
+    ? 'Reviewing…'
+    : reviewState.phase === 'approving'
+      ? 'Authorizing…'
+      : reviewState.phase === 'error'
+        ? 'Review failed'
+        : 'Apply';
 
   return (
     <Sheet
-      title="Confirm sync"
+      title="Review & apply"
+      width="mid"
       onClose={onCancel}
       footer={
         <>
-          <button className="btn" onClick={onCancel}>Cancel (Esc)</button>
-          <button className="btn accent" disabled={!canApply} onClick={onConfirm}>
-            Apply
+          <button type="button" className="btn" onClick={onCancel}>
+            {blocked || reviewState.phase === 'error' ? 'Close' : 'Cancel (Esc)'}
+          </button>
+          <button type="button" className="btn accent" disabled={!canApply} onClick={onConfirm}>
+            {actionLabel}
           </button>
         </>
       }
@@ -66,31 +79,7 @@ export function ConfirmSheet(props: Props) {
           <span className="dim">The view is the action set</span>
         </div>
       )}
-      {preflight?.warnings.map((w, k) => (
-        <div className="mrow warn" key={`w${k}`}><span>Warning</span><span className="dim">{w}</span></div>
-      ))}
-      {!preflight && !preflightError && (
-        <div className="mrow"><span>Safety checks</span><span className="dim">Checking…</span></div>
-      )}
-      {blocked && preflight!.blockers.map((b, k) => (
-        <div className="mrow danger" key={`b${k}`}><span>Blocked</span><span className="dim">{b}</span></div>
-      ))}
-      {blocked && preflight!.acknowledgeable && (
-        <div className="mrow">
-          <label className="chkline">
-            <input type="checkbox" checked={acknowledged} onChange={(e) => onAcknowledge(e.target.checked)} />
-            I confirm this is correct, continue (same as the CLI&apos;s --i-know)
-          </label>
-        </div>
-      )}
-      {blocked && !preflight!.acknowledgeable && (
-        <div className="mrow danger">
-          <span>Action required</span><span className="dim">Resolve the blockers above and compare again.</span>
-        </div>
-      )}
-      {preflightError && (
-        <div className="mrow danger"><span>Check failed</span><span className="dim">{preflightError}</span></div>
-      )}
+      <OperationReviewDetails state={reviewState} choices={choices} onChoices={onChoices} />
     </Sheet>
   );
 }

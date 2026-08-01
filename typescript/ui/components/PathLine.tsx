@@ -13,6 +13,9 @@ interface Props {
   /// Full config behind the selected job, for the pill row (JobDto carries only what the list needs)
   cfgJob: JobFull | null;
   busy: boolean;
+  /// Keep target navigation available so a pending review can be abandoned, while preventing root
+  /// and config mutations from racing the review request.
+  reviewing: boolean;
   selTarget: number;
   pathHistory: string[];
   /// Which root input the Tauri drag handler is currently hovering, if any
@@ -116,7 +119,8 @@ function configPills(j: JobFull, presets: JunkPresetDto[]): Pill[] {
 /// job TOML. No "just tweak it in memory" — once the two roots in the plan header disagree with what the
 /// job file says, run logs and archive refresh both point in the wrong direction.
 export function PathLine(props: Props) {
-  const { job, cfgJob, busy, selTarget, pathHistory, dropOn, scopeRef, onCommit, onBrowse, onSwap, onSelectTarget, onEditGroup } = props;
+  const { job, cfgJob, busy, reviewing, selTarget, pathHistory, dropOn, scopeRef, onCommit, onBrowse, onSwap, onSelectTarget, onEditGroup } = props;
+  const mutationBusy = busy || reviewing;
 
   const targets = job ? (job.targets && job.targets.length ? job.targets : [job.target]) : [];
   const targetValue = targets[selTarget] ?? '';
@@ -149,7 +153,7 @@ export function PathLine(props: Props) {
           list="sd-paths"
           spellCheck={false}
           placeholder="Select a job, then edit here"
-          disabled={!job || busy}
+          disabled={!job || mutationBusy}
           title={src}
           value={src}
           onChange={(e) => setSrc(e.target.value)}
@@ -169,13 +173,13 @@ export function PathLine(props: Props) {
             (e.target as HTMLInputElement).blur();
           }}
         />
-        <button className="pbtn" title="Browse…" disabled={!job || busy} onClick={() => onBrowse('source')}>
+        <button className="pbtn" title="Browse…" disabled={!job || mutationBusy} onClick={() => onBrowse('source')}>
           <FolderOpen size={13} />
         </button>
         <button
           className="pbtn"
           title={job ? `Swap: ${job.source} ⇄ ${targetValue} (written back to the job file)` : 'Swap source / target'}
-          disabled={!job || busy}
+          disabled={!job || mutationBusy}
           onClick={onSwap}
         ><ArrowLeftRight size={13} /></button>
         <span className="plabel">target</span>
@@ -186,7 +190,7 @@ export function PathLine(props: Props) {
           data-root="target"
           list="sd-paths"
           spellCheck={false}
-          disabled={!job || busy}
+          disabled={!job || mutationBusy}
           title={tgt}
           value={tgt}
           onChange={(e) => setTgt(e.target.value)}
@@ -205,7 +209,7 @@ export function PathLine(props: Props) {
             (e.target as HTMLInputElement).blur();
           }}
         />
-        <button className="pbtn" title="Browse…" disabled={!job || busy} onClick={() => onBrowse('target')}>
+        <button className="pbtn" title="Browse…" disabled={!job || mutationBusy} onClick={() => onBrowse('target')}>
           <FolderOpen size={13} />
         </button>
         {targets.length > 1 && (
@@ -237,7 +241,7 @@ export function PathLine(props: Props) {
             key={p.key}
             className="cfgpill"
             title={`${p.title}\n\nClick to edit — opens ${p.group}.`}
-            disabled={busy}
+            disabled={mutationBusy}
             onClick={() => onEditGroup(p.group)}
           >
             <span className="ck">{p.key}</span><span className="cv">{p.value}</span>

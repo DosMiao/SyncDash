@@ -4,8 +4,17 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { PlanDto, OpDto } from './plan';
 import type { RunEventEnvelope } from './runEvents';
+import {
+  applyAuthorizationArgs,
+  approveOperationArgs,
+  compareAuthorizationArgs,
+  reviewApplyArgs,
+  reviewCompareArgs,
+  unattendedApplyAuthorizationArgs,
+} from './operation-protocol';
 import type { ApplyDto } from './types/generated/ApplyDto';
 import type { AppSettings } from './types/generated/AppSettings';
+import type { AuthorizationDto } from './types/generated/AuthorizationDto';
 import type { CompareOwner } from './types/generated/CompareOwner';
 import type { Job as JobFull } from './types/generated/Job';
 import type { JobDeleteDto } from './types/generated/JobDeleteDto';
@@ -15,16 +24,16 @@ import type { JobFileSchemaDto } from './types/generated/JobFileSchemaDto';
 import type { JobSaveDto } from './types/generated/JobSaveDto';
 import type { JunkPresetDto } from './types/generated/JunkPresetDto';
 import type { MigrateReport } from './types/generated/MigrateReport';
+import type { OperationReviewDto } from './types/generated/OperationReviewDto';
 import type { PathVerdict } from './types/generated/PathVerdict';
 import type { PlanHeader } from './types/generated/PlanHeader';
-import type { PreflightDto } from './types/generated/PreflightDto';
 import type { RowMeta } from './types/generated/RowMeta';
 import type { RunRecord } from './types/generated/RunRecord';
 import type { SamePage } from './types/generated/SamePage';
 import type { SameRow } from './types/generated/SameRow';
 import type { SelectedRowDto } from './types/generated/SelectedRowDto';
 
-export type { JobDeleteDto, JobDetailDto, JobFull, JobSaveDto, JunkPresetDto };
+export type { AuthorizationDto, JobDeleteDto, JobDetailDto, JobFull, JobSaveDto, JunkPresetDto, OperationReviewDto };
 
 export type { SameRow, SamePage };
 
@@ -97,32 +106,25 @@ export const completeAutoScan = (
 
 // Compare / run
 
-/// Capability-degradation consent, per job, per session. A remote backend that lacks something the job
-/// asks for (fsync, sampled reads, a reachable trash…) makes the engine REFUSE with the exact list.
-/// Never persisted: each session sees the list at least once.
-const capsConsent = new Set<string>();
+export const reviewCompare = (name: string, expectedJobId: string, targetIndex?: number) =>
+  invoke<OperationReviewDto>('review_compare', reviewCompareArgs(name, expectedJobId, targetIndex));
 
-/// invoke(), plus the capability-consent round-trip: on the engine's refusal (its message carries the
-/// --accept-caps lines), show the list verbatim and retry once if the user agrees.
-async function withCapsConsent<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
-  const name = String(args.name ?? '');
-  try {
-    return await invoke<T>(cmd, { ...args, acceptCaps: capsConsent.has(name) });
-  } catch (e) {
-    const msg = String(e);
-    if (!msg.includes('--accept-caps')) throw e;
-    const lines = msg.split('\n').slice(1).join('\n').trim();
-    const ok = window.confirm(
-      `This job degrades on capabilities the remote backend lacks:\n\n${lines}\n\nProceed anyway? (Applies to '${name}' for this session.)`,
-    );
-    if (!ok) throw e;
-    capsConsent.add(name);
-    return await invoke<T>(cmd, { ...args, acceptCaps: true });
-  }
-}
+export const approveOperation = (
+  challengeId: string,
+  acknowledgeHealth: boolean,
+  acceptCapabilities: boolean,
+  rememberForSession: boolean,
+  allowUnattended: boolean,
+) => invoke<AuthorizationDto>('approve_operation', approveOperationArgs(
+  challengeId,
+  acknowledgeHealth,
+  acceptCapabilities,
+  rememberForSession,
+  allowUnattended,
+));
 
-export const compareJob = (name: string, expectedJobId: string, targetIndex: number) =>
-  withCapsConsent<PlanDto>('compare_job', { name, expectedJobId, targetIndex });
+export const compareJob = (authorizationToken: string) =>
+  invoke<PlanDto>('compare_job', compareAuthorizationArgs(authorizationToken));
 
 export const touchCompare = (owner: CompareOwner) =>
   invoke<CompareOwner | null>('touch_compare', { owner });
@@ -130,24 +132,14 @@ export const touchCompare = (owner: CompareOwner) =>
 export const restoreCompare = (jobId: string, targetIndex: number) =>
   invoke<PlanDto | null>('restore_compare', { jobId, targetIndex });
 
-export const applyJob = (
-  name: string,
-  plan: PlanDto,
-  selected: SelectedRowDto[],
-  acknowledged: boolean,
-  targetIndex: number,
-  launchId: number,
-) => withCapsConsent<ApplyDto>('apply_job', { name, plan, selected, acknowledged, targetIndex, launchId });
+export const reviewApply = (owner: CompareOwner, selected: SelectedRowDto[]) =>
+  invoke<OperationReviewDto>('review_apply', reviewApplyArgs(owner, selected));
 
-/// AutoScan never grants capability consent by itself — it only reuses consent the user already gave
-/// interactively this session (a degraded run must never start on a timer without a human having seen the list)
-export const applyJobUnattended = (name: string, plan: PlanDto, selected: SelectedRowDto[], targetIndex: number) =>
-  invoke<ApplyDto>('apply_job', {
-    name, plan, selected, acknowledged: false, targetIndex, acceptCaps: capsConsent.has(name),
-  });
+export const authorizeUnattendedApply = (owner: CompareOwner, selected: SelectedRowDto[]) =>
+  invoke<AuthorizationDto>('authorize_unattended_apply', unattendedApplyAuthorizationArgs(owner, selected));
 
-export const preflight = (name: string, plan: PlanDto, selected: SelectedRowDto[], acknowledged: boolean, targetIndex: number) =>
-  invoke<PreflightDto>('preflight', { name, plan, selected, acknowledged, targetIndex });
+export const applyJob = (authorizationToken: string, launchId?: number) =>
+  invoke<ApplyDto>('apply_job', applyAuthorizationArgs(authorizationToken, launchId));
 
 export const cancelRun = (runId: number) => invoke<boolean>('cancel_run', { runId });
 export const pauseRun = (runId: number, paused: boolean) => invoke<boolean>('pause_run', { runId, paused });

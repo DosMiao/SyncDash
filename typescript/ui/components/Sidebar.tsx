@@ -10,6 +10,9 @@ interface Props {
   /// job name → most recent run, for the second line on each card
   lastMap: Record<string, RunRecord>;
   busy: boolean;
+  /// A safety review may be abandoned by selecting another job, but editing job identity/config
+  /// underneath it is disabled until the response is fenced or dismissed.
+  reviewing: boolean;
   appVersion: string;
   jobsDir: string;
   onSelect: (job: JobDto) => void;
@@ -32,7 +35,7 @@ function LastRun({ r }: { r: RunRecord }) {
 }
 
 export function Sidebar(props: Props) {
-  const { jobs, currentJobId, lastMap, busy, appVersion, jobsDir, onSelect, onEdit, onNew } = props;
+  const { jobs, currentJobId, lastMap, busy, reviewing, appVersion, jobsDir, onSelect, onEdit, onNew } = props;
   const jobButtons = useRef<Array<HTMLButtonElement | null>>([]);
 
   const moveFocus = (from: number, direction: -1 | 1 | 'first' | 'last') => {
@@ -89,14 +92,14 @@ export function Sidebar(props: Props) {
               className="jedit"
               aria-label={`Edit job ${j.name}`}
               title="Edit job"
-              disabled={busy}
+              disabled={busy || reviewing}
               onClick={() => onEdit(j.name)}
             ><Pencil size={12} aria-hidden="true" /></button>
           </div>
           );
         })}
       </nav>
-      <button className="btn newjob" disabled={busy} onClick={onNew}><Plus size={13} /> New job</button>
+      <button className="btn newjob" disabled={busy || reviewing} onClick={onNew}><Plus size={13} /> New job</button>
       <div className="sidefoot">
         <span>{appVersion}</span>
         <span title={jobsDir}>{jobsDir}</span>

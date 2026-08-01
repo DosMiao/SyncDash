@@ -55,11 +55,17 @@ pub struct Guards {
 
 impl Default for Guards {
     fn default() -> Self {
-        Guards { require_marker: false, min_free_pct: 0.01, max_delete_ratio: 0.5, acknowledged: false }
+        Guards {
+            require_marker: false,
+            min_free_pct: 0.01,
+            max_delete_ratio: 0.5,
+            acknowledged: false,
+        }
     }
 }
 
 /// The verdict of one preflight. Non-empty `blockers` = refuse to run.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Verdict {
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
@@ -90,19 +96,58 @@ pub fn run_all_vfs(
     head: &PlanHeader,
     g: &Guards,
 ) -> Verdict {
-    let mut v = Verdict { blockers: Vec::new(), warnings: Vec::new() };
+    let mut v = Verdict {
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+    };
     check_root_vfs("source", source, g.require_marker, &mut v);
     check_root_vfs("target", target, g.require_marker, &mut v);
     if !v.ok() {
         return v; // with a root unavailable, the later checks are meaningless
     }
-    check_scan_complete("source", head.source_walk_errors, &head.source_walk_err_samples, g, &mut v);
-    check_scan_complete("target", head.target_walk_errors, &head.target_walk_err_samples, g, &mut v);
-    check_materialized("source", head.source_icloud_stubs, &head.source_icloud_stub_samples, g, &mut v);
-    check_materialized("target", head.target_icloud_stubs, &head.target_icloud_stub_samples, g, &mut v);
+    check_scan_complete(
+        "source",
+        head.source_walk_errors,
+        &head.source_walk_err_samples,
+        g,
+        &mut v,
+    );
+    check_scan_complete(
+        "target",
+        head.target_walk_errors,
+        &head.target_walk_err_samples,
+        g,
+        &mut v,
+    );
+    check_materialized(
+        "source",
+        head.source_icloud_stubs,
+        &head.source_icloud_stub_samples,
+        g,
+        &mut v,
+    );
+    check_materialized(
+        "target",
+        head.target_icloud_stubs,
+        &head.target_icloud_stub_samples,
+        g,
+        &mut v,
+    );
     let st = stat_plan(ops);
-    check_space_vfs("target", target, st.target.write_bytes, g.min_free_pct, &mut v);
-    check_space_vfs("source", source, st.source.write_bytes, g.min_free_pct, &mut v);
+    check_space_vfs(
+        "target",
+        target,
+        st.target.write_bytes,
+        g.min_free_pct,
+        &mut v,
+    );
+    check_space_vfs(
+        "source",
+        source,
+        st.source.write_bytes,
+        g.min_free_pct,
+        &mut v,
+    );
     check_delete_ratio("target", &st.target, head.target_entries, g, &mut v);
     check_delete_ratio("source", &st.source, head.source_entries, g, &mut v);
     v
@@ -118,19 +163,58 @@ pub fn run_all(
     head: &PlanHeader,
     g: &Guards,
 ) -> Verdict {
-    let mut v = Verdict { blockers: Vec::new(), warnings: Vec::new() };
+    let mut v = Verdict {
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+    };
     check_root("source", source_root, g.require_marker, &mut v);
     check_root("target", target_root, g.require_marker, &mut v);
     if !v.ok() {
         return v; // with a root unavailable, the later checks are meaningless
     }
-    check_scan_complete("source", head.source_walk_errors, &head.source_walk_err_samples, g, &mut v);
-    check_scan_complete("target", head.target_walk_errors, &head.target_walk_err_samples, g, &mut v);
-    check_materialized("source", head.source_icloud_stubs, &head.source_icloud_stub_samples, g, &mut v);
-    check_materialized("target", head.target_icloud_stubs, &head.target_icloud_stub_samples, g, &mut v);
+    check_scan_complete(
+        "source",
+        head.source_walk_errors,
+        &head.source_walk_err_samples,
+        g,
+        &mut v,
+    );
+    check_scan_complete(
+        "target",
+        head.target_walk_errors,
+        &head.target_walk_err_samples,
+        g,
+        &mut v,
+    );
+    check_materialized(
+        "source",
+        head.source_icloud_stubs,
+        &head.source_icloud_stub_samples,
+        g,
+        &mut v,
+    );
+    check_materialized(
+        "target",
+        head.target_icloud_stubs,
+        &head.target_icloud_stub_samples,
+        g,
+        &mut v,
+    );
     let st = stat_plan(ops);
-    check_space("target", target_root, st.target.write_bytes, g.min_free_pct, &mut v);
-    check_space("source", source_root, st.source.write_bytes, g.min_free_pct, &mut v);
+    check_space(
+        "target",
+        target_root,
+        st.target.write_bytes,
+        g.min_free_pct,
+        &mut v,
+    );
+    check_space(
+        "source",
+        source_root,
+        st.source.write_bytes,
+        g.min_free_pct,
+        &mut v,
+    );
     check_delete_ratio("target", &st.target, head.target_entries, g, &mut v);
     check_delete_ratio("source", &st.source, head.source_entries, g, &mut v);
     v

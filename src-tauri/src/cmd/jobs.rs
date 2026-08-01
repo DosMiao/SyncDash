@@ -6,9 +6,19 @@ use syncdash::job::{self};
 use syncdash::run;
 use tauri::Emitter;
 
+use crate::auth::AuthorizationStore;
 use crate::autoscan::AutoScanController;
 use crate::dto::{JobDeleteDto, JobDetailDto, JobDto, JobFileSchemaDto, JobSaveDto};
 use crate::state::{with_run_idle, ResultRepository, RunState};
+
+use super::require_main_window;
+
+fn mutation_revokes_authority(effect: job::JobMutationEffect) -> bool {
+    matches!(
+        effect,
+        job::JobMutationEffect::Updated | job::JobMutationEffect::Deleted
+    )
+}
 
 #[tauri::command]
 pub fn list_jobs() -> Result<Vec<JobDto>, String> {
@@ -80,23 +90,30 @@ pub fn job_file_schema(name: String) -> Result<JobFileSchemaDto, String> {
 
 #[tauri::command]
 pub fn save_job(
+    window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     run_state: tauri::State<'_, Arc<RunState>>,
     results: tauri::State<'_, Arc<ResultRepository>>,
     autoscan: tauri::State<'_, Arc<AutoScanController>>,
+    authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
     name: String,
     job: job::Job,
     original_name: Option<String>,
     expected_revision: Option<String>,
 ) -> Result<JobSaveDto, String> {
+    require_main_window(&window)?;
     let saved = with_run_idle(run_state.inner(), "Saving jobs", || {
-        job::save_job(
+        let saved = job::save_job(
             &name,
             &job,
             original_name.as_deref(),
             expected_revision.as_deref(),
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        if mutation_revokes_authority(saved.effect) {
+            authorizations.revoke_job(&saved.job_id);
+        }
+        Ok(saved)
     })?;
     match saved.effect {
         job::JobMutationEffect::Renamed => {
@@ -138,16 +155,21 @@ pub fn save_job(
 
 #[tauri::command]
 pub fn delete_job(
+    window: tauri::WebviewWindow,
     run_state: tauri::State<'_, Arc<RunState>>,
     results: tauri::State<'_, Arc<ResultRepository>>,
     autoscan: tauri::State<'_, Arc<AutoScanController>>,
+    authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
     name: String,
     expected_job_id: String,
     expected_revision: String,
 ) -> Result<JobDeleteDto, String> {
+    require_main_window(&window)?;
     let deleted = with_run_idle(run_state.inner(), "Deleting jobs", || {
-        job::delete_job(&name, &expected_job_id, &expected_revision)
-            .map_err(|error| error.to_string())
+        let deleted = job::delete_job(&name, &expected_job_id, &expected_revision)
+            .map_err(|error| error.to_string())?;
+        authorizations.revoke_job(&deleted.job_id);
+        Ok(deleted)
     })?;
     autoscan.stop_if_job_id(&deleted.job_id);
     results.0.lock().unwrap().invalidate_job(&deleted.job_id);
@@ -157,4 +179,19 @@ pub fn delete_job(
         config_revision: deleted.config_revision,
         effect: deleted.effect,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mutation_revokes_authority;
+    use syncdash::job::JobMutationEffect;
+
+    #[test]
+    fn semantic_update_and_delete_revoke_but_rename_and_noop_preserve() {
+        assert!(mutation_revokes_authority(JobMutationEffect::Updated));
+        assert!(mutation_revokes_authority(JobMutationEffect::Deleted));
+        assert!(!mutation_revokes_authority(JobMutationEffect::Renamed));
+        assert!(!mutation_revokes_authority(JobMutationEffect::NoOp));
+        assert!(!mutation_revokes_authority(JobMutationEffect::Created));
+    }
 }

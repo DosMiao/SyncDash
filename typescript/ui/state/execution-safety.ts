@@ -1,35 +1,4 @@
 import type { CompareOwner } from '../../core/types/generated/CompareOwner';
-import type { PreflightDto } from '../../core/types/generated/PreflightDto';
-import type { SelectedRowDto } from '../../core/types/generated/SelectedRowDto';
-
-export function reviewedSetKey(
-  owner: CompareOwner,
-  jobId: string,
-  configRevision: string,
-  targetIndex: number,
-  selected: SelectedRowDto[],
-): string {
-  return JSON.stringify([
-    owner.compare_id,
-    owner.job_id,
-    owner.config_revision,
-    owner.target_index,
-    jobId,
-    configRevision,
-    targetIndex,
-    selected.map((row) => [row.index, row.flipped]),
-  ]);
-}
-
-export function preflightAllowsApply(
-  preflight: PreflightDto | null,
-  preflightError: string | null,
-  acknowledged: boolean,
-): boolean {
-  return preflightError === null
-    && preflight !== null
-    && (preflight.ok || (preflight.acknowledgeable && acknowledged));
-}
 
 export interface AutoScanTicket {
   generation: number;

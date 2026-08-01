@@ -2,10 +2,10 @@
 //
 // This component owns the session state (selected job, bounded compare reviews, view filters)
 // and every action that crosses the Tauri boundary; everything under components/ is presentation fed by
-// props. The frontend derives a flipped row for review, but preflight/apply receive only row indices
-// and flip flags; Rust reconstructs the executable operations from the authenticated plan.
+// props. The frontend derives flipped row decisions for review, but execution receives only a
+// one-use authorization token; Rust owns the authenticated plan and reconstructs every operation.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { CircleCheck, FolderSearch } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
@@ -23,7 +23,6 @@ import type { CmpStage, CompareProgressEvent } from '../core/compareProgress';
 import type { ViewFilter } from '../core/filter';
 import type { PlanLayout } from '../core/grouping';
 import type { JobDto } from '../core/types/generated/JobDto';
-import type { PreflightDto } from '../core/types/generated/PreflightDto';
 import type { RunRecord } from '../core/types/generated/RunRecord';
 
 import { useStatus } from './hooks/useStatus';
@@ -44,18 +43,31 @@ import {
   targetForSelection,
   updateSession,
 } from './state/compare-session';
-import type { CompareRepository } from './state/compare-session';
+import type { CompareRepository, JobIdentitySnapshot } from './state/compare-session';
 import {
   ownsFreshAutoScanResult,
-  preflightAllowsApply,
-  reviewedSetKey,
 } from './state/execution-safety';
 import type { AutoScanTicket } from './state/execution-safety';
+import {
+  applyReviewKey,
+  compareReviewKey,
+  directAuthorization,
+  EMPTY_APPROVAL_CHOICES,
+  INITIAL_OPERATION_REVIEW,
+  normalizeApprovalChoices,
+  operationReviewCanSubmit,
+  operationReviewPending,
+  operationReviewReducer,
+  ownsOperationReviewTicket,
+  type ApprovalChoices,
+  type OperationReviewTicket,
+} from './state/operation-review';
 import { RequestFence } from './state/request-fence';
 import { mergeRunEventReplay } from '../core/runEvents';
 import { ComparePanel } from './components/ComparePanel';
 import { ScanFaultBanner } from './components/ScanFaultBanner';
 import { ConfirmSheet } from './components/ConfirmSheet';
+import { CompareReviewSheet } from './components/OperationReviewSheet';
 import { FilterBar } from './components/FilterBar';
 import { FunnelPopover } from './components/FunnelPopover';
 import { JobEditor } from './components/JobEditor';
@@ -115,9 +127,7 @@ export function App() {
   const maskRequest = useRef(new RequestFence());
   const restoreRequest = useRef(new RequestFence());
   const [busy, setBusy] = useState(false);
-  const syncInFlight = useRef(false);
-  /// The user ticked "I confirm this is correct" in the confirm sheet (same as CLI --i-know); reset on every new compare
-  const [acknowledged, setAcknowledged] = useState(false);
+  const syncInFlight = useRef<OperationReviewTicket | null>(null);
 
   // View
   const [chips, setChips] = useState<Set<Chip>>(new Set());
@@ -136,10 +146,17 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [confirmReviewKey, setConfirmReviewKey] = useState<string | null>(null);
-  const [preflight, setPreflight] = useState<PreflightDto | null>(null);
-  const [preflightError, setPreflightError] = useState<string | null>(null);
-  const preflightRequest = useRef(0);
+  const [applyReview, dispatchApplyReview] = useReducer(operationReviewReducer, INITIAL_OPERATION_REVIEW);
+  const [applyChoices, setApplyChoices] = useState<ApprovalChoices>(EMPTY_APPROVAL_CHOICES);
+  const applyReviewGeneration = useRef(0);
+  const applyReviewTicket = useRef<OperationReviewTicket | null>(null);
   const confirmReviewKeyRef = useRef<string | null>(null);
+  const [compareReview, dispatchCompareReview] = useReducer(operationReviewReducer, INITIAL_OPERATION_REVIEW);
+  const [compareChoices, setCompareChoices] = useState<ApprovalChoices>(EMPTY_APPROVAL_CHOICES);
+  const compareReviewGeneration = useRef(0);
+  const compareReviewTicket = useRef<OperationReviewTicket | null>(null);
+  const compareReviewFetchTicket = useRef<OperationReviewTicket | null>(null);
+  const compareApprovalTicket = useRef<OperationReviewTicket | null>(null);
   const [funnelAnchor, setFunnelAnchor] = useState<DOMRect | null>(null);
   const [ctx, setCtx] = useState<CtxState | null>(null);
   const [logOpen, setLogOpen] = useState(false);
@@ -212,11 +229,18 @@ export function App() {
   const reviewedRows = useMemo(() => (plan ? selectedRows(final, flipped) : []), [plan, final, flipped]);
   const reviewKey = useMemo(() => (
     plan && currentJob
-      ? reviewedSetKey(plan.owner, currentJob.job_id, currentJob.config_revision, selTarget, reviewedRows)
+      ? applyReviewKey(plan.owner, currentJob.job_id, currentJob.config_revision, selTarget, reviewedRows)
       : null
   ), [plan, currentJob, selTarget, reviewedRows]);
   const currentReviewKeyRef = useRef<string | null>(reviewKey);
   currentReviewKeyRef.current = reviewKey;
+  const currentCompareReviewKey = useMemo(() => (
+    currentJob
+      ? compareReviewKey(currentJob.job_id, currentJob.config_revision, selTarget)
+      : null
+  ), [currentJob, selTarget]);
+  const currentCompareReviewKeyRef = useRef<string | null>(currentCompareReviewKey);
+  currentCompareReviewKeyRef.current = currentCompareReviewKey;
 
   const layout = useMemo(() => (
     plan ? buildLayout({ plan, flipped, visible, grouped, sort }) : EMPTY_LAYOUT
@@ -292,22 +316,30 @@ export function App() {
   }, [refreshJobs, setStatus]);
 
   const resetConfirmation = useCallback(() => {
-    preflightRequest.current += 1;
+    applyReviewTicket.current = null;
     confirmReviewKeyRef.current = null;
-    setAcknowledged(false);
+    setApplyChoices(EMPTY_APPROVAL_CHOICES);
     setConfirmOpen(false);
     setConfirmReviewKey(null);
-    setPreflight(null);
-    setPreflightError(null);
+    dispatchApplyReview({ type: 'reset' });
+  }, []);
+
+  const resetCompareReview = useCallback(() => {
+    compareReviewTicket.current = null;
+    compareReviewFetchTicket.current = null;
+    compareApprovalTicket.current = null;
+    setCompareChoices(EMPTY_APPROVAL_CHOICES);
+    dispatchCompareReview({ type: 'reset' });
   }, []);
 
   const resetSafetyUi = useCallback(() => {
     resetConfirmation();
+    resetCompareReview();
     setSameOpen(false);
     setFunnelAnchor(null);
     setCtx(null);
     setAskSwap(null);
-  }, [resetConfirmation]);
+  }, [resetCompareReview, resetConfirmation]);
 
   const clearMasks = useCallback(() => {
     maskRequest.current.invalidate();
@@ -344,11 +376,17 @@ export function App() {
   useEffect(() => {
     if (previousReviewKey.current === reviewKey) return;
     previousReviewKey.current = reviewKey;
-    setAcknowledged(false);
     if (!confirmOpen) return;
     resetConfirmation();
     setStatus('The reviewed action set changed — open confirmation again', 'err');
   }, [reviewKey, confirmOpen, resetConfirmation, setStatus]);
+
+  const previousCompareReviewKey = useRef<string | null>(currentCompareReviewKey);
+  useEffect(() => {
+    if (previousCompareReviewKey.current === currentCompareReviewKey) return;
+    previousCompareReviewKey.current = currentCompareReviewKey;
+    resetCompareReview();
+  }, [currentCompareReviewKey, resetCompareReview]);
 
   useEffect(() => {
     if (!currentJob || currentJob.targets.length === 0 || selTarget < currentJob.targets.length) return;
@@ -447,15 +485,18 @@ export function App() {
 
   // Actions
 
-  const doCompare = useCallback(async (autoTicket?: AutoScanTicket): Promise<CompareCompletion | null> => {
-    if (!currentJob || busy || editor || compareInFlight.current) return null;
+  const runAuthorizedCompare = useCallback(async (
+    authorizationToken: string,
+    comparedJob: JobIdentitySnapshot,
+    targetIndex: number,
+    autoTicket?: AutoScanTicket,
+  ): Promise<CompareCompletion | null> => {
+    if (busy || editor || compareInFlight.current) return null;
     if (autoTicket && (!autoScanEnabled.current || autoScanTicket.current?.generation !== autoTicket.generation)) return null;
     if (!autoTicket) autoScanTicket.current = null;
     restoreRequest.current.invalidate();
     compareInFlight.current = true;
-    const name = currentJob.name;
-    const comparedJob = snapshotJob(currentJob);
-    const targetIndex = selTarget;
+    const name = comparedJob.name;
     resetSafetyUi();
     setBusy(true);
     setStatus(`Comparing '${name}' ...`);
@@ -466,7 +507,7 @@ export function App() {
     cmpRunReady.current = false;
     setCmpActive(true);
     try {
-      const p = await ipc.compareJob(name, comparedJob.jobId, targetIndex);
+      const p = await ipc.compareJob(authorizationToken);
       const f = p.ops.map(() => false);
       setCompareRepository((repository) => retainSuccessfulSession(
         repository,
@@ -570,10 +611,162 @@ export function App() {
       cmpRunReady.current = false;
       compareInFlight.current = false;
     }
-  }, [currentJob, busy, editor, selTarget, vfilter.masks, clearMasks, recomputeMasks, refreshJobs, resetNavigationUi, resetSafetyUi, stopAutoScan, setStatus]);
+  }, [busy, editor, vfilter.masks, clearMasks, recomputeMasks, refreshJobs, resetNavigationUi, resetSafetyUi, stopAutoScan, setStatus]);
+
+  const doCompare = useCallback(async (autoTicket?: AutoScanTicket): Promise<CompareCompletion | null> => {
+    if (!currentJob || busy || editor || compareInFlight.current) return null;
+    if (!autoTicket && applyReviewTicket.current) return null;
+    if (!autoTicket && operationReviewPending(compareReview)) return null;
+    if (autoTicket && (
+      !autoScanEnabled.current
+      || autoScanTicket.current?.generation !== autoTicket.generation
+      || autoScanTicket.current.ticketId !== autoTicket.ticketId
+    )) return null;
+
+    const comparedJob = snapshotJob(currentJob);
+    const targetIndex = selTarget;
+    const key = compareReviewKey(comparedJob.jobId, comparedJob.configRevision, targetIndex);
+
+    if (autoTicket) {
+      setStatus(`AutoScan is reviewing Compare authorization for '${comparedJob.name}'…`);
+      try {
+        const review = await ipc.reviewCompare(comparedJob.name, comparedJob.jobId, targetIndex);
+        const selection = selectionRef.current;
+        const stillOwned = autoScanEnabled.current
+          && autoScanTicket.current?.generation === autoTicket.generation
+          && autoScanTicket.current.ticketId === autoTicket.ticketId
+          && selection.job?.job_id === comparedJob.jobId
+          && selection.job.config_revision === comparedJob.configRevision
+          && selection.targetIndex === targetIndex;
+        if (!stillOwned) return null;
+        const authorization = directAuthorization(review);
+        if (!authorization) {
+          setStatus(
+            review.status === 'direct_authorized'
+              ? `AutoScan paused: the direct Compare review for '${comparedJob.name}' was internally inconsistent`
+              : `AutoScan paused: Compare requires an exact interactive authorization for '${comparedJob.name}'`,
+            'err',
+          );
+          return null;
+        }
+        return runAuthorizedCompare(
+          authorization.authorization_token,
+          comparedJob,
+          targetIndex,
+          autoTicket,
+        );
+      } catch (error) {
+        setStatus(`AutoScan could not review Compare authorization: ${error}`, 'err');
+        return null;
+      }
+    }
+
+    if (compareReviewFetchTicket.current?.key === key) return null;
+
+    const ticket: OperationReviewTicket = {
+      key,
+      generation: compareReviewGeneration.current + 1,
+    };
+    compareReviewGeneration.current = ticket.generation;
+    compareReviewTicket.current = ticket;
+    compareReviewFetchTicket.current = ticket;
+    setCompareChoices(EMPTY_APPROVAL_CHOICES);
+    dispatchCompareReview({ type: 'begin', ticket });
+    setStatus(`Reviewing Compare authorization for '${comparedJob.name}'…`);
+    try {
+      const review = await ipc.reviewCompare(comparedJob.name, comparedJob.jobId, targetIndex);
+      if (!ownsOperationReviewTicket(compareReviewTicket.current, ticket, currentCompareReviewKeyRef.current)) {
+        return null;
+      }
+      dispatchCompareReview({ type: 'resolved', ticket, review });
+      const authorization = directAuthorization(review);
+      if (authorization) {
+        return runAuthorizedCompare(
+          authorization.authorization_token,
+          comparedJob,
+          targetIndex,
+        );
+      }
+      if (review.status === 'direct_authorized') {
+        const error = 'The direct Compare review was internally inconsistent and was rejected';
+        dispatchCompareReview({ type: 'failed', ticket, error });
+        setStatus(error, 'err');
+        return null;
+      }
+      if (review.status === 'blocked') {
+        setStatus(`Compare is blocked for '${comparedJob.name}' — review the required fixes`, 'err');
+      } else if (review.status === 'confirmation_required') {
+        setStatus(`Compare requires your approval for '${comparedJob.name}'`);
+      } else {
+        const error = 'The Compare review returned an unknown status and was rejected';
+        dispatchCompareReview({ type: 'failed', ticket, error });
+        setStatus(error, 'err');
+      }
+      return null;
+    } catch (error) {
+      if (!ownsOperationReviewTicket(compareReviewTicket.current, ticket, currentCompareReviewKeyRef.current)) {
+        return null;
+      }
+      dispatchCompareReview({ type: 'failed', ticket, error: String(error) });
+      setStatus(`Compare authorization review failed: ${error}`, 'err');
+      return null;
+    } finally {
+      if (compareReviewFetchTicket.current?.generation === ticket.generation
+        && compareReviewFetchTicket.current.key === ticket.key) {
+        compareReviewFetchTicket.current = null;
+      }
+    }
+  }, [currentJob, busy, editor, compareReview, selTarget, runAuthorizedCompare, setStatus]);
+
+  const approveCompareReview = useCallback(async () => {
+    const ticket = compareReviewTicket.current;
+    const review = compareReview.review;
+    if (!ticket || !review || !operationReviewCanSubmit(compareReview, compareChoices)) return;
+    if (review.status !== 'confirmation_required' || !review.challenge_id) return;
+    if (compareApprovalTicket.current?.generation === ticket.generation
+      && compareApprovalTicket.current.key === ticket.key) return;
+    compareApprovalTicket.current = ticket;
+    const choices = normalizeApprovalChoices(review, compareChoices);
+    dispatchCompareReview({ type: 'begin_approval', ticket });
+    setStatus('Authorizing this exact Compare operation…');
+    try {
+      const authorization = await ipc.approveOperation(
+        review.challenge_id,
+        choices.acknowledgeHealth,
+        choices.acceptCapabilities,
+        choices.rememberForSession,
+        choices.allowUnattended,
+      );
+      if (!ownsOperationReviewTicket(compareReviewTicket.current, ticket, currentCompareReviewKeyRef.current)) return;
+      const selected = selectionRef.current;
+      if (!selected.job) return;
+      dispatchCompareReview({ type: 'authorized', ticket, authorization });
+      await runAuthorizedCompare(
+        authorization.authorization_token,
+        snapshotJob(selected.job),
+        selected.targetIndex,
+      );
+    } catch (error) {
+      if (!ownsOperationReviewTicket(compareReviewTicket.current, ticket, currentCompareReviewKeyRef.current)) return;
+      dispatchCompareReview({ type: 'approval_failed', ticket, error: String(error) });
+      setStatus(`Compare authorization failed: ${error}`, 'err');
+    } finally {
+      if (compareApprovalTicket.current?.generation === ticket.generation
+        && compareApprovalTicket.current.key === ticket.key) {
+        compareApprovalTicket.current = null;
+      }
+    }
+  }, [compareChoices, compareReview, runAuthorizedCompare, setStatus]);
 
   const openConfirm = useCallback(async () => {
-    if (!currentJob || !plan || !reviewKey || busy) return;
+    if (!currentJob
+      || !plan
+      || !reviewKey
+      || busy
+      || operationReviewPending(applyReview)
+      || applyReviewTicket.current
+      || compareReviewFetchTicket.current
+      || compareReview.review) return;
     const hiddenChecked = checked.filter(Boolean).length - final.length;
     if (final.length === 0) {
       setStatus(
@@ -582,31 +775,26 @@ export function App() {
       );
       return;
     }
-    const request = preflightRequest.current + 1;
-    preflightRequest.current = request;
+    const ticket: OperationReviewTicket = {
+      key: reviewKey,
+      generation: applyReviewGeneration.current + 1,
+    };
+    applyReviewGeneration.current = ticket.generation;
+    applyReviewTicket.current = ticket;
     confirmReviewKeyRef.current = reviewKey;
     setConfirmReviewKey(reviewKey);
-    setAcknowledged(false);
-    setPreflight(null);
-    setPreflightError(null);
+    setApplyChoices(EMPTY_APPROVAL_CHOICES);
+    dispatchApplyReview({ type: 'begin', ticket });
     setConfirmOpen(true);
     try {
-      const result = await ipc.preflight(currentJob.name, plan, reviewedRows, false, selTarget);
-      if (
-        preflightRequest.current !== request
-        || confirmReviewKeyRef.current !== reviewKey
-        || currentReviewKeyRef.current !== reviewKey
-      ) return;
-      setPreflight(result);
-    } catch (e) {
-      if (
-        preflightRequest.current !== request
-        || confirmReviewKeyRef.current !== reviewKey
-        || currentReviewKeyRef.current !== reviewKey
-      ) return;
-      setPreflightError(String(e));
+      const review = await ipc.reviewApply(plan.owner, reviewedRows);
+      if (!ownsOperationReviewTicket(applyReviewTicket.current, ticket, currentReviewKeyRef.current)) return;
+      dispatchApplyReview({ type: 'resolved', ticket, review });
+    } catch (error) {
+      if (!ownsOperationReviewTicket(applyReviewTicket.current, ticket, currentReviewKeyRef.current)) return;
+      dispatchApplyReview({ type: 'failed', ticket, error: String(error) });
     }
-  }, [currentJob, plan, reviewKey, busy, checked, final, reviewedRows, selTarget, setStatus]);
+  }, [currentJob, plan, reviewKey, busy, applyReview, compareReview.review, checked, final, reviewedRows, setStatus]);
 
   const doSync = useCallback(async () => {
     if (
@@ -616,29 +804,61 @@ export function App() {
       || !confirmOpen
       || confirmReviewKey !== reviewKey
       || confirmReviewKeyRef.current !== reviewKey
-      || !preflightAllowsApply(preflight, preflightError, acknowledged)
+      || !operationReviewCanSubmit(applyReview, applyChoices)
     ) {
-      setStatus('Apply is unavailable until the exact reviewed action set passes its safety checks', 'err');
+      setStatus('Apply is unavailable until this exact reviewed action set is authorized', 'err');
       return;
     }
-    if (busy || syncInFlight.current) return;
-    syncInFlight.current = true;
+    const ticket = applyReviewTicket.current;
+    const review = applyReview.review;
+    if (!ticket || !review) return;
+    if (busy || (syncInFlight.current?.generation === ticket.generation
+      && syncInFlight.current.key === ticket.key)) return;
+    syncInFlight.current = ticket;
     const selected = reviewedRows;
-    const acknowledgedForRun = acknowledged;
-    resetConfirmation();
-    setBusy(true);
-    setStatus(`Synchronizing '${currentJob.name}' (${selected.length} items)...`);
+    const applyingJob = currentJob;
     // Whether the progress window stays during a sync is its own Auto-close / When-finished business
     let launchId: number | null = null;
+    let executionStarted = false;
     try {
+      let authorization = review.authorization;
+      if (review.status === 'confirmation_required') {
+        if (!review.challenge_id) throw new Error('the safety review did not provide an approval challenge');
+        const choices = normalizeApprovalChoices(review, applyChoices);
+        dispatchApplyReview({ type: 'begin_approval', ticket });
+        setStatus('Authorizing this exact apply operation…');
+        try {
+          authorization = await ipc.approveOperation(
+            review.challenge_id,
+            choices.acknowledgeHealth,
+            choices.acceptCapabilities,
+            choices.rememberForSession,
+            choices.allowUnattended,
+          );
+        } catch (error) {
+          if (ownsOperationReviewTicket(applyReviewTicket.current, ticket, currentReviewKeyRef.current)) {
+            dispatchApplyReview({ type: 'approval_failed', ticket, error: String(error) });
+            setStatus(`Apply authorization failed: ${error}`, 'err');
+          }
+          return;
+        }
+        if (!ownsOperationReviewTicket(applyReviewTicket.current, ticket, currentReviewKeyRef.current)) return;
+        dispatchApplyReview({ type: 'authorized', ticket, authorization });
+      }
+      if (!authorization) throw new Error('the safety review did not authorize this operation');
+
+      resetConfirmation();
+      setBusy(true);
+      setStatus(`Synchronizing '${applyingJob.name}' (${selected.length} items)...`);
       // The command returns only after the new window has installed its run-progress listener.
       // Starting apply any earlier loses the phase start/totals on a freshly opened window.
       launchId = await ipc.openProgressWindow();
       // Once apply is invoked, any rejection may still follow partial writes. Retire this plan before
       // crossing that boundary; only the post-run compare is entitled to publish another one.
-      invalidateCompareRevision(currentJob.job_id, currentJob.config_revision);
+      invalidateCompareRevision(applyingJob.job_id, applyingJob.config_revision);
       resetSafetyUi();
-      const r = await ipc.applyJob(currentJob.name, plan, selected, acknowledgedForRun, selTarget, launchId);
+      executionStarted = true;
+      const r = await ipc.applyJob(authorization.authorization_token, launchId);
       setStatus(
         r.cancelled
           ? `Stopped: cancelled after ${r.done} run — re-checking...`
@@ -650,14 +870,22 @@ export function App() {
       setLogReload((k) => k + 1);
       await doCompare();
     } catch (e) {
-      setStatus(`Synchronize failed: ${e}`, 'err');
+      setStatus(
+        executionStarted
+          ? `Apply failed and may have made partial changes: ${e} — Compare again before continuing`
+          : `Apply did not start: ${e} — the reviewed result was retained`,
+        'err',
+      );
       setBusy(false);
-      requestResultRestore(currentJob, selTarget, activeCompare, false);
+      requestResultRestore(applyingJob, selTarget, activeCompare, false);
     } finally {
       if (launchId !== null) void ipc.cancelProgressLaunch(launchId);
-      syncInFlight.current = false;
+      if (syncInFlight.current?.generation === ticket.generation
+        && syncInFlight.current.key === ticket.key) {
+        syncInFlight.current = null;
+      }
     }
-  }, [currentJob, activeCompare, plan, reviewKey, confirmOpen, confirmReviewKey, preflight, preflightError, busy, reviewedRows, acknowledged, selTarget, doCompare, refreshLastSyncs, invalidateCompareRevision, requestResultRestore, resetConfirmation, resetSafetyUi, setStatus]);
+  }, [currentJob, activeCompare, plan, reviewKey, confirmOpen, confirmReviewKey, applyReview, applyChoices, busy, reviewedRows, selTarget, doCompare, refreshLastSyncs, invalidateCompareRevision, requestResultRestore, resetConfirmation, resetSafetyUi, setStatus]);
 
   const selectJob = useCallback((j: JobDto) => {
     if (currentJob?.job_id === j.job_id) return;
@@ -1309,25 +1537,37 @@ export function App() {
 
     setStatus(`AutoScan found ${selected.length} visible differences — checking unattended authorization…`);
     setBusy(true);
-    invalidateCompareRevision(ticket.jobId, ticket.configRevision);
-    resetSafetyUi();
     try {
-      const result = await ipc.applyJobUnattended(
-        freshPlan.owner.job_name,
-        freshPlan,
-        selected,
-        ticket.targetIndex,
-      );
-      refreshLastSyncs();
-      setLogReload((value) => value + 1);
-      setStatus(
-        result.cancelled
-          ? `Auto-sync stopped after ${result.done} actions`
-          : `Auto-sync finished: ${result.done} run, ${result.skipped} skipped, ${result.errors} errors`,
-        result.errors ? 'err' : 'ok',
-      );
-    } catch (e) {
-      setStatus(`Auto-sync needs review or failed safely: ${e}`, 'err');
+      let authorization: ipc.AuthorizationDto;
+      try {
+        authorization = await ipc.authorizeUnattendedApply(freshPlan.owner, selected);
+      } catch (error) {
+        setStatus(
+          `Auto-sync did not run: an exact interactive session grant is required for this job, revision, target, and capability set: ${error}`,
+          'err',
+        );
+        return;
+      }
+      // Authorization failure leaves the freshly compared result intact for interactive review.
+      // Once execution begins, retire it because a rejected apply may still have made partial writes.
+      invalidateCompareRevision(ticket.jobId, ticket.configRevision);
+      resetSafetyUi();
+      try {
+        const result = await ipc.applyJob(authorization.authorization_token);
+        refreshLastSyncs();
+        setLogReload((value) => value + 1);
+        setStatus(
+          result.cancelled
+            ? `Auto-sync stopped after ${result.done} actions`
+            : `Auto-sync finished: ${result.done} run, ${result.skipped} skipped, ${result.errors} errors`,
+          result.errors ? 'err' : 'ok',
+        );
+      } catch (error) {
+        setStatus(
+          `The authorized auto-sync failed and may have made partial changes: ${error} — Compare again before continuing`,
+          'err',
+        );
+      }
     } finally {
       setBusy(false);
     }
@@ -1401,6 +1641,7 @@ export function App() {
   }, []);
 
   const hasRows = !!plan && plan.ops.length > 0;
+  const reviewBusy = operationReviewPending(compareReview) || operationReviewPending(applyReview);
   const confirmTotals: ConfirmTotals | null = useMemo(() => {
     if (!plan) return null;
     const t: ConfirmTotals = { copy: 0, update: 0, move: 0, del: 0, bytes: 0, delBytes: 0, flips: 0, hiddenChecked: 0 };
@@ -1424,6 +1665,7 @@ export function App() {
           currentJobId={currentJob?.job_id ?? null}
           lastMap={lastMap}
           busy={busy}
+          reviewing={reviewBusy}
           appVersion={appVersion}
           jobsDir={jobsDir}
           onSelect={selectJob}
@@ -1436,7 +1678,7 @@ export function App() {
             hasPlan={!!plan}
             finalCount={final.length}
             stats={stats}
-            busy={busy}
+            busy={busy || reviewBusy}
             canSync={final.length > 0}
             watchSecs={watchSecs}
             watchMode={autoScanStatus?.active ? (autoScanStatus.mode ?? null) : null}
@@ -1476,6 +1718,7 @@ export function App() {
             job={currentJob}
             cfgJob={cfgJob}
             busy={busy}
+            reviewing={reviewBusy}
             selTarget={selTarget}
             pathHistory={pathHistory}
             dropOn={dropOn === 'source' || dropOn === 'target' ? dropOn : null}
@@ -1780,12 +2023,20 @@ export function App() {
         <ConfirmSheet
           job={currentJob}
           totals={confirmTotals}
-          preflight={preflight}
-          preflightError={preflightError}
-          acknowledged={acknowledged}
-          onAcknowledge={setAcknowledged}
+          reviewState={applyReview}
+          choices={applyChoices}
+          onChoices={setApplyChoices}
           onCancel={resetConfirmation}
           onConfirm={() => void doSync()}
+        />
+      )}
+      {compareReview.review && compareReview.review.status !== 'direct_authorized' && (
+        <CompareReviewSheet
+          state={compareReview}
+          choices={compareChoices}
+          onChoices={setCompareChoices}
+          onCancel={resetCompareReview}
+          onApprove={() => void approveCompareReview()}
         />
       )}
     </>
