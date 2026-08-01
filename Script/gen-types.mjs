@@ -32,7 +32,7 @@ function run(args) {
 function sanitize(text) {
   const out = [];
   let inDoc = false;
-  for (const line of text.split("\n")) {
+  for (const line of text.replace(/\r\n?/g, "\n").split("\n")) {
     const t = line.trim();
     if (!inDoc && t.startsWith("/**")) {
       inDoc = !t.endsWith("*/") || t === "/**";

@@ -34,8 +34,8 @@ function plan(o: CompareOwner): PlanDto {
     header: {} as PlanDto['header'],
     ops: [],
     metas: [],
-    equal_count: 0,
-    equal_bytes: 0,
+    identical_count: 0,
+    identical_bytes: 0,
   };
 }
 

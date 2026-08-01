@@ -1,13 +1,11 @@
-//! The read-only layer the desktop reads: per-row measurements, the paged "identical items" view,
-//! and the reverse of an op for the UI's direction flip.
+//! Desktop-facing compare evidence: per-row measurements, paged identical items, and operation
+//! reversal.
 //!
-//! `compare()` never calls into this module, and `evidence()` / `same_page()` only describe a plan
+//! `compare()` never calls into this module, and `evidence()` / `identical_page()` only describe a plan
 //! that already exists — neither can change what a sync does.
 //!
-//! `reverse_op` is the exception, and the header used to claim otherwise. Its output is not a
-//! description: the desktop mirrors these semantics lazily when a user flips a row and builds the
-//! apply payload from that result. A field dropped by either implementation is a field dropped
-//! from a write. That mistaken "this file is inert" line is why it went unexamined.
+//! `reverse_op` is executable semantics: the desktop previews the same transformation, while Rust
+//! reconstructs the authenticated operation before apply.
 
 use serde::{Deserialize, Serialize};
 
@@ -44,18 +42,16 @@ pub struct RowMeta {
 pub struct Evidence {
     /// Length is always exactly plan.ops.len()
     pub metas: Vec<RowMeta>,
-    /// Files present on both sides and judged equal — the source of the denominator in FFS's "Showing 481 of 23,112"
-    pub equal_count: u64,
-    pub equal_bytes: u64,
+    /// Files present on both sides and judged identical by this comparison.
+    pub identical_count: u64,
+    pub identical_bytes: u64,
 }
 
-/// "Evidence" beyond the plan: measured size/mtime of both sides per row + a count of equal items.
+/// Display evidence derived from the same snapshots and exact comparison options as the plan.
 ///
-/// Why these two fields are not simply stuffed into `Op`: there are thirty-odd `Op { .. }` struct
-/// literals in this file, so adding a field means touching thirty-odd sites, and it would change the
-/// plan JSONL on-disk format and the CLI behavior. We use a parallel array, leaving `compare()` untouched.
-///
-/// The criteria share `norm_key` / `files_equal` with `compare()`, so they cannot drift.
+/// Per-side measurements remain parallel to `Plan.ops` because they are presentation metadata, not
+/// executable operation fields; putting them on `Op` would also change the plan JSONL format and CLI
+/// contract. Identical totals use the comparison's own key folding and equality predicate.
 pub fn evidence(
     source: &Snapshot,
     target: &Snapshot,
@@ -102,126 +98,122 @@ pub fn evidence(
         })
         .collect();
 
-    let mut equal_count = 0u64;
-    let mut equal_bytes = 0u64;
+    let mut identical_count = 0u64;
+    let mut identical_bytes = 0u64;
     for (k, se) in &s_files {
         if let Some(te) = t_files.get(k) {
             if files_equal(se, te, win) {
-                equal_count += 1;
-                equal_bytes += se.size;
+                identical_count += 1;
+                identical_bytes += se.size;
             }
         }
     }
     Evidence {
         metas,
-        equal_count,
-        equal_bytes,
+        identical_count,
+        identical_bytes,
     }
 }
 
 /// One "identical on both sides" record. It is not in the plan — it is not an action, it is evidence.
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
-pub struct SameRow {
+pub struct IdenticalRow {
     pub path: String,
     #[ts(type = "number")]
     pub size: u64,
     #[ts(type = "number")]
-    pub mtime_ms: i64,
-    /// The target side's time (content is identical but timestamps may differ by a few milliseconds — FAT/SMB granularity)
+    pub source_mtime_ms: i64,
     #[ts(type = "number")]
-    pub other_mtime_ms: i64,
+    pub target_mtime_ms: i64,
 }
 
-/// Files judged equal on both sides, paged in source-side path order.
-/// The data behind FFS's "22,631" button at the bottom: when a file does not appear in the diff table,
-/// you must be able to confirm it is "equal" rather than "never scanned at all".
-pub fn same_page(
+/// Files judged identical on both sides, paged in source-side path order. This retained evidence lets
+/// the UI distinguish an identical file from a path absent because it was excluded or unread.
+pub fn identical_page(
     source: &Snapshot,
     target: &Snapshot,
-    copts: &CompareOptions,
+    compare_options: &CompareOptions,
     query: &str,
     offset: usize,
     limit: usize,
-) -> (u64, Vec<SameRow>) {
-    let ci = copts.case_insensitive;
-    let win = copts.mtime_window_ms;
-    let (s_files, _) = map_of(source, EntryKind::File, ci);
-    let (t_files, _) = map_of(target, EntryKind::File, ci);
-    let q = query.trim().to_lowercase();
+) -> (u64, Vec<IdenticalRow>) {
+    let case_insensitive = compare_options.case_insensitive;
+    let mtime_window_ms = compare_options.mtime_window_ms;
+    let (source_files, _) = map_of(source, EntryKind::File, case_insensitive);
+    let (target_files, _) = map_of(target, EntryKind::File, case_insensitive);
+    let normalized_query = query.trim().to_lowercase();
     let mut total = 0u64;
-    let mut out = Vec::new();
-    for (k, se) in &s_files {
-        let Some(te) = t_files.get(k) else { continue };
-        if !files_equal(se, te, win) {
+    let mut rows = Vec::new();
+    for (normalized_path, source_entry) in &source_files {
+        let Some(target_entry) = target_files.get(normalized_path) else {
+            continue;
+        };
+        if !files_equal(source_entry, target_entry, mtime_window_ms) {
             continue;
         }
-        if !q.is_empty() && !se.path.to_lowercase().contains(&q) {
+        if !normalized_query.is_empty()
+            && !source_entry.path.to_lowercase().contains(&normalized_query)
+        {
             continue;
         }
         total += 1;
-        let idx = (total - 1) as usize;
-        if idx >= offset && out.len() < limit {
-            out.push(SameRow {
-                path: se.path.clone(),
-                size: se.size,
-                mtime_ms: se.mtime_ms,
-                other_mtime_ms: te.mtime_ms,
+        let result_index = (total - 1) as usize;
+        if result_index >= offset && rows.len() < limit {
+            rows.push(IdenticalRow {
+                path: source_entry.path.clone(),
+                size: source_entry.size,
+                source_mtime_ms: source_entry.mtime_ms,
+                target_mtime_ms: target_entry.mtime_ms,
             });
         }
     }
-    (total, out)
+    (total, rows)
 }
 
-/// Per-row direction flip in the GUI (the semantic core of the same interaction FFS has). Returns None = this op cannot be reversed (move/dir/conflict/note).
-/// - Reverse of Copy: instead of pushing the file over, delete the "extra" one (the side that has it falls in line with the side that lacks it)
-/// - Reverse of Update: let the other side's content win
-/// - Reverse of Delete: don't delete — copy it back to the other side instead (restore)
+/// Reconstructs a user-reversed operation. Move, directory, conflict, and note operations are not
+/// reversible.
 ///
-/// **Built by overriding a clone, not by listing fields.** Each arm used to construct an `Op` from
-/// scratch, which meant every field nobody thought to name was silently dropped — `link` and `mode`
-/// both arrived as `None`. That is not display-only: the frontend builds the apply payload from the
-/// flipped op, so a flipped symlink Update took the content-copy lane instead of `make_symlink`.
-/// Spelling it `..op.clone()` means the next field added to `Op` is carried here by default and only
-/// a deliberate override can drop it.
-pub fn reverse_op(op: &Op) -> Option<Op> {
-    let other = match op.side {
+/// Each arm overrides a clone so new `Op` fields survive by default. Rust invokes this function
+/// while reconstructing authenticated row decisions; the TypeScript preview mirrors its semantics.
+pub fn reverse_op(operation: &Op) -> Option<Op> {
+    let opposite_side = match operation.side {
         Side::Source => Side::Target,
         Side::Target => Side::Source,
     };
-    let reason = format!("flipped({})", op.reason);
-    match op.action {
+    let reason = format!("flipped({})", operation.reason);
+    match operation.action {
         // Copy becomes Delete: the content evidence describes a file that is about to be removed,
         // not written, so hash and mtime are dropped on purpose. `size` stays — it is what the
         // deletion tally is measured in.
         Action::Copy => Some(Op {
-            side: other,
+            side: opposite_side,
             action: Action::Delete,
             from: None,
             mtime_ms: None,
             hash: None,
             link: None,
             reason,
-            ..op.clone()
+            ..operation.clone()
         }),
         // The other side's content wins, so this op can no longer describe *this* side's bytes.
         Action::Update => Some(Op {
-            side: other,
+            side: opposite_side,
             from: None,
             size: None,
             mtime_ms: None,
             hash: None,
             reason,
-            ..op.clone()
+            ..operation.clone()
         }),
         Action::Delete => Some(Op {
-            side: other,
+            side: opposite_side,
             action: Action::Copy,
             from: None,
             mtime_ms: None,
             hash: None,
             reason,
-            ..op.clone()
+            ..operation.clone()
         }),
         _ => None,
     }
@@ -240,7 +232,7 @@ mod tests {
     /// written without its mode.
     #[test]
     fn a_flipped_op_keeps_the_fields_that_decide_how_it_is_written() {
-        let src = Op {
+        let source_operation = Op {
             side: Side::Target,
             action: Action::Update,
             path: "bin/node".into(),
@@ -252,18 +244,22 @@ mod tests {
             mode: Some(0o755),
             reason: "differs".into(),
         };
-        let r = reverse_op(&src).expect("an Update is reversible");
-        assert_eq!(r.side, Side::Source, "the flip is what the side is for");
+        let reversed = reverse_op(&source_operation).expect("an Update is reversible");
         assert_eq!(
-            r.link.as_deref(),
+            reversed.side,
+            Side::Source,
+            "the flip is what the side is for"
+        );
+        assert_eq!(
+            reversed.link.as_deref(),
             Some("../nodejs/bin/node"),
             "a symlink op must stay a symlink op"
         );
-        assert_eq!(r.mode, Some(0o755), "the mode survives the flip");
-        assert_eq!(r.path, "bin/node");
+        assert_eq!(reversed.mode, Some(0o755), "the mode survives the flip");
+        assert_eq!(reversed.path, "bin/node");
         // The content evidence belonged to the side that just lost, so it is dropped deliberately.
-        assert_eq!(r.hash, None);
-        assert_eq!(r.size, None);
+        assert_eq!(reversed.hash, None);
+        assert_eq!(reversed.size, None);
     }
 
     fn snap(os: &str, entries: Vec<Entry>) -> Snapshot {
@@ -393,7 +389,7 @@ mod tests {
     // Evidence layer
 
     #[test]
-    fn evidence_reports_both_sides_and_equal_count() {
+    fn evidence_reports_both_sides_and_identical_count() {
         // same: identical on both sides; upd: on both sides but with different content; only_s: source only; only_t: target only
         let s = snap(
             "windows",
@@ -442,8 +438,8 @@ mod tests {
             plan.ops.len(),
             "the evidence array must correspond one-to-one with ops"
         );
-        assert_eq!(ev.equal_count, 1);
-        assert_eq!(ev.equal_bytes, 10);
+        assert_eq!(ev.identical_count, 1);
+        assert_eq!(ev.identical_bytes, 10);
 
         let by = |name: &str| {
             let i = plan.ops.iter().position(|o| o.path == name).expect(name);
@@ -466,39 +462,68 @@ mod tests {
     }
 
     #[test]
-    fn same_page_lists_only_equal_files_and_pages() {
-        let mk = |n: usize, h: &str| Entry {
-            size: n as u64,
-            mtime_ms: n as i64 * 1000,
-            ..file(&format!("d{}/f{n}.bin", n % 3), h)
+    fn identical_page_lists_only_identical_files_and_pages() {
+        let make_entry = |index: usize, hash: &str| Entry {
+            size: index as u64,
+            mtime_ms: index as i64 * 1000,
+            ..file(&format!("d{}/f{index}.bin", index % 3), hash)
         };
-        let s = snap("windows", (0..10).map(|n| mk(n, "same")).collect());
+        let source = snap(
+            "windows",
+            (0..10).map(|index| make_entry(index, "same")).collect(),
+        );
         // The last 3 differ in content on the target side → not counted as equal
-        let t = snap(
+        let target = snap(
             "windows",
             (0..10)
-                .map(|n| mk(n, if n >= 7 { "diff" } else { "same" }))
+                .map(|index| make_entry(index, if index >= 7 { "diff" } else { "same" }))
                 .collect(),
         );
-        let copts = CompareOptions::default();
-        let (total, rows) = same_page(&s, &t, &copts, "", 0, 100);
+        let compare_options = CompareOptions::default();
+        let (total, rows) = identical_page(&source, &target, &compare_options, "", 0, 100);
         assert_eq!(total, 7);
-        assert_eq!(rows.len(), 7);
-        // Paging
-        let (total, rows) = same_page(&s, &t, &copts, "", 5, 100);
+        let expected_paths = vec![
+            "d0/f0.bin",
+            "d0/f3.bin",
+            "d0/f6.bin",
+            "d1/f1.bin",
+            "d1/f4.bin",
+            "d2/f2.bin",
+            "d2/f5.bin",
+        ];
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            expected_paths
+        );
+        let (total, second_page) = identical_page(&source, &target, &compare_options, "", 3, 3);
         assert_eq!(
             total, 7,
             "total is the post-filter total, independent of the paging window"
         );
-        assert_eq!(rows.len(), 2);
-        let (_t, rows) = same_page(&s, &t, &copts, "", 0, 3);
-        assert_eq!(rows.len(), 3);
-        // Substring filter (case-insensitive)
-        let (total, rows) = same_page(&s, &t, &copts, "D1/", 0, 100);
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|row| row.path.as_str())
+                .collect::<Vec<_>>(),
+            &expected_paths[3..6]
+        );
+        let (_, first_page) = identical_page(&source, &target, &compare_options, "", 0, 3);
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|row| row.path.as_str())
+                .collect::<Vec<_>>(),
+            &expected_paths[..3]
+        );
+        assert!(first_page
+            .iter()
+            .all(|first| second_page.iter().all(|second| first.path != second.path)));
+        let (total, rows) = identical_page(&source, &target, &compare_options, "D1/", 0, 100);
         assert_eq!(total as usize, rows.len());
-        assert!(rows.iter().all(|r| r.path.starts_with("d1/")));
-        // Both sides' times must be surfaced (identical content, timestamps may differ)
-        assert!(rows.iter().all(|r| r.mtime_ms == r.other_mtime_ms));
+        assert!(rows.iter().all(|row| row.path.starts_with("d1/")));
+        assert!(rows
+            .iter()
+            .all(|row| row.source_mtime_ms == row.target_mtime_ms));
     }
 
     #[test]

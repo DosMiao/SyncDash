@@ -425,6 +425,7 @@ pub fn compare_peer_job_detailed(
         plan,
         source: s,
         target: t,
+        compare_options: copts,
     })
 }
 

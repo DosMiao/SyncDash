@@ -528,7 +528,7 @@ pub async fn compare_job(
             &outcome.source,
             &outcome.target,
             &outcome.plan,
-            &loaded.job.compare_opts(),
+            &outcome.compare_options,
         );
         let metas = evidence
             .metas
@@ -547,8 +547,8 @@ pub async fn compare_job(
             header: outcome.plan.header,
             ops: outcome.plan.ops,
             metas,
-            equal_count: evidence.equal_count,
-            equal_bytes: evidence.equal_bytes,
+            identical_count: evidence.identical_count,
+            identical_bytes: evidence.identical_bytes,
         };
 
         let mut repository = results.0.lock().unwrap();
@@ -576,6 +576,7 @@ pub async fn compare_job(
             plan: dto.clone(),
             source: outcome.source,
             target: outcome.target,
+            compare_options: outcome.compare_options,
         });
         drop(repository);
         // Registration is opportunistic: a stop/rearm may have made this an ordinary interactive

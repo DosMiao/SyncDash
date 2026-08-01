@@ -25,7 +25,7 @@ use crate::job::Job;
 use crate::model::plan::{Op, Plan};
 use crate::model::table::Snapshot;
 
-use crate::pipeline::scan;
+use crate::pipeline::{compare::CompareOptions, scan};
 use local::{
     apply_job_guarded_with, compare_job_detailed, compare_job_detailed_with_consent, preflight_job,
     run_local_job,
@@ -448,12 +448,14 @@ pub fn describe_root(phrase: &str) -> std::io::Result<String> {
     Ok(out)
 }
 
-/// The full output of a comparison: the plan plus both snapshots.
-/// The desktop shell needs the snapshots to compute the "evidence layer" (both sides' size/mtime, identical items); the CLI only wants the plan.
+/// The full output of a comparison: the plan, both snapshots, and the exact options that judged
+/// them. The desktop shell must reuse those options when it derives or pages evidence; reconstructing
+/// them later would lose capability-driven adjustments such as a protocol's timestamp precision.
 pub struct CompareOutcome {
     pub plan: Plan,
     pub source: Snapshot,
     pub target: Snapshot,
+    pub compare_options: CompareOptions,
 }
 
 /// v0.9 M1: the end-to-end comparison with an event stream and cancellation. This function replaces the second

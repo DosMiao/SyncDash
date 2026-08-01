@@ -346,7 +346,7 @@ impl PathFilter {
     }
 }
 
-/// Ad-hoc matching for the UI's "funnel": **judged by the given masks alone**, with neither the SELF
+/// Ad-hoc matching for Advanced Filters: **judged by the given masks alone**, with neither the SELF
 /// tier nor the job's own exclude list mixed in,
 /// and no include whitelist applied either — it answers "did this path hit the mask the user just typed",
 /// not "should this path be synced".

@@ -91,13 +91,13 @@ pub(crate) struct PlanDto {
     /// otherwise account for most of WebKit's retained allocations.
     #[serde(default)]
     pub(crate) metas: Vec<Option<compare::evidence::RowMeta>>,
-    /// Count/bytes of the files judged equal on both sides (the denominator of "showing X of Y")
+    /// Count/bytes of files this comparison judged identical on both sides.
     #[serde(default)]
     #[ts(type = "number")]
-    pub(crate) equal_count: u64,
+    pub(crate) identical_count: u64,
     #[serde(default)]
     #[ts(type = "number")]
-    pub(crate) equal_bytes: u64,
+    pub(crate) identical_bytes: u64,
     pub(crate) owner: CompareOwner,
 }
 
@@ -247,22 +247,16 @@ pub(crate) struct PathVerdict {
     pub(crate) notes: Vec<String>,
 }
 
-// Compare-result repository (the data source for the "Identical" panel)
-//
-// Compare already walked both sides in full; dropping the snapshots would force a rescan merely to
-// inspect identical items. A bounded set of successful job/target/revision results remains available,
-// and every page is authenticated against the exact owner that produced it.
+/// A page of identical rows from the bounded compare-result repository. Every request is
+/// authenticated against the exact job, target, revision, and compare owner that produced it.
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
-pub(crate) struct SamePage {
+pub(crate) struct IdenticalPage {
     #[ts(type = "number")]
     pub(crate) total: u64,
-    pub(crate) rows: Vec<compare::evidence::SameRow>,
-    /// Which job owns this authenticated result
-    pub(crate) job: String,
+    pub(crate) rows: Vec<compare::evidence::IdenticalRow>,
 }
 
-// Run state (mutual exclusion + cancel/pause handles)
 /// The `schema` recorded in the job file **as it sits on disk**, next to the version this build writes.
 /// `get_job` returns the migrated job, so by then the difference is gone — but the editor is showing
 /// exclude lines the file does not contain yet, and it has to be able to say so.

@@ -1,31 +1,44 @@
-// SyncDash main window.
-//
-// This component owns the session state (selected job, bounded compare reviews, view filters)
-// and every action that crosses the Tauri boundary; everything under components/ is presentation fed by
-// props. The frontend derives flipped row decisions for review, but execution receives only a
-// one-use authorization token; Rust owns the authenticated plan and reconstructs every operation.
+// This orchestration shell owns session selection, compare/apply reviews, and mutating Tauri
+// workflows. Result semantics live in core, effectful domain state in hooks/state, and rendering in
+// components. Execution receives only a one-use authorization token; Rust owns the authenticated
+// plan and reconstructs every operation.
 
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState } from 'react';
 import { CircleCheck, FolderSearch } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 
 import * as ipc from '../core/ipc';
-import { EMPTY_FILTER, computeVisible, finalIdx, funnelActive } from '../core/filter';
-import { buildLayout, flattenLayout, layoutDirs, treeDirOf } from '../core/grouping';
+import { owningFolderOf } from '../core/folders';
+import { buildLayout, flattenLayout, layoutFolderPaths } from '../core/grouping';
 import { addExcludeEntries } from '../core/junk';
 import { baseOf, fullPath, p2 } from '../core/format';
-import { canFlip, eff, keySpec, metaOf, selectable, selectedRows, sidePaths } from '../core/plan';
+import {
+  canReverseOperation,
+  effectiveOperation,
+  keySpec,
+  rowMetadata,
+  rowTransferBytes,
+  isExecutableOperation,
+  selectedRows,
+  sidePaths,
+} from '../core/plan';
+import {
+  computeExecutableIndices,
+  computeInScopeIndices,
+  countActiveAdvancedFilterGroups,
+  matchesFolderScope,
+} from '../core/runScope';
 import { reduceCompareStages } from '../core/compareProgress';
-import type { Chip, PlanDto, Sort, SortKey } from '../core/plan';
+import type { PlanDto, Sort, SortKey } from '../core/plan';
 import type { CmpStage, CompareProgressEvent } from '../core/compareProgress';
-import type { ViewFilter } from '../core/filter';
 import type { PlanLayout } from '../core/grouping';
 import type { JobDto } from '../core/types/generated/JobDto';
 import type { RunRecord } from '../core/types/generated/RunRecord';
 
 import { useStatus } from './hooks/useStatus';
+import { useRunScopeController } from './hooks/useRunScopeController';
 import { useZoomControl } from './hooks/useZoomControl';
 import {
   activeSession as sessionForSelection,
@@ -73,41 +86,43 @@ import { ComparePanel } from './components/ComparePanel';
 import { ScanFaultBanner } from './components/ScanFaultBanner';
 import { ConfirmSheet } from './components/ConfirmSheet';
 import { CompareReviewSheet } from './components/OperationReviewSheet';
-import { FilterBar } from './components/FilterBar';
-import { FunnelPopover } from './components/FunnelPopover';
+import { ResultBar } from './components/ResultBar';
+import { AdvancedFiltersPopover } from './components/AdvancedFiltersPopover';
 import { JobEditor } from './components/JobEditor';
 import { LogPanel } from './components/LogPanel';
-import { Overview } from './components/Overview';
+import { RunScopePanel } from './components/RunScopePanel';
 import { PathLine } from './components/PathLine';
 import { PlanTable } from './components/PlanTable';
-import { SamePanel } from './components/SamePanel';
+import { IdenticalResultsPanel } from './components/IdenticalResultsPanel';
 import { SettingsSheet } from './components/SettingsSheet';
 import { Sidebar } from './components/Sidebar';
 import { StatusBar } from './components/StatusBar';
 import { Toolbar } from './components/Toolbar';
 import { ConfirmDialog, ContextMenu, MenuDivider, MenuItem, Placeholder } from './components/ui';
-import type { ConfirmTotals } from './components/ConfirmSheet';
+import type { ApplyReviewTotals } from './components/ConfirmSheet';
 import type { EditorApi } from './components/JobEditor';
+import { deriveApplyAvailability } from './state/result-workspace';
+import type { ResultView } from './state/result-workspace';
 
 const HIST_KEY = 'sd.pathhist';
 
 /// Stable identity for "no plan, nothing to lay out" — a fresh object literal here would make the
 /// flatten memo below recompute on every render
-const EMPTY_LAYOUT: PlanLayout = { order: [], tree: null };
+const EMPTY_LAYOUT: PlanLayout = { displayOrder: [], folderTree: null };
 const EMPTY_FLAGS: boolean[] = [];
 
 /// One entry in a row's right-click menu. Built at open time so each closure sees the row and the
 /// plan as they were when you right-clicked — a menu is transient, and a stale entry would be worse
 /// than a frozen one.
-interface CtxItem {
+interface ContextMenuEntry {
   label: string;
   disabled?: boolean;
   danger?: boolean;
-  sep?: boolean;
+  separator?: boolean;
   run?: () => void;
 }
 
-interface CtxState { x: number; y: number; items: CtxItem[] }
+interface ContextMenuState { x: number; y: number; entries: ContextMenuEntry[] }
 interface CompareCompletion { plan: PlanDto }
 interface AutoScanOutcome { completion: CompareCompletion | null; owned: boolean }
 
@@ -116,39 +131,26 @@ function readHistory(): string[] {
 }
 
 export function App() {
-  // Session
   const [jobs, setJobs] = useState<JobDto[]>([]);
   const [currentJob, setCurrentJob] = useState<JobDto | null>(null);
-  const [cfgJob, setCfgJob] = useState<ipc.JobFull | null>(null);
-  const [lastMap, setLastMap] = useState<Record<string, RunRecord>>({});
+  const [jobConfiguration, setJobConfiguration] = useState<ipc.JobFull | null>(null);
+  const [lastSyncByJobName, setLastSyncByJobName] = useState<Record<string, RunRecord>>({});
   const [appVersion, setAppVersion] = useState('');
   const [jobsDir, setJobsDir] = useState('');
   const [pathHistory, setPathHistory] = useState<string[]>(readHistory);
-  /// 1:N: index of the target currently being operated on (resets when the job changes)
-  const [selTarget, setSelTarget] = useState(0);
+  const [selectedTargetIndex, setSelectedTargetIndex] = useState(0);
 
-  // Compare result
   const [compareRepository, setCompareRepository] = useState<CompareRepository>(EMPTY_COMPARE_REPOSITORY);
-  const [maskHit, setMaskHit] = useState<boolean[]>([]);
-  const maskRequest = useRef(new RequestFence());
   const restoreRequest = useRef(new RequestFence());
   const [busy, setBusy] = useState(false);
   const syncInFlight = useRef<OperationReviewTicket | null>(null);
   const autoApplyInFlight = useRef(false);
 
-  // View
-  const [chips, setChips] = useState<Set<Chip>>(new Set());
-  const [search, setSearch] = useState('');
-  const [ovFilter, setOvFilter] = useState<string | null>(null);
-  const [ovExpanded, setOvExpanded] = useState<Set<string>>(new Set());
-  const [ovCollapsed, setOvCollapsed] = useState(() => localStorage.getItem('sd.ov') !== 'open');
   const [sort, setSort] = useState<Sort | null>(null);
-  const [vfilter, setVfilter] = useState<ViewFilter>(EMPTY_FILTER);
   const [pathMode, setPathMode] = useState<'rel' | 'full'>(() => (localStorage.getItem('sd.pathmode') === 'full' ? 'full' : 'rel'));
   const [grouped, setGrouped] = useState(() => localStorage.getItem('sd.grouped') !== 'off');
-  const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(new Set());
+  const [collapsedFolderPaths, setCollapsedFolderPaths] = useState<Set<string>>(new Set());
 
-  // Panels and overlays
   const [editor, setEditor] = useState<{ name: string | null; focusGroup?: string } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -164,15 +166,14 @@ export function App() {
   const compareReviewTicket = useRef<OperationReviewTicket | null>(null);
   const compareReviewFetchTicket = useRef<OperationReviewTicket | null>(null);
   const compareApprovalTicket = useRef<OperationReviewTicket | null>(null);
-  const [funnelAnchor, setFunnelAnchor] = useState<DOMRect | null>(null);
-  const [ctx, setCtx] = useState<CtxState | null>(null);
+  const [advancedFiltersAnchor, setAdvancedFiltersAnchor] = useState<DOMRect | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [logOpen, setLogOpen] = useState(false);
   const [logReload, setLogReload] = useState(0);
-  const [sameOpen, setSameOpen] = useState(false);
-  const [dropOn, setDropOn] = useState<string | null>(null);
-  /// The diff table's scroll container. App renders it, so App owns it and hands it down.
-  const [tableWrap, setTableWrap] = useState<HTMLDivElement | null>(null);
-  /// Pending root swap, held with the job it read so the confirmation can spell out both roots
+  const [resultView, setResultView] = useState<ResultView>('differences');
+  const [dropTargetKey, setDropTargetKey] = useState<string | null>(null);
+  const [resultsViewport, setResultsViewport] = useState<HTMLDivElement | null>(null);
+  // Retain the exact job snapshot so root-swap confirmation names what it will mutate.
   const [askSwap, setAskSwap] = useState<{
     jobId: string;
     name: string;
@@ -180,23 +181,25 @@ export function App() {
     configRevision: string;
     targetIndex: number;
   } | null>(null);
-  /// The two regions holding droppable path fields. A ref rather than state: the drag handler is
-  /// registered once and reads this at drop time, so state here would only hand it a stale closure.
+  // The drag handler is registered once and must read the live droppable regions at drop time.
   const dropScope = useRef<{ editor: HTMLElement | null; path: HTMLElement | null }>({ editor: null, path: null });
   // Stable identities: a ref callback whose identity changes is detached with null and reattached
   // on every render, and these two are handed to components that re-render on every keystroke.
-  const setPathScope = useCallback((el: HTMLElement | null) => { dropScope.current.path = el; }, []);
-  const setEditorScope = useCallback((el: HTMLElement | null) => { dropScope.current.editor = el; }, []);
+  const setPathScope = useCallback((element: HTMLElement | null) => { dropScope.current.path = element; }, []);
+  const setEditorScope = useCallback((element: HTMLElement | null) => { dropScope.current.editor = element; }, []);
 
-  // Compare progress (fed by the run-progress stream)
-  const [cmpActive, setCmpActive] = useState(false);
-  const [cmpStages, setCmpStages] = useState<CmpStage[]>([]);
-  const [cmpCancelling, setCmpCancelling] = useState(false);
-  /// Rate EMA (0.7 old + 0.3 new): the instantaneous rate swings wildly with file size
-  const cmpRate = useRef(new Map<string, { t: number; b: number; ema: number }>());
-  const cmpRunId = useRef(-1);
-  const cmpRunFloor = useRef(-1);
-  const cmpRunReady = useRef(false);
+  const [compareActive, setCompareActive] = useState(false);
+  const [compareStages, setCompareStages] = useState<CmpStage[]>([]);
+  const [compareCancelling, setCompareCancelling] = useState(false);
+  // The 0.7/0.3 EMA prevents per-file size swings from dominating the compare rate.
+  const compareRateByPhase = useRef(new Map<string, {
+    timestampMs: number;
+    bytesDone: number;
+    smoothedRate: number;
+  }>());
+  const compareRunId = useRef(-1);
+  const compareRunFloor = useRef(-1);
+  const compareRunReady = useRef(false);
   const compareInFlight = useRef(false);
 
   // AutoScan is backend-owned. The webview renders status and handles exact trigger tickets; it
@@ -214,86 +217,143 @@ export function App() {
   const { status, set: setStatus, withUndo: setStatusUndo, runUndo } = useStatus('');
   const zoom = useZoomControl();
   const selectionRef = useRef<{ job: JobDto | null; targetIndex: number }>({ job: null, targetIndex: 0 });
-  selectionRef.current = { job: currentJob, targetIndex: selTarget };
+  selectionRef.current = { job: currentJob, targetIndex: selectedTargetIndex };
 
-  // Derived view
-
-  const activeCompare = sessionForSelection(compareRepository, currentJob, selTarget);
+  const activeCompare = sessionForSelection(compareRepository, currentJob, selectedTargetIndex);
   const plan = activeCompare?.plan ?? null;
   const checked = activeCompare?.checked ?? EMPTY_FLAGS;
   const flipped = activeCompare?.flipped ?? EMPTY_FLAGS;
+  const reportRunScopeError = useCallback((message: string) => setStatus(message, 'err'), [setStatus]);
+  const runScope = useRunScopeController(plan, flipped, reportRunScopeError);
+  const {
+    selectedResultTypes,
+    setSelectedResultTypes,
+    searchDraft,
+    setSearchDraft,
+    searchQuery,
+    searchPending,
+    clearSearch,
+    folderScope,
+    setFolderScope,
+    advancedFilter,
+    setAdvancedFilter,
+    maskDraft,
+    setMaskDraft,
+    clearAdvancedFilter: clearAdvancedScopeCriteria,
+    excludedByMask,
+    scopeCalculationPending,
+    scopeCalculationFailed,
+    clearRunScope: clearRunScopeCriteria,
+    resetResultWorkspace: resetRunScopeWorkspace,
+    expandedFolders,
+    toggleExpandedFolder,
+    panelCollapsed,
+    togglePanelCollapsed,
+  } = runScope;
+  const resultPanelId = useId();
+  const differencesTabId = `${resultPanelId}-differences-tab`;
+  const identicalTabId = `${resultPanelId}-identical-tab`;
 
   // Three memos, not one, because the three questions change at different rates. Membership is the
   // expensive full-table scan and no longer depends on `sort`, so clicking a header does not re-run
   // it; the layout does the sorting; flattening only decides which member rows a fold emits, so
   // folding one directory costs one pass instead of redoing the sort.
   //
-  // `flipped` legitimately appears in all three: a flip changes eff(op), hence the row's directory
-  // and its side paths, hence its group and its sort key. It is a full rebuild by necessity.
-  const visible = useMemo(() => (
-    plan ? computeVisible({ plan, flipped, chips, search, ovFilter, vfilter, maskHit }) : []
-  ), [plan, flipped, chips, search, ovFilter, vfilter, maskHit]);
+  // `flipped` legitimately appears in all three: reversal changes the effective operation, its
+  // owning folder, side paths, and sort key. It therefore requires a complete derived-state rebuild.
+  const inScopeIndices = useMemo(() => (
+    plan ? computeInScopeIndices({
+      plan,
+      flipped,
+      selectedResultTypes,
+      searchQuery,
+      folderScope,
+      advancedFilter,
+      excludedByMask,
+    }) : []
+  ), [plan, flipped, selectedResultTypes, searchQuery, folderScope, advancedFilter, excludedByMask]);
 
-  const final = useMemo(() => finalIdx(visible, checked), [visible, checked]);
-  const reviewedRows = useMemo(() => (plan ? selectedRows(final, flipped) : []), [plan, final, flipped]);
+  const executableIndices = useMemo(() => (
+    plan ? computeExecutableIndices(plan, flipped, inScopeIndices, checked) : []
+  ), [plan, flipped, inScopeIndices, checked]);
+  const reviewedRows = useMemo(
+    () => (plan ? selectedRows(executableIndices, flipped) : []),
+    [plan, executableIndices, flipped],
+  );
   const reviewKey = useMemo(() => (
     plan && currentJob
-      ? applyReviewKey(plan.owner, currentJob.job_id, currentJob.config_revision, selTarget, reviewedRows)
+      ? applyReviewKey(plan.owner, currentJob.job_id, currentJob.config_revision, selectedTargetIndex, reviewedRows)
       : null
-  ), [plan, currentJob, selTarget, reviewedRows]);
+  ), [plan, currentJob, selectedTargetIndex, reviewedRows]);
   const currentReviewKeyRef = useRef<string | null>(reviewKey);
   currentReviewKeyRef.current = reviewKey;
   const currentCompareReviewKey = useMemo(() => (
     currentJob
-      ? compareReviewKey(currentJob.job_id, currentJob.config_revision, selTarget)
+      ? compareReviewKey(currentJob.job_id, currentJob.config_revision, selectedTargetIndex)
       : null
-  ), [currentJob, selTarget]);
+  ), [currentJob, selectedTargetIndex]);
   const currentCompareReviewKeyRef = useRef<string | null>(currentCompareReviewKey);
   currentCompareReviewKeyRef.current = currentCompareReviewKey;
 
   const layout = useMemo(() => (
-    plan ? buildLayout({ plan, flipped, visible, grouped, sort }) : EMPTY_LAYOUT
-  ), [plan, flipped, visible, grouped, sort]);
+    plan ? buildLayout({ plan, flipped, inScopeIndices, grouped, sort }) : EMPTY_LAYOUT
+  ), [plan, flipped, inScopeIndices, grouped, sort]);
 
-  const rowPlan = useMemo(() => flattenLayout(layout, collapsedDirs), [layout, collapsedDirs]);
-  const treeDirs = useMemo(() => layoutDirs(layout), [layout]);
+  const rowPlan = useMemo(() => flattenLayout(layout, collapsedFolderPaths), [layout, collapsedFolderPaths]);
+  const folderPathsInLayout = useMemo(() => layoutFolderPaths(layout), [layout]);
   // A filter may temporarily remove a collapsed branch. Only keys present in this layout decide
   // whether the toolbar says Expand all; otherwise one stale path leaves the control backwards.
   const anyCollapsed = useMemo(
-    () => treeDirs.some((dir) => collapsedDirs.has(dir)),
-    [treeDirs, collapsedDirs],
+    () => folderPathsInLayout.some((folderPath) => collapsedFolderPaths.has(folderPath)),
+    [folderPathsInLayout, collapsedFolderPaths],
   );
 
   // Fold state belongs to one compare result. A new plan can reuse the same relative names for
   // entirely different roots, so carrying old folds over would hide fresh results on arrival.
-  useEffect(() => { setCollapsedDirs(new Set()); }, [plan]);
+  useEffect(() => { setCollapsedFolderPaths(new Set()); }, [plan]);
 
-  /// The stats bar counts exactly what will run (checked ∩ visible), matching the confirm sheet
   const stats = useMemo(() => {
     if (!plan) return null;
-    const s = { copy: 0, upd: 0, mv: 0, del: 0, conflicts: plan.header.conflict_count, bytes: 0, flips: 0 };
-    for (const i of final) {
-      const op = eff(plan, flipped, i);
-      switch (op.action) {
-        case 'copy': s.copy++; s.bytes += op.size ?? 0; break;
-        case 'update': case 'chmod': s.upd++; s.bytes += op.size ?? 0; break;
-        case 'move': s.mv++; break;
-        case 'delete': case 'delete_dir': s.del++; break;
+    const next = {
+      copyCount: 0,
+      updateCount: 0,
+      moveCount: 0,
+      deleteCount: 0,
+      transferBytes: 0,
+      reversedCount: 0,
+    };
+    for (const index of executableIndices) {
+      const operation = effectiveOperation(plan, flipped, index);
+      switch (operation.action) {
+        case 'copy': next.copyCount++; next.transferBytes += rowTransferBytes(plan, flipped, index); break;
+        case 'update': next.updateCount++; next.transferBytes += rowTransferBytes(plan, flipped, index); break;
+        case 'chmod': next.updateCount++; break;
+        case 'move': next.moveCount++; break;
+        case 'delete': case 'delete_dir': next.deleteCount++; break;
       }
-      if (flipped[i]) s.flips++;
+      if (flipped[index]) next.reversedCount++;
     }
-    return s;
-  }, [plan, final, flipped]);
+    return next;
+  }, [plan, executableIndices, flipped]);
 
-  // Helpers
+  const applyAvailability = useMemo(() => deriveApplyAvailability({
+    hasPlan: plan !== null,
+    resultView,
+    scopeCalculationPending,
+    scopeCalculationFailed,
+    executableCount: executableIndices.length,
+  }), [plan, resultView, scopeCalculationPending, scopeCalculationFailed, executableIndices.length]);
 
-  const pushHistory = useCallback((p: string) => {
-    const v = p.trim();
-    if (!v) return;
-    setPathHistory((prev) => {
-      const list = [v, ...prev.filter((x) => x.toLowerCase() !== v.toLowerCase())].slice(0, 12);
-      localStorage.setItem(HIST_KEY, JSON.stringify(list));
-      return list;
+  const pushHistory = useCallback((candidatePath: string) => {
+    const normalizedPath = candidatePath.trim();
+    if (!normalizedPath) return;
+    setPathHistory((previousPaths) => {
+      const nextPaths = [
+        normalizedPath,
+        ...previousPaths.filter((path) => path.toLowerCase() !== normalizedPath.toLowerCase()),
+      ].slice(0, 12);
+      localStorage.setItem(HIST_KEY, JSON.stringify(nextPaths));
+      return nextPaths;
     });
   }, []);
 
@@ -304,15 +364,17 @@ export function App() {
       // listJobs is the authoritative registry. The name guard prevents a delayed refresh from
       // hijacking a newer selection; when that guarded job disappeared, retaining `cur` would
       // instead leave a ghost row that every later Compare retries.
-      setCurrentJob((cur) => (
-        cur?.name === keepName ? list.find((x) => x.job_id === cur.job_id) ?? null : cur
+      setCurrentJob((selectedJob) => (
+        selectedJob?.name === keepName
+          ? list.find((job) => job.job_id === selectedJob.job_id) ?? null
+          : selectedJob
       ));
     }
     return list;
   }, []);
 
   const refreshLastSyncs = useCallback(() => {
-    ipc.lastSyncs().then(setLastMap).catch(() => { /* missing logs are not fatal */ });
+    ipc.lastSyncs().then(setLastSyncByJobName).catch(() => { /* missing logs are not fatal */ });
   }, []);
 
   const reportMutationFailure = useCallback(async (name: string, action: string, error: unknown) => {
@@ -344,16 +406,21 @@ export function App() {
   const resetSafetyUi = useCallback(() => {
     resetConfirmation();
     resetCompareReview();
-    setSameOpen(false);
-    setFunnelAnchor(null);
-    setCtx(null);
+    setResultView('differences');
+    setAdvancedFiltersAnchor(null);
+    setContextMenu(null);
     setAskSwap(null);
   }, [resetCompareReview, resetConfirmation]);
 
-  const clearMasks = useCallback(() => {
-    maskRequest.current.invalidate();
-    setMaskHit([]);
-  }, []);
+  const clearAdvancedFilters = useCallback(() => {
+    clearAdvancedScopeCriteria();
+    setAdvancedFiltersAnchor(null);
+  }, [clearAdvancedScopeCriteria]);
+
+  const clearRunScope = useCallback(() => {
+    clearRunScopeCriteria();
+    setAdvancedFiltersAnchor(null);
+  }, [clearRunScopeCriteria]);
 
   const acceptAutoScanStatus = useCallback((
     incoming: ipc.AutoScanStatusDto,
@@ -393,16 +460,12 @@ export function App() {
     });
   }, [acceptAutoScanStatus, setStatus]);
 
-  const resetNavigationUi = useCallback(() => {
+  const resetResultWorkspace = useCallback(() => {
     resetSafetyUi();
-    setChips(new Set());
-    setSearch('');
-    setOvFilter(null);
-    setOvExpanded(new Set());
+    resetRunScopeWorkspace();
     setSort(null);
-    setVfilter(EMPTY_FILTER);
-    clearMasks();
-  }, [clearMasks, resetSafetyUi]);
+    setCollapsedFolderPaths(new Set());
+  }, [resetRunScopeWorkspace, resetSafetyUi]);
 
   const previousReviewKey = useRef<string | null>(reviewKey);
   useEffect(() => {
@@ -421,11 +484,11 @@ export function App() {
   }, [currentCompareReviewKey, resetCompareReview]);
 
   useEffect(() => {
-    if (!currentJob || currentJob.targets.length === 0 || selTarget < currentJob.targets.length) return;
-    setSelTarget(0);
-    resetNavigationUi();
-    setStatus(`'${currentJob.name}' no longer has target ${selTarget + 1}; selected target 1`);
-  }, [currentJob, selTarget, resetNavigationUi, setStatus]);
+    if (!currentJob || currentJob.targets.length === 0 || selectedTargetIndex < currentJob.targets.length) return;
+    setSelectedTargetIndex(0);
+    resetResultWorkspace();
+    setStatus(`'${currentJob.name}' no longer has target ${selectedTargetIndex + 1}; selected target 1`);
+  }, [currentJob, selectedTargetIndex, resetResultWorkspace, setStatus]);
 
   const invalidateCompareRevision = useCallback((jobId: string, configRevision: string) => {
     setCompareRepository((repository) => invalidateJobRevision(repository, jobId, configRevision));
@@ -436,41 +499,18 @@ export function App() {
   }, []);
 
   const setChecked = useCallback((next: boolean[] | ((prev: boolean[]) => boolean[])) => {
-    setCompareRepository((repository) => updateSession(repository, currentJob, selTarget, (session) => ({
+    setCompareRepository((repository) => updateSession(repository, currentJob, selectedTargetIndex, (session) => ({
       ...session,
       checked: typeof next === 'function' ? next(session.checked) : next,
     })));
-  }, [currentJob, selTarget]);
+  }, [currentJob, selectedTargetIndex]);
 
   const setFlipped = useCallback((next: boolean[] | ((prev: boolean[]) => boolean[])) => {
-    setCompareRepository((repository) => updateSession(repository, currentJob, selTarget, (session) => ({
+    setCompareRepository((repository) => updateSession(repository, currentJob, selectedTargetIndex, (session) => ({
       ...session,
       flipped: typeof next === 'function' ? next(session.flipped) : next,
     })));
-  }, [currentJob, selTarget]);
-
-  /// A new plan means a new row set, so the mask cache is stale; the funnel criteria themselves persist
-  /// (watching the same files for several rounds is common)
-  const recomputeMasks = useCallback(async (p: PlanDto | null, f: boolean[], masks: string[]) => {
-    if (!p || masks.length === 0) { clearMasks(); return []; }
-    const owner = p.owner;
-    const ticket = maskRequest.current.start(`${owner.compare_id}\0${owner.job_id}\0${owner.target_index}\0${owner.config_revision}`);
-    try {
-      const hits = await ipc.maskMatch(masks, p.ops.map((_, i) => eff(p, f, i).path));
-      if (!maskRequest.current.owns(ticket)) return;
-      const selected = selectionRef.current;
-      if (!ownerMatchesSelection(owner, selected.job, selected.targetIndex)) return hits;
-      setMaskHit(hits);
-      return hits;
-    } catch (e) {
-      if (!maskRequest.current.owns(ticket)) return;
-      const selected = selectionRef.current;
-      if (!ownerMatchesSelection(owner, selected.job, selected.targetIndex)) return null;
-      setMaskHit([]);
-      setStatus(`Mask matching failed: ${e}`, 'err');
-      return null;
-    }
-  }, [clearMasks, setStatus]);
+  }, [currentJob, selectedTargetIndex]);
 
   const requestResultRestore = useCallback((
     job: JobDto,
@@ -485,7 +525,7 @@ export function App() {
       if (!ownerMatchesSelection(restored.owner, selected.job, selected.targetIndex)) return;
       const session = successfulSession(
         restored,
-        restored.ops.map((op) => selectable(op)),
+        restored.ops.map((operation) => isExecutableOperation(operation)),
         restored.ops.map(() => false),
       );
       setCompareRepository((repository) => retainSuccessfulSession(repository, session));
@@ -518,8 +558,6 @@ export function App() {
     }).catch(failed);
   }, [setStatus]);
 
-  // Actions
-
   const runAuthorizedCompare = useCallback(async (
     authorizationToken: string,
     comparedJob: JobIdentitySnapshot,
@@ -549,25 +587,23 @@ export function App() {
     if (!autoTicket) resetSafetyUi();
     setBusy(true);
     setStatus(`${autoTicket ? 'AutoScan is comparing' : 'Comparing'} '${name}'…`);
-    if (showProgress) setCmpStages([]);
-    cmpRate.current.clear();
-    if (showProgress) setCmpCancelling(false);
-    cmpRunFloor.current = cmpRunId.current;
-    cmpRunReady.current = false;
-    if (showProgress) setCmpActive(true);
+    if (showProgress) setCompareStages([]);
+    compareRateByPhase.current.clear();
+    if (showProgress) setCompareCancelling(false);
+    compareRunFloor.current = compareRunId.current;
+    compareRunReady.current = false;
+    if (showProgress) setCompareActive(true);
     try {
-      const p = await ipc.compareJob(authorizationToken);
-      const f = p.ops.map(() => false);
+      const comparedPlan = await ipc.compareJob(authorizationToken);
+      const freshFlips = comparedPlan.ops.map(() => false);
       setCompareRepository((repository) => retainSuccessfulSession(
         repository,
-        successfulSession(p, p.ops.map((op) => selectable(op)), f),
+        successfulSession(
+          comparedPlan,
+          comparedPlan.ops.map((operation) => isExecutableOperation(operation)),
+          freshFlips,
+        ),
       ));
-      if (!autoTicket) {
-        setChips(new Set());
-        setOvFilter(null);
-        setOvExpanded(new Set());
-        setSort(null);
-      }
       // A job file can be edited outside the app while it is open. Compare used the authoritative
       // file, so refresh the list row before deciding whether the returned owner belongs on screen.
       // Snapshot first: refreshJobs may commit the new row (or null) before this continuation runs,
@@ -577,58 +613,58 @@ export function App() {
       let refreshProblem: unknown = null;
       try {
         const list = await refreshJobs(name);
-        refreshedJob = list.find((job) => job.job_id === p.owner.job_id) ?? null;
+        refreshedJob = list.find((job) => job.job_id === comparedPlan.owner.job_id) ?? null;
         setCompareRepository((repository) => reconcileRefreshedJobSession(
           repository,
-          { jobId: p.owner.job_id, name: p.owner.job_name, configRevision: p.owner.config_revision },
+          {
+            jobId: comparedPlan.owner.job_id,
+            name: comparedPlan.owner.job_name,
+            configRevision: comparedPlan.owner.config_revision,
+          },
           refreshedJob,
         ));
-      } catch (e) {
-        refreshProblem = e;
+      } catch (error) {
+        refreshProblem = error;
       }
       const selected = selectionRef.current;
-      const selectedJob = selected.job?.job_id === p.owner.job_id && !refreshProblem ? refreshedJob : selected.job;
-      let navigationWasReset = false;
-      if (selectedBeforeRefresh.job?.job_id === p.owner.job_id && !refreshProblem) {
+      const selectedJob = selected.job?.job_id === comparedPlan.owner.job_id && !refreshProblem
+        ? refreshedJob
+        : selected.job;
+      if (selectedBeforeRefresh.job?.job_id === comparedPlan.owner.job_id && !refreshProblem) {
         if (!refreshedJob) {
-          setSelTarget(0);
-          resetNavigationUi();
-          navigationWasReset = true;
+          setSelectedTargetIndex(0);
+          resetResultWorkspace();
         } else if (selectedBeforeRefresh.job.config_revision !== refreshedJob.config_revision) {
-          resetNavigationUi();
-          navigationWasReset = true;
+          resetResultWorkspace();
         }
       }
-      const visibleHere = ownerMatchesSelection(p.owner, selectedJob, selected.targetIndex);
-      if (visibleHere) {
-        // resetNavigationUi cleared both the funnel and maskHit. Replaying masks from this render's
-        // stale closure would hide rows behind an apparently empty funnel after an external edit.
-        await recomputeMasks(p, f, navigationWasReset ? [] : vfilter.masks);
-      }
-      // The counts bar to the right already says what was scanned and what is showing, and the
-      // placeholder in the table says "identical" in full — this line only has to say the result
-      if (visibleHere) {
+      const resultBelongsToSelection = ownerMatchesSelection(
+        comparedPlan.owner,
+        selectedJob,
+        selected.targetIndex,
+      );
+      if (resultBelongsToSelection) {
         setStatus(
-          p.ops.length === 0
-            ? 'Both sides identical'
-            : `${p.ops.length} items · ${p.header.conflict_count} conflicts`,
-          p.header.conflict_count > 0 ? 'err' : '',
+          comparedPlan.ops.length === 0
+            ? 'No differences in the compared scope'
+            : `${comparedPlan.ops.length} items · ${comparedPlan.header.conflict_count} conflicts`,
+          comparedPlan.header.conflict_count > 0 ? 'err' : '',
         );
       } else if (refreshProblem) {
         setStatus(`Compare finished for '${name}', but the refreshed job identity could not be read: ${refreshProblem}`, 'err');
       } else if (autoTicket) {
         setStatus(
-          p.ops.length === 0
-            ? `AutoScan finished for '${name}' — both sides are identical; result retained`
-            : `AutoScan finished for '${name}' — ${p.ops.length} differences retained for review`,
-          p.header.conflict_count > 0 ? 'err' : '',
+          comparedPlan.ops.length === 0
+            ? `AutoScan finished for '${name}' — no differences in the compared scope; result retained`
+            : `AutoScan finished for '${name}' — ${comparedPlan.ops.length} differences retained for review`,
+          comparedPlan.header.conflict_count > 0 ? 'err' : '',
         );
       } else {
         setStatus(`Compare finished for '${name}', but its job or target changed — the result was not attached to the current view`, 'err');
       }
-      return { plan: p };
-    } catch (e) {
-      const cancelled = String(e) === 'cancelled';
+      return { plan: comparedPlan };
+    } catch (error) {
+      const cancelled = String(error) === 'cancelled';
       let suffix = '';
       let refreshProblem: unknown = null;
       try {
@@ -641,28 +677,28 @@ export function App() {
         setCompareRepository((repository) => reconcileRefreshedJobSession(repository, comparedJob, refreshedJob));
         if (selected.job?.job_id === comparedJob.jobId) {
           if (!refreshedJob) {
-            setSelTarget(0);
-            resetNavigationUi();
+            setSelectedTargetIndex(0);
+            resetResultWorkspace();
             suffix = ` · '${name}' is no longer a registered job`;
           } else if (selected.job.config_revision !== refreshedJob.config_revision) {
-            resetNavigationUi();
+            resetResultWorkspace();
             suffix = ' · refreshed the changed job configuration';
           }
         }
       } catch (refreshError) {
         refreshProblem = refreshError;
       }
-      const base = cancelled ? 'Compare cancelled' : `${autoTicket ? 'AutoScan Compare' : 'Compare'} failed: ${e}`;
+      const base = cancelled ? 'Compare cancelled' : `${autoTicket ? 'AutoScan Compare' : 'Compare'} failed: ${error}`;
       if (refreshProblem) suffix = ` · job-list refresh failed: ${refreshProblem}`;
       setStatus(`${base}${suffix}`, cancelled && !refreshProblem ? '' : 'err');
       return null;
     } finally {
-      if (showProgress) setCmpActive(false);
+      if (showProgress) setCompareActive(false);
       setBusy(false);
-      cmpRunReady.current = false;
+      compareRunReady.current = false;
       compareInFlight.current = false;
     }
-  }, [busy, editor, confirmOpen, compareReview, applyReview, vfilter.masks, recomputeMasks, refreshJobs, resetNavigationUi, resetSafetyUi, setStatus]);
+  }, [busy, editor, confirmOpen, compareReview, applyReview, refreshJobs, resetResultWorkspace, resetSafetyUi, setStatus]);
 
   const doCompare = useCallback(async (autoTicket?: AutoScanTicket): Promise<CompareCompletion | null> => {
     if (busy || editor || compareInFlight.current || syncInFlight.current || autoApplyInFlight.current) return null;
@@ -681,7 +717,7 @@ export function App() {
     const comparedJob: JobIdentitySnapshot = autoTicket
       ? { jobId: autoTicket.jobId, name: autoTicket.jobName, configRevision: autoTicket.configRevision }
       : snapshotJob(currentJob!);
-    const targetIndex = autoTicket?.targetIndex ?? selTarget;
+    const targetIndex = autoTicket?.targetIndex ?? selectedTargetIndex;
     const key = compareReviewKey(comparedJob.jobId, comparedJob.configRevision, targetIndex);
 
     if (autoTicket) {
@@ -771,7 +807,7 @@ export function App() {
         compareReviewFetchTicket.current = null;
       }
     }
-  }, [currentJob, busy, editor, compareReview, applyReview, confirmOpen, selTarget, runAuthorizedCompare, setStatus]);
+  }, [currentJob, busy, editor, compareReview, applyReview, confirmOpen, selectedTargetIndex, runAuthorizedCompare, setStatus]);
 
   const approveCompareReview = useCallback(async () => {
     const ticket = compareReviewTicket.current;
@@ -814,6 +850,10 @@ export function App() {
   }, [compareChoices, compareReview, runAuthorizedCompare, setStatus]);
 
   const openConfirm = useCallback(async () => {
+    if (!applyAvailability.available) {
+      setStatus(applyAvailability.blockedMessage ?? 'Apply is unavailable', 'err');
+      return;
+    }
     if (!currentJob
       || !plan
       || !reviewKey
@@ -823,14 +863,6 @@ export function App() {
       || applyReviewTicket.current
       || compareReviewFetchTicket.current
       || compareReview.review) return;
-    const hiddenChecked = checked.filter(Boolean).length - final.length;
-    if (final.length === 0) {
-      setStatus(
-        hiddenChecked > 0 ? 'Every checked row is hidden by a filter — clear the filter first' : 'Nothing is checked',
-        'err',
-      );
-      return;
-    }
     const ticket: OperationReviewTicket = {
       key: reviewKey,
       generation: applyReviewGeneration.current + 1,
@@ -850,7 +882,7 @@ export function App() {
       if (!ownsOperationReviewTicket(applyReviewTicket.current, ticket, currentReviewKeyRef.current)) return;
       dispatchApplyReview({ type: 'failed', ticket, error: String(error) });
     }
-  }, [currentJob, plan, reviewKey, busy, applyReview, compareReview.review, checked, final, reviewedRows, setStatus]);
+  }, [applyAvailability, currentJob, plan, reviewKey, busy, applyReview, compareReview.review, reviewedRows, setStatus]);
 
   const doSync = useCallback(async () => {
     if (
@@ -860,6 +892,7 @@ export function App() {
       || !confirmOpen
       || confirmReviewKey !== reviewKey
       || confirmReviewKeyRef.current !== reviewKey
+      || !applyAvailability.available
       || !operationReviewCanSubmit(applyReview, applyChoices)
     ) {
       setStatus('Apply is unavailable until this exact reviewed action set is authorized', 'err');
@@ -914,26 +947,26 @@ export function App() {
       invalidateCompareRevision(applyingJob.job_id, applyingJob.config_revision);
       resetSafetyUi();
       executionStarted = true;
-      const r = await ipc.applyJob(authorization.authorization_token, launchId);
+      const applyResult = await ipc.applyJob(authorization.authorization_token, launchId);
       setStatus(
-        r.cancelled
-          ? `Stopped: cancelled after ${r.done} run — re-checking...`
-          : `Done: ${r.done} run, ${r.skipped} skipped, ${r.errors} errors — re-checking...`,
-        r.errors ? 'err' : 'ok',
+        applyResult.cancelled
+          ? `Stopped: cancelled after ${applyResult.done} run — re-checking...`
+          : `Done: ${applyResult.done} run, ${applyResult.skipped} skipped, ${applyResult.errors} errors — re-checking...`,
+        applyResult.errors ? 'err' : 'ok',
       );
       setBusy(false);
       refreshLastSyncs();
       setLogReload((k) => k + 1);
       await doCompare();
-    } catch (e) {
+    } catch (error) {
       setStatus(
         executionStarted
-          ? `Apply failed and may have made partial changes: ${e} — Compare again before continuing`
-          : `Apply did not start: ${e} — the reviewed result was retained`,
+          ? `Apply failed and may have made partial changes: ${error} — Compare again before continuing`
+          : `Apply did not start: ${error} — the reviewed result was retained`,
         'err',
       );
       setBusy(false);
-      requestResultRestore(applyingJob, selTarget, activeCompare, false);
+      requestResultRestore(applyingJob, selectedTargetIndex, activeCompare, false);
     } finally {
       if (launchId !== null) void ipc.cancelProgressLaunch(launchId);
       if (syncInFlight.current?.generation === ticket.generation
@@ -941,47 +974,49 @@ export function App() {
         syncInFlight.current = null;
       }
     }
-  }, [currentJob, activeCompare, plan, reviewKey, confirmOpen, confirmReviewKey, applyReview, applyChoices, busy, reviewedRows, selTarget, doCompare, refreshLastSyncs, invalidateCompareRevision, requestResultRestore, resetConfirmation, resetSafetyUi, setStatus]);
+  }, [currentJob, activeCompare, plan, reviewKey, confirmOpen, confirmReviewKey, applyAvailability, applyReview, applyChoices, busy, reviewedRows, selectedTargetIndex, doCompare, refreshLastSyncs, invalidateCompareRevision, requestResultRestore, resetConfirmation, resetSafetyUi, setStatus]);
 
-  const selectJob = useCallback((j: JobDto) => {
-    if (currentJob?.job_id === j.job_id) return;
-    const targetIndex = targetForSelection(compareRepository, j);
-    const restored = sessionForSelection(compareRepository, j, targetIndex);
-    selectionRef.current = { job: j, targetIndex };
-    setCurrentJob(j);
-    setSelTarget(targetIndex);
-    resetNavigationUi();
+  const selectJob = useCallback((job: JobDto) => {
+    if (currentJob?.job_id === job.job_id) return;
+    const targetIndex = targetForSelection(compareRepository, job);
+    const restored = sessionForSelection(compareRepository, job, targetIndex);
+    selectionRef.current = { job, targetIndex };
+    setCurrentJob(job);
+    setSelectedTargetIndex(targetIndex);
+    resetResultWorkspace();
     setStatus(restored
-      ? `${j.name} · restored ${restored.plan.ops.length} compare items`
-      : `${j.name} · ${j.mode}${j.rigor !== 'standard' ? ` · ${j.rigor}` : ''}`);
-    requestResultRestore(j, targetIndex, restored);
-  }, [currentJob?.job_id, compareRepository, requestResultRestore, resetNavigationUi, setStatus]);
+      ? `${job.name} · restored ${restored.plan.ops.length} compare items`
+      : `${job.name} · ${job.mode}${job.rigor !== 'standard' ? ` · ${job.rigor}` : ''}`);
+    requestResultRestore(job, targetIndex, restored);
+  }, [currentJob?.job_id, compareRepository, requestResultRestore, resetResultWorkspace, setStatus]);
 
   /// Write a root edited on the main screen back to the job TOML. Changing a root invalidates the current
   /// plan, so clear it too. For multi-target jobs, only the currently selected target changes.
   const saveRoot = useCallback(async (which: 'source' | 'target', value: string) => {
     if (!currentJob) return;
     const name = currentJob.name;
-    const v = value.trim();
-    if (!v) return;
+    const normalizedValue = value.trim();
+    if (!normalizedValue) return;
     let detail: ipc.JobDetailDto;
     try {
       detail = await ipc.getJob(name);
-    } catch (e) {
-      await reportMutationFailure(name, `Failed to read the job before changing ${which}`, e);
+    } catch (error) {
+      await reportMutationFailure(name, `Failed to read the job before changing ${which}`, error);
       return;
     }
-    const j = detail.job;
-    const hasTargetList = j.targets.length > 0;
-    const ts = hasTargetList ? [...j.targets] : [j.target];
-    const before = which === 'source' ? j.source : ts[selTarget];
-    if (before === v) return; // unchanged means no disk write — otherwise every blur would bump the mtime
+    const jobConfiguration = detail.job;
+    const hasTargetList = jobConfiguration.targets.length > 0;
+    const targets = hasTargetList ? [...jobConfiguration.targets] : [jobConfiguration.target];
+    const before = which === 'source' ? jobConfiguration.source : targets[selectedTargetIndex];
+    if (before === normalizedValue) return; // unchanged means no disk write — otherwise every blur would bump the mtime
     const next: ipc.JobFull = which === 'source'
-      ? { ...j, source: v }
+      ? { ...jobConfiguration, source: normalizedValue }
       : {
-        ...j,
-        target: selTarget === 0 ? v : j.target,
-        targets: hasTargetList ? ts.map((t, i) => (i === selTarget ? v : t)) : [],
+        ...jobConfiguration,
+        target: selectedTargetIndex === 0 ? normalizedValue : jobConfiguration.target,
+        targets: hasTargetList
+          ? targets.map((target, index) => (index === selectedTargetIndex ? normalizedValue : target))
+          : [],
       };
     let saved: ipc.JobSaveDto;
     try {
@@ -989,8 +1024,8 @@ export function App() {
         originalName: detail.name,
         expectedRevision: detail.config_revision,
       });
-    } catch (e) {
-      await reportMutationFailure(name, `Failed to write ${which} back to the job`, e);
+    } catch (error) {
+      await reportMutationFailure(name, `Failed to write ${which} back to the job`, error);
       return;
     }
     // The mutation is committed at this point. Retire its old compare immediately, and never let a
@@ -1000,12 +1035,16 @@ export function App() {
       saved,
       { jobId: detail.job_id, name: detail.name, configRevision: detail.config_revision },
     ));
-    resetSafetyUi();
-    pushHistory(v);
+    resetResultWorkspace();
+    pushHistory(normalizedValue);
     const undo = async () => {
       const back: ipc.JobFull = which === 'source'
         ? { ...next, source: before }
-        : { ...next, target: selTarget === 0 ? before : next.target, targets: next.targets.map((t, i) => (i === selTarget ? before : t)) };
+        : {
+          ...next,
+          target: selectedTargetIndex === 0 ? before : next.target,
+          targets: next.targets.map((target, index) => (index === selectedTargetIndex ? before : target)),
+        };
       try {
         const restored = await ipc.saveJob(saved.name, back, {
           originalName: saved.name,
@@ -1016,26 +1055,26 @@ export function App() {
           restored,
           { jobId: saved.job_id, name: saved.name, configRevision: saved.config_revision },
         ));
-      } catch (e) {
-        await reportMutationFailure(saved.name, `Could not restore ${which}`, e);
+      } catch (error) {
+        await reportMutationFailure(saved.name, `Could not restore ${which}`, error);
         return;
       }
-      resetSafetyUi();
+      resetResultWorkspace();
       try {
         await refreshJobs(saved.name);
         setStatus(`Restored ${which}`);
-      } catch (e) {
-        setStatus(`Restored ${which}, but refreshing the job list failed: ${e}`, 'err');
+      } catch (error) {
+        setStatus(`Restored ${which}, but refreshing the job list failed: ${error}`, 'err');
       }
     };
-    const success = `Changed ${which} → ${v} — Compare again (Ctrl+R)`;
+    const success = `Changed ${which} → ${normalizedValue} — Compare again (Ctrl+R)`;
     try {
       await refreshJobs(name);
       setStatusUndo(success, 'Undo', undo);
-    } catch (e) {
-      setStatusUndo(`${success}; refreshing the job list failed: ${e}`, 'Undo', undo, 'err');
+    } catch (error) {
+      setStatusUndo(`${success}; refreshing the job list failed: ${error}`, 'Undo', undo, 'err');
     }
-  }, [currentJob, selTarget, pushHistory, refreshJobs, reportMutationFailure, resetSafetyUi, setStatus, setStatusUndo]);
+  }, [currentJob, selectedTargetIndex, pushHistory, refreshJobs, reportMutationFailure, resetResultWorkspace, setStatus, setStatusUndo]);
 
   /// The FFS ⇄ swaps the in-memory config; our jobs are named TOML files on disk, so a swap has to hit
   /// the disk — otherwise the two roots in the plan header say something different from the job file, and
@@ -1047,8 +1086,8 @@ export function App() {
       const detail = await ipc.getJob(currentJob.name);
       const job = detail.job;
       const targets = job.targets.length ? job.targets : [job.target];
-      if (selTarget >= targets.length) {
-        setStatus(`Target ${selTarget + 1} no longer exists — refresh the job before swapping`, 'err');
+      if (selectedTargetIndex >= targets.length) {
+        setStatus(`Target ${selectedTargetIndex + 1} no longer exists — refresh the job before swapping`, 'err');
         return;
       }
       setAskSwap({
@@ -1056,32 +1095,36 @@ export function App() {
         name: detail.name,
         job,
         configRevision: detail.config_revision,
-        targetIndex: selTarget,
+        targetIndex: selectedTargetIndex,
       });
-    } catch (e) {
-      await reportMutationFailure(currentJob.name, 'Failed to read job before swapping', e);
+    } catch (error) {
+      await reportMutationFailure(currentJob.name, 'Failed to read job before swapping', error);
     }
-  }, [currentJob, busy, selTarget, reportMutationFailure, setStatus]);
+  }, [currentJob, busy, selectedTargetIndex, reportMutationFailure, setStatus]);
 
   const doSwap = useCallback(async (
     jobId: string,
     name: string,
-    j: ipc.JobFull,
+    jobConfiguration: ipc.JobFull,
     configRevision: string,
     targetIndex: number,
   ) => {
-    const targets = j.targets.length ? [...j.targets] : [j.target];
-    const hasTargetList = j.targets.length > 0;
+    const targets = jobConfiguration.targets.length
+      ? [...jobConfiguration.targets]
+      : [jobConfiguration.target];
+    const hasTargetList = jobConfiguration.targets.length > 0;
     const selectedTarget = targets[targetIndex];
     if (selectedTarget === undefined) {
       setStatus(`Swap failed: target ${targetIndex + 1} no longer exists`, 'err');
       return;
     }
-    const nextTargets = targets.map((target, index) => (index === targetIndex ? j.source : target));
+    const nextTargets = targets.map((target, index) => (
+      index === targetIndex ? jobConfiguration.source : target
+    ));
     const next: ipc.JobFull = {
-      ...j,
+      ...jobConfiguration,
       source: selectedTarget,
-      target: targetIndex === 0 ? j.source : j.target,
+      target: targetIndex === 0 ? jobConfiguration.source : jobConfiguration.target,
       targets: hasTargetList ? nextTargets : [],
     };
     let saved: ipc.JobSaveDto;
@@ -1090,8 +1133,8 @@ export function App() {
         originalName: name,
         expectedRevision: configRevision,
       });
-    } catch (e) {
-      await reportMutationFailure(name, 'Swap failed', e);
+    } catch (error) {
+      await reportMutationFailure(name, 'Swap failed', error);
       return;
     }
     setCompareRepository((repository) => reconcileSavedJobSession(
@@ -1099,13 +1142,10 @@ export function App() {
       saved,
       { jobId, name, configRevision },
     ));
-    resetSafetyUi();
-    setChips(new Set());
-    setOvFilter(null);
-    setOvExpanded(new Set());
+    resetResultWorkspace();
     const undo = async () => {
       try {
-        const restored = await ipc.saveJob(saved.name, j, {
+        const restored = await ipc.saveJob(saved.name, jobConfiguration, {
           originalName: saved.name,
           expectedRevision: saved.config_revision,
         });
@@ -1114,26 +1154,26 @@ export function App() {
           restored,
           { jobId: saved.job_id, name: saved.name, configRevision: saved.config_revision },
         ));
-      } catch (e) {
-        await reportMutationFailure(saved.name, 'Could not undo the root swap', e);
+      } catch (error) {
+        await reportMutationFailure(saved.name, 'Could not undo the root swap', error);
         return;
       }
-      resetSafetyUi();
+      resetResultWorkspace();
       try {
         await refreshJobs(saved.name);
         setStatus(`Restored the two roots of '${saved.name}'`);
-      } catch (e) {
-        setStatus(`Restored the two roots of '${saved.name}', but refreshing the job list failed: ${e}`, 'err');
+      } catch (error) {
+        setStatus(`Restored the two roots of '${saved.name}', but refreshing the job list failed: ${error}`, 'err');
       }
     };
     const success = `Swapped the two roots of '${name}' — Compare again (Ctrl+R)`;
     try {
       await refreshJobs(name);
       setStatusUndo(success, 'Undo swap', undo);
-    } catch (e) {
-      setStatusUndo(`${success}; refreshing the job list failed: ${e}`, 'Undo swap', undo, 'err');
+    } catch (error) {
+      setStatusUndo(`${success}; refreshing the job list failed: ${error}`, 'Undo swap', undo, 'err');
     }
-  }, [refreshJobs, reportMutationFailure, resetSafetyUi, setStatus, setStatusUndo]);
+  }, [refreshJobs, reportMutationFailure, resetResultWorkspace, setStatus, setStatusUndo]);
 
   /// Write an exclude back into the job's exclude list. Pruning during the scan only takes effect at the
   /// next Compare, so the message has to say so and leave an undo behind.
@@ -1143,26 +1183,29 @@ export function App() {
     let detail: ipc.JobDetailDto;
     try {
       detail = await ipc.getJob(name);
-    } catch (e) {
-      await reportMutationFailure(name, 'Failed to read the job before adding the exclude', e);
+    } catch (error) {
+      await reportMutationFailure(name, 'Failed to read the job before adding the exclude', error);
       return;
     }
-    const j = detail.job;
-    const prev = [...j.exclude];
+    const jobConfiguration = detail.job;
+    const previousExcludes = [...jobConfiguration.exclude];
     // Folded the way the engine folds, not by string equality: a mask typed with backslashes, in a
     // different case, or in NFD is the same rule to the filter, and appending it again would leave
     // two lines that mean one thing — and a preset box unticked next to its own pattern
-    const { next, added: add } = addExcludeEntries(prev, masks);
-    if (!add.length) { setStatus(`The job already has ${masks.length > 1 ? 'all of these masks' : 'this exclude'}`); return; }
-    const nextJob = { ...j, exclude: next };
+    const { next: nextExcludes, added: addedMasks } = addExcludeEntries(previousExcludes, masks);
+    if (!addedMasks.length) {
+      setStatus(`The job already has ${masks.length > 1 ? 'all of these masks' : 'this exclude'}`);
+      return;
+    }
+    const updatedJob = { ...jobConfiguration, exclude: nextExcludes };
     let saved: ipc.JobSaveDto;
     try {
-      saved = await ipc.saveJob(name, nextJob, {
+      saved = await ipc.saveJob(name, updatedJob, {
         originalName: detail.name,
         expectedRevision: detail.config_revision,
       });
-    } catch (e) {
-      await reportMutationFailure(name, 'Failed to write exclude', e);
+    } catch (error) {
+      await reportMutationFailure(name, 'Failed to write exclude', error);
       return;
     }
     setCompareRepository((repository) => reconcileSavedJobSession(
@@ -1170,10 +1213,10 @@ export function App() {
       saved,
       { jobId: detail.job_id, name: detail.name, configRevision: detail.config_revision },
     ));
-    resetSafetyUi();
+    resetResultWorkspace();
     const undo = async () => {
       try {
-        const restored = await ipc.saveJob(saved.name, j, {
+        const restored = await ipc.saveJob(saved.name, jobConfiguration, {
           originalName: saved.name,
           expectedRevision: saved.config_revision,
         });
@@ -1182,84 +1225,92 @@ export function App() {
           restored,
           { jobId: saved.job_id, name: saved.name, configRevision: saved.config_revision },
         ));
-      } catch (e) {
-        await reportMutationFailure(saved.name, 'Could not undo the exclude', e);
+      } catch (error) {
+        await reportMutationFailure(saved.name, 'Could not undo the exclude', error);
         return;
       }
-      resetSafetyUi();
+      resetResultWorkspace();
       try {
         await refreshJobs(saved.name);
         setStatus('Exclude undone');
-      } catch (e) {
-        setStatus(`Exclude undone, but refreshing the job list failed: ${e}`, 'err');
+      } catch (error) {
+        setStatus(`Exclude undone, but refreshing the job list failed: ${error}`, 'err');
       }
     };
-    const success = `${label}: ${add.join(', ')} — Compare again to build a result with this exclusion`;
+    const success = `${label}: ${addedMasks.join(', ')} — Compare again to build a result with this exclusion`;
     try {
       await refreshJobs(name);
       setStatusUndo(success, 'Undo exclude', undo);
-    } catch (e) {
-      setStatusUndo(`${success}; refreshing the job list failed: ${e}`, 'Undo exclude', undo, 'err');
+    } catch (error) {
+      setStatusUndo(`${success}; refreshing the job list failed: ${error}`, 'Undo exclude', undo, 'err');
     }
-  }, [currentJob, refreshJobs, reportMutationFailure, resetSafetyUi, setStatus, setStatusUndo]);
+  }, [currentJob, refreshJobs, reportMutationFailure, resetResultWorkspace, setStatus, setStatusUndo]);
 
-  /// Export the current view (the visible set, with check state). Escaping and the BOM are handled once
-  /// on the Rust side.
+  // CSV is a presentation snapshot, while Rust remains the single owner of escaping and the BOM.
   const exportCsv = useCallback(async () => {
     if (!plan || !currentJob) { setStatus('Compare first', 'err'); return; }
-    if (!visible.length) { setStatus('The current view is empty', 'err'); return; }
+    if (resultView !== 'differences') { setStatus('Switch to Differences before exporting', 'err'); return; }
+    if (scopeCalculationFailed) { setStatus('The run scope could not be calculated safely', 'err'); return; }
+    if (scopeCalculationPending) { setStatus('The run scope is still being calculated', 'err'); return; }
+    if (!inScopeIndices.length) { setStatus('The current run scope is empty', 'err'); return; }
     const stamp = new Date();
-    const def = `${currentJob.name}-${stamp.getFullYear()}${p2(stamp.getMonth() + 1)}${p2(stamp.getDate())}.csv`;
+    const defaultFilename = `${currentJob.name}-${stamp.getFullYear()}${p2(stamp.getMonth() + 1)}${p2(stamp.getDate())}.csv`;
     try {
-      const path = await ipc.pickPath({ save: true, title: 'Export CSV', defaultPath: def });
+      const path = await ipc.pickPath({ save: true, title: 'Export CSV', defaultPath: defaultFilename });
       if (!path) return;
-      // layout.order, not `visible`: the export is a snapshot of the view, so it follows the sort
-      // and the directory grouping you are looking at
-      const n = await ipc.exportCsv(
+      // CSV is a snapshot of the presentation, so it deliberately follows display order rather
+      // than the engine order used for execution.
+      const exportedRowCount = await ipc.exportCsv(
         path, plan.header,
-        layout.order.map((i) => eff(plan, flipped, i)),
-        layout.order.map((i) => metaOf(plan, i)),
-        layout.order.map((i) => checked[i]),
+        layout.displayOrder.map((index) => effectiveOperation(plan, flipped, index)),
+        layout.displayOrder.map((index) => rowMetadata(plan, index)),
+        layout.displayOrder.map((index) => checked[index]),
       );
-      setStatusUndo(`Exported ${n} rows to ${path}`, 'Open containing folder', () => ipc.reveal(path));
-    } catch (e) {
-      setStatus(`Export failed: ${e}`, 'err');
+      setStatusUndo(`Exported ${exportedRowCount} rows to ${path}`, 'Open containing folder', () => ipc.reveal(path));
+    } catch (error) {
+      setStatus(`Export failed: ${error}`, 'err');
     }
-  }, [plan, currentJob, visible, layout, flipped, checked, setStatus, setStatusUndo]);
+  }, [plan, currentJob, resultView, scopeCalculationFailed, scopeCalculationPending, inScopeIndices, layout, flipped, checked, setStatus, setStatusUndo]);
 
   const browseRoot = useCallback(async (which: 'source' | 'target') => {
     try {
-      const p = await ipc.pickPath({
+      const selectedPath = await ipc.pickPath({
         directory: true,
         title: `Select the ${which} directory`,
         defaultPath: which === 'source'
           ? currentJob?.source
-          : currentJob?.targets[selTarget] ?? currentJob?.target,
+          : currentJob?.targets[selectedTargetIndex] ?? currentJob?.target,
       });
-      if (p) await saveRoot(which, p);
-    } catch (e) {
-      setStatus(`Can't open the picker: ${e}`, 'err');
+      if (selectedPath) await saveRoot(which, selectedPath);
+    } catch (error) {
+      setStatus(`Can't open the picker: ${error}`, 'err');
     }
-  }, [currentJob, selTarget, saveRoot, setStatus]);
+  }, [currentJob, selectedTargetIndex, saveRoot, setStatus]);
 
-  // Row interactions
-
-  const toggleRow = useCallback((i: number, v: boolean) => {
-    setChecked((prev) => { const next = [...prev]; next[i] = v; return next; });
+  const toggleRow = useCallback((index: number, value: boolean) => {
+    setChecked((previous) => { const next = [...previous]; next[index] = value; return next; });
   }, [setChecked]);
 
-  const toggleMany = useCallback((items: number[], v: boolean) => {
-    setChecked((prev) => { const next = [...prev]; for (const i of items) next[i] = v; return next; });
+  const toggleMany = useCallback((indices: number[], value: boolean) => {
+    setChecked((previous) => {
+      const next = [...previous];
+      for (const index of indices) next[index] = value;
+      return next;
+    });
   }, [setChecked]);
 
-  const flipRow = useCallback((i: number) => {
-    setFlipped((prev) => { const next = [...prev]; next[i] = !next[i]; return next; });
+  const flipRow = useCallback((index: number) => {
+    setFlipped((previous) => {
+      const next = [...previous];
+      next[index] = !next[index];
+      return next;
+    });
   }, [setFlipped]);
 
-  const foldDir = useCallback((dir: string) => {
-    setCollapsedDirs((prev) => {
-      const next = new Set(prev);
-      if (next.has(dir)) next.delete(dir); else next.add(dir);
+  const toggleFolderFold = useCallback((folderPath: string) => {
+    setCollapsedFolderPaths((previous) => {
+      const next = new Set(previous);
+      if (next.has(folderPath)) next.delete(folderPath); else next.add(folderPath);
       return next;
     });
   }, []);
@@ -1275,47 +1326,43 @@ export function App() {
     });
   }, []);
 
-  const rowMenu = useCallback((i: number, x: number, y: number) => {
+  const rowMenu = useCallback((index: number, x: number, y: number) => {
     if (!plan) return;
-    const op = eff(plan, flipped, i);
-    const [sp, tp] = sidePaths(op);
-    const sAbs = sp ? fullPath(plan.header.source_root, sp) : null;
-    const tAbs = tp ? fullPath(plan.header.target_root, tp) : null;
-    const rel = op.path;
-    const base = baseOf(rel);
-    const dot = base.lastIndexOf('.');
-    const ext = dot > 0 ? base.slice(dot + 1) : '';
-    const dir = treeDirOf(op);
-    const sameDir = visible.filter((k) => {
-      const candidate = treeDirOf(eff(plan, flipped, k));
-      // `(root)` remains a direct-files bucket; a real folder owns its complete visible subtree.
-      const inTree = dir === '' ? candidate === '' : candidate === dir || candidate.startsWith(`${dir}/`);
-      return inTree && selectable(eff(plan, flipped, k));
-    });
-    const copy = (s: string) => navigator.clipboard?.writeText(s).then(
-      () => setStatus(`Copied: ${s}`),
+    const operation = effectiveOperation(plan, flipped, index);
+    const [sourcePath, targetPath] = sidePaths(operation);
+    const sourceAbsolutePath = sourcePath ? fullPath(plan.header.source_root, sourcePath) : null;
+    const targetAbsolutePath = targetPath ? fullPath(plan.header.target_root, targetPath) : null;
+    const relativePath = operation.path;
+    const baseName = baseOf(relativePath);
+    const extensionSeparator = baseName.lastIndexOf('.');
+    const extension = extensionSeparator > 0 ? baseName.slice(extensionSeparator + 1) : '';
+    const folderPath = owningFolderOf(operation);
+    const inFolderScope = inScopeIndices.filter((candidateIndex) => (
+      matchesFolderScope(effectiveOperation(plan, flipped, candidateIndex), folderPath)
+      && isExecutableOperation(effectiveOperation(plan, flipped, candidateIndex))
+    ));
+    const copyPath = (path: string) => navigator.clipboard?.writeText(path).then(
+      () => setStatus(`Copied: ${path}`),
       () => setStatus('Copy failed (clipboard unavailable)', 'err'),
     );
-    setCtx({
+    setContextMenu({
       x, y,
-      items: [
-        { label: 'Show in Explorer · source', disabled: !sAbs, run: () => { ipc.reveal(sAbs!).catch((e) => setStatus(String(e), 'err')); } },
-        { label: 'Show in Explorer · target', disabled: !tAbs, run: () => { ipc.reveal(tAbs!).catch((e) => setStatus(String(e), 'err')); } },
-        { sep: true, label: '' },
-        { label: 'Copy full path', run: () => copy((sAbs ?? tAbs)!) },
-        { label: 'Copy relative path', run: () => copy(rel) },
-        { sep: true, label: '' },
-        { label: ext ? `Exclude this type */*.${ext}` : 'Exclude this type (no extension)', disabled: !ext || !currentJob, run: () => addExcludes([`*/*.${ext}`], 'Added to exclude') },
-        { label: dir ? `Exclude this directory /${dir}/` : 'Exclude this directory (already at the root)', disabled: !dir || !currentJob, run: () => addExcludes([`/${dir}/`], 'Added to exclude') },
-        { sep: true, label: '' },
-        { label: flipped[i] ? 'Restore original direction' : 'Reverse this row', disabled: !canFlip(plan, i), run: () => flipRow(i) },
-        { label: 'Check only this item', run: () => setChecked(plan.ops.map((_, k) => k === i && selectable(eff(plan, flipped, k)))) },
-        { label: `${dir ? 'Uncheck this folder and subfolders' : 'Uncheck root-level items'} (${sameDir.length})`, disabled: sameDir.length === 0, run: () => toggleMany(sameDir, false) },
+      entries: [
+        { label: 'Show in Explorer · Source', disabled: !sourceAbsolutePath, run: () => { ipc.reveal(sourceAbsolutePath!).catch((error) => setStatus(String(error), 'err')); } },
+        { label: 'Show in Explorer · Target', disabled: !targetAbsolutePath, run: () => { ipc.reveal(targetAbsolutePath!).catch((error) => setStatus(String(error), 'err')); } },
+        { separator: true, label: '' },
+        { label: 'Copy Full Path', run: () => copyPath((sourceAbsolutePath ?? targetAbsolutePath)!) },
+        { label: 'Copy Relative Path', run: () => copyPath(relativePath) },
+        { separator: true, label: '' },
+        { label: extension ? `Exclude This Type */*.${extension}` : 'Exclude This Type (No Extension)', disabled: !extension || !currentJob, run: () => addExcludes([`*/*.${extension}`], 'Added to exclude') },
+        { label: folderPath ? `Exclude This Directory /${folderPath}/` : 'Exclude This Directory (Already at the Root)', disabled: !folderPath || !currentJob, run: () => addExcludes([`/${folderPath}/`], 'Added to exclude') },
+        { separator: true, label: '' },
+        { label: flipped[index] ? 'Restore Original Direction' : 'Reverse This Row', disabled: !canReverseOperation(plan, index), run: () => flipRow(index) },
+        { label: 'Check Only This Item', run: () => setChecked(plan.ops.map((_, candidateIndex) => candidateIndex === index && isExecutableOperation(effectiveOperation(plan, flipped, candidateIndex)))) },
+        { label: `${folderPath ? 'Uncheck This Folder and Subfolders' : 'Uncheck Root-Level Items'} (${inFolderScope.length})`, disabled: inFolderScope.length === 0, run: () => toggleMany(inFolderScope, false) },
       ],
     });
-  }, [plan, flipped, visible, currentJob, addExcludes, flipRow, toggleMany, setChecked, setStatus]);
-
-  // Init
+  }, [plan, flipped, inScopeIndices, currentJob, addExcludes, flipRow, toggleMany, setChecked, setStatus]);
 
   useEffect(() => {
     (async () => {
@@ -1325,62 +1372,66 @@ export function App() {
         setJobsDir(await ipc.jobsDir());
         try { setAppVersion('v' + (await getVersion())); } catch { /* ignore when the permission isn't granted */ }
         setStatus(list.length ? 'Select a job on the left to start' : 'No jobs — drop a <name>.toml into the jobs directory');
-      } catch (e) {
-        setStatus(`Init failed: ${e}`, 'err');
+      } catch (error) {
+        setStatus(`Init failed: ${error}`, 'err');
       }
     })();
   }, []);
 
-  // Progress event streams
   useEffect(() => {
     let disposed = false;
     let dispose: (() => void) | undefined;
     let ready = false;
     let lastSequence = 0;
     const queued: CompareProgressEvent[] = [];
-    const handle = (e: CompareProgressEvent) => {
-      if (e.purpose !== 'compare') return;
-      if (!cmpRunReady.current && e.run_id <= cmpRunFloor.current) return;
-      if (e.run_id < cmpRunId.current) return;
-      if (e.run_id > cmpRunId.current) {
-        cmpRunId.current = e.run_id;
-        cmpRate.current.clear();
-        setCmpStages([]);
+    const handle = (event: CompareProgressEvent) => {
+      if (event.purpose !== 'compare') return;
+      if (!compareRunReady.current && event.run_id <= compareRunFloor.current) return;
+      if (event.run_id < compareRunId.current) return;
+      if (event.run_id > compareRunId.current) {
+        compareRunId.current = event.run_id;
+        compareRateByPhase.current.clear();
+        setCompareStages([]);
       }
-      cmpRunReady.current = true;
+      compareRunReady.current = true;
       // A `log` event carries no phase, so the phase guard below would drop it. Errors do carry
       // one, but the guard used to sit above every branch and there was no branch to reach:
       // `phase_start` and `progress` were the only two, and a scan that could not read a directory
       // produced an event nothing was listening for.
-      if (e.kind === 'error') {
-        setStatus(`${e.action === 'walk' ? 'Scan could not read' : 'Error'}: ${e.message ?? ''}`, 'err');
+      if (event.kind === 'error') {
+        setStatus(`${event.action === 'walk' ? 'Scan could not read' : 'Error'}: ${event.message ?? ''}`, 'err');
         return;
       }
-      if (!e.phase) return;
-      if (e.kind === 'phase_start') {
-        setCmpStages((prev) => reduceCompareStages(prev, e));
-      } else if (e.kind === 'totals') {
-        const ts = e.ts_ms ?? Date.now();
-        const bd = e.bytes_done ?? 0;
-        cmpRate.current.set(e.phase, { t: ts, b: bd, ema: 0 });
-        setCmpStages((prev) => reduceCompareStages(prev, e));
-      } else if (e.kind === 'progress') {
-        const ts = e.ts_ms ?? Date.now();
-        const bd = e.bytes_done ?? 0;
-        const prevR = cmpRate.current.get(e.phase);
-        let ema = 0;
-        if (prevR && ts > prevR.t && bd >= prevR.b) {
-          const inst = ((bd - prevR.b) * 1000) / (ts - prevR.t);
-          ema = prevR.ema > 0 ? prevR.ema * 0.7 + inst * 0.3 : inst;
-          cmpRate.current.set(e.phase, { t: ts, b: bd, ema });
-        } else if (!prevR) {
-          cmpRate.current.set(e.phase, { t: ts, b: bd, ema: 0 });
+      if (!event.phase) return;
+      if (event.kind === 'phase_start') {
+        setCompareStages((previous) => reduceCompareStages(previous, event));
+      } else if (event.kind === 'totals') {
+        const timestampMs = event.ts_ms ?? Date.now();
+        const bytesDone = event.bytes_done ?? 0;
+        compareRateByPhase.current.set(event.phase, { timestampMs, bytesDone, smoothedRate: 0 });
+        setCompareStages((previous) => reduceCompareStages(previous, event));
+      } else if (event.kind === 'progress') {
+        const timestampMs = event.ts_ms ?? Date.now();
+        const bytesDone = event.bytes_done ?? 0;
+        const previousRate = compareRateByPhase.current.get(event.phase);
+        let smoothedRate = 0;
+        if (previousRate
+          && timestampMs > previousRate.timestampMs
+          && bytesDone >= previousRate.bytesDone) {
+          const instantaneousRate = ((bytesDone - previousRate.bytesDone) * 1000)
+            / (timestampMs - previousRate.timestampMs);
+          smoothedRate = previousRate.smoothedRate > 0
+            ? previousRate.smoothedRate * 0.7 + instantaneousRate * 0.3
+            : instantaneousRate;
+          compareRateByPhase.current.set(event.phase, { timestampMs, bytesDone, smoothedRate });
+        } else if (!previousRate) {
+          compareRateByPhase.current.set(event.phase, { timestampMs, bytesDone, smoothedRate: 0 });
         } else {
-          ema = prevR.ema;
+          smoothedRate = previousRate.smoothedRate;
         }
-        setCmpStages((prev) => reduceCompareStages(prev, e, ema));
-      } else if (e.kind === 'phase_end') {
-        setCmpStages((prev) => reduceCompareStages(prev, e));
+        setCompareStages((previous) => reduceCompareStages(previous, event, smoothedRate));
+      } else if (event.kind === 'phase_end') {
+        setCompareStages((previous) => reduceCompareStages(previous, event));
       }
     };
     const publish = (event: CompareProgressEvent) => {
@@ -1421,78 +1472,81 @@ export function App() {
   }, [setStatus]);
 
   useEffect(() => {
-    const un = listen<string>('main-close-blocked', (event) => {
+    const pendingUnlisten = listen<string>('main-close-blocked', (event) => {
       setStatus(event.payload, 'err');
     });
-    return () => { un.then((dispose) => dispose()); };
+    return () => { pendingUnlisten.then((dispose) => dispose()); };
   }, [setStatus]);
 
-  // P1: drag a directory onto a path box.
   // Tauri v2 has dragDropEnabled on by default, so HTML5 drop events never reach the webview — you must
   // go through onDragDropEvent, and payload.position is in **physical pixels**, to be converted yourself.
   useEffect(() => {
     let disposed = false;
     let dispose: (() => void) | undefined;
-    getCurrentWebview().onDragDropEvent((ev) => {
-      const p = ev.payload as unknown as { type: string; paths?: string[]; position?: { x: number; y: number } };
-      if (p.type === 'leave') { setDropOn(null); return; }
-      const pos = p.position;
-      if (!pos) return;
-      const r = window.devicePixelRatio || 1;
-      const x = pos.x / r, y = pos.y / r;
+    getCurrentWebview().onDragDropEvent((event) => {
+      const payload = event.payload as unknown as {
+        type: string;
+        paths?: string[];
+        position?: { x: number; y: number };
+      };
+      if (payload.type === 'leave') { setDropTargetKey(null); return; }
+      const position = payload.position;
+      if (!position) return;
+      const pixelRatio = window.devicePixelRatio || 1;
+      const x = position.x / pixelRatio;
+      const y = position.y / pixelRatio;
       // While the editor is open only its fields count; otherwise the two roots on the main screen do.
       // Each region registers itself through a callback ref, so the editor's entry clears itself on
       // unmount and this stays a plain null check rather than a lookup that has to guess at markup.
       const scope = dropScope.current.editor ?? dropScope.current.path;
-      const el = [...(scope?.querySelectorAll<HTMLInputElement>('input[data-drop]') ?? [])]
-        .filter((n) => !n.disabled)
-        .find((n) => {
-          const b = n.getBoundingClientRect();
-          return x >= b.left && x <= b.right && y >= b.top && y <= b.bottom;
+      const input = [...(scope?.querySelectorAll<HTMLInputElement>('input[data-drop]') ?? [])]
+        .filter((candidate) => !candidate.disabled)
+        .find((candidate) => {
+          const bounds = candidate.getBoundingClientRect();
+          return x >= bounds.left && x <= bounds.right && y >= bounds.top && y <= bounds.bottom;
         });
-      const key = el?.dataset.root ?? el?.dataset.k ?? null;
-      if (p.type === 'over' || p.type === 'enter') { setDropOn(key); return; }
-      if (p.type !== 'drop') return;
-      setDropOn(null);
-      const first = p.paths?.[0];
-      if (!el || !key || !first) return;
+      const key = input?.dataset.root ?? input?.dataset.fieldKey ?? null;
+      if (payload.type === 'over' || payload.type === 'enter') { setDropTargetKey(key); return; }
+      if (payload.type !== 'drop') return;
+      setDropTargetKey(null);
+      const firstPath = payload.paths?.[0];
+      if (!input || !key || !firstPath) return;
       void (async () => {
         // If a file was dropped, take its parent directory — a root field wants a directory
-        let v = first;
+        let pathValue = firstPath;
         try {
-          const info = await ipc.inspectPaths(first, '');
-          if (info.source.readiness === 'not_directory') {
-            const i = Math.max(v.lastIndexOf('\\'), v.lastIndexOf('/'));
-            if (i > 0) v = v.slice(0, i);
+          const pathInformation = await ipc.inspectPaths(firstPath, '');
+          if (pathInformation.source.readiness === 'not_directory') {
+            const separatorIndex = Math.max(pathValue.lastIndexOf('\\'), pathValue.lastIndexOf('/'));
+            if (separatorIndex > 0) pathValue = pathValue.slice(0, separatorIndex);
           }
         } catch { /* if we can't tell, fill it in as-is */ }
-        pushHistory(v);
+        pushHistory(pathValue);
         // Dropping on the two main-screen roots edits the job right away (same path as typing and
         // pressing Enter); in the editor it waits for save
-        if (el.dataset.root === 'source' || el.dataset.root === 'target') {
-          await saveRoot(el.dataset.root as 'source' | 'target', v);
+        if (input.dataset.root === 'source' || input.dataset.root === 'target') {
+          await saveRoot(input.dataset.root as 'source' | 'target', pathValue);
         } else {
-          editorApi.current?.setField(key, v);
-          setStatus(`Filled in: ${v}`);
+          editorApi.current?.setField(key, pathValue);
+          setStatus(`Filled in: ${pathValue}`);
         }
       })();
     })
       // The unlisten handle can arrive after the effect has already been cleaned up (StrictMode
       // double-mounts in development); dropping it there would leak a second live handler
-      .then((f) => { if (disposed) f(); else dispose = f; })
+      .then((unlisten) => { if (disposed) unlisten(); else dispose = unlisten; })
       .catch(() => { /* if drag and drop is unavailable, typed paths still work */ });
     return () => { disposed = true; dispose?.(); };
   }, [pushHistory, saveRoot, setStatus]);
 
-  // Config pills follow the selected job
   useEffect(() => {
-    if (!currentJob) { setCfgJob(null); return; }
+    if (!currentJob) { setJobConfiguration(null); return; }
     let live = true;
     ipc.getJob(currentJob.name).then((detail) => {
-      if (live) setCfgJob(detail.job);
+      if (live) setJobConfiguration(detail.job);
     }).catch((error) => {
       if (!live) return;
-      setCfgJob(null);
+      setJobConfiguration(null);
       setStatus(`Failed to load '${currentJob.name}' settings: ${error}`, 'err');
     });
     return () => { live = false; };
@@ -1749,51 +1803,61 @@ export function App() {
     };
   }, [acceptAutoScanStatus, setStatus]);
 
-  // Keyboard.
-  //
   // Escape is deliberately absent: every overlay closes itself, and they stack, so one Escape
   // unwinds exactly one layer. Handling it here as well would close the sheet *and* the dialog
   // nested inside it on a single press.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const mod = e.ctrlKey || e.metaKey;
+    const onKey = (event: KeyboardEvent) => {
+      const modifierPressed = event.ctrlKey || event.metaKey;
       // While an overlay owns the screen it owns the keyboard: F5 must not kick off a compare
       // behind an open editor
-      if (ctx || editor || settingsOpen || askSwap) return;
+      if (contextMenu || editor || settingsOpen || askSwap) return;
       if (confirmOpen) return;
       // F5 / F9 = the FFS compare / synchronize keys; Ctrl+R also compares
-      if (e.key === 'F5') { e.preventDefault(); void doCompare(); }
-      else if (e.key === 'F9') { e.preventDefault(); void openConfirm(); }
-      else if (mod && e.key.toLowerCase() === 'r') { e.preventDefault(); void doCompare(); }
+      if (event.key === 'F5') { event.preventDefault(); void doCompare(); }
+      else if (event.key === 'F9') { event.preventDefault(); void openConfirm(); }
+      else if (modifierPressed && event.key.toLowerCase() === 'r') {
+        event.preventDefault();
+        void doCompare();
+      }
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [ctx, editor, settingsOpen, askSwap, confirmOpen, doCompare, openConfirm]);
+  }, [contextMenu, editor, settingsOpen, askSwap, confirmOpen, doCompare, openConfirm]);
 
-  // The funnel is anchored to its toolbar button and has no dismissal of its own; the context menu
-  // brings its own (outside click, Esc, and any scroll under it), so it is not handled here
-  useEffect(() => {
-    const onClick = () => setFunnelAnchor(null);
-    document.addEventListener('click', onClick);
-    return () => document.removeEventListener('click', onClick);
-  }, []);
-
-  const hasRows = !!plan && plan.ops.length > 0;
+  const hasDifferences = !!plan && plan.ops.length > 0;
   const reviewBusy = operationReviewPending(compareReview) || operationReviewPending(applyReview);
-  const confirmTotals: ConfirmTotals | null = useMemo(() => {
+  const confirmTotals: ApplyReviewTotals | null = useMemo(() => {
     if (!plan) return null;
-    const t: ConfirmTotals = { copy: 0, update: 0, move: 0, del: 0, bytes: 0, delBytes: 0, flips: 0, hiddenChecked: 0 };
-    for (const i of final) {
-      const op = eff(plan, flipped, i);
-      if (op.action === 'copy') { t.copy++; t.bytes += op.size ?? 0; }
-      else if (op.action === 'update' || op.action === 'chmod') { t.update++; t.bytes += op.size ?? 0; }
-      else if (op.action === 'move') t.move++;
-      else if (op.action === 'delete' || op.action === 'delete_dir') { t.del++; t.delBytes += op.size ?? 0; }
-      if (flipped[i]) t.flips++;
+    const totals: ApplyReviewTotals = {
+      copyCount: 0,
+      updateCount: 0,
+      moveCount: 0,
+      deleteCount: 0,
+      transferBytes: 0,
+      deletionBytes: 0,
+      reversedCount: 0,
+      checkedOutsideScope: 0,
+    };
+    for (const index of executableIndices) {
+      const operation = effectiveOperation(plan, flipped, index);
+      if (operation.action === 'copy') {
+        totals.copyCount++;
+        totals.transferBytes += rowTransferBytes(plan, flipped, index);
+      } else if (operation.action === 'update') {
+        totals.updateCount++;
+        totals.transferBytes += rowTransferBytes(plan, flipped, index);
+      } else if (operation.action === 'chmod') totals.updateCount++;
+      else if (operation.action === 'move') totals.moveCount++;
+      else if (operation.action === 'delete' || operation.action === 'delete_dir') {
+        totals.deleteCount++;
+        totals.deletionBytes += operation.size ?? 0;
+      }
+      if (flipped[index]) totals.reversedCount++;
     }
-    t.hiddenChecked = checked.filter(Boolean).length - final.length;
-    return t;
-  }, [plan, final, flipped, checked]);
+    totals.checkedOutsideScope = checked.filter(Boolean).length - executableIndices.length;
+    return totals;
+  }, [plan, executableIndices, flipped, checked]);
 
   return (
     <>
@@ -1801,7 +1865,7 @@ export function App() {
         <Sidebar
           jobs={jobs}
           currentJobId={currentJob?.job_id ?? null}
-          lastMap={lastMap}
+          lastSyncByJobName={lastSyncByJobName}
           busy={busy}
           reviewing={reviewBusy}
           appVersion={appVersion}
@@ -1814,10 +1878,11 @@ export function App() {
           <Toolbar
             job={currentJob}
             hasPlan={!!plan}
-            finalCount={final.length}
+            executableCount={executableIndices.length}
             stats={stats}
             busy={busy || reviewBusy}
-            canSync={final.length > 0}
+            canSync={applyAvailability.available}
+            applyBlockedMessage={applyAvailability.blockedMessage}
             watchStatus={autoScanStatus}
             watchPending={autoScanControlPending}
             onCompare={() => void doCompare()}
@@ -1828,7 +1893,7 @@ export function App() {
               if (action === 'stop') { stopAutoScan(); return; }
               if (action !== 'start' || !currentJob || autoScanControlPendingRef.current !== null) return;
               const monitoredJob = currentJob;
-              const monitoredTarget = selTarget;
+              const monitoredTarget = selectedTargetIndex;
               const request = autoScanControlRequest.current + 1;
               autoScanControlRequest.current = request;
               autoScanTicket.current = null;
@@ -1857,61 +1922,73 @@ export function App() {
           />
           <PathLine
             job={currentJob}
-            cfgJob={cfgJob}
+            jobConfiguration={jobConfiguration}
             busy={busy}
             reviewing={reviewBusy}
-            selTarget={selTarget}
+            selectedTargetIndex={selectedTargetIndex}
             pathHistory={pathHistory}
-            dropOn={dropOn === 'source' || dropOn === 'target' ? dropOn : null}
+            dropTargetKey={dropTargetKey === 'source' || dropTargetKey === 'target' ? dropTargetKey : null}
             scopeRef={setPathScope}
             onCommit={(which, v) => void saveRoot(which, v)}
             onBrowse={(which) => void browseRoot(which)}
             onSwap={() => void requestSwap()}
-            onSelectTarget={(i) => {
-              if (busy || i === selTarget) return;
+            onSelectTarget={(targetIndex) => {
+              if (busy || targetIndex === selectedTargetIndex) return;
               const selected = currentJob;
               if (!selected) return;
-              selectionRef.current = { job: selected, targetIndex: i };
-              setSelTarget(i);
-              resetNavigationUi();
-              const t = selected.targets[i] ?? '';
-              const restored = sessionForSelection(compareRepository, selected, i);
+              selectionRef.current = { job: selected, targetIndex };
+              setSelectedTargetIndex(targetIndex);
+              resetResultWorkspace();
+              const targetPath = selected.targets[targetIndex] ?? '';
+              const restored = sessionForSelection(compareRepository, selected, targetIndex);
               setStatus(restored
-                ? `Switched target → ${t} · restored ${restored.plan.ops.length} compare items`
-                : `Switched target → ${t} — Compare again (Ctrl+R)`);
-              requestResultRestore(selected, i, restored);
+                ? `Switched target → ${targetPath} · restored ${restored.plan.ops.length} compare items`
+                : `Switched target → ${targetPath} — Compare again (Ctrl+R)`);
+              requestResultRestore(selected, targetIndex, restored);
             }}
             onEditGroup={(g) => { if (currentJob && !busy) setEditor({ name: currentJob.name, focusGroup: g }); }}
           />
-          {hasRows && !sameOpen && !cmpActive && (
-            <FilterBar
-              plan={plan!}
-              flipped={flipped}
-              chips={chips}
-              onChips={setChips}
-              onSearch={setSearch}
-              searchKey={currentJob?.job_id ?? ''}
-              funnelCount={funnelActive(vfilter)}
-              funnelOpen={!!funnelAnchor}
-              sameOpen={sameOpen}
+          {plan && !compareActive && (
+            <ResultBar
+              plan={plan}
+              resultView={resultView}
+              onResultViewChange={(next) => {
+                setResultView(next);
+                if (next === 'identical') setAdvancedFiltersAnchor(null);
+              }}
+              searchDraft={searchDraft}
+              searchPending={searchPending}
+              scopeCalculationPending={scopeCalculationPending}
+              scopeCalculationFailed={scopeCalculationFailed}
+              onSearchDraftChange={setSearchDraft}
+              onClearSearch={clearSearch}
+              scope={{
+                foundCount: plan.ops.length,
+                inScopeCount: inScopeIndices.length,
+                selectedCount: executableIndices.length,
+                folderScope,
+                selectedResultTypes: [...selectedResultTypes],
+                advancedFilterCount: countActiveAdvancedFilterGroups(advancedFilter),
+              }}
+              onClearScope={clearRunScope}
+              onClearFolderScope={() => setFolderScope(null)}
+              onClearSelectedResultTypes={() => setSelectedResultTypes(new Set())}
+              onClearAdvancedFilters={clearAdvancedFilters}
+              advancedFiltersOpen={!!advancedFiltersAnchor}
+              onToggleAdvancedFilters={(anchor) => setAdvancedFiltersAnchor((current) => (current ? null : anchor))}
+              onExportCsv={() => void exportCsv()}
               grouped={grouped}
               sort={sort}
               anyCollapsed={anyCollapsed}
               pathMode={pathMode}
-              onToggleFunnel={(a) => setFunnelAnchor((cur) => (cur ? null : a))}
-              onToggleSame={() => {
-                if (!plan) { setStatus('Compare first — identical items come from the last compare snapshot', 'err'); return; }
-                setSameOpen((v) => !v);
-              }}
-              onExportCsv={() => void exportCsv()}
-              onToggleFold={() => setCollapsedDirs(anyCollapsed ? new Set() : new Set(treeDirs))}
+              onToggleFold={() => setCollapsedFolderPaths(anyCollapsed ? new Set() : new Set(folderPathsInLayout))}
               // Grouping and sorting are independent now — a sort orders rows inside each group and
               // the groups among themselves, so this button no longer has to double as a sort clear
               onToggleGroup={() => {
                 const next = !grouped;
                 setGrouped(next);
                 localStorage.setItem('sd.grouped', next ? 'on' : 'off');
-                setCollapsedDirs(new Set());
+                setCollapsedFolderPaths(new Set());
               }}
               onClearSort={() => setSort(null)}
               onTogglePathMode={() => {
@@ -1919,86 +1996,94 @@ export function App() {
                 setPathMode(next);
                 localStorage.setItem('sd.pathmode', next);
               }}
+              resultPanelId={resultPanelId}
+              differencesTabId={differencesTabId}
+              identicalTabId={identicalTabId}
             />
           )}
           {plan && <ScanFaultBanner header={plan.header} />}
-          <div className="reviewrow">
-            <Overview
-              plan={plan}
-              flipped={flipped}
-              collapsed={ovCollapsed}
-              ovFilter={ovFilter}
-              expanded={ovExpanded}
-              onToggleCollapsed={() => setOvCollapsed((v) => {
-                localStorage.setItem('sd.ov', v ? 'open' : 'closed');
-                return !v;
-              })}
-              onFilter={setOvFilter}
-              onToggleExpanded={(k) => setOvExpanded((prev) => {
-                const next = new Set(prev);
-                if (next.has(k)) next.delete(k); else next.add(k);
-                return next;
-              })}
-            />
+          <div className="results-layout">
+            {hasDifferences && resultView === 'differences' && !compareActive && (
+              <RunScopePanel
+                plan={plan}
+                flipped={flipped}
+                selectedResultTypes={selectedResultTypes}
+                onSelectedResultTypesChange={setSelectedResultTypes}
+                folderScope={folderScope}
+                onFolderScopeChange={setFolderScope}
+                collapsed={panelCollapsed}
+                expandedFolders={expandedFolders}
+                onToggleCollapsed={togglePanelCollapsed}
+                onToggleExpandedFolder={toggleExpandedFolder}
+                onClearRunScope={clearRunScope}
+              />
+            )}
             {/* A callback ref into state, not a useRef: the table measures this element, and a child's
                 effects run before an ancestor host ref attaches — so on mount a ref would still be
                 null exactly when the virtual window first needs it */}
-            <div className="tablewrap" ref={setTableWrap}>
-              {cmpActive ? (
+            <div
+              id={resultPanelId}
+              className="results-viewport"
+              role={plan && !compareActive ? 'tabpanel' : undefined}
+              aria-labelledby={plan && !compareActive
+                ? (resultView === 'identical' ? identicalTabId : differencesTabId)
+                : undefined}
+              ref={setResultsViewport}
+            >
+              {compareActive ? (
                 <ComparePanel
-                  stages={cmpStages}
-                  cancelling={cmpCancelling}
+                  stages={compareStages}
+                  cancelling={compareCancelling}
                   onCancel={() => {
-                    if (!cmpRunReady.current || cmpRunId.current < 0) {
+                    if (!compareRunReady.current || compareRunId.current < 0) {
                       setStatus('Compare is still starting — cancel will be available when its run is registered');
                       return;
                     }
-                    const runId = cmpRunId.current;
-                    setCmpCancelling(true);
+                    const runId = compareRunId.current;
+                    setCompareCancelling(true);
                     setStatus('Cancelling the compare…');
                     ipc.cancelRun(runId).then((accepted) => {
                       if (accepted) return;
-                      setCmpCancelling(false);
+                      setCompareCancelling(false);
                       setStatus('That compare already finished; no newer run was cancelled');
                     }).catch((e) => {
-                      setCmpCancelling(false);
+                      setCompareCancelling(false);
                       setStatus(`Cancel failed: ${e}`, 'err');
                     });
                   }}
                 />
-              ) : sameOpen && plan ? (
-                <SamePanel owner={plan.owner} onClose={() => setSameOpen(false)} />
-              ) : hasRows ? (
+              ) : resultView === 'identical' && plan ? (
+                <IdenticalResultsPanel owner={plan.owner} />
+              ) : hasDifferences ? (
                 <PlanTable
-                  plan={plan!}
+                  plan={plan}
                   flipped={flipped}
                   checked={checked}
                   rowPlan={rowPlan}
-                  displayOrder={layout.order}
-                  visible={visible}
+                  displayOrder={layout.displayOrder}
+                  inScopeIndices={inScopeIndices}
                   pathMode={pathMode}
                   grouped={grouped}
                   sort={sort}
-                  collapsedDirs={collapsedDirs}
-                  wrap={tableWrap}
-                  resetKey={`${currentJob?.job_id}|${search}|${[...chips].join()}|${ovFilter}|${sort?.key}${sort?.dir}|${grouped}`}
+                  collapsedFolderPaths={collapsedFolderPaths}
+                  wrap={resultsViewport}
                   onToggleRow={toggleRow}
                   onToggleMany={toggleMany}
                   onFlip={flipRow}
-                  onFoldDir={foldDir}
+                  onToggleFolderFold={toggleFolderFold}
                   onSort={toggleSort}
                   onContextRow={rowMenu}
                 />
               ) : plan ? (
                 <Placeholder
                   icon={<CircleCheck size={26} className="icon-ok" />}
-                  title="Both sides are identical"
-                  description="Nothing to synchronize. The status bar below counts what was scanned and what a filter excluded."
+                  title="No Differences in the Compared Scope"
+                  description="No synchronization actions are planned. Identical lists matching files; the status bar preserves excluded and unread counts."
                 />
               ) : (
                 <Placeholder
                   icon={<FolderSearch size={26} />}
-                  title={currentJob ? `Ready — ${currentJob.name}` : 'No job selected'}
+                  title={currentJob ? `Ready — ${currentJob.name}` : 'No Job Selected'}
                   description={
                     currentJob
                       ? 'Press Compare (F5 or Ctrl+R) to walk both roots and build a plan.'
@@ -2021,7 +2106,8 @@ export function App() {
             status={status}
             onUndo={runUndo}
             plan={plan}
-            visibleCount={visible.length}
+            inScopeCount={inScopeIndices.length}
+            resultView={resultView}
             zoom={zoom.zoom}
             onZoomIn={zoom.zoomIn}
             onZoomOut={zoom.zoomOut}
@@ -2030,38 +2116,37 @@ export function App() {
         </main>
       </div>
 
-      {ctx && (
-        <ContextMenu at={ctx} onClose={() => setCtx(null)}>
-          {ctx.items.map((it, k) => (it.sep
-            ? <MenuDivider key={k} />
-            : <MenuItem key={k} disabled={it.disabled} danger={it.danger} onClick={it.run}>{it.label}</MenuItem>
+      {contextMenu && (
+        <ContextMenu at={contextMenu} onClose={() => setContextMenu(null)}>
+          {contextMenu.entries.map((entry, index) => (entry.separator
+            ? <MenuDivider key={index} />
+            : <MenuItem key={index} disabled={entry.disabled} danger={entry.danger} onClick={entry.run}>{entry.label}</MenuItem>
           ))}
         </ContextMenu>
       )}
-      {funnelAnchor && plan && (
-        <FunnelPopover
-          anchor={funnelAnchor}
-          vfilter={vfilter}
-          shown={visible.length}
-          planned={plan.ops.length}
-          onChange={(next) => {
-            setVfilter(next);
-            if (next.masks.join('\n') !== vfilter.masks.join('\n')) void recomputeMasks(plan, flipped, next.masks);
-          }}
-          onClear={() => { setVfilter(EMPTY_FILTER); clearMasks(); }}
-          onPromote={(masks) => {
+      {advancedFiltersAnchor && plan && (
+        <AdvancedFiltersPopover
+          anchor={advancedFiltersAnchor}
+          advancedFilter={advancedFilter}
+          maskDraft={maskDraft}
+          inScopeCount={inScopeIndices.length}
+          differenceCount={plan.ops.length}
+          onAdvancedFilterChange={setAdvancedFilter}
+          onMaskDraftChange={setMaskDraft}
+          onClear={clearAdvancedFilters}
+          onWriteMasksToJob={(masks) => {
             if (!masks.length) { setStatus('Write at least one mask first', 'err'); return; }
-            setFunnelAnchor(null);
+            setAdvancedFiltersAnchor(null);
             void addExcludes(masks, 'Written into the exclude list');
           }}
-          onDone={() => setFunnelAnchor(null)}
+          onClose={() => setAdvancedFiltersAnchor(null)}
         />
       )}
       {editor && (
         <JobEditor
           name={editor.name}
           focusGroup={editor.focusGroup}
-          dropOn={dropOn}
+          dropTargetKey={dropTargetKey}
           scopeRef={setEditorScope}
           apiRef={editorApi}
           busy={busy}
@@ -2070,7 +2155,7 @@ export function App() {
             const selectedIdentity = !!original && currentJob?.job_id === original.jobId;
             const semanticMutation = !!original
               && saved.config_revision !== original.configRevision;
-            const preserveRuntime = !!original
+            const preservesCompareResult = !!original
               && !semanticMutation
               && (saved.effect === 'renamed' || saved.effect === 'updated' || saved.effect === 'no_op');
             setEditor(null);
@@ -2081,35 +2166,35 @@ export function App() {
                 original,
               ));
             }
-            if (original && !preserveRuntime) {
-              resetSafetyUi();
+            if (selectedIdentity && !preservesCompareResult) {
+              resetResultWorkspace();
             }
             pushHistory(job.source);
             pushHistory(job.target);
             try {
               await refreshJobs(selectedIdentity ? original?.name : undefined);
-              if (selectedIdentity) setCfgJob(job);
+              if (selectedIdentity) setJobConfiguration(job);
               setStatus(
                 saved.effect === 'no_op' ? `No changes to save for '${saved.name}'` : `Saved '${saved.name}'`,
                 'ok',
               );
-            } catch (e) {
-              setStatus(`Saved '${saved.name}', but refreshing the job list failed: ${e}`, 'err');
+            } catch (error) {
+              setStatus(`Saved '${saved.name}', but refreshing the job list failed: ${error}`, 'err');
             }
           }}
           onDeleted={async (deleted) => {
             setEditor(null);
             invalidateCompareJob(deleted.job_id);
-            resetSafetyUi();
             if (currentJob?.job_id === deleted.job_id) {
+              resetResultWorkspace();
               setCurrentJob(null);
-              setSelTarget(0);
+              setSelectedTargetIndex(0);
             }
             try {
               await refreshJobs();
               setStatus(`Deleted '${deleted.name}'`);
-            } catch (e) {
-              setStatus(`Deleted '${deleted.name}', but refreshing the job list failed: ${e}`, 'err');
+            } catch (error) {
+              setStatus(`Deleted '${deleted.name}', but refreshing the job list failed: ${error}`, 'err');
             }
           }}
           onMutationConflict={async (name, original) => {
@@ -2119,7 +2204,7 @@ export function App() {
             setCompareRepository((repository) => reconcileRefreshedJobSession(repository, original, refreshed));
             if (currentJob?.job_id === original.jobId
               && (!refreshed || currentJob.config_revision !== refreshed.config_revision)) {
-              resetNavigationUi();
+              resetResultWorkspace();
             }
           }}
           onStatus={setStatus}

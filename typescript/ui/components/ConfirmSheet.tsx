@@ -8,21 +8,20 @@ import { OperationReviewDetails } from './OperationReviewSheet';
 import { Sheet } from './ui';
 import type { JobDto } from '../../core/types/generated/JobDto';
 
-export interface ConfirmTotals {
-  copy: number;
-  update: number;
-  move: number;
-  del: number;
-  bytes: number;
-  delBytes: number;
-  flips: number;
-  /// Checked rows a filter is hiding — they will NOT run, and that has to be said out loud
-  hiddenChecked: number;
+export interface ApplyReviewTotals {
+  copyCount: number;
+  updateCount: number;
+  moveCount: number;
+  deleteCount: number;
+  transferBytes: number;
+  deletionBytes: number;
+  reversedCount: number;
+  checkedOutsideScope: number;
 }
 
-interface Props {
+interface ConfirmSheetProps {
   job: JobDto;
-  totals: ConfirmTotals;
+  totals: ApplyReviewTotals;
   reviewState: OperationReviewState;
   choices: ApprovalChoices;
   onChoices: (choices: ApprovalChoices) => void;
@@ -30,8 +29,8 @@ interface Props {
   onConfirm: () => void;
 }
 
-export function ConfirmSheet(props: Props) {
-  const { job, totals: t, reviewState, choices, onChoices, onCancel, onConfirm } = props;
+export function ConfirmSheet(props: ConfirmSheetProps) {
+  const { job, totals, reviewState, choices, onChoices, onCancel, onConfirm } = props;
   const blocked = reviewState.review?.status === 'blocked';
   const canApply = operationReviewCanSubmit(reviewState, choices);
   const actionLabel = reviewState.phase === 'reviewing'
@@ -44,7 +43,7 @@ export function ConfirmSheet(props: Props) {
 
   return (
     <Sheet
-      title="Review & apply"
+      title="Review & Apply"
       width="mid"
       onClose={onCancel}
       footer={
@@ -62,21 +61,21 @@ export function ConfirmSheet(props: Props) {
         <span>Job</span><b>{job.name}</b><span className={'mode ' + job.mode}>{job.mode}</span>
       </div>
       <div className="mrow">
-        <span>Copy / update</span><b>{t.copy} / {t.update}</b>
-        <span className="dim">{humanSize(t.bytes) || '0 B'}</span>
+        <span>Copy / Update</span><b>{totals.copyCount} / {totals.updateCount}</b>
+        <span className="dim">{humanSize(totals.transferBytes) || '0 B'}</span>
       </div>
-      <div className="mrow"><span>Move (no re-transfer)</span><b>{t.move}</b></div>
-      <div className={'mrow' + (t.del ? ' danger' : '')}>
-        <span>Delete (into the trash)</span><b>{t.del}</b>
-        <span className="dim">{t.del ? humanSize(t.delBytes) : ''}</span>
+      <div className="mrow"><span>Move (No Re-transfer)</span><b>{totals.moveCount}</b></div>
+      <div className={'mrow' + (totals.deleteCount ? ' danger' : '')}>
+        <span>Delete (Into the Trash)</span><b>{totals.deleteCount}</b>
+        <span className="dim">{totals.deleteCount ? humanSize(totals.deletionBytes) : ''}</span>
       </div>
-      {t.flips > 0 && (
-        <div className="mrow warn"><span>Of those, reversed</span><b>{t.flips}</b></div>
+      {totals.reversedCount > 0 && (
+        <div className="mrow warn"><span>Of Those, Reversed</span><b>{totals.reversedCount}</b></div>
       )}
-      {t.hiddenChecked > 0 && (
+      {totals.checkedOutsideScope > 0 && (
         <div className="mrow warn">
-          <span>Hidden by filter, not run</span><b>{t.hiddenChecked}</b>
-          <span className="dim">The view is the action set</span>
+          <span>Checked but Outside Run Scope</span><b>{totals.checkedOutsideScope}</b>
+          <span className="dim">Only checked rows in scope are applied</span>
         </div>
       )}
       <OperationReviewDetails state={reviewState} choices={choices} onChoices={onChoices} />

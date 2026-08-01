@@ -8,7 +8,7 @@ import type { FormValues, FSpec } from '../../core/jobfields';
 // slot — so they stay one implementation and cannot drift apart visually.
 //
 // Every row is the same three-part shape: **name, control, one short line**. The three are given
-// different size, weight and colour by .field-label / .hint, which is the whole point — the rule
+// different size, weight and color by .field-label / .hint, which is the whole point — the rule
 // this replaced gave a field's name and its explanation identical typography, so the form read as
 // an undifferentiated wall. Anything longer than that one line goes behind the info icon.
 
@@ -27,7 +27,7 @@ export interface SchemaSectionProps {
   after?: (key: string) => ReactNode;
   disabledField?: (key: string) => boolean;
   /// The job editor uses these to make an invalid off-screen field discoverable. Settings leaves
-  /// both unset, so the shared renderer keeps its ordinary behaviour there.
+  /// both unset, so the shared renderer keeps its ordinary behavior there.
   autoFocusField?: string;
   invalidField?: string;
   /// Body for a `custom` field — the junk-preset checkbox block, which edits `exclude` rather than
@@ -100,7 +100,7 @@ function Field({ f, props }: { f: FSpec; props: SchemaSectionProps }) {
           type="text"
           className={pathClass?.(f.key) ?? ''}
           data-drop={droppable ? '1' : undefined}
-          data-k={f.key}
+          data-field-key={f.key}
           list="sd-paths"
           spellCheck={false}
           value={String(v ?? '')}

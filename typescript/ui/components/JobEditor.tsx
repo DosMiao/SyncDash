@@ -25,7 +25,7 @@ interface Props {
   /// setting they show, so clicking one lands you on it rather than scrolling you near it.
   focusGroup?: string;
   /// Field key the Tauri drag handler is hovering, for the drop highlight
-  dropOn: string | null;
+  dropTargetKey: string | null;
   /// Registers the form as the drop region. While the editor is open it takes precedence over the
   /// main screen's two roots, and unmounting clears it — which is the whole reason it is a callback ref.
   scopeRef: (el: HTMLElement | null) => void;
@@ -61,7 +61,7 @@ interface SaveError { message: string; field?: string }
 
 export function JobEditor(props: Props) {
   const {
-    name, focusGroup, dropOn, scopeRef, apiRef, busy, onClose, onSaved, onDeleted,
+    name, focusGroup, dropTargetKey, scopeRef, apiRef, busy, onClose, onSaved, onDeleted,
     onMutationConflict, onStatus,
   } = props;
   const [form, setForm] = useState<Loaded | null>(null);
@@ -280,7 +280,7 @@ export function JobEditor(props: Props) {
     const base = key === 'source' ? pathState(verdict?.source, source)
       : key === 'target' ? pathState(verdict?.target, target)
       : '';
-    return [base, dropOn === key ? 'dropon' : ''].filter(Boolean).join(' ');
+    return [base, dropTargetKey === key ? 'dropon' : ''].filter(Boolean).join(' ');
   };
 
   return (

@@ -71,4 +71,9 @@ test('frontend source has no legacy confirmation or raw-consent execution path',
   assert.doesNotMatch(ipc, /invoke<ApplyDto>\('apply_job',\s*\{[^}]*\b(plan|selected|acknowledged)\b/s);
   assert.match(ipc, /invoke<ApplyDto>\('apply_job', applyAuthorizationArgs\(/);
   assert.match(ipc, /invoke<PlanDto>\('compare_job', compareAuthorizationArgs\(/);
+  assert.match(
+    app,
+    /const doSync = useCallback[\s\S]*?!applyAvailability\.available[\s\S]*?operationReviewCanSubmit/,
+    'the final submit boundary must re-check the current result view and run-scope availability',
+  );
 });

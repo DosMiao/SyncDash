@@ -1,70 +1,73 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, ChevronUp, Folder, FolderOpen } from 'lucide-react';
 import { baseOf, dirOf, fmtTime, fullPath, humanSize } from '../../core/format';
-import { treeDirOf } from '../../core/grouping';
-import { canFlip, eff, metaOf, newerSide, rowAction, selectable, sidePaths } from '../../core/plan';
-import { DIR_ICON, MARK } from '../icons';
+import { owningFolderOf, ROOT_FOLDER_PATH, ROOT_LEVEL_LABEL } from '../../core/folders';
+import {
+  canReverseOperation,
+  effectiveOperation,
+  newerSide,
+  describeRowAction,
+  rowMetadata,
+  isExecutableOperation,
+  sidePaths,
+} from '../../core/plan';
+import { DIRECTION_ICON, RESULT_TYPE_ICON } from '../icons';
 import { useVirtualRows } from '../hooks/useVirtualRows';
 import type { CSSProperties, ReactNode } from 'react';
 import type { RowSpec } from '../../core/grouping';
 import type { PlanDto, SortKey, Sort } from '../../core/plan';
 import type { SideMeta } from '../../core/types/generated/SideMeta';
 
-interface Props {
+interface PlanTableProps {
   plan: PlanDto;
   flipped: boolean[];
   checked: boolean[];
   rowPlan: RowSpec[];
-  /// Every visible operation in tree display order, including descendants hidden by a collapsed
-  /// folder. Folder rows address their subtree through ranges into this one shared array.
+  // Collapsed descendants remain in this display order so folder ranges and CSV stay complete.
   displayOrder: number[];
-  visible: number[];
+  inScopeIndices: number[];
   pathMode: 'rel' | 'full';
   grouped: boolean;
   sort: Sort | null;
-  collapsedDirs: Set<string>;
-  /// The scroll container, owned by whoever rendered this table. Both the virtual window and the
-  /// column policy measure it, and neither can find it on its own without reaching into the DOM.
+  collapsedFolderPaths: Set<string>;
+  // Both virtualization and responsive columns measure the caller-owned scroll container.
   wrap: HTMLElement | null;
-  /// Changing this string scrolls the body back to the top — a filter change should not leave you
-  /// staring at row 4000 of a list that no longer has one
-  resetKey: string;
-  onToggleRow: (i: number, value: boolean) => void;
-  onToggleMany: (items: number[], value: boolean) => void;
-  onFlip: (i: number) => void;
-  onFoldDir: (dir: string) => void;
+  onToggleRow: (index: number, value: boolean) => void;
+  onToggleMany: (indices: number[], value: boolean) => void;
+  onFlip: (index: number) => void;
+  onToggleFolderFold: (folderPath: string) => void;
   onSort: (key: SortKey) => void;
-  onContextRow: (i: number, x: number, y: number) => void;
+  onContextRow: (index: number, x: number, y: number) => void;
 }
 
 /// Named for what each rung drops. They are cumulative: `nosize` has no time column either, having
 /// already lost it one rung up.
-type ColMode = 'full' | 'noreason' | 'notime' | 'nosize';
+type ColumnMode = 'full' | 'noreason' | 'notime' | 'nosize';
 
 /// A column's identity **is** its sort key — there is no column you can sort by two ways, and no key
 /// without a column. Only the checkbox has neither.
-type ColId = 'chk' | SortKey;
+type ColumnId = 'chk' | SortKey;
 
-interface ColDef {
-  id: ColId;
+interface ColumnDefinition {
+  id: ColumnId;
   /// Keys this header takes over in the modes where their own column is gone. A column that drops
   /// must not take its sort key with it: the header that owns the key would then be unmounted in
   /// exactly the mode where it is the last place left to click, leaving a stale sort you can see but
   /// not change.
-  adopts?: Partial<Record<ColMode, SortKey[]>>;
+  adoptedSortKeys?: Partial<Record<ColumnMode, SortKey[]>>;
   /// Width per mode. **A mode absent from this map means the column is not rendered in it** —
   /// presence and width are one fact, so they cannot drift apart. null = flexible: only the two path
   /// columns, which get no <col> width and so split whatever the fixed ones leave, evenly.
-  w: Partial<Record<ColMode, number | null>>;
+  widths: Partial<Record<ColumnMode, number | null>>;
   /// Class on both <th> and <td>. Never a width — <colgroup> owns those.
-  cls: string;
-  /// Header tooltip, for a column whose behaviour needs a sentence the label cannot carry
-  headTitle?: string;
+  className: string;
+  /// Header tooltip, for a column whose behavior needs a sentence the label cannot carry
+  title?: string;
 }
 
 /// Header text. Short and contextual, because the column it sits over says which side it is;
 /// SORT_LABEL in core/plan.ts carries the unambiguous name for the "sorted by" indicator.
-const COL_HEAD: Record<SortKey, string> = {
+const COLUMN_HEADER: Record<SortKey, string> = {
   's.path': 'source', 't.path': 'target', action: 'action',
   's.size': 'size', 't.size': 'size', 's.mtime': 'time', 't.mtime': 'time',
   reason: 'reason',
@@ -83,82 +86,85 @@ const COL_HEAD: Record<SortKey, string> = {
 /// Widths at each mode's own floor leave the two path columns 191 / 191 / 157 / 199 px — they are
 /// the primary content and never get starved. The 1240→1000 step is exactly the reason column's
 /// 240px, so crossing it costs the paths nothing.
-const COLS: ColDef[] = [
-  { id: 'chk', cls: 'c-chk', w: { full: 38, noreason: 38, notime: 38, nosize: 38 } },
+const COLUMNS: ColumnDefinition[] = [
+  { id: 'chk', className: 'c-chk', widths: { full: 38, noreason: 38, notime: 38, nosize: 38 } },
   {
-    id: 's.path', cls: 'c-path c-path-s',
-    adopts: { nosize: ['s.size', 's.mtime'] },
-    w: { full: null, noreason: null, notime: null, nosize: null },
+    id: 's.path', className: 'c-path c-path-s',
+    adoptedSortKeys: { nosize: ['s.size', 's.mtime'] },
+    widths: { full: null, noreason: null, notime: null, nosize: null },
   },
   // 112 rather than 92 in notime: an ellipsized "size · ti…" would leave the time span unclickable,
   // and thead clips. 92 fits "894.0 MB"; 112 fits the composite header above it.
-  { id: 's.size', cls: 'c-size', adopts: { notime: ['s.mtime'] }, w: { full: 92, noreason: 92, notime: 112 } },
-  { id: 's.mtime', cls: 'c-time', w: { full: 136, noreason: 136 } },
+  { id: 's.size', className: 'c-size', adoptedSortKeys: { notime: ['s.mtime'] }, widths: { full: 92, noreason: 92, notime: 112 } },
+  { id: 's.mtime', className: 'c-time', widths: { full: 136, noreason: 136 } },
   {
-    id: 'action', cls: 'c-act',
-    w: { full: 124, noreason: 124, notime: 124, nosize: 124 },
-    headTitle: "Sort by action. Activate a row's action to reverse its direction; activate it again to restore.",
+    id: 'action', className: 'c-act',
+    widths: { full: 124, noreason: 124, notime: 124, nosize: 124 },
+    title: "Sort by action. Activate a row's action to reverse its direction; activate it again to restore.",
   },
   {
-    id: 't.path', cls: 'c-path c-path-t',
-    adopts: { nosize: ['t.size', 't.mtime'] },
-    w: { full: null, noreason: null, notime: null, nosize: null },
+    id: 't.path', className: 'c-path c-path-t',
+    adoptedSortKeys: { nosize: ['t.size', 't.mtime'] },
+    widths: { full: null, noreason: null, notime: null, nosize: null },
   },
-  { id: 't.size', cls: 'c-size', adopts: { notime: ['t.mtime'] }, w: { full: 92, noreason: 92, notime: 112 } },
-  { id: 't.mtime', cls: 'c-time', w: { full: 136, noreason: 136 } },
-  { id: 'reason', cls: 'c-reason', w: { full: 240 } },
+  { id: 't.size', className: 'c-size', adoptedSortKeys: { notime: ['t.mtime'] }, widths: { full: 92, noreason: 92, notime: 112 } },
+  { id: 't.mtime', className: 'c-time', widths: { full: 136, noreason: 136 } },
+  { id: 'reason', className: 'c-reason', widths: { full: 240 } },
 ];
 
-const colMode = (w: number): ColMode =>
-  (w >= 1240 ? 'full' : w >= 1000 ? 'noreason' : w >= 700 ? 'notime' : 'nosize');
+const columnModeForWidth = (width: number): ColumnMode => (
+  width >= 1240 ? 'full' : width >= 1000 ? 'noreason' : width >= 700 ? 'notime' : 'nosize'
+);
 
 /// The narrowest a path column may be before the table stops shrinking and scrolls sideways instead.
 /// Under fixed layout the columns with no <col> width absorb every shortfall, so without a floor they
 /// go to zero and the paths vanish entirely rather than the table admitting it has run out of room.
-const PATH_MIN = 140;
+const MINIMUM_PATH_WIDTH = 140;
 
 /// Minimum table width for a column set: everything pinned, plus a floor for each path column. A
 /// static number cannot do this job — the pinned total is 858 in `full` and 162 in `nosize`, so one
 /// value is either far too wide for the narrow set or no constraint at all for the wide one.
-function minWidth(cols: ColDef[], mode: ColMode): number {
-  let fixed = 0, flex = 0;
-  for (const c of cols) {
-    const w = c.w[mode];
-    if (w == null) flex++; else fixed += w;
+function minimumTableWidth(columns: ColumnDefinition[], mode: ColumnMode): number {
+  let fixedWidth = 0;
+  let flexibleColumnCount = 0;
+  for (const column of columns) {
+    const width = column.widths[mode];
+    if (width == null) flexibleColumnCount++; else fixedWidth += width;
   }
-  return fixed + flex * PATH_MIN;
+  return fixedWidth + flexibleColumnCount * MINIMUM_PATH_WIDTH;
 }
 
-/// The column set tracks the scroll container, not the window: collapsing the Overview pane widens the
-/// table by 208px (236 → 28) without any window resize.
-function useWrapWidth(wrap: HTMLElement | null): number {
-  const [w, setW] = useState(1600);
+/// The column set tracks the scroll container because collapsing Run Scope changes that width
+/// without resizing the window.
+function useContainerWidth(container: HTMLElement | null): number {
+  const [width, setWidth] = useState(1600);
   useLayoutEffect(() => {
-    if (!wrap) return;
-    const ro = new ResizeObserver(() => setW(wrap.clientWidth));
-    ro.observe(wrap);
-    setW(wrap.clientWidth);
-    return () => ro.disconnect();
-  }, [wrap]);
-  return w;
+    if (!container) return;
+    const observer = new ResizeObserver(() => setWidth(container.clientWidth));
+    observer.observe(container);
+    setWidth(container.clientWidth);
+    return () => observer.disconnect();
+  }, [container]);
+  return width;
 }
 
 /// A clickable header. Declared at module scope, not inside PlanTable: a component defined in a
 /// render body is a *new type* on every render, so React unmounts and rebuilds every one of these
 /// controls — and this table re-renders on every scroll frame.
-function SortHead({ k, sort, onSort }: { k: SortKey; sort: Sort | null; onSort: (k: SortKey) => void }) {
-  const on = sort?.key === k;
-  const state = on ? `, currently ${sort.dir === 1 ? 'ascending' : 'descending'}` : '';
+function SortHeader(props: { sortKey: SortKey; sort: Sort | null; onSort: (key: SortKey) => void }) {
+  const { sortKey, sort, onSort } = props;
+  const active = sort?.key === sortKey;
+  const state = active ? `, currently ${sort.dir === 1 ? 'ascending' : 'descending'}` : '';
   return (
     <button
       type="button"
-      className={'sortable' + (on ? ' on' : '')}
-      aria-pressed={on}
-      aria-label={`Sort by ${COL_HEAD[k]}${state}`}
-      onClick={() => onSort(k)}
+      className={'sortable' + (active ? ' on' : '')}
+      aria-pressed={active}
+      aria-label={`Sort by ${COLUMN_HEADER[sortKey]}${state}`}
+      onClick={() => onSort(sortKey)}
     >
-      {COL_HEAD[k]}
-      {on && (
+      {COLUMN_HEADER[sortKey]}
+      {active && (
         <span className="sortmark">
           {sort.dir === 1 ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
         </span>
@@ -168,7 +174,7 @@ function SortHead({ k, sort, onSort }: { k: SortKey; sort: Sort | null; onSort: 
 }
 
 /// indeterminate is a DOM property with no HTML attribute, so it can only be set through a ref
-function TriCheckbox(props: { checked: boolean; indeterminate?: boolean; disabled?: boolean; title?: string; ariaLabel: string; onChange: (v: boolean) => void; stopClick?: boolean }) {
+function TriCheckbox(props: { checked: boolean; indeterminate?: boolean; disabled?: boolean; title?: string; ariaLabel: string; onChange: (value: boolean) => void; stopClick?: boolean }) {
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => { if (ref.current) ref.current.indeterminate = !!props.indeterminate; });
   return (
@@ -179,55 +185,65 @@ function TriCheckbox(props: { checked: boolean; indeterminate?: boolean; disable
       disabled={props.disabled}
       title={props.title}
       aria-label={props.ariaLabel}
-      onClick={props.stopClick ? (e) => e.stopPropagation() : undefined}
-      onChange={(e) => props.onChange(e.target.checked)}
+      onClick={props.stopClick ? (event) => event.stopPropagation() : undefined}
+      onChange={(event) => props.onChange(event.target.checked)}
     />
   );
 }
 
 /// What a column contributes to one row. The <td> itself is emitted by the single loop below, so
 /// the cell count can never disagree with the <col> count.
-interface Cell { cls?: string; title?: string; children?: ReactNode }
+interface TableCell { className?: string; title?: string; children?: ReactNode }
 
 /// Both meta cells carry the whole truth in their tooltip regardless of mode, so the contract does
 /// not change with the window width — that is what lets the time column drop without losing it.
-const metaTitle = (sm: SideMeta) => `${sm.size.toLocaleString()} bytes\n${new Date(sm.mtime_ms).toLocaleString()}`;
-const ABSENT: Cell = { cls: 'mono dim', children: '—' };
+const metadataTitle = (metadata: SideMeta) => (
+  `${metadata.size.toLocaleString()} bytes\n${new Date(metadata.mtime_ms).toLocaleString()}`
+);
+const ABSENT_CELL: TableCell = { className: 'mono dim', children: '—' };
 
-function sizeCell(sm: SideMeta | null, tint: boolean): Cell {
-  if (!sm) return ABSENT;
-  return { cls: 'mono' + (tint ? ' newer' : ''), title: metaTitle(sm), children: humanSize(sm.size) };
+function sizeCell(metadata: SideMeta | null, highlighted: boolean): TableCell {
+  if (!metadata) return ABSENT_CELL;
+  return {
+    className: 'mono' + (highlighted ? ' newer' : ''),
+    title: metadataTitle(metadata),
+    children: humanSize(metadata.size),
+  };
 }
 
-function timeCell(sm: SideMeta | null, tint: boolean): Cell {
-  if (!sm) return ABSENT;
-  return { cls: 'mono' + (tint ? ' newer' : ''), title: metaTitle(sm), children: fmtTime(sm.mtime_ms) };
+function timeCell(metadata: SideMeta | null, highlighted: boolean): TableCell {
+  if (!metadata) return ABSENT_CELL;
+  return {
+    className: 'mono' + (highlighted ? ' newer' : ''),
+    title: metadataTitle(metadata),
+    children: fmtTime(metadata.mtime_ms),
+  };
 }
 
-export function PlanTable(props: Props) {
+export function PlanTable(props: PlanTableProps) {
   const {
-    plan, flipped, checked, rowPlan, displayOrder, visible, pathMode, grouped, sort, collapsedDirs, resetKey, wrap,
-    onToggleRow, onToggleMany, onFlip, onFoldDir, onSort, onContextRow,
+    plan, flipped, checked, rowPlan, displayOrder, inScopeIndices, pathMode, grouped, sort, collapsedFolderPaths, wrap,
+    onToggleRow, onToggleMany, onFlip, onToggleFolderFold, onSort, onContextRow,
   } = props;
 
   const theadRef = useRef<HTMLTableSectionElement>(null);
   const bodyRef = useRef<HTMLTableSectionElement>(null);
   const gridLabelId = useId();
 
-  useEffect(() => { if (wrap) wrap.scrollTop = 0; }, [resetKey, wrap]);
+  useEffect(() => { if (wrap) wrap.scrollTop = 0; }, [grouped, inScopeIndices, sort, wrap]);
 
-  const win = useVirtualRows(rowPlan, wrap, theadRef, bodyRef);
-  const mode = colMode(useWrapWidth(wrap));
-  const cols = COLS.filter((c) => c.w[mode] !== undefined);
-  const shown = new Set<ColId>(cols.map((c) => c.id));
-  const nCols = cols.length;
-  const tableMinWidth = minWidth(cols, mode);
+  const virtualWindow = useVirtualRows(rowPlan, wrap, theadRef, bodyRef);
+  const mode = columnModeForWidth(useContainerWidth(wrap));
+  const columns = COLUMNS.filter((column) => column.widths[mode] !== undefined);
+  const visibleColumns = new Set<ColumnId>(columns.map((column) => column.id));
+  const columnCount = columns.length;
+  const tableMinWidth = minimumTableWidth(columns, mode);
 
   const colGroup = () => (
     <colgroup>
-      {cols.map((c) => {
-        const w = c.w[mode];
-        return <col key={c.id} style={w != null ? { width: w } : undefined} />;
+      {columns.map((column) => {
+        const width = column.widths[mode];
+        return <col key={column.id} style={width != null ? { width } : undefined} />;
       })}
     </colgroup>
   );
@@ -236,28 +252,29 @@ export function PlanTable(props: Props) {
   // full-plan passes used to run on every one of those renders; at several hundred thousand rows,
   // trackpad momentum allocated another multi-megabyte index array per frame until WebKit hit
   // memory pressure and painted the window black.
-  const selectableVisible = useMemo(
-    () => visible.filter((i) => selectable(eff(plan, flipped, i))),
-    [plan, flipped, visible],
+  const executableInScope = useMemo(
+    () => inScopeIndices.filter((index) => isExecutableOperation(effectiveOperation(plan, flipped, index))),
+    [plan, flipped, inScopeIndices],
   );
   const allChecked = useMemo(
-    () => selectableVisible.length > 0 && selectableVisible.every((i) => checked[i]),
-    [selectableVisible, checked],
+    () => executableInScope.length > 0 && executableInScope.every((index) => checked[index]),
+    [executableInScope, checked],
   );
   const someChecked = useMemo(
-    () => selectableVisible.some((i) => checked[i]),
-    [selectableVisible, checked],
+    () => executableInScope.some((index) => checked[index]),
+    [executableInScope, checked],
   );
 
   // A folder row needs the checked count of an arbitrary subtree. Prefixing the one DFS order once
-  // makes that O(1) per visible folder, instead of repeatedly scanning a 100k-file parent on every
+  // makes that O(1) per rendered folder, instead of repeatedly scanning a 100k-file parent on every
   // virtual-scroll render. Descendant indices themselves are materialized only when a checkbox is
   // actually clicked.
   const checkedPrefix = useMemo(() => {
     const prefix = new Uint32Array(displayOrder.length + 1);
-    for (let k = 0; k < displayOrder.length; k++) {
-      const i = displayOrder[k];
-      prefix[k + 1] = prefix[k] + (checked[i] && selectable(eff(plan, flipped, i)) ? 1 : 0);
+    for (let position = 0; position < displayOrder.length; position++) {
+      const index = displayOrder[position];
+      prefix[position + 1] = prefix[position]
+        + (checked[index] && isExecutableOperation(effectiveOperation(plan, flipped, index)) ? 1 : 0);
     }
     return prefix;
   }, [plan, flipped, checked, displayOrder]);
@@ -266,186 +283,216 @@ export function PlanTable(props: Props) {
   /// specific of that side's columns still on screen, falling back to the path once the narrowest
   /// rung has dropped both meta columns. Without that fallback the single most decision-critical
   /// hint in the table would simply vanish below 700px.
-  const newerCol = (side: 's' | 't'): ColId =>
-    (shown.has(`${side}.mtime`) ? `${side}.mtime` : shown.has(`${side}.size`) ? `${side}.size` : `${side}.path`);
+  const newerCol = (side: 's' | 't'): ColumnId =>
+    (visibleColumns.has(`${side}.mtime`)
+      ? `${side}.mtime`
+      : visibleColumns.has(`${side}.size`)
+        ? `${side}.size`
+        : `${side}.path`);
 
   const rows = (
     <tbody ref={bodyRef} role="rowgroup">
-        {rowPlan.slice(win.from, win.to).map((spec, k) => {
+        {rowPlan.slice(virtualWindow.from, virtualWindow.to).map((row, visibleOffset) => {
           // Zebra striping keys off the real row index, not :nth-child — otherwise the stripes flip as
           // the window scrolls
-          const alt = (win.from + k) % 2 === 1;
+          const alternate = (virtualWindow.from + visibleOffset) % 2 === 1;
 
-          if (typeof spec !== 'number') {
-            const { bytes } = spec;
-            const nChecked = checkedPrefix[spec.end] - checkedPrefix[spec.start];
-            const folded = collapsedDirs.has(spec.dir);
-            const isRoot = spec.dir === '';
-            const label = isRoot ? '(root)' : baseOf(spec.dir);
-            const treeStyle = { '--tree-depth': spec.depth } as CSSProperties;
+          if (typeof row !== 'number') {
+            const { bytes } = row;
+            const checkedCount = checkedPrefix[row.end] - checkedPrefix[row.start];
+            const folded = collapsedFolderPaths.has(row.folderPath);
+            const isRoot = row.folderPath === ROOT_FOLDER_PATH;
+            const label = isRoot ? ROOT_LEVEL_LABEL : baseOf(row.folderPath);
+            const treeStyle = { '--tree-depth': row.depth } as CSSProperties;
             const toggleFolder = (value: boolean) => {
-              const members: number[] = [];
-              for (let p = spec.start; p < spec.end; p++) {
-                const i = displayOrder[p];
-                if (selectable(eff(plan, flipped, i))) members.push(i);
+              const memberIndices: number[] = [];
+              for (let position = row.start; position < row.end; position++) {
+                const index = displayOrder[position];
+                if (isExecutableOperation(effectiveOperation(plan, flipped, index))) {
+                  memberIndices.push(index);
+                }
               }
-              onToggleMany(members, value);
+              onToggleMany(memberIndices, value);
             };
             return (
-              <tr key={`f:${spec.dir}`} className="grp" style={treeStyle} role="row" aria-rowindex={win.from + k + 2}>
+              <tr
+                key={`f:${row.folderPath}`}
+                className="grp"
+                style={treeStyle}
+                role="row"
+                aria-rowindex={virtualWindow.from + visibleOffset + 2}
+              >
                 <td className="c-chk" role="gridcell" aria-colindex={1}>
                   <TriCheckbox
-                    checked={spec.selectable > 0 && nChecked === spec.selectable}
-                    indeterminate={nChecked > 0 && nChecked < spec.selectable}
-                    disabled={spec.selectable === 0}
+                    checked={row.executableCount > 0 && checkedCount === row.executableCount}
+                    indeterminate={checkedCount > 0 && checkedCount < row.executableCount}
+                    disabled={row.executableCount === 0}
                     ariaLabel={isRoot
-                      ? 'Select visible root-level items'
-                      : `Select visible items in folder ${spec.dir}`}
+                      ? 'Select in-scope root-level items'
+                      : `Select in-scope items in folder ${row.folderPath}`}
                     title={isRoot
-                      ? 'Check / uncheck visible root-level items'
-                      : 'Check / uncheck visible items in this folder and its subfolders'}
+                      ? 'Check / uncheck in-scope root-level items'
+                      : 'Check / uncheck in-scope items in this folder and its subfolders'}
                     onChange={toggleFolder}
                   />
                 </td>
                 <td
                   role="gridcell"
                   aria-colindex={2}
-                  aria-colspan={nCols - 1}
-                  colSpan={nCols - 1}
-                  title={`${plan.header.source_root}\n${plan.header.target_root}\n… ${spec.dir || '(root)'}`}
+                  aria-colspan={columnCount - 1}
+                  colSpan={columnCount - 1}
+                  title={`${plan.header.source_root}\n${plan.header.target_root}\n… ${row.folderPath || ROOT_LEVEL_LABEL}`}
                 >
                   <button
                     type="button"
                     className="gtree"
                     aria-label={isRoot
                       ? `${folded ? 'Show' : 'Hide'} root-level items`
-                      : `${folded ? 'Expand' : 'Collapse'} folder ${spec.dir}`}
+                      : `${folded ? 'Expand' : 'Collapse'} folder ${row.folderPath}`}
                     aria-expanded={!folded}
-                    onClick={() => onFoldDir(spec.dir)}
+                    onClick={() => onToggleFolderFold(row.folderPath)}
                   >
                     <span className="gchev">{folded ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
                     <span className="gfolder">{folded ? <Folder size={13} /> : <FolderOpen size={13} />}</span>
                     <span className="gdir mono">{label}</span>
-                    <span className="gmeta">{spec.count} {spec.count === 1 ? 'item' : 'items'}{bytes ? ` · ${humanSize(bytes)}` : ''}</span>
+                    <span className="gmeta">{row.count} {row.count === 1 ? 'item' : 'items'}{bytes ? ` · ${humanSize(bytes)}` : ''}</span>
                   </button>
                 </td>
               </tr>
             );
           }
 
-          const i = spec;
-          const op = eff(plan, flipped, i);
-          const groupDir = grouped ? treeDirOf(op) : null;
-          const treeDepth = groupDir === null || groupDir === '' ? 0 : groupDir.split('/').length - 1;
-          const flippable = canFlip(plan, i);
-          const act = rowAction(op);
-          const [sp, tp] = sidePaths(op);
-          const m = metaOf(plan, i);
-          const newer = newerSide(plan, i);
-          const tinted = newer ? newerCol(newer) : null;
+          const index = row;
+          const operation = effectiveOperation(plan, flipped, index);
+          const groupFolderPath = grouped ? owningFolderOf(operation) : null;
+          const treeDepth = groupFolderPath === null || groupFolderPath === ''
+            ? 0
+            : groupFolderPath.split('/').length - 1;
+          const reversible = canReverseOperation(plan, index);
+          const actionPresentation = describeRowAction(operation);
+          const [sourcePath, targetPath] = sidePaths(operation);
+          const metadata = rowMetadata(plan, index);
+          const newerMetadataSide = newerSide(plan, index);
+          const highlightedColumn = newerMetadataSide ? newerCol(newerMetadataSide) : null;
 
-          // Files inside a group show only their name, while a cross-directory move source keeps its
-          // full relative path so nothing is lost. When this side's size column has dropped out, the
-          // path tooltip absorbs its numbers — dropped information always lands on the same side.
-          const pathCell = (pv: string | null, root: string, sm: SideMeta | null, side: 's' | 't'): Cell => {
-            if (!pv) return { cls: 'mono dim' };
-            const folderSelf = groupDir !== null && op.action === 'delete_dir' && pv === groupDir;
-            const text = folderSelf
-              ? '(this folder)'
-              : groupDir !== null && dirOf(pv) === groupDir
-                ? baseOf(pv)
-                : pathMode === 'full' ? fullPath(root, pv) : pv;
-            const abs = fullPath(root, pv);
-            const metaGone = !shown.has(`${side}.size`);
+          // Relative tree rows compact entries owned by their displayed folder to a basename. Full
+          // mode is literal even in the tree: choosing it must never continue showing compact paths.
+          // When this side's size column has dropped out, the path tooltip absorbs its numbers.
+          const pathCell = (
+            relativePath: string | null,
+            rootPath: string,
+            sideMetadata: SideMeta | null,
+            side: 's' | 't',
+          ): TableCell => {
+            if (!relativePath) return { className: 'mono dim' };
+            const absolutePath = fullPath(rootPath, relativePath);
+            const folderSelf = groupFolderPath !== null
+              && operation.action === 'delete_dir'
+              && relativePath === groupFolderPath;
+            const text = pathMode === 'full'
+              ? absolutePath
+              : folderSelf
+                ? '(this folder)'
+                : groupFolderPath !== null && dirOf(relativePath) === groupFolderPath
+                  ? baseOf(relativePath)
+                  : relativePath;
+            const metadataColumnsHidden = !visibleColumns.has(`${side}.size`);
             return {
-              cls: 'mono' + (tinted === `${side}.path` ? ' newer' : ''),
-              title: sm && metaGone ? `${abs}\n${metaTitle(sm)}` : abs,
+              className: 'mono' + (highlightedColumn === `${side}.path` ? ' newer' : ''),
+              title: sideMetadata && metadataColumnsHidden
+                ? `${absolutePath}\n${metadataTitle(sideMetadata)}`
+                : absolutePath,
               children: text,
             };
           };
 
           // Built for every column, rendered for the ones this mode shows — here rather than in a
           // per-column render function because every value it needs is already a local.
-          const cells: Record<ColId, Cell> = {
+          const cells: Record<ColumnId, TableCell> = {
             chk: {
               children: (
                 <TriCheckbox
-                  checked={checked[i]}
-                  disabled={!selectable(op)}
-                  ariaLabel={`${checked[i] ? 'Exclude' : 'Include'} ${op.path} in synchronization`}
-                  onChange={(v) => onToggleRow(i, v)}
+                  checked={checked[index]}
+                  disabled={!isExecutableOperation(operation)}
+                  ariaLabel={`${checked[index] ? 'Exclude' : 'Include'} ${operation.path} in Run Scope`}
+                  onChange={(value) => onToggleRow(index, value)}
                 />
               ),
             },
-            's.path': pathCell(sp, plan.header.source_root, m.src, 's'),
-            's.size': sizeCell(m.src, tinted === 's.size'),
-            's.mtime': timeCell(m.src, tinted === 's.mtime'),
+            's.path': pathCell(sourcePath, plan.header.source_root, metadata.src, 's'),
+            's.size': sizeCell(metadata.src, highlightedColumn === 's.size'),
+            's.mtime': timeCell(metadata.src, highlightedColumn === 's.mtime'),
             action: {
               // With the reason column folded away, the action cell's tooltip carries the reason
               title: [
-                shown.has('reason') ? '' : op.reason,
-                flippable ? 'Activate to reverse the direction (activate again to restore)' : '',
+                visibleColumns.has('reason') ? '' : operation.reason,
+                reversible ? 'Activate to reverse the direction (activate again to restore)' : '',
               ].filter(Boolean).join('\n') || undefined,
               children: (
-                flippable ? (
+                reversible ? (
                 <button
                   type="button"
-                  className={`act k-${act.kind} flippable`}
-                  aria-pressed={flipped[i]}
-                  aria-label={`${flipped[i] ? 'Restore' : 'Reverse'} direction for ${op.path}: ${act.label}`}
-                  onClick={() => onFlip(i)}
+                  className={`act result-type-${actionPresentation.resultType} flippable`}
+                  aria-pressed={flipped[index]}
+                  aria-label={`${flipped[index] ? 'Restore' : 'Reverse'} direction for ${operation.path}: ${actionPresentation.label}`}
+                  onClick={() => onFlip(index)}
                 >
-                  {/* Both glyph slots are always rendered at a fixed width: a conflict has no
+                  {/* Both glyph slots are always rendered at a fixed width: reports have no
                       direction, and without a reserved slot its label would start 16px to the left
                       of every other row's — the arrow is the glyph you scan down this column, so its
                       x has to be the same on every row. */}
-                  <span className="act-dir" aria-hidden="true">{act.dir ? DIR_ICON[act.dir] : null}</span>
-                  <span className="act-mark" aria-hidden="true">{MARK[act.kind]}</span>
-                  <span className="act-label">{act.label}</span>
+                  <span className="act-dir" aria-hidden="true">{actionPresentation.direction ? DIRECTION_ICON[actionPresentation.direction] : null}</span>
+                  <span className="act-mark" aria-hidden="true">{RESULT_TYPE_ICON[actionPresentation.resultType]}</span>
+                  <span className="act-label">{actionPresentation.label}</span>
                 </button>
                 ) : (
-                  <span className={`act k-${act.kind}`}>
-                    <span className="act-dir" aria-hidden="true">{act.dir ? DIR_ICON[act.dir] : null}</span>
-                    <span className="act-mark" aria-hidden="true">{MARK[act.kind]}</span>
-                    <span className="act-label">{act.label}</span>
+                  <span className={`act result-type-${actionPresentation.resultType}`}>
+                    <span className="act-dir" aria-hidden="true">{actionPresentation.direction ? DIRECTION_ICON[actionPresentation.direction] : null}</span>
+                    <span className="act-mark" aria-hidden="true">{RESULT_TYPE_ICON[actionPresentation.resultType]}</span>
+                    <span className="act-label">{actionPresentation.label}</span>
                   </span>
                 )
               ),
             },
-            't.path': pathCell(tp, plan.header.target_root, m.dst, 't'),
-            't.size': sizeCell(m.dst, tinted === 't.size'),
-            't.mtime': timeCell(m.dst, tinted === 't.mtime'),
-            reason: { children: op.reason },
+            't.path': pathCell(targetPath, plan.header.target_root, metadata.dst, 't'),
+            't.size': sizeCell(metadata.dst, highlightedColumn === 't.size'),
+            't.mtime': timeCell(metadata.dst, highlightedColumn === 't.mtime'),
+            reason: { children: operation.reason },
           };
 
           return (
             <tr
-              key={`r:${i}`}
-              className={[!checked[i] && 'off', flipped[i] && 'flip', groupDir !== null && 'ingrp', alt && 'alt']
+              key={`r:${index}`}
+              className={[
+                !checked[index] && 'off',
+                flipped[index] && 'flip',
+                groupFolderPath !== null && 'ingrp',
+                alternate && 'alt',
+              ]
                 .filter(Boolean).join(' ')}
-              style={groupDir === null ? undefined : ({ '--tree-depth': treeDepth } as CSSProperties)}
+              style={groupFolderPath === null ? undefined : ({ '--tree-depth': treeDepth } as CSSProperties)}
               role="row"
-              aria-rowindex={win.from + k + 2}
-              aria-selected={checked[i]}
+              aria-rowindex={virtualWindow.from + visibleOffset + 2}
+              aria-selected={checked[index]}
               tabIndex={0}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.currentTarget.focus();
-                onContextRow(i, e.clientX, e.clientY);
+                onContextRow(index, e.clientX, e.clientY);
               }}
               onKeyDown={(e) => {
                 if (e.key !== 'ContextMenu' && !(e.shiftKey && e.key === 'F10')) return;
                 e.preventDefault();
                 const rect = e.currentTarget.getBoundingClientRect();
-                onContextRow(i, rect.left + 24, rect.top + rect.height / 2);
+                onContextRow(index, rect.left + 24, rect.top + rect.height / 2);
               }}
             >
-              {cols.map((c, columnIndex) => {
-                const cell = cells[c.id];
+              {columns.map((column, columnIndex) => {
+                const cell = cells[column.id];
                 return (
                   <td
-                    key={c.id}
-                    className={cell.cls ? `${c.cls} ${cell.cls}` : c.cls}
+                    key={column.id}
+                    className={cell.className ? `${column.className} ${cell.className}` : column.className}
                     title={cell.title}
                     role="gridcell"
                     aria-colindex={columnIndex + 1}
@@ -469,41 +516,44 @@ export function PlanTable(props: Props) {
       role="grid"
       aria-labelledby={gridLabelId}
       aria-rowcount={rowPlan.length + 1}
-      aria-colcount={nCols}
+      aria-colcount={columnCount}
       aria-multiselectable="true"
-      style={{ minWidth: tableMinWidth, height: win.canvasHeight }}
+      style={{ minWidth: tableMinWidth, height: virtualWindow.canvasHeight }}
     >
       <span id={gridLabelId} className="sr-only">Synchronization plan</span>
       <table className="plantable vtable-head" role="presentation">
         {colGroup()}
         <thead ref={theadRef} role="rowgroup">
           <tr role="row" aria-rowindex={1}>
-            {cols.map((c, columnIndex) => {
-              const ownedKeys = c.id === 'chk' ? [] : [c.id, ...(c.adopts?.[mode] ?? [])];
+            {columns.map((column, columnIndex) => {
+              const ownedKeys = column.id === 'chk'
+                ? []
+                : [column.id, ...(column.adoptedSortKeys?.[mode] ?? [])];
               const ownsSort = !!sort && ownedKeys.includes(sort.key);
               return (
               <th
-                key={c.id}
-                className={c.cls}
-                title={c.headTitle}
+                key={column.id}
+                className={column.className}
+                title={column.title}
                 scope="col"
                 role="columnheader"
                 aria-colindex={columnIndex + 1}
                 aria-sort={ownsSort ? (sort!.dir === 1 ? 'ascending' : 'descending') : undefined}
               >
-                {c.id === 'chk' ? (
+                {column.id === 'chk' ? (
                   <TriCheckbox
                     checked={allChecked}
                     indeterminate={someChecked && !allChecked}
-                    ariaLabel="Select all selectable rows in the current view"
-                    title="Select all / none (current view)"
-                    onChange={(v) => onToggleMany(selectableVisible, v)}
+                    disabled={executableInScope.length === 0}
+                    ariaLabel="Select all executable rows in the current run scope"
+                    title="Select all / none in the current run scope"
+                    onChange={(value) => onToggleMany(executableInScope, value)}
                   />
                 ) : (
                   <>
-                    <SortHead k={c.id} sort={sort} onSort={onSort} />
-                    {(c.adopts?.[mode] ?? []).map((k) => (
-                      <span key={k}> · <SortHead k={k} sort={sort} onSort={onSort} /></span>
+                    <SortHeader sortKey={column.id} sort={sort} onSort={onSort} />
+                    {(column.adoptedSortKeys?.[mode] ?? []).map((adoptedKey) => (
+                      <span key={adoptedKey}> · <SortHeader sortKey={adoptedKey} sort={sort} onSort={onSort} /></span>
                     ))}
                   </>
                 )}
@@ -516,7 +566,7 @@ export function PlanTable(props: Props) {
       <table
         className="plantable vtable-body"
         role="presentation"
-        style={{ transform: `translate3d(0, ${win.bodyTop}px, 0)` }}
+        style={{ transform: `translate3d(0, ${virtualWindow.bodyTop}px, 0)` }}
       >
         {colGroup()}
         {rows}
