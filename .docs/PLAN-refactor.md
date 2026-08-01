@@ -2,7 +2,11 @@
 
 > Scope: whole app — `src/` (11.4k lines Rust), `src-tauri/` (886), `typescript/` (2.8k).
 > Method: six parallel deep-read agents over every file, plus git churn/co-change analysis.
-> Status: proposal. Nothing below has been applied.
+> Historical status at time of writing: proposal; nothing below had been applied yet.
+>
+> **Current status:** superseded. The repository has since completed multiple architecture phases,
+> including the Result Workspace / Run Scope refactor. Treat names, paths, line counts and proposed
+> call graphs below as historical evidence only; `AGENTS.md` and `README.md` define the live contract.
 
 ---
 
