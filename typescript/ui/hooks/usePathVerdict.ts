@@ -11,11 +11,12 @@ export function usePathVerdict(source: string, target: string, enabled = true): 
 
   useEffect(() => {
     if (!enabled || (!source && !target)) { setVerdict(null); return; }
+    setVerdict(null);
     let live = true;
     const t = setTimeout(() => {
       inspectPaths(source, target)
         .then((v) => { if (live) setVerdict(v); })
-        .catch(() => { /* a failed check must not block editing */ });
+        .catch(() => { if (live) setVerdict(null); });
     }, 300);
     return () => { live = false; clearTimeout(t); };
   }, [source, target, enabled]);

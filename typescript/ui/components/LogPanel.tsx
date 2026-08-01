@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { FolderOpen, Settings2, X } from 'lucide-react';
 import { hms } from '../../core/format';
 import { logArtifact, logDirPath, logRuns, reveal } from '../../core/ipc';
 import { LOG_LEVEL_LABEL, LP_LEVELS, LP_VIEWS, parseLogLine, runLabel } from '../../core/logs';
 import type { LogLevel, LogRow, LogView } from '../../core/logs';
 import type { RunRecord } from '../../core/types/generated/RunRecord';
+import { RequestFence } from '../state/request-fence';
 
 /// Building DOM for a huge list stalls; the items list routinely runs to tens of thousands of rows
 const CAP = 3000;
@@ -26,13 +27,27 @@ export function LogPanel({ jobName, onClose, onSettings, onStatus, reloadKey }: 
   const [q, setQ] = useState('');
   const [rows, setRows] = useState<LogRow[]>([]);
   const [notice, setNotice] = useState('Loading…');
+  const runsFence = useRef(new RequestFence());
+  const artifactFence = useRef(new RequestFence());
+  const titleId = useId();
 
   useEffect(() => {
-    let live = true;
+    const ticket = runsFence.current.start(`${jobName ?? '*'}\0${reloadKey}`);
+    artifactFence.current.invalidate();
+    setRows([]);
+    setNotice('Loading…');
     logRuns(jobName, 100)
-      .then((r) => { if (live) { setRuns(r); setSel(0); } })
-      .catch((e) => { if (live) { setRuns([]); setNotice(`Failed to read the run list: ${e}`); } });
-    return () => { live = false; };
+      .then((r) => {
+        if (!runsFence.current.owns(ticket)) return;
+        setRuns(r);
+        setSel(0);
+      })
+      .catch((e) => {
+        if (!runsFence.current.owns(ticket)) return;
+        setRuns([]);
+        setNotice(`Failed to read the run list: ${e}`);
+      });
+    return () => { runsFence.current.invalidate(); artifactFence.current.invalidate(); };
   }, [jobName, reloadKey]);
 
   const current = runs[sel];
@@ -40,21 +55,26 @@ export function LogPanel({ jobName, onClose, onSettings, onStatus, reloadKey }: 
   const load = useCallback(async () => {
     setRows([]);
     if (!runs.length) {
+      artifactFence.current.invalidate();
       setNotice('No runs recorded yet — a trace appears only after a job runs (Synchronize)');
       return;
     }
-    if (!current) return;
+    if (!current) { artifactFence.current.invalidate(); return; }
     if (!current.run_id) {
+      artifactFence.current.invalidate();
       // Compare runs leave only an index line and no directory — spell out why this is empty
       setNotice('Compare runs record a summary only, with no detail directory (AutoScan runs every 30 s, and creating a directory each time would flood the log disk)');
       return;
     }
+    const ticket = artifactFence.current.start(`${current.run_id}\0${view}`);
     setNotice('Loading…');
     try {
       const lines = await logArtifact(current.run_id, view);
+      if (!artifactFence.current.owns(ticket)) return;
       setRows(lines.map((l) => parseLogLine(l, view)).filter((x): x is LogRow => x !== null));
       setNotice('');
     } catch (e) {
+      if (!artifactFence.current.owns(ticket)) return;
       setNotice(`Read failed: ${e}`);
     }
   }, [current, runs.length, view]);
@@ -69,24 +89,32 @@ export function LogPanel({ jobName, onClose, onSettings, onStatus, reloadKey }: 
   }, [rows, level, q]);
 
   return (
-    <div className="logpanel">
+    <section className="logpanel" aria-labelledby={titleId}>
       <div className="lp-head">
-        <span className="lp-title">Log</span>
-        <select title="Select a run" value={sel} onChange={(e) => setSel(Number(e.target.value))}>
+        <h2 className="lp-title" id={titleId}>Log</h2>
+        <select aria-label="Select a run" title="Select a run" value={sel} onChange={(e) => setSel(Number(e.target.value))}>
           {runs.map((r, i) => <option key={i} value={i}>{runLabel(r)}</option>)}
         </select>
-        <div className="lp-pills">
+        <div className="lp-pills" role="group" aria-label="Log artifact">
           {LP_VIEWS.map(([v, label]) => (
-            <button key={v} className={'lp-pill' + (v === view ? ' on' : '')} onClick={() => setView(v)}>{label}</button>
+            <button
+              type="button"
+              key={v}
+              className={'lp-pill' + (v === view ? ' on' : '')}
+              aria-pressed={v === view}
+              onClick={() => setView(v)}
+            >{label}</button>
           ))}
         </div>
-        <div className="lp-pills">
+        <div className="lp-pills" role="group" aria-label="Log level">
           {LP_LEVELS.map(([l, label]) => {
             const n = l === 'all' ? rows.length : rows.filter((r) => r.level === l).length;
             return (
               <button
+                type="button"
                 key={l}
                 className={'lp-pill' + (l === level ? ' on' : '') + (l !== 'all' ? ` lv-${l}` : '')}
+                aria-pressed={l === level}
                 onClick={() => setLevel(l)}
               >{label} {n}</button>
             );
@@ -94,29 +122,32 @@ export function LogPanel({ jobName, onClose, onSettings, onStatus, reloadKey }: 
         </div>
         <input
           className="mono"
-          type="text"
+          type="search"
+          aria-label="Search log messages and paths"
           placeholder="Search messages / paths…"
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
-        <span className="dim">{rows.length ? `${shown.length} / ${rows.length}` : ''}</span>
+        <span className="dim" aria-live="polite">{rows.length ? `${shown.length} / ${rows.length}` : ''}</span>
         <span className="spacer" />
         <button
+          type="button"
           className="icon-btn"
           title="Open this run's folder in the file manager"
+          aria-label="Open this run's folder in the file manager"
           onClick={() => {
             logDirPath(current?.run_id ?? null)
               .then(reveal)
               .catch((e) => onStatus(`Failed to open the directory: ${e}`, 'err'));
           }}
         ><FolderOpen size={14} /></button>
-        <button className="icon-btn" title="Log settings" onClick={onSettings}><Settings2 size={14} /></button>
-        <button className="icon-btn" title="Collapse the log panel" onClick={onClose}><X size={14} /></button>
+        <button type="button" className="icon-btn" title="Log settings" aria-label="Log settings" onClick={onSettings}><Settings2 size={14} /></button>
+        <button type="button" className="icon-btn" title="Collapse the log panel" aria-label="Collapse the log panel" onClick={onClose}><X size={14} /></button>
       </div>
-      <div className="lp-body">
-        {notice && <div className="logempty">{notice}</div>}
+      <div className="lp-body" role="region" aria-label="Run log entries" aria-busy={notice === 'Loading…'}>
+        {notice && <div className="logempty" role="status" aria-live="polite">{notice}</div>}
         {!notice && shown.length === 0 && (
-          <div className="logempty">{rows.length ? 'No matching rows' : 'This artifact is empty'}</div>
+          <div className="logempty" role="status">{rows.length ? 'No matching rows' : 'This artifact is empty'}</div>
         )}
         {shown.slice(0, CAP).map((r, k) => (
           <div key={k} className={`lp-row lv-${r.level}`}>
@@ -133,6 +164,6 @@ export function LogPanel({ jobName, onClose, onSettings, onStatus, reloadKey }: 
           </div>
         )}
       </div>
-    </div>
+    </section>
   );
 }
