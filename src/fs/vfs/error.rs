@@ -29,6 +29,9 @@ pub enum VfsErrorKind {
     NotEmpty,
     /// rename refused because the destination exists (SFTP v3 semantics).
     AlreadyExists,
+    /// A rename crossed filesystem/volume boundaries. This is the only rename failure for which
+    /// apply may safely select its transactional copy fallback.
+    CrossDevice,
     /// The server answered with a protocol-level error code — evidence that the
     /// connection itself is fine (the opposite signal of `Transient`).
     Protocol,
@@ -49,7 +52,11 @@ pub struct VfsError {
 
 impl VfsError {
     pub fn new(kind: VfsErrorKind, detail: impl Into<String>) -> VfsError {
-        VfsError { kind, detail: detail.into(), source: None }
+        VfsError {
+            kind,
+            detail: detail.into(),
+            source: None,
+        }
     }
 
     pub fn unsupported(what: impl Into<String>) -> VfsError {
@@ -65,7 +72,9 @@ impl fmt::Display for VfsError {
 
 impl std::error::Error for VfsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_deref().map(|e| e as &(dyn std::error::Error + 'static))
+        self.source
+            .as_deref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -82,12 +91,31 @@ impl From<std::io::Error> for VfsError {
         // symlink privilege, which is not transient but is a specific, actionable refusal.
         #[cfg(windows)]
         if let Some((kind, hint)) = match e.raw_os_error() {
+            Some(17) => Some((VfsErrorKind::CrossDevice, "source and destination are on different volumes")),
             Some(32) => Some((VfsErrorKind::Transient, "file is open in another program (sharing violation); it will be retried on the next run")),
             Some(33) => Some((VfsErrorKind::Transient, "a byte range of the file is locked by another program; it will be retried on the next run")),
             Some(1314) => Some((VfsErrorKind::PermissionDenied, "creating symlinks needs Windows Developer Mode or an elevated process (SeCreateSymbolicLinkPrivilege)")),
             _ => None,
         } {
             return VfsError { kind, detail: format!("{e} — {hint}"), source: Some(Box::new(e)) };
+        }
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::EXDEV) {
+            return VfsError {
+                kind: VfsErrorKind::CrossDevice,
+                detail: e.to_string(),
+                source: Some(Box::new(e)),
+            };
+        }
+        #[cfg(unix)]
+        if e.raw_os_error().is_some_and(|raw| {
+            raw == libc::ENOTSUP || raw == libc::EOPNOTSUPP || raw == libc::ENOSYS
+        }) {
+            return VfsError {
+                kind: VfsErrorKind::Unsupported,
+                detail: e.to_string(),
+                source: Some(Box::new(e)),
+            };
         }
         // The Darwin counterpart of the block above: errnos std does not give a distinct
         // ErrorKind, where the difference is actionable.
@@ -115,6 +143,8 @@ impl From<std::io::Error> for VfsError {
             K::NotFound => VfsErrorKind::NotFound,
             K::PermissionDenied => VfsErrorKind::PermissionDenied,
             K::AlreadyExists => VfsErrorKind::AlreadyExists,
+            K::CrossesDevices => VfsErrorKind::CrossDevice,
+            K::Unsupported => VfsErrorKind::Unsupported,
             K::DirectoryNotEmpty => VfsErrorKind::NotEmpty,
             K::Interrupted => VfsErrorKind::Cancelled,
             // A volume mounted read-only (an NTFS external, a DMG, a Time Machine snapshot) is a
@@ -123,16 +153,24 @@ impl From<std::io::Error> for VfsError {
             K::ReadOnlyFilesystem => VfsErrorKind::PermissionDenied,
             // A stale handle is the portable spelling of the ESTALE case above.
             K::StaleNetworkFileHandle => VfsErrorKind::Transient,
-            K::TimedOut | K::ConnectionReset | K::ConnectionAborted | K::BrokenPipe
-            | K::ConnectionRefused | K::HostUnreachable | K::NetworkUnreachable
+            K::TimedOut
+            | K::ConnectionReset
+            | K::ConnectionAborted
+            | K::BrokenPipe
+            | K::ConnectionRefused
+            | K::HostUnreachable
+            | K::NetworkUnreachable
             | K::NetworkDown => VfsErrorKind::Transient,
-            // StorageFull, QuotaExceeded and CrossesDevices stay Io on purpose: they are real,
-            // permanent, local failures. They are named here so the next reader knows they were
-            // considered rather than missed.
+            // StorageFull and QuotaExceeded stay Io on purpose: they are real, permanent, local
+            // failures. CrossesDevices is classified above because Move has one safe fallback.
             _ => VfsErrorKind::Io,
         };
         let detail = e.to_string();
-        VfsError { kind, detail, source: Some(Box::new(e)) }
+        VfsError {
+            kind,
+            detail,
+            source: Some(Box::new(e)),
+        }
     }
 }
 
@@ -145,6 +183,7 @@ impl From<VfsError> for std::io::Error {
             VfsErrorKind::NotFound => K::NotFound,
             VfsErrorKind::PermissionDenied | VfsErrorKind::Auth => K::PermissionDenied,
             VfsErrorKind::AlreadyExists => K::AlreadyExists,
+            VfsErrorKind::CrossDevice => K::CrossesDevices,
             VfsErrorKind::NotEmpty => K::DirectoryNotEmpty,
             VfsErrorKind::Cancelled => K::Interrupted,
             VfsErrorKind::Transient => K::TimedOut,
@@ -180,6 +219,40 @@ mod tests {
         assert_eq!(v2.kind, VfsErrorKind::Cancelled);
     }
 
+    #[test]
+    fn cross_device_maps_both_ways_without_becoming_a_generic_io_error() {
+        let v: VfsError = std::io::Error::from(std::io::ErrorKind::CrossesDevices).into();
+        assert_eq!(v.kind, VfsErrorKind::CrossDevice);
+
+        let io: std::io::Error =
+            VfsError::new(VfsErrorKind::CrossDevice, "different volume").into();
+        assert_eq!(io.kind(), std::io::ErrorKind::CrossesDevices);
+        let roundtrip: VfsError = io.into();
+        assert_eq!(roundtrip.kind, VfsErrorKind::CrossDevice);
+
+        #[cfg(unix)]
+        {
+            let raw: VfsError = std::io::Error::from_raw_os_error(libc::EXDEV).into();
+            assert_eq!(raw.kind, VfsErrorKind::CrossDevice);
+        }
+    }
+
+    #[test]
+    fn unsupported_os_operations_fail_closed_as_unsupported() {
+        let v: VfsError = std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace unavailable",
+        )
+        .into();
+        assert_eq!(v.kind, VfsErrorKind::Unsupported);
+
+        #[cfg(unix)]
+        {
+            let raw: VfsError = std::io::Error::from_raw_os_error(libc::ENOTSUP).into();
+            assert_eq!(raw.kind, VfsErrorKind::Unsupported);
+        }
+    }
+
     /// A `/Volumes` share that dropped and remounted mid-run leaves stale handles. That is the
     /// classic macOS sync interruption and it is recoverable, so it must not be reported as a
     /// permanent local failure the way the unclassified `Io` bucket would.
@@ -201,8 +274,16 @@ mod tests {
     fn eperm_offers_causes_without_claiming_one() {
         let v: VfsError = std::io::Error::from_raw_os_error(1).into();
         assert_eq!(v.kind, VfsErrorKind::PermissionDenied);
-        assert!(v.detail.contains("Full Disk Access"), "the remedy has to be reachable: {}", v.detail);
-        assert!(v.detail.contains("may"), "but it must be offered, not asserted: {}", v.detail);
+        assert!(
+            v.detail.contains("Full Disk Access"),
+            "the remedy has to be reachable: {}",
+            v.detail
+        );
+        assert!(
+            v.detail.contains("may"),
+            "but it must be offered, not asserted: {}",
+            v.detail
+        );
     }
 
     /// A read-only volume (an NTFS external, a mounted DMG, a Time Machine snapshot) fails every
@@ -223,11 +304,23 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("locked.txt");
         std::fs::write(&p, b"data").unwrap();
-        let _hold = std::fs::OpenOptions::new().read(true).share_mode(0).open(&p).unwrap();
+        let _hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&p)
+            .unwrap();
 
         let io = std::fs::remove_file(&p).expect_err("an exclusively-held file cannot be deleted");
-        assert_eq!(io.raw_os_error(), Some(32), "premise: ERROR_SHARING_VIOLATION");
-        assert_ne!(io.kind(), std::io::ErrorKind::PermissionDenied, "premise: std does not classify it");
+        assert_eq!(
+            io.raw_os_error(),
+            Some(32),
+            "premise: ERROR_SHARING_VIOLATION"
+        );
+        assert_ne!(
+            io.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "premise: std does not classify it"
+        );
         let v: VfsError = io.into();
         assert_eq!(v.kind, VfsErrorKind::Transient);
         assert!(v.detail.contains("another program"), "{}", v.detail);

@@ -10,7 +10,8 @@
 //   2. Sanitize the output — ts-rs copies Rust doc comments verbatim into JSDoc, and a lot of the
 //      docs here describe FFS filter syntax (`*/big_temp/`, `*/*.log`). That literal `*/`
 //      **terminates the JSDoc block early**, producing syntactically invalid .ts. This escapes
-//      in-block `*/` to `*\/` (JSDoc still renders it as `*/`, but it no longer ends the block).
+//      in-block `*/` to `*\/` (JSDoc still renders it as `*/`, but it no longer ends the block),
+//      and removes trailing whitespace emitted around multiline struct fields.
 //
 // Never hand-edit anything under typescript/core/types/generated/.
 
@@ -49,7 +50,7 @@ function sanitize(text) {
     }
     out.push(line);
   }
-  return out.join("\n");
+  return out.join("\n").replace(/[ \t]+$/gm, "");
 }
 
 console.log("[1/2] cargo test export_bindings …");

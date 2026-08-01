@@ -156,7 +156,11 @@ impl NameRules {
 
     /// What a root reached through this process's own path layer is subject to.
     pub fn host() -> NameRules {
-        if cfg!(windows) { NameRules::Windows } else { NameRules::Posix }
+        if cfg!(windows) {
+            NameRules::Windows
+        } else {
+            NameRules::Posix
+        }
     }
 }
 
@@ -192,9 +196,8 @@ pub struct VfsCaps {
     ///
     /// False does **not** mean "cannot preserve" — it means "preserving here would copy the
     /// bytes off this root", so the originals are renamed into `<root>/.syncdash/trash/<run>/`
-    /// instead. That is the whole point: for a network share, a move into the local trash is a
-    /// download of every deleted file. A cross-volume move between two disks on this machine is
-    /// merely a local copy, so removable and fixed volumes both keep the central store.
+    /// instead. That prevents both network downloads and full cross-volume copies from removable
+    /// or secondary disks.
     pub local_trash: bool,
     pub case_sensitivity: CaseSense,
     /// Naming rules writes to this root must satisfy. Drives the plan-time legality
@@ -262,6 +265,13 @@ pub trait WriteStaged: Send {
     /// Atomically move the staged file onto the destination. The engine has already
     /// cleared/preserved the old file per plan. Consumes self.
     fn commit(self: Box<Self>) -> VfsResult<CommitReport>;
+    /// Atomically publish onto an absent destination, refusing if another writer created it
+    /// after compare. Backends that cannot guarantee this must fail closed.
+    fn commit_noreplace(self: Box<Self>) -> VfsResult<CommitReport> {
+        Err(VfsError::unsupported(
+            "atomic no-replace staged commit is unavailable on this backend",
+        ))
+    }
 }
 
 /// One sync root on some filesystem. All methods take `&self` and must be callable
@@ -299,7 +309,11 @@ pub trait Vfs: Send + Sync {
     /// Names-only listing for callers that need nothing else (delete-dir residue
     /// sampling). Default delegates; backends with a cheaper primitive override.
     fn read_dir_names(&self, rel: &str) -> VfsResult<Vec<(String, EntryKind)>> {
-        Ok(self.read_dir(rel)?.into_iter().map(|e| (e.name, e.meta.kind)).collect())
+        Ok(self
+            .read_dir(rel)?
+            .into_iter()
+            .map(|e| (e.name, e.meta.kind))
+            .collect())
     }
     fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>>;
     /// Read `len` bytes at `off` (sampled evidence windows). Short only at EOF.
@@ -314,6 +328,17 @@ pub trait Vfs: Send + Sync {
     /// `caps().rename_overwrite` declares; the engine clears the target first when
     /// it needs the overwrite semantics.
     fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()>;
+    /// Rename only while `to_rel` remains absent. The check and rename must be one filesystem
+    /// operation; a `stat` followed by replacing `rename` does not satisfy this contract.
+    fn rename_noreplace(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
+        if self.caps().rename_overwrite == Support::No {
+            self.rename(from_rel, to_rel)
+        } else {
+            Err(VfsError::unsupported(
+                "atomic no-replace rename is unavailable on this backend",
+            ))
+        }
+    }
     fn remove_file(&self, rel: &str) -> VfsResult<()>;
     /// Empty directories only; `NotEmpty` otherwise (the engine classifies).
     fn remove_dir(&self, rel: &str) -> VfsResult<()>;

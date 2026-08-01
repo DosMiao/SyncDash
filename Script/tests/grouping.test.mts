@@ -19,6 +19,7 @@ function op(path: string, patch: Partial<OpDto> = {}): OpDto {
 
 function plan(ops: OpDto[]): PlanDto {
   return {
+    owner: {} as PlanDto['owner'],
     // Grouping never reads the header. Keep the fixture focused on the paths and row metadata that
     // are its actual input instead of copying the whole Rust wire header into every frontend test.
     header: {} as PlanDto['header'],

@@ -36,7 +36,11 @@ pub enum RemoteShell {
 
 impl RemoteShell {
     pub fn from_os(os: &str) -> RemoteShell {
-        if os == "windows" { RemoteShell::PowerShell } else { RemoteShell::Posix }
+        if os == "windows" {
+            RemoteShell::PowerShell
+        } else {
+            RemoteShell::Posix
+        }
     }
 }
 
@@ -94,13 +98,18 @@ pub struct PeerAddr {
 /// login name, matching what `ssh host` would have done.
 pub fn addr_of(phrase: &str) -> std::io::Result<PeerAddr> {
     let RootSpec::Remote(r) = parse(phrase) else {
-        return Err(Error::new(ErrorKind::InvalidInput, format!("'{phrase}' is not a peer:// root")));
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("'{phrase}' is not a peer:// root"),
+        ));
     };
     Ok(PeerAddr {
         host: r.host.clone(),
         port: r.port.unwrap_or(22),
         user: r.user.clone().unwrap_or_else(|| {
-            std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_default()
+            std::env::var("USERNAME")
+                .or_else(|_| std::env::var("USER"))
+                .unwrap_or_default()
         }),
     })
 }
@@ -124,9 +133,16 @@ impl PeerSession {
             })
             .map_err(std::io::Error::from)?;
         let session = rt
-            .block_on(async { ssh::connect(&a.host, a.port, &a.user, &creds, timeout, phrase).await })
+            .block_on(async {
+                ssh::connect(&a.host, a.port, &a.user, &creds, timeout, phrase).await
+            })
             .map_err(std::io::Error::from)?;
-        Ok(PeerSession { rt, handle: session.handle, host: a.host, timeout })
+        Ok(PeerSession {
+            rt,
+            handle: session.handle,
+            host: a.host,
+            timeout,
+        })
     }
 
     /// Run one command, collecting stdout. Stderr is forwarded to this process's own stderr, which
@@ -177,11 +193,9 @@ impl PeerSession {
         mut stdin: Option<(std::fs::File, &mut dyn FnMut(u64) -> std::io::Result<()>)>,
     ) -> std::io::Result<(Vec<u8>, u32)> {
         self.rt.block_on(async {
-            let mut ch = self
-                .handle
-                .channel_open_session()
-                .await
-                .map_err(|e| Error::other(format!("cannot open a channel to {}: {e}", self.host)))?;
+            let mut ch = self.handle.channel_open_session().await.map_err(|e| {
+                Error::other(format!("cannot open a channel to {}: {e}", self.host))
+            })?;
             ch.exec(true, cmd)
                 .await
                 .map_err(|e| Error::other(format!("exec refused by {}: {e}", self.host)))?;
@@ -195,16 +209,18 @@ impl PeerSession {
                     if n == 0 {
                         break;
                     }
-                    ch.data(&buf[..n])
-                        .await
-                        .map_err(|e| Error::other(format!("sending to {} failed: {e}", self.host)))?;
+                    ch.data(&buf[..n]).await.map_err(|e| {
+                        Error::other(format!("sending to {} failed: {e}", self.host))
+                    })?;
                     // A cancel here abandons the channel: dropping it without eof tells the far
                     // side's `recv` that the stream ended early, so it fails its hash check and
                     // writes nothing. Half a package can never be applied.
                     on_chunk(n as u64)?;
                 }
                 // The far side reads stdin to EOF; without this it waits forever.
-                ch.eof().await.map_err(|e| Error::other(format!("eof to {} failed: {e}", self.host)))?;
+                ch.eof()
+                    .await
+                    .map_err(|e| Error::other(format!("eof to {} failed: {e}", self.host)))?;
             }
 
             let mut out = Vec::new();
@@ -246,7 +262,11 @@ mod tests {
     /// string to the far side's login shell, so both dialects still have to be quoted for.
     #[test]
     fn posix_quoting_survives_an_embedded_quote() {
-        let c = remote_cmd(RemoteShell::Posix, "syncdash", &["scan".into(), "/it's/here".into()]);
+        let c = remote_cmd(
+            RemoteShell::Posix,
+            "syncdash",
+            &["scan".into(), "/it's/here".into()],
+        );
         assert_eq!(c, r#"syncdash 'scan' '/it'\''s/here'"#);
         // The exe stays bare so the remote shell still expands a leading ~
         assert!(remote_cmd(RemoteShell::Posix, "~/bin/syncdash", &[]).starts_with("~/bin/syncdash"));
@@ -254,7 +274,11 @@ mod tests {
 
     #[test]
     fn powershell_doubles_quotes_and_switches_the_code_page_first() {
-        let c = remote_cmd(RemoteShell::PowerShell, "sd.exe", &["scan".into(), "C:\\it's".into()]);
+        let c = remote_cmd(
+            RemoteShell::PowerShell,
+            "sd.exe",
+            &["scan".into(), "C:\\it's".into()],
+        );
         // chcp 65001 or a non-ASCII path arrives mangled by the OEM code page
         assert!(c.starts_with("chcp 65001 >$null; & 'sd.exe'"), "{c}");
         assert!(c.ends_with("'C:\\it''s'"), "{c}");
@@ -264,16 +288,25 @@ mod tests {
     fn the_dialect_follows_the_probed_os() {
         assert!(RemoteShell::from_os("windows") == RemoteShell::PowerShell);
         assert!(RemoteShell::from_os("macos") == RemoteShell::Posix);
-        assert!(RemoteShell::from_os("") == RemoteShell::Posix, "unknown means posix, not a panic");
+        assert!(
+            RemoteShell::from_os("") == RemoteShell::Posix,
+            "unknown means posix, not a panic"
+        );
     }
 
     #[test]
     fn a_peer_phrase_resolves_to_an_address() {
         let a = addr_of("peer://mac/Users/ben/x").unwrap();
         assert_eq!(a.host, "mac");
-        assert_eq!(a.port, 22, "the ssh default, same as `ssh mac` would have used");
+        assert_eq!(
+            a.port, 22,
+            "the ssh default, same as `ssh mac` would have used"
+        );
         let a = addr_of("peer://ben@mac:2222/Users/ben/x").unwrap();
-        assert_eq!((a.host.as_str(), a.port, a.user.as_str()), ("mac", 2222, "ben"));
+        assert_eq!(
+            (a.host.as_str(), a.port, a.user.as_str()),
+            ("mac", 2222, "ben")
+        );
         // A non-peer phrase is a caller error, not something to dial anyway
         assert!(addr_of(r"D:\Code\x").is_err());
     }

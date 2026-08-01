@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { endpointInputState } from '../../core/endpoint-readiness';
 import { inspectPaths } from '../../core/ipc';
 import type { PathInfo } from '../../core/types/generated/PathInfo';
 import type { PathVerdict } from '../../core/types/generated/PathVerdict';
@@ -11,11 +12,12 @@ export function usePathVerdict(source: string, target: string, enabled = true): 
 
   useEffect(() => {
     if (!enabled || (!source && !target)) { setVerdict(null); return; }
+    setVerdict(null);
     let live = true;
     const t = setTimeout(() => {
       inspectPaths(source, target)
         .then((v) => { if (live) setVerdict(v); })
-        .catch(() => { /* a failed check must not block editing */ });
+        .catch(() => { if (live) setVerdict(null); });
     }, 300);
     return () => { live = false; clearTimeout(t); };
   }, [source, target, enabled]);
@@ -25,7 +27,5 @@ export function usePathVerdict(source: string, target: string, enabled = true): 
 
 /// '' | 'good' | 'bad' for a root input, from the verdict for that side
 export function pathState(info: PathInfo | undefined, value: string): string {
-  if (!info) return '';
-  if (info.is_dir) return 'good';
-  return value.trim() ? 'bad' : '';
+  return endpointInputState(info, value);
 }

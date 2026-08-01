@@ -4,8 +4,6 @@
 //! excluded by the filter, or a file appeared after the scan. The engine walks it to find out
 //! which, so the report names the reason instead of just "failed".
 
-
-
 /// Classified outcome of a failed directory deletion (P0-4).
 /// This used to be `Err(_) => Ok(())`: safe behavior (no recursive delete) but **completely silent** —
 /// the user sees "0 errors" while the directory is still there, the next comparison emits the same DeleteDir again, and it never converges.
@@ -16,7 +14,9 @@ pub(super) enum DirOutcome {
     /// Non-empty; `sample` names a few of the leftovers so the error can say what is still in there.
     /// Deletability was already decided before this point — a directory whose leftovers all match
     /// `deletable` is removed outright and reports `Removed`, so reaching here means it is staying.
-    NotEmpty { sample: Vec<String> },
+    NotEmpty {
+        sample: Vec<String>,
+    },
     Failed(std::io::Error),
 }
 

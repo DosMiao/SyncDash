@@ -78,7 +78,9 @@ impl RootLock {
                     Some(m) if m != m0 => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::WouldBlock,
-                            format!("{disp} is being synced right now by {holder} — try again later"),
+                            format!(
+                                "{disp} is being synced right now by {holder} — try again later"
+                            ),
                         ));
                     }
                     _ => {}
@@ -117,7 +119,11 @@ impl RootLock {
             }
         });
 
-        Ok(RootLock { vfs: vfs.clone(), stop, heartbeat: Some(heartbeat) })
+        Ok(RootLock {
+            vfs: vfs.clone(),
+            stop,
+            heartbeat: Some(heartbeat),
+        })
     }
 }
 

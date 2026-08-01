@@ -85,8 +85,18 @@ mod tests {
     #[test]
     fn roundtrips_at_millisecond_resolution() {
         // The value the conformance suite actually writes, sub-second digits and all.
-        for ms in [0, 1, 1_600_000_123_456, 1_704_067_200_123, 253_402_300_799_000] {
-            assert_eq!(unix_ms_from_filetime(filetime_from_unix_ms(ms)), ms, "ms={ms}");
+        for ms in [
+            0,
+            1,
+            1_600_000_123_456,
+            1_704_067_200_123,
+            253_402_300_799_000,
+        ] {
+            assert_eq!(
+                unix_ms_from_filetime(filetime_from_unix_ms(ms)),
+                ms,
+                "ms={ms}"
+            );
         }
     }
 
@@ -108,7 +118,10 @@ mod tests {
     fn no_requested_time_ever_encodes_as_the_leave_unchanged_sentinel() {
         // Exactly the Windows epoch, and well before it: both would compute to <= 0 ticks.
         for ms in [-11_644_473_600_000, -999_999_999_999_999, i64::MIN] {
-            assert!(filetime_from_unix_ms(ms) >= 1, "ms={ms} encoded as the no-change sentinel");
+            assert!(
+                filetime_from_unix_ms(ms) >= 1,
+                "ms={ms} encoded as the no-change sentinel"
+            );
         }
     }
 
@@ -121,13 +134,20 @@ mod tests {
         assert_eq!(&b[8..16], &[0u8; 8], "access time must say 'unchanged'");
         assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), ticks);
         assert_eq!(&b[24..32], &[0u8; 8], "change time must say 'unchanged'");
-        assert_eq!(&b[32..36], &[0u8; 4], "attributes must say 'unchanged', not 'cleared'");
+        assert_eq!(
+            &b[32..36],
+            &[0u8; 4],
+            "attributes must say 'unchanged', not 'cleared'"
+        );
     }
 
     /// Absurd inputs must saturate rather than wrap into a plausible-looking date.
     #[test]
     fn out_of_range_input_saturates() {
         assert_eq!(filetime_from_unix_ms(i64::MAX), i64::MAX as u64);
-        assert_eq!(unix_ms_from_filetime(u64::MAX), (i64::MAX - EPOCH_DIFF_100NS) / TICKS_PER_MS);
+        assert_eq!(
+            unix_ms_from_filetime(u64::MAX),
+            (i64::MAX - EPOCH_DIFF_100NS) / TICKS_PER_MS
+        );
     }
 }

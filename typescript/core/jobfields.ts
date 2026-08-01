@@ -51,9 +51,9 @@ export const ED_FIELDS: FSpec[] = [
   },
   { key: 'archive', label: 'Archive file', kind: 'file', desc: 'Sync mode only. Empty = none.', help: 'Suggested location: the archive/ directory beside your jobs/ one, as <name>.jsonl. syncdash gen-jobs fills this in for you.' },
   {
-    key: 'rigor', label: 'Rigor', kind: 'select', opts: ['quick', 'fast', 'standard', 'paranoid', 'custom'],
+    key: 'rigor', label: 'Rigor', kind: 'select', opts: ['quick', 'fast', 'balanced', 'standard', 'paranoid', 'custom'],
     desc: 'A preset for the four knobs below. Changing one by hand switches this to custom.',
-    help: 'Each tier actually reads more this round. quick = size and time only · fast = sampled digest, uses the cache · standard = sampled digest, no cache, escalates on divergence · paranoid = full hash and verify after write.',
+    help: 'quick = size and time only · fast = sampled digest with cache · balanced = cached comparison plus write verification · standard = fresh sampled evidence · paranoid = fresh full evidence.',
   },
   {
     key: 'evidence', label: 'Content evidence', kind: 'select', opts: ['none', 'sampled', 'full'], parent: 'rigor',
@@ -94,8 +94,14 @@ export const ED_FIELDS: FSpec[] = [
   },
   { key: 'deletable', label: 'Deletable', kind: 'lines', desc: 'May be removed along with a deleted parent directory.' },
 
-  { key: 'watch_interval_secs', label: 'Scheduled scan interval', kind: 'num', group: 'AutoScan', desc: 'Seconds; empty = off. For UNC targets use 30 or more.' },
-  { key: 'watch_auto_apply', label: 'Run automatically when differences are found', kind: 'bool' },
+  {
+    key: 'watch_interval_secs', label: 'Maximum verification interval', kind: 'num', group: 'AutoScan',
+    desc: 'Seconds. Local macOS roots also react to FSEvents; remote/unsupported roots poll at this interval while SyncDash is open.',
+  },
+  {
+    key: 'watch_auto_apply', label: 'Run automatically when differences are found', kind: 'bool',
+    help: 'Auto-run never grants permission to degraded capabilities or health warnings. If the exact job revision, target, capability set, and action set lack unattended authorization, AutoScan stops at review required.',
+  },
 ];
 
 export const SET_FIELDS: FSpec[] = [
@@ -137,6 +143,7 @@ export const NULLABLE_TEXT = new Set(['archive']);
 export const RIGOR_PRESETS: Record<string, { evidence: string; use_cache: boolean; escalate: boolean; verify_writes: boolean }> = {
   quick: { evidence: 'none', use_cache: false, escalate: false, verify_writes: false },
   fast: { evidence: 'sampled', use_cache: true, escalate: true, verify_writes: false },
+  balanced: { evidence: 'sampled', use_cache: true, escalate: true, verify_writes: true },
   standard: { evidence: 'sampled', use_cache: false, escalate: true, verify_writes: true },
   paranoid: { evidence: 'full', use_cache: false, escalate: false, verify_writes: true },
 };
@@ -161,12 +168,12 @@ export function detectRigor(evidence: string, useCache: boolean, escalate: boole
   return hit ? hit[0] : 'custom';
 }
 
-/// One-to-one with the preset baselines in config::rigor_resolved (quick/fast/paranoid/everything else =
-/// the standard baseline). Keep this in step when the ladder changes over there — the button subtitle is
+/// One-to-one with the preset baselines in job::rigor. Keep this in step when the ladder changes there — the button subtitle is
 /// the only place a user sees what a tier actually does.
 export const RIGOR_HINT: Record<string, string> = {
   quick: 'size and time only',
   fast: 'sampled digest · uses cache',
+  balanced: 'cached digest · verify after write',
   standard: 'sampled digest · no cache · escalate on divergence',
   paranoid: 'full hash · verify after write',
   custom: 'per the four detail knobs',

@@ -1,11 +1,11 @@
 // SyncDash main window.
 //
-// This component owns the session state (selected job, compare result, check/flip vectors, view filters)
+// This component owns the session state (selected job, bounded compare reviews, view filters)
 // and every action that crosses the Tauri boundary; everything under components/ is presentation fed by
-// props. Sync semantics stay on the Rust side — reverse ops are precomputed there (reversed[i]), so the
-// frontend carries zero of them and cannot drift.
+// props. The frontend derives flipped row decisions for review, but execution receives only a
+// one-use authorization token; Rust owns the authenticated plan and reconstructs every operation.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { CircleCheck, FolderSearch } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
@@ -16,21 +16,63 @@ import { EMPTY_FILTER, computeVisible, finalIdx, funnelActive } from '../core/fi
 import { buildLayout, flattenLayout, layoutDirs, treeDirOf } from '../core/grouping';
 import { addExcludeEntries } from '../core/junk';
 import { baseOf, fullPath, p2 } from '../core/format';
-import { canFlip, eff, keySpec, metaOf, selectable, sidePaths } from '../core/plan';
+import { canFlip, eff, keySpec, metaOf, selectable, selectedRows, sidePaths } from '../core/plan';
 import { reduceCompareStages } from '../core/compareProgress';
 import type { Chip, PlanDto, Sort, SortKey } from '../core/plan';
 import type { CmpStage, CompareProgressEvent } from '../core/compareProgress';
 import type { ViewFilter } from '../core/filter';
 import type { PlanLayout } from '../core/grouping';
 import type { JobDto } from '../core/types/generated/JobDto';
-import type { PreflightDto } from '../core/types/generated/PreflightDto';
 import type { RunRecord } from '../core/types/generated/RunRecord';
 
 import { useStatus } from './hooks/useStatus';
 import { useZoomControl } from './hooks/useZoomControl';
+import {
+  activeSession as sessionForSelection,
+  EMPTY_COMPARE_REPOSITORY,
+  invalidateJobRevision,
+  invalidateSession,
+  invalidateJobSession,
+  ownerMatchesSelection,
+  rebindSessionOwner,
+  reconcileRefreshedJobSession,
+  reconcileSavedJobSession,
+  retainSuccessfulSession,
+  successfulSession,
+  snapshotJob,
+  targetForSelection,
+  updateSession,
+} from './state/compare-session';
+import type { CompareRepository, JobIdentitySnapshot } from './state/compare-session';
+import {
+  AutoScanTicketLedger,
+  autoScanToggleAction,
+  monitorOwnsAutoScanResult,
+  monitorOwnsAutoScanTicket,
+  reconcileAutoScanStatus,
+  statusCanOwnAutoScanTrigger,
+} from './state/autoscan';
+import type { AutoScanStatusSource, AutoScanTicket } from './state/autoscan';
+import {
+  applyReviewKey,
+  compareReviewKey,
+  directAuthorization,
+  EMPTY_APPROVAL_CHOICES,
+  INITIAL_OPERATION_REVIEW,
+  normalizeApprovalChoices,
+  operationReviewCanSubmit,
+  operationReviewPending,
+  operationReviewReducer,
+  ownsOperationReviewTicket,
+  type ApprovalChoices,
+  type OperationReviewTicket,
+} from './state/operation-review';
+import { RequestFence } from './state/request-fence';
+import { mergeRunEventReplay } from '../core/runEvents';
 import { ComparePanel } from './components/ComparePanel';
 import { ScanFaultBanner } from './components/ScanFaultBanner';
 import { ConfirmSheet } from './components/ConfirmSheet';
+import { CompareReviewSheet } from './components/OperationReviewSheet';
 import { FilterBar } from './components/FilterBar';
 import { FunnelPopover } from './components/FunnelPopover';
 import { JobEditor } from './components/JobEditor';
@@ -52,6 +94,7 @@ const HIST_KEY = 'sd.pathhist';
 /// Stable identity for "no plan, nothing to lay out" — a fresh object literal here would make the
 /// flatten memo below recompute on every render
 const EMPTY_LAYOUT: PlanLayout = { order: [], tree: null };
+const EMPTY_FLAGS: boolean[] = [];
 
 /// One entry in a row's right-click menu. Built at open time so each closure sees the row and the
 /// plan as they were when you right-clicked — a menu is transient, and a stale entry would be worse
@@ -65,6 +108,8 @@ interface CtxItem {
 }
 
 interface CtxState { x: number; y: number; items: CtxItem[] }
+interface CompareCompletion { plan: PlanDto }
+interface AutoScanOutcome { completion: CompareCompletion | null; owned: boolean }
 
 function readHistory(): string[] {
   try { return JSON.parse(localStorage.getItem(HIST_KEY) ?? '[]') as string[]; } catch { return []; }
@@ -83,14 +128,13 @@ export function App() {
   const [selTarget, setSelTarget] = useState(0);
 
   // Compare result
-  const [plan, setPlan] = useState<PlanDto | null>(null);
-  const [checked, setChecked] = useState<boolean[]>([]);
-  const [flipped, setFlipped] = useState<boolean[]>([]);
+  const [compareRepository, setCompareRepository] = useState<CompareRepository>(EMPTY_COMPARE_REPOSITORY);
   const [maskHit, setMaskHit] = useState<boolean[]>([]);
+  const maskRequest = useRef(new RequestFence());
+  const restoreRequest = useRef(new RequestFence());
   const [busy, setBusy] = useState(false);
-  const syncInFlight = useRef(false);
-  /// The user ticked "I confirm this is correct" in the confirm sheet (same as CLI --i-know); reset on every new compare
-  const [acknowledged, setAcknowledged] = useState(false);
+  const syncInFlight = useRef<OperationReviewTicket | null>(null);
+  const autoApplyInFlight = useRef(false);
 
   // View
   const [chips, setChips] = useState<Set<Chip>>(new Set());
@@ -108,8 +152,18 @@ export function App() {
   const [editor, setEditor] = useState<{ name: string | null; focusGroup?: string } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [preflight, setPreflight] = useState<PreflightDto | null>(null);
-  const [preflightError, setPreflightError] = useState<string | null>(null);
+  const [confirmReviewKey, setConfirmReviewKey] = useState<string | null>(null);
+  const [applyReview, dispatchApplyReview] = useReducer(operationReviewReducer, INITIAL_OPERATION_REVIEW);
+  const [applyChoices, setApplyChoices] = useState<ApprovalChoices>(EMPTY_APPROVAL_CHOICES);
+  const applyReviewGeneration = useRef(0);
+  const applyReviewTicket = useRef<OperationReviewTicket | null>(null);
+  const confirmReviewKeyRef = useRef<string | null>(null);
+  const [compareReview, dispatchCompareReview] = useReducer(operationReviewReducer, INITIAL_OPERATION_REVIEW);
+  const [compareChoices, setCompareChoices] = useState<ApprovalChoices>(EMPTY_APPROVAL_CHOICES);
+  const compareReviewGeneration = useRef(0);
+  const compareReviewTicket = useRef<OperationReviewTicket | null>(null);
+  const compareReviewFetchTicket = useRef<OperationReviewTicket | null>(null);
+  const compareApprovalTicket = useRef<OperationReviewTicket | null>(null);
   const [funnelAnchor, setFunnelAnchor] = useState<DOMRect | null>(null);
   const [ctx, setCtx] = useState<CtxState | null>(null);
   const [logOpen, setLogOpen] = useState(false);
@@ -119,7 +173,13 @@ export function App() {
   /// The diff table's scroll container. App renders it, so App owns it and hands it down.
   const [tableWrap, setTableWrap] = useState<HTMLDivElement | null>(null);
   /// Pending root swap, held with the job it read so the confirmation can spell out both roots
-  const [askSwap, setAskSwap] = useState<{ name: string; job: ipc.JobFull } | null>(null);
+  const [askSwap, setAskSwap] = useState<{
+    jobId: string;
+    name: string;
+    job: ipc.JobFull;
+    configRevision: string;
+    targetIndex: number;
+  } | null>(null);
   /// The two regions holding droppable path fields. A ref rather than state: the drag handler is
   /// registered once and reads this at drop time, so state here would only hand it a stale closure.
   const dropScope = useRef<{ editor: HTMLElement | null; path: HTMLElement | null }>({ editor: null, path: null });
@@ -135,16 +195,33 @@ export function App() {
   /// Rate EMA (0.7 old + 0.3 new): the instantaneous rate swings wildly with file size
   const cmpRate = useRef(new Map<string, { t: number; b: number; ema: number }>());
   const cmpRunId = useRef(-1);
+  const cmpRunFloor = useRef(-1);
+  const cmpRunReady = useRef(false);
+  const compareInFlight = useRef(false);
 
-  // AutoScan (the job field behind it is watch_interval_secs)
-  const [watchSecs, setWatchSecs] = useState<number | null>(null);
-  const watchNext = useRef(0);
+  // AutoScan is backend-owned. The webview renders status and handles exact trigger tickets; it
+  // never owns the clock or assumes that remaining mounted means the watcher is still alive.
+  const [autoScanStatus, setAutoScanStatus] = useState<ipc.AutoScanStatusDto | null>(null);
+  const autoScanStatusRef = useRef<ipc.AutoScanStatusDto | null>(null);
+  const autoScanTicket = useRef<AutoScanTicket | null>(null);
+  const autoScanLedger = useRef(new AutoScanTicketLedger<AutoScanOutcome>());
+  const autoScanControlRequest = useRef(0);
+  const [autoScanControlPending, setAutoScanControlPending] = useState<'start' | 'stop' | null>(null);
+  const autoScanControlPendingRef = useRef<'start' | 'stop' | null>(null);
+  const autoScanTriggerRef = useRef<(trigger: ipc.AutoScanTriggerDto) => Promise<void>>(async () => {});
 
   const editorApi = useRef<EditorApi | null>(null);
   const { status, set: setStatus, withUndo: setStatusUndo, runUndo } = useStatus('');
   const zoom = useZoomControl();
+  const selectionRef = useRef<{ job: JobDto | null; targetIndex: number }>({ job: null, targetIndex: 0 });
+  selectionRef.current = { job: currentJob, targetIndex: selTarget };
 
   // Derived view
+
+  const activeCompare = sessionForSelection(compareRepository, currentJob, selTarget);
+  const plan = activeCompare?.plan ?? null;
+  const checked = activeCompare?.checked ?? EMPTY_FLAGS;
+  const flipped = activeCompare?.flipped ?? EMPTY_FLAGS;
 
   // Three memos, not one, because the three questions change at different rates. Membership is the
   // expensive full-table scan and no longer depends on `sort`, so clicking a header does not re-run
@@ -158,6 +235,21 @@ export function App() {
   ), [plan, flipped, chips, search, ovFilter, vfilter, maskHit]);
 
   const final = useMemo(() => finalIdx(visible, checked), [visible, checked]);
+  const reviewedRows = useMemo(() => (plan ? selectedRows(final, flipped) : []), [plan, final, flipped]);
+  const reviewKey = useMemo(() => (
+    plan && currentJob
+      ? applyReviewKey(plan.owner, currentJob.job_id, currentJob.config_revision, selTarget, reviewedRows)
+      : null
+  ), [plan, currentJob, selTarget, reviewedRows]);
+  const currentReviewKeyRef = useRef<string | null>(reviewKey);
+  currentReviewKeyRef.current = reviewKey;
+  const currentCompareReviewKey = useMemo(() => (
+    currentJob
+      ? compareReviewKey(currentJob.job_id, currentJob.config_revision, selTarget)
+      : null
+  ), [currentJob, selTarget]);
+  const currentCompareReviewKeyRef = useRef<string | null>(currentCompareReviewKey);
+  currentCompareReviewKeyRef.current = currentCompareReviewKey;
 
   const layout = useMemo(() => (
     plan ? buildLayout({ plan, flipped, visible, grouped, sort }) : EMPTY_LAYOUT
@@ -188,8 +280,8 @@ export function App() {
         case 'move': s.mv++; break;
         case 'delete': case 'delete_dir': s.del++; break;
       }
+      if (flipped[i]) s.flips++;
     }
-    s.flips = flipped.filter(Boolean).length;
     return s;
   }, [plan, final, flipped]);
 
@@ -208,7 +300,14 @@ export function App() {
   const refreshJobs = useCallback(async (keepName?: string) => {
     const list = await ipc.listJobs();
     setJobs(list);
-    if (keepName) setCurrentJob((cur) => list.find((x) => x.name === keepName) ?? cur);
+    if (keepName) {
+      // listJobs is the authoritative registry. The name guard prevents a delayed refresh from
+      // hijacking a newer selection; when that guarded job disappeared, retaining `cur` would
+      // instead leave a ghost row that every later Compare retries.
+      setCurrentJob((cur) => (
+        cur?.name === keepName ? list.find((x) => x.job_id === cur.job_id) ?? null : cur
+      ));
+    }
     return list;
   }, []);
 
@@ -216,63 +315,514 @@ export function App() {
     ipc.lastSyncs().then(setLastMap).catch(() => { /* missing logs are not fatal */ });
   }, []);
 
+  const reportMutationFailure = useCallback(async (name: string, action: string, error: unknown) => {
+    try {
+      await refreshJobs(name);
+      setStatus(`${action}: ${error} · refreshed the job registry; no unseen changes were overwritten`, 'err');
+    } catch (refreshError) {
+      setStatus(`${action}: ${error} · job-registry refresh failed: ${refreshError}`, 'err');
+    }
+  }, [refreshJobs, setStatus]);
+
+  const resetConfirmation = useCallback(() => {
+    applyReviewTicket.current = null;
+    confirmReviewKeyRef.current = null;
+    setApplyChoices(EMPTY_APPROVAL_CHOICES);
+    setConfirmOpen(false);
+    setConfirmReviewKey(null);
+    dispatchApplyReview({ type: 'reset' });
+  }, []);
+
+  const resetCompareReview = useCallback(() => {
+    compareReviewTicket.current = null;
+    compareReviewFetchTicket.current = null;
+    compareApprovalTicket.current = null;
+    setCompareChoices(EMPTY_APPROVAL_CHOICES);
+    dispatchCompareReview({ type: 'reset' });
+  }, []);
+
+  const resetSafetyUi = useCallback(() => {
+    resetConfirmation();
+    resetCompareReview();
+    setSameOpen(false);
+    setFunnelAnchor(null);
+    setCtx(null);
+    setAskSwap(null);
+  }, [resetCompareReview, resetConfirmation]);
+
+  const clearMasks = useCallback(() => {
+    maskRequest.current.invalidate();
+    setMaskHit([]);
+  }, []);
+
+  const acceptAutoScanStatus = useCallback((
+    incoming: ipc.AutoScanStatusDto,
+    source: AutoScanStatusSource,
+    completedTicketId?: number,
+  ) => {
+    const current = autoScanStatusRef.current;
+    const next = reconcileAutoScanStatus(current, incoming, source, completedTicketId);
+    if (!next || next === current) return false;
+    autoScanStatusRef.current = next;
+    setAutoScanStatus(next);
+    if (next.pending_trigger) void autoScanTriggerRef.current(next.pending_trigger);
+    return true;
+  }, []);
+
+  const stopAutoScan = useCallback(() => {
+    if (autoScanControlPendingRef.current !== null) return;
+    const request = autoScanControlRequest.current + 1;
+    autoScanControlRequest.current = request;
+    autoScanControlPendingRef.current = 'stop';
+    setAutoScanControlPending('stop');
+    setStatus('Stopping AutoScan…');
+    void ipc.stopAutoScan().then((next) => {
+      if (autoScanControlRequest.current !== request) return;
+      acceptAutoScanStatus(next, 'stop');
+      autoScanTicket.current = null;
+      setStatus('AutoScan stopped');
+    }).catch((error) => {
+      if (autoScanControlRequest.current === request) {
+        setStatus(`AutoScan could not be stopped cleanly: ${error}`, 'err');
+      }
+    }).finally(() => {
+      if (autoScanControlRequest.current === request) {
+        autoScanControlPendingRef.current = null;
+        setAutoScanControlPending(null);
+      }
+    });
+  }, [acceptAutoScanStatus, setStatus]);
+
+  const resetNavigationUi = useCallback(() => {
+    resetSafetyUi();
+    setChips(new Set());
+    setSearch('');
+    setOvFilter(null);
+    setOvExpanded(new Set());
+    setSort(null);
+    setVfilter(EMPTY_FILTER);
+    clearMasks();
+  }, [clearMasks, resetSafetyUi]);
+
+  const previousReviewKey = useRef<string | null>(reviewKey);
+  useEffect(() => {
+    if (previousReviewKey.current === reviewKey) return;
+    previousReviewKey.current = reviewKey;
+    if (!confirmOpen) return;
+    resetConfirmation();
+    setStatus('The reviewed action set changed — open confirmation again', 'err');
+  }, [reviewKey, confirmOpen, resetConfirmation, setStatus]);
+
+  const previousCompareReviewKey = useRef<string | null>(currentCompareReviewKey);
+  useEffect(() => {
+    if (previousCompareReviewKey.current === currentCompareReviewKey) return;
+    previousCompareReviewKey.current = currentCompareReviewKey;
+    resetCompareReview();
+  }, [currentCompareReviewKey, resetCompareReview]);
+
+  useEffect(() => {
+    if (!currentJob || currentJob.targets.length === 0 || selTarget < currentJob.targets.length) return;
+    setSelTarget(0);
+    resetNavigationUi();
+    setStatus(`'${currentJob.name}' no longer has target ${selTarget + 1}; selected target 1`);
+  }, [currentJob, selTarget, resetNavigationUi, setStatus]);
+
+  const invalidateCompareRevision = useCallback((jobId: string, configRevision: string) => {
+    setCompareRepository((repository) => invalidateJobRevision(repository, jobId, configRevision));
+  }, []);
+
+  const invalidateCompareJob = useCallback((jobId: string) => {
+    setCompareRepository((repository) => invalidateJobSession(repository, jobId));
+  }, []);
+
+  const setChecked = useCallback((next: boolean[] | ((prev: boolean[]) => boolean[])) => {
+    setCompareRepository((repository) => updateSession(repository, currentJob, selTarget, (session) => ({
+      ...session,
+      checked: typeof next === 'function' ? next(session.checked) : next,
+    })));
+  }, [currentJob, selTarget]);
+
+  const setFlipped = useCallback((next: boolean[] | ((prev: boolean[]) => boolean[])) => {
+    setCompareRepository((repository) => updateSession(repository, currentJob, selTarget, (session) => ({
+      ...session,
+      flipped: typeof next === 'function' ? next(session.flipped) : next,
+    })));
+  }, [currentJob, selTarget]);
+
   /// A new plan means a new row set, so the mask cache is stale; the funnel criteria themselves persist
   /// (watching the same files for several rounds is common)
   const recomputeMasks = useCallback(async (p: PlanDto | null, f: boolean[], masks: string[]) => {
-    if (!p) { setMaskHit([]); return; }
-    if (masks.length === 0) { setMaskHit([]); return; }
+    if (!p || masks.length === 0) { clearMasks(); return []; }
+    const owner = p.owner;
+    const ticket = maskRequest.current.start(`${owner.compare_id}\0${owner.job_id}\0${owner.target_index}\0${owner.config_revision}`);
     try {
-      setMaskHit(await ipc.maskMatch(masks, p.ops.map((_, i) => eff(p, f, i).path)));
+      const hits = await ipc.maskMatch(masks, p.ops.map((_, i) => eff(p, f, i).path));
+      if (!maskRequest.current.owns(ticket)) return;
+      const selected = selectionRef.current;
+      if (!ownerMatchesSelection(owner, selected.job, selected.targetIndex)) return hits;
+      setMaskHit(hits);
+      return hits;
     } catch (e) {
+      if (!maskRequest.current.owns(ticket)) return;
+      const selected = selectionRef.current;
+      if (!ownerMatchesSelection(owner, selected.job, selected.targetIndex)) return null;
       setMaskHit([]);
       setStatus(`Mask matching failed: ${e}`, 'err');
+      return null;
     }
+  }, [clearMasks, setStatus]);
+
+  const requestResultRestore = useCallback((
+    job: JobDto,
+    targetIndex: number,
+    retained: ReturnType<typeof sessionForSelection>,
+    announce = true,
+  ) => {
+    const ticket = restoreRequest.current.start(`${job.job_id}\0${targetIndex}\0${job.config_revision}`);
+    const publish = (restored: PlanDto | null) => {
+      if (!restoreRequest.current.owns(ticket) || !restored) return;
+      const selected = selectionRef.current;
+      if (!ownerMatchesSelection(restored.owner, selected.job, selected.targetIndex)) return;
+      const session = successfulSession(
+        restored,
+        restored.ops.map((op) => selectable(op)),
+        restored.ops.map(() => false),
+      );
+      setCompareRepository((repository) => retainSuccessfulSession(repository, session));
+      if (announce) setStatus(`${job.name} · restored ${restored.ops.length} compare items`);
+    };
+    const failed = (error: unknown) => {
+      if (!restoreRequest.current.owns(ticket)) return;
+      if (announce) setStatus(`Could not restore '${job.name}' result: ${error}`, 'err');
+    };
+    if (!retained) {
+      void ipc.restoreCompare(job.job_id, targetIndex).then(publish).catch(failed);
+      return;
+    }
+    void ipc.touchCompare(retained.plan.owner).then(async (backendOwner) => {
+      if (!restoreRequest.current.owns(ticket)) return;
+      if (!backendOwner) {
+        setCompareRepository((repository) => invalidateSession(repository, retained.plan.owner));
+        if (announce) setStatus(`${job.name} · retained result expired — Compare again`, 'err');
+        return;
+      }
+      if (backendOwner.compare_id === retained.plan.owner.compare_id) {
+        setCompareRepository((repository) => rebindSessionOwner(
+          retainSuccessfulSession(repository, retained),
+          retained.plan.owner,
+          backendOwner,
+        ));
+        return;
+      }
+      publish(await ipc.restoreCompare(job.job_id, targetIndex));
+    }).catch(failed);
   }, [setStatus]);
 
   // Actions
 
-  const doCompare = useCallback(async () => {
-    if (!currentJob || busy) return;
-    setSameOpen(false); // a new compare = a new snapshot, so the old identical-items list is stale
+  const runAuthorizedCompare = useCallback(async (
+    authorizationToken: string,
+    comparedJob: JobIdentitySnapshot,
+    targetIndex: number,
+    autoTicket?: AutoScanTicket,
+  ): Promise<CompareCompletion | null> => {
+    if (busy || editor || compareInFlight.current || autoApplyInFlight.current) return null;
+    if (autoTicket && (
+      !monitorOwnsAutoScanTicket(autoScanStatusRef.current, autoScanTicket.current, autoTicket)
+      || syncInFlight.current !== null
+      || applyReviewTicket.current !== null
+      || compareReviewTicket.current !== null
+      || confirmOpen
+      || operationReviewPending(compareReview)
+      || operationReviewPending(applyReview)
+    )) return null;
+    if (!autoTicket) autoScanTicket.current = null;
+    const selectedAtStart = selectionRef.current;
+    const showProgress = !autoTicket || (
+      selectedAtStart.job?.job_id === autoTicket.jobId
+      && selectedAtStart.job.config_revision === autoTicket.configRevision
+      && selectedAtStart.targetIndex === autoTicket.targetIndex
+    );
+    if (!autoTicket) restoreRequest.current.invalidate();
+    compareInFlight.current = true;
+    const name = comparedJob.name;
+    if (!autoTicket) resetSafetyUi();
     setBusy(true);
-    setStatus(`Comparing '${currentJob.name}' ...`);
-    setCmpStages([]);
+    setStatus(`${autoTicket ? 'AutoScan is comparing' : 'Comparing'} '${name}'…`);
+    if (showProgress) setCmpStages([]);
     cmpRate.current.clear();
-    setCmpCancelling(false);
-    setCmpActive(true);
+    if (showProgress) setCmpCancelling(false);
+    cmpRunFloor.current = cmpRunId.current;
+    cmpRunReady.current = false;
+    if (showProgress) setCmpActive(true);
     try {
-      setAcknowledged(false);
-      const p = await ipc.compareJob(currentJob.name, selTarget);
+      const p = await ipc.compareJob(authorizationToken);
       const f = p.ops.map(() => false);
-      setPlan(p);
-      setChecked(p.ops.map((op) => selectable(op)));
-      setFlipped(f);
-      setChips(new Set());
-      setOvFilter(null);
-      setOvExpanded(new Set());
-      setSort(null);
-      await recomputeMasks(p, f, vfilter.masks);
+      setCompareRepository((repository) => retainSuccessfulSession(
+        repository,
+        successfulSession(p, p.ops.map((op) => selectable(op)), f),
+      ));
+      if (!autoTicket) {
+        setChips(new Set());
+        setOvFilter(null);
+        setOvExpanded(new Set());
+        setSort(null);
+      }
+      // A job file can be edited outside the app while it is open. Compare used the authoritative
+      // file, so refresh the list row before deciding whether the returned owner belongs on screen.
+      // Snapshot first: refreshJobs may commit the new row (or null) before this continuation runs,
+      // and then the ref no longer tells us that the selected job changed underneath this compare.
+      const selectedBeforeRefresh = selectionRef.current;
+      let refreshedJob: JobDto | null = null;
+      let refreshProblem: unknown = null;
+      try {
+        const list = await refreshJobs(name);
+        refreshedJob = list.find((job) => job.job_id === p.owner.job_id) ?? null;
+        setCompareRepository((repository) => reconcileRefreshedJobSession(
+          repository,
+          { jobId: p.owner.job_id, name: p.owner.job_name, configRevision: p.owner.config_revision },
+          refreshedJob,
+        ));
+      } catch (e) {
+        refreshProblem = e;
+      }
+      const selected = selectionRef.current;
+      const selectedJob = selected.job?.job_id === p.owner.job_id && !refreshProblem ? refreshedJob : selected.job;
+      let navigationWasReset = false;
+      if (selectedBeforeRefresh.job?.job_id === p.owner.job_id && !refreshProblem) {
+        if (!refreshedJob) {
+          setSelTarget(0);
+          resetNavigationUi();
+          navigationWasReset = true;
+        } else if (selectedBeforeRefresh.job.config_revision !== refreshedJob.config_revision) {
+          resetNavigationUi();
+          navigationWasReset = true;
+        }
+      }
+      const visibleHere = ownerMatchesSelection(p.owner, selectedJob, selected.targetIndex);
+      if (visibleHere) {
+        // resetNavigationUi cleared both the funnel and maskHit. Replaying masks from this render's
+        // stale closure would hide rows behind an apparently empty funnel after an external edit.
+        await recomputeMasks(p, f, navigationWasReset ? [] : vfilter.masks);
+      }
       // The counts bar to the right already says what was scanned and what is showing, and the
       // placeholder in the table says "identical" in full — this line only has to say the result
-      setStatus(
-        p.ops.length === 0
-          ? 'Both sides identical'
-          : `${p.ops.length} items · ${p.header.conflict_count} conflicts`,
-        p.header.conflict_count > 0 ? 'err' : '',
-      );
+      if (visibleHere) {
+        setStatus(
+          p.ops.length === 0
+            ? 'Both sides identical'
+            : `${p.ops.length} items · ${p.header.conflict_count} conflicts`,
+          p.header.conflict_count > 0 ? 'err' : '',
+        );
+      } else if (refreshProblem) {
+        setStatus(`Compare finished for '${name}', but the refreshed job identity could not be read: ${refreshProblem}`, 'err');
+      } else if (autoTicket) {
+        setStatus(
+          p.ops.length === 0
+            ? `AutoScan finished for '${name}' — both sides are identical; result retained`
+            : `AutoScan finished for '${name}' — ${p.ops.length} differences retained for review`,
+          p.header.conflict_count > 0 ? 'err' : '',
+        );
+      } else {
+        setStatus(`Compare finished for '${name}', but its job or target changed — the result was not attached to the current view`, 'err');
+      }
+      return { plan: p };
     } catch (e) {
-      setPlan(null);
-      setChecked([]);
-      setFlipped([]);
       const cancelled = String(e) === 'cancelled';
-      setStatus(cancelled ? 'Compare cancelled' : `Compare failed: ${e}`, cancelled ? '' : 'err');
+      let suffix = '';
+      let refreshProblem: unknown = null;
+      try {
+        // Compare reads the job file directly. If that read failed because the file was edited,
+        // removed, or had its targets changed outside the app, refresh even on failure so the
+        // stale list row cannot trap every subsequent attempt on the same invalid selection.
+        const selected = selectionRef.current;
+        const list = await refreshJobs(name);
+        const refreshedJob = list.find((job) => job.job_id === comparedJob.jobId) ?? null;
+        setCompareRepository((repository) => reconcileRefreshedJobSession(repository, comparedJob, refreshedJob));
+        if (selected.job?.job_id === comparedJob.jobId) {
+          if (!refreshedJob) {
+            setSelTarget(0);
+            resetNavigationUi();
+            suffix = ` · '${name}' is no longer a registered job`;
+          } else if (selected.job.config_revision !== refreshedJob.config_revision) {
+            resetNavigationUi();
+            suffix = ' · refreshed the changed job configuration';
+          }
+        }
+      } catch (refreshError) {
+        refreshProblem = refreshError;
+      }
+      const base = cancelled ? 'Compare cancelled' : `${autoTicket ? 'AutoScan Compare' : 'Compare'} failed: ${e}`;
+      if (refreshProblem) suffix = ` · job-list refresh failed: ${refreshProblem}`;
+      setStatus(`${base}${suffix}`, cancelled && !refreshProblem ? '' : 'err');
+      return null;
+    } finally {
+      if (showProgress) setCmpActive(false);
+      setBusy(false);
+      cmpRunReady.current = false;
+      compareInFlight.current = false;
     }
-    setCmpActive(false);
-    setBusy(false);
-  }, [currentJob, busy, selTarget, vfilter.masks, recomputeMasks, setStatus]);
+  }, [busy, editor, confirmOpen, compareReview, applyReview, vfilter.masks, recomputeMasks, refreshJobs, resetNavigationUi, resetSafetyUi, setStatus]);
+
+  const doCompare = useCallback(async (autoTicket?: AutoScanTicket): Promise<CompareCompletion | null> => {
+    if (busy || editor || compareInFlight.current || syncInFlight.current || autoApplyInFlight.current) return null;
+    if (!autoTicket && !currentJob) return null;
+    if (!autoTicket && applyReviewTicket.current) return null;
+    if (!autoTicket && operationReviewPending(compareReview)) return null;
+    if (autoTicket && (
+      !monitorOwnsAutoScanTicket(autoScanStatusRef.current, autoScanTicket.current, autoTicket)
+      || applyReviewTicket.current !== null
+      || compareReviewTicket.current !== null
+      || confirmOpen
+      || operationReviewPending(compareReview)
+      || operationReviewPending(applyReview)
+    )) return null;
+
+    const comparedJob: JobIdentitySnapshot = autoTicket
+      ? { jobId: autoTicket.jobId, name: autoTicket.jobName, configRevision: autoTicket.configRevision }
+      : snapshotJob(currentJob!);
+    const targetIndex = autoTicket?.targetIndex ?? selTarget;
+    const key = compareReviewKey(comparedJob.jobId, comparedJob.configRevision, targetIndex);
+
+    if (autoTicket) {
+      setStatus(`AutoScan is reviewing Compare authorization for '${comparedJob.name}'…`);
+      try {
+        const review = await ipc.reviewCompare(comparedJob.jobId, targetIndex);
+        const stillOwned = monitorOwnsAutoScanTicket(
+          autoScanStatusRef.current,
+          autoScanTicket.current,
+          autoTicket,
+        );
+        if (!stillOwned) return null;
+        const authorization = directAuthorization(review);
+        if (!authorization) {
+          setStatus(
+            review.status === 'direct_authorized'
+              ? `AutoScan paused: the direct Compare review for '${comparedJob.name}' was internally inconsistent`
+              : `AutoScan paused: Compare requires an exact interactive authorization for '${comparedJob.name}'`,
+            'err',
+          );
+          return null;
+        }
+        return runAuthorizedCompare(
+          authorization.authorization_token,
+          comparedJob,
+          targetIndex,
+          autoTicket,
+        );
+      } catch (error) {
+        setStatus(`AutoScan could not review Compare authorization: ${error}`, 'err');
+        return null;
+      }
+    }
+
+    if (compareReviewFetchTicket.current?.key === key) return null;
+
+    const ticket: OperationReviewTicket = {
+      key,
+      generation: compareReviewGeneration.current + 1,
+    };
+    compareReviewGeneration.current = ticket.generation;
+    compareReviewTicket.current = ticket;
+    compareReviewFetchTicket.current = ticket;
+    setCompareChoices(EMPTY_APPROVAL_CHOICES);
+    dispatchCompareReview({ type: 'begin', ticket });
+    setStatus(`Reviewing Compare authorization for '${comparedJob.name}'…`);
+    try {
+      const review = await ipc.reviewCompare(comparedJob.jobId, targetIndex);
+      if (!ownsOperationReviewTicket(compareReviewTicket.current, ticket, currentCompareReviewKeyRef.current)) {
+        return null;
+      }
+      dispatchCompareReview({ type: 'resolved', ticket, review });
+      const authorization = directAuthorization(review);
+      if (authorization) {
+        return runAuthorizedCompare(
+          authorization.authorization_token,
+          comparedJob,
+          targetIndex,
+        );
+      }
+      if (review.status === 'direct_authorized') {
+        const error = 'The direct Compare review was internally inconsistent and was rejected';
+        dispatchCompareReview({ type: 'failed', ticket, error });
+        setStatus(error, 'err');
+        return null;
+      }
+      if (review.status === 'blocked') {
+        setStatus(`Compare is blocked for '${comparedJob.name}' — review the required fixes`, 'err');
+      } else if (review.status === 'confirmation_required') {
+        setStatus(`Compare requires your approval for '${comparedJob.name}'`);
+      } else {
+        const error = 'The Compare review returned an unknown status and was rejected';
+        dispatchCompareReview({ type: 'failed', ticket, error });
+        setStatus(error, 'err');
+      }
+      return null;
+    } catch (error) {
+      if (!ownsOperationReviewTicket(compareReviewTicket.current, ticket, currentCompareReviewKeyRef.current)) {
+        return null;
+      }
+      dispatchCompareReview({ type: 'failed', ticket, error: String(error) });
+      setStatus(`Compare authorization review failed: ${error}`, 'err');
+      return null;
+    } finally {
+      if (compareReviewFetchTicket.current?.generation === ticket.generation
+        && compareReviewFetchTicket.current.key === ticket.key) {
+        compareReviewFetchTicket.current = null;
+      }
+    }
+  }, [currentJob, busy, editor, compareReview, applyReview, confirmOpen, selTarget, runAuthorizedCompare, setStatus]);
+
+  const approveCompareReview = useCallback(async () => {
+    const ticket = compareReviewTicket.current;
+    const review = compareReview.review;
+    if (!ticket || !review || !operationReviewCanSubmit(compareReview, compareChoices)) return;
+    if (review.status !== 'confirmation_required' || !review.challenge_id) return;
+    if (compareApprovalTicket.current?.generation === ticket.generation
+      && compareApprovalTicket.current.key === ticket.key) return;
+    compareApprovalTicket.current = ticket;
+    const choices = normalizeApprovalChoices(review, compareChoices);
+    dispatchCompareReview({ type: 'begin_approval', ticket });
+    setStatus('Authorizing this exact Compare operation…');
+    try {
+      const authorization = await ipc.approveOperation(
+        review.challenge_id,
+        choices.acknowledgeHealth,
+        choices.acceptCapabilities,
+        choices.rememberForSession,
+        choices.allowUnattended,
+      );
+      if (!ownsOperationReviewTicket(compareReviewTicket.current, ticket, currentCompareReviewKeyRef.current)) return;
+      const selected = selectionRef.current;
+      if (!selected.job) return;
+      dispatchCompareReview({ type: 'authorized', ticket, authorization });
+      await runAuthorizedCompare(
+        authorization.authorization_token,
+        snapshotJob(selected.job),
+        selected.targetIndex,
+      );
+    } catch (error) {
+      if (!ownsOperationReviewTicket(compareReviewTicket.current, ticket, currentCompareReviewKeyRef.current)) return;
+      dispatchCompareReview({ type: 'approval_failed', ticket, error: String(error) });
+      setStatus(`Compare authorization failed: ${error}`, 'err');
+    } finally {
+      if (compareApprovalTicket.current?.generation === ticket.generation
+        && compareApprovalTicket.current.key === ticket.key) {
+        compareApprovalTicket.current = null;
+      }
+    }
+  }, [compareChoices, compareReview, runAuthorizedCompare, setStatus]);
 
   const openConfirm = useCallback(async () => {
-    if (!currentJob || !plan || busy) return;
+    if (!currentJob
+      || !plan
+      || !reviewKey
+      || busy
+      || autoApplyInFlight.current
+      || operationReviewPending(applyReview)
+      || applyReviewTicket.current
+      || compareReviewFetchTicket.current
+      || compareReview.review) return;
     const hiddenChecked = checked.filter(Boolean).length - final.length;
     if (final.length === 0) {
       setStatus(
@@ -281,30 +831,90 @@ export function App() {
       );
       return;
     }
-    setPreflight(null);
-    setPreflightError(null);
+    const ticket: OperationReviewTicket = {
+      key: reviewKey,
+      generation: applyReviewGeneration.current + 1,
+    };
+    applyReviewGeneration.current = ticket.generation;
+    applyReviewTicket.current = ticket;
+    confirmReviewKeyRef.current = reviewKey;
+    setConfirmReviewKey(reviewKey);
+    setApplyChoices(EMPTY_APPROVAL_CHOICES);
+    dispatchApplyReview({ type: 'begin', ticket });
     setConfirmOpen(true);
     try {
-      setPreflight(await ipc.preflight(currentJob.name, plan, final.map((i) => eff(plan, flipped, i)), acknowledged, selTarget));
-    } catch (e) {
-      setPreflightError(String(e));
+      const review = await ipc.reviewApply(plan.owner, reviewedRows);
+      if (!ownsOperationReviewTicket(applyReviewTicket.current, ticket, currentReviewKeyRef.current)) return;
+      dispatchApplyReview({ type: 'resolved', ticket, review });
+    } catch (error) {
+      if (!ownsOperationReviewTicket(applyReviewTicket.current, ticket, currentReviewKeyRef.current)) return;
+      dispatchApplyReview({ type: 'failed', ticket, error: String(error) });
     }
-  }, [currentJob, plan, busy, checked, final, flipped, acknowledged, selTarget, setStatus]);
+  }, [currentJob, plan, reviewKey, busy, applyReview, compareReview.review, checked, final, reviewedRows, setStatus]);
 
   const doSync = useCallback(async () => {
-    setConfirmOpen(false);
-    if (!currentJob || !plan || busy || syncInFlight.current) return;
-    syncInFlight.current = true;
-    const ops = final.map((i) => eff(plan, flipped, i));
-    setBusy(true);
-    setStatus(`Synchronizing '${currentJob.name}' (${ops.length} items)...`);
+    if (
+      !currentJob
+      || !plan
+      || !reviewKey
+      || !confirmOpen
+      || confirmReviewKey !== reviewKey
+      || confirmReviewKeyRef.current !== reviewKey
+      || !operationReviewCanSubmit(applyReview, applyChoices)
+    ) {
+      setStatus('Apply is unavailable until this exact reviewed action set is authorized', 'err');
+      return;
+    }
+    const ticket = applyReviewTicket.current;
+    const review = applyReview.review;
+    if (!ticket || !review) return;
+    if (busy || autoApplyInFlight.current || (syncInFlight.current?.generation === ticket.generation
+      && syncInFlight.current.key === ticket.key)) return;
+    syncInFlight.current = ticket;
+    const selected = reviewedRows;
+    const applyingJob = currentJob;
     // Whether the progress window stays during a sync is its own Auto-close / When-finished business
     let launchId: number | null = null;
+    let executionStarted = false;
     try {
+      let authorization = review.authorization;
+      if (review.status === 'confirmation_required') {
+        if (!review.challenge_id) throw new Error('the safety review did not provide an approval challenge');
+        const choices = normalizeApprovalChoices(review, applyChoices);
+        dispatchApplyReview({ type: 'begin_approval', ticket });
+        setStatus('Authorizing this exact apply operation…');
+        try {
+          authorization = await ipc.approveOperation(
+            review.challenge_id,
+            choices.acknowledgeHealth,
+            choices.acceptCapabilities,
+            choices.rememberForSession,
+            choices.allowUnattended,
+          );
+        } catch (error) {
+          if (ownsOperationReviewTicket(applyReviewTicket.current, ticket, currentReviewKeyRef.current)) {
+            dispatchApplyReview({ type: 'approval_failed', ticket, error: String(error) });
+            setStatus(`Apply authorization failed: ${error}`, 'err');
+          }
+          return;
+        }
+        if (!ownsOperationReviewTicket(applyReviewTicket.current, ticket, currentReviewKeyRef.current)) return;
+        dispatchApplyReview({ type: 'authorized', ticket, authorization });
+      }
+      if (!authorization) throw new Error('the safety review did not authorize this operation');
+
+      resetConfirmation();
+      setBusy(true);
+      setStatus(`Synchronizing '${applyingJob.name}' (${selected.length} items)...`);
       // The command returns only after the new window has installed its run-progress listener.
       // Starting apply any earlier loses the phase start/totals on a freshly opened window.
       launchId = await ipc.openProgressWindow();
-      const r = await ipc.applyJob(currentJob.name, plan, ops, acknowledged, selTarget, launchId);
+      // Once apply is invoked, any rejection may still follow partial writes. Retire this plan before
+      // crossing that boundary; only the post-run compare is entitled to publish another one.
+      invalidateCompareRevision(applyingJob.job_id, applyingJob.config_revision);
+      resetSafetyUi();
+      executionStarted = true;
+      const r = await ipc.applyJob(authorization.authorization_token, launchId);
       setStatus(
         r.cancelled
           ? `Stopped: cancelled after ${r.done} run — re-checking...`
@@ -316,31 +926,36 @@ export function App() {
       setLogReload((k) => k + 1);
       await doCompare();
     } catch (e) {
-      setStatus(`Synchronize failed: ${e}`, 'err');
+      setStatus(
+        executionStarted
+          ? `Apply failed and may have made partial changes: ${e} — Compare again before continuing`
+          : `Apply did not start: ${e} — the reviewed result was retained`,
+        'err',
+      );
       setBusy(false);
+      requestResultRestore(applyingJob, selTarget, activeCompare, false);
     } finally {
       if (launchId !== null) void ipc.cancelProgressLaunch(launchId);
-      syncInFlight.current = false;
+      if (syncInFlight.current?.generation === ticket.generation
+        && syncInFlight.current.key === ticket.key) {
+        syncInFlight.current = null;
+      }
     }
-  }, [currentJob, plan, busy, final, flipped, acknowledged, selTarget, doCompare, refreshLastSyncs, setStatus]);
+  }, [currentJob, activeCompare, plan, reviewKey, confirmOpen, confirmReviewKey, applyReview, applyChoices, busy, reviewedRows, selTarget, doCompare, refreshLastSyncs, invalidateCompareRevision, requestResultRestore, resetConfirmation, resetSafetyUi, setStatus]);
 
   const selectJob = useCallback((j: JobDto) => {
+    if (currentJob?.job_id === j.job_id) return;
+    const targetIndex = targetForSelection(compareRepository, j);
+    const restored = sessionForSelection(compareRepository, j, targetIndex);
+    selectionRef.current = { job: j, targetIndex };
     setCurrentJob(j);
-    setPlan(null);
-    setChecked([]);
-    setFlipped([]);
-    setChips(new Set());
-    setSearch('');
-    setOvFilter(null);
-    setOvExpanded(new Set());
-    setSort(null);
-    setVfilter(EMPTY_FILTER);
-    setMaskHit([]);
-    setSelTarget(0);
-    setSameOpen(false);
-    setWatchSecs(null);
-    setStatus(`${j.name} · ${j.mode}${j.rigor !== 'standard' ? ` · ${j.rigor}` : ''}`);
-  }, [setStatus]);
+    setSelTarget(targetIndex);
+    resetNavigationUi();
+    setStatus(restored
+      ? `${j.name} · restored ${restored.plan.ops.length} compare items`
+      : `${j.name} · ${j.mode}${j.rigor !== 'standard' ? ` · ${j.rigor}` : ''}`);
+    requestResultRestore(j, targetIndex, restored);
+  }, [currentJob?.job_id, compareRepository, requestResultRestore, resetNavigationUi, setStatus]);
 
   /// Write a root edited on the main screen back to the job TOML. Changing a root invalidates the current
   /// plan, so clear it too. For multi-target jobs, only the currently selected target changes.
@@ -349,33 +964,78 @@ export function App() {
     const name = currentJob.name;
     const v = value.trim();
     if (!v) return;
+    let detail: ipc.JobDetailDto;
     try {
-      const j = await ipc.getJob(name);
-      const ts = j.targets && j.targets.length ? [...j.targets] : [j.target];
-      const before = which === 'source' ? j.source : ts[selTarget];
-      if (before === v) return; // unchanged means no disk write — otherwise every blur would bump the mtime
-      const next: ipc.JobFull = which === 'source'
-        ? { ...j, source: v }
-        : { ...j, target: selTarget === 0 ? v : j.target, targets: ts.map((t, i) => (i === selTarget ? v : t)) };
-      await ipc.saveJob(name, next);
-      pushHistory(v);
-      await refreshJobs(name);
-      setPlan(null);
-      setChecked([]);
-      setFlipped([]);
-      setStatusUndo(`Changed ${which} → ${v} — Compare again (Ctrl+R)`, 'Undo', async () => {
-        const cur = await ipc.getJob(name);
-        const back: ipc.JobFull = which === 'source'
-          ? { ...cur, source: before }
-          : { ...cur, target: selTarget === 0 ? before : cur.target, targets: (cur.targets ?? []).map((t, i) => (i === selTarget ? before : t)) };
-        await ipc.saveJob(name, back);
-        await refreshJobs(name);
-        setStatus(`Restored ${which}`);
+      detail = await ipc.getJob(name);
+    } catch (e) {
+      await reportMutationFailure(name, `Failed to read the job before changing ${which}`, e);
+      return;
+    }
+    const j = detail.job;
+    const hasTargetList = j.targets.length > 0;
+    const ts = hasTargetList ? [...j.targets] : [j.target];
+    const before = which === 'source' ? j.source : ts[selTarget];
+    if (before === v) return; // unchanged means no disk write — otherwise every blur would bump the mtime
+    const next: ipc.JobFull = which === 'source'
+      ? { ...j, source: v }
+      : {
+        ...j,
+        target: selTarget === 0 ? v : j.target,
+        targets: hasTargetList ? ts.map((t, i) => (i === selTarget ? v : t)) : [],
+      };
+    let saved: ipc.JobSaveDto;
+    try {
+      saved = await ipc.saveJob(name, next, {
+        originalName: detail.name,
+        expectedRevision: detail.config_revision,
       });
     } catch (e) {
-      setStatus(`Failed to write back to the job: ${e}`, 'err');
+      await reportMutationFailure(name, `Failed to write ${which} back to the job`, e);
+      return;
     }
-  }, [currentJob, selTarget, pushHistory, refreshJobs, setStatus, setStatusUndo]);
+    // The mutation is committed at this point. Retire its old compare immediately, and never let a
+    // later list-refresh failure make the UI claim that this successful disk write failed.
+    setCompareRepository((repository) => reconcileSavedJobSession(
+      repository,
+      saved,
+      { jobId: detail.job_id, name: detail.name, configRevision: detail.config_revision },
+    ));
+    resetSafetyUi();
+    pushHistory(v);
+    const undo = async () => {
+      const back: ipc.JobFull = which === 'source'
+        ? { ...next, source: before }
+        : { ...next, target: selTarget === 0 ? before : next.target, targets: next.targets.map((t, i) => (i === selTarget ? before : t)) };
+      try {
+        const restored = await ipc.saveJob(saved.name, back, {
+          originalName: saved.name,
+          expectedRevision: saved.config_revision,
+        });
+        setCompareRepository((repository) => reconcileSavedJobSession(
+          repository,
+          restored,
+          { jobId: saved.job_id, name: saved.name, configRevision: saved.config_revision },
+        ));
+      } catch (e) {
+        await reportMutationFailure(saved.name, `Could not restore ${which}`, e);
+        return;
+      }
+      resetSafetyUi();
+      try {
+        await refreshJobs(saved.name);
+        setStatus(`Restored ${which}`);
+      } catch (e) {
+        setStatus(`Restored ${which}, but refreshing the job list failed: ${e}`, 'err');
+      }
+    };
+    const success = `Changed ${which} → ${v} — Compare again (Ctrl+R)`;
+    try {
+      await refreshJobs(name);
+      setStatusUndo(success, 'Undo', undo);
+    } catch (e) {
+      setStatusUndo(`${success}; refreshing the job list failed: ${e}`, 'Undo', undo, 'err');
+    }
+  }, [currentJob, selTarget, pushHistory, refreshJobs, reportMutationFailure, resetSafetyUi, setStatus, setStatusUndo]);
 
   /// The FFS ⇄ swaps the in-memory config; our jobs are named TOML files on disk, so a swap has to hit
   /// the disk — otherwise the two roots in the plan header say something different from the job file, and
@@ -384,59 +1044,164 @@ export function App() {
   const requestSwap = useCallback(async () => {
     if (!currentJob || busy) return;
     try {
-      setAskSwap({ name: currentJob.name, job: await ipc.getJob(currentJob.name) });
-    } catch (e) {
-      setStatus(`Failed to read job: ${e}`, 'err');
-    }
-  }, [currentJob, busy, setStatus]);
-
-  const doSwap = useCallback(async (name: string, j: ipc.JobFull) => {
-    const prev = { source: j.source, target: j.target };
-    try {
-      await ipc.saveJob(name, { ...j, source: j.target, target: j.source });
-      await refreshJobs(name);
-      setPlan(null);
-      setChecked([]);
-      setFlipped([]);
-      setChips(new Set());
-      setOvFilter(null);
-      setOvExpanded(new Set());
-      setStatusUndo(`Swapped the two roots of '${name}' — Compare again (Ctrl+R)`, 'Undo swap', async () => {
-        const cur = await ipc.getJob(name);
-        await ipc.saveJob(name, { ...cur, ...prev });
-        await refreshJobs(name);
-        setStatus(`Restored the two roots of '${name}'`);
+      const detail = await ipc.getJob(currentJob.name);
+      const job = detail.job;
+      const targets = job.targets.length ? job.targets : [job.target];
+      if (selTarget >= targets.length) {
+        setStatus(`Target ${selTarget + 1} no longer exists — refresh the job before swapping`, 'err');
+        return;
+      }
+      setAskSwap({
+        jobId: detail.job_id,
+        name: detail.name,
+        job,
+        configRevision: detail.config_revision,
+        targetIndex: selTarget,
       });
     } catch (e) {
-      setStatus(`Swap failed: ${e}`, 'err');
+      await reportMutationFailure(currentJob.name, 'Failed to read job before swapping', e);
     }
-  }, [refreshJobs, setStatus, setStatusUndo]);
+  }, [currentJob, busy, selTarget, reportMutationFailure, setStatus]);
+
+  const doSwap = useCallback(async (
+    jobId: string,
+    name: string,
+    j: ipc.JobFull,
+    configRevision: string,
+    targetIndex: number,
+  ) => {
+    const targets = j.targets.length ? [...j.targets] : [j.target];
+    const hasTargetList = j.targets.length > 0;
+    const selectedTarget = targets[targetIndex];
+    if (selectedTarget === undefined) {
+      setStatus(`Swap failed: target ${targetIndex + 1} no longer exists`, 'err');
+      return;
+    }
+    const nextTargets = targets.map((target, index) => (index === targetIndex ? j.source : target));
+    const next: ipc.JobFull = {
+      ...j,
+      source: selectedTarget,
+      target: targetIndex === 0 ? j.source : j.target,
+      targets: hasTargetList ? nextTargets : [],
+    };
+    let saved: ipc.JobSaveDto;
+    try {
+      saved = await ipc.saveJob(name, next, {
+        originalName: name,
+        expectedRevision: configRevision,
+      });
+    } catch (e) {
+      await reportMutationFailure(name, 'Swap failed', e);
+      return;
+    }
+    setCompareRepository((repository) => reconcileSavedJobSession(
+      repository,
+      saved,
+      { jobId, name, configRevision },
+    ));
+    resetSafetyUi();
+    setChips(new Set());
+    setOvFilter(null);
+    setOvExpanded(new Set());
+    const undo = async () => {
+      try {
+        const restored = await ipc.saveJob(saved.name, j, {
+          originalName: saved.name,
+          expectedRevision: saved.config_revision,
+        });
+        setCompareRepository((repository) => reconcileSavedJobSession(
+          repository,
+          restored,
+          { jobId: saved.job_id, name: saved.name, configRevision: saved.config_revision },
+        ));
+      } catch (e) {
+        await reportMutationFailure(saved.name, 'Could not undo the root swap', e);
+        return;
+      }
+      resetSafetyUi();
+      try {
+        await refreshJobs(saved.name);
+        setStatus(`Restored the two roots of '${saved.name}'`);
+      } catch (e) {
+        setStatus(`Restored the two roots of '${saved.name}', but refreshing the job list failed: ${e}`, 'err');
+      }
+    };
+    const success = `Swapped the two roots of '${name}' — Compare again (Ctrl+R)`;
+    try {
+      await refreshJobs(name);
+      setStatusUndo(success, 'Undo swap', undo);
+    } catch (e) {
+      setStatusUndo(`${success}; refreshing the job list failed: ${e}`, 'Undo swap', undo, 'err');
+    }
+  }, [refreshJobs, reportMutationFailure, resetSafetyUi, setStatus, setStatusUndo]);
 
   /// Write an exclude back into the job's exclude list. Pruning during the scan only takes effect at the
   /// next Compare, so the message has to say so and leave an undo behind.
   const addExcludes = useCallback(async (masks: string[], label: string) => {
     if (!currentJob) { setStatus('Select a job first', 'err'); return; }
     const name = currentJob.name;
+    let detail: ipc.JobDetailDto;
     try {
-      const j = await ipc.getJob(name);
-      const prev = [...j.exclude];
-      // Folded the way the engine folds, not by string equality: a mask typed with backslashes, in a
-      // different case, or in NFD is the same rule to the filter, and appending it again would leave
-      // two lines that mean one thing — and a preset box unticked next to its own pattern
-      const { next, added: add } = addExcludeEntries(prev, masks);
-      if (!add.length) { setStatus(`The job already has ${masks.length > 1 ? 'all of these masks' : 'this exclude'}`); return; }
-      await ipc.saveJob(name, { ...j, exclude: next });
-      await refreshJobs(name);
-      setStatusUndo(`${label}: ${add.join(', ')} — pruned during the scan from the next Compare on`, 'Undo exclude', async () => {
-        const cur = await ipc.getJob(name);
-        await ipc.saveJob(name, { ...cur, exclude: prev });
-        await refreshJobs(name);
-        setStatus('Exclude undone');
+      detail = await ipc.getJob(name);
+    } catch (e) {
+      await reportMutationFailure(name, 'Failed to read the job before adding the exclude', e);
+      return;
+    }
+    const j = detail.job;
+    const prev = [...j.exclude];
+    // Folded the way the engine folds, not by string equality: a mask typed with backslashes, in a
+    // different case, or in NFD is the same rule to the filter, and appending it again would leave
+    // two lines that mean one thing — and a preset box unticked next to its own pattern
+    const { next, added: add } = addExcludeEntries(prev, masks);
+    if (!add.length) { setStatus(`The job already has ${masks.length > 1 ? 'all of these masks' : 'this exclude'}`); return; }
+    const nextJob = { ...j, exclude: next };
+    let saved: ipc.JobSaveDto;
+    try {
+      saved = await ipc.saveJob(name, nextJob, {
+        originalName: detail.name,
+        expectedRevision: detail.config_revision,
       });
     } catch (e) {
-      setStatus(`Failed to write exclude: ${e}`, 'err');
+      await reportMutationFailure(name, 'Failed to write exclude', e);
+      return;
     }
-  }, [currentJob, refreshJobs, setStatus, setStatusUndo]);
+    setCompareRepository((repository) => reconcileSavedJobSession(
+      repository,
+      saved,
+      { jobId: detail.job_id, name: detail.name, configRevision: detail.config_revision },
+    ));
+    resetSafetyUi();
+    const undo = async () => {
+      try {
+        const restored = await ipc.saveJob(saved.name, j, {
+          originalName: saved.name,
+          expectedRevision: saved.config_revision,
+        });
+        setCompareRepository((repository) => reconcileSavedJobSession(
+          repository,
+          restored,
+          { jobId: saved.job_id, name: saved.name, configRevision: saved.config_revision },
+        ));
+      } catch (e) {
+        await reportMutationFailure(saved.name, 'Could not undo the exclude', e);
+        return;
+      }
+      resetSafetyUi();
+      try {
+        await refreshJobs(saved.name);
+        setStatus('Exclude undone');
+      } catch (e) {
+        setStatus(`Exclude undone, but refreshing the job list failed: ${e}`, 'err');
+      }
+    };
+    const success = `${label}: ${add.join(', ')} — Compare again to build a result with this exclusion`;
+    try {
+      await refreshJobs(name);
+      setStatusUndo(success, 'Undo exclude', undo);
+    } catch (e) {
+      setStatusUndo(`${success}; refreshing the job list failed: ${e}`, 'Undo exclude', undo, 'err');
+    }
+  }, [currentJob, refreshJobs, reportMutationFailure, resetSafetyUi, setStatus, setStatusUndo]);
 
   /// Export the current view (the visible set, with check state). Escaping and the BOM are handled once
   /// on the Rust side.
@@ -467,27 +1232,29 @@ export function App() {
       const p = await ipc.pickPath({
         directory: true,
         title: `Select the ${which} directory`,
-        defaultPath: which === 'source' ? currentJob?.source : currentJob?.target,
+        defaultPath: which === 'source'
+          ? currentJob?.source
+          : currentJob?.targets[selTarget] ?? currentJob?.target,
       });
       if (p) await saveRoot(which, p);
     } catch (e) {
       setStatus(`Can't open the picker: ${e}`, 'err');
     }
-  }, [currentJob, saveRoot, setStatus]);
+  }, [currentJob, selTarget, saveRoot, setStatus]);
 
   // Row interactions
 
   const toggleRow = useCallback((i: number, v: boolean) => {
     setChecked((prev) => { const next = [...prev]; next[i] = v; return next; });
-  }, []);
+  }, [setChecked]);
 
   const toggleMany = useCallback((items: number[], v: boolean) => {
     setChecked((prev) => { const next = [...prev]; for (const i of items) next[i] = v; return next; });
-  }, []);
+  }, [setChecked]);
 
   const flipRow = useCallback((i: number) => {
     setFlipped((prev) => { const next = [...prev]; next[i] = !next[i]; return next; });
-  }, []);
+  }, [setFlipped]);
 
   const foldDir = useCallback((dir: string) => {
     setCollapsedDirs((prev) => {
@@ -546,7 +1313,7 @@ export function App() {
         { label: `${dir ? 'Uncheck this folder and subfolders' : 'Uncheck root-level items'} (${sameDir.length})`, disabled: sameDir.length === 0, run: () => toggleMany(sameDir, false) },
       ],
     });
-  }, [plan, flipped, visible, currentJob, addExcludes, flipRow, toggleMany, setStatus]);
+  }, [plan, flipped, visible, currentJob, addExcludes, flipRow, toggleMany, setChecked, setStatus]);
 
   // Init
 
@@ -566,14 +1333,21 @@ export function App() {
 
   // Progress event streams
   useEffect(() => {
-    const un = listen<CompareProgressEvent>('run-progress', (ev) => {
-      const e = ev.payload;
-      if (e.purpose !== 'compare' || e.run_id < cmpRunId.current) return;
+    let disposed = false;
+    let dispose: (() => void) | undefined;
+    let ready = false;
+    let lastSequence = 0;
+    const queued: CompareProgressEvent[] = [];
+    const handle = (e: CompareProgressEvent) => {
+      if (e.purpose !== 'compare') return;
+      if (!cmpRunReady.current && e.run_id <= cmpRunFloor.current) return;
+      if (e.run_id < cmpRunId.current) return;
       if (e.run_id > cmpRunId.current) {
         cmpRunId.current = e.run_id;
         cmpRate.current.clear();
         setCmpStages([]);
       }
+      cmpRunReady.current = true;
       // A `log` event carries no phase, so the phase guard below would drop it. Errors do carry
       // one, but the guard used to sit above every branch and there was no branch to reach:
       // `phase_start` and `progress` were the only two, and a scan that could not read a directory
@@ -608,8 +1382,49 @@ export function App() {
       } else if (e.kind === 'phase_end') {
         setCmpStages((prev) => reduceCompareStages(prev, e));
       }
+    };
+    const publish = (event: CompareProgressEvent) => {
+      if (!ready) {
+        queued.push(event);
+        return;
+      }
+      if (event.sequence <= lastSequence) return;
+      lastSequence = event.sequence;
+      handle(event);
+    };
+    void listen<CompareProgressEvent>('run-progress', (event) => publish(event.payload))
+      .then(async (unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        dispose = unlisten;
+        let replay: CompareProgressEvent[] = [];
+        try {
+          replay = await ipc.replayRunEvents('compare');
+        } catch (error) {
+          setStatus(`Could not restore compare progress after reconnect: ${error}`, 'err');
+        }
+        if (disposed) return;
+        const pending = mergeRunEventReplay(replay, queued);
+        queued.length = 0;
+        ready = true;
+        for (const event of pending) publish(event);
+      })
+      .catch((error) => {
+        if (!disposed) setStatus(`Could not subscribe to compare progress: ${error}`, 'err');
+      });
+    return () => {
+      disposed = true;
+      dispose?.();
+    };
+  }, [setStatus]);
+
+  useEffect(() => {
+    const un = listen<string>('main-close-blocked', (event) => {
+      setStatus(event.payload, 'err');
     });
-    return () => { un.then((f) => f()); };
+    return () => { un.then((dispose) => dispose()); };
   }, [setStatus]);
 
   // P1: drag a directory onto a path box.
@@ -646,7 +1461,7 @@ export function App() {
         let v = first;
         try {
           const info = await ipc.inspectPaths(first, '');
-          if (info.source.exists && !info.source.is_dir) {
+          if (info.source.readiness === 'not_directory') {
             const i = Math.max(v.lastIndexOf('\\'), v.lastIndexOf('/'));
             if (i > 0) v = v.slice(0, i);
           }
@@ -673,55 +1488,266 @@ export function App() {
   useEffect(() => {
     if (!currentJob) { setCfgJob(null); return; }
     let live = true;
-    ipc.getJob(currentJob.name).then((j) => { if (live) setCfgJob(j); }).catch(() => setCfgJob(null));
+    ipc.getJob(currentJob.name).then((detail) => {
+      if (live) setCfgJob(detail.job);
+    }).catch((error) => {
+      if (!live) return;
+      setCfgJob(null);
+      setStatus(`Failed to load '${currentJob.name}' settings: ${error}`, 'err');
+    });
     return () => { live = false; };
-  }, [currentJob]);
+  }, [currentJob, setStatus]);
 
-  // AutoScan (scheduled scans; seconds = near real time)
-  const tickRef = useRef<() => void>(() => {});
-  tickRef.current = async () => {
-    if (!currentJob) { setWatchSecs(null); return; }
-    const iv = (currentJob.watch_interval_secs ?? 30) * 1000;
-    const left = watchNext.current - Date.now();
-    if (left > 0) {
-      if (!busy) setStatus(`AutoScan — next scan in ${Math.ceil(left / 1000)}s (${currentJob.name})`);
+  autoScanTriggerRef.current = async (trigger) => {
+    const ticket: AutoScanTicket = {
+      generation: trigger.generation,
+      ticketId: trigger.ticket_id,
+      jobId: trigger.job_id,
+      jobName: trigger.job_name,
+      configRevision: trigger.config_revision,
+      targetIndex: trigger.target_index,
+      autoApply: trigger.auto_apply,
+    };
+    const claim = autoScanLedger.current.claim(ticket);
+    if (claim.kind === 'duplicate') return;
+    if (claim.kind === 'capacity') {
+      setStatus('AutoScan rejected a trigger because its bounded recovery ledger is full', 'err');
+      try {
+        acceptAutoScanStatus(
+          await ipc.completeAutoScan(ticket.generation, ticket.ticketId, false, null),
+          'completion',
+          ticket.ticketId,
+        );
+      } catch (error) {
+        setStatus(`AutoScan could not release the rejected trigger: ${error}`, 'err');
+      }
       return;
     }
-    if (busy) return; // the previous round hasn't finished — skip this beat
-    watchNext.current = Date.now() + iv;
-    await doCompare();
-  };
 
-  useEffect(() => {
-    if (watchSecs === null) return;
-    const id = window.setInterval(() => tickRef.current(), 1000);
-    return () => window.clearInterval(id);
-  }, [watchSecs]);
+    const observed = autoScanStatusRef.current;
+    if (observed?.active
+      && observed.generation === ticket.generation
+      && observed.job_id === ticket.jobId
+      && observed.config_revision === ticket.configRevision
+      && observed.target_index === ticket.targetIndex) {
+      // The trigger event is itself the newest backend cursor. Materialize it into status so a
+      // delayed completion for N cannot race an event for N+1 merely because no status event exists.
+      acceptAutoScanStatus({
+        ...observed,
+        latest_ticket_id: ticket.ticketId,
+        active_ticket: ticket.ticketId,
+        pending_trigger: trigger,
+        mode: trigger.mode,
+      }, 'event');
+    }
 
-  // Auto-apply is a separate effect so it observes the plan the compare above just produced
-  const autoApplied = useRef<PlanDto | null>(null);
-  useEffect(() => {
-    if (watchSecs === null || busy || !plan || !currentJob || !currentJob.watch_auto_apply) return;
-    if (plan.ops.length === 0 || autoApplied.current === plan) return;
-    autoApplied.current = plan;
-    void (async () => {
-      const ops = plan.ops.filter((op) => selectable(op));
-      setStatus(`AutoScan found ${ops.length} differences — running automatically…`);
-      setBusy(true);
-      try {
-        await ipc.applyJobUnattended(currentJob.name, plan, ops, selTarget);
-        refreshLastSyncs();
-      } catch (e) {
-        setStatus(`Auto-sync failed: ${e}`, 'err');
+    let outcome: AutoScanOutcome;
+    if (claim.kind === 'retry_completion') {
+      outcome = claim.outcome;
+    } else {
+      let monitor = autoScanStatusRef.current;
+      const triggerMatchesMonitor = statusCanOwnAutoScanTrigger(monitor, ticket);
+      if (!triggerMatchesMonitor) {
+        try {
+          acceptAutoScanStatus(await ipc.autoScanStatus(), 'snapshot');
+          monitor = autoScanStatusRef.current;
+        } catch (error) {
+          setStatus(`AutoScan could not verify recovered trigger ownership: ${error}`, 'err');
+        }
       }
-      setBusy(false);
-    })();
-  }, [watchSecs, busy, plan, currentJob, selTarget, refreshLastSyncs, setStatus]);
 
+      const monitorMatches = statusCanOwnAutoScanTrigger(monitor, ticket);
+      let completion: CompareCompletion | null = null;
+      if (monitorMatches) {
+        autoScanTicket.current = ticket;
+        completion = await doCompare(ticket);
+      }
+      const owned = completion !== null && monitorOwnsAutoScanResult(
+        autoScanStatusRef.current,
+        autoScanTicket.current,
+        ticket,
+        completion.plan.owner,
+      );
+      outcome = { completion, owned };
+      if (!autoScanLedger.current.prepareCompletion(ticket, outcome)) return;
+    }
+
+    let completionCurrent = false;
+    try {
+      const next = await ipc.completeAutoScan(
+        ticket.generation,
+        ticket.ticketId,
+        outcome.owned,
+        outcome.owned && outcome.completion ? outcome.completion.plan.owner : null,
+      );
+      acceptAutoScanStatus(next, 'completion', ticket.ticketId);
+      autoScanLedger.current.completed(ticket);
+      const current = autoScanStatusRef.current;
+      completionCurrent = current?.active === true
+        && current.generation === ticket.generation
+        && current.latest_ticket_id === ticket.ticketId
+        && current.job_id === ticket.jobId
+        && current.config_revision === ticket.configRevision
+        && current.target_index === ticket.targetIndex
+        && current.active_ticket === null
+        && current.pending_trigger === null;
+    } catch (error) {
+      autoScanLedger.current.completionFailed(ticket);
+      try {
+        const recovered = await ipc.autoScanStatus();
+        const completedDespiteLostResponse = recovered.active
+          && recovered.generation === ticket.generation
+          && recovered.latest_ticket_id === ticket.ticketId
+          && recovered.job_id === ticket.jobId
+          && recovered.config_revision === ticket.configRevision
+          && recovered.target_index === ticket.targetIndex
+          && recovered.active_ticket === null
+          && recovered.pending_trigger === null;
+        if (completedDespiteLostResponse) {
+          acceptAutoScanStatus(recovered, 'completion', ticket.ticketId);
+          autoScanLedger.current.completed(ticket);
+          completionCurrent = true;
+        } else {
+          const samePending = recovered.active
+            && recovered.generation === ticket.generation
+            && recovered.pending_trigger?.ticket_id === ticket.ticketId;
+          if (samePending) {
+            // Connectivity is back and the backend proves the success was not committed. Release
+            // this cycle as failed instead of leaving the worker waiting forever or rerunning Compare.
+            try {
+              const released = await ipc.completeAutoScan(ticket.generation, ticket.ticketId, false, null);
+              acceptAutoScanStatus(released, 'completion', ticket.ticketId);
+              autoScanLedger.current.completed(ticket);
+              if (autoScanTicket.current?.generation === ticket.generation
+                && autoScanTicket.current.ticketId === ticket.ticketId) autoScanTicket.current = null;
+              setStatus(`AutoScan deferred this cycle after completion recovery failed: ${error}`, 'err');
+            } catch (releaseError) {
+              setStatus(`AutoScan could not release its recovered ticket: ${releaseError}`, 'err');
+            }
+            return;
+          } else {
+            acceptAutoScanStatus(recovered, 'snapshot');
+            autoScanLedger.current.completed(ticket);
+          }
+        }
+      } catch {
+        // Preserve the ready ledger record. Recovery can retry this completion without rescanning.
+      }
+      if (!completionCurrent) {
+        const current = autoScanStatusRef.current;
+        const stillPending = current?.active === true
+          && current.generation === ticket.generation
+          && current.pending_trigger?.ticket_id === ticket.ticketId;
+        if (!stillPending
+          && autoScanTicket.current?.generation === ticket.generation
+          && autoScanTicket.current.ticketId === ticket.ticketId) autoScanTicket.current = null;
+        if (autoScanTicket.current?.generation === ticket.generation
+          && autoScanTicket.current.ticketId === ticket.ticketId) {
+          setStatus(`AutoScan could not commit its compare ticket: ${error}`, 'err');
+        }
+        return;
+      }
+    }
+    if (autoScanTicket.current?.generation === ticket.generation
+      && autoScanTicket.current.ticketId === ticket.ticketId) autoScanTicket.current = null;
+    if (!completionCurrent) return;
+    if (!outcome.owned || !outcome.completion) return;
+
+    const freshPlan = outcome.completion.plan;
+    if (freshPlan.ops.length === 0) return;
+    if (!ticket.autoApply) {
+      setStatus(`AutoScan found ${freshPlan.ops.length} differences — review required`, 'err');
+      return;
+    }
+
+    if (compareInFlight.current || syncInFlight.current || editor || applyReviewTicket.current || compareReviewTicket.current) {
+      setStatus(`AutoScan found ${freshPlan.ops.length} differences — another interaction owns execution; review required`, 'err');
+      return;
+    }
+    const applyStatus = autoScanStatusRef.current;
+    if (applyStatus?.active !== true
+      || applyStatus.generation !== ticket.generation
+      || applyStatus.latest_ticket_id !== ticket.ticketId
+      || applyStatus.job_id !== ticket.jobId
+      || applyStatus.config_revision !== ticket.configRevision
+      || applyStatus.target_index !== ticket.targetIndex
+      || applyStatus.active_ticket !== null
+      || applyStatus.pending_trigger !== null
+      || autoScanTicket.current !== null) return;
+    setStatus(`AutoScan found ${freshPlan.ops.length} differences — checking the backend-owned AutoApply ticket…`);
+    autoApplyInFlight.current = true;
+    setBusy(true);
+    try {
+      let authorization: ipc.AuthorizationDto;
+      try {
+        authorization = await ipc.authorizeAutoScanApply(ticket.generation, ticket.ticketId);
+      } catch (error) {
+        setStatus(
+          `AutoApply did not run: interactive review is required for this exact job revision, target, and capability set: ${error}`,
+          'err',
+        );
+        return;
+      }
+      // Authorization failure leaves the freshly compared result intact for interactive review.
+      // Once execution begins, retire it because a rejected apply may still have made partial writes.
+      invalidateCompareRevision(ticket.jobId, ticket.configRevision);
+      try {
+        const result = await ipc.applyJob(authorization.authorization_token);
+        refreshLastSyncs();
+        setLogReload((value) => value + 1);
+        setStatus(
+          result.cancelled
+            ? `Auto-sync stopped after ${result.done} actions`
+            : `Auto-sync finished: ${result.done} run, ${result.skipped} skipped, ${result.errors} errors`,
+          result.errors ? 'err' : 'ok',
+        );
+      } catch (error) {
+        setStatus(
+          `The authorized auto-sync failed and may have made partial changes: ${error} — Compare again before continuing`,
+          'err',
+        );
+      }
+    } finally {
+      autoApplyInFlight.current = false;
+      setBusy(false);
+    }
+  };
   useEffect(() => {
-    if (watchSecs === null || !plan || !currentJob || currentJob.watch_auto_apply) return;
-    if (plan.ops.length > 0) setStatus(`AutoScan found ${plan.ops.length} differences`, 'err');
-  }, [watchSecs, plan, currentJob, setStatus]);
+    let disposed = false;
+    const removers: Array<() => void> = [];
+    void (async () => {
+      const installed = await Promise.allSettled([
+        listen<ipc.AutoScanStatusDto>('autoscan-status', ({ payload }) => {
+          if (disposed) return;
+          const accepted = acceptAutoScanStatus(payload, 'event');
+          if (accepted) setStatus(`AutoScan: ${payload.detail}`, payload.active ? '' : 'err');
+        }),
+        listen<ipc.AutoScanTriggerDto>('autoscan-trigger', ({ payload }) => {
+          if (!disposed) void autoScanTriggerRef.current(payload);
+        }),
+      ]);
+      for (const [index, result] of installed.entries()) {
+        if (result.status === 'fulfilled') {
+          if (disposed) result.value(); else removers.push(result.value);
+        } else if (!disposed) {
+          setStatus(
+            `AutoScan ${index === 0 ? 'status' : 'trigger'} subscription failed: ${result.reason}`,
+            'err',
+          );
+        }
+      }
+      if (disposed) return;
+      try {
+        acceptAutoScanStatus(await ipc.autoScanStatus(), 'snapshot');
+      } catch (error) {
+        if (!disposed) setStatus(`AutoScan status is unavailable: ${error}`, 'err');
+      }
+    })();
+    return () => {
+      disposed = true;
+      for (const remove of removers) remove();
+    };
+  }, [acceptAutoScanStatus, setStatus]);
 
   // Keyboard.
   //
@@ -734,19 +1760,15 @@ export function App() {
       // While an overlay owns the screen it owns the keyboard: F5 must not kick off a compare
       // behind an open editor
       if (ctx || editor || settingsOpen || askSwap) return;
-      if (confirmOpen) {
-        if (e.key === 'Enter' && !(preflight && !preflight.ok && !acknowledged)) void doSync();
-        return;
-      }
-      // F5 / F9 = the FFS compare / synchronize keys; Ctrl+R / Enter still work
+      if (confirmOpen) return;
+      // F5 / F9 = the FFS compare / synchronize keys; Ctrl+R also compares
       if (e.key === 'F5') { e.preventDefault(); void doCompare(); }
       else if (e.key === 'F9') { e.preventDefault(); void openConfirm(); }
       else if (mod && e.key.toLowerCase() === 'r') { e.preventDefault(); void doCompare(); }
-      else if (e.key === 'Enter' && !(document.activeElement instanceof HTMLInputElement)) void openConfirm();
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [ctx, editor, settingsOpen, askSwap, confirmOpen, preflight, acknowledged, doSync, doCompare, openConfirm]);
+  }, [ctx, editor, settingsOpen, askSwap, confirmOpen, doCompare, openConfirm]);
 
   // The funnel is anchored to its toolbar button and has no dismissal of its own; the context menu
   // brings its own (outside click, Esc, and any scroll under it), so it is not handled here
@@ -757,17 +1779,18 @@ export function App() {
   }, []);
 
   const hasRows = !!plan && plan.ops.length > 0;
+  const reviewBusy = operationReviewPending(compareReview) || operationReviewPending(applyReview);
   const confirmTotals: ConfirmTotals | null = useMemo(() => {
     if (!plan) return null;
     const t: ConfirmTotals = { copy: 0, update: 0, move: 0, del: 0, bytes: 0, delBytes: 0, flips: 0, hiddenChecked: 0 };
     for (const i of final) {
       const op = eff(plan, flipped, i);
       if (op.action === 'copy') { t.copy++; t.bytes += op.size ?? 0; }
-      else if (op.action === 'update') { t.update++; t.bytes += op.size ?? 0; }
+      else if (op.action === 'update' || op.action === 'chmod') { t.update++; t.bytes += op.size ?? 0; }
       else if (op.action === 'move') t.move++;
       else if (op.action === 'delete' || op.action === 'delete_dir') { t.del++; t.delBytes += op.size ?? 0; }
+      if (flipped[i]) t.flips++;
     }
-    t.flips = flipped.filter(Boolean).length;
     t.hiddenChecked = checked.filter(Boolean).length - final.length;
     return t;
   }, [plan, final, flipped, checked]);
@@ -777,14 +1800,15 @@ export function App() {
       <div className="app">
         <Sidebar
           jobs={jobs}
-          currentName={currentJob?.name ?? null}
+          currentJobId={currentJob?.job_id ?? null}
           lastMap={lastMap}
           busy={busy}
+          reviewing={reviewBusy}
           appVersion={appVersion}
           jobsDir={jobsDir}
           onSelect={selectJob}
-          onEdit={(name) => setEditor({ name })}
-          onNew={() => setEditor({ name: null })}
+          onEdit={(name) => { if (!busy) setEditor({ name }); }}
+          onNew={() => { if (!busy) setEditor({ name: null }); }}
         />
         <main className="main">
           <Toolbar
@@ -792,25 +1816,50 @@ export function App() {
             hasPlan={!!plan}
             finalCount={final.length}
             stats={stats}
-            busy={busy}
-            canSync={hasRows}
-            watchSecs={watchSecs}
+            busy={busy || reviewBusy}
+            canSync={final.length > 0}
+            watchStatus={autoScanStatus}
+            watchPending={autoScanControlPending}
             onCompare={() => void doCompare()}
             onSync={() => void openConfirm()}
             onToggleLog={() => setLogOpen((v) => !v)}
             onToggleWatch={() => {
-              if (watchSecs !== null) { setWatchSecs(null); setStatus('AutoScan stopped'); return; }
-              if (!currentJob) return;
-              const iv = currentJob.watch_interval_secs ?? 30;
-              watchNext.current = Date.now() + iv * 1000;
-              setWatchSecs(iv);
-              setStatus(`AutoScan on: compare every ${iv}s (the hash cache means an unchanged tree costs only the walk)${currentJob.watch_auto_apply ? ' · auto-run' : ''}`);
+              const action = autoScanToggleAction(autoScanStatusRef.current, currentJob !== null);
+              if (action === 'stop') { stopAutoScan(); return; }
+              if (action !== 'start' || !currentJob || autoScanControlPendingRef.current !== null) return;
+              const monitoredJob = currentJob;
+              const monitoredTarget = selTarget;
+              const request = autoScanControlRequest.current + 1;
+              autoScanControlRequest.current = request;
+              autoScanTicket.current = null;
+              autoScanControlPendingRef.current = 'start';
+              setAutoScanControlPending('start');
+              setStatus(`Starting AutoScan for '${monitoredJob.name}'…`);
+              void ipc.startAutoScan(
+                monitoredJob.job_id,
+                monitoredJob.config_revision,
+                monitoredTarget,
+              ).then((next) => {
+                if (autoScanControlRequest.current !== request) return;
+                if (acceptAutoScanStatus(next, 'start')) {
+                  setStatus(`AutoScan: ${next.detail}${next.auto_apply ? ' · unattended apply requires an exact prior grant' : ''}`);
+                }
+              }).catch((error) => {
+                if (autoScanControlRequest.current !== request) return;
+                setStatus(`AutoScan could not start: ${error}`, 'err');
+              }).finally(() => {
+                if (autoScanControlRequest.current === request) {
+                  autoScanControlPendingRef.current = null;
+                  setAutoScanControlPending(null);
+                }
+              });
             }}
           />
           <PathLine
             job={currentJob}
             cfgJob={cfgJob}
             busy={busy}
+            reviewing={reviewBusy}
             selTarget={selTarget}
             pathHistory={pathHistory}
             dropOn={dropOn === 'source' || dropOn === 'target' ? dropOn : null}
@@ -819,15 +1868,20 @@ export function App() {
             onBrowse={(which) => void browseRoot(which)}
             onSwap={() => void requestSwap()}
             onSelectTarget={(i) => {
-              // A different target means a different comparison, so the old plan is stale
+              if (busy || i === selTarget) return;
+              const selected = currentJob;
+              if (!selected) return;
+              selectionRef.current = { job: selected, targetIndex: i };
               setSelTarget(i);
-              setPlan(null);
-              setChecked([]);
-              setFlipped([]);
-              const t = (currentJob?.targets ?? [])[i] ?? '';
-              setStatus(`Switched target → ${t} — Compare again (Ctrl+R)`);
+              resetNavigationUi();
+              const t = selected.targets[i] ?? '';
+              const restored = sessionForSelection(compareRepository, selected, i);
+              setStatus(restored
+                ? `Switched target → ${t} · restored ${restored.plan.ops.length} compare items`
+                : `Switched target → ${t} — Compare again (Ctrl+R)`);
+              requestResultRestore(selected, i, restored);
             }}
-            onEditGroup={(g) => { if (currentJob) setEditor({ name: currentJob.name, focusGroup: g }); }}
+            onEditGroup={(g) => { if (currentJob && !busy) setEditor({ name: currentJob.name, focusGroup: g }); }}
           />
           {hasRows && !sameOpen && !cmpActive && (
             <FilterBar
@@ -836,7 +1890,7 @@ export function App() {
               chips={chips}
               onChips={setChips}
               onSearch={setSearch}
-              searchKey={currentJob?.name ?? ''}
+              searchKey={currentJob?.job_id ?? ''}
               funnelCount={funnelActive(vfilter)}
               funnelOpen={!!funnelAnchor}
               sameOpen={sameOpen}
@@ -895,13 +1949,25 @@ export function App() {
                   stages={cmpStages}
                   cancelling={cmpCancelling}
                   onCancel={() => {
+                    if (!cmpRunReady.current || cmpRunId.current < 0) {
+                      setStatus('Compare is still starting — cancel will be available when its run is registered');
+                      return;
+                    }
+                    const runId = cmpRunId.current;
                     setCmpCancelling(true);
-                    ipc.cancelRun().catch(() => {});
                     setStatus('Cancelling the compare…');
+                    ipc.cancelRun(runId).then((accepted) => {
+                      if (accepted) return;
+                      setCmpCancelling(false);
+                      setStatus('That compare already finished; no newer run was cancelled');
+                    }).catch((e) => {
+                      setCmpCancelling(false);
+                      setStatus(`Cancel failed: ${e}`, 'err');
+                    });
                   }}
                 />
-              ) : sameOpen && currentJob ? (
-                <SamePanel jobName={currentJob.name} onClose={() => setSameOpen(false)} />
+              ) : sameOpen && plan ? (
+                <SamePanel owner={plan.owner} onClose={() => setSameOpen(false)} />
               ) : hasRows ? (
                 <PlanTable
                   plan={plan!}
@@ -915,7 +1981,7 @@ export function App() {
                   sort={sort}
                   collapsedDirs={collapsedDirs}
                   wrap={tableWrap}
-                  resetKey={`${currentJob?.name}|${search}|${[...chips].join()}|${ovFilter}|${sort?.key}${sort?.dir}|${grouped}`}
+                  resetKey={`${currentJob?.job_id}|${search}|${[...chips].join()}|${ovFilter}|${sort?.key}${sort?.dir}|${grouped}`}
                   onToggleRow={toggleRow}
                   onToggleMany={toggleMany}
                   onFlip={flipRow}
@@ -982,7 +2048,7 @@ export function App() {
             setVfilter(next);
             if (next.masks.join('\n') !== vfilter.masks.join('\n')) void recomputeMasks(plan, flipped, next.masks);
           }}
-          onClear={() => { setVfilter(EMPTY_FILTER); setMaskHit([]); }}
+          onClear={() => { setVfilter(EMPTY_FILTER); clearMasks(); }}
           onPromote={(masks) => {
             if (!masks.length) { setStatus('Write at least one mask first', 'err'); return; }
             setFunnelAnchor(null);
@@ -998,20 +2064,63 @@ export function App() {
           dropOn={dropOn}
           scopeRef={setEditorScope}
           apiRef={editorApi}
+          busy={busy}
           onClose={() => setEditor(null)}
-          onSaved={async (name, job) => {
+          onSaved={async (saved, job, original) => {
+            const selectedIdentity = !!original && currentJob?.job_id === original.jobId;
+            const semanticMutation = !!original
+              && saved.config_revision !== original.configRevision;
+            const preserveRuntime = !!original
+              && !semanticMutation
+              && (saved.effect === 'renamed' || saved.effect === 'updated' || saved.effect === 'no_op');
             setEditor(null);
+            if (original) {
+              setCompareRepository((repository) => reconcileSavedJobSession(
+                repository,
+                saved,
+                original,
+              ));
+            }
+            if (original && !preserveRuntime) {
+              resetSafetyUi();
+            }
             pushHistory(job.source);
             pushHistory(job.target);
-            await refreshJobs(currentJob?.name === name ? name : undefined);
-            if (currentJob?.name === name) setCfgJob(job);
-            setStatus(`Saved '${name}'`, 'ok');
+            try {
+              await refreshJobs(selectedIdentity ? original?.name : undefined);
+              if (selectedIdentity) setCfgJob(job);
+              setStatus(
+                saved.effect === 'no_op' ? `No changes to save for '${saved.name}'` : `Saved '${saved.name}'`,
+                'ok',
+              );
+            } catch (e) {
+              setStatus(`Saved '${saved.name}', but refreshing the job list failed: ${e}`, 'err');
+            }
           }}
-          onDeleted={async (name) => {
+          onDeleted={async (deleted) => {
             setEditor(null);
-            if (currentJob?.name === name) { setCurrentJob(null); setPlan(null); setChecked([]); setFlipped([]); }
-            await refreshJobs();
-            setStatus(`Deleted '${name}'`);
+            invalidateCompareJob(deleted.job_id);
+            resetSafetyUi();
+            if (currentJob?.job_id === deleted.job_id) {
+              setCurrentJob(null);
+              setSelTarget(0);
+            }
+            try {
+              await refreshJobs();
+              setStatus(`Deleted '${deleted.name}'`);
+            } catch (e) {
+              setStatus(`Deleted '${deleted.name}', but refreshing the job list failed: ${e}`, 'err');
+            }
+          }}
+          onMutationConflict={async (name, original) => {
+            const list = await refreshJobs(name);
+            if (!original) return;
+            const refreshed = list.find((candidate) => candidate.job_id === original.jobId) ?? null;
+            setCompareRepository((repository) => reconcileRefreshedJobSession(repository, original, refreshed));
+            if (currentJob?.job_id === original.jobId
+              && (!refreshed || currentJob.config_revision !== refreshed.config_revision)) {
+              resetNavigationUi();
+            }
           }}
           onStatus={setStatus}
         />
@@ -1027,13 +2136,23 @@ export function App() {
         <ConfirmDialog
           title={`Swap the two roots of '${askSwap.name}'?`}
           message={
-            `source ← ${askSwap.job.target}\ntarget ← ${askSwap.job.source}\n\n` +
+            `source ← ${(askSwap.job.targets.length ? askSwap.job.targets : [askSwap.job.target])[askSwap.targetIndex]}\n` +
+            `target ${askSwap.targetIndex + 1} ← ${askSwap.job.source}\n\n` +
             (askSwap.job.mode === 'mirror'
               ? 'In mirror mode this reverses which side is authoritative: after the swap, the original target wins.\n\n'
               : '') +
             'The job file is rewritten and the current compare result is discarded. The status bar keeps an undo.'
           }
-          actions={[{ label: 'Swap them', onConfirm: () => void doSwap(askSwap.name, askSwap.job) }]}
+          actions={[{
+            label: 'Swap them',
+            onConfirm: () => void doSwap(
+              askSwap.jobId,
+              askSwap.name,
+              askSwap.job,
+              askSwap.configRevision,
+              askSwap.targetIndex,
+            ),
+          }]}
           onCancel={() => setAskSwap(null)}
         />
       )}
@@ -1041,12 +2160,20 @@ export function App() {
         <ConfirmSheet
           job={currentJob}
           totals={confirmTotals}
-          preflight={preflight}
-          preflightError={preflightError}
-          acknowledged={acknowledged}
-          onAcknowledge={setAcknowledged}
-          onCancel={() => setConfirmOpen(false)}
+          reviewState={applyReview}
+          choices={applyChoices}
+          onChoices={setApplyChoices}
+          onCancel={resetConfirmation}
           onConfirm={() => void doSync()}
+        />
+      )}
+      {compareReview.review && compareReview.review.status !== 'direct_authorized' && (
+        <CompareReviewSheet
+          state={compareReview}
+          choices={compareChoices}
+          onChoices={setCompareChoices}
+          onCancel={resetCompareReview}
+          onApprove={() => void approveCompareReview()}
         />
       )}
     </>

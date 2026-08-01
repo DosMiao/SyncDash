@@ -1,34 +1,51 @@
 //! What each op did: one record to the event stream and the run log.
 
+use super::schedule::{Counters, Shared};
 use crate::model::event::ItemOutcome;
 use crate::model::plan::{Op, Side};
-use super::schedule::{Counters, Shared};
 use crate::obs::progress::PhaseProgress;
 use std::sync::atomic::Ordering;
 
 /// Book the result of a single op: an error never aborts the whole run (FFS accumulating semantics),
 /// each one emits an Error event through the sink (the first time the windowed desktop build can really see errors) plus keeps the eprintln for the CLI.
-pub(super) fn record(sh: &Shared, op: &Op, res: std::io::Result<()>, pp: &PhaseProgress, acc: &Counters, ms: u64) {
+pub(super) fn record(
+    sh: &Shared,
+    op: &Op,
+    res: std::io::Result<()>,
+    pp: &PhaseProgress,
+    acc: &Counters,
+    ms: u64,
+) {
     let label = format!(
         "[{}] {:?} {}",
-        if op.side == Side::Target { "target" } else { "source" },
+        if op.side == Side::Target {
+            "target"
+        } else {
+            "source"
+        },
         op.action,
         op.path
     );
-    let side = if op.side == Side::Target { "target" } else { "source" };
+    let side = if op.side == Side::Target {
+        "target"
+    } else {
+        "source"
+    };
     // Every op's outcome emits one ItemResult — this is the only place in the codebase that knows "did this one actually succeed";
     // outside this function all that remains are three aggregate counters. The execution ledger (items.jsonl) rests entirely on it.
     let ledger = |outcome: ItemOutcome| {
-        sh.ctx.sink.emit(crate::model::event::ProgressEvent::ItemResult {
-            ts_ms: crate::foundation::time::now_ms(),
-            path: op.path.clone(),
-            action: format!("{:?}", op.action),
-            side: side.to_string(),
-            outcome,
-            // The item's own size (a delta update actually writes fewer bytes — that is a link metric, not a ledger metric)
-            bytes: op.size.unwrap_or(0),
-            ms,
-        });
+        sh.ctx
+            .sink
+            .emit(crate::model::event::ProgressEvent::ItemResult {
+                ts_ms: crate::foundation::time::now_ms(),
+                path: op.path.clone(),
+                action: format!("{:?}", op.action),
+                side: side.to_string(),
+                outcome,
+                // The item's own size (a delta update actually writes fewer bytes — that is a link metric, not a ledger metric)
+                bytes: op.size.unwrap_or(0),
+                ms,
+            });
     };
     match res {
         Ok(_) => {

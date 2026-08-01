@@ -4,13 +4,13 @@
 //! streams, and it must produce a snapshot indistinguishable from the local lane's for the same
 //! content — including the exclusion counts, which the UI reports.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::foundation::time::now_ms;
 use crate::model::table::{Entry, EntryKind, Header, Snapshot, SCHEMA};
 
 use super::digest::{effective_read, full_hash_vfs, sampled_digest_vfs, SAMPLE_MIN};
-use super::ScanOptions;
+use super::{ScanMetrics, ScanOptions};
 
 /// What the hashing pass produced for one pending entry.
 ///
@@ -47,19 +47,32 @@ pub(super) fn scan_vfs(
     };
     let started = now_ms();
     let t0 = std::time::Instant::now();
+    let mut metrics = ScanMetrics::default();
     let identity = vfs.identity();
     let caps = vfs.caps();
     // A backend without ranged reads cannot sample — the tier upgrades to full reads.
     // Never silent: preflight already put a NeedsAck line in front of the user, and the
     // snapshot's VfsNote records the tier that actually ran.
     let sampled = opt.sampled && caps.ranged_read.yes();
-    let cache = if opt.hash && opt.use_cache { crate::store::hashcache::load_by_key(&identity) } else { HashMap::new() };
+    let measured = std::time::Instant::now();
+    // A no-cache scan must not reuse these hashes, but it still needs the previous table in order
+    // to retain rows deliberately outside the active filter domain when reconciliation completes.
+    let cache = if opt.hash {
+        crate::store::hashcache::load_by_key(&identity)
+    } else {
+        HashMap::new()
+    };
+    metrics.cache_load_ms = measured.elapsed().as_millis() as u64;
+    let measured = std::time::Instant::now();
     let mtime_fixes = crate::store::mtimefix::load_by_key(&identity);
+    let mut matched_mtime_fixes = HashSet::new();
+    metrics.mtime_load_ms = measured.elapsed().as_millis() as u64;
 
     let mut entries: Vec<Entry> = Vec::new();
     struct PendingVfs {
         rel: String,
         size: u64,
+        raw_mt: i64,
         mt: i64,
         hash: Option<String>,
         /// Hashing was attempted and failed — not the same fact as `hash: None`, which also means
@@ -77,6 +90,7 @@ pub(super) fn scan_vfs(
 
     // Engine-driven DFS: one read_dir round-trip per kept directory
     let mut stack: Vec<String> = vec![String::new()];
+    let measured = std::time::Instant::now();
     while let Some(dir) = stack.pop() {
         pp.checkpoint()?;
         let list = match vfs.read_dir(&dir) {
@@ -102,12 +116,27 @@ pub(super) fn scan_vfs(
             }
         };
         for de in list {
-            let rel = if dir.is_empty() { de.name.clone() } else { format!("{dir}/{}", de.name) };
+            let rel = if dir.is_empty() {
+                de.name.clone()
+            } else {
+                format!("{dir}/{}", de.name)
+            };
             match de.meta.kind {
                 EntryKind::Dir => {
                     let (pass, child_might_match) = opt.filter.pass_dir(&rel);
                     if pass {
-                        entries.push(Entry { path: rel.clone(), kind: EntryKind::Dir, size: 0, mtime_ms: de.meta.mtime_ms, hash: None, hash_failed: false, file_id: None, mode: None, link: None, prev: None });
+                        entries.push(Entry {
+                            path: rel.clone(),
+                            kind: EntryKind::Dir,
+                            size: 0,
+                            mtime_ms: de.meta.mtime_ms,
+                            hash: None,
+                            hash_failed: false,
+                            file_id: None,
+                            mode: None,
+                            link: None,
+                            prev: None,
+                        });
                     }
                     if pass || child_might_match {
                         stack.push(rel);
@@ -125,7 +154,18 @@ pub(super) fn scan_vfs(
                     }
                     if opt.symlinks_direct {
                         let target = de.meta.link.clone().or_else(|| vfs.read_link(&rel).ok());
-                        entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: de.meta.mtime_ms, hash: None, hash_failed: false, file_id: None, mode: None, link: target, prev: None });
+                        entries.push(Entry {
+                            path: rel,
+                            kind: EntryKind::Symlink,
+                            size: 0,
+                            mtime_ms: de.meta.mtime_ms,
+                            hash: None,
+                            hash_failed: false,
+                            file_id: None,
+                            mode: None,
+                            link: target,
+                            prev: None,
+                        });
                     }
                 }
                 EntryKind::File => {
@@ -136,11 +176,14 @@ pub(super) fn scan_vfs(
                     let size = de.meta.size;
                     let raw_mt = de.meta.mtime_ms;
                     let mt = match mtime_fixes.get(&rel) {
-                        Some((ondisk, intended)) if *ondisk == raw_mt => *intended,
+                        Some((ondisk, intended)) if *ondisk == raw_mt => {
+                            matched_mtime_fixes.insert(rel.clone());
+                            *intended
+                        }
                         _ => raw_mt,
                     };
                     let mut hash = None;
-                    if opt.hash && opt.use_cache {
+                    if opt.hash && opt.use_cache && !matched_mtime_fixes.contains(&rel) {
                         if let Some((cs, cm, ch)) = cache.get(&rel) {
                             let want_sampled = sampled && size >= SAMPLE_MIN;
                             if *cs == size && *cm == mt && ch.starts_with('~') == want_sampled {
@@ -148,12 +191,39 @@ pub(super) fn scan_vfs(
                             }
                         }
                     }
-                    pending.push(PendingVfs { rel, size, mt, hash, hash_failed: false, file_id: de.meta.file_id, mode: de.meta.mode });
+                    pending.push(PendingVfs {
+                        rel,
+                        size,
+                        raw_mt,
+                        mt,
+                        hash,
+                        hash_failed: false,
+                        file_id: de.meta.file_id,
+                        mode: de.meta.mode,
+                    });
                     pp.item_done(&pending.last().unwrap().rel);
                 }
             }
         }
     }
+    metrics.walk_ms = measured.elapsed().as_millis() as u64;
+    metrics.files = pending.len() as u64;
+    metrics.cache_hits = pending.iter().filter(|file| file.hash.is_some()).count() as u64;
+    let coverage = if walk_errors == 0 {
+        crate::store::ScanCoverage::Complete
+    } else {
+        crate::store::ScanCoverage::Partial
+    };
+    let retain_absent: HashSet<String> = if coverage == crate::store::ScanCoverage::Complete {
+        cache
+            .keys()
+            .chain(mtime_fixes.keys())
+            .filter(|path| !opt.filter.pass_file(path))
+            .cloned()
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     if walk_errors > 0 {
         crate::log_warn!(
@@ -171,7 +241,11 @@ pub(super) fn scan_vfs(
     }
 
     let bytes_to_hash: u64 = if opt.hash {
-        pending.iter().filter(|p| p.hash.is_none()).map(|p| effective_read(p.size, sampled)).sum()
+        pending
+            .iter()
+            .filter(|p| p.hash.is_none())
+            .map(|p| effective_read(p.size, sampled))
+            .sum()
     } else {
         0
     };
@@ -182,10 +256,13 @@ pub(super) fn scan_vfs(
     }
 
     let hash_errors;
+    let actual_bytes_read = AtomicU64::new(0);
+    let measured = std::time::Instant::now();
     if opt.hash {
         // Not rayon: the bottleneck is the network, and the width belongs to the backend
         // (its connection budget), not to the CPU count
         let width = caps.max_parallel_streams.clamp(1, 4);
+        metrics.workers = width;
         let next = AtomicUsize::new(0);
         let err_count = AtomicU64::new(0);
         let hashes: Vec<std::sync::OnceLock<HashOutcome>> =
@@ -205,10 +282,29 @@ pub(super) fn scan_vfs(
                         continue;
                     }
                     let res = if sampled && p.size >= SAMPLE_MIN {
-                        sampled_digest_vfs(vfs.as_ref(), &p.rel, p.size)
+                        sampled_digest_vfs(vfs.as_ref(), &p.rel, p.size, |n| {
+                            actual_bytes_read.fetch_add(n, Ordering::Relaxed);
+                            pp.add_bytes(n, &p.rel);
+                        })
                     } else {
-                        full_hash_vfs(vfs.as_ref(), &p.rel, &pp)
-                    };
+                        full_hash_vfs(vfs.as_ref(), &p.rel, p.size, &pp, |n| {
+                            actual_bytes_read.fetch_add(n, Ordering::Relaxed);
+                            pp.add_bytes(n, &p.rel);
+                        })
+                    }
+                    .and_then(|hash| match vfs.stat(&p.rel)? {
+                        Some(meta)
+                            if meta.kind == EntryKind::File
+                                && meta.size == p.size
+                                && meta.mtime_ms == p.raw_mt =>
+                        {
+                            Ok(hash)
+                        }
+                        _ => Err(crate::fs::vfs::error::VfsError::new(
+                            VfsErrorKind::Io,
+                            "file changed while content evidence was being read",
+                        )),
+                    });
                     match res {
                         Ok(h) => {
                             let _ = hashes[i].set(HashOutcome::Done(h));
@@ -223,8 +319,6 @@ pub(super) fn scan_vfs(
                             let _ = hashes[i].set(HashOutcome::Failed);
                         }
                     }
-                    let eff = effective_read(p.size, sampled);
-                    pp.add_bytes(eff, &p.rel);
                     pp.item_done(&p.rel);
                 });
             }
@@ -242,16 +336,51 @@ pub(super) fn scan_vfs(
     } else {
         hash_errors = 0;
     }
+    metrics.hash_ms = measured.elapsed().as_millis() as u64;
+    metrics.read_bytes = actual_bytes_read.load(Ordering::Relaxed);
 
+    let measured = std::time::Instant::now();
     for p in pending {
-        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, hash_failed: p.hash_failed, file_id: p.file_id, mode: p.mode, link: None, prev: None });
+        entries.push(Entry {
+            path: p.rel,
+            kind: EntryKind::File,
+            size: p.size,
+            mtime_ms: p.mt,
+            hash: p.hash,
+            hash_failed: p.hash_failed,
+            file_id: p.file_id,
+            mode: p.mode,
+            link: None,
+            prev: None,
+        });
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+    metrics.finalize_ms = measured.elapsed().as_millis() as u64;
+    let measured = std::time::Instant::now();
     if opt.hash {
-        crate::store::hashcache::save_by_key(&identity, &entries);
+        if crate::store::hashcache::save_by_key(&identity, &entries, coverage, &retain_absent)
+            == crate::store::StateWriteStatus::Failed
+        {
+            metrics.state_failures += 1;
+        }
     }
+    if crate::store::mtimefix::reconcile_by_key(
+        &identity,
+        &mtime_fixes,
+        &entries,
+        coverage,
+        &matched_mtime_fixes,
+        &retain_absent,
+    ) == crate::store::StateWriteStatus::Failed
+    {
+        metrics.state_failures += 1;
+    }
+    metrics.state_write_ms = measured.elapsed().as_millis() as u64;
     if hash_errors > 0 {
-        crate::log_warn!("scan", "warning: {hash_errors} file(s) could not be hashed (in use / unreadable)");
+        crate::log_warn!(
+            "scan",
+            "warning: {hash_errors} file(s) could not be hashed (in use / unreadable)"
+        );
     }
 
     let snapshot = Snapshot {
@@ -280,6 +409,7 @@ pub(super) fn scan_vfs(
         },
         entries,
     };
+    metrics.emit(ctx, side, "vfs");
     pp.finish()?;
     Ok(snapshot)
 }

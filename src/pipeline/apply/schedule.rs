@@ -6,15 +6,15 @@
 //! by another machine, so the ordering is re-derived here.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::model::plan::Op;
-use crate::obs::progress::{PhaseProgress, RunCtx};
-use super::ApplyOptions;
-use super::ops::exec_op;
-use crate::model::plan::Side;
 use super::ledger::record;
+use super::ops::exec_op;
+use super::ApplyOptions;
+use crate::model::plan::Op;
+use crate::model::plan::Side;
+use crate::obs::progress::{PhaseProgress, RunCtx};
 
 /// Execution environment shared by the worker threads. All counters are atomic and writers sit behind locks — a worker only borrows &Shared.
 pub(super) struct Shared<'a> {
@@ -28,16 +28,19 @@ pub(super) struct Shared<'a> {
     pub(super) target_local: Option<PathBuf>,
     /// Whether the central trash store may take each side's deletions.
     ///
-    /// A separate question from `local_of`, and the reason this field exists: `\\nas\share` is a
-    /// real local path, so the delta lane does apply to it — but it is on another machine, so a
-    /// move into the store on this one copies every deleted file across the network first.
+    /// A separate question from `local_of`, and the reason this field exists: a mounted share or
+    /// external disk is a real local path, so the delta lane applies, but a move into a store on
+    /// another volume would copy every deleted file first.
     pub(super) source_trash_ok: bool,
     pub(super) target_trash_ok: bool,
     pub(super) trash: PathBuf,
-    /// The in-root retention area for remote sides: `.syncdash/trash/<run_ms>` under
-    /// the executing root — originals move there by RENAME on the far side, nothing
-    /// is downloaded. Named in the preflight report before it is ever used.
-    pub(super) remote_keep_rel: String,
+    /// The in-root retention area for every side that cannot rename into the central store:
+    /// `.syncdash/trash/<run_ms>` under that root. This includes protocol roots, mounted shares,
+    /// and external local volumes.
+    pub(super) in_root_keep_rel: String,
+    pub(super) central_preserved: AtomicBool,
+    pub(super) source_in_root_preserved: AtomicBool,
+    pub(super) target_in_root_preserved: AtomicBool,
     pub(super) ver_source: Mutex<Option<crate::store::version::VersionWriter>>,
     pub(super) ver_target: Mutex<Option<crate::store::version::VersionWriter>>,
     /// Directories already ensured on each side this run (spares one round-trip per file on remote roots)
@@ -50,7 +53,13 @@ pub(super) struct Shared<'a> {
 }
 
 impl<'a> Shared<'a> {
-    pub(super) fn exec_other(&self, side: &Side) -> (&std::sync::Arc<dyn crate::fs::vfs::Vfs>, &std::sync::Arc<dyn crate::fs::vfs::Vfs>) {
+    pub(super) fn exec_other(
+        &self,
+        side: &Side,
+    ) -> (
+        &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+        &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    ) {
         match side {
             Side::Target => (self.target, self.source),
             Side::Source => (self.source, self.target),
@@ -71,8 +80,35 @@ impl<'a> Shared<'a> {
         }
     }
 
+    pub(super) fn note_central_preservation(&self) {
+        self.central_preserved.store(true, Ordering::Relaxed);
+    }
+
+    pub(super) fn note_in_root_preservation(&self, side: &Side) {
+        match side {
+            Side::Source => self.source_in_root_preserved.store(true, Ordering::Relaxed),
+            Side::Target => self.target_in_root_preserved.store(true, Ordering::Relaxed),
+        }
+    }
+
+    pub(super) fn central_preservation_used(&self) -> bool {
+        self.central_preserved.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn in_root_preservation_used(&self, side: &Side) -> bool {
+        match side {
+            Side::Source => self.source_in_root_preserved.load(Ordering::Relaxed),
+            Side::Target => self.target_in_root_preserved.load(Ordering::Relaxed),
+        }
+    }
+
     /// Ensure a directory exists on `exec`, memoized per (side, rel).
-    pub(super) fn ensure_dir(&self, side: &Side, exec: &std::sync::Arc<dyn crate::fs::vfs::Vfs>, rel: &str) -> std::io::Result<()> {
+    pub(super) fn ensure_dir(
+        &self,
+        side: &Side,
+        exec: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+        rel: &str,
+    ) -> std::io::Result<()> {
         if rel.is_empty() {
             return Ok(());
         }
@@ -99,7 +135,13 @@ pub(super) struct Counters {
 /// pause, and these are threads of our own to park. Handing them to the global pool would mean a
 /// user pressing Pause pins rayon workers for as long as they like. (This used to be justified by
 /// verify's blake3 occupying that pool already; it no longer does — nothing here maps a file.)
-pub(super) fn run_class(class: &[&Op], width: usize, sh: &Shared, pp: &PhaseProgress, acc: &Counters) {
+pub(super) fn run_class(
+    class: &[&Op],
+    width: usize,
+    sh: &Shared,
+    pp: &PhaseProgress,
+    acc: &Counters,
+) {
     if class.is_empty() {
         return;
     }

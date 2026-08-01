@@ -72,7 +72,12 @@ impl Default for ApplyOptions {
     }
 }
 
-pub fn apply(ops: &[Op], source_root: &Path, target_root: &Path, opt: &ApplyOptions) -> (u64, u64, u64) {
+pub fn apply(
+    ops: &[Op],
+    source_root: &Path,
+    target_root: &Path,
+    opt: &ApplyOptions,
+) -> (u64, u64, u64) {
     apply_with(ops, source_root, target_root, opt, &RunCtx::null()).into_tuple()
 }
 
@@ -86,10 +91,12 @@ pub fn apply_with(
     opt: &ApplyOptions,
     ctx: &RunCtx,
 ) -> ApplyOutcome {
-    let sv: std::sync::Arc<dyn crate::fs::vfs::Vfs> =
-        std::sync::Arc::new(crate::fs::vfs::local::LocalVfs::new(source_root.to_path_buf()));
-    let tv: std::sync::Arc<dyn crate::fs::vfs::Vfs> =
-        std::sync::Arc::new(crate::fs::vfs::local::LocalVfs::new(target_root.to_path_buf()));
+    let sv: std::sync::Arc<dyn crate::fs::vfs::Vfs> = std::sync::Arc::new(
+        crate::fs::vfs::local::LocalVfs::new(source_root.to_path_buf()),
+    );
+    let tv: std::sync::Arc<dyn crate::fs::vfs::Vfs> = std::sync::Arc::new(
+        crate::fs::vfs::local::LocalVfs::new(target_root.to_path_buf()),
+    );
     apply_vfs(ops, &sv, &tv, opt, ctx)
 }
 
@@ -112,7 +119,190 @@ pub fn copy_width(
     if has_dup {
         return 1;
     }
-    pref.min(src.max_parallel_streams.min(tgt.max_parallel_streams)).max(1)
+    pref.min(src.max_parallel_streams.min(tgt.max_parallel_streams))
+        .max(1)
+}
+
+fn in_root_retention_display(sh: &Shared<'_>, side: &Side) -> String {
+    if let Some(root) = sh.local_of(side) {
+        crate::foundation::path::join_native(root, &sh.in_root_keep_rel)
+            .display()
+            .to_string()
+    } else {
+        let exec = match side {
+            Side::Source => sh.source,
+            Side::Target => sh.target,
+        };
+        format!(
+            "{}/{}",
+            exec.display().trim_end_matches('/'),
+            sh.in_root_keep_rel
+        )
+    }
+}
+
+fn report_preservation_routes(sh: &Shared<'_>) {
+    use crate::model::event::LogLevel;
+
+    if sh.central_preservation_used() {
+        sh.ctx.log(
+            LogLevel::Info,
+            "apply",
+            format!(
+                "trash (central; deleted/overwritten originals kept at): {}",
+                sh.trash.display()
+            ),
+        );
+    }
+    for (side, label) in [(Side::Source, "source"), (Side::Target, "target")] {
+        if sh.in_root_preservation_used(&side) {
+            sh.ctx.log(
+                LogLevel::Info,
+                "apply",
+                format!(
+                    "trash ({label} in-root; deleted/overwritten originals kept at): {}",
+                    in_root_retention_display(sh, &side)
+                ),
+            );
+        }
+    }
+}
+
+/// Plans can come from files or another process, so every executable relative path is validated at
+/// the last common boundary before any backend is opened. A local backend ultimately joins strings
+/// onto its root; allowing `..`, an absolute path, or a drive prefix here would escape that root.
+fn mutates_path(op: &Op) -> bool {
+    matches!(
+        op.action,
+        Action::Copy | Action::Update | Action::Move | Action::Delete | Action::Chmod
+    )
+}
+
+fn valid_move_hash(hash: &str) -> bool {
+    let digest = hash.strip_prefix('~').unwrap_or(hash);
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_ordered_move_source_recreation(ops: &[Op], moving: &Op, mutation: &Op) -> bool {
+    // `Update` always reads this same relative path from `other`, i.e. the opposite root. The
+    // scheduler runs the whole Move class before Update regardless of serialized plan order, so
+    // this is a deliberate consume-then-recreate chain rather than two writers racing one name.
+    // Reasons are deliberately excluded: imported plans must not gain authority by spoofing text.
+    moving.action == Action::Move
+        && mutation.action == Action::Update
+        && moving.side == mutation.side
+        && moving.from.as_deref() == Some(mutation.path.as_str())
+        && mutation.from.is_none()
+        && ops
+            .iter()
+            .filter(|candidate| {
+                candidate.action == Action::Move
+                    && candidate.side == moving.side
+                    && candidate.from == moving.from
+            })
+            .count()
+            == 1
+        && ops
+            .iter()
+            .filter(|candidate| {
+                mutates_path(candidate)
+                    && candidate.side == mutation.side
+                    && candidate.path == mutation.path
+            })
+            .count()
+            == 1
+}
+
+fn validate_op_paths(ops: &[Op]) -> Result<(), String> {
+    let mut mutations = std::collections::HashSet::new();
+    let mut move_sources = std::collections::HashSet::new();
+    for op in ops
+        .iter()
+        .filter(|op| !matches!(op.action, Action::Conflict | Action::Note))
+    {
+        if !crate::foundation::path::is_safe_rel(&op.path) {
+            return Err(format!("unsafe operation path: {}", op.path));
+        }
+        if matches!(op.action, Action::Move) {
+            let from = op
+                .from
+                .as_deref()
+                .ok_or_else(|| format!("move operation is missing its source path: {}", op.path))?;
+            if !crate::foundation::path::is_safe_rel(from) {
+                return Err(format!("unsafe move source path: {from}"));
+            }
+            if from == op.path {
+                return Err(format!("move source and destination are identical: {from}"));
+            }
+            if op.size.is_none() {
+                return Err(format!(
+                    "move operation has no source-size evidence: {from}"
+                ));
+            }
+            if op.hash.is_none() && op.mtime_ms.is_none() && op.link.is_none() {
+                return Err(format!(
+                    "move operation has neither content, mtime, nor symlink-target evidence: {from}"
+                ));
+            }
+            if op
+                .hash
+                .as_deref()
+                .is_some_and(|hash| !valid_move_hash(hash))
+            {
+                return Err(format!(
+                    "move operation has an invalid content digest: {from}"
+                ));
+            }
+            if op.link.is_some() && op.hash.is_some() {
+                return Err(format!(
+                    "move operation ambiguously carries both file and symlink evidence: {from}"
+                ));
+            }
+            let source_key = (op.side == Side::Source, from);
+            if !move_sources.insert(source_key) {
+                return Err(format!(
+                    "duplicate move source for {} path: {from}",
+                    if op.side == Side::Source {
+                        "source"
+                    } else {
+                        "target"
+                    }
+                ));
+            }
+            let planned_recreation = ops.iter().any(|mutation| {
+                mutation.path == from && is_ordered_move_source_recreation(ops, op, mutation)
+            });
+            if mutations.contains(&source_key) && !planned_recreation {
+                return Err(format!(
+                    "move source is also mutated by another operation on the same side: {from}"
+                ));
+            }
+        }
+        if mutates_path(op) {
+            let mutation_key = (op.side == Side::Source, op.path.as_str());
+            let planned_recreation = ops
+                .iter()
+                .any(|moving| is_ordered_move_source_recreation(ops, moving, op));
+            if move_sources.contains(&mutation_key) && !planned_recreation {
+                return Err(format!(
+                    "move source is also mutated by another operation on the same side: {}",
+                    op.path
+                ));
+            }
+            if !mutations.insert(mutation_key) {
+                return Err(format!(
+                    "duplicate mutation for {} path: {}",
+                    if op.side == Side::Source {
+                        "source"
+                    } else {
+                        "target"
+                    },
+                    op.path
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// v0.9 M1 → v0.10 VFS: the execution body with progress/cancel/pause, now over a
@@ -127,8 +317,21 @@ pub fn apply_vfs(
     opt: &ApplyOptions,
     ctx: &RunCtx,
 ) -> ApplyOutcome {
+    if let Err(error) = validate_op_paths(ops) {
+        crate::log_error!("apply", "refusing plan before writes: {error}");
+        return ApplyOutcome {
+            done: 0,
+            skipped: ops.len() as u64,
+            errors: 1,
+            bytes_copied: 0,
+            cancelled: false,
+        };
+    }
     // Apply's totals are known before it starts: the UI percentage formula is valid from t=0
-    let items_total = ops.iter().filter(|o| !matches!(o.action, Action::Conflict | Action::Note)).count() as u64;
+    let items_total = ops
+        .iter()
+        .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
+        .count() as u64;
     let bytes_total: u64 = ops
         .iter()
         .filter(|o| matches!(o.action, Action::Copy | Action::Update) && o.link.is_none())
@@ -145,7 +348,12 @@ pub fn apply_vfs(
                 acc.skipped.fetch_add(1, Ordering::Relaxed);
             }
             Action::Note => {
-                println!("NOTE      {} ({} from={})", op.path, op.reason, op.from.clone().unwrap_or_default());
+                println!(
+                    "NOTE      {} ({} from={})",
+                    op.path,
+                    op.reason,
+                    op.from.clone().unwrap_or_default()
+                );
                 acc.skipped.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
@@ -153,11 +361,18 @@ pub fn apply_vfs(
     }
 
     if opt.dry_run {
-        for op in ops.iter().filter(|o| !matches!(o.action, Action::Conflict | Action::Note)) {
+        for op in ops
+            .iter()
+            .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
+        {
             if opt.verbose {
                 let label = format!(
                     "[{}] {:?} {}",
-                    if op.side == Side::Target { "target" } else { "source" },
+                    if op.side == Side::Target {
+                        "target"
+                    } else {
+                        "source"
+                    },
                     op.action,
                     op.path
                 );
@@ -178,8 +393,16 @@ pub fn apply_vfs(
 
     let source_local = source.as_local().map(|p| p.to_path_buf());
     let target_local = target.as_local().map(|p| p.to_path_buf());
-    let source_trash_ok = source.caps().local_trash;
-    let target_trash_ok = target.caps().local_trash;
+    let trash = opt.trash.clone().unwrap_or_else(default_trash);
+    // `local_trash` describes only the normal store. Callers may configure another path, so the
+    // actual batch directory decides reachability for every real local root. Protocol roots have
+    // no local path and therefore always retain originals inside themselves.
+    let source_trash_ok = source_local
+        .as_deref()
+        .is_some_and(|root| crate::fs::vfs::local::same_device(root, &trash));
+    let target_trash_ok = target_local
+        .as_deref()
+        .is_some_and(|root| crate::fs::vfs::local::same_device(root, &trash));
 
     // The FFS dir_lock idea: lock both roots (with a heartbeat) before touching anything, so two machines cannot apply to the same directory at once.
     // Pause spins on 100ms instead of suspending and returning precisely so these two locks' heartbeat threads keep beating while paused.
@@ -189,14 +412,26 @@ pub fn apply_vfs(
             Ok(l) => l,
             Err(e) => {
                 crate::log_error!("apply", "cannot lock source root: {e}");
-                return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
+                return ApplyOutcome {
+                    done: 0,
+                    skipped: ops.len() as u64,
+                    errors: 1,
+                    bytes_copied: 0,
+                    cancelled: false,
+                };
             }
         };
         let lt = match crate::fs::lock::RootLock::acquire_vfs(target) {
             Ok(l) => l,
             Err(e) => {
                 crate::log_error!("apply", "cannot lock target root: {e}");
-                return ApplyOutcome { done: 0, skipped: ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false };
+                return ApplyOutcome {
+                    done: 0,
+                    skipped: ops.len() as u64,
+                    errors: 1,
+                    bytes_copied: 0,
+                    cancelled: false,
+                };
             }
         };
         (ls, lt)
@@ -211,12 +446,15 @@ pub fn apply_vfs(
         target_local,
         source_trash_ok,
         target_trash_ok,
-        trash: opt.trash.clone().unwrap_or_else(default_trash),
-        remote_keep_rel: format!(
+        trash,
+        in_root_keep_rel: format!(
             "{}/trash/{}",
             crate::foundation::names::APP_DIR,
             crate::foundation::time::now_ms()
         ),
+        central_preserved: std::sync::atomic::AtomicBool::new(false),
+        source_in_root_preserved: std::sync::atomic::AtomicBool::new(false),
+        target_in_root_preserved: std::sync::atomic::AtomicBool::new(false),
         ver_source: Mutex::new(None),
         ver_target: Mutex::new(None),
         mkdir_memo: Mutex::new(std::collections::HashSet::new()),
@@ -252,7 +490,9 @@ pub fn apply_vfs(
 
     // The same (side, path) appearing twice (a plan shouldn't generate that, but flipping direction by hand can) → parallel would race on the write, so force sequential
     let mut seen = std::collections::HashSet::new();
-    let has_dup = copies.iter().any(|o| !seen.insert((o.side == Side::Source, o.path.as_str())));
+    let has_dup = copies
+        .iter()
+        .any(|o| !seen.insert((o.side == Side::Source, o.path.as_str())));
     let width = copy_width(opt.parallel, &source.caps(), &target.caps(), has_dup);
 
     run_class(&moves, 1, &sh, &pp, &acc);
@@ -274,44 +514,67 @@ pub fn apply_vfs(
                 tgt_fix.push((rel, ondisk, intended));
             }
         }
-        // Keyed by identity(): a local root's identity is its path string, so the
-        // pre-VFS correction files keep working; a remote root gets its own table
+        // Local tables keep the historical path-derived filename but bind their header to the
+        // physical volume. Remote roots remain keyed by their credential-free VFS identity.
         if !src_fix.is_empty() {
-            crate::store::mtimefix::record_by_key(&sh.source.identity(), &src_fix);
+            if let Some(root) = sh.source_local.as_deref() {
+                let identity = crate::store::localid::LocalScanStateIdentity::for_root(root);
+                crate::store::mtimefix::record_local(&identity, &src_fix);
+            } else {
+                crate::store::mtimefix::record_by_key(&sh.source.identity(), &src_fix);
+            }
         }
         if !tgt_fix.is_empty() {
-            crate::store::mtimefix::record_by_key(&sh.target.identity(), &tgt_fix);
+            if let Some(root) = sh.target_local.as_deref() {
+                let identity = crate::store::localid::LocalScanStateIdentity::for_root(root);
+                crate::store::mtimefix::record_local(&identity, &tgt_fix);
+            } else {
+                crate::store::mtimefix::record_by_key(&sh.target.identity(), &tgt_fix);
+            }
         }
     }
     let delta_saved = sh.delta_saved.load(Ordering::Relaxed);
     if delta_saved > 0 {
-        println!("delta: {} not re-written", crate::foundation::fmt::human_bytes(delta_saved));
+        println!(
+            "delta: {} not re-written",
+            crate::foundation::fmt::human_bytes(delta_saved)
+        );
     }
-    let any_remote_side = sh.source_local.is_none() || sh.target_local.is_none();
+    report_preservation_routes(&sh);
     let (src_local_path, tgt_local_path) = (sh.source_local.clone(), sh.target_local.clone());
     if let Some(w) = sh.ver_source.into_inner().unwrap() {
-        let side_ops: Vec<Op> = ops.iter().filter(|o| o.side == Side::Source).cloned().collect();
+        let side_ops: Vec<Op> = ops
+            .iter()
+            .filter(|o| o.side == Side::Source)
+            .cloned()
+            .collect();
         if let Ok(Some(id)) = w.finish(&side_ops) {
             if let Some(root) = &src_local_path {
-                println!("version saved: {} (id {id})", root.join(crate::foundation::names::VERSION_STORE_DIR).display());
+                println!(
+                    "version saved: {} (id {id})",
+                    root.join(crate::foundation::names::VERSION_STORE_DIR)
+                        .display()
+                );
             }
         }
     }
     if let Some(w) = sh.ver_target.into_inner().unwrap() {
-        let side_ops: Vec<Op> = ops.iter().filter(|o| o.side == Side::Target).cloned().collect();
+        let side_ops: Vec<Op> = ops
+            .iter()
+            .filter(|o| o.side == Side::Target)
+            .cloned()
+            .collect();
         if let Ok(Some(id)) = w.finish(&side_ops) {
             if let Some(root) = &tgt_local_path {
-                println!("version saved: {} (id {id})", root.join(crate::foundation::names::VERSION_STORE_DIR).display());
+                println!(
+                    "version saved: {} (id {id})",
+                    root.join(crate::foundation::names::VERSION_STORE_DIR)
+                        .display()
+                );
             }
         }
     }
     let done = acc.done.load(Ordering::Relaxed);
-    if !opt.versioning && done > 0 {
-        println!("trash (deleted/overwritten files kept at): {}", sh.trash.display());
-    }
-    if done > 0 && any_remote_side {
-        println!("remote retention (originals renamed on the far side): <root>/{}", sh.remote_keep_rel);
-    }
     let mut out = ApplyOutcome {
         done,
         skipped: acc.skipped.load(Ordering::Relaxed),

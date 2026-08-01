@@ -8,14 +8,27 @@ use crate::job::Job;
 use crate::model::plan::{Action, Op, Plan};
 use crate::pipeline::{compare, scan};
 
-use super::{scan_opts, CompareOutcome};
 use super::archive::refresh_archive_with;
+use super::{scan_opts, CompareOutcome};
 use crate::model::table::Snapshot;
 
 /// Remote pipeline (the v0.6 end-to-end over ssh): ssh probe → remote-local scan (table collected from stdout) → local scan → compare
 /// → pack the target side and ship it over ssh to apply-pack → write the source side straight through the mounted path → refresh the archive on a successful sync.
-pub fn run_peer_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool) -> std::io::Result<(u64, u64, u64, u64)> {
-    run_peer_job_with(name, job, do_apply, verbose, acknowledged, &crate::obs::progress::RunCtx::null())
+pub fn run_peer_job(
+    name: &str,
+    job: &Job,
+    do_apply: bool,
+    verbose: bool,
+    acknowledged: bool,
+) -> std::io::Result<(u64, u64, u64, u64)> {
+    run_peer_job_with(
+        name,
+        job,
+        do_apply,
+        verbose,
+        acknowledged,
+        &crate::obs::progress::RunCtx::null(),
+    )
 }
 
 /// v0.9 M1/M3: the remote pipeline = a compare stage plus an apply stage (desktop calls each over its own IPC round; the CLI runs both end-to-end here).
@@ -64,11 +77,23 @@ pub fn run_peer_job_with(
     let rec = crate::obs::runlog::Recorder::start(name, &super::run_kind(job, "apply"), ctx, &ops);
     let out = apply_peer_job_with(name, job, &plan, &ops, verbose, acknowledged, &rec.ctx)?;
     rec.finish(&out, t0.elapsed().as_millis() as u64);
-    Ok((out.done, out.skipped, out.errors, plan.header.conflict_count))
+    Ok((
+        out.done,
+        out.skipped,
+        out.errors,
+        plan.header.conflict_count,
+    ))
 }
 
 fn emit_cancel_summary(ctx: &crate::obs::progress::RunCtx, t0: std::time::Instant) {
-    emit_apply_summary(ctx, t0, crate::obs::progress::ApplyOutcome { cancelled: true, ..Default::default() });
+    emit_apply_summary(
+        ctx,
+        t0,
+        crate::obs::progress::ApplyOutcome {
+            cancelled: true,
+            ..Default::default()
+        },
+    );
 }
 
 fn emit_apply_summary(
@@ -140,7 +165,10 @@ fn link_of(job: &Job) -> std::io::Result<(String, String, String, Option<std::pa
     use crate::fs::vfs::spec::{parse, RootSpec};
     let bad = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, m);
     let RootSpec::Remote(r) = parse(&job.target) else {
-        return Err(bad(format!("target '{}' is not a peer:// root", job.target)));
+        return Err(bad(format!(
+            "target '{}' is not a peer:// root",
+            job.target
+        )));
     };
     if r.root.is_empty() {
         return Err(bad(format!(
@@ -150,9 +178,14 @@ fn link_of(job: &Job) -> std::io::Result<(String, String, String, Option<std::pa
     }
     Ok((
         r.host.clone(),
-        r.opt("exe").filter(|e| !e.is_empty()).unwrap_or("syncdash").to_string(),
+        r.opt("exe")
+            .filter(|e| !e.is_empty())
+            .unwrap_or("syncdash")
+            .to_string(),
         absolute_remote_root(&r.root),
-        r.opt("mount").filter(|m| !m.is_empty()).map(std::path::PathBuf::from),
+        r.opt("mount")
+            .filter(|m| !m.is_empty())
+            .map(std::path::PathBuf::from),
     ))
 }
 
@@ -200,7 +233,10 @@ mod filter_tests {
 
     #[test]
     fn every_exclude_crosses_the_link() {
-        let a = remote_scan_args(&job_with(&[], &["*/big_temp/", "*/*.log"]), "/Users/ben/dst");
+        let a = remote_scan_args(
+            &job_with(&[], &["*/big_temp/", "*/*.log"]),
+            "/Users/ben/dst",
+        );
         assert_eq!(pairs(&a, "--exclude"), vec!["*/big_temp/", "*/*.log"]);
         assert_eq!(pairs(&a, "--junk"), vec!["none"]);
     }
@@ -229,13 +265,21 @@ mod filter_tests {
 /// It takes `ctx` for the sake of the schema-mismatch warning: that one has to reach the UI **during compare**.
 /// Going through the macro and the global registry, no sink is installed during compare (only apply starts a Recorder),
 /// so this line in particular would fall back to stderr — which in a windowed desktop build is the same as saying nothing.
-pub fn probe_peer(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<RemoteLink> {
+pub fn probe_peer(
+    name: &str,
+    job: &Job,
+    ctx: &crate::obs::progress::RunCtx,
+) -> std::io::Result<RemoteLink> {
     let (host, exe, rroot, mount) = link_of(job)?;
     let (host, exe, rroot) = (host.as_str(), exe.as_str(), rroot.as_str());
     let session = crate::transfer::peer::PeerSession::open(&job.target)?;
     let probe = session.capture(&format!("{exe} probe"))?;
-    let pv: serde_json::Value = serde_json::from_slice(&probe)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad probe output: {e}")))?;
+    let pv: serde_json::Value = serde_json::from_slice(&probe).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bad probe output: {e}"),
+        )
+    })?;
     if pv["schema"].as_u64() != Some(crate::model::table::SCHEMA as u64) {
         ctx.log(
             crate::model::event::LogLevel::Warn,
@@ -251,7 +295,12 @@ pub fn probe_peer(name: &str, job: &Job, ctx: &crate::obs::progress::RunCtx) -> 
     ctx.log(
         crate::model::event::LogLevel::Info,
         "remote",
-        format!("[{name}] remote {}: {} {}", host, remote_os, pv["arch"].as_str().unwrap_or("?")),
+        format!(
+            "[{name}] remote {}: {} {}",
+            host,
+            remote_os,
+            pv["arch"].as_str().unwrap_or("?")
+        ),
     );
     Ok(RemoteLink {
         host: host.to_string(),
@@ -311,7 +360,7 @@ pub fn compare_peer_job_detailed(
     ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<CompareOutcome> {
     use crate::model::event::Phase;
-use crate::obs::progress::PhaseProgress;
+    use crate::obs::progress::PhaseProgress;
     let link = probe_peer(name, job, ctx)?;
 
     // 2) Remote scan (hashing on the remote's own disk — far faster than pulling the data over UNC)
@@ -319,19 +368,40 @@ use crate::obs::progress::PhaseProgress;
     let scan_args = remote_scan_args(job, &link.rroot);
     ctx.checkpoint()?;
     // The remote scans on its own disk, so locally all we can show is "in progress" — totals zeroed, the label spells out who we are waiting on
-    let pp_rs = PhaseProgress::begin(ctx, Phase::ScanTarget, Some(format!("ssh:{} {}", link.host, link.rroot)), 0, 0);
+    let pp_rs = PhaseProgress::begin(
+        ctx,
+        Phase::ScanTarget,
+        Some(format!("ssh:{} {}", link.host, link.rroot)),
+        0,
+        0,
+    );
     let table_bytes = link.session.capture(&link.cmd(&scan_args))?;
     let t = Snapshot::from_reader(std::io::BufReader::new(&table_bytes[..]))?;
     pp_rs.finish()?;
 
     // 3) Local scan + compare (the local source side goes through the mount-point gate too)
-    let mut v = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-    crate::pipeline::guard::roots::check_root("source", job.source_path(), job.require_marker, &mut v);
+    let mut v = crate::pipeline::guard::Verdict {
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+    };
+    crate::pipeline::guard::roots::check_root(
+        "source",
+        job.source_path(),
+        job.require_marker,
+        &mut v,
+    );
     for w in &v.warnings {
-        ctx.log(crate::model::event::LogLevel::Warn, "compare", format!("[{name}] warning: {w}"));
+        ctx.log(
+            crate::model::event::LogLevel::Warn,
+            "compare",
+            format!("[{name}] warning: {w}"),
+        );
     }
     if !v.ok() {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, v.blockers.join("; ")));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            v.blockers.join("; "),
+        ));
     }
     let s = scan::scan_ctx(job.source_path(), &scan_opts(job), ctx, Phase::ScanSource)?;
     let archive = match (&job.archive, job.mode.as_str()) {
@@ -341,25 +411,168 @@ use crate::obs::progress::PhaseProgress;
     let pp_cmp = PhaseProgress::begin(
         ctx,
         Phase::Compare,
-        Some(format!("{} × {} entries", s.header.entry_count, t.header.entry_count)),
+        Some(format!(
+            "{} × {} entries",
+            s.header.entry_count, t.header.entry_count
+        )),
         0,
         0,
     );
     let copts = job.compare_opts();
     let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
     pp_cmp.finish()?;
-    Ok(CompareOutcome { plan, source: s, target: t })
+    Ok(CompareOutcome {
+        plan,
+        source: s,
+        target: t,
+    })
 }
 
 /// The plan health check for a remote job (used by the desktop confirmation sheet): the deletion-share gate only —
 /// disk space and the marker live on the remote machine; we cannot check them locally and must not pretend we did.
-pub fn preflight_peer_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::pipeline::guard::Verdict {
+pub fn preflight_peer_job(
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    acknowledged: bool,
+) -> crate::pipeline::guard::Verdict {
     let g = job.guards(acknowledged);
     let st = crate::pipeline::guard::stats::stat_plan(ops);
-    let mut gv = crate::pipeline::guard::Verdict { blockers: Vec::new(), warnings: Vec::new() };
-    crate::pipeline::guard::ratio::check_delete_ratio("target", &st.target, plan.header.target_entries, &g, &mut gv);
-    crate::pipeline::guard::ratio::check_delete_ratio("source", &st.source, plan.header.source_entries, &g, &mut gv);
+    let mut gv = crate::pipeline::guard::Verdict {
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+    };
+    crate::pipeline::guard::ratio::check_delete_ratio(
+        "target",
+        &st.target,
+        plan.header.target_entries,
+        &g,
+        &mut gv,
+    );
+    crate::pipeline::guard::ratio::check_delete_ratio(
+        "source",
+        &st.source,
+        plan.header.source_entries,
+        &g,
+        &mut gv,
+    );
+    let needs_pull_mount = ops.iter().any(|op| {
+        op.side == crate::model::plan::Side::Source
+            && !matches!(
+                op.action,
+                crate::model::plan::Action::Conflict | crate::model::plan::Action::Note
+            )
+    });
+    if needs_pull_mount {
+        match crate::fs::vfs::spec::parse(&job.target) {
+            crate::fs::vfs::spec::RootSpec::Remote(remote) => {
+                match remote.opt("mount").filter(|mount| !mount.is_empty()) {
+                    Some(mount) if std::path::Path::new(mount).is_dir() => {}
+                    Some(mount) => gv.blockers.push(format!(
+                        "source-side actions require the peer mount '{mount}', but it is not an accessible directory"
+                    )),
+                    None => gv.blockers.push(
+                        "source-side actions require |mount=<local path serving the peer tree>; this peer job is push-only without it"
+                            .into(),
+                    ),
+                }
+            }
+            _ => gv
+                .blockers
+                .push("the peer target phrase is no longer valid — run Compare again".into()),
+        }
+    }
     gv
+}
+
+/// Limitations the controlling process can prove before shipping a package to a peer.
+/// Anything unobservable is represented as structured review data instead of being fabricated.
+pub fn apply_capabilities(job: &Job, ops: &[Op]) -> crate::pipeline::guard::caps::CapReport {
+    use crate::model::plan::{Action, Side};
+    use crate::pipeline::guard::caps::{CapItem, CapReport, CapSeverity};
+
+    let writes_target = ops
+        .iter()
+        .any(|op| op.side == Side::Target && !matches!(op.action, Action::Conflict | Action::Note));
+    if !writes_target {
+        return CapReport::default();
+    }
+    let mut report = CapReport::default();
+    if job.require_marker {
+        report.items.push(CapItem {
+            feature: "require_marker".into(),
+            side: "target".into(),
+            severity: CapSeverity::Block,
+            requested: "a .syncdash-root marker verified before writing".into(),
+            actual: "the current peer package protocol cannot inspect the remote marker".into(),
+            effect:
+                "the required mount-point gate cannot be proven, so target-side writes are refused"
+                    .into(),
+        });
+    }
+    if job.min_free_pct > 0.0 {
+        report.items.push(CapItem {
+            feature: "min_free_pct".into(),
+            side: "target".into(),
+            severity: CapSeverity::NeedsAck,
+            requested: format!(
+                "at least {:.2}% free space retained before writing",
+                job.min_free_pct * 100.0
+            ),
+            actual: "remote free space is not observable through the current peer package protocol"
+                .into(),
+            effect: "the remote target can run out of space; staged writes still fail per file without publishing partial content"
+                .into(),
+        });
+    }
+    report
+}
+
+#[cfg(test)]
+mod apply_capability_tests {
+    use super::*;
+    use crate::model::plan::{Action, Op, Side};
+    use crate::pipeline::guard::caps::CapSeverity;
+
+    fn target_write() -> Op {
+        Op {
+            side: Side::Target,
+            action: Action::Delete,
+            path: "old.txt".into(),
+            from: None,
+            size: None,
+            mtime_ms: None,
+            hash: None,
+            link: None,
+            mode: None,
+            reason: "test".into(),
+        }
+    }
+
+    #[test]
+    fn peer_limitations_are_structured_only_when_the_remote_side_writes() {
+        let mut job = Job::default();
+        job.target = "peer://host/srv/data".into();
+        let report = apply_capabilities(&job, &[target_write()]);
+        assert!(report.items.iter().any(|item| {
+            item.feature == "min_free_pct" && item.severity == CapSeverity::NeedsAck
+        }));
+
+        let mut source = target_write();
+        source.side = Side::Source;
+        assert!(apply_capabilities(&job, &[source]).items.is_empty());
+    }
+
+    #[test]
+    fn an_unobservable_required_peer_marker_is_a_hard_blocker() {
+        let mut job = Job::default();
+        job.target = "peer://host/srv/data".into();
+        job.require_marker = true;
+        let report = apply_capabilities(&job, &[target_write()]);
+        assert!(report.items.iter().any(|item| {
+            item.feature == "require_marker" && item.severity == CapSeverity::Block
+        }));
+    }
 }
 
 /// v0.9 M3: the **apply stage** of a remote job — `ops` is the subset the user finalised in the diff table (direction flips / check marks already applied).
@@ -373,8 +586,30 @@ pub fn apply_peer_job_with(
     acknowledged: bool,
     ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
+    apply_peer_job_with_classified(name, job, plan, ops, verbose, acknowledged, ctx).into_result()
+}
+
+pub fn apply_peer_job_with_classified(
+    name: &str,
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    verbose: bool,
+    acknowledged: bool,
+    ctx: &crate::obs::progress::RunCtx,
+) -> super::ApplyExecution {
     let t0 = std::time::Instant::now();
-    let mut r = apply_peer_inner(name, job, plan, ops, verbose, acknowledged, ctx);
+    let mut writes_started = false;
+    let mut r = apply_peer_inner(
+        name,
+        job,
+        plan,
+        ops,
+        verbose,
+        acknowledged,
+        ctx,
+        &mut writes_started,
+    );
     if let Ok(out) = &mut r {
         out.cancelled |= ctx.ctl.cancelled();
     }
@@ -387,7 +622,55 @@ pub fn apply_peer_job_with(
         },
     };
     emit_apply_summary(ctx, t0, terminal);
-    r
+    classify_peer_completion(writes_started, r)
+}
+
+fn classify_peer_completion(
+    writes_started: bool,
+    result: std::io::Result<crate::obs::progress::ApplyOutcome>,
+) -> super::ApplyExecution {
+    match (writes_started, result) {
+        (false, Ok(outcome)) => super::ApplyExecution::rejected(outcome),
+        (true, Ok(outcome)) => super::ApplyExecution::started(outcome),
+        (false, Err(error)) => super::ApplyExecution::failed_before_write(error),
+        (true, Err(error)) => super::ApplyExecution::failed_after_write(error),
+    }
+}
+
+#[cfg(test)]
+mod apply_boundary_tests {
+    use super::classify_peer_completion;
+    use crate::obs::progress::ApplyOutcome;
+
+    #[test]
+    fn peer_boundary_is_explicit_not_inferred_from_outcome_or_error_text() {
+        let indistinguishable = ApplyOutcome {
+            done: 0,
+            skipped: 1,
+            errors: 1,
+            bytes_copied: 0,
+            cancelled: false,
+        };
+        let before = classify_peer_completion(false, Ok(indistinguishable));
+        let after = classify_peer_completion(true, Ok(indistinguishable));
+        assert!(!before.writes_started());
+        assert!(after.writes_started());
+
+        let before = classify_peer_completion(
+            false,
+            Err(std::io::Error::other("identical transport failure")),
+        );
+        let after = classify_peer_completion(
+            true,
+            Err(std::io::Error::other("identical transport failure")),
+        );
+        assert!(!before.writes_started());
+        assert!(after.writes_started());
+        assert_eq!(
+            before.into_result().unwrap_err().to_string(),
+            after.into_result().unwrap_err().to_string()
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -399,10 +682,11 @@ fn apply_peer_inner(
     verbose: bool,
     acknowledged: bool,
     ctx: &crate::obs::progress::RunCtx,
+    writes_started: &mut bool,
 ) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
-    use crate::model::plan::Side;
     use crate::model::event::{Phase, ProgressEvent};
-use crate::obs::progress::{ApplyOutcome, PhaseProgress};
+    use crate::model::plan::Side;
+    use crate::obs::progress::{ApplyOutcome, PhaseProgress};
 
     // Plan health check: remote disk space is unknowable, but an accident like "delete most of the other side" can be caught locally
     let gv = preflight_peer_job(job, plan_full, sel_ops, acknowledged);
@@ -417,13 +701,22 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
                 message: b.clone(),
             });
         }
-        return Ok(ApplyOutcome { done: 0, skipped: sel_ops.len() as u64, errors: 1, bytes_copied: 0, cancelled: false });
+        return Ok(ApplyOutcome {
+            done: 0,
+            skipped: sel_ops.len() as u64,
+            errors: 1,
+            bytes_copied: 0,
+            cancelled: false,
+        });
     }
 
     let link = probe_peer(name, job, ctx)?;
     let (host, rroot, shell) = (link.host.as_str(), link.rroot.as_str(), link.shell);
     // Packing and the pull-back only look at the finalised subset; the full plan is used only for the archive refresh (dropping conflicted paths needs all of it)
-    let plan = Plan { header: plan_full.header.clone(), ops: sel_ops.to_vec() };
+    let plan = Plan {
+        header: plan_full.header.clone(),
+        ops: sel_ops.to_vec(),
+    };
 
     let mut done = 0u64;
     let mut skipped = 0u64;
@@ -431,7 +724,10 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
     let mut bytes_done_total = 0u64;
 
     // 4) Target side: (for large updates, fetch the remote chunk table first so FastCDC delta can be used) pack → ship the package over ssh → remote apply-pack
-    let has_target_ops = plan.ops.iter().any(|o| o.side == Side::Target && !matches!(o.action, Action::Conflict | Action::Note));
+    let has_target_ops = plan
+        .ops
+        .iter()
+        .any(|o| o.side == Side::Target && !matches!(o.action, Action::Conflict | Action::Note));
     if has_target_ops {
         let delta_rels: Vec<String> = plan
             .ops
@@ -440,7 +736,9 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
                 o.side == Side::Target
                     && o.action == Action::Update
                     && o.link.is_none()
-                    && o.size.map(|s| s >= crate::model::chunk::DELTA_MIN_SIZE).unwrap_or(false)
+                    && o.size
+                        .map(|s| s >= crate::model::chunk::DELTA_MIN_SIZE)
+                        .unwrap_or(false)
             })
             .map(|o| o.path.clone())
             .collect();
@@ -460,14 +758,19 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
                         if line.is_empty() {
                             continue;
                         }
-                        if let Ok(fc) = serde_json::from_str::<crate::model::chunk::FileChunks>(line) {
+                        if let Ok(fc) =
+                            serde_json::from_str::<crate::model::chunk::FileChunks>(line)
+                        {
                             m.insert(fc.rel.clone(), fc);
                         }
                     }
                     ctx.log(
                         crate::model::event::LogLevel::Info,
                         "delta",
-                        format!("[{name}] delta: got chunk tables for {} large file(s)", m.len()),
+                        format!(
+                            "[{name}] delta: got chunk tables for {} large file(s)",
+                            m.len()
+                        ),
                     );
                     Some(m)
                 }
@@ -482,15 +785,28 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
             }
         };
         ctx.checkpoint()?;
-        let pp_pack = PhaseProgress::begin(ctx, Phase::Pack, Some("packing target-side content".into()), 0, 0);
-        let tmp = std::env::temp_dir().join(format!("syncdash-remote-{}.tar", crate::foundation::time::now_ms()));
-        let sum = crate::transfer::pack::pack(&plan, job.source_path(), &tmp, remote_chunks.as_ref())?;
+        let pp_pack = PhaseProgress::begin(
+            ctx,
+            Phase::Pack,
+            Some("packing target-side content".into()),
+            0,
+            0,
+        );
+        let tmp = std::env::temp_dir().join(format!(
+            "syncdash-remote-{}.tar",
+            crate::foundation::time::now_ms()
+        ));
+        let sum =
+            crate::transfer::pack::pack(&plan, job.source_path(), &tmp, remote_chunks.as_ref())?;
         pp_pack.set_totals(sum.ops, sum.bytes);
         if sum.delta_saved > 0 {
             ctx.log(
                 crate::model::event::LogLevel::Info,
                 "pack",
-                format!("[{name}] packed {} B, delta saved {} B", sum.bytes, sum.delta_saved),
+                format!(
+                    "[{name}] packed {} B, delta saved {} B",
+                    sum.bytes, sum.delta_saved
+                ),
             );
         }
         pp_pack.complete("package");
@@ -505,7 +821,8 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         };
         ctx.checkpoint()?;
         let tar_len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-        let pp_ship = PhaseProgress::begin(ctx, Phase::Ship, Some(format!("→ ssh:{host}")), 1, tar_len);
+        let pp_ship =
+            PhaseProgress::begin(ctx, Phase::Ship, Some(format!("→ ssh:{host}")), 1, tar_len);
         let recv_cmd = link.cmd(&["recv".into(), rpkg.clone()]);
         // Bytes are counted as they leave, not assumed once the transfer returns: the old
         // transport handed the file to a child process and learned nothing until it exited, so a
@@ -522,14 +839,28 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
         bytes_done_total += sum.bytes;
 
         ctx.checkpoint()?;
-        let pp_ra = PhaseProgress::begin(ctx, Phase::Apply, Some(format!("ssh:{host} apply-pack")), sum.ops, 0);
-        let mut ap_args: Vec<String> = vec!["apply-pack".into(), rpkg.clone(), "--apply".into(), "--remove-pkg".into()];
+        let pp_ra = PhaseProgress::begin(
+            ctx,
+            Phase::Apply,
+            Some(format!("ssh:{host} apply-pack")),
+            sum.ops,
+            0,
+        );
+        let mut ap_args: Vec<String> = vec![
+            "apply-pack".into(),
+            rpkg.clone(),
+            "--apply".into(),
+            "--remove-pkg".into(),
+        ];
         if job.versioning {
             ap_args.push("--versioning".into());
         }
         if verbose {
             ap_args.push("-v".into());
         }
+        // Once this command is handed to ssh, a transport error cannot prove whether the far side
+        // started publishing files. Mark the boundary before invocation, not after its response.
+        *writes_started = true;
         let ok = link.session.run_status(&link.cmd(&ap_args))?;
         if ok {
             done += sum.ops;
@@ -545,7 +876,11 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
             }
         } else {
             errors += 1;
-            ctx.log(crate::model::event::LogLevel::Error, "remote", format!("[{name}] remote apply-pack reported failure"));
+            ctx.log(
+                crate::model::event::LogLevel::Error,
+                "remote",
+                format!("[{name}] remote apply-pack reported failure"),
+            );
             ctx.sink.emit(ProgressEvent::Error {
                 phase: Phase::Apply,
                 ts_ms: crate::foundation::time::now_ms(),
@@ -571,6 +906,7 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
     if !src_ops.is_empty() {
         match link.mount.as_deref() {
             Some(m) if m.is_dir() => {
+                *writes_started = true;
                 let out = crate::pipeline::apply::apply_with(
                     &src_ops,
                     job.source_path(),
@@ -618,7 +954,10 @@ use crate::obs::progress::{ApplyOutcome, PhaseProgress};
             // The peer lane has no local handle on the far root, so no joint-tier narrowing applies
             // and never did: its comparison runs at the job's own tier, and the archive matches it.
             Ok(sv) => {
-                if !refresh_archive_with(job, plan_full, &sv, &scan_opts(job), ctx) && !ctx.ctl.cancelled() {
+                *writes_started = true;
+                if !refresh_archive_with(job, plan_full, &sv, &scan_opts(job), ctx)
+                    && !ctx.ctl.cancelled()
+                {
                     errors += 1;
                 }
             }

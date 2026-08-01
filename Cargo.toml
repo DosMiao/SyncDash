@@ -16,6 +16,7 @@ serde_json = "1"
 # "rayon" only exists to enable `update_mmap_rayon`/`update_rayon`; the crate's own `rayon`
 # dependency below is unaffected. See the crate header in src/lib.rs.
 blake3 = "1"
+getrandom = "0.3"
 walkdir = "2"
 clap = { version = "4", features = ["derive"] }
 filetime = "0.2"
@@ -51,6 +52,11 @@ rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
 # statvfs (disk-space preflight). Windows goes through kernel32's GetDiskFreeSpaceExW, no extra crate needed.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFDate", "CFString", "CFUUID"] }
+objc2-core-services = { version = "0.3.2", default-features = false, features = ["std", "dispatch2", "FSEvents", "libc"] }
 
 # Integration tests under tests/ link the crate but resolve their own imports, so the
 # crates they touch directly have to be named again here.

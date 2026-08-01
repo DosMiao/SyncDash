@@ -8,9 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::fs::vfs::error::{VfsError, VfsErrorKind, VfsResult};
-use crate::fs::vfs::{
-    CommitReport, ReadStream, WriteHint, WriteStaged,
-};
+use crate::fs::vfs::{CommitReport, ReadStream, WriteHint, WriteStaged};
 
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileAttributes;
@@ -30,9 +28,16 @@ impl std::io::Read for SftpRead {
         use tokio::io::AsyncReadExt;
         let d = self.timeout;
         let file = &mut self.file;
-        match self.rt.clone().block_on(async { tokio::time::timeout(d, file.read(buf)).await }) {
+        match self
+            .rt
+            .clone()
+            .block_on(async { tokio::time::timeout(d, file.read(buf)).await })
+        {
             Ok(r) => r,
-            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "sftp read timed out")),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "sftp read timed out",
+            )),
         }
     }
 }
@@ -67,10 +72,16 @@ impl SftpStaged {
         F: std::future::Future<Output = Result<T, russh_sftp::client::error::Error>>,
     {
         let d = self.timeout;
-        match self.rt.block_on(async { tokio::time::timeout(d, fut).await }) {
+        match self
+            .rt
+            .block_on(async { tokio::time::timeout(d, fut).await })
+        {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(map_sftp_err(what, e)),
-            Err(_) => Err(VfsError::new(VfsErrorKind::Transient, format!("{what} timed out after {d:?}"))),
+            Err(_) => Err(VfsError::new(
+                VfsErrorKind::Transient,
+                format!("{what} timed out after {d:?}"),
+            )),
         }
     }
 }
@@ -80,10 +91,19 @@ impl WriteStaged for SftpStaged {
         use tokio::io::AsyncWriteExt;
         let d = self.timeout;
         let f = self.file.as_mut().expect("write after seal");
-        match self.rt.block_on(async { tokio::time::timeout(d, f.write_all(buf)).await }) {
+        match self
+            .rt
+            .block_on(async { tokio::time::timeout(d, f.write_all(buf)).await })
+        {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(VfsError::new(VfsErrorKind::Transient, format!("sftp write failed: {e}"))),
-            Err(_) => Err(VfsError::new(VfsErrorKind::Transient, "sftp write timed out")),
+            Ok(Err(e)) => Err(VfsError::new(
+                VfsErrorKind::Transient,
+                format!("sftp write failed: {e}"),
+            )),
+            Err(_) => Err(VfsError::new(
+                VfsErrorKind::Transient,
+                "sftp write timed out",
+            )),
         }
     }
 
@@ -92,7 +112,9 @@ impl WriteStaged for SftpStaged {
     }
 
     fn write_at(&mut self, _off: u64, _buf: &[u8]) -> VfsResult<()> {
-        Err(VfsError::unsupported("random-access writes are not offered on sftp roots (delta is a both-local affair)"))
+        Err(VfsError::unsupported(
+            "random-access writes are not offered on sftp roots (delta is a both-local affair)",
+        ))
     }
 
     fn seal(&mut self, fsync: bool) -> VfsResult<()> {
@@ -116,7 +138,11 @@ impl WriteStaged for SftpStaged {
             match res {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(VfsError::new(
-                    if fsync { VfsErrorKind::Protocol } else { VfsErrorKind::Transient },
+                    if fsync {
+                        VfsErrorKind::Protocol
+                    } else {
+                        VfsErrorKind::Transient
+                    },
                     format!("sealing the staged file failed: {e}"),
                 )),
                 Err(_) => Err(VfsError::new(VfsErrorKind::Transient, "seal timed out")),
@@ -137,7 +163,11 @@ impl WriteStaged for SftpStaged {
         let s = self.sftp.clone();
         let p = self.tmp_abs.clone();
         let file = self.block("open staged for read-back", async move { s.open(p).await })?;
-        Ok(Box::new(SftpRead { rt: self.rt.clone(), timeout: self.timeout, file }))
+        Ok(Box::new(SftpRead {
+            rt: self.rt.clone(),
+            timeout: self.timeout,
+            file,
+        }))
     }
 
     fn commit(mut self: Box<Self>) -> VfsResult<CommitReport> {
@@ -173,12 +203,16 @@ impl WriteStaged for SftpStaged {
             };
             let s = self.sftp.clone();
             let dst = self.dst_abs.clone();
-            if let Err(e) = self.block("setstat after rename", async move { s.set_metadata(dst, attrs).await }) {
+            if let Err(e) = self.block("setstat after rename", async move {
+                s.set_metadata(dst, attrs).await
+            }) {
                 report.mtime_error = Some(e);
             } else if self.hint.mtime_ms.is_some() {
                 let s2 = self.sftp.clone();
                 let dst2 = self.dst_abs.clone();
-                if let Ok(a) = self.block("stat back", async move { s2.symlink_metadata(dst2).await }) {
+                if let Ok(a) =
+                    self.block("stat back", async move { s2.symlink_metadata(dst2).await })
+                {
                     report.mtime_ondisk_ms = a.mtime.map(|s| s as i64 * 1000);
                 }
             }
@@ -193,13 +227,15 @@ impl Drop for SftpStaged {
             use tokio::io::AsyncWriteExt;
             let d = self.timeout;
             if let Some(mut f) = self.file.take() {
-                let _ = self.rt.block_on(async { tokio::time::timeout(d, f.shutdown()).await });
+                let _ = self
+                    .rt
+                    .block_on(async { tokio::time::timeout(d, f.shutdown()).await });
             }
             let s = self.sftp.clone();
             let t = self.tmp_abs.clone();
-            let _ = self
-                .rt
-                .block_on(async { tokio::time::timeout(d, async move { s.remove_file(t).await }).await });
+            let _ = self.rt.block_on(async {
+                tokio::time::timeout(d, async move { s.remove_file(t).await }).await
+            });
         }
     }
 }

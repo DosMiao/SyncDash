@@ -3,7 +3,7 @@
 /**
  * One "identical on both sides" record. It is not in the plan — it is not an action, it is evidence.
  */
-export type SameRow = { path: string, size: number, mtime_ms: number, 
+export type SameRow = { path: string, size: number, mtime_ms: number,
 /**
  * The target side's time (content is identical but timestamps may differ by a few milliseconds — FAT/SMB granularity)
  */

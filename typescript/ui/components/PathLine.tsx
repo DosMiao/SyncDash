@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ArrowLeftRight, FolderOpen } from 'lucide-react';
 import { summarizePresets } from '../../core/junk';
 import { pathState, usePathVerdict } from '../hooks/usePathVerdict';
+import { rootEditKeyAction } from '../state/execution-safety';
 import { useJunkPresets } from './JunkPresets';
 import { PathVerdictBox } from './PathVerdictBox';
 import type { JobDto } from '../../core/types/generated/JobDto';
@@ -12,6 +13,9 @@ interface Props {
   /// Full config behind the selected job, for the pill row (JobDto carries only what the list needs)
   cfgJob: JobFull | null;
   busy: boolean;
+  /// Keep target navigation available so a pending review can be abandoned, while preventing root
+  /// and config mutations from racing the review request.
+  reviewing: boolean;
   selTarget: number;
   pathHistory: string[];
   /// Which root input the Tauri drag handler is currently hovering, if any
@@ -115,12 +119,15 @@ function configPills(j: JobFull, presets: JunkPresetDto[]): Pill[] {
 /// job TOML. No "just tweak it in memory" — once the two roots in the plan header disagree with what the
 /// job file says, run logs and archive refresh both point in the wrong direction.
 export function PathLine(props: Props) {
-  const { job, cfgJob, busy, selTarget, pathHistory, dropOn, scopeRef, onCommit, onBrowse, onSwap, onSelectTarget, onEditGroup } = props;
+  const { job, cfgJob, busy, reviewing, selTarget, pathHistory, dropOn, scopeRef, onCommit, onBrowse, onSwap, onSelectTarget, onEditGroup } = props;
+  const mutationBusy = busy || reviewing;
 
   const targets = job ? (job.targets && job.targets.length ? job.targets : [job.target]) : [];
   const targetValue = targets[selTarget] ?? '';
   const [src, setSrc] = useState(job?.source ?? '');
   const [tgt, setTgt] = useState(targetValue);
+  const suppressSourceBlur = useRef(false);
+  const suppressTargetBlur = useRef(false);
 
   // Re-seed whenever the job (or the selected target of a 1:N job) changes underneath the box
   useEffect(() => { setSrc(job?.source ?? ''); }, [job?.name, job?.source]);
@@ -146,24 +153,33 @@ export function PathLine(props: Props) {
           list="sd-paths"
           spellCheck={false}
           placeholder="Select a job, then edit here"
-          disabled={!job || busy}
+          disabled={!job || mutationBusy}
           title={src}
           value={src}
           onChange={(e) => setSrc(e.target.value)}
           // change fires only on Enter or blur — nothing is written to disk while typing
-          onBlur={() => onCommit('source', src)}
+          onBlur={() => {
+            if (suppressSourceBlur.current) { suppressSourceBlur.current = false; return; }
+            onCommit('source', src);
+          }}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
-            if (e.key === 'Escape') { setSrc(job?.source ?? ''); (e.target as HTMLInputElement).blur(); }
+            const action = rootEditKeyAction(e.key);
+            if (!action) return;
+            e.preventDefault();
+            if (action === 'revert') {
+              suppressSourceBlur.current = true;
+              setSrc(job?.source ?? '');
+            }
+            (e.target as HTMLInputElement).blur();
           }}
         />
-        <button className="pbtn" title="Browse…" disabled={!job || busy} onClick={() => onBrowse('source')}>
+        <button className="pbtn" title="Browse…" disabled={!job || mutationBusy} onClick={() => onBrowse('source')}>
           <FolderOpen size={13} />
         </button>
         <button
           className="pbtn"
-          title={job ? `Swap: ${job.source} ⇄ ${job.target} (written back to the job file)` : 'Swap source / target'}
-          disabled={!job || busy}
+          title={job ? `Swap: ${job.source} ⇄ ${targetValue} (written back to the job file)` : 'Swap source / target'}
+          disabled={!job || mutationBusy}
           onClick={onSwap}
         ><ArrowLeftRight size={13} /></button>
         <span className="plabel">target</span>
@@ -174,17 +190,26 @@ export function PathLine(props: Props) {
           data-root="target"
           list="sd-paths"
           spellCheck={false}
-          disabled={!job || busy}
+          disabled={!job || mutationBusy}
           title={tgt}
           value={tgt}
           onChange={(e) => setTgt(e.target.value)}
-          onBlur={() => onCommit('target', tgt)}
+          onBlur={() => {
+            if (suppressTargetBlur.current) { suppressTargetBlur.current = false; return; }
+            onCommit('target', tgt);
+          }}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
-            if (e.key === 'Escape') { setTgt(targetValue); (e.target as HTMLInputElement).blur(); }
+            const action = rootEditKeyAction(e.key);
+            if (!action) return;
+            e.preventDefault();
+            if (action === 'revert') {
+              suppressTargetBlur.current = true;
+              setTgt(targetValue);
+            }
+            (e.target as HTMLInputElement).blur();
           }}
         />
-        <button className="pbtn" title="Browse…" disabled={!job || busy} onClick={() => onBrowse('target')}>
+        <button className="pbtn" title="Browse…" disabled={!job || mutationBusy} onClick={() => onBrowse('target')}>
           <FolderOpen size={13} />
         </button>
         {targets.length > 1 && (
@@ -192,6 +217,7 @@ export function PathLine(props: Props) {
             className="target-sel"
             title="Multi-target job: pick the target to work on"
             value={selTarget}
+            disabled={busy}
             onChange={(e) => onSelectTarget(Number(e.target.value) || 0)}
           >
             {targets.map((t, i) => (
@@ -215,6 +241,7 @@ export function PathLine(props: Props) {
             key={p.key}
             className="cfgpill"
             title={`${p.title}\n\nClick to edit — opens ${p.group}.`}
+            disabled={mutationBusy}
             onClick={() => onEditGroup(p.group)}
           >
             <span className="ck">{p.key}</span><span className="cv">{p.value}</span>

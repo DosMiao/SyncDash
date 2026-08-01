@@ -139,6 +139,21 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Content identity of the original comparison plan.
+    ///
+    /// `write_to` is the canonical public plan encoding: header first, then one op per line, with
+    /// struct field order fixed by the Rust schema. Hashing those bytes catches any header or op
+    /// mutation while deliberately excluding desktop-only evidence/view metadata.
+    pub fn digest(&self) -> String {
+        let mut bytes = Vec::new();
+        self.write_to(&mut bytes)
+            .expect("serializing a Plan into memory cannot fail");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"syncdash-plan-v1\0");
+        hasher.update(&bytes);
+        hasher.finalize().to_hex().to_string()
+    }
+
     pub fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
         writeln!(w, "{}", serde_json::to_string(&self.header)?)?;
         for op in &self.ops {
@@ -153,9 +168,15 @@ impl Plan {
     /// through a temp file to reach `load` gave two concurrent calls the same path to fight over.
     pub fn from_reader(r: impl std::io::BufRead) -> std::io::Result<Plan> {
         let mut lines = r.lines();
-        let head = lines.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty plan"))??;
-        let header: PlanHeader = serde_json::from_str(&head)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad plan header: {e}")))?;
+        let head = lines
+            .next()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty plan"))??;
+        let header: PlanHeader = serde_json::from_str(&head).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad plan header: {e}"),
+            )
+        })?;
         // Read the version before the ops, so an older plan is named as an older plan instead of
         // failing later as "bad op: missing field ..." — the same bytes, but one of those messages
         // reads as corruption and sends the user looking for a damaged file.
@@ -172,9 +193,12 @@ impl Plan {
         let mut ops = Vec::new();
         for line in lines {
             let line = line?;
-            if line.trim().is_empty() { continue; }
-            ops.push(serde_json::from_str(&line)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad op: {e}")))?);
+            if line.trim().is_empty() {
+                continue;
+            }
+            ops.push(serde_json::from_str(&line).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad op: {e}"))
+            })?);
         }
         Ok(Plan { header, ops })
     }
@@ -190,7 +214,10 @@ mod tests {
     #[test]
     fn an_older_plan_is_refused_by_version_not_by_a_parse_error() {
         let mut buf = Vec::new();
-        let mut p = Plan { header: header(1), ops: vec![] };
+        let mut p = Plan {
+            header: header(1),
+            ops: vec![],
+        };
         p.header.schema = PLAN_SCHEMA - 1;
         p.write_to(&mut buf).unwrap();
         let e = match Plan::from_reader(std::io::BufReader::new(&buf[..])) {
@@ -199,7 +226,10 @@ mod tests {
         };
         let msg = e.to_string();
         assert!(msg.contains("format version"), "{msg}");
-        assert!(msg.contains("re-run Compare"), "the message has to carry the remedy: {msg}");
+        assert!(
+            msg.contains("re-run Compare"),
+            "the message has to carry the remedy: {msg}"
+        );
     }
 
     fn header(ops: usize) -> PlanHeader {
@@ -250,7 +280,13 @@ mod tests {
     fn a_plan_survives_write_then_read() {
         let plan = Plan {
             header: header(2),
-            ops: vec![op(Action::Copy, "a/one.txt"), Op { from: Some("old/two.bin".into()), ..op(Action::Move, "new/two.bin") }],
+            ops: vec![
+                op(Action::Copy, "a/one.txt"),
+                Op {
+                    from: Some("old/two.bin".into()),
+                    ..op(Action::Move, "new/two.bin")
+                },
+            ],
         };
         let mut buf: Vec<u8> = Vec::new();
         plan.write_to(&mut buf).unwrap();
@@ -261,9 +297,44 @@ mod tests {
         assert_eq!(back.header.conflict_count, 1);
         assert_eq!(back.ops.len(), 2);
         assert_eq!(back.ops[0].action, Action::Copy);
-        assert_eq!(back.ops[0].mode, Some(0o644), "the mode SMB cannot carry must survive the plan");
+        assert_eq!(
+            back.ops[0].mode,
+            Some(0o644),
+            "the mode SMB cannot carry must survive the plan"
+        );
         assert_eq!(back.ops[1].action, Action::Move);
-        assert_eq!(back.ops[1].from.as_deref(), Some("old/two.bin"), "a move without its origin is a copy");
+        assert_eq!(
+            back.ops[1].from.as_deref(),
+            Some("old/two.bin"),
+            "a move without its origin is a copy"
+        );
+    }
+
+    #[test]
+    fn digest_identifies_the_complete_serialized_plan() {
+        let plan = Plan {
+            header: header(1),
+            ops: vec![op(Action::Copy, "a/one.txt")],
+        };
+        let revision = plan.digest();
+        assert_eq!(revision.len(), 64);
+
+        let mut bytes = Vec::new();
+        plan.write_to(&mut bytes).unwrap();
+        let round_trip = Plan::from_reader(std::io::BufReader::new(&bytes[..])).unwrap();
+        assert_eq!(
+            revision,
+            round_trip.digest(),
+            "the public JSONL encoding is canonical"
+        );
+
+        let mut changed = round_trip;
+        changed.ops[0].reason = "different evidence".into();
+        assert_ne!(
+            revision,
+            changed.digest(),
+            "any executable plan mutation must be detected"
+        );
     }
 
     /// Action and Side serialize snake_case, and the CSV export, the event stream and the plan

@@ -32,7 +32,11 @@ pub struct Run {
 fn dir_stats(d: &Path) -> (u64, u64) {
     let mut files = 0u64;
     let mut bytes = 0u64;
-    for e in walkdir::WalkDir::new(d).follow_links(false).into_iter().flatten() {
+    for e in walkdir::WalkDir::new(d)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
         if e.file_type().is_file() {
             files += 1;
             bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
@@ -53,9 +57,17 @@ pub fn list_runs() -> Vec<Run> {
             continue;
         }
         let id = e.file_name().to_string_lossy().into_owned();
-        let Ok(at_ms) = id.parse::<u64>() else { continue };
+        let Ok(at_ms) = id.parse::<u64>() else {
+            continue;
+        };
         let (files, bytes) = dir_stats(&e.path());
-        out.push(Run { id, at_ms, dir: e.path(), files, bytes });
+        out.push(Run {
+            id,
+            at_ms,
+            dir: e.path(),
+            files,
+            bytes,
+        });
     }
     out.sort_by_key(|r| r.at_ms);
     out
@@ -78,7 +90,11 @@ pub fn find(needle: &str) -> Vec<Found> {
     let needle = needle.to_lowercase();
     let mut out = Vec::new();
     for run in list_runs() {
-        for e in walkdir::WalkDir::new(&run.dir).follow_links(false).into_iter().flatten() {
+        for e in walkdir::WalkDir::new(&run.dir)
+            .follow_links(false)
+            .into_iter()
+            .flatten()
+        {
             if !e.file_type().is_file() {
                 continue;
             }
@@ -133,7 +149,12 @@ pub fn restore(
             continue;
         }
         if dry_run {
-            println!("WOULD RESTORE  {}  <-  {} ({})", dst.display(), f.run_id, crate::foundation::fmt::human_bytes(f.size));
+            println!(
+                "WOULD RESTORE  {}  <-  {} ({})",
+                dst.display(),
+                f.run_id,
+                crate::foundation::fmt::human_bytes(f.size)
+            );
             skipped += 1;
             continue;
         }
@@ -174,17 +195,21 @@ pub struct Retention {
 
 impl Default for Retention {
     fn default() -> Self {
-        Retention { keep_days: 30, max_bytes: 10 * 1024 * 1024 * 1024, staggered: true }
+        Retention {
+            keep_days: 30,
+            max_bytes: 10 * 1024 * 1024 * 1024,
+            staggered: true,
+        }
     }
 }
 
 /// syncthing's `staggered` interval table (`lib/versioner/staggered.go:47-53`):
 /// (adjacent versions must be at least step seconds apart, the interval covers everything younger than end seconds)
 const INTERVALS: [(i64, i64); 4] = [
-    (30, 3600),                    // first hour: at most one copy per 30s
-    (3600, 86_400),                // rest of the day: one per hour
-    (86_400, 30 * 86_400),         // within 30 days: one per day
-    (7 * 86_400, 365 * 86_400),    // within a year: one per week
+    (30, 3600),                 // first hour: at most one copy per 30s
+    (3600, 86_400),             // rest of the day: one per hour
+    (86_400, 30 * 86_400),      // within 30 days: one per day
+    (7 * 86_400, 365 * 86_400), // within a year: one per week
 ];
 
 /// Given each run's **second-resolution** timestamp (any order), return the timestamps that should be deleted.
@@ -208,7 +233,11 @@ pub fn staggered_removals(times_secs: &[i64], now_secs: i64) -> Vec<i64> {
             first = false;
             continue;
         }
-        let step = INTERVALS.iter().find(|(_, end)| age < *end).map(|(s, _)| *s).unwrap_or(max_age);
+        let step = INTERVALS
+            .iter()
+            .find(|(_, end)| age < *end)
+            .map(|(s, _)| *s)
+            .unwrap_or(max_age);
         if prev_age - age < step {
             // Too close to the previously kept copy → thin it out
             remove.push(t);
@@ -250,7 +279,11 @@ pub fn prune(r: &Retention, dry_run: bool) -> std::io::Result<(u64, u64)> {
 
     // 3) total size cap: evict oldest-first until back under the line
     if r.max_bytes > 0 {
-        let mut total: u64 = runs.iter().filter(|x| !doomed.contains(&x.id)).map(|x| x.bytes).sum();
+        let mut total: u64 = runs
+            .iter()
+            .filter(|x| !doomed.contains(&x.id))
+            .map(|x| x.bytes)
+            .sum();
         for run in runs.iter() {
             if total <= r.max_bytes {
                 break;
@@ -273,7 +306,12 @@ pub fn prune(r: &Retention, dry_run: bool) -> std::io::Result<(u64, u64)> {
             continue;
         }
         if dry_run {
-            println!("WOULD PRUNE  {}  ({} files, {})", run.id, run.files, crate::foundation::fmt::human_bytes(run.bytes));
+            println!(
+                "WOULD PRUNE  {}  ({} files, {})",
+                run.id,
+                run.files,
+                crate::foundation::fmt::human_bytes(run.bytes)
+            );
         } else if let Err(e) = std::fs::remove_dir_all(&run.dir) {
             crate::log_error!("trash", "ERR  prune {}: {e}", run.dir.display());
             continue;
@@ -307,7 +345,10 @@ mod tests {
         let times: Vec<i64> = (0..12).map(|i| now - i * 10).collect();
         let rm = staggered_removals(&times, now);
         let kept = times.len() - rm.len();
-        assert!(kept >= 3 && kept <= 6, "12 runs 10s apart should thin to ~4, got {kept}");
+        assert!(
+            kept >= 3 && kept <= 6,
+            "12 runs 10s apart should thin to ~4, got {kept}"
+        );
     }
 
     #[test]
@@ -316,7 +357,10 @@ mod tests {
         // the same-day interval demands 1 hour of spacing; these are 2 hours apart → nothing should be deleted
         let times: Vec<i64> = (1..10).map(|i| now - i * 2 * H).collect();
         let rm = staggered_removals(&times, now);
-        assert!(rm.is_empty(), "runs spaced wider than the interval must all survive, removed {rm:?}");
+        assert!(
+            rm.is_empty(),
+            "runs spaced wider than the interval must all survive, removed {rm:?}"
+        );
     }
 
     #[test]
@@ -324,7 +368,10 @@ mod tests {
         let now = 1_000_000_000;
         let times = vec![now - 5 * D, now - 5 * D + 1, now - 5 * D + 2];
         let rm = staggered_removals(&times, now);
-        assert!(!rm.contains(&(now - 5 * D)), "oldest is the anchor and must survive");
+        assert!(
+            !rm.contains(&(now - 5 * D)),
+            "oldest is the anchor and must survive"
+        );
         assert_eq!(rm.len(), 2, "the two that crowd it must go");
     }
 

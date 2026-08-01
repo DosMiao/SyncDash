@@ -86,7 +86,10 @@ mod tests {
 
     #[test]
     fn placeholders_block_and_say_why_excluding_them_will_not_help() {
-        let mut v = Verdict { blockers: vec![], warnings: vec![] };
+        let mut v = Verdict {
+            blockers: vec![],
+            warnings: vec![],
+        };
         let s = ["Docs/.Report.pdf.icloud".to_string()];
         check_materialized("source", 1, &s, &Guards::default(), &mut v);
         assert_eq!(v.blockers.len(), 1);
@@ -97,14 +100,20 @@ mod tests {
 
     #[test]
     fn a_materialized_tree_says_nothing() {
-        let mut v = Verdict { blockers: vec![], warnings: vec![] };
+        let mut v = Verdict {
+            blockers: vec![],
+            warnings: vec![],
+        };
         check_materialized("source", 0, &[], &Guards::default(), &mut v);
         assert!(v.ok() && v.warnings.is_empty());
     }
 
     #[test]
     fn a_complete_scan_says_nothing() {
-        let mut v = Verdict { blockers: vec![], warnings: vec![] };
+        let mut v = Verdict {
+            blockers: vec![],
+            warnings: vec![],
+        };
         check_scan_complete("source", 0, &[], &Guards::default(), &mut v);
         assert!(v.ok());
         assert!(v.warnings.is_empty(), "a clean scan must not produce noise");
@@ -112,10 +121,17 @@ mod tests {
 
     #[test]
     fn one_skipped_entry_blocks_and_names_it() {
-        let mut v = Verdict { blockers: vec![], warnings: vec![] };
+        let mut v = Verdict {
+            blockers: vec![],
+            warnings: vec![],
+        };
         let samples = ["/Users/x/Desktop: Operation not permitted (os error 1)".to_string()];
         check_scan_complete("source", 1, &samples, &Guards::default(), &mut v);
-        assert_eq!(v.blockers.len(), 1, "a single skipped entry is enough to refuse");
+        assert_eq!(
+            v.blockers.len(),
+            1,
+            "a single skipped entry is enough to refuse"
+        );
         // The blocker has to carry the path: "1 entry skipped" sends the user hunting, the path
         // sends them to Privacy & Security.
         assert!(v.blockers[0].contains("/Users/x/Desktop"));
@@ -123,8 +139,14 @@ mod tests {
 
     #[test]
     fn i_know_downgrades_it_but_never_hides_it() {
-        let g = Guards { acknowledged: true, ..Guards::default() };
-        let mut v = Verdict { blockers: vec![], warnings: vec![] };
+        let g = Guards {
+            acknowledged: true,
+            ..Guards::default()
+        };
+        let mut v = Verdict {
+            blockers: vec![],
+            warnings: vec![],
+        };
         check_scan_complete("target", 4, &[], &g, &mut v);
         assert!(v.ok());
         assert_eq!(v.warnings.len(), 1);

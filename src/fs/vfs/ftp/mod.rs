@@ -28,13 +28,13 @@ use std::io::Read;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::model::table::EntryKind;
 use super::error::{VfsError, VfsErrorKind, VfsResult};
 use super::spec::RemoteSpec;
 use super::{
-    CaseSense, CredentialProvider, ReadStream, Support, VDirEntry, VMeta,
-    Vfs, VfsCaps, WriteHint, WriteStaged,
+    CaseSense, CredentialProvider, ReadStream, Support, VDirEntry, VMeta, Vfs, VfsCaps, WriteHint,
+    WriteStaged,
 };
+use crate::model::table::EntryKind;
 
 use suppaftp::list::File as FtpFile;
 use suppaftp::types::FileType;
@@ -242,9 +242,10 @@ pub struct FtpBackend {
 
 pub(super) fn map_ftp_err(what: &str, e: FtpError) -> VfsError {
     match e {
-        FtpError::ConnectionError(io) => {
-            VfsError::new(VfsErrorKind::Transient, format!("{what}: connection error: {io}"))
-        }
+        FtpError::ConnectionError(io) => VfsError::new(
+            VfsErrorKind::Transient,
+            format!("{what}: connection error: {io}"),
+        ),
         FtpError::UnexpectedResponse(resp) => {
             let code = resp.status as u32;
             let body = String::from_utf8_lossy(&resp.body).trim().to_string();
@@ -265,7 +266,13 @@ impl FtpBackend {
             .and_then(|t| t.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(20));
-        FtpBackend { spec, creds, timeout, conn: Arc::new(Mutex::new(None)), feats: OnceLock::new() }
+        FtpBackend {
+            spec,
+            creds,
+            timeout,
+            conn: Arc::new(Mutex::new(None)),
+            feats: OnceLock::new(),
+        }
     }
 
     fn abs(&self, rel: &str) -> String {
@@ -278,12 +285,19 @@ impl FtpBackend {
         }
     }
 
-    fn with_conn<T>(&self, what: &str, f: impl FnOnce(&mut FtpConn) -> Result<T, FtpError>) -> VfsResult<T> {
+    fn with_conn<T>(
+        &self,
+        what: &str,
+        f: impl FnOnce(&mut FtpConn) -> Result<T, FtpError>,
+    ) -> VfsResult<T> {
         let mut guard = self.conn.lock().unwrap();
         let conn = guard.as_mut().ok_or_else(|| {
             VfsError::new(
                 VfsErrorKind::Transient,
-                format!("'{}' is not connected — connect() must run first", self.spec.display()),
+                format!(
+                    "'{}' is not connected — connect() must run first",
+                    self.spec.display()
+                ),
             )
         })?;
         f(conn).map_err(|e| {
@@ -417,8 +431,16 @@ impl Vfs for FtpBackend {
             // the server, never a promise about the evidence tier.
             format!(
                 "ftp, MLSD:{} MFMT:{} REST:{} (unused)",
-                if f.mlsd { "yes" } else { "NO (minute-precision LIST)" },
-                if f.mfmt { "yes" } else { "NO (mtimes cannot be set)" },
+                if f.mlsd {
+                    "yes"
+                } else {
+                    "NO (minute-precision LIST)"
+                },
+                if f.mfmt {
+                    "yes"
+                } else {
+                    "NO (mtimes cannot be set)"
+                },
                 if f.rest { "yes" } else { "no" },
             )
         })
@@ -440,7 +462,9 @@ impl Vfs for FtpBackend {
         })?;
         let creds = self.creds.credentials_for(&self.spec)?;
         let password = if user == "anonymous" {
-            creds.password.unwrap_or_else(|| "anonymous@syncdash".into())
+            creds
+                .password
+                .unwrap_or_else(|| "anonymous@syncdash".into())
         } else {
             creds.password.ok_or_else(|| {
                 VfsError::new(
@@ -458,9 +482,19 @@ impl Vfs for FtpBackend {
         let port = self.spec.port.unwrap_or(21);
         let addr = format!("{}:{}", self.spec.host, port)
             .to_socket_addrs()
-            .map_err(|e| VfsError::new(VfsErrorKind::Transient, format!("cannot resolve {}: {e}", self.spec.host)))?
+            .map_err(|e| {
+                VfsError::new(
+                    VfsErrorKind::Transient,
+                    format!("cannot resolve {}: {e}", self.spec.host),
+                )
+            })?
             .next()
-            .ok_or_else(|| VfsError::new(VfsErrorKind::Transient, format!("no address for {}", self.spec.host)))?;
+            .ok_or_else(|| {
+                VfsError::new(
+                    VfsErrorKind::Transient,
+                    format!("no address for {}", self.spec.host),
+                )
+            })?;
 
         // The TLS parameter is fixed at construction — `into_secure` performs AUTH TLS on a
         // stream that is *already* typed for it and hands back the same type, so the two schemes
@@ -490,7 +524,11 @@ impl Vfs for FtpBackend {
             },
             Err(_) => Feats::default(),
         };
-        if stream.feat().map(|m| m.contains_key("UTF8")).unwrap_or(false) {
+        if stream
+            .feat()
+            .map(|m| m.contains_key("UTF8"))
+            .unwrap_or(false)
+        {
             let _ = stream.opts("UTF8", Some("ON"));
         }
 
@@ -542,14 +580,21 @@ impl Vfs for FtpBackend {
         Ok(self
             .list_dir(rel)?
             .iter()
-            .map(|f| VDirEntry { name: f.name().to_string(), meta: meta_of(f) })
+            .map(|f| VDirEntry {
+                name: f.name().to_string(),
+                meta: meta_of(f),
+            })
             .collect())
     }
 
     fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>> {
         let abs = self.abs(rel);
         let data = self.with_conn("open_read", |c| c.stream.retr_as_stream(&abs))?;
-        Ok(Box::new(FtpRead { conn: self.conn.clone(), data: Some(Box::new(data)), finished: false }))
+        Ok(Box::new(FtpRead {
+            conn: self.conn.clone(),
+            data: Some(Box::new(data)),
+            finished: false,
+        }))
     }
 
     /// Refused, and `caps().ranged_read` says so before anyone asks.
@@ -575,9 +620,15 @@ impl Vfs for FtpBackend {
     fn read_link(&self, rel: &str) -> VfsResult<String> {
         match self.stat(rel)? {
             Some(m) => m.link.ok_or_else(|| {
-                VfsError::new(VfsErrorKind::Io, format!("not a symlink (or the listing carries no target): {rel}"))
+                VfsError::new(
+                    VfsErrorKind::Io,
+                    format!("not a symlink (or the listing carries no target): {rel}"),
+                )
             }),
-            None => Err(VfsError::new(VfsErrorKind::NotFound, format!("no such path: {rel}"))),
+            None => Err(VfsError::new(
+                VfsErrorKind::NotFound,
+                format!("no such path: {rel}"),
+            )),
         }
     }
 
@@ -642,9 +693,10 @@ impl Vfs for FtpBackend {
             Err(e) if e.kind != VfsErrorKind::Transient => {
                 // Server prose varies; whether it is non-empty is checked by looking
                 match self.read_dir_names(rel) {
-                    Ok(l) if !l.is_empty() => {
-                        Err(VfsError::new(VfsErrorKind::NotEmpty, format!("directory not empty: {rel}")))
-                    }
+                    Ok(l) if !l.is_empty() => Err(VfsError::new(
+                        VfsErrorKind::NotEmpty,
+                        format!("directory not empty: {rel}"),
+                    )),
                     _ => Err(e),
                 }
             }
@@ -654,7 +706,9 @@ impl Vfs for FtpBackend {
 
     fn set_mtime(&self, rel: &str, mtime_ms: i64) -> VfsResult<()> {
         if !self.feats.get().map(|f| f.mfmt).unwrap_or(false) {
-            return Err(VfsError::unsupported("this server advertises no MFMT — mtimes cannot be set"));
+            return Err(VfsError::unsupported(
+                "this server advertises no MFMT — mtimes cannot be set",
+            ));
         }
         let abs = self.abs(rel);
         let stamp = crate::foundation::time::stamp_compact(mtime_ms).replace('-', "");
@@ -684,7 +738,9 @@ mod tests {
     use crate::fs::vfs::spec::{parse, RootSpec};
 
     fn backend(s: &str) -> FtpBackend {
-        let RootSpec::Remote(r) = parse(s) else { panic!() };
+        let RootSpec::Remote(r) = parse(s) else {
+            panic!()
+        };
         FtpBackend::new(r, crate::fs::vfs::cred::default_provider())
     }
 
@@ -699,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn abs_paths_are_rooted(){
+    fn abs_paths_are_rooted() {
         let b = backend("ftp://u@h/pub/data");
         assert_eq!(b.abs(""), "/pub/data");
         assert_eq!(b.abs("x/y.txt"), "/pub/data/x/y.txt");
@@ -715,8 +771,16 @@ mod tests {
     #[test]
     fn ftps_is_a_real_scheme_and_authenticates_like_ftp() {
         let e = backend("ftps://u@h/x").connect().unwrap_err();
-        assert_eq!(e.kind, VfsErrorKind::Auth, "no stored secret — same rung ftp:// stops at");
-        assert_ne!(e.kind, VfsErrorKind::Unsupported, "the scheme itself is supported now");
+        assert_eq!(
+            e.kind,
+            VfsErrorKind::Auth,
+            "no stored secret — same rung ftp:// stops at"
+        );
+        assert_ne!(
+            e.kind,
+            VfsErrorKind::Unsupported,
+            "the scheme itself is supported now"
+        );
 
         // And it is still refused when the phrase names nobody, for the same reason ftp:// is:
         // anonymous has to be asked for, never assumed.

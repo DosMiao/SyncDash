@@ -28,8 +28,11 @@ const STAMP: i64 = 1_767_225_600_000;
 fn place(root: &Arc<dyn Vfs>, name: &str) {
     let payload = crate::fs::vfs::memory::filler(PAYLOAD_SEED, PAYLOAD_SIZE);
     root.mkdir_all("unicode").unwrap();
-    let hint =
-        WriteHint { size_hint: Some(payload.len() as u64), mtime_ms: Some(STAMP), mode: None };
+    let hint = WriteHint {
+        size_hint: Some(payload.len() as u64),
+        mtime_ms: Some(STAMP),
+        mode: None,
+    };
     let mut w = root.open_write(name, &hint).unwrap();
     w.write(&payload).unwrap();
     w.seal(false).unwrap();
@@ -91,5 +94,8 @@ fn nfc_and_nfd_agree_across_a_real_windows_mac_pair() {
     crate::fs::vfs::conformance::remove_tree(&base, &name).unwrap();
     let _ = std::fs::remove_dir_all(&local);
 
-    assert!(ops.is_empty(), "NTFS wrote NFC, APFS holds NFD, and they are the same file — {ops:?}");
+    assert!(
+        ops.is_empty(),
+        "NTFS wrote NFC, APFS holds NFD, and they are the same file — {ops:?}"
+    );
 }

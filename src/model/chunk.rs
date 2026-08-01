@@ -43,8 +43,14 @@ pub struct RecipeStep {
 pub fn chunk_bytes(data: &[u8]) -> Vec<ChunkInfo> {
     let mut out = Vec::new();
     for c in fastcdc::v2020::FastCDC::new(data, MIN, AVG, MAX) {
-        let h = blake3::hash(&data[c.offset..c.offset + c.length]).to_hex().to_string();
-        out.push(ChunkInfo { off: c.offset as u64, len: c.length as u32, hash: h });
+        let h = blake3::hash(&data[c.offset..c.offset + c.length])
+            .to_hex()
+            .to_string();
+        out.push(ChunkInfo {
+            off: c.offset as u64,
+            len: c.length as u32,
+            hash: h,
+        });
     }
     out
 }
@@ -54,7 +60,12 @@ pub fn chunk_file(root: &Path, rel: &str) -> std::io::Result<FileChunks> {
     // Delta only kicks in for large files, and the memory ceiling here is the file itself; a GB-scale .mph is acceptable (one-shot, sequential read)
     let data = std::fs::read(&p)?;
     let hash = blake3::hash(&data).to_hex().to_string();
-    Ok(FileChunks { rel: rel.to_string(), size: data.len() as u64, hash, chunks: chunk_bytes(&data) })
+    Ok(FileChunks {
+        rel: rel.to_string(),
+        size: data.len() as u64,
+        hash,
+        chunks: chunk_bytes(&data),
+    })
 }
 
 #[cfg(test)]
@@ -65,7 +76,9 @@ mod tests {
     /// the boundaries are content-defined, so this is a property of the data, not of the run.
     #[test]
     fn chunking_is_deterministic_for_the_same_bytes() {
-        let data: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let data: Vec<u8> = (0..200_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
         let a = chunk_bytes(&data);
         let b = chunk_bytes(&data);
         assert!(!a.is_empty(), "a 200KB buffer must produce chunks");
@@ -87,21 +100,30 @@ mod tests {
             assert_eq!(c.off, at, "chunk starts where the previous one ended");
             at += c.len as u64;
         }
-        assert_eq!(at, data.len() as u64, "the chunks together must cover the whole input");
+        assert_eq!(
+            at,
+            data.len() as u64,
+            "the chunks together must cover the whole input"
+        );
     }
 
     /// An edit in the middle must leave most boundaries alone — that is the entire reason
     /// this is content-defined chunking rather than fixed blocks.
     #[test]
     fn an_edit_disturbs_only_nearby_boundaries() {
-        let data: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+        let data: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
         let mut edited = data.clone();
         for b in edited.iter_mut().skip(150_000).take(64) {
             *b ^= 0xFF;
         }
         let a = chunk_bytes(&data);
         let b = chunk_bytes(&edited);
-        let shared = a.iter().filter(|c| b.iter().any(|d| d.hash == c.hash)).count();
+        let shared = a
+            .iter()
+            .filter(|c| b.iter().any(|d| d.hash == c.hash))
+            .count();
         assert!(
             shared * 2 >= a.len(),
             "a 64-byte edit should leave over half of {} chunks reusable, kept {shared}",

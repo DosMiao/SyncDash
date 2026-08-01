@@ -9,6 +9,7 @@
 
 use crate::model::event::LogLevel;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, ts_rs::TS)]
@@ -102,7 +103,11 @@ impl AppSettings {
         }
         let fallback = default_log_dir();
         if want != fallback && std::fs::create_dir_all(&fallback).is_ok() {
-            eprintln!("settings: log dir {} unusable, falling back to {}", want.display(), fallback.display());
+            eprintln!(
+                "settings: log dir {} unusable, falling back to {}",
+                want.display(),
+                fallback.display()
+            );
             return fallback;
         }
         std::env::temp_dir().join("syncdash-logs")
@@ -111,27 +116,84 @@ impl AppSettings {
     pub fn logs_compare(&self) -> bool {
         self.log_compare != "off"
     }
-}
 
-/// Read the settings. A missing file or a broken one both fall back to the defaults.
-pub fn load() -> AppSettings {
-    let p = settings_path();
-    match std::fs::read_to_string(&p) {
-        Ok(t) => toml::from_str(&t).unwrap_or_else(|e| {
-            eprintln!("settings: {} failed to parse, using defaults: {e}", p.display());
-            AppSettings::default()
-        }),
-        Err(_) => AppSettings::default(),
+    pub fn validate(&self) -> Result<(), String> {
+        if !matches!(self.log_compare.as_str(), "summary" | "off") {
+            return Err(format!(
+                "log_compare must be 'summary' or 'off', got {:?}",
+                self.log_compare
+            ));
+        }
+        if self.log_dir.contains('\0') {
+            return Err("log_dir contains a NUL byte".into());
+        }
+        self.max_total_mb
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| "max_total_mb is too large".to_string())?;
+        self.keep_days
+            .checked_mul(24 * 60 * 60 * 1000)
+            .ok_or_else(|| "keep_days is too large".to_string())?;
+        Ok(())
     }
 }
 
+/// Read settings and preserve any fallback reason so startup can publish it after installing the
+/// application log sink. A missing file is the normal first-run state and has no diagnostic.
+pub fn load_with_diagnostic() -> (AppSettings, Option<String>) {
+    let p = settings_path();
+    match std::fs::read_to_string(&p) {
+        Ok(text) => match toml::from_str::<AppSettings>(&text) {
+            Ok(settings) => match settings.validate() {
+                Ok(()) => (settings, None),
+                Err(error) => (
+                    AppSettings::default(),
+                    Some(format!(
+                        "settings: {} is invalid, using defaults: {error}",
+                        p.display()
+                    )),
+                ),
+            },
+            Err(error) => (
+                AppSettings::default(),
+                Some(format!(
+                    "settings: {} failed to parse, using defaults: {error}",
+                    p.display()
+                )),
+            ),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (AppSettings::default(), None)
+        }
+        Err(error) => (
+            AppSettings::default(),
+            Some(format!(
+                "settings: {} could not be read, using defaults: {error}",
+                p.display()
+            )),
+        ),
+    }
+}
+
+pub fn load() -> AppSettings {
+    load_with_diagnostic().0
+}
+
 pub fn save(s: &AppSettings) -> std::io::Result<PathBuf> {
+    s.validate()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let dir = config_dir();
     std::fs::create_dir_all(&dir)?;
-    let text = toml::to_string_pretty(s)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}")))?;
+    let text = toml::to_string_pretty(s).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("toml serialize: {e}"),
+        )
+    })?;
     let p = settings_path();
-    std::fs::write(&p, text)?;
+    let mut staged = crate::fs::staged::Staged::create(&p)?;
+    staged.write_all(text.as_bytes())?;
+    staged.seal(true)?;
+    staged.commit()?;
     Ok(p)
 }
 
@@ -140,14 +202,22 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("syncdash-set-{tag}-{}", crate::foundation::time::now_ms()));
+        let p = std::env::temp_dir().join(format!(
+            "syncdash-set-{tag}-{}",
+            crate::foundation::time::now_ms()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
 
     #[test]
     fn settings_roundtrip_and_defaults() {
-        let s = AppSettings { log_dir: "D:\\logs".into(), level: LogLevel::Warn, keep_days: 7, ..Default::default() };
+        let s = AppSettings {
+            log_dir: "D:\\logs".into(),
+            level: LogLevel::Warn,
+            keep_days: 7,
+            ..Default::default()
+        };
         let text = toml::to_string_pretty(&s).unwrap();
         let back: AppSettings = toml::from_str(&text).unwrap();
         assert_eq!(s, back);
@@ -159,6 +229,16 @@ mod tests {
         assert!(partial.logs_compare());
     }
 
+    #[test]
+    fn invalid_settings_are_rejected_before_the_live_configuration_changes() {
+        let mut settings = AppSettings::default();
+        settings.log_compare = "everything".into();
+        assert!(settings.validate().unwrap_err().contains("log_compare"));
+
+        settings.log_compare = "summary".into();
+        settings.log_dir = "bad\0path".into();
+        assert!(settings.validate().unwrap_err().contains("NUL"));
+    }
 
     #[test]
     fn resolved_log_dir_falls_back_when_unwritable() {
@@ -166,10 +246,17 @@ mod tests {
         let root = tmp("fallback");
         let f = root.join("not-a-dir");
         std::fs::write(&f, "x").unwrap();
-        let s = AppSettings { log_dir: f.display().to_string(), ..Default::default() };
+        let s = AppSettings {
+            log_dir: f.display().to_string(),
+            ..Default::default()
+        };
         let got = s.resolved_log_dir();
         assert_ne!(got, f, "must not return a path that cannot be written");
-        assert!(got.is_dir(), "the fallback target must actually exist: {}", got.display());
+        assert!(
+            got.is_dir(),
+            "the fallback target must actually exist: {}",
+            got.display()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

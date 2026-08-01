@@ -12,7 +12,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::model::table::EntryKind;
 use super::error::VfsResult;
 use super::{
     CaseSense, CommitReport, Medium, ReadStream, Support, VDirEntry, VMeta, Vfs, VfsCaps,
@@ -20,6 +19,7 @@ use super::{
 };
 use crate::foundation::path::join_native;
 use crate::fs::staged::Staged;
+use crate::model::table::EntryKind;
 
 pub struct LocalVfs {
     root: PathBuf,
@@ -35,7 +35,11 @@ pub struct LocalVfs {
 impl LocalVfs {
     pub fn new(root: PathBuf) -> LocalVfs {
         let root_str = root.to_string_lossy().into_owned();
-        LocalVfs { root, root_str, vol: OnceLock::new() }
+        LocalVfs {
+            root,
+            root_str,
+            vol: OnceLock::new(),
+        }
     }
 
     fn abs(&self, rel: &str) -> PathBuf {
@@ -64,7 +68,11 @@ pub struct Volume {
 
 impl Volume {
     fn unknown() -> Volume {
-        Volume { medium: Medium::Unknown, fs_name: String::new(), case_sensitivity: CaseSense::Unknown }
+        Volume {
+            medium: Medium::Unknown,
+            fs_name: String::new(),
+            case_sensitivity: CaseSense::Unknown,
+        }
     }
 }
 
@@ -80,6 +88,53 @@ fn mtime_precision_for(fs_name: &str) -> u32 {
     }
 }
 
+fn fat_family(fs_name: &str) -> bool {
+    matches!(
+        fs_name.to_ascii_lowercase().as_str(),
+        "fat" | "fat12" | "fat16" | "fat32" | "msdos" | "vfat" | "exfat"
+    )
+}
+
+fn file_ids_stable_for_fs(fs_name: &str) -> bool {
+    matches!(
+        fs_name.to_ascii_lowercase().as_str(),
+        "apfs"
+            | "hfs"
+            | "hfsplus"
+            | "ext2"
+            | "ext3"
+            | "ext4"
+            | "btrfs"
+            | "xfs"
+            | "zfs"
+            | "f2fs"
+            | "jfs"
+            | "ntfs"
+            | "ntfs3"
+            | "refs"
+    )
+}
+
+fn unix_mode_support(fs_name: &str) -> Support {
+    if cfg!(unix) && !fat_family(fs_name) {
+        Support::Yes
+    } else {
+        Support::No
+    }
+}
+
+fn symlink_support_for_fs(fs_name: &str) -> Support {
+    if cfg!(target_os = "macos") && fs_name.eq_ignore_ascii_case("exfat") {
+        Support::Yes
+    } else if fat_family(fs_name) {
+        Support::No
+    } else if cfg!(unix) {
+        Support::Yes
+    } else {
+        Support::Unknown
+    }
+}
+
 /// Classify a filesystem by the name the OS gives it.
 ///
 /// Used by the unix probe, where `statfs` reports a name but no medium. Windows does not need it:
@@ -90,8 +145,8 @@ fn medium_for_fs(fs_name: &str) -> Medium {
         "smbfs" | "cifs" | "smb2" | "smb3" | "nfs" | "nfs4" | "afpfs" | "webdav" | "ftp"
         | "sshfs" | "davfs" | "9p" => Medium::NetworkShare,
         "ntfs" | "ntfs3" | "refs" | "apfs" | "hfs" | "hfsplus" | "ext2" | "ext3" | "ext4"
-        | "btrfs" | "xfs" | "zfs" | "f2fs" | "jfs" | "reiserfs" | "tmpfs" | "overlay"
-        | "msdos" | "vfat" | "exfat" | "fat" | "fat32" => Medium::FixedDisk,
+        | "btrfs" | "xfs" | "zfs" | "f2fs" | "jfs" | "reiserfs" | "tmpfs" | "overlay" | "msdos"
+        | "vfat" | "exfat" | "fat" | "fat32" => Medium::FixedDisk,
         _ => Medium::Unknown,
     }
 }
@@ -111,13 +166,70 @@ fn case_for_fs(fs_name: &str) -> CaseSense {
     }
 }
 
-/// Whether the central trash store can take this root's deletions.
+/// Whether the default central trash can receive this root through a same-volume rename.
 ///
-/// Named rather than inlined because it is the whole point of probing the medium, and because
-/// the failure it prevents is invisible in a diff: `true` on a share means every deleted file is
-/// downloaded before being removed.
-fn trash_reaches(medium: Medium) -> bool {
-    matches!(medium, Medium::FixedDisk | Medium::RemovableDisk)
+/// "Local disk" is not sufficient: an external SSD and the user's cache directory are both local
+/// but still different volumes. Falling back from that rename to a copy makes every deletion read
+/// the complete old file off the removable disk. In-root retention is both safer and faster there.
+fn central_trash_reaches(root: &Path, medium: Medium) -> bool {
+    !matches!(medium, Medium::NetworkShare | Medium::Unknown)
+        && same_device(root, &crate::foundation::dirs::data_dir())
+}
+
+fn scan_streams(volume: &Volume) -> usize {
+    let base = if volume.medium == Medium::NetworkShare {
+        4
+    } else {
+        match volume.fs_name.to_ascii_lowercase().as_str() {
+            // FAT/exFAT trees are commonly removable media with many small files. Four readers
+            // under-fill a modern external SSD, while the old fixed width of sixteen creates a
+            // deep random-I/O queue on spinning media. Half the available CPUs, bounded to 4..=8,
+            // is the same conservative shape used by mature parallel hashers: enough overlap for
+            // metadata/open latency without turning every directory into an I/O storm.
+            "fat" | "fat12" | "fat16" | "fat32" | "msdos" | "vfat" | "exfat" => {
+                std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(4)
+                    .div_ceil(2)
+                    .clamp(4, 8)
+            }
+            _ => 16,
+        }
+    };
+    crate::foundation::thread::configured_worker_limit().map_or(base, |limit| base.min(limit))
+}
+
+#[cfg(unix)]
+pub fn same_device(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    fn device(path: &Path) -> Option<u64> {
+        let mut candidate = Some(path);
+        while let Some(path) = candidate {
+            match std::fs::metadata(path) {
+                Ok(metadata) => return Some(metadata.dev()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    candidate = path.parent();
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    matches!((device(left), device(right)), (Some(left), Some(right)) if left == right)
+}
+
+#[cfg(windows)]
+pub fn same_device(left: &Path, right: &Path) -> bool {
+    match (
+        win_root_of(&left.to_string_lossy()),
+        win_root_of(&right.to_string_lossy()),
+    ) {
+        (WinRoot::Drive(left), WinRoot::Drive(right))
+        | (WinRoot::Share(left), WinRoot::Share(right)) => left.eq_ignore_ascii_case(&right),
+        _ => false,
+    }
 }
 
 /// The volume root Windows' volume APIs want, derived from a root path.
@@ -199,8 +311,10 @@ fn probe(root: &Path) -> Volume {
         WinRoot::Share(s) => (s, Medium::NetworkShare),
         WinRoot::Unknown => return Volume::unknown(),
     };
-    let wide: Vec<u16> =
-        std::ffi::OsStr::new(&vol_root).encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = std::ffi::OsStr::new(&vol_root)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
     // A UNC path is already settled; only a drive letter needs the call.
     let medium = if shape == Medium::NetworkShare {
@@ -225,7 +339,10 @@ fn probe(root: &Path) -> Volume {
     };
     if ok == 0 {
         // The medium is still worth keeping — an offline share answers the drive type fine.
-        return Volume { medium, ..Volume::unknown() };
+        return Volume {
+            medium,
+            ..Volume::unknown()
+        };
     }
     let n = fs_buf.iter().position(|&c| c == 0).unwrap_or(fs_buf.len());
     Volume {
@@ -360,6 +477,48 @@ struct LocalStaged {
     hint: WriteHint,
 }
 
+impl LocalStaged {
+    fn commit_with(&mut self, replace: bool) -> VfsResult<CommitReport> {
+        let staged = self.staged.take().expect("double commit");
+        let mut report = CommitReport::default();
+
+        if let Some(ms) = self.hint.mtime_ms {
+            let ft = filetime::FileTime::from_unix_time(
+                ms.div_euclid(1000),
+                (ms.rem_euclid(1000) * 1_000_000) as u32,
+            );
+            if let Err(e) = filetime::set_file_mtime(staged.path(), ft) {
+                report.mtime_error = Some(e.into());
+            }
+        }
+        #[cfg(unix)]
+        if let Some(mode) = self.hint.mode {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(staged.path(), std::fs::Permissions::from_mode(mode))
+            {
+                report.mode_error = Some(e.into());
+            }
+        }
+        if self.hint.mtime_ms.is_some() || (cfg!(unix) && self.hint.mode.is_some()) {
+            staged.resync_metadata_if_requested()?;
+        }
+
+        if replace {
+            staged.commit()?;
+        } else {
+            staged.commit_noreplace()?;
+        }
+
+        if self.hint.mtime_ms.is_some() {
+            report.mtime_ondisk_ms = std::fs::metadata(&self.dst)
+                .ok()
+                .map(|md| crate::foundation::time::meta_mtime_ms(&md));
+        }
+        Ok(report)
+    }
+}
+
 impl WriteStaged for LocalStaged {
     fn write(&mut self, buf: &[u8]) -> VfsResult<()> {
         let s = self.staged.as_mut().expect("write after commit");
@@ -390,42 +549,23 @@ impl WriteStaged for LocalStaged {
 
     fn open_staged_read(&self) -> VfsResult<Box<dyn ReadStream>> {
         let s = self.staged.as_ref().expect("read after commit");
-        Ok(Box::new(LocalRead { file: std::fs::File::open(s.path())? }))
+        Ok(Box::new(LocalRead {
+            file: std::fs::File::open(s.path())?,
+        }))
     }
 
     fn commit(mut self: Box<Self>) -> VfsResult<CommitReport> {
-        let staged = self.staged.take().expect("double commit");
-        let mut report = CommitReport::default();
+        self.commit_with(true)
+    }
 
-        if let Some(ms) = self.hint.mtime_ms {
-            let ft = filetime::FileTime::from_unix_time(ms.div_euclid(1000), (ms.rem_euclid(1000) * 1_000_000) as u32);
-            if let Err(e) = filetime::set_file_mtime(staged.path(), ft) {
-                report.mtime_error = Some(e.into());
-            }
-        }
-        #[cfg(unix)]
-        if let Some(mode) = self.hint.mode {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(staged.path(), std::fs::Permissions::from_mode(mode)) {
-                report.mode_error = Some(e.into());
-            }
-        }
-
-        staged.commit()?;
-
-        if self.hint.mtime_ms.is_some() {
-            report.mtime_ondisk_ms = std::fs::metadata(&self.dst)
-                .ok()
-                .map(|md| crate::foundation::time::meta_mtime_ms(&md));
-        }
-        Ok(report)
+    fn commit_noreplace(mut self: Box<Self>) -> VfsResult<CommitReport> {
+        self.commit_with(false)
     }
 }
 
 impl Vfs for LocalVfs {
     fn caps(&self) -> VfsCaps {
         let vol = self.volume();
-        let networked = vol.medium == Medium::NetworkShare;
         VfsCaps {
             protocol: "local",
             // Measured, not assumed: FAT stores two-second mtimes and exFAT ten-millisecond ones,
@@ -437,20 +577,28 @@ impl Vfs for LocalVfs {
             rename_overwrite: Support::Yes,
             ranged_read: Support::Yes,
             write_at: Support::Yes,
-            unix_mode: if cfg!(unix) { Support::Yes } else { Support::No },
-            symlink: if cfg!(unix) { Support::Yes } else { Support::Unknown },
-            file_id: if cfg!(unix) { Support::Yes } else { Support::No },
+            // Host syscalls are not the filesystem contract: FAT/exFAT synthesize permission
+            // bits even when mounted on a Unix host.
+            unix_mode: unix_mode_support(&vol.fs_name),
+            // macOS FSKit-backed exFAT represents real links despite the portable exFAT format
+            // having no POSIX mode bits. Other FAT drivers cannot be assumed to do so.
+            symlink: symlink_support_for_fs(&vol.fs_name),
+            file_id: if cfg!(unix) && file_ids_stable_for_fs(&vol.fs_name) {
+                Support::Yes
+            } else {
+                Support::No
+            },
             free_space: Support::Yes,
             read_back: Support::Yes,
             medium: vol.medium,
-            local_trash: trash_reaches(vol.medium),
+            local_trash: central_trash_reaches(&self.root, vol.medium),
             case_sensitivity: vol.case_sensitivity,
             // Whatever this process's own path layer enforces. SMB inherits this deliberately:
             // a Windows client gets Win32 name parsing even when the share is served by Samba.
             name_rules: super::NameRules::host(),
             // A share saturates its uplink long before sixteen streams; past that they only
             // queue against each other. FFS measured the same knee at two to four.
-            max_parallel_streams: if networked { 4 } else { 16 },
+            max_parallel_streams: scan_streams(vol),
         }
     }
 
@@ -506,13 +654,18 @@ impl Vfs for LocalVfs {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
             };
-            out.push(VDirEntry { name, meta: meta_of(&md) });
+            out.push(VDirEntry {
+                name,
+                meta: meta_of(&md),
+            });
         }
         Ok(out)
     }
 
     fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>> {
-        Ok(Box::new(LocalRead { file: std::fs::File::open(self.abs(rel))? }))
+        Ok(Box::new(LocalRead {
+            file: std::fs::File::open(self.abs(rel))?,
+        }))
     }
 
     fn read_range(&self, rel: &str, off: u64, len: u32) -> VfsResult<Vec<u8>> {
@@ -533,7 +686,9 @@ impl Vfs for LocalVfs {
     }
 
     fn read_link(&self, rel: &str) -> VfsResult<String> {
-        Ok(std::fs::read_link(self.abs(rel))?.to_string_lossy().into_owned())
+        Ok(std::fs::read_link(self.abs(rel))?
+            .to_string_lossy()
+            .into_owned())
     }
 
     fn mkdir_all(&self, rel: &str) -> VfsResult<()> {
@@ -543,12 +698,26 @@ impl Vfs for LocalVfs {
     fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
         let dst = self.abs(rel);
         let staged = Staged::create(&dst)?;
-        Ok(Box::new(LocalStaged { staged: Some(staged), dst, hint: hint.clone() }))
+        Ok(Box::new(LocalStaged {
+            staged: Some(staged),
+            dst,
+            hint: hint.clone(),
+        }))
     }
 
     fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
         // force: an SMB server mapping unix modes can refuse to move a read-only source
-        Ok(crate::fs::rename_force(&self.abs(from_rel), &self.abs(to_rel))?)
+        Ok(crate::fs::rename_force(
+            &self.abs(from_rel),
+            &self.abs(to_rel),
+        )?)
+    }
+
+    fn rename_noreplace(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
+        let (from, to) = (self.abs(from_rel), self.abs(to_rel));
+        // Never turn ENOTSUP (notably FSKit exFAT) into stat + replacing rename: another writer
+        // can create `to` between those calls. Unsupported filesystems must fail closed.
+        Ok(crate::fs::staged::atomic_rename_noreplace(&from, &to)?)
     }
 
     fn remove_file(&self, rel: &str) -> VfsResult<()> {
@@ -574,12 +743,18 @@ impl Vfs for LocalVfs {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            Ok(std::fs::set_permissions(self.abs(rel), std::fs::Permissions::from_mode(mode))?)
+            Ok(std::fs::set_permissions(
+                self.abs(rel),
+                std::fs::Permissions::from_mode(mode),
+            )?)
         }
         #[cfg(not(unix))]
         {
             let _ = (rel, mode);
-            Err(super::VfsError::new(super::VfsErrorKind::Unsupported, "unix modes do not exist on this filesystem"))
+            Err(super::VfsError::new(
+                super::VfsErrorKind::Unsupported,
+                "unix modes do not exist on this filesystem",
+            ))
         }
     }
 
@@ -613,10 +788,19 @@ mod volume_tests {
 
     #[test]
     fn a_unc_root_is_a_share_whatever_the_spelling() {
-        assert_eq!(win_root_of(r"\\nas\photos\2026"), WinRoot::Share(r"\\nas\photos\".into()));
-        assert_eq!(win_root_of(r"\\nas\photos"), WinRoot::Share(r"\\nas\photos\".into()));
+        assert_eq!(
+            win_root_of(r"\\nas\photos\2026"),
+            WinRoot::Share(r"\\nas\photos\".into())
+        );
+        assert_eq!(
+            win_root_of(r"\\nas\photos"),
+            WinRoot::Share(r"\\nas\photos\".into())
+        );
         // The extended-length UNC spelling names the same share
-        assert_eq!(win_root_of(r"\\?\UNC\nas\photos\sub"), WinRoot::Share(r"\\nas\photos\".into()));
+        assert_eq!(
+            win_root_of(r"\\?\UNC\nas\photos\sub"),
+            WinRoot::Share(r"\\nas\photos\".into())
+        );
         // A host with no share names no volume — better Unknown than a wrong guess
         assert_eq!(win_root_of(r"\\nas"), WinRoot::Unknown);
     }
@@ -628,7 +812,10 @@ mod volume_tests {
         assert_eq!(win_root_of("d:/code"), WinRoot::Drive(r"D:\".into()));
         assert_eq!(win_root_of("D:"), WinRoot::Drive(r"D:\".into()));
         // \\?\ is a parsing escape, not a different volume
-        assert_eq!(win_root_of(r"\\?\D:\very\long"), WinRoot::Drive(r"D:\".into()));
+        assert_eq!(
+            win_root_of(r"\\?\D:\very\long"),
+            WinRoot::Drive(r"D:\".into())
+        );
         // A relative root names no volume
         assert_eq!(win_root_of("relative/dir"), WinRoot::Unknown);
     }
@@ -653,7 +840,47 @@ mod volume_tests {
         assert_eq!(mtime_precision_for("exFAT"), 10);
         assert_eq!(mtime_precision_for("NTFS"), 1);
         assert_eq!(mtime_precision_for("apfs"), 1);
-        assert_eq!(mtime_precision_for(""), 1, "an unnamed filesystem is not assumed coarse");
+        assert_eq!(
+            mtime_precision_for(""),
+            1,
+            "an unnamed filesystem is not assumed coarse"
+        );
+    }
+
+    #[test]
+    fn fat_and_exfat_do_not_claim_unix_modes() {
+        for fs in ["FAT32", "msdos", "vfat", "exFAT"] {
+            assert_eq!(unix_mode_support(fs), Support::No, "{fs}");
+        }
+
+        if cfg!(unix) {
+            assert_eq!(unix_mode_support("apfs"), Support::Yes);
+        }
+    }
+
+    #[test]
+    fn file_id_capability_is_positive_listed() {
+        for fs in ["apfs", "ext4", "btrfs", "xfs", "NTFS"] {
+            assert!(file_ids_stable_for_fs(fs), "{fs}");
+        }
+        for fs in ["exFAT", "overlay", "tmpfs", "fuse", "mysteryfs", ""] {
+            assert!(!file_ids_stable_for_fs(fs), "{fs}");
+        }
+    }
+
+    #[test]
+    fn symlink_support_accounts_for_the_filesystem_driver() {
+        let exfat = if cfg!(target_os = "macos") {
+            Support::Yes
+        } else {
+            Support::No
+        };
+        assert_eq!(symlink_support_for_fs("exFAT"), exfat);
+        assert_eq!(symlink_support_for_fs("FAT32"), Support::No);
+
+        if cfg!(unix) {
+            assert_eq!(symlink_support_for_fs("apfs"), Support::Yes);
+        }
     }
 
     #[test]
@@ -664,7 +891,11 @@ mod volume_tests {
         for fs in ["apfs", "ext4", "NTFS", "btrfs", "exfat"] {
             assert_eq!(medium_for_fs(fs), Medium::FixedDisk, "{fs}");
         }
-        assert_eq!(medium_for_fs("fuse"), Medium::Unknown, "fuse could be either — say so");
+        assert_eq!(
+            medium_for_fs("fuse"),
+            Medium::Unknown,
+            "fuse could be either — say so"
+        );
         assert_eq!(medium_for_fs(""), Medium::Unknown);
     }
 
@@ -678,24 +909,61 @@ mod volume_tests {
         assert_eq!(case_for_fs("smbfs"), CaseSense::Unknown);
     }
 
-    /// The bug this phase exists to fix. `true` on a share means `preserve` moves the original
-    /// into the central store, the rename fails cross-volume, and the fallback copy pulls every
-    /// deleted file across the network before deleting it.
+    /// Central retention is a rename only when the root and state directory share a volume.
     #[test]
-    fn the_central_trash_is_claimed_only_for_volumes_on_this_machine() {
-        assert!(trash_reaches(Medium::FixedDisk));
-        assert!(trash_reaches(Medium::RemovableDisk), "a local copy is fast and costs no bandwidth");
-        assert!(!trash_reaches(Medium::NetworkShare), "this is the download");
-        assert!(!trash_reaches(Medium::Unknown), "not established is not the same as local");
+    fn the_central_trash_is_claimed_only_for_the_same_physical_volume() {
+        let root = std::env::temp_dir();
+        let same_volume = same_device(&root, &crate::foundation::dirs::data_dir());
+        assert_eq!(central_trash_reaches(&root, Medium::FixedDisk), same_volume);
+        assert_eq!(
+            central_trash_reaches(&root, Medium::RemovableDisk),
+            same_volume
+        );
+        assert!(!central_trash_reaches(&root, Medium::NetworkShare));
+        assert!(!central_trash_reaches(&root, Medium::Unknown));
     }
 
     #[test]
     fn a_real_local_root_probes_as_a_disk_on_this_machine() {
         let v = LocalVfs::new(std::env::temp_dir());
         let caps = v.caps();
-        assert_ne!(caps.medium, Medium::NetworkShare, "the temp dir is not a share");
-        assert!(caps.local_trash, "the temp dir's volume can take a trash move");
+        assert_ne!(
+            caps.medium,
+            Medium::NetworkShare,
+            "the temp dir is not a share"
+        );
+        assert_eq!(
+            caps.local_trash,
+            same_device(&std::env::temp_dir(), &crate::foundation::dirs::data_dir())
+        );
         // Probing twice must not re-probe or disagree with itself
         assert_eq!(v.volume(), v.volume());
+    }
+
+    #[test]
+    fn small_file_filesystems_use_a_bounded_scan_width() {
+        let exfat = Volume {
+            medium: Medium::FixedDisk,
+            fs_name: "exfat".into(),
+            case_sensitivity: CaseSense::Insensitive,
+        };
+        let network = Volume {
+            medium: Medium::NetworkShare,
+            fs_name: "smbfs".into(),
+            case_sensitivity: CaseSense::Unknown,
+        };
+        assert!((1..=8).contains(&scan_streams(&exfat)));
+        assert!((1..=4).contains(&scan_streams(&network)));
+        assert!(!file_ids_stable_for_fs(&exfat.fs_name));
+    }
+
+    #[test]
+    fn nested_roots_are_recognized_as_the_same_device() {
+        let root = std::env::temp_dir().join(format!("syncdash-device-{}", std::process::id()));
+        let nested = root.join("nested");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(same_device(&root, &nested));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

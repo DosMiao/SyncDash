@@ -33,25 +33,39 @@ pub fn check_delete_ratio(
     if g.acknowledged {
         v.warnings.push(format!("{msg} (allowed by --i-know)"));
     } else {
-        v.blockers.push(format!("{msg} Re-run with --i-know if this is really intended."));
+        v.blockers.push(format!(
+            "{msg} Re-run with --i-know if this is really intended."
+        ));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::Guards;
+    use super::*;
 
     #[test]
     fn delete_ratio_blocks_and_can_be_acknowledged() {
-        let side = SideStats { deletes: 60, ..Default::default() };
+        let side = SideStats {
+            deletes: 60,
+            ..Default::default()
+        };
         let g = Guards::default();
-        let mut v = Verdict { blockers: vec![], warnings: vec![] };
+        let mut v = Verdict {
+            blockers: vec![],
+            warnings: vec![],
+        };
         check_delete_ratio("target", &side, 100, &g, &mut v);
         assert_eq!(v.blockers.len(), 1, "60% deletion must be blocked");
 
-        let g2 = Guards { acknowledged: true, ..Guards::default() };
-        let mut v2 = Verdict { blockers: vec![], warnings: vec![] };
+        let g2 = Guards {
+            acknowledged: true,
+            ..Guards::default()
+        };
+        let mut v2 = Verdict {
+            blockers: vec![],
+            warnings: vec![],
+        };
         check_delete_ratio("target", &side, 100, &g2, &mut v2);
         assert!(v2.ok(), "--i-know must let it through");
         assert_eq!(v2.warnings.len(), 1, "but it must still be reported");
@@ -59,8 +73,14 @@ mod tests {
 
     #[test]
     fn small_deletions_pass() {
-        let side = SideStats { deletes: 3, ..Default::default() };
-        let mut v = Verdict { blockers: vec![], warnings: vec![] };
+        let side = SideStats {
+            deletes: 3,
+            ..Default::default()
+        };
+        let mut v = Verdict {
+            blockers: vec![],
+            warnings: vec![],
+        };
         check_delete_ratio("target", &side, 1000, &Guards::default(), &mut v);
         assert!(v.ok());
     }

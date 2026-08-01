@@ -125,7 +125,10 @@ impl SmbBackend {
         self.conn.get().ok_or_else(|| {
             VfsError::new(
                 VfsErrorKind::Transient,
-                format!("'{}' is not connected — connect() must run first", self.spec.display()),
+                format!(
+                    "'{}' is not connected — connect() must run first",
+                    self.spec.display()
+                ),
             )
         })
     }
@@ -174,7 +177,10 @@ impl SmbBackend {
         let d = self.timeout;
         // The timeout future has to be built inside the runtime (it takes the timer at
         // construction), hence the async block rather than a bare block_on(timeout(..)).
-        match self.rt.block_on(async { tokio::time::timeout(d, fut).await }) {
+        match self
+            .rt
+            .block_on(async { tokio::time::timeout(d, fut).await })
+        {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(map_smb_err(what, e)),
             Err(_) => Err(VfsError::new(
@@ -190,7 +196,10 @@ impl SmbBackend {
         F: std::future::Future<Output = VfsResult<T>>,
     {
         let d = self.timeout;
-        match self.rt.block_on(async { tokio::time::timeout(d, fut).await }) {
+        match self
+            .rt
+            .block_on(async { tokio::time::timeout(d, fut).await })
+        {
             Ok(r) => r,
             Err(_) => Err(VfsError::new(
                 VfsErrorKind::Transient,
@@ -312,7 +321,10 @@ async fn set_write_time(
         file_id: FileId::SENTINEL,
         buffer: basic_info::set_write_time_buffer(ticks),
     };
-    let close = CloseRequest { flags: 0, file_id: FileId::SENTINEL };
+    let close = CloseRequest {
+        flags: 0,
+        file_id: FileId::SENTINEL,
+    };
     let ops = [
         CompoundOp::new(Command::Create, &create, Some(tree.tree_id)),
         CompoundOp::new(Command::SetInfo, &set, Some(tree.tree_id)),
@@ -368,7 +380,11 @@ async fn set_write_time(
 
 fn meta_of(size: u64, is_dir: bool, modified_ticks: u64) -> VMeta {
     VMeta {
-        kind: if is_dir { EntryKind::Dir } else { EntryKind::File },
+        kind: if is_dir {
+            EntryKind::Dir
+        } else {
+            EntryKind::File
+        },
         size,
         mtime_ms: basic_info::unix_ms_from_filetime(modified_ticks),
         // SMB2 carries DOS attributes, not a unix mode; inventing 0o644 here would be a lie
@@ -481,9 +497,15 @@ impl Vfs for SmbBackend {
             .params()
             .map(|p| format!("{:?}", p.dialect))
             .unwrap_or_else(|| "unknown dialect".to_string());
-        *self.server_line.lock().unwrap() =
-            Some(format!("smb2 native: {addr} as {user}, {dialect}, share '{}'", self.share));
-        let _ = self.conn.set(Conn { _client: client, conn, tree: Arc::new(tree) });
+        *self.server_line.lock().unwrap() = Some(format!(
+            "smb2 native: {addr} as {user}, {dialect}, share '{}'",
+            self.share
+        ));
+        let _ = self.conn.set(Conn {
+            _client: client,
+            conn,
+            tree: Arc::new(tree),
+        });
         Ok(())
     }
 
@@ -510,8 +532,9 @@ impl Vfs for SmbBackend {
         let c = self.conn()?;
         let (tree, mut conn) = (c.tree.clone(), c.conn.clone());
         let p = self.share_rel(rel);
-        let entries =
-            self.block("read_dir", async move { tree.list_directory(&mut conn, &p).await })?;
+        let entries = self.block("read_dir", async move {
+            tree.list_directory(&mut conn, &p).await
+        })?;
         Ok(entries
             .into_iter()
             // The server sends the self and parent links; the table vocabulary has no room
@@ -531,7 +554,11 @@ impl Vfs for SmbBackend {
         let reader = self.block("open_read", async move {
             smb2::client::stream::open_file_reader(tree, conn, &p).await
         })?;
-        Ok(Box::new(SmbRead::new(self.rt.handle().clone(), self.timeout, reader)))
+        Ok(Box::new(SmbRead::new(
+            self.rt.handle().clone(),
+            self.timeout,
+            reader,
+        )))
     }
 
     fn read_range(&self, rel: &str, off: u64, len: u32) -> VfsResult<Vec<u8>> {
@@ -568,7 +595,9 @@ impl Vfs for SmbBackend {
             let c = self.conn()?;
             let (tree, mut conn) = (c.tree.clone(), c.conn.clone());
             let p = self.share_rel(&prefix);
-            match self.block("mkdir", async move { tree.create_directory(&mut conn, &p).await }) {
+            match self.block("mkdir", async move {
+                tree.create_directory(&mut conn, &p).await
+            }) {
                 Ok(()) => {}
                 Err(e) => {
                     // "Already there" is the normal case on the way down an existing tree, but
@@ -599,9 +628,9 @@ impl Vfs for SmbBackend {
         {
             let (tree, mut conn) = (c.tree.clone(), c.conn.clone());
             let p = tmp_share_rel.clone();
-            match self
-                .block("clear stale temp", async move { tree.delete_file(&mut conn, &p).await })
-            {
+            match self.block("clear stale temp", async move {
+                tree.delete_file(&mut conn, &p).await
+            }) {
                 Ok(()) => {}
                 Err(e) if e.kind == VfsErrorKind::NotFound => {}
                 Err(e) => return Err(e),
@@ -616,8 +645,9 @@ impl Vfs for SmbBackend {
         let p = self.wire_path(&tmp_rel);
         // Opened read+write with sharing allowed, which is what lets `staged_len` and the
         // read-back ask the server directly while the handle is still open.
-        let (file_id, _) = self
-            .block("open staged", async move { tree.open_file_readwrite(&mut conn, &p).await })?;
+        let (file_id, _) = self.block("open staged", async move {
+            tree.open_file_readwrite(&mut conn, &p).await
+        })?;
         let max_write = c.conn.params().map(|p| p.max_write_size).unwrap_or(65_536);
         Ok(Box::new(SmbStaged {
             rt: self.rt.handle().clone(),
@@ -641,14 +671,19 @@ impl Vfs for SmbBackend {
         let (f, t) = (self.share_rel(from_rel), self.share_rel(to_rel));
         // ReplaceIfExists = 0 on the wire: an occupied target is refused, which is the
         // semantics caps() declares and the engine clears the destination for.
-        self.block("rename", async move { tree.rename(&mut conn, &f, &t).await })
+        self.block(
+            "rename",
+            async move { tree.rename(&mut conn, &f, &t).await },
+        )
     }
 
     fn remove_file(&self, rel: &str) -> VfsResult<()> {
         let c = self.conn()?;
         let (tree, mut conn) = (c.tree.clone(), c.conn.clone());
         let p = self.share_rel(rel);
-        self.block("remove_file", async move { tree.delete_file(&mut conn, &p).await })
+        self.block("remove_file", async move {
+            tree.delete_file(&mut conn, &p).await
+        })
     }
 
     /// Empty directories only — and the outcome is **verified, not trusted**.
@@ -663,7 +698,9 @@ impl Vfs for SmbBackend {
         let c = self.conn()?;
         let (tree, mut conn) = (c.tree.clone(), c.conn.clone());
         let p = self.share_rel(rel);
-        self.block("remove_dir", async move { tree.delete_directory(&mut conn, &p).await })?;
+        self.block("remove_dir", async move {
+            tree.delete_directory(&mut conn, &p).await
+        })?;
         match self.stat(rel)? {
             None => Ok(()),
             Some(_) => {
@@ -726,7 +763,9 @@ mod tests {
     use crate::fs::vfs::spec::{parse, RootSpec};
 
     fn backend(s: &str) -> SmbBackend {
-        let RootSpec::Remote(r) = parse(s) else { panic!() };
+        let RootSpec::Remote(r) = parse(s) else {
+            panic!()
+        };
         SmbBackend::new(r, crate::fs::vfs::cred::default_provider()).unwrap()
     }
 
@@ -742,7 +781,9 @@ mod tests {
 
     #[test]
     fn no_share_is_refused_at_construction() {
-        let RootSpec::Remote(r) = parse("smb://server") else { panic!() };
+        let RootSpec::Remote(r) = parse("smb://server") else {
+            panic!()
+        };
         assert!(SmbBackend::new(r, crate::fs::vfs::cred::default_provider()).is_err());
     }
 
@@ -766,7 +807,11 @@ mod tests {
         assert_eq!(b.wire_path("a/b.txt"), "2026\\a\\b.txt");
         assert_eq!(b.wire_path(""), "2026");
         let flat = backend("smb://ben@server/photos");
-        assert_eq!(flat.wire_path(""), "", "the share root is the empty path, not '\\'");
+        assert_eq!(
+            flat.wire_path(""),
+            "",
+            "the share root is the empty path, not '\\'"
+        );
         assert_eq!(flat.wire_path("x.txt"), "x.txt");
     }
 
@@ -793,7 +838,11 @@ mod tests {
         let c = backend("smb://ben@server/share").caps();
         assert_eq!(c.protocol, "smb");
         assert!(c.set_mtime.yes(), "the whole point of this backend");
-        assert_eq!(c.rename_overwrite, Support::No, "ReplaceIfExists goes out as 0");
+        assert_eq!(
+            c.rename_overwrite,
+            Support::No,
+            "ReplaceIfExists goes out as 0"
+        );
         assert_eq!(c.symlink, Support::No);
         assert_eq!(c.unix_mode, Support::No);
         assert!(c.ranged_read.yes());
@@ -807,9 +856,18 @@ mod tests {
     #[test]
     fn declared_gaps_refuse_honestly() {
         let b = backend("smb://ben@server/share");
-        assert_eq!(b.set_mode("x", 0o644).unwrap_err().kind, VfsErrorKind::Unsupported);
-        assert_eq!(b.make_symlink("x", "y").unwrap_err().kind, VfsErrorKind::Unsupported);
-        assert_eq!(b.read_link("x").unwrap_err().kind, VfsErrorKind::Unsupported);
+        assert_eq!(
+            b.set_mode("x", 0o644).unwrap_err().kind,
+            VfsErrorKind::Unsupported
+        );
+        assert_eq!(
+            b.make_symlink("x", "y").unwrap_err().kind,
+            VfsErrorKind::Unsupported
+        );
+        assert_eq!(
+            b.read_link("x").unwrap_err().kind,
+            VfsErrorKind::Unsupported
+        );
     }
 
     /// The engine's delete-dir classification rides on this one code, which the crate folds
@@ -831,11 +889,27 @@ mod tests {
     #[test]
     fn ambiguous_failures_stay_transient() {
         for status in [NtStatus::SHARING_VIOLATION, NtStatus::ACCESS_DENIED] {
-            let e = map_smb_err("op", smb2::Error::Protocol { status, command: Command::Create });
-            assert_ne!(e.kind, VfsErrorKind::NotFound, "{status} must not read as absence");
+            let e = map_smb_err(
+                "op",
+                smb2::Error::Protocol {
+                    status,
+                    command: Command::Create,
+                },
+            );
+            assert_ne!(
+                e.kind,
+                VfsErrorKind::NotFound,
+                "{status} must not read as absence"
+            );
         }
-        assert_eq!(map_smb_err("op", smb2::Error::Disconnected).kind, VfsErrorKind::Transient);
-        assert_eq!(map_smb_err("op", smb2::Error::Timeout).kind, VfsErrorKind::Transient);
+        assert_eq!(
+            map_smb_err("op", smb2::Error::Disconnected).kind,
+            VfsErrorKind::Transient
+        );
+        assert_eq!(
+            map_smb_err("op", smb2::Error::Timeout).kind,
+            VfsErrorKind::Transient
+        );
     }
 
     #[test]

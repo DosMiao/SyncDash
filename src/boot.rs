@@ -27,9 +27,15 @@ pub struct Session {
 /// app log at the resolved log directory.
 pub fn init(sink_for: impl FnOnce(&AppSettings) -> Option<Arc<dyn ProgressSink>>) -> Session {
     init_worker_pool();
-    let settings = crate::store::settings::load();
+    let (settings, diagnostic) = crate::store::settings::load_with_diagnostic();
     let guard = sink_for(&settings).map(crate::obs::progress::install);
-    Session { settings, _sink: guard }
+    if let Some(message) = diagnostic {
+        crate::obs::logging::emit(crate::model::event::LogLevel::Warn, "settings", message);
+    }
+    Session {
+        settings,
+        _sink: guard,
+    }
 }
 
 /// Initialize the global rayon pool (hash worker threads): **lowered priority** —— a standard scan's BLAKE3
@@ -38,39 +44,11 @@ pub fn init(sink_for: impl FnOnce(&AppSettings) -> Option<Arc<dyn ProgressSink>>
 /// `SYNCDASH_SCAN_THREADS=N` caps the thread count further. CLI and desktop each call this once at startup (idempotent).
 pub fn init_worker_pool() {
     let mut b = rayon::ThreadPoolBuilder::new().thread_name(|i| format!("sd-hash-{i}"));
-    if let Ok(n) = std::env::var("SYNCDASH_SCAN_THREADS") {
-        if let Ok(n) = n.parse::<usize>() {
-            if n >= 1 {
-                b = b.num_threads(n.min(64));
-            }
-        }
+    if let Some(threads) = crate::foundation::thread::configured_worker_limit() {
+        b = b.num_threads(threads);
     }
     // build_global returns Err when a global pool already exists (repeat call) —— swallowing it is fine
-    let _ = b.start_handler(|_| lower_thread_priority()).build_global();
+    let _ = b
+        .start_handler(|_| crate::foundation::thread::lower_priority())
+        .build_global();
 }
-
-#[cfg(windows)]
-fn lower_thread_priority() {
-    // THREAD_PRIORITY_BELOW_NORMAL = -1 (lowers this thread only, not the process; the UI thread is untouched)
-    extern "system" {
-        fn GetCurrentThread() -> isize;
-        fn SetThreadPriority(h: isize, p: i32) -> i32;
-    }
-    unsafe {
-        SetThreadPriority(GetCurrentThread(), -1);
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn lower_thread_priority() {
-    // nice on Linux is per-thread
-    unsafe {
-        libc::nice(3);
-    }
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn lower_thread_priority() {
-    // nice() on macOS is process-wide; touching it would drag the UI down with it —— so don't
-}
-

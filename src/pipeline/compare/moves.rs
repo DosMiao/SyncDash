@@ -6,14 +6,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::table::Entry;
 use super::is_conflict_copy;
+use crate::model::table::Entry;
 
 /// The result of one move pairing
 pub struct MovePair {
     pub from: String,
     pub to: String,
     pub size: u64,
+    pub mtime_ms: i64,
+    pub hash: String,
+    pub mode: Option<u32>,
     /// Same parent dir = rename in place (FFS's "same-directory rename merge")
     pub rename_in_place: bool,
     /// Number of same-content candidates at pairing time. >1 means `from` was picked arbitrarily among equivalent candidates —
@@ -39,7 +42,10 @@ pub(super) fn detect_moves<'a>(
     let mut by_key: HashMap<(String, u64), Vec<&'a Entry>> = HashMap::new();
     for &d in &dels {
         if eligible(d) {
-            by_key.entry((d.hash.clone().unwrap(), d.size)).or_default().push(d);
+            by_key
+                .entry((d.hash.clone().unwrap(), d.size))
+                .or_default()
+                .push(d);
         }
     }
     let mut moves = Vec::new();
@@ -67,7 +73,10 @@ pub(super) fn detect_moves<'a>(
                         rename_in_place: parent(&c.path) == parent(&a.path),
                         from: c.path.clone(),
                         to: a.path.clone(),
-                        size: a.size,
+                        size: c.size,
+                        mtime_ms: c.mtime_ms,
+                        hash: c.hash.clone().expect("eligible move source has a hash"),
+                        mode: c.mode,
                         candidates: n,
                     });
                 }
@@ -78,7 +87,10 @@ pub(super) fn detect_moves<'a>(
             None => rest_adds.push(a),
         }
     }
-    let rest_dels = dels.into_iter().filter(|d| !used.contains(&d.path)).collect();
+    let rest_dels = dels
+        .into_iter()
+        .filter(|d| !used.contains(&d.path))
+        .collect();
     (moves, rest_adds, rest_dels)
 }
 

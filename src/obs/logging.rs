@@ -14,7 +14,9 @@
 //! identical before and after the rework" hold, so the correctness of the swap (P3) does not depend on
 //! whether the desktop shell or the CLI installed a sink.
 
-use crate::foundation::names::{APP_LOG_FILE, RUNLOG_ERRORS_FILE, RUNLOG_ITEMS_FILE, RUNLOG_RUN_FILE};
+use crate::foundation::names::{
+    APP_LOG_FILE, RUNLOG_ERRORS_FILE, RUNLOG_ITEMS_FILE, RUNLOG_RUN_FILE,
+};
 use crate::model::event::{LogLevel, ProgressEvent};
 use crate::obs::progress::{current, ProgressSink};
 use std::io::Write;
@@ -57,7 +59,6 @@ macro_rules! log_error {
     };
 }
 
-
 /// The CLI's old behavior: `Log` goes verbatim to stderr.
 ///
 /// Only `Log` — after the swap every `Error` event also carries a `Log` alongside it (`apply::record`
@@ -74,6 +75,10 @@ impl ProgressSink for StderrSink {
             }
         }
     }
+
+    fn wants_progress(&self) -> bool {
+        false
+    }
 }
 
 /// Fan one event out to several sinks (desktop: TauriSink + FileSink).
@@ -88,8 +93,14 @@ impl MultiSink {
 impl ProgressSink for MultiSink {
     fn emit(&self, ev: ProgressEvent) {
         for s in &self.0 {
-            s.emit(ev.clone());
+            if !matches!(ev, ProgressEvent::Progress { .. }) || s.wants_progress() {
+                s.emit(ev.clone());
+            }
         }
+    }
+
+    fn wants_progress(&self) -> bool {
+        self.0.iter().any(|sink| sink.wants_progress())
     }
 }
 
@@ -108,7 +119,10 @@ const FLUSH_EVERY: u32 = 64;
 impl Appender {
     fn create(path: &Path) -> Option<Appender> {
         match std::fs::File::create(path) {
-            Ok(f) => Some(Appender { w: std::io::BufWriter::new(f), since_flush: 0 }),
+            Ok(f) => Some(Appender {
+                w: std::io::BufWriter::new(f),
+                since_flush: 0,
+            }),
             Err(e) => {
                 eprintln!("logging: cannot create {}: {e}", path.display());
                 None
@@ -203,12 +217,18 @@ impl ProgressSink for FileSink {
                 }
             }
             // Phase boundaries and terminal states flush everything while we are here — so Ctrl-C does not take the whole tail with it
-            ProgressEvent::PhaseStart { .. } | ProgressEvent::PhaseEnd { .. } | ProgressEvent::Summary { .. } => {
+            ProgressEvent::PhaseStart { .. }
+            | ProgressEvent::PhaseEnd { .. }
+            | ProgressEvent::Summary { .. } => {
                 Self::put(&self.run, &line, true);
                 self.flush_all();
             }
             _ => Self::put(&self.run, &line, false),
         }
+    }
+
+    fn wants_progress(&self) -> bool {
+        false
     }
 }
 
@@ -221,14 +241,92 @@ impl Drop for FileSink {
 /// App-level rolling log (events outside a run: startup, settings errors, prune, migration).
 /// Single-file append, flushed per line — these events are sparse and all happen at moments where something may be about to go wrong.
 pub struct AppLogSink {
-    w: Mutex<Option<std::fs::File>>,
+    target: Mutex<AppLogTarget>,
+}
+
+struct AppLogTarget {
+    w: Option<std::fs::File>,
     min_level: LogLevel,
+    dir: std::path::PathBuf,
 }
 
 impl AppLogSink {
     pub fn open(dir: &Path, min_level: LogLevel) -> AppLogSink {
-        let f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(APP_LOG_FILE)).ok();
-        AppLogSink { w: Mutex::new(f), min_level }
+        let target = Self::open_target(dir, min_level).unwrap_or_else(|_| AppLogTarget {
+            w: None,
+            min_level,
+            dir: dir.to_path_buf(),
+        });
+        AppLogSink {
+            target: Mutex::new(target),
+        }
+    }
+
+    fn open_target(dir: &Path, min_level: LogLevel) -> std::io::Result<AppLogTarget> {
+        std::fs::create_dir_all(dir)?;
+        let w = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(APP_LOG_FILE))?;
+        Ok(AppLogTarget {
+            w: Some(w),
+            min_level,
+            dir: dir.to_path_buf(),
+        })
+    }
+
+    pub fn validate_target(dir: &Path, min_level: LogLevel) -> std::io::Result<()> {
+        drop(Self::open_target(dir, min_level)?);
+        Ok(())
+    }
+
+    /// Switch future app-level diagnostics to the saved location without restarting the desktop.
+    /// The destination is probed first; if the final open loses a race, the previous target is reopened.
+    pub fn reconfigure(&self, dir: &Path, min_level: LogLevel) -> std::io::Result<()> {
+        self.reconfigure_after(dir, min_level, || ())
+    }
+
+    pub fn reconfigure_after<T>(
+        &self,
+        dir: &Path,
+        min_level: LogLevel,
+        action: impl FnOnce() -> T,
+    ) -> std::io::Result<T> {
+        Self::validate_target(dir, min_level)?;
+        let mut target = self
+            .target
+            .lock()
+            .map_err(|_| std::io::Error::other("application log sink lock is poisoned"))?;
+        let previous_dir = target.dir.clone();
+        let previous_level = target.min_level;
+        target.w.take();
+        let output = action();
+        match Self::open_target(dir, min_level) {
+            Ok(replacement) => {
+                *target = replacement;
+                Ok(output)
+            }
+            Err(error) => {
+                match Self::open_target(&previous_dir, previous_level) {
+                    Ok(previous) => *target = previous,
+                    Err(restore_error) => {
+                        target.dir = previous_dir;
+                        target.min_level = previous_level;
+                        return Err(std::io::Error::other(format!(
+                            "{error}; restoring the previous application log also failed: {restore_error}"
+                        )));
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub fn directory(&self) -> std::path::PathBuf {
+        self.target
+            .lock()
+            .map(|target| target.dir.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -237,17 +335,21 @@ impl ProgressSink for AppLogSink {
         let ProgressEvent::Log { level, .. } = &ev else {
             return;
         };
-        if *level < self.min_level {
-            return;
-        }
         let Ok(line) = serde_json::to_string(&ev) else {
             return;
         };
-        if let Ok(mut g) = self.w.lock() {
-            if let Some(f) = g.as_mut() {
+        if let Ok(mut target) = self.target.lock() {
+            if *level < target.min_level {
+                return;
+            }
+            if let Some(f) = target.w.as_mut() {
                 let _ = writeln!(f, "{line}");
             }
         }
+    }
+
+    fn wants_progress(&self) -> bool {
+        false
     }
 }
 
@@ -260,7 +362,12 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn ev_log(level: LogLevel, msg: &str) -> ProgressEvent {
-        ProgressEvent::Log { ts_ms: 1, level, scope: "t".into(), message: msg.into() }
+        ProgressEvent::Log {
+            ts_ms: 1,
+            level,
+            scope: "t".into(),
+            message: msg.into(),
+        }
     }
 
     fn collecting() -> (Arc<dyn ProgressSink>, Arc<Mutex<Vec<ProgressEvent>>>) {
@@ -285,15 +392,26 @@ mod tests {
             // Once the inner guard lands it must restore a — otherwise the next run's log cross-contaminates the directory
             emit(LogLevel::Info, "t", "after".into());
         }
-        assert_eq!(sa.lock().unwrap().len(), 2, "the outer sink should receive first + after");
-        assert_eq!(sb.lock().unwrap().len(), 1, "the inner sink receives only inner");
+        assert_eq!(
+            sa.lock().unwrap().len(),
+            2,
+            "the outer sink should receive first + after"
+        );
+        assert_eq!(
+            sb.lock().unwrap().len(),
+            1,
+            "the inner sink receives only inner"
+        );
         // Once every guard has landed we are back to "nobody holding the sink"
         assert!(current().is_none());
     }
 
     #[test]
     fn file_sink_routes_three_ways() {
-        let dir = std::env::temp_dir().join(format!("syncdash-logtest-{}", crate::foundation::time::now_ms()));
+        let dir = std::env::temp_dir().join(format!(
+            "syncdash-logtest-{}",
+            crate::foundation::time::now_ms()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         {
             let fs_sink = FileSink::open(&dir, LogLevel::Info);
@@ -331,18 +449,39 @@ mod tests {
         let run = read(RUNLOG_RUN_FILE);
         let errors = read(RUNLOG_ERRORS_FILE);
         let items = read(RUNLOG_ITEMS_FILE);
-        assert_eq!(run.lines().count(), 3, "run.jsonl = info + warn + error, no item/progress:\n{run}");
-        assert!(!run.contains("\"progress\""), "Progress must not be persisted");
-        assert_eq!(errors.lines().count(), 2, "errors.jsonl = warn + error:\n{errors}");
-        assert!(!errors.contains("narrative"), "info does not go into the error detail");
-        assert_eq!(items.lines().count(), 1, "items.jsonl takes only ItemResult:\n{items}");
+        assert_eq!(
+            run.lines().count(),
+            3,
+            "run.jsonl = info + warn + error, no item/progress:\n{run}"
+        );
+        assert!(
+            !run.contains("\"progress\""),
+            "Progress must not be persisted"
+        );
+        assert_eq!(
+            errors.lines().count(),
+            2,
+            "errors.jsonl = warn + error:\n{errors}"
+        );
+        assert!(
+            !errors.contains("narrative"),
+            "info does not go into the error detail"
+        );
+        assert_eq!(
+            items.lines().count(),
+            1,
+            "items.jsonl takes only ItemResult:\n{items}"
+        );
         assert!(items.contains("\"failed\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn file_sink_respects_min_level() {
-        let dir = std::env::temp_dir().join(format!("syncdash-logtest-lv-{}", crate::foundation::time::now_ms()));
+        let dir = std::env::temp_dir().join(format!(
+            "syncdash-logtest-lv-{}",
+            crate::foundation::time::now_ms()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         {
             let fs_sink = FileSink::open(&dir, LogLevel::Warn);
@@ -350,7 +489,11 @@ mod tests {
             fs_sink.emit(ev_log(LogLevel::Error, "boom"));
         }
         let run = std::fs::read_to_string(dir.join(RUNLOG_RUN_FILE)).unwrap();
-        assert_eq!(run.lines().count(), 1, "at level=warn, info is blocked:\n{run}");
+        assert_eq!(
+            run.lines().count(),
+            1,
+            "at level=warn, info is blocked:\n{run}"
+        );
         assert!(run.contains("boom"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -366,7 +509,87 @@ mod tests {
     }
 
     #[test]
+    fn multi_sink_does_not_clone_progress_into_sinks_that_discard_it() {
+        struct BoundaryOnly(Arc<Mutex<Vec<ProgressEvent>>>);
+        impl ProgressSink for BoundaryOnly {
+            fn emit(&self, event: ProgressEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+
+            fn wants_progress(&self) -> bool {
+                false
+            }
+        }
+
+        let boundary_events = Arc::new(Mutex::new(Vec::new()));
+        let (collector, collected) = collecting();
+        let sink = MultiSink::new(vec![
+            Arc::new(BoundaryOnly(boundary_events.clone())),
+            collector,
+        ]);
+        sink.emit(ProgressEvent::Progress {
+            phase: crate::model::event::Phase::ScanSource,
+            ts_ms: 1,
+            items_done: 1,
+            items_total: 2,
+            bytes_done: 3,
+            bytes_total: 4,
+            current_path: "a.txt".into(),
+        });
+
+        assert!(boundary_events.lock().unwrap().is_empty());
+        assert_eq!(collected.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn level_ordering_is_info_warn_error() {
         assert!(LogLevel::Info < LogLevel::Warn && LogLevel::Warn < LogLevel::Error);
+    }
+
+    #[test]
+    fn app_log_reconfigure_routes_only_future_events_to_the_new_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "syncdash-app-log-reconfigure-{}-{}",
+            std::process::id(),
+            crate::foundation::time::now_ms()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        let sink = AppLogSink::open(&first, LogLevel::Info);
+        sink.emit(ev_log(LogLevel::Info, "before"));
+        sink.reconfigure(&second, LogLevel::Warn).unwrap();
+        sink.emit(ev_log(LogLevel::Info, "filtered"));
+        sink.emit(ev_log(LogLevel::Warn, "after"));
+
+        let old = std::fs::read_to_string(first.join(APP_LOG_FILE)).unwrap();
+        let new = std::fs::read_to_string(second.join(APP_LOG_FILE)).unwrap();
+        assert!(old.contains("before") && !old.contains("after"));
+        assert!(new.contains("after") && !new.contains("filtered"));
+        assert_eq!(sink.directory(), second);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_log_switch_releases_the_old_file_during_migration() {
+        let root = std::env::temp_dir().join(format!(
+            "syncdash-app-log-migrate-{}-{}",
+            std::process::id(),
+            crate::foundation::time::now_ms()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        let sink = AppLogSink::open(&first, LogLevel::Info);
+        sink.emit(ev_log(LogLevel::Info, "before"));
+
+        let removed = sink
+            .reconfigure_after(&second, LogLevel::Info, || {
+                std::fs::remove_file(first.join(APP_LOG_FILE))
+            })
+            .unwrap();
+
+        removed.unwrap();
+        sink.emit(ev_log(LogLevel::Info, "after"));
+        assert!(second.join(APP_LOG_FILE).is_file());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

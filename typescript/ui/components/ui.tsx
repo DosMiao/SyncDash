@@ -19,9 +19,12 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from 'react';
+import { createPortal } from 'react-dom';
 import { Check, ChevronRight } from 'lucide-react';
+import { menuFocusIndex, type MenuNavigationKey } from './a11y';
 
 // ----------------------------------------------------------------- menus --
 
@@ -42,6 +45,9 @@ export function MenuItem({ children, onClick, disabled, checked, title, danger }
     <button
       type="button"
       className={'menu-item' + (danger ? ' menu-item-danger' : '')}
+      role={checked === undefined ? 'menuitem' : 'menuitemcheckbox'}
+      aria-checked={checked === undefined ? undefined : checked}
+      tabIndex={-1}
       disabled={disabled}
       title={title}
       onClick={() => { close(); onClick?.(); }}
@@ -58,17 +64,36 @@ export function MenuDivider() {
 
 export function MenuSection({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <>
-      <div className="menu-section">{title}</div>
+    <div className="menu-section-group" role="group" aria-label={title}>
+      <div className="menu-section" aria-hidden="true">{title}</div>
       {children}
-    </>
+    </div>
   );
+}
+
+function directMenuItems(panel: HTMLElement): HTMLElement[] {
+  return [...panel.querySelectorAll<HTMLElement>('[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]')]
+    .filter((item) => item.closest('[role="menu"]') === panel && !item.matches(':disabled, [aria-disabled="true"]'));
+}
+
+function moveMenuFocus(e: ReactKeyboardEvent<HTMLElement>, panel: HTMLElement): boolean {
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return false;
+  const items = directMenuItems(panel);
+  const current = items.indexOf(document.activeElement as HTMLElement);
+  const next = menuFocusIndex(e.key as MenuNavigationKey, current, items.length);
+  if (next === null) return false;
+  e.preventDefault();
+  e.stopPropagation();
+  items[next]?.focus();
+  return true;
 }
 
 /// A submenu. Opens on hover or click, and its contents are a plain layer of MenuItems.
 export function SubMenu({ label, children }: { label: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const panel = useRef<HTMLDivElement>(null);
 
   // Asymmetric delays: opening should feel immediate, but closing waits long enough to cross the
   // diagonal gap between the parent item and the panel without the menu vanishing mid-travel
@@ -78,15 +103,53 @@ export function SubMenu({ label, children }: { label: string; children: ReactNod
   };
 
   useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+  useEscape(open, () => { setOpen(false); trigger.current?.focus(); });
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    directMenuItems(panel.current!)[0]?.focus();
+  }, [open]);
 
   return (
     <div className="submenu" onMouseEnter={() => schedule(true)} onMouseLeave={() => schedule(false)}>
-      <button type="button" className="menu-item" onClick={() => setOpen((v) => !v)}>
+      <button
+        ref={trigger}
+        type="button"
+        className="menu-item"
+        role="menuitem"
+        tabIndex={-1}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        onKeyDown={(e) => {
+          if (e.key !== 'ArrowRight') return;
+          e.preventDefault();
+          e.stopPropagation();
+          setOpen(true);
+        }}
+      >
         <span className="menu-check" />
         <span className="menu-label">{label}</span>
         <ChevronRight size={12} className="menu-arrow" />
       </button>
-      {open ? <div className="menu-panel submenu-panel">{children}</div> : null}
+      {open ? (
+        <div
+          ref={panel}
+          className="menu-panel submenu-panel"
+          role="menu"
+          aria-label={label}
+          onKeyDown={(e) => {
+            if (moveMenuFocus(e, e.currentTarget)) return;
+            if (e.key !== 'ArrowLeft') return;
+            e.preventDefault();
+            e.stopPropagation();
+            setOpen(false);
+            trigger.current?.focus();
+          }}
+        >
+          {children}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -137,11 +200,16 @@ function useEscape(active: boolean, close: () => void) {
 
 /// Close on an outside click or Esc. Shared by Menu and ContextMenu — the two differ only in
 /// what opens them.
-function useDismiss(open: boolean, close: () => void, inside: React.RefObject<HTMLElement | null>[]) {
+function useDismiss(
+  open: boolean,
+  close: () => void,
+  inside: React.RefObject<HTMLElement | null>[],
+  escapeClose: () => void = close,
+) {
   const latest = useRef(close);
   latest.current = close;
 
-  useEscape(open, close);
+  useEscape(open, escapeClose);
 
   useEffect(() => {
     if (!open) return;
@@ -176,6 +244,7 @@ export function Menu({ trigger, children, disabled, title, align = 'start', clas
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   const anchor = useRef<HTMLButtonElement>(null);
   const panel = useRef<HTMLDivElement>(null);
+  const panelId = useId();
 
   useLayoutEffect(() => {
     if (!open || !anchor.current) return;
@@ -185,7 +254,19 @@ export function Menu({ trigger, children, disabled, title, align = 'start', clas
     setPos(clamp(align === 'end' ? rect.right - w : rect.left, rect.bottom + 4, w, h));
   }, [open, align]);
 
-  useDismiss(open, () => setOpen(false), [panel, anchor]);
+  useDismiss(
+    open,
+    () => setOpen(false),
+    [panel, anchor],
+    () => {
+      setOpen(false);
+      requestAnimationFrame(() => anchor.current?.focus());
+    },
+  );
+
+  useLayoutEffect(() => {
+    if (open) panel.current?.focus();
+  }, [open]);
 
   return (
     <>
@@ -194,7 +275,11 @@ export function Menu({ trigger, children, disabled, title, align = 'start', clas
         type="button"
         className={className}
         title={title}
+        aria-label={title}
         disabled={disabled}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls={open ? panelId : undefined}
         onClick={(e) => { e.stopPropagation(); setOpen((v) => !v); }}
       >
         {trigger}
@@ -204,8 +289,12 @@ export function Menu({ trigger, children, disabled, title, align = 'start', clas
           {/* Off-screen until the first layout has measured the panel — otherwise it paints once
               at the unclamped position and visibly jumps */}
           <div
+            id={panelId}
             ref={panel}
             className="menu-panel"
+            role="dialog"
+            aria-label={title ?? 'More information'}
+            tabIndex={-1}
             style={{ top: pos?.top ?? -9999, left: pos?.left ?? -9999 }}
             onClick={(e) => e.stopPropagation()}
           >
@@ -227,6 +316,7 @@ export function ContextMenu({ at, onClose, children }: {
   children: ReactNode;
 }) {
   const panel = useRef<HTMLDivElement>(null);
+  const previousFocus = useRef(document.activeElement instanceof HTMLElement ? document.activeElement : null);
   const [pos, setPos] = useState<{ top: number; left: number }>({ left: at.x, top: at.y });
 
   useLayoutEffect(() => {
@@ -237,6 +327,14 @@ export function ContextMenu({ at, onClose, children }: {
 
   useDismiss(true, onClose, [panel]);
 
+  useLayoutEffect(() => {
+    directMenuItems(panel.current!)[0]?.focus();
+    return () => {
+      const previous = previousFocus.current;
+      if (previous?.isConnected) requestAnimationFrame(() => previous.focus());
+    };
+  }, []);
+
   // Scrolling the list underneath would leave the menu pointing at a row that has moved on
   useEffect(() => {
     document.addEventListener('scroll', onClose, true);
@@ -245,7 +343,15 @@ export function ContextMenu({ at, onClose, children }: {
 
   return (
     <MenuCtx.Provider value={{ close: onClose }}>
-      <div ref={panel} className="menu-panel" style={pos} onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={panel}
+        className="menu-panel"
+        role="menu"
+        aria-label="Row actions"
+        style={pos}
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => { moveMenuFocus(e, e.currentTarget); }}
+      >
         {children}
       </div>
     </MenuCtx.Provider>
@@ -253,6 +359,34 @@ export function ContextMenu({ at, onClose, children }: {
 }
 
 // ---------------------------------------------------------------- sheets --
+
+const FOCUSABLE = [
+  'button:not(:disabled)',
+  'input:not(:disabled):not([type="hidden"])',
+  'select:not(:disabled)',
+  'textarea:not(:disabled)',
+  'a[href]',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
+interface SheetLayer { id: symbol; root: HTMLDivElement }
+
+const sheetStack: SheetLayer[] = [];
+
+function syncSheetStack() {
+  const top = sheetStack[sheetStack.length - 1]?.id;
+  for (const layer of sheetStack) {
+    const hidden = layer.id !== top;
+    layer.root.inert = hidden;
+    if (hidden) layer.root.setAttribute('aria-hidden', 'true');
+    else layer.root.removeAttribute('aria-hidden');
+  }
+}
+
+function focusableIn(panel: HTMLElement): HTMLElement[] {
+  return [...panel.querySelectorAll<HTMLElement>(FOCUSABLE)]
+    .filter((el) => el.getAttribute('aria-hidden') !== 'true');
+}
 
 /**
  * The modal shell: scrim, panel, title, scrolling body, button row.
@@ -268,18 +402,66 @@ export function Sheet({ title, width = 'sm', children, footer, onClose }: {
   onClose: () => void;
 }) {
   const labelId = useId();
+  const layerId = useRef(Symbol('sheet'));
+  const scrim = useRef<HTMLDivElement>(null);
+  const panel = useRef<HTMLDivElement>(null);
+  const previousFocus = useRef(document.activeElement instanceof HTMLElement ? document.activeElement : null);
   useEscape(true, onClose);
 
-  return (
+  useLayoutEffect(() => {
+    const root = scrim.current!;
+    const layer = { id: layerId.current, root };
+    sheetStack.push(layer);
+    syncSheetStack();
+
+    const frame = requestAnimationFrame(() => {
+      if (sheetStack[sheetStack.length - 1]?.id !== layer.id) return;
+      const target = panel.current?.querySelector<HTMLElement>('[autofocus]')
+        ?? (panel.current ? focusableIn(panel.current)[0] : null)
+        ?? panel.current;
+      target?.focus();
+    });
+
+    return () => {
+      cancelAnimationFrame(frame);
+      const index = sheetStack.findIndex((entry) => entry.id === layer.id);
+      if (index >= 0) sheetStack.splice(index, 1);
+      syncSheetStack();
+      const previous = previousFocus.current;
+      if (previous?.isConnected) requestAnimationFrame(() => previous.focus());
+    };
+  }, []);
+
+  const dialog = (
     // mousedown, not click: a drag that starts inside the sheet and releases on the scrim would
     // otherwise close it, which is how a text selection in the body used to dismiss the dialog
-    <div className="scrim" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+    <div ref={scrim} className="scrim" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div
+        ref={panel}
         className={'sheet' + (width === 'sm' ? '' : ` sheet-${width}`)}
         role="dialog"
         aria-modal="true"
         aria-labelledby={labelId}
+        tabIndex={-1}
         onMouseDown={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key !== 'Tab' || sheetStack[sheetStack.length - 1]?.id !== layerId.current) return;
+          const focusable = panel.current ? focusableIn(panel.current) : [];
+          if (focusable.length === 0) {
+            e.preventDefault();
+            panel.current?.focus();
+            return;
+          }
+          const first = focusable[0]!;
+          const last = focusable[focusable.length - 1]!;
+          if (e.shiftKey && (document.activeElement === first || !panel.current?.contains(document.activeElement))) {
+            e.preventDefault();
+            last.focus();
+          } else if (!e.shiftKey && document.activeElement === last) {
+            e.preventDefault();
+            first.focus();
+          }
+        }}
       >
         <h3 id={labelId}>{title}</h3>
         <div className="sheet-body">{children}</div>
@@ -287,6 +469,8 @@ export function Sheet({ title, width = 'sm', children, footer, onClose }: {
       </div>
     </div>
   );
+
+  return createPortal(dialog, document.body);
 }
 
 export interface ConfirmAction {

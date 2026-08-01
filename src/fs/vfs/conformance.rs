@@ -5,10 +5,10 @@
 use std::io::Read;
 use std::sync::Arc;
 
-use crate::model::table::EntryKind;
 use super::error::VfsErrorKind;
 use super::{Support, Vfs, WriteHint};
 use crate::foundation::names::TEMP_PREFIX;
+use crate::model::table::EntryKind;
 
 /// Run the whole contract. `mk` must return a **fresh, empty** root each call.
 pub fn run_all(mk: &mut dyn FnMut() -> Arc<dyn Vfs>) {
@@ -19,6 +19,7 @@ pub fn run_all(mk: &mut dyn FnMut() -> Arc<dyn Vfs>) {
     abandoned_write_leaves_nothing(mk());
     staged_len_reconciles(mk());
     rename_matches_declared_semantics(mk());
+    no_replace_operations_fail_closed_without_damage(mk());
     remove_dir_classifies_nonempty(mk());
     ranged_read_matches_stream(mk());
     set_mtime_roundtrips_within_precision(mk());
@@ -30,7 +31,11 @@ fn write_file(v: &Arc<dyn Vfs>, rel: &str, content: &[u8], mtime_ms: Option<i64>
     if let Some(parent) = crate::foundation::path::parent(rel) {
         v.mkdir_all(parent).expect("mkdir_all");
     }
-    let hint = WriteHint { size_hint: Some(content.len() as u64), mtime_ms, mode: None };
+    let hint = WriteHint {
+        size_hint: Some(content.len() as u64),
+        mtime_ms,
+        mode: None,
+    };
     let mut w = v.open_write(rel, &hint).expect("open_write");
     w.write(content).expect("write");
     w.seal(false).expect("seal");
@@ -39,24 +44,42 @@ fn write_file(v: &Arc<dyn Vfs>, rel: &str, content: &[u8], mtime_ms: Option<i64>
 
 fn read_file(v: &Arc<dyn Vfs>, rel: &str) -> Vec<u8> {
     let mut buf = Vec::new();
-    v.open_read(rel).expect("open_read").read_to_end(&mut buf).expect("read_to_end");
+    v.open_read(rel)
+        .expect("open_read")
+        .read_to_end(&mut buf)
+        .expect("read_to_end");
     buf
 }
 
 fn root_stat(v: Arc<dyn Vfs>) {
     let m = v.stat("").expect("stat root").expect("root exists");
-    assert_eq!(m.kind, EntryKind::Dir, "rel=\"\" must name the root directory");
+    assert_eq!(
+        m.kind,
+        EntryKind::Dir,
+        "rel=\"\" must name the root directory"
+    );
 }
 
 fn missing_is_confirmed_absent(v: Arc<dyn Vfs>) {
-    assert!(v.stat("definitely/not/here.txt").expect("stat must not error").is_none());
+    assert!(v
+        .stat("definitely/not/here.txt")
+        .expect("stat must not error")
+        .is_none());
 }
 
 fn single_level_listing(v: Arc<dyn Vfs>) {
     write_file(&v, "a/b/c.txt", b"x", None);
     write_file(&v, "a/top.txt", b"y", None);
-    let names: Vec<String> = v.read_dir("a").expect("read_dir").into_iter().map(|e| e.name).collect();
-    assert!(names.contains(&"b".to_string()), "listing must include the child dir: {names:?}");
+    let names: Vec<String> = v
+        .read_dir("a")
+        .expect("read_dir")
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(
+        names.contains(&"b".to_string()),
+        "listing must include the child dir: {names:?}"
+    );
     assert!(names.contains(&"top.txt".to_string()));
     assert!(
         !names.iter().any(|n| n.contains('/')),
@@ -74,7 +97,10 @@ fn write_commit_visibility(v: Arc<dyn Vfs>) {
     w.write(b"payload").unwrap();
     // Before commit the destination does not exist; any staging artifact that IS
     // visible must carry the temp prefix so the filter recognizes it.
-    assert!(v.stat("d/f.bin").unwrap().is_none(), "destination must not appear before commit");
+    assert!(
+        v.stat("d/f.bin").unwrap().is_none(),
+        "destination must not appear before commit"
+    );
     for e in v.read_dir("d").unwrap() {
         assert!(
             e.name.starts_with(TEMP_PREFIX),
@@ -98,9 +124,17 @@ fn abandoned_write_leaves_nothing(v: Arc<dyn Vfs>) {
         w.write(b"half...").unwrap();
         // dropped without commit
     }
-    assert_eq!(read_file(&v, "d/keep.txt"), b"original", "abandoned write must not touch the destination");
+    assert_eq!(
+        read_file(&v, "d/keep.txt"),
+        b"original",
+        "abandoned write must not touch the destination"
+    );
     for e in v.read_dir("d").unwrap() {
-        assert!(!e.name.starts_with(TEMP_PREFIX), "abandoned temp not cleaned up: {}", e.name);
+        assert!(
+            !e.name.starts_with(TEMP_PREFIX),
+            "abandoned temp not cleaned up: {}",
+            e.name
+        );
     }
 }
 
@@ -124,22 +158,80 @@ fn rename_matches_declared_semantics(v: Arc<dyn Vfs>) {
     write_file(&v, "r/src.txt", b"new", None);
     match v.caps().rename_overwrite {
         Support::Yes => {
-            v.rename("r/src.txt", "r/blocker.txt").expect("declared rename_overwrite=Yes");
+            v.rename("r/src.txt", "r/blocker.txt")
+                .expect("declared rename_overwrite=Yes");
             assert_eq!(read_file(&v, "r/blocker.txt"), b"new");
         }
         Support::No => {
-            let e = v.rename("r/src.txt", "r/blocker.txt").expect_err("declared rename_overwrite=No");
-            assert_eq!(e.kind, VfsErrorKind::AlreadyExists, "refusal must classify as AlreadyExists");
-            assert_eq!(read_file(&v, "r/blocker.txt"), b"old", "refused rename must not damage the destination");
+            let e = v
+                .rename("r/src.txt", "r/blocker.txt")
+                .expect_err("declared rename_overwrite=No");
+            assert_eq!(
+                e.kind,
+                VfsErrorKind::AlreadyExists,
+                "refusal must classify as AlreadyExists"
+            );
+            assert_eq!(
+                read_file(&v, "r/blocker.txt"),
+                b"old",
+                "refused rename must not damage the destination"
+            );
         }
         Support::Unknown => { /* nothing to pin down */ }
     }
 }
 
+fn no_replace_operations_fail_closed_without_damage(v: Arc<dyn Vfs>) {
+    write_file(&v, "nr/source.txt", b"source", None);
+    write_file(&v, "nr/occupied.txt", b"external", None);
+    let rename_error = v
+        .rename_noreplace("nr/source.txt", "nr/occupied.txt")
+        .expect_err("no-replace rename must never replace an occupied destination");
+    assert!(
+        matches!(
+            rename_error.kind,
+            VfsErrorKind::AlreadyExists | VfsErrorKind::Unsupported
+        ),
+        "a backend must either refuse the occupied name atomically or fail closed: {rename_error}"
+    );
+    assert_eq!(read_file(&v, "nr/source.txt"), b"source");
+    assert_eq!(read_file(&v, "nr/occupied.txt"), b"external");
+
+    let mut staged = v
+        .open_write("nr/occupied.txt", &WriteHint::default())
+        .expect("open staged no-replace write");
+    staged.write(b"planned").expect("write staged payload");
+    staged.seal(false).expect("seal staged payload");
+    let commit_error = staged
+        .commit_noreplace()
+        .expect_err("no-replace commit must never replace an occupied destination");
+    assert!(
+        matches!(
+            commit_error.kind,
+            VfsErrorKind::AlreadyExists | VfsErrorKind::Unsupported
+        ),
+        "a backend must either refuse the staged publish atomically or fail closed: {commit_error}"
+    );
+    assert_eq!(read_file(&v, "nr/occupied.txt"), b"external");
+    for entry in v.read_dir("nr").expect("list after refused publish") {
+        assert!(
+            !entry.name.starts_with(TEMP_PREFIX),
+            "refused no-replace publish leaked a staging artifact: {}",
+            entry.name
+        );
+    }
+}
+
 fn remove_dir_classifies_nonempty(v: Arc<dyn Vfs>) {
     write_file(&v, "full/inner.txt", b"x", None);
-    let e = v.remove_dir("full").expect_err("non-empty removal must fail");
-    assert_eq!(e.kind, VfsErrorKind::NotEmpty, "the engine's delete-dir classification rides on this kind");
+    let e = v
+        .remove_dir("full")
+        .expect_err("non-empty removal must fail");
+    assert_eq!(
+        e.kind,
+        VfsErrorKind::NotEmpty,
+        "the engine's delete-dir classification rides on this kind"
+    );
     v.remove_file("full/inner.txt").unwrap();
     v.remove_dir("full").expect("empty removal succeeds");
     assert!(v.stat("full").unwrap().is_none());
@@ -155,7 +247,9 @@ fn ranged_read_matches_stream(v: Arc<dyn Vfs>) {
     assert_eq!(full, payload);
     let mid = v.read_range("big.bin", 40_000, 4_096).expect("read_range");
     assert_eq!(&full[40_000..44_096], &mid[..]);
-    let tail = v.read_range("big.bin", 99_900, 4_096).expect("read_range at eof");
+    let tail = v
+        .read_range("big.bin", 99_900, 4_096)
+        .expect("read_range at eof");
     assert_eq!(tail.len(), 100, "short only at EOF");
     assert_eq!(&full[99_900..], &tail[..]);
 }
@@ -180,9 +274,14 @@ fn symlink_is_not_followed(v: Arc<dyn Vfs>) {
         return;
     }
     write_file(&v, "target.txt", b"real content", None);
-    v.make_symlink("link.txt", "target.txt").expect("make_symlink");
+    v.make_symlink("link.txt", "target.txt")
+        .expect("make_symlink");
     let m = v.stat("link.txt").unwrap().expect("link exists");
-    assert_eq!(m.kind, EntryKind::Symlink, "stat is lstat: the link itself, never the target");
+    assert_eq!(
+        m.kind,
+        EntryKind::Symlink,
+        "stat is lstat: the link itself, never the target"
+    );
     let t = v.read_link("link.txt").expect("read_link");
     assert!(t.contains("target.txt"), "read_link returned {t}");
 }
@@ -196,8 +295,14 @@ fn staged_read_back_returns_written_bytes(v: Arc<dyn Vfs>) {
     w.write(&payload).unwrap();
     w.seal(false).unwrap();
     let mut got = Vec::new();
-    w.open_staged_read().expect("open_staged_read").read_to_end(&mut got).unwrap();
-    assert_eq!(got, payload, "read-back must reproduce the staged bytes exactly");
+    w.open_staged_read()
+        .expect("open_staged_read")
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(
+        got, payload,
+        "read-back must reproduce the staged bytes exactly"
+    );
     w.commit().unwrap();
 }
 
@@ -230,7 +335,8 @@ mod suite {
         let mut n = 0usize;
         run_all(&mut || {
             n += 1;
-            let d = std::env::temp_dir().join(format!("syncdash-vfs-conf-{}-{n}", std::process::id()));
+            let d =
+                std::env::temp_dir().join(format!("syncdash-vfs-conf-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             dirs.push(d.clone());
@@ -271,7 +377,10 @@ mod suite {
             panic!("set SYNCDASH_SMB_ROOT to a writable directory on an SMB share");
         };
         let base = std::path::PathBuf::from(&root);
-        assert!(base.is_dir(), "SYNCDASH_SMB_ROOT '{root}' is not a reachable directory");
+        assert!(
+            base.is_dir(),
+            "SYNCDASH_SMB_ROOT '{root}' is not a reachable directory"
+        );
         let mut dirs: Vec<std::path::PathBuf> = Vec::new();
         let mut n = 0usize;
         run_all(&mut || {
@@ -326,7 +435,8 @@ mod suite {
             };
             let b = SmbBackend::new(spec, creds.clone())
                 .unwrap_or_else(|e| panic!("building a backend for '{url}': {e}"));
-            b.connect().unwrap_or_else(|e| panic!("connecting to '{url}': {e}"));
+            b.connect()
+                .unwrap_or_else(|e| panic!("connecting to '{url}': {e}"));
             Arc::new(b) as Arc<dyn Vfs>
         };
 
@@ -340,7 +450,8 @@ mod suite {
             let name = format!("conf-native-{}-{n}", std::process::id());
             // "Fresh and empty" has to hold even if an earlier run died mid-suite.
             remove_tree(&base, &name).unwrap_or_else(|e| panic!("clearing '{name}': {e}"));
-            base.mkdir_all(&name).unwrap_or_else(|e| panic!("creating '{name}': {e}"));
+            base.mkdir_all(&name)
+                .unwrap_or_else(|e| panic!("creating '{name}': {e}"));
             roots.push(name.clone());
             open(&format!("{base_url}/{name}"))
         });

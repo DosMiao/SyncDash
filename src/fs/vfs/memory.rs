@@ -22,8 +22,15 @@ use crate::model::table::EntryKind;
 #[derive(Clone, Debug)]
 enum Node {
     Dir,
-    File { data: Vec<u8>, mtime_ms: i64, mode: Option<u32> },
-    Link { target: String, mtime_ms: i64 },
+    File {
+        data: Vec<u8>,
+        mtime_ms: i64,
+        mode: Option<u32>,
+    },
+    Link {
+        target: String,
+        mtime_ms: i64,
+    },
 }
 
 pub struct MemVfs {
@@ -36,7 +43,9 @@ pub struct MemVfs {
 /// "the same file" and compare equal by hash without either one copying from the other.
 pub fn filler(seed: u64, size: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(size);
-    let mut x = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+    let mut x = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
     while out.len() < size {
         x ^= x << 13;
         x ^= x >> 7;
@@ -76,7 +85,11 @@ impl MemVfs {
     pub fn new(id: &str) -> MemVfs {
         let mut tree = BTreeMap::new();
         tree.insert(String::new(), Node::Dir);
-        MemVfs { id: id.to_string(), caps: default_caps(), tree: Arc::new(Mutex::new(tree)) }
+        MemVfs {
+            id: id.to_string(),
+            caps: default_caps(),
+            tree: Arc::new(Mutex::new(tree)),
+        }
     }
 
     /// Capability knobs, chained: `MemVfs::new("x").without(|c| c.ranged_read = Support::No)`.
@@ -92,7 +105,14 @@ impl MemVfs {
     pub fn seed_bytes(&self, rel: &str, data: &[u8], mtime_ms: i64) {
         let mut t = self.tree.lock().unwrap();
         mkdirs(&mut t, crate::foundation::path::parent(rel));
-        t.insert(rel.to_string(), Node::File { data: data.to_vec(), mtime_ms, mode: None });
+        t.insert(
+            rel.to_string(),
+            Node::File {
+                data: data.to_vec(),
+                mtime_ms,
+                mode: None,
+            },
+        );
     }
 
     fn meta_of(node: &Node) -> VMeta {
@@ -105,7 +125,11 @@ impl MemVfs {
                 file_id: None,
                 link: None,
             },
-            Node::File { data, mtime_ms, mode } => VMeta {
+            Node::File {
+                data,
+                mtime_ms,
+                mode,
+            } => VMeta {
                 kind: EntryKind::File,
                 size: data.len() as u64,
                 mtime_ms: *mtime_ms,
@@ -175,7 +199,10 @@ impl Vfs for MemVfs {
             let parent = crate::foundation::path::parent(k).unwrap_or("");
             if parent == rel {
                 let name = k.rsplit('/').next().unwrap_or(k).to_string();
-                out.push(VDirEntry { name, meta: MemVfs::meta_of(node) });
+                out.push(VDirEntry {
+                    name,
+                    meta: MemVfs::meta_of(node),
+                });
             }
         }
         Ok(out)
@@ -183,8 +210,14 @@ impl Vfs for MemVfs {
 
     fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>> {
         match self.tree.lock().unwrap().get(rel) {
-            Some(Node::File { data, .. }) => Ok(Box::new(MemRead { data: data.clone(), pos: 0 })),
-            Some(_) => Err(VfsError::new(VfsErrorKind::Io, format!("'{rel}' is not a file"))),
+            Some(Node::File { data, .. }) => Ok(Box::new(MemRead {
+                data: data.clone(),
+                pos: 0,
+            })),
+            Some(_) => Err(VfsError::new(
+                VfsErrorKind::Io,
+                format!("'{rel}' is not a file"),
+            )),
             None => Err(not_found(rel)),
         }
     }
@@ -199,7 +232,10 @@ impl Vfs for MemVfs {
                 let b = (a + len as usize).min(data.len());
                 Ok(data[a..b].to_vec())
             }
-            Some(_) => Err(VfsError::new(VfsErrorKind::Io, format!("'{rel}' is not a file"))),
+            Some(_) => Err(VfsError::new(
+                VfsErrorKind::Io,
+                format!("'{rel}' is not a file"),
+            )),
             None => Err(not_found(rel)),
         }
     }
@@ -207,7 +243,10 @@ impl Vfs for MemVfs {
     fn read_link(&self, rel: &str) -> VfsResult<String> {
         match self.tree.lock().unwrap().get(rel) {
             Some(Node::Link { target, .. }) => Ok(target.clone()),
-            Some(_) => Err(VfsError::new(VfsErrorKind::Io, format!("'{rel}' is not a symlink"))),
+            Some(_) => Err(VfsError::new(
+                VfsErrorKind::Io,
+                format!("'{rel}' is not a symlink"),
+            )),
             None => Err(not_found(rel)),
         }
     }
@@ -247,12 +286,30 @@ impl Vfs for MemVfs {
         Ok(())
     }
 
+    fn rename_noreplace(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
+        let mut t = self.tree.lock().unwrap();
+        if !t.contains_key(from_rel) {
+            return Err(not_found(from_rel));
+        }
+        if t.contains_key(to_rel) {
+            return Err(VfsError::new(
+                VfsErrorKind::AlreadyExists,
+                format!("rename target already exists: {to_rel}"),
+            ));
+        }
+        let node = t.remove(from_rel).expect("checked above");
+        mkdirs(&mut t, crate::foundation::path::parent(to_rel));
+        t.insert(to_rel.to_string(), node);
+        Ok(())
+    }
+
     fn remove_file(&self, rel: &str) -> VfsResult<()> {
         let mut t = self.tree.lock().unwrap();
         match t.get(rel) {
-            Some(Node::Dir) => {
-                Err(VfsError::new(VfsErrorKind::Io, format!("'{rel}' is a directory")))
-            }
+            Some(Node::Dir) => Err(VfsError::new(
+                VfsErrorKind::Io,
+                format!("'{rel}' is a directory"),
+            )),
             Some(_) => {
                 t.remove(rel);
                 Ok(())
@@ -313,12 +370,22 @@ impl Vfs for MemVfs {
         }
         let mut t = self.tree.lock().unwrap();
         mkdirs(&mut t, crate::foundation::path::parent(rel));
-        t.insert(rel.to_string(), Node::Link { target: target.to_string(), mtime_ms: 0 });
+        t.insert(
+            rel.to_string(),
+            Node::Link {
+                target: target.to_string(),
+                mtime_ms: 0,
+            },
+        );
         Ok(())
     }
 
     fn free_space(&self) -> VfsResult<Option<(u64, u64)>> {
-        Ok(if self.caps.free_space.yes() { Some((1 << 40, 1 << 41)) } else { None })
+        Ok(if self.caps.free_space.yes() {
+            Some((1 << 40, 1 << 41))
+        } else {
+            None
+        })
     }
 }
 
@@ -384,7 +451,10 @@ impl WriteStaged for MemStaged {
         if !self.caps_read_back.yes() {
             return Err(VfsError::unsupported("read back"));
         }
-        Ok(Box::new(MemRead { data: self.buf.clone(), pos: 0 }))
+        Ok(Box::new(MemRead {
+            data: self.buf.clone(),
+            pos: 0,
+        }))
     }
     fn commit(self: Box<Self>) -> VfsResult<CommitReport> {
         let mut t = self.tree.lock().unwrap();
@@ -392,8 +462,39 @@ impl WriteStaged for MemStaged {
         let mtime = self.mtime_ms.unwrap_or(0);
         t.insert(
             self.rel.clone(),
-            Node::File { data: self.buf.clone(), mtime_ms: mtime, mode: self.mode },
+            Node::File {
+                data: self.buf.clone(),
+                mtime_ms: mtime,
+                mode: self.mode,
+            },
         );
-        Ok(CommitReport { mtime_ondisk_ms: Some(mtime), ..Default::default() })
+        Ok(CommitReport {
+            mtime_ondisk_ms: Some(mtime),
+            ..Default::default()
+        })
+    }
+
+    fn commit_noreplace(self: Box<Self>) -> VfsResult<CommitReport> {
+        let mut t = self.tree.lock().unwrap();
+        if t.contains_key(&self.rel) {
+            return Err(VfsError::new(
+                VfsErrorKind::AlreadyExists,
+                format!("staged destination already exists: {}", self.rel),
+            ));
+        }
+        mkdirs(&mut t, crate::foundation::path::parent(&self.rel));
+        let mtime = self.mtime_ms.unwrap_or(0);
+        t.insert(
+            self.rel.clone(),
+            Node::File {
+                data: self.buf.clone(),
+                mtime_ms: mtime,
+                mode: self.mode,
+            },
+        );
+        Ok(CommitReport {
+            mtime_ondisk_ms: Some(mtime),
+            ..Default::default()
+        })
     }
 }

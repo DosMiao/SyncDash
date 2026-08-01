@@ -32,7 +32,10 @@ fn memory_lane_syncs() {
         "the memory backend declares every capability, so it should skip nothing: {:?}",
         rep.skipped
     );
-    assert!(!rep.ran.is_empty(), "a lane that ran no cases is not a passing lane");
+    assert!(
+        !rep.ran.is_empty(),
+        "a lane that ran no cases is not a passing lane"
+    );
 }
 
 /// The real filesystem, and the only lane where `as_local()` is `Some` — so it is the only one that
@@ -56,7 +59,10 @@ fn local_lane_syncs() {
     for d in dirs {
         let _ = std::fs::remove_dir_all(&d);
     }
-    assert!(!rep.ran.is_empty(), "a lane that ran no cases is not a passing lane");
+    assert!(
+        !rep.ran.is_empty(),
+        "a lane that ran no cases is not a passing lane"
+    );
 }
 
 /// `MemVfs` wearing SFTP's declared shape: second-granularity timestamps and a rename that refuses
@@ -107,7 +113,11 @@ fn ftp_list_only_lane_is_readable_but_never_writable() {
         "a root that cannot hold a lock must not have applied anything: {:?}",
         rep.ran
     );
-    assert_eq!(rep.skipped.len(), cases::ALL.len(), "every case should have skipped, not just some");
+    assert_eq!(
+        rep.skipped.len(),
+        cases::ALL.len(),
+        "every case should have skipped, not just some"
+    );
     assert!(
         rep.skipped.iter().all(|(_, n)| *n == Need::WritableTarget),
         "the reason must be the lock, not an incidental capability: {:?}",
@@ -125,7 +135,12 @@ fn ftp_list_only_still_compares_and_says_why_it_will_not_write() {
     corpus::seed_into(&tv, corpus::BASE);
     corpus::apply_edits(
         &sv,
-        &[Edit::Add(Seed { path: "new.txt", seed: 5, size: 512, mtime_ms: 1_767_225_600_000 })],
+        &[Edit::Add(Seed {
+            path: "new.txt",
+            seed: 5,
+            size: 512,
+            mtime_ms: 1_767_225_600_000,
+        })],
     );
 
     let job = bare_job();
@@ -138,7 +153,11 @@ fn ftp_list_only_still_compares_and_says_why_it_will_not_write() {
     // Both sides lose sampling together: a `~` digest can only ever match another `~` digest, so a
     // one-sided upgrade would make identical files look different.
     assert_eq!(
-        out.source.header.vfs.as_ref().map(|v| v.evidence_effective.as_str()),
+        out.source
+            .header
+            .vfs
+            .as_ref()
+            .map(|v| v.evidence_effective.as_str()),
         Some("full"),
         "no ranged reads on either side means both sides read whole"
     );
@@ -177,8 +196,10 @@ fn ftp_list_only_still_compares_and_says_why_it_will_not_write() {
 fn live_lane(lane: &str, base_url: &str) {
     let creds = crate::fs::vfs::cred::default_provider();
     let open = |url: &str| -> Arc<dyn Vfs> {
-        let v = crate::fs::vfs::open(url, &creds).unwrap_or_else(|e| panic!("opening '{url}': {e}"));
-        v.connect().unwrap_or_else(|e| panic!("connecting to '{url}': {e}"));
+        let v =
+            crate::fs::vfs::open(url, &creds).unwrap_or_else(|e| panic!("opening '{url}': {e}"));
+        v.connect()
+            .unwrap_or_else(|e| panic!("connecting to '{url}': {e}"));
         v
     };
 
@@ -189,20 +210,28 @@ fn live_lane(lane: &str, base_url: &str) {
         n += 1;
         let name = format!("e2e-{}-{n}", std::process::id());
         conformance::remove_tree(&base, &name).unwrap_or_else(|e| panic!("clearing '{name}': {e}"));
-        base.mkdir_all(&name).unwrap_or_else(|e| panic!("creating '{name}': {e}"));
+        base.mkdir_all(&name)
+            .unwrap_or_else(|e| panic!("creating '{name}': {e}"));
         roots.push(name.clone());
         open(&format!("{base_url}/{name}"))
     };
 
     let rep = run_all(lane, &mut mk);
-    println!("[{lane}] ran {} case(s), skipped {:?}", rep.ran.len(), rep.skipped);
+    println!(
+        "[{lane}] ran {} case(s), skipped {:?}",
+        rep.ran.len(),
+        rep.skipped
+    );
     conformance::run_all(&mut mk);
 
     for name in &roots {
         conformance::remove_tree(&base, name)
             .unwrap_or_else(|e| panic!("cleaning up '{name}': {e}"));
     }
-    assert!(!rep.ran.is_empty(), "a live lane that ran no cases proves nothing");
+    assert!(
+        !rep.ran.is_empty(),
+        "a live lane that ran no cases proves nothing"
+    );
 }
 
 /// ```text
@@ -294,10 +323,51 @@ fn exfat_live_lane() {
         conformance::run_all(&mut mk);
         run_all("exfat", &mut mk)
     };
-    let precision = LocalVfs::new(base.clone()).caps().mtime_precision_ms;
+    let caps = LocalVfs::new(base.clone()).caps();
+    let precision = caps.mtime_precision_ms;
+    assert_eq!(
+        caps.unix_mode,
+        Support::No,
+        "exFAT cannot preserve Unix modes"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        caps.symlink,
+        Support::Yes,
+        "macOS FSKit exFAT supports symbolic links"
+    );
+    assert_eq!(
+        caps.file_id,
+        Support::No,
+        "exFAT object IDs are not durable rename evidence"
+    );
+
+    let id_probe = base.join(format!("file-id-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&id_probe);
+    std::fs::create_dir_all(&id_probe).unwrap();
+    std::fs::write(id_probe.join("empty.bin"), b"").unwrap();
+    let snapshot = crate::pipeline::scan::scan(
+        &id_probe,
+        &crate::pipeline::scan::ScanOptions {
+            hash: false,
+            sampled: false,
+            use_cache: false,
+            symlinks_direct: false,
+            filter: crate::pipeline::filter::PathFilter::build(&[], &[]),
+        },
+    )
+    .unwrap();
+    assert!(
+        snapshot.entries.iter().all(|entry| entry.file_id.is_none()),
+        "exFAT snapshots must omit unstable synthetic object IDs",
+    );
+    let _ = std::fs::remove_dir_all(&id_probe);
     for d in dirs {
         let _ = std::fs::remove_dir_all(&d);
     }
-    println!("[exfat] {root} reports {precision} ms mtime precision; skipped {:?}", rep.skipped);
+    println!(
+        "[exfat] {root} reports {precision} ms mtime precision; skipped {:?}",
+        rep.skipped
+    );
     assert!(!rep.ran.is_empty());
 }

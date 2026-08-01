@@ -4,10 +4,9 @@
 // and the sample series reaches thousands of entries. The window re-renders on its own cadence (500 ms
 // for the readouts, 100 ms for the graphs), which is where FFS puts the throttle.
 
-import type { LogLevel } from '../core/types/generated/LogLevel';
+import type { RunEventEnvelope } from '../core/runEvents';
 import type { Phase } from '../core/types/generated/Phase';
 import type { PhaseStatus } from '../core/types/generated/PhaseStatus';
-import type { ProgressEvent } from '../core/types/generated/ProgressEvent';
 
 /// The engine's phase names, not a copy of them. A phase added in Rust becomes a missing key in
 /// PHASE_LABEL below — a compile error, rather than a blank cell at runtime.
@@ -29,40 +28,8 @@ export const PHASE_LABEL: Record<PhaseName, string> = {
 /// wraps it in. Every field below is optional because the arms of that union are read structurally
 /// here rather than narrowed on `kind` — but the *names and spellings* come from the generated
 /// type, so a renamed or removed variant is a compile error rather than a blank readout.
-export type EventKind = ProgressEvent['kind'];
-
-export interface RunEv {
-  run_id: number;
-  /// "compare" | "apply" — this window only accepts apply (compare progress is shown inline in the main
-  /// window; without the filter, the automatic re-check compare after a sync would hijack the result
-  /// window into a forever-spinning "comparing")
-  purpose?: string;
-  kind: EventKind;
-  /// kind='log' only
-  level?: LogLevel;
-  /// kind='log' only: module name (run / pack / lock…)
-  scope?: string;
-  ts_ms: number;
-  phase?: Phase;
-  status?: PhaseStatus;
-  reset?: boolean;
-  label?: string | null;
-  items_total?: number;
-  bytes_total?: number;
-  items_done?: number;
-  bytes_done?: number;
-  current_path?: string;
-  path?: string;
-  action?: string;
-  side?: string;
-  message?: string;
-  paused_ms?: number;
-  done?: number;
-  skipped?: number;
-  errors?: number;
-  elapsed_ms?: number;
-  cancelled?: boolean;
-}
+export type EventKind = RunEventEnvelope['kind'];
+export type RunEv = RunEventEnvelope;
 
 /// t = active milliseconds (paused time removed)
 export interface Sample { t: number; b: number; i: number }

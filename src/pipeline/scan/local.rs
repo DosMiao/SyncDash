@@ -1,56 +1,91 @@
-//! The local lane: walkdir + rayon over a real directory.
+//! The local lane: platform metadata traversal + rayon hashing over a real directory.
 //!
-//! Kept byte-for-byte on the fast path — this is what runs for the overwhelming majority of
-//! scans, and the parallel hashing here is the reason a cold scan of a large tree is bearable.
-//! Parallelism is per *file*, not within one: hashing reads through an explicit loop rather than
-//! mapping the file, because a mapped page whose backing store goes away kills the process with
-//! SIGBUS instead of returning an error (see the hashing section for the full reasoning).
+//! macOS batches directory metadata with `getattrlistbulk`; other platforms use WalkDir. Both
+//! feed the same records into this scanner, so filtering, cache use, hashing, progress, and error
+//! policy remain one implementation. Hash parallelism is per *file*, not within one: reads use an
+//! explicit loop rather than mapping because a vanished mapping kills the process with SIGBUS.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::foundation::time::now_ms;
 use crate::model::table::{os_name, Entry, EntryKind, Header, Snapshot, SCHEMA};
 
-use super::digest::{effective_read, sampled_digest, SAMPLE_MIN};
-use super::{ProgressFn, ScanOptions, ScanProgress};
-
-#[cfg(unix)]
-fn file_id(md: &std::fs::Metadata) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    Some(format!("{}:{}", md.dev(), md.ino()))
-}
-
-#[cfg(not(unix))]
-fn file_id(_md: &std::fs::Metadata) -> Option<String> {
-    None
-}
-
-#[cfg(unix)]
-fn unix_mode(md: &std::fs::Metadata) -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-    Some(md.mode() & 0o7777)
-}
-
-#[cfg(not(unix))]
-fn unix_mode(_md: &std::fs::Metadata) -> Option<u32> {
-    None
-}
-
-/// macOS marks a file whose contents have been evicted to iCloud but whose name, size and mtime
-/// remain. Reading one hydrates it — a full-rigor scan of a photo library would pull every byte
-/// back down. Not a correctness problem (the bytes that arrive are the right bytes), which is why
-/// it is reported and not refused.
-#[cfg(target_os = "macos")]
-fn is_dataless(md: &std::fs::Metadata) -> bool {
-    use std::os::macos::fs::MetadataExt;
-    const SF_DATALESS: u32 = 0x4000_0000; // sys/stat.h: "file is dataless object"
-    md.st_flags() & SF_DATALESS != 0
-}
+use super::digest::{effective_read, sampled_digest_with_buffer, SAMPLE_MIN};
+use super::local_walk::WalkKind;
+use super::{ProgressFn, ScanMetrics, ScanOptions, ScanProgress};
 
 #[cfg(not(target_os = "macos"))]
-fn is_dataless(_md: &std::fs::Metadata) -> bool {
-    false
+use super::local_walk::walk as walk_local;
+#[cfg(target_os = "macos")]
+use super::macos_bulk::walk as walk_local;
+
+/// Read granularity, and therefore how often cancel/pause is honored mid-file.
+const READ_CHUNK: u64 = 8 * 1024 * 1024;
+const PROGRESS_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+const WALK_PROGRESS_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+fn progress_sample_due(stop: &std::sync::mpsc::Receiver<()>) -> bool {
+    matches!(
+        stop.recv_timeout(PROGRESS_SAMPLE_INTERVAL),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    )
+}
+
+fn walk_progress_sample_due(
+    last: &mut Option<std::time::Duration>,
+    now: std::time::Duration,
+) -> bool {
+    let due = last.map_or(true, |previous| {
+        now.saturating_sub(previous) >= WALK_PROGRESS_SAMPLE_INTERVAL
+    });
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
+fn full_hash_with_buffer<C, P>(
+    path: &Path,
+    size: u64,
+    buf: &mut Vec<u8>,
+    mut checkpoint: C,
+    mut on_read: P,
+) -> std::io::Result<String>
+where
+    C: FnMut() -> std::io::Result<()>,
+    P: FnMut(u64),
+{
+    use std::io::Read;
+
+    let mut f = std::fs::File::open(path)?;
+    // Grow once to the largest file this worker has seen. Smaller files reuse the allocation and
+    // read through only the prefix they need; a tree of tiny files no longer allocates per entry.
+    let len = size.clamp(1, READ_CHUNK) as usize;
+    if buf.len() < len {
+        buf.resize(len, 0);
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut remaining = size;
+    while remaining > 0 {
+        checkpoint()?;
+        let width = remaining.min(len as u64) as usize;
+        let n = f.read(&mut buf[..width])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "file shrank while hashing: expected {size} bytes, read {}",
+                    size - remaining
+                ),
+            ));
+        }
+        hasher.update(&buf[..n]);
+        on_read(n as u64);
+        remaining -= n as u64;
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// The *other* iCloud eviction shape, and the dangerous one. When a file is evicted the real name
@@ -66,22 +101,21 @@ fn is_icloud_stub(name: &str) -> bool {
     name.starts_with('.') && name.ends_with(".icloud") && name.len() > ".icloud".len() + 1
 }
 
-fn mtime_ms(md: &std::fs::Metadata) -> i64 {
-    md.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 pub(super) fn scan_impl(
     root: &Path,
     opt: &ScanOptions,
     progress: Option<ProgressFn<'_>>,
     ctxp: Option<(&crate::obs::progress::RunCtx, crate::model::event::Phase)>,
+    max_parallel_streams: usize,
 ) -> std::io::Result<Snapshot> {
     let pp = ctxp.map(|(ctx, phase)| {
-        crate::obs::progress::PhaseProgress::begin(ctx, phase, Some(root.to_string_lossy().into_owned()), 0, 0)
+        crate::obs::progress::PhaseProgress::begin(
+            ctx,
+            phase,
+            Some(root.to_string_lossy().into_owned()),
+            0,
+            0,
+        )
     });
     let side = match ctxp.map(|(_, ph)| ph) {
         Some(crate::model::event::Phase::ScanTarget) => "target",
@@ -89,8 +123,22 @@ pub(super) fn scan_impl(
     };
     let started = now_ms();
     let t0 = std::time::Instant::now();
-    let cache = if opt.hash { crate::store::hashcache::load(root) } else { HashMap::new() };
-    let mtime_fixes = crate::store::mtimefix::load(root);
+    let mut metrics = ScanMetrics::default();
+    let local_state = crate::store::localid::LocalScanStateIdentity::for_root(root);
+    let measured = std::time::Instant::now();
+    // No-cache rigor tiers still need the previous table to preserve rows outside this scan's
+    // filter domain. `use_cache` controls reuse below; loading here does not turn old hashes into
+    // evidence for any file observed by this scan.
+    let cache = if opt.hash {
+        crate::store::hashcache::load_local(&local_state)
+    } else {
+        HashMap::new()
+    };
+    metrics.cache_load_ms = measured.elapsed().as_millis() as u64;
+    let measured = std::time::Instant::now();
+    let mtime_fixes = crate::store::mtimefix::load_local(&local_state);
+    let mut matched_mtime_fixes = HashSet::new();
+    metrics.mtime_load_ms = measured.elapsed().as_millis() as u64;
     let mut entries: Vec<Entry> = Vec::new();
     let mut hash_errors = 0u64;
 
@@ -115,10 +163,6 @@ pub(super) fn scan_impl(
     #[cfg(not(windows))]
     let walk_root: std::path::PathBuf = root.to_path_buf();
 
-    // Walk-phase errors are never silent again: count them, sample them, and say so honestly at the end
-    // (a skipped entry is equivalent to "absent on this side" during compare —— an invisible fault that can produce a catastrophic plan)
-    let mut walk_errors = 0u64;
-    let mut walk_err_samples: Vec<String> = Vec::new();
     // iCloud eviction, counted separately from walk errors because the remedy is different:
     // `brctl download` or an exclusion, not a permission.
     let mut icloud_stubs = 0u64;
@@ -126,45 +170,13 @@ pub(super) fn scan_impl(
     let mut dataless_files = 0u64;
     let mut skipped_symlinks = 0u64;
 
-    // Exclusions must be visible: pruned directories/files are counted into the snapshot header so the UI can state "this much never took part in the comparison".
-    // (Lesson learned: the default exclusions silently swallowed .git while the UI still said "both sides identical ✓" —— never again)
-    let excl_dirs = std::cell::Cell::new(0u64);
-    let excl_files = std::cell::Cell::new(0u64);
-    let walker = walkdir::WalkDir::new(&walk_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| {
-            if e.depth() == 0 {
-                return true;
-            }
-            let rel = e
-                .path()
-                .strip_prefix(&walk_root)
-                .unwrap_or(e.path())
-                .to_string_lossy()
-                .replace('\\', "/");
-            if e.file_type().is_dir() {
-                let (pass, child_might_match) = opt.filter.pass_dir(&rel);
-                let keep = pass || child_might_match;
-                if !keep {
-                    excl_dirs.set(excl_dirs.get() + 1); // the whole subtree is pruned
-                }
-                keep
-            } else {
-                let keep = opt.filter.pass_file(&rel);
-                if !keep {
-                    excl_files.set(excl_files.get() + 1);
-                }
-                keep
-            }
-        });
-
     // Phase 1: serial walk to collect entries (metadata is fast); phase 2: parallel hashing with rayon (the lesson from FFS
     // parallel_scan: with many small files the bottleneck is serial I/O). Every file is read through the same chunked loop, so the parallelism is across files and the buffer is sized to the file.
     struct PendingFile {
         rel: String,
         abs: std::path::PathBuf,
         size: u64,
+        raw_mt: i64,
         mt: i64,
         hash: Option<String>, // cache hit
         /// Set when hashing was attempted and failed: distinct from `hash: None`, which also covers
@@ -174,174 +186,185 @@ pub(super) fn scan_impl(
         mode: Option<u32>,
     }
     let mut pending: Vec<PendingFile> = Vec::new();
+    let legacy_walk_started = std::time::Instant::now();
+    let mut legacy_walk_last_sample = None;
 
-    for item in walker {
-        if let Some(pp) = &pp {
-            pp.checkpoint()?; // cancel/pause cooperation point (one relaxed atomic read per iteration)
-        }
-        let item = match item {
-            Ok(i) => i,
-            // A failure at depth 0 is the root itself being unreadable, and it must never be
-            // downgraded to "this root has no entries". That snapshot is structurally valid and
-            // says the tree is empty, so mirror reads it as "delete everything on the far side" —
-            // the warning line scrolls past and the plan is a catastrophe. This is the same stance
-            // scan_vfs already takes for a directory-level failure: refuse to emit a table rather
-            // than emit one whose missing half reads as deletions.
-            Err(e) if e.depth() == 0 => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "scan of '{}' could not read the root itself: {e} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
-                        root.display()
-                    ),
-                ));
-            }
-            // Past the root the same rule holds, and for the same reason. walkdir emits a
-            // directory before it descends, so a directory it then fails to read is already in
-            // the table — with zero children. Counting and continuing leaves a structurally
-            // valid snapshot that says the subtree is empty, and mirror turns that into a delete
-            // for every file the other side still has.
-            //
-            // NotFound is the one honest exception: an entry that vanished between being listed
-            // and being read is a scan race, not an unreadable tree. Everything else — EPERM from
-            // a TCC-gated directory (~/Desktop, ~/Documents, any external volume), an ACL, a
-            // dropped mount — means a subtree exists that this scan cannot see, and a table that
-            // omits it is a table that lies. A loop error carries no io_error at all and aborts
-            // for the same reason.
-            Err(e) => {
-                let kind = e.io_error().map(|io| io.kind());
-                if kind != Some(std::io::ErrorKind::NotFound) {
-                    return Err(std::io::Error::new(
-                        kind.unwrap_or(std::io::ErrorKind::Other),
-                        format!(
-                            "scan of '{}' aborted at '{}': {e} — refusing to emit a half table (its missing subtrees would read as deletions)",
-                            root.display(),
-                            // Not unwrap_or_default: an empty string reads as "the root", which is
-                            // the one place this cannot have happened. Say that the path is unknown.
-                            e.path().map(|p| p.display().to_string()).unwrap_or_else(|| "<path unavailable>".into()),
-                        ),
-                    ));
+    let measured = std::time::Instant::now();
+    let walk_stats = walk_local(
+        &walk_root,
+        &opt.filter,
+        || match &pp {
+            Some(pp) => pp.checkpoint(),
+            None => Ok(()),
+        },
+        |item| match item.kind {
+            WalkKind::Dir => {
+                let rel = item.rel;
+                if opt.filter.pass_dir(&rel).0 {
+                    entries.push(Entry {
+                        path: rel,
+                        kind: EntryKind::Dir,
+                        size: 0,
+                        mtime_ms: item.mtime_ms,
+                        hash: None,
+                        hash_failed: false,
+                        file_id: None,
+                        mode: None,
+                        link: None,
+                        prev: None,
+                    });
                 }
-                walk_errors += 1;
-                if walk_err_samples.len() < 5 {
-                    walk_err_samples.push(format!(
-                        "{}: {e}",
-                        e.path().map(|p| p.display().to_string()).unwrap_or_else(|| "<path unavailable>".into())
-                    ));
+            }
+            WalkKind::Symlink => {
+                if !opt.symlinks_direct {
+                    skipped_symlinks += 1;
                 }
-                continue;
-            }
-        };
-        if item.depth() == 0 {
-            continue;
-        }
-        let raw_rel = item.path().strip_prefix(&walk_root).unwrap_or(item.path());
-        // A name that is not valid Unicode must not enter the table. `to_string_lossy` would
-        // hand back U+FFFD in its place, and that lossy spelling is a different path: apply
-        // would join it against the root, miss the real file, and (in mirror) the original
-        // would read as "absent on this side" forever. Linux and Samba shares hand out such
-        // names routinely — a tree carried over from a legacy encoding is the usual source.
-        // Route it into the walk-error channel, which already says out loud what a skipped
-        // entry costs, rather than inventing a spelling nobody can act on.
-        let Some(rel) = raw_rel.to_str() else {
-            walk_errors += 1;
-            if walk_err_samples.len() < 5 {
-                walk_err_samples.push(format!(
-                    "{}: name is not valid Unicode on this platform — skipped rather than recorded under a substituted spelling",
-                    raw_rel.to_string_lossy()
-                ));
-            }
-            continue;
-        };
-        let rel = rel.replace('\\', "/");
-        let md = match item.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                walk_errors += 1;
-                if walk_err_samples.len() < 5 {
-                    walk_err_samples.push(format!("{rel}: {e}"));
+                if opt.symlinks_direct {
+                    let target = std::fs::read_link(&item.abs)
+                        .ok()
+                        .map(|t| t.to_string_lossy().into_owned());
+                    entries.push(Entry {
+                        path: item.rel,
+                        kind: EntryKind::Symlink,
+                        size: 0,
+                        mtime_ms: item.mtime_ms,
+                        hash: None,
+                        hash_failed: false,
+                        file_id: None,
+                        mode: None,
+                        link: target,
+                        prev: None,
+                    });
                 }
-                continue;
             }
-        };
-        if item.file_type().is_dir() {
-            if opt.filter.pass_dir(&rel).0 {
-                entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: mtime_ms(&md), hash: None, hash_failed: false, file_id: None, mode: None, link: None, prev: None });
-            }
-        } else if item.file_type().is_symlink() {
-            if !opt.symlinks_direct {
-                skipped_symlinks += 1;
-            }
-            if opt.symlinks_direct {
-                let target = std::fs::read_link(item.path())
-                    .ok()
-                    .map(|t| t.to_string_lossy().into_owned());
-                entries.push(Entry { path: rel, kind: EntryKind::Symlink, size: 0, mtime_ms: mtime_ms(&md), hash: None, hash_failed: false, file_id: None, mode: None, link: target, prev: None });
-            }
-        } else {
-            // Both iCloud eviction shapes, judged before the entry is recorded. Neither is an
-            // exclusion and neither can be fixed by one: the stub's danger comes from the *absence*
-            // of the real name, and excluding the stub only removes the visible hint while leaving
-            // the delete in place.
-            if is_icloud_stub(crate::foundation::path::base_name(&rel)) {
-                icloud_stubs += 1;
-                if icloud_stub_samples.len() < 5 {
-                    icloud_stub_samples.push(rel.clone());
+            WalkKind::File => {
+                let rel = item.rel;
+                // Both iCloud eviction shapes, judged before the entry is recorded. Neither is an
+                // exclusion and neither can be fixed by one: the stub's danger comes from the *absence*
+                // of the real name, and excluding the stub only removes the visible hint while leaving
+                // the delete in place.
+                if is_icloud_stub(crate::foundation::path::base_name(&rel)) {
+                    icloud_stubs += 1;
+                    if icloud_stub_samples.len() < 5 {
+                        icloud_stub_samples.push(rel.clone());
+                    }
+                } else if item.dataless {
+                    dataless_files += 1;
                 }
-            } else if is_dataless(&md) {
-                dataless_files += 1;
-            }
-            let size = md.len();
-            // P1-4: the filesystem once stored a different value than the mtime we asked for (FAT's 2-second granularity
-            // / SMB truncation); convert it back to what we meant so compare need not lean on a tolerance
-            let raw_mt = mtime_ms(&md);
-            let mt = match mtime_fixes.get(&rel) {
-                Some((ondisk, intended)) if *ondisk == raw_mt => *intended,
-                _ => raw_mt,
-            };
-            let mut hash = None;
-            if opt.hash && opt.use_cache {
-                if let Some((cs, cm, ch)) = cache.get(&rel) {
-                    // Cached values are isolated per mode: a `~` prefix means sampled digest, which must never stand in for a full hash (or the reverse)
-                    let want_sampled = opt.sampled && size >= SAMPLE_MIN;
-                    if *cs == size && *cm == mt && ch.starts_with('~') == want_sampled {
-                        hash = Some(ch.clone());
+                let size = item.size;
+                // P1-4: the filesystem once stored a different value than the mtime we asked for (FAT's 2-second granularity
+                // / SMB truncation); convert it back to what we meant so compare need not lean on a tolerance
+                let raw_mt = item.mtime_ms;
+                let mt = match mtime_fixes.get(&rel) {
+                    Some((ondisk, intended)) if *ondisk == raw_mt => {
+                        matched_mtime_fixes.insert(rel.clone());
+                        *intended
+                    }
+                    _ => raw_mt,
+                };
+                let mut hash = None;
+                // A correction has no stable object token in the legacy table. Re-read content
+                // instead of letting a same-size replacement inherit the previous object's hash.
+                if opt.hash && opt.use_cache && !matched_mtime_fixes.contains(&rel) {
+                    if let Some((cs, cm, ch)) = cache.get(&rel) {
+                        // Cached values are isolated per mode: a `~` prefix means sampled digest, which must never stand in for a full hash (or the reverse)
+                        let want_sampled = opt.sampled && size >= SAMPLE_MIN;
+                        if *cs == size && *cm == mt && ch.starts_with('~') == want_sampled {
+                            hash = Some(ch.clone());
+                        }
+                    }
+                }
+                pending.push(PendingFile {
+                    rel,
+                    abs: item.abs,
+                    size,
+                    raw_mt,
+                    mt,
+                    hash,
+                    hash_failed: false,
+                    // FAT/exFAT synthesize object IDs from allocation state. On the real exFAT
+                    // corpus, 1,532 zero-byte files changed IDs between two untouched scans, so
+                    // persisting those values creates thousands of imaginary moves.
+                    file_id: if local_state.file_ids_stable() {
+                        item.file_id
+                    } else {
+                        None
+                    },
+                    mode: item.mode,
+                });
+                if let Some(pp) = &pp {
+                    pp.item_done(&pending.last().unwrap().rel);
+                }
+                if let Some(cb) = progress {
+                    if walk_progress_sample_due(
+                        &mut legacy_walk_last_sample,
+                        legacy_walk_started.elapsed(),
+                    ) {
+                        cb(ScanProgress {
+                            phase: "walk",
+                            files_done: pending.len() as u64,
+                            files_total: 0,
+                            bytes_total: 0,
+                            bytes_done: 0,
+                            mib_per_s: 0.0,
+                            complete: false,
+                        });
                     }
                 }
             }
-            pending.push(PendingFile { rel, abs: item.path().to_path_buf(), size, mt, hash, hash_failed: false, file_id: file_id(&md), mode: unix_mode(&md) });
-            if let Some(pp) = &pp {
-                pp.item_done(&pending.last().unwrap().rel);
-            }
-        }
-    }
+        },
+    )?;
+    let walk_errors = walk_stats.walk_errors;
+    let walk_err_samples = walk_stats.walk_err_samples;
+    let excl_dirs = walk_stats.excluded_dirs;
+    let excl_files = walk_stats.excluded_files;
+    let coverage = if walk_errors == 0 {
+        crate::store::ScanCoverage::Complete
+    } else {
+        crate::store::ScanCoverage::Partial
+    };
+    let retain_absent: HashSet<String> = if coverage == crate::store::ScanCoverage::Complete {
+        cache
+            .keys()
+            .chain(mtime_fixes.keys())
+            .filter(|path| !opt.filter.pass_file(path))
+            .cloned()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    metrics.walk_ms = measured.elapsed().as_millis() as u64;
+    metrics.files = pending.len() as u64;
+    metrics.cache_hits = pending.iter().filter(|file| file.hash.is_some()).count() as u64;
 
     if walk_errors > 0 {
-        crate::log_warn!(
-            "scan",
-            "warning: {walk_errors} entr(ies) under {} skipped by walk errors — they will look ABSENT on this side! samples: {}",
-            root.display(),
-            walk_err_samples.join(" | ")
-        );
+        crate::log_warn!("scan", "warning: {walk_errors} entr(ies) under {} skipped by walk errors — they will look ABSENT on this side! samples: {}", root.display(), walk_err_samples.join(" | "));
         if let Some(pp) = &pp {
-            pp.error(
-                "",
-                "walk",
-                side,
-                &format!("{walk_errors} entr(ies) skipped by walk errors (they will be treated as ABSENT on this side!) samples: {}", walk_err_samples.join(" | ")),
-            );
+            pp.error("", "walk", side, &format!("{walk_errors} entr(ies) skipped by walk errors (they will be treated as ABSENT on this side!) samples: {}", walk_err_samples.join(" | ")));
         }
     }
 
     // The totals are known the moment the walk ends (the P2-6 insight): items = file count; bytes = the part that really has to be read off disk and hashed.
     // The item counter shifts gears: during the walk it counts "how many were found", during hashing it restarts from zero counting "how many are done"
     // —— otherwise the UI would sit at N/N from the very start of hashing.
+    let bytes_to_hash: u64 = if opt.hash {
+        pending
+            .iter()
+            .filter(|p| p.hash.is_none())
+            .map(|p| effective_read(p.size, opt.sampled))
+            .sum()
+    } else {
+        0
+    };
+    let legacy_progress_totals = (pending.len() as u64, bytes_to_hash);
+    metrics.workers = if opt.hash {
+        max_parallel_streams
+            .max(1)
+            .min(rayon::current_num_threads())
+    } else {
+        0
+    };
     if let Some(pp) = &pp {
-        let bytes_to_hash: u64 = if opt.hash {
-            pending.iter().filter(|p| p.hash.is_none()).map(|p| effective_read(p.size, opt.sampled)).sum()
-        } else {
-            0
-        };
         if opt.hash {
             pp.restart_items_with_totals(pending.len() as u64, bytes_to_hash);
         } else {
@@ -350,41 +373,69 @@ pub(super) fn scan_impl(
     }
 
     let hash_err_count = std::sync::atomic::AtomicU64::new(0);
+    let files_done = AtomicU64::new(0);
+    let bytes_done = AtomicU64::new(0);
+    let measured = std::time::Instant::now();
     if opt.hash {
         use rayon::prelude::*;
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        /// Read granularity, and therefore how often cancel/pause is honoured mid-file.
-        const READ_CHUNK: u64 = 8 * 1024 * 1024;
         // Only cache misses are actually read; the progress bar is only accurate if it counts their bytes
-        let bytes_total: u64 = pending.iter().filter(|p| p.hash.is_none()).map(|p| p.size).sum();
+        let bytes_total = bytes_to_hash;
         let files_total = pending.len() as u64;
-        let bytes_done = AtomicU64::new(0);
-        let hashing = AtomicBool::new(true);
+        let global_width = rayon::current_num_threads();
+        let width = max_parallel_streams.max(1).min(global_width);
+        let scan_pool = if width < global_width {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(width)
+                    .thread_name(|index| format!("sd-scan-{index}"))
+                    .start_handler(|_| crate::foundation::thread::lower_priority())
+                    .build()
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "cannot build {width}-thread scan pool: {error}"
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
 
         if let Some(cb) = progress {
-            cb(ScanProgress { phase: "walk", files_total, bytes_total, bytes_done: 0, mib_per_s: 0.0 });
+            cb(ScanProgress {
+                phase: "hash",
+                files_done: 0,
+                files_total,
+                bytes_total,
+                bytes_done: 0,
+                mib_per_s: 0.0,
+                complete: false,
+            });
         }
 
         // Progress sampling gets a thread of its own (same structure as syncthing's ProgressTicker):
         // the hash threads only do one relaxed add and carry no callback overhead at all
         std::thread::scope(|sc| {
-            if let Some(cb) = progress {
-                let (bd, hz, t_start) = (&bytes_done, &hashing, std::time::Instant::now());
+            let progress_stop = progress.map(|cb| {
+                let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+                let (fd, bd, t_start) = (&files_done, &bytes_done, std::time::Instant::now());
                 sc.spawn(move || {
-                    while hz.load(Ordering::Relaxed) {
-                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    while progress_sample_due(&stop_rx) {
+                        let done_files = fd.load(Ordering::Relaxed);
                         let done = bd.load(Ordering::Relaxed);
                         let secs = t_start.elapsed().as_secs_f64().max(0.001);
                         cb(ScanProgress {
                             phase: "hash",
+                            files_done: done_files,
                             files_total,
                             bytes_total,
                             bytes_done: done,
                             mib_per_s: done as f64 / secs / (1024.0 * 1024.0),
+                            complete: false,
                         });
                     }
                 });
-            }
+                stop_tx
+            });
             // Every file is read through the same chunked loop, whatever its size. Two reasons, and
             // the second is why the small-file mmap fast path is gone:
             //
@@ -401,17 +452,87 @@ pub(super) fn scan_impl(
             // The answer is not a SIGBUS handler in a process that writes user files; it is to not
             // map the file, so a vanishing file is an ordinary Err the hash-error path already
             // knows how to record.
-            pending.par_iter_mut().for_each(|p| {
-                if let Some(pp) = &pp {
-                    if pp.checkpoint().is_err() {
-                        return; // cancelled: the remaining work items spin out empty (the standard rayon early-exit)
+            let mut hash_all = || {
+                pending.par_iter_mut().for_each_init(Vec::new, |buf, p| {
+                    if let Some(pp) = &pp {
+                        if pp.checkpoint().is_err() {
+                            return; // cancelled: the remaining work items spin out empty (the standard rayon early-exit)
+                        }
                     }
-                }
-                if p.hash.is_none() {
-                    // fast rigor tier: large files only read the three sample windows (a cloud placeholder hydrates only those three too)
-                    if opt.sampled && p.size >= SAMPLE_MIN {
-                        match sampled_digest(&p.abs, p.size) {
-                            Ok(d) => p.hash = Some(d),
+                    if p.hash.is_none() {
+                        // fast rigor tier: large files only read the three sample windows (a cloud placeholder hydrates only those three too)
+                        if opt.sampled && p.size >= SAMPLE_MIN {
+                            let result = sampled_digest_with_buffer(&p.abs, p.size, buf, |n| {
+                                bytes_done.fetch_add(n, Ordering::Relaxed);
+                                if let Some(pp) = &pp {
+                                    pp.add_bytes(n, &p.rel);
+                                }
+                            })
+                            .and_then(|hash| {
+                                let metadata = std::fs::symlink_metadata(&p.abs)?;
+                                let current_mt = metadata
+                                    .modified()
+                                    .ok()
+                                    .and_then(|time| {
+                                        time.duration_since(std::time::UNIX_EPOCH).ok()
+                                    })
+                                    .map(|duration| duration.as_millis() as i64)
+                                    .unwrap_or(0);
+                                if metadata.len() != p.size || current_mt != p.raw_mt {
+                                    return Err(std::io::Error::other(
+                                        "file changed while content evidence was being read",
+                                    ));
+                                }
+                                Ok(hash)
+                            });
+                            match result {
+                                Ok(d) => p.hash = Some(d),
+                                Err(e) => {
+                                    p.hash_failed = true;
+                                    hash_err_count.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(pp) = &pp {
+                                        pp.error(&p.rel, "hash", side, &e.to_string());
+                                    }
+                                }
+                            }
+                            if let Some(pp) = &pp {
+                                pp.item_done(&p.rel);
+                            }
+                            files_done.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        let res = full_hash_with_buffer(
+                            &p.abs,
+                            p.size,
+                            buf,
+                            || match &pp {
+                                Some(pp) => pp.checkpoint(),
+                                None => Ok(()),
+                            },
+                            |n| {
+                                bytes_done.fetch_add(n, Ordering::Relaxed);
+                                if let Some(pp) = &pp {
+                                    pp.add_bytes(n, &p.rel);
+                                }
+                            },
+                        );
+                        match res.and_then(|hash| {
+                            let metadata = std::fs::symlink_metadata(&p.abs)?;
+                            let current_mt = metadata
+                                .modified()
+                                .ok()
+                                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|duration| duration.as_millis() as i64)
+                                .unwrap_or(0);
+                            if metadata.len() != p.size || current_mt != p.raw_mt {
+                                return Err(std::io::Error::other(
+                                    "file changed while content evidence was being read",
+                                ));
+                            }
+                            Ok(hash)
+                        }) {
+                            Ok(hash) => p.hash = Some(hash),
+                            Err(e) if crate::obs::progress::is_cancelled(&e) => return, // cancellation is not a hash error
                             Err(e) => {
                                 p.hash_failed = true;
                                 hash_err_count.fetch_add(1, Ordering::Relaxed);
@@ -420,81 +541,72 @@ pub(super) fn scan_impl(
                                 }
                             }
                         }
-                        let eff = effective_read(p.size, true);
-                        bytes_done.fetch_add(eff, Ordering::Relaxed);
-                        if let Some(pp) = &pp {
-                            pp.add_bytes(eff, &p.rel);
-                            pp.item_done(&p.rel);
-                        }
-                        return;
                     }
-                    let mut hasher = blake3::Hasher::new();
-                    let res = (|| -> std::io::Result<()> {
-                        use std::io::Read;
-                        let mut f = std::fs::File::open(&p.abs)?;
-                        // Sized to the file, capped at the checkpoint interval: a tree of small
-                        // files must not allocate 8MiB per rayon worker.
-                        let cap = p.size.clamp(1, READ_CHUNK) as usize;
-                        let mut buf = vec![0u8; cap];
-                        loop {
-                            if let Some(pp) = &pp {
-                                pp.checkpoint()?;
-                            }
-                            let n = f.read(&mut buf)?;
-                            if n == 0 {
-                                break;
-                            }
-                            hasher.update(&buf[..n]);
-                        }
-                        Ok(())
-                    })();
-                    match res {
-                        Ok(_) => p.hash = Some(hasher.finalize().to_hex().to_string()),
-                        Err(e) if crate::obs::progress::is_cancelled(&e) => return, // cancellation is not a hash error
-                        Err(e) => {
-                            p.hash_failed = true;
-                            hash_err_count.fetch_add(1, Ordering::Relaxed);
-                            if let Some(pp) = &pp {
-                                pp.error(&p.rel, "hash", side, &e.to_string());
-                            }
-                        }
-                    }
-                    bytes_done.fetch_add(p.size, Ordering::Relaxed);
                     if let Some(pp) = &pp {
-                        pp.add_bytes(p.size, &p.rel);
+                        pp.item_done(&p.rel); // item count during hashing = files processed (a cache hit bumps it immediately)
                     }
-                }
-                if let Some(pp) = &pp {
-                    pp.item_done(&p.rel); // item count during hashing = files processed (a cache hit bumps it immediately)
-                }
-            });
-            hashing.store(false, Ordering::Relaxed);
+                    files_done.fetch_add(1, Ordering::Relaxed);
+                })
+            };
+            if let Some(pool) = &scan_pool {
+                pool.install(hash_all);
+            } else {
+                hash_all();
+            }
+            if let Some(stop) = progress_stop {
+                let _ = stop.send(());
+            }
         });
         if let Some(pp) = &pp {
             pp.checkpoint()?; // when the cancellation happened during hashing, this is where we honestly return Interrupted
         }
-
-        if let Some(cb) = progress {
-            cb(ScanProgress {
-                phase: "hash",
-                files_total,
-                bytes_total,
-                bytes_done: bytes_total,
-                mib_per_s: 0.0,
-            });
-        }
     }
+    metrics.hash_ms = measured.elapsed().as_millis() as u64;
+    metrics.read_bytes = bytes_done.load(Ordering::Relaxed);
+    let measured = std::time::Instant::now();
     for p in pending {
-        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, hash_failed: p.hash_failed, file_id: p.file_id, mode: p.mode, link: None, prev: None });
+        entries.push(Entry {
+            path: p.rel,
+            kind: EntryKind::File,
+            size: p.size,
+            mtime_ms: p.mt,
+            hash: p.hash,
+            hash_failed: p.hash_failed,
+            file_id: p.file_id,
+            mode: p.mode,
+            link: None,
+            prev: None,
+        });
     }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+    metrics.finalize_ms = measured.elapsed().as_millis() as u64;
+    let measured = std::time::Instant::now();
     if opt.hash {
-        crate::store::hashcache::save_by_key(&root.to_string_lossy(), &entries);
+        if crate::store::hashcache::save_local(&local_state, &entries, coverage, &retain_absent)
+            == crate::store::StateWriteStatus::Failed
+        {
+            metrics.state_failures += 1;
+        }
     }
+    if crate::store::mtimefix::reconcile_local(
+        &local_state,
+        &mtime_fixes,
+        &entries,
+        coverage,
+        &matched_mtime_fixes,
+        &retain_absent,
+    ) == crate::store::StateWriteStatus::Failed
+    {
+        metrics.state_failures += 1;
+    }
+    metrics.state_write_ms = measured.elapsed().as_millis() as u64;
     hash_errors += hash_err_count.load(std::sync::atomic::Ordering::Relaxed);
     if hash_errors > 0 {
-        crate::log_warn!("scan", "warning: {hash_errors} file(s) could not be hashed (in use / unreadable)");
+        crate::log_warn!(
+            "scan",
+            "warning: {hash_errors} file(s) could not be hashed (in use / unreadable)"
+        );
     }
 
     let snapshot = Snapshot {
@@ -508,8 +620,8 @@ pub(super) fn scan_impl(
             duration_ms: t0.elapsed().as_millis() as u64,
             entry_count: entries.len() as u64,
             hashed: opt.hash,
-            excluded_dirs: excl_dirs.get(),
-            excluded_files: excl_files.get(),
+            excluded_dirs: excl_dirs,
+            excluded_files: excl_files,
             walk_errors,
             walk_err_samples,
             icloud_stubs,
@@ -520,8 +632,23 @@ pub(super) fn scan_impl(
         },
         entries,
     };
+    if let Some((ctx, _)) = ctxp {
+        metrics.emit(ctx, side, "local");
+    }
     if let Some(pp) = pp {
         pp.finish()?;
+    }
+    if let Some(cb) = progress {
+        let (files_total, bytes_total) = legacy_progress_totals;
+        cb(ScanProgress {
+            phase: if opt.hash { "hash" } else { "walk" },
+            files_done: files_total,
+            files_total,
+            bytes_total,
+            bytes_done: bytes_done.load(Ordering::Relaxed),
+            mib_per_s: 0.0,
+            complete: true,
+        });
     }
     Ok(snapshot)
 }
@@ -530,7 +657,7 @@ pub(super) fn scan_impl(
 mod tests {
     use super::*;
     use crate::pipeline::filter::PathFilter;
-    use crate::pipeline::scan::{scan, ScanOptions};
+    use crate::pipeline::scan::{scan, scan_with_progress, ScanOptions};
 
     fn opts() -> ScanOptions {
         ScanOptions {
@@ -540,6 +667,224 @@ mod tests {
             symlinks_direct: false,
             filter: PathFilter::build(&[], &[]),
         }
+    }
+
+    #[test]
+    fn full_hash_reuses_the_worker_buffer_across_files() {
+        let root =
+            std::env::temp_dir().join(format!("syncdash-hash-buffer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let large = vec![17u8; 64 * 1024];
+        let small = vec![29u8; 17];
+        let large_path = root.join("large.bin");
+        let small_path = root.join("small.bin");
+        std::fs::write(&large_path, &large).unwrap();
+        std::fs::write(&small_path, &small).unwrap();
+
+        let mut buf = Vec::new();
+        let first =
+            full_hash_with_buffer(&large_path, large.len() as u64, &mut buf, || Ok(()), |_| {})
+                .unwrap();
+        assert_eq!(first, blake3::hash(&large).to_hex().to_string());
+        let capacity = buf.capacity();
+
+        let second =
+            full_hash_with_buffer(&small_path, small.len() as u64, &mut buf, || Ok(()), |_| {})
+                .unwrap();
+        assert_eq!(second, blake3::hash(&small).to_hex().to_string());
+        assert_eq!(
+            buf.capacity(),
+            capacity,
+            "the next file must reuse rather than replace the worker allocation"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn progress_sampler_stop_is_wakeable() {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        stop_tx.send(()).unwrap();
+        assert!(!progress_sample_due(&stop_rx));
+    }
+
+    #[test]
+    fn walk_progress_cadence_is_immediate_then_throttled() {
+        let mut last = None;
+        assert!(walk_progress_sample_due(
+            &mut last,
+            std::time::Duration::ZERO
+        ));
+        assert!(!walk_progress_sample_due(
+            &mut last,
+            WALK_PROGRESS_SAMPLE_INTERVAL - std::time::Duration::from_millis(1),
+        ));
+        assert!(walk_progress_sample_due(
+            &mut last,
+            WALK_PROGRESS_SAMPLE_INTERVAL,
+        ));
+    }
+
+    #[test]
+    fn zero_byte_progress_has_one_explicit_completion_boundary() {
+        let root =
+            std::env::temp_dir().join(format!("syncdash-zero-progress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..8 {
+            std::fs::write(root.join(format!("empty-{index}")), b"").unwrap();
+        }
+
+        let events = std::sync::Mutex::new(Vec::new());
+        let state_ready_at_completion = std::sync::atomic::AtomicBool::new(false);
+        let collect = |progress: ScanProgress| {
+            if progress.complete {
+                let state = crate::store::localid::LocalScanStateIdentity::for_root(&root);
+                let cache = crate::store::hashcache::load_local(&state);
+                state_ready_at_completion
+                    .store(cache.len() == 8, std::sync::atomic::Ordering::Relaxed);
+            }
+            events.lock().unwrap().push(progress);
+        };
+        scan_with_progress(&root, &opts(), Some(&collect)).unwrap();
+        let events = events.into_inner().unwrap();
+        assert!(events.len() >= 2);
+        assert!(events[..events.len() - 1]
+            .iter()
+            .all(|progress| !progress.complete));
+        let final_event = events.last().unwrap();
+        assert!(final_event.complete);
+        assert_eq!(final_event.files_done, 8);
+        assert_eq!(final_event.files_total, 8);
+        assert_eq!(final_event.bytes_done, 0);
+        assert_eq!(final_event.bytes_total, 0);
+        assert!(
+            state_ready_at_completion.load(std::sync::atomic::Ordering::Relaxed),
+            "the completion callback must run after the finished hash cache is visible",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_hash_progress_still_has_one_terminal_completion() {
+        let root =
+            std::env::temp_dir().join(format!("syncdash-no-hash-progress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..3 {
+            std::fs::write(root.join(format!("file-{index}")), b"contents").unwrap();
+        }
+
+        let events = std::sync::Mutex::new(Vec::new());
+        let collect = |progress: ScanProgress| events.lock().unwrap().push(progress);
+        let mut options = opts();
+        options.hash = false;
+        scan_with_progress(&root, &options, Some(&collect)).unwrap();
+
+        let events = events.into_inner().unwrap();
+        assert_eq!(events.iter().filter(|event| event.complete).count(), 1);
+        assert!(events.iter().any(|event| {
+            event.phase == "walk"
+                && !event.complete
+                && event.files_done > 0
+                && event.files_total == 0
+        }));
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal.phase, "walk");
+        assert_eq!(terminal.files_done, 3);
+        assert_eq!(terminal.files_total, 3);
+        assert_eq!(terminal.bytes_done, 0);
+        assert_eq!(terminal.bytes_total, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrected_mtime_never_reuses_a_hash_for_a_replacement_object() {
+        let root = std::env::temp_dir().join(format!(
+            "syncdash-corrected-cache-replacement-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("same.bin");
+        let raw_ms = 1_700_000_000_000i64;
+        let intended_ms = raw_ms + 1_500;
+        let stamp = filetime::FileTime::from_unix_time(raw_ms / 1_000, 0);
+        std::fs::write(&file, b"old!").unwrap();
+        filetime::set_file_mtime(&file, stamp).unwrap();
+
+        let state = crate::store::localid::LocalScanStateIdentity::for_root(&root);
+        assert_ne!(
+            crate::store::mtimefix::record_local(
+                &state,
+                &[("same.bin".into(), raw_ms, intended_ms)],
+            ),
+            crate::store::StateWriteStatus::Failed,
+        );
+        let mut options = opts();
+        options.use_cache = true;
+        let first = scan(&root, &options).unwrap();
+        let first_hash = first.entries[0].hash.clone().unwrap();
+        assert_eq!(first.entries[0].mtime_ms, intended_ms);
+
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, b"new!").unwrap();
+        filetime::set_file_mtime(&file, stamp).unwrap();
+        let second = scan(&root, &options).unwrap();
+        assert_eq!(second.entries[0].mtime_ms, intended_ms);
+        assert_ne!(
+            second.entries[0].hash.as_deref(),
+            Some(first_hash.as_str()),
+            "a same-size replacement with the same coarse raw mtime must be re-read",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn filtered_no_cache_scan_retains_hashes_outside_its_domain() {
+        let root = std::env::temp_dir().join(format!(
+            "syncdash-filtered-no-cache-local-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("excluded")).unwrap();
+        let included = root.join("included.bin");
+        std::fs::write(&included, b"old!").unwrap();
+        std::fs::write(root.join("excluded/keep.bin"), b"outside").unwrap();
+        let stamp = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(&included, stamp).unwrap();
+
+        let first = scan(&root, &opts()).unwrap();
+        let old_hash = first
+            .entries
+            .iter()
+            .find(|entry| entry.path == "included.bin")
+            .and_then(|entry| entry.hash.clone())
+            .unwrap();
+
+        // Same size and mtime would be a cache hit if loading state accidentally weakened the
+        // no-cache tier. The filtered scan must re-read this file while retaining the other row.
+        std::fs::write(&included, b"new!").unwrap();
+        filetime::set_file_mtime(&included, stamp).unwrap();
+        let mut filtered = opts();
+        filtered.filter = PathFilter::build(&[], &["/excluded/".into()]);
+        let second = scan(&root, &filtered).unwrap();
+        let new_hash = second
+            .entries
+            .iter()
+            .find(|entry| entry.path == "included.bin")
+            .and_then(|entry| entry.hash.as_deref())
+            .unwrap();
+        assert_ne!(new_hash, old_hash);
+
+        let state = crate::store::localid::LocalScanStateIdentity::for_root(&root);
+        let cache = crate::store::hashcache::load_local(&state);
+        assert!(cache.contains_key("excluded/keep.bin"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -559,19 +904,30 @@ mod tests {
             use std::os::unix::ffi::OsStringExt;
             std::ffi::OsString::from_vec(vec![b'b', 0xFF, b'c'])
         };
-        assert!(bad.to_str().is_none(), "premise: the name is not valid Unicode");
+        assert!(
+            bad.to_str().is_none(),
+            "premise: the name is not valid Unicode"
+        );
         if std::fs::write(root.join(&bad), b"x").is_err() {
             let _ = std::fs::remove_dir_all(&root);
             return; // this filesystem refuses the name outright, which is also fine
         }
 
-        let snap = scan(&root, &ScanOptions { hash: false, ..opts() }).unwrap();
+        let snap = scan(
+            &root,
+            &ScanOptions {
+                hash: false,
+                ..opts()
+            },
+        )
+        .unwrap();
         let paths: Vec<&str> = snap.entries.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, vec!["good.txt"], "the unrepresentable name must not enter the table");
-        assert!(
-            !paths.iter().any(|p| p.contains('\u{FFFD}')),
-            "a substituted spelling is worse than an omission: it points at a file that does not exist"
+        assert_eq!(
+            paths,
+            vec!["good.txt"],
+            "the unrepresentable name must not enter the table"
         );
+        assert!(!paths.iter().any(|p| p.contains('\u{FFFD}')), "a substituted spelling is worse than an omission: it points at a file that does not exist");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -589,18 +945,37 @@ mod tests {
             std::fs::write(root.join(format!("f{i}.txt")), b"x").unwrap();
         }
         let base = root.to_string_lossy().into_owned();
-        let baseline = scan(&root, &ScanOptions { hash: false, ..opts() }).unwrap().entries.len();
+        let baseline = scan(
+            &root,
+            &ScanOptions {
+                hash: false,
+                ..opts()
+            },
+        )
+        .unwrap()
+        .entries
+        .len();
         assert_eq!(baseline, 6, "5 files + 1 dir");
 
         let spellings = [
             base.replace('\\', "/"),
-            format!("{base}{}sub{}..", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR),
+            format!(
+                "{base}{}sub{}..",
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR
+            ),
             format!("{base}{}", std::path::MAIN_SEPARATOR),
             format!("{base}{}.", std::path::MAIN_SEPARATOR),
         ];
         for s in spellings {
-            let got = scan(Path::new(&s), &ScanOptions { hash: false, ..opts() })
-                .unwrap_or_else(|e| panic!("scanning {s:?} failed: {e}"));
+            let got = scan(
+                Path::new(&s),
+                &ScanOptions {
+                    hash: false,
+                    ..opts()
+                },
+            )
+            .unwrap_or_else(|e| panic!("scanning {s:?} failed: {e}"));
             assert_eq!(
                 got.entries.len(),
                 baseline,
@@ -616,9 +991,22 @@ mod tests {
     fn an_unreadable_root_is_an_error_not_an_empty_table() {
         let missing = std::env::temp_dir().join(format!("syncdash-absent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
-        match scan(&missing, &ScanOptions { hash: false, ..opts() }) {
-            Ok(s) => panic!("a missing root scanned as a {}-entry tree instead of erroring", s.entries.len()),
-            Err(e) => assert!(e.to_string().contains("refusing to report it as an empty tree"), "{e}"),
+        match scan(
+            &missing,
+            &ScanOptions {
+                hash: false,
+                ..opts()
+            },
+        ) {
+            Ok(s) => panic!(
+                "a missing root scanned as a {}-entry tree instead of erroring",
+                s.entries.len()
+            ),
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("refusing to report it as an empty tree"),
+                "{e}"
+            ),
         }
     }
 }

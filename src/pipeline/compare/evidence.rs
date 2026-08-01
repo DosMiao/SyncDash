@@ -9,7 +9,6 @@
 //! apply payload from that result. A field dropped by either implementation is a field dropped
 //! from a write. That mistaken "this file is inert" line is why it went unexamined.
 
-
 use serde::{Deserialize, Serialize};
 
 use crate::model::plan::{Action, Op, Plan, Side};
@@ -57,7 +56,12 @@ pub struct Evidence {
 /// plan JSONL on-disk format and the CLI behavior. We use a parallel array, leaving `compare()` untouched.
 ///
 /// The criteria share `norm_key` / `files_equal` with `compare()`, so they cannot drift.
-pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &CompareOptions) -> Evidence {
+pub fn evidence(
+    source: &Snapshot,
+    target: &Snapshot,
+    plan: &Plan,
+    copts: &CompareOptions,
+) -> Evidence {
     let ci = copts.case_insensitive;
     let win = copts.mtime_window_ms;
     let (s_files, _) = map_of(source, EntryKind::File, ci);
@@ -65,8 +69,14 @@ pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &Compa
     let (s_dirs, _) = map_of(source, EntryKind::Dir, ci);
     let (t_dirs, _) = map_of(target, EntryKind::Dir, ci);
 
-    let meta = |e: &Entry| SideMeta { size: e.size, mtime_ms: e.mtime_ms };
-    let look = |files: &BTreeMap<String, &Entry>, dirs: &BTreeMap<String, &Entry>, rel: &str| -> Option<SideMeta> {
+    let meta = |e: &Entry| SideMeta {
+        size: e.size,
+        mtime_ms: e.mtime_ms,
+    };
+    let look = |files: &BTreeMap<String, &Entry>,
+                dirs: &BTreeMap<String, &Entry>,
+                rel: &str|
+     -> Option<SideMeta> {
         let k = norm_key(rel, ci);
         files.get(&k).or_else(|| dirs.get(&k)).map(|e| meta(e))
     };
@@ -77,8 +87,12 @@ pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &Compa
         .map(|op| {
             // On the executing side a move is still called from, on the other side it is already path — each side is looked up under its own name
             let (s_rel, t_rel) = match (&op.action, &op.side) {
-                (Action::Move, Side::Target) => (op.path.as_str(), op.from.as_deref().unwrap_or(&op.path)),
-                (Action::Move, Side::Source) => (op.from.as_deref().unwrap_or(&op.path), op.path.as_str()),
+                (Action::Move, Side::Target) => {
+                    (op.path.as_str(), op.from.as_deref().unwrap_or(&op.path))
+                }
+                (Action::Move, Side::Source) => {
+                    (op.from.as_deref().unwrap_or(&op.path), op.path.as_str())
+                }
                 _ => (op.path.as_str(), op.path.as_str()),
             };
             RowMeta {
@@ -98,7 +112,11 @@ pub fn evidence(source: &Snapshot, target: &Snapshot, plan: &Plan, copts: &Compa
             }
         }
     }
-    Evidence { metas, equal_count, equal_bytes }
+    Evidence {
+        metas,
+        equal_count,
+        equal_bytes,
+    }
 }
 
 /// One "identical on both sides" record. It is not in the plan — it is not an action, it is evidence.
@@ -187,8 +205,24 @@ pub fn reverse_op(op: &Op) -> Option<Op> {
             ..op.clone()
         }),
         // The other side's content wins, so this op can no longer describe *this* side's bytes.
-        Action::Update => Some(Op { side: other, from: None, size: None, mtime_ms: None, hash: None, reason, ..op.clone() }),
-        Action::Delete => Some(Op { side: other, action: Action::Copy, from: None, mtime_ms: None, hash: None, reason, ..op.clone() }),
+        Action::Update => Some(Op {
+            side: other,
+            from: None,
+            size: None,
+            mtime_ms: None,
+            hash: None,
+            reason,
+            ..op.clone()
+        }),
+        Action::Delete => Some(Op {
+            side: other,
+            action: Action::Copy,
+            from: None,
+            mtime_ms: None,
+            hash: None,
+            reason,
+            ..op.clone()
+        }),
         _ => None,
     }
 }
@@ -220,7 +254,11 @@ mod tests {
         };
         let r = reverse_op(&src).expect("an Update is reversible");
         assert_eq!(r.side, Side::Source, "the flip is what the side is for");
-        assert_eq!(r.link.as_deref(), Some("../nodejs/bin/node"), "a symlink op must stay a symlink op");
+        assert_eq!(
+            r.link.as_deref(),
+            Some("../nodejs/bin/node"),
+            "a symlink op must stay a symlink op"
+        );
         assert_eq!(r.mode, Some(0o755), "the mode survives the flip");
         assert_eq!(r.path, "bin/node");
         // The content evidence belonged to the side that just lost, so it is dropped deliberately.
@@ -231,19 +269,41 @@ mod tests {
     fn snap(os: &str, entries: Vec<Entry>) -> Snapshot {
         Snapshot {
             header: Header {
-                schema: SCHEMA, kind: "snapshot".into(), root: "/r".into(), host: "h".into(),
-                os: os.into(), scanned_at_ms: 0, duration_ms: 0,
-                entry_count: entries.len() as u64, hashed: true,
-                excluded_dirs: 0, excluded_files: 0,
-                walk_errors: 0, walk_err_samples: Vec::new(),
-                icloud_stubs: 0, icloud_stub_samples: Vec::new(), dataless_files: 0,
-                skipped_symlinks: 0, vfs: None,
+                schema: SCHEMA,
+                kind: "snapshot".into(),
+                root: "/r".into(),
+                host: "h".into(),
+                os: os.into(),
+                scanned_at_ms: 0,
+                duration_ms: 0,
+                entry_count: entries.len() as u64,
+                hashed: true,
+                excluded_dirs: 0,
+                excluded_files: 0,
+                walk_errors: 0,
+                walk_err_samples: Vec::new(),
+                icloud_stubs: 0,
+                icloud_stub_samples: Vec::new(),
+                dataless_files: 0,
+                skipped_symlinks: 0,
+                vfs: None,
             },
             entries,
         }
     }
     fn file(path: &str, hash: &str) -> Entry {
-        Entry { path: path.into(), kind: EntryKind::File, size: 1, mtime_ms: 0, hash: Some(hash.into()), hash_failed: false, file_id: None, mode: None, link: None, prev: None }
+        Entry {
+            path: path.into(),
+            kind: EntryKind::File,
+            size: 1,
+            mtime_ms: 0,
+            hash: Some(hash.into()),
+            hash_failed: false,
+            file_id: None,
+            mode: None,
+            link: None,
+            prev: None,
+        }
     }
     /// A file with an mtime (conflict arbitration goes by mtime)
     /// An archive entry: current hash + historic generations
@@ -254,28 +314,80 @@ mod tests {
 
     #[test]
     fn reverse_op_semantics() {
-        let copy = Op { side: Side::Target, action: Action::Copy, path: "x".into(), from: None, size: Some(5), mtime_ms: Some(1), hash: None, link: None, mode: None, reason: "only-in-source".into() };
+        let copy = Op {
+            side: Side::Target,
+            action: Action::Copy,
+            path: "x".into(),
+            from: None,
+            size: Some(5),
+            mtime_ms: Some(1),
+            hash: None,
+            link: None,
+            mode: None,
+            reason: "only-in-source".into(),
+        };
         let r = reverse_op(&copy).unwrap();
         assert_eq!((r.side, r.action), (Side::Source, Action::Delete));
 
-        let del = Op { side: Side::Target, action: Action::Delete, path: "x".into(), from: None, size: Some(5), mtime_ms: None, hash: None, link: None, mode: None, reason: "gone-from-source".into() };
+        let del = Op {
+            side: Side::Target,
+            action: Action::Delete,
+            path: "x".into(),
+            from: None,
+            size: Some(5),
+            mtime_ms: None,
+            hash: None,
+            link: None,
+            mode: None,
+            reason: "gone-from-source".into(),
+        };
         let r = reverse_op(&del).unwrap();
         assert_eq!((r.side, r.action), (Side::Source, Action::Copy));
 
-        let upd = Op { side: Side::Target, action: Action::Update, path: "x".into(), from: None, size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "differs".into() };
+        let upd = Op {
+            side: Side::Target,
+            action: Action::Update,
+            path: "x".into(),
+            from: None,
+            size: None,
+            mtime_ms: None,
+            hash: None,
+            link: None,
+            mode: None,
+            reason: "differs".into(),
+        };
         let r = reverse_op(&upd).unwrap();
         assert_eq!((r.side, r.action), (Side::Source, Action::Update));
 
-        let mv = Op { side: Side::Target, action: Action::Move, path: "b".into(), from: Some("a".into()), size: None, mtime_ms: None, hash: None, link: None, mode: None, reason: "m".into() };
+        let mv = Op {
+            side: Side::Target,
+            action: Action::Move,
+            path: "b".into(),
+            from: Some("a".into()),
+            size: None,
+            mtime_ms: None,
+            hash: None,
+            link: None,
+            mode: None,
+            reason: "m".into(),
+        };
         assert!(reverse_op(&mv).is_none());
     }
 
     #[test]
     fn normalization_twins_reported_not_merged() {
-        let s = snap("linux", vec![file("caf\u{00e9}.txt", "h1"), file("cafe\u{0301}.txt", "h2")]);
+        let s = snap(
+            "linux",
+            vec![
+                file("caf\u{00e9}.txt", "h1"),
+                file("cafe\u{0301}.txt", "h2"),
+            ],
+        );
         let t = snap("windows", vec![file("caf\u{00e9}.txt", "h1")]);
         let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
-        assert!(plan.ops.iter().any(|o| o.action == Action::Note && o.reason.contains("duplicate-after-normalization")));
+        assert!(plan.ops.iter().any(
+            |o| o.action == Action::Note && o.reason.contains("duplicate-after-normalization")
+        ));
     }
 
     // Evidence layer
@@ -283,19 +395,53 @@ mod tests {
     #[test]
     fn evidence_reports_both_sides_and_equal_count() {
         // same: identical on both sides; upd: on both sides but with different content; only_s: source only; only_t: target only
-        let s = snap("windows", vec![
-            Entry { size: 10, mtime_ms: 1_000, ..file("same.txt", "h0") },
-            Entry { size: 30, mtime_ms: 9_000, ..file("upd.txt", "hs") },
-            Entry { size: 7, mtime_ms: 5_000, ..file("only_s.txt", "h1") },
-        ]);
-        let t = snap("windows", vec![
-            Entry { size: 10, mtime_ms: 1_000, ..file("same.txt", "h0") },
-            Entry { size: 20, mtime_ms: 2_000, ..file("upd.txt", "ht") },
-            Entry { size: 4, mtime_ms: 3_000, ..file("only_t.txt", "h2") },
-        ]);
+        let s = snap(
+            "windows",
+            vec![
+                Entry {
+                    size: 10,
+                    mtime_ms: 1_000,
+                    ..file("same.txt", "h0")
+                },
+                Entry {
+                    size: 30,
+                    mtime_ms: 9_000,
+                    ..file("upd.txt", "hs")
+                },
+                Entry {
+                    size: 7,
+                    mtime_ms: 5_000,
+                    ..file("only_s.txt", "h1")
+                },
+            ],
+        );
+        let t = snap(
+            "windows",
+            vec![
+                Entry {
+                    size: 10,
+                    mtime_ms: 1_000,
+                    ..file("same.txt", "h0")
+                },
+                Entry {
+                    size: 20,
+                    mtime_ms: 2_000,
+                    ..file("upd.txt", "ht")
+                },
+                Entry {
+                    size: 4,
+                    mtime_ms: 3_000,
+                    ..file("only_t.txt", "h2")
+                },
+            ],
+        );
         let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
         let ev = evidence(&s, &t, &plan, &CompareOptions::default());
-        assert_eq!(ev.metas.len(), plan.ops.len(), "the evidence array must correspond one-to-one with ops");
+        assert_eq!(
+            ev.metas.len(),
+            plan.ops.len(),
+            "the evidence array must correspond one-to-one with ops"
+        );
         assert_eq!(ev.equal_count, 1);
         assert_eq!(ev.equal_bytes, 10);
 
@@ -321,17 +467,29 @@ mod tests {
 
     #[test]
     fn same_page_lists_only_equal_files_and_pages() {
-        let mk = |n: usize, h: &str| Entry { size: n as u64, mtime_ms: n as i64 * 1000, ..file(&format!("d{}/f{n}.bin", n % 3), h) };
+        let mk = |n: usize, h: &str| Entry {
+            size: n as u64,
+            mtime_ms: n as i64 * 1000,
+            ..file(&format!("d{}/f{n}.bin", n % 3), h)
+        };
         let s = snap("windows", (0..10).map(|n| mk(n, "same")).collect());
         // The last 3 differ in content on the target side → not counted as equal
-        let t = snap("windows", (0..10).map(|n| mk(n, if n >= 7 { "diff" } else { "same" })).collect());
+        let t = snap(
+            "windows",
+            (0..10)
+                .map(|n| mk(n, if n >= 7 { "diff" } else { "same" }))
+                .collect(),
+        );
         let copts = CompareOptions::default();
         let (total, rows) = same_page(&s, &t, &copts, "", 0, 100);
         assert_eq!(total, 7);
         assert_eq!(rows.len(), 7);
         // Paging
         let (total, rows) = same_page(&s, &t, &copts, "", 5, 100);
-        assert_eq!(total, 7, "total is the post-filter total, independent of the paging window");
+        assert_eq!(
+            total, 7,
+            "total is the post-filter total, independent of the paging window"
+        );
         assert_eq!(rows.len(), 2);
         let (_t, rows) = same_page(&s, &t, &copts, "", 0, 3);
         assert_eq!(rows.len(), 3);
@@ -346,12 +504,38 @@ mod tests {
     #[test]
     fn evidence_follows_move_naming_on_each_side() {
         // Same-content rename: source is already called b.bin, target is still a.bin — each side is looked up under its own name
-        let s = snap("windows", vec![Entry { size: 42, mtime_ms: 8_000, ..file("b.bin", "hm") }]);
-        let t = snap("windows", vec![Entry { size: 42, mtime_ms: 4_000, ..file("a.bin", "hm") }]);
+        let s = snap(
+            "windows",
+            vec![Entry {
+                size: 42,
+                mtime_ms: 8_000,
+                ..file("b.bin", "hm")
+            }],
+        );
+        let t = snap(
+            "windows",
+            vec![Entry {
+                size: 42,
+                mtime_ms: 4_000,
+                ..file("a.bin", "hm")
+            }],
+        );
         let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
-        let i = plan.ops.iter().position(|o| o.action == Action::Move).expect("move");
+        let i = plan
+            .ops
+            .iter()
+            .position(|o| o.action == Action::Move)
+            .expect("move");
         let ev = evidence(&s, &t, &plan, &CompareOptions::default());
-        assert_eq!(ev.metas[i].src.unwrap().mtime_ms, 8_000, "the source side is looked up under the new name b.bin");
-        assert_eq!(ev.metas[i].dst.unwrap().mtime_ms, 4_000, "the target side is looked up under the old name a.bin");
+        assert_eq!(
+            ev.metas[i].src.unwrap().mtime_ms,
+            8_000,
+            "the source side is looked up under the new name b.bin"
+        );
+        assert_eq!(
+            ev.metas[i].dst.unwrap().mtime_ms,
+            4_000,
+            "the target side is looked up under the old name a.bin"
+        );
     }
 }

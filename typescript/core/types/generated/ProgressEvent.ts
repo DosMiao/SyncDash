@@ -4,7 +4,7 @@ import type { LogLevel } from "./LogLevel";
 import type { Phase } from "./Phase";
 import type { PhaseStatus } from "./PhaseStatus";
 
-export type ProgressEvent = { "kind": "phase_start", phase: Phase, ts_ms: number, label: string | null, items_total: number, bytes_total: number, } | { "kind": "totals", phase: Phase, 
+export type ProgressEvent = { "kind": "phase_start", phase: Phase, ts_ms: number, label: string | null, items_total: number, bytes_total: number, } | { "kind": "totals", phase: Phase,
 /**
  * True when done counters intentionally start a new epoch (scan discovery → hashing).
  * False for a denominator refinement such as work discovered during apply.

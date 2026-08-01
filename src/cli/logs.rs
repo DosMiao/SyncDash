@@ -53,10 +53,20 @@ pub fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
                     r.elapsed_ms as f64 / 1000.0,
                 );
             }
-            println!("\n{} run(s) · logs at {}", rows.len(), runlog::logs_dir().display());
+            println!(
+                "\n{} run(s) · logs at {}",
+                rows.len(),
+                runlog::logs_dir().display()
+            );
             Ok(0)
         }
-        LogsCmd::Show { run_id, errors, items, plan, limit } => {
+        LogsCmd::Show {
+            run_id,
+            errors,
+            items,
+            plan,
+            limit,
+        } => {
             let which = if errors {
                 "errors"
             } else if items {
@@ -68,7 +78,9 @@ pub fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
             };
             let lines = runlog::artifact_lines(&run_id, which, limit);
             if lines.is_empty() {
-                eprintln!("no {which} lines for run '{run_id}' (wrong id, or that artifact is empty)");
+                eprintln!(
+                    "no {which} lines for run '{run_id}' (wrong id, or that artifact is empty)"
+                );
                 return Ok(1);
             }
             for l in lines {
@@ -76,7 +88,10 @@ pub fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        LogsCmd::Prune { keep_days, max_total_mb } => {
+        LogsCmd::Prune {
+            keep_days,
+            max_total_mb,
+        } => {
             let cfg = syncdash::store::settings::load();
             let days = keep_days.unwrap_or(cfg.keep_days);
             let cap = max_total_mb.unwrap_or(cfg.max_total_mb);
@@ -86,7 +101,10 @@ pub fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
         }
         LogsCmd::Dir => {
             println!("{}", runlog::logs_dir().display());
-            println!("settings: {}", syncdash::store::settings::settings_path().display());
+            println!(
+                "settings: {}",
+                syncdash::store::settings::settings_path().display()
+            );
             Ok(0)
         }
     }

@@ -10,9 +10,9 @@
 use crate::model::plan::{Action, Op, Plan, PlanHeader, Side};
 // The real path-safety check and the `rel → native separator` conversion both live in `foundation::path`.
 // This file used to carry its own copy of each (`rel_is_safe`/`to_native`), verbatim duplicates of those.
-use crate::model::chunk::RecipeStep;
 use crate::foundation::path::{is_safe_rel, to_native};
 use crate::foundation::time::now_ms;
+use crate::model::chunk::RecipeStep;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -118,7 +118,12 @@ pub struct PackSummary {
 
 /// Pack the target-side ops of a plan. Payload is read from source_root.
 /// remote_chunks: FastCDC chunk tables for the large files the remote already has (when present, Updates ≥4MB go delta).
-pub fn pack(plan: &Plan, source_root: &Path, out: &Path, remote_chunks: Option<&std::collections::HashMap<String, crate::model::chunk::FileChunks>>) -> std::io::Result<PackSummary> {
+pub fn pack(
+    plan: &Plan,
+    source_root: &Path,
+    out: &Path,
+    remote_chunks: Option<&std::collections::HashMap<String, crate::model::chunk::FileChunks>>,
+) -> std::io::Result<PackSummary> {
     let target_ops: Vec<Op> = plan
         .ops
         .iter()
@@ -131,19 +136,32 @@ pub fn pack(plan: &Plan, source_root: &Path, out: &Path, remote_chunks: Option<&
     }
     for op in &target_ops {
         if !is_safe_rel(&op.path) || op.from.as_deref().map(|f| !is_safe_rel(f)).unwrap_or(false) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("unsafe path in plan: {}", op.path)));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsafe path in plan: {}", op.path),
+            ));
         }
     }
 
     // Sub-plan: same header, target-side ops only
-    let sub = Plan { header: PlanHeader { op_count: target_ops.len() as u64, ..plan.header.clone() }, ops: target_ops.clone() };
+    let sub = Plan {
+        header: PlanHeader {
+            op_count: target_ops.len() as u64,
+            ..plan.header.clone()
+        },
+        ops: target_ops.clone(),
+    };
     let mut plan_bytes: Vec<u8> = Vec::new();
     sub.write_to(&mut plan_bytes)?;
     let plan_hash = blake3::hash(&plan_bytes).to_hex().to_string();
 
     let f = std::fs::File::create(out)?;
     let mut tarb = tar::Builder::new(std::io::BufWriter::new(f));
-    tarb.append_data(&mut tar_header(plan_bytes.len() as u64), "plan.jsonl", &plan_bytes[..])?;
+    tarb.append_data(
+        &mut tar_header(plan_bytes.len() as u64),
+        "plan.jsonl",
+        &plan_bytes[..],
+    )?;
 
     // payload: the content behind Copy/Update, deduplicated; large files that hit remote_chunks go through FastCDC delta
     let mut seen = std::collections::HashSet::new();
@@ -174,29 +192,46 @@ pub fn pack(plan: &Plan, source_root: &Path, out: &Path, remote_chunks: Option<&
         #[cfg(not(unix))]
         let mode: Option<u32> = None;
 
-        let base = remote_chunks.and_then(|m| m.get(&op.path)).filter(|_| size >= crate::model::chunk::DELTA_MIN_SIZE);
+        let base = remote_chunks
+            .and_then(|m| m.get(&op.path))
+            .filter(|_| size >= crate::model::chunk::DELTA_MIN_SIZE);
         if let Some(base) = base {
             // Delta: chunk the new local file, align it against the remote chunk table by hash, pack only the missing chunks
             let data = std::fs::read(&src)?;
             let hash = blake3::hash(&data).to_hex().to_string();
             let local_chunks = crate::model::chunk::chunk_bytes(&data);
-            let mut base_by_hash: std::collections::HashMap<&str, (u64, u32)> = std::collections::HashMap::new();
+            let mut base_by_hash: std::collections::HashMap<&str, (u64, u32)> =
+                std::collections::HashMap::new();
             for c in &base.chunks {
-                base_by_hash.entry(c.hash.as_str()).or_insert((c.off, c.len));
+                base_by_hash
+                    .entry(c.hash.as_str())
+                    .or_insert((c.off, c.len));
             }
             let mut blob: Vec<u8> = Vec::new();
             let mut recipe: Vec<RecipeStep> = Vec::new();
             for c in &local_chunks {
                 if let Some(&(boff, blen)) = base_by_hash.get(c.hash.as_str()) {
-                    recipe.push(RecipeStep { s: "base".into(), off: boff, len: blen });
+                    recipe.push(RecipeStep {
+                        s: "base".into(),
+                        off: boff,
+                        len: blen,
+                    });
                 } else {
                     let off = blob.len() as u64;
                     blob.extend_from_slice(&data[c.off as usize..(c.off + c.len as u64) as usize]);
-                    recipe.push(RecipeStep { s: "blob".into(), off, len: c.len });
+                    recipe.push(RecipeStep {
+                        s: "blob".into(),
+                        off,
+                        len: c.len,
+                    });
                 }
             }
             let blob_hash = blake3::hash(&blob).to_hex().to_string();
-            tarb.append_data(&mut tar_header(blob.len() as u64), format!("payload/{}", op.path), &blob[..])?;
+            tarb.append_data(
+                &mut tar_header(blob.len() as u64),
+                format!("payload/{}", op.path),
+                &blob[..],
+            )?;
             bytes_total += blob.len() as u64;
             delta_saved += size.saturating_sub(blob.len() as u64);
             payload.push(PayloadEntry {
@@ -212,11 +247,28 @@ pub fn pack(plan: &Plan, source_root: &Path, out: &Path, remote_chunks: Option<&
             });
         } else {
             let file = std::fs::File::open(&src)?;
-            let mut hr = HashingReader { inner: std::io::BufReader::new(file), hasher: blake3::Hasher::new() };
-            tarb.append_data(&mut tar_header(size), format!("payload/{}", op.path), &mut hr)?;
+            let mut hr = HashingReader {
+                inner: std::io::BufReader::new(file),
+                hasher: blake3::Hasher::new(),
+            };
+            tarb.append_data(
+                &mut tar_header(size),
+                format!("payload/{}", op.path),
+                &mut hr,
+            )?;
             let hash = hr.hasher.finalize().to_hex().to_string();
             bytes_total += size;
-            payload.push(PayloadEntry { rel: op.path.clone(), size, mtime_ms, hash, mode, kind: "whole".into(), base_hash: None, blob_hash: None, recipe: None });
+            payload.push(PayloadEntry {
+                rel: op.path.clone(),
+                size,
+                mtime_ms,
+                hash,
+                mode,
+                kind: "whole".into(),
+                base_hash: None,
+                blob_hash: None,
+                recipe: None,
+            });
         }
     }
 
@@ -237,10 +289,19 @@ pub fn pack(plan: &Plan, source_root: &Path, out: &Path, remote_chunks: Option<&
         payload_combined_blake3: comb.finalize().to_hex().to_string(),
     };
     let mani_bytes = serde_json::to_vec_pretty(&manifest)?;
-    tarb.append_data(&mut tar_header(mani_bytes.len() as u64), "manifest.json", &mani_bytes[..])?;
+    tarb.append_data(
+        &mut tar_header(mani_bytes.len() as u64),
+        "manifest.json",
+        &mani_bytes[..],
+    )?;
     tarb.into_inner()?.flush()?;
 
-    Ok(PackSummary { ops: manifest.op_count, files: manifest.payload.len() as u64, bytes: bytes_total, delta_saved })
+    Ok(PackSummary {
+        ops: manifest.op_count,
+        files: manifest.payload.len() as u64,
+        bytes: bytes_total,
+        delta_saved,
+    })
 }
 
 /// Execute a package on the far end. dry_run=true only verifies and lists. Returns (done, skipped, errors).
@@ -268,13 +329,23 @@ pub fn apply_pack(
                 let mut v = Vec::new();
                 entry.read_to_end(&mut v)?;
                 manifest = Some(serde_json::from_slice(&v).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad manifest: {e}"))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("bad manifest: {e}"),
+                    )
                 })?);
             }
         }
     }
-    let plan_bytes = plan_bytes.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "package has no plan.jsonl"))?;
-    let manifest = manifest.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "package has no manifest.json"))?;
+    let plan_bytes = plan_bytes.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "package has no plan.jsonl")
+    })?;
+    let manifest = manifest.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "package has no manifest.json",
+        )
+    })?;
 
     // Plan integrity + version
     if manifest.pack_version > PACK_VERSION {
@@ -282,7 +353,13 @@ pub fn apply_pack(
     }
     let got = blake3::hash(&plan_bytes).to_hex().to_string();
     if got != manifest.plan_blake3 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("plan hash mismatch: manifest {} vs actual {got}", manifest.plan_blake3)));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "plan hash mismatch: manifest {} vs actual {got}",
+                manifest.plan_blake3
+            ),
+        ));
     }
 
     // Parse the plan straight from the bytes we just verified. It used to go out to a temp file
@@ -292,7 +369,10 @@ pub fn apply_pack(
 
     for op in &plan.ops {
         if !is_safe_rel(&op.path) || op.from.as_deref().map(|f| !is_safe_rel(f)).unwrap_or(false) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("unsafe path in package plan: {}", op.path)));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsafe path in package plan: {}", op.path),
+            ));
         }
     }
 
@@ -318,12 +398,19 @@ pub fn apply_pack(
     }
 
     if !target_root.is_dir() {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("target root not accessible: {}", target_root.display())));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("target root not accessible: {}", target_root.display()),
+        ));
     }
 
     // pass 2: extract payload into staging, verifying each file's hash
     let staging = create_staging_dir()?;
-    let by_rel: std::collections::HashMap<&str, &PayloadEntry> = manifest.payload.iter().map(|p| (p.rel.as_str(), p)).collect();
+    let by_rel: std::collections::HashMap<&str, &PayloadEntry> = manifest
+        .payload
+        .iter()
+        .map(|p| (p.rel.as_str(), p))
+        .collect();
     let mut extract_errors = 0u64;
     {
         let f = std::fs::File::open(pkg)?;
@@ -331,7 +418,9 @@ pub fn apply_pack(
         for entry in ar.entries()? {
             let mut entry = entry?;
             let name = entry.path()?.to_string_lossy().into_owned();
-            let Some(rel) = name.strip_prefix("payload/") else { continue };
+            let Some(rel) = name.strip_prefix("payload/") else {
+                continue;
+            };
             let rel = rel.to_string();
             if !is_safe_rel(&rel) {
                 extract_errors += 1;
@@ -382,7 +471,10 @@ pub fn apply_pack(
                 let base_hex = bh.finalize().to_hex().to_string();
                 if meta.base_hash.as_deref() != Some(base_hex.as_str()) {
                     extract_errors += 1;
-                    crate::log_error!("pack", "ERR  delta base changed since chunk table: {rel} — rerun to repack");
+                    crate::log_error!(
+                        "pack",
+                        "ERR  delta base changed since chunk table: {rel} — rerun to repack"
+                    );
                     continue;
                 }
                 let mut out = std::fs::File::create(&dst)?;
@@ -423,7 +515,11 @@ pub fn apply_pack(
                     crate::log_error!("pack", "ERR  delta reconstruction failed: {rel}");
                     let _ = std::fs::remove_file(&dst);
                 } else if verbose {
-                    println!("OK   delta reconstructed: {rel} (blob {} B of {} B)", blob.len(), meta.size);
+                    println!(
+                        "OK   delta reconstructed: {rel} (blob {} B of {} B)",
+                        blob.len(),
+                        meta.size
+                    );
                 }
             } else {
                 let mut out = std::fs::File::create(&dst)?;
@@ -444,7 +540,11 @@ pub fn apply_pack(
                     }
                 } else {
                     extract_errors += 1;
-                    crate::log_error!("pack", "ERR  payload hash mismatch: {rel} (manifest {} vs {got})", meta.hash);
+                    crate::log_error!(
+                        "pack",
+                        "ERR  payload hash mismatch: {rel} (manifest {} vs {got})",
+                        meta.hash
+                    );
                     let _ = std::fs::remove_file(&dst);
                 }
             }
@@ -452,7 +552,10 @@ pub fn apply_pack(
     }
     if extract_errors > 0 {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{extract_errors} payload file(s) failed verification — nothing applied")));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{extract_errors} payload file(s) failed verification — nothing applied"),
+        ));
     }
 
     // execute: reuse apply (lock, trash directory, post-copy verification)
@@ -470,7 +573,13 @@ pub fn apply_pack(
         &ops,
         &staging,
         &target_root,
-        &crate::pipeline::apply::ApplyOptions { dry_run: false, verbose, verify: true, versioning, ..Default::default() },
+        &crate::pipeline::apply::ApplyOptions {
+            dry_run: false,
+            verbose,
+            verify: true,
+            versioning,
+            ..Default::default()
+        },
     );
 
     // unix: restore the exec and other permission bits (the one attribute lost along the SMB/pack route)
@@ -481,7 +590,10 @@ pub fn apply_pack(
             if matches!(op.action, Action::Copy | Action::Update) {
                 if let Some(p) = by_rel.get(op.path.as_str()) {
                     if let Some(mode) = p.mode {
-                        let _ = std::fs::set_permissions(target_root.join(to_native(&op.path)), std::fs::Permissions::from_mode(mode));
+                        let _ = std::fs::set_permissions(
+                            target_root.join(to_native(&op.path)),
+                            std::fs::Permissions::from_mode(mode),
+                        );
                     }
                 }
             }

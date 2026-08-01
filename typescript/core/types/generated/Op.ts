@@ -2,15 +2,15 @@
 import type { Action } from "./Action";
 import type { Side } from "./Side";
 
-export type Op = { side: Side, action: Action, path: string, from?: string | null, size?: number | null, mtime_ms?: number | null, 
+export type Op = { side: Side, action: Action, path: string, from?: string | null, size?: number | null, mtime_ms?: number | null,
 /**
  * Expected hash of the copied/updated content (used by paranoid mode to verify after copying)
  */
-hash?: string | null, 
+hash?: string | null,
 /**
  * Some = this is a symlink op, the value is the link target (apply creates a link instead of copying content)
  */
-link?: string | null, 
+link?: string | null,
 /**
  * Target unix permission bits. Chmod uses it as the value to write; when Copy/Update carries it, it is written back right after the copy
  */

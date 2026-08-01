@@ -83,9 +83,9 @@ pub(super) fn win_invalid_reason(rel: &str) -> Option<String> {
     // COM0/LPT0 are absent from the Microsoft list but Explorer treats them as reserved too
     // (syncthing carries the same two extras, with the same note).
     const RESERVED: [&str; 24] = [
-        "CON", "PRN", "AUX", "NUL",
-        "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-        "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
+        "LPT9",
     ];
     for seg in rel.split('/') {
         if seg.is_empty() {
@@ -101,8 +101,13 @@ pub(super) fn win_invalid_reason(rel: &str) -> Option<String> {
                 "mangled: '{seg}' would be written into an alternate data stream — the write reports success, but the name disappears from the directory"
             ));
         }
-        if let Some(c) = seg.chars().find(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*' | '\\') || (*c as u32) < 0x20) {
-            return Some(format!("rejected: Windows refuses the character {c:?} in '{seg}'"));
+        if let Some(c) = seg
+            .chars()
+            .find(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*' | '\\') || (*c as u32) < 0x20)
+        {
+            return Some(format!(
+                "rejected: Windows refuses the character {c:?} in '{seg}'"
+            ));
         }
         let base = seg.split('.').next().unwrap_or("").to_ascii_uppercase();
         if RESERVED.contains(&base.as_str()) {

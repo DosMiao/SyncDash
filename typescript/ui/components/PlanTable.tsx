@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, ChevronUp, Folder, FolderOpen } from 'lucide-react';
 import { baseOf, dirOf, fmtTime, fullPath, humanSize } from '../../core/format';
 import { treeDirOf } from '../../core/grouping';
@@ -97,7 +97,7 @@ const COLS: ColDef[] = [
   {
     id: 'action', cls: 'c-act',
     w: { full: 124, noreason: 124, notime: 124, nosize: 124 },
-    headTitle: "Sort by action. Click a row's action to reverse its direction; click again to restore.",
+    headTitle: "Sort by action. Activate a row's action to reverse its direction; activate it again to restore.",
   },
   {
     id: 't.path', cls: 'c-path c-path-t',
@@ -145,23 +145,30 @@ function useWrapWidth(wrap: HTMLElement | null): number {
 
 /// A clickable header. Declared at module scope, not inside PlanTable: a component defined in a
 /// render body is a *new type* on every render, so React unmounts and rebuilds every one of these
-/// spans — and this table re-renders on every scroll frame.
+/// controls — and this table re-renders on every scroll frame.
 function SortHead({ k, sort, onSort }: { k: SortKey; sort: Sort | null; onSort: (k: SortKey) => void }) {
   const on = sort?.key === k;
+  const state = on ? `, currently ${sort.dir === 1 ? 'ascending' : 'descending'}` : '';
   return (
-    <span className={'sortable' + (on ? ' on' : '')} onClick={() => onSort(k)}>
+    <button
+      type="button"
+      className={'sortable' + (on ? ' on' : '')}
+      aria-pressed={on}
+      aria-label={`Sort by ${COL_HEAD[k]}${state}`}
+      onClick={() => onSort(k)}
+    >
       {COL_HEAD[k]}
       {on && (
         <span className="sortmark">
           {sort.dir === 1 ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
         </span>
       )}
-    </span>
+    </button>
   );
 }
 
 /// indeterminate is a DOM property with no HTML attribute, so it can only be set through a ref
-function TriCheckbox(props: { checked: boolean; indeterminate?: boolean; disabled?: boolean; title?: string; onChange: (v: boolean) => void; stopClick?: boolean }) {
+function TriCheckbox(props: { checked: boolean; indeterminate?: boolean; disabled?: boolean; title?: string; ariaLabel: string; onChange: (v: boolean) => void; stopClick?: boolean }) {
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => { if (ref.current) ref.current.indeterminate = !!props.indeterminate; });
   return (
@@ -171,6 +178,7 @@ function TriCheckbox(props: { checked: boolean; indeterminate?: boolean; disable
       checked={props.checked}
       disabled={props.disabled}
       title={props.title}
+      aria-label={props.ariaLabel}
       onClick={props.stopClick ? (e) => e.stopPropagation() : undefined}
       onChange={(e) => props.onChange(e.target.checked)}
     />
@@ -204,6 +212,7 @@ export function PlanTable(props: Props) {
 
   const theadRef = useRef<HTMLTableSectionElement>(null);
   const bodyRef = useRef<HTMLTableSectionElement>(null);
+  const gridLabelId = useId();
 
   useEffect(() => { if (wrap) wrap.scrollTop = 0; }, [resetKey, wrap]);
 
@@ -235,6 +244,10 @@ export function PlanTable(props: Props) {
     () => selectableVisible.length > 0 && selectableVisible.every((i) => checked[i]),
     [selectableVisible, checked],
   );
+  const someChecked = useMemo(
+    () => selectableVisible.some((i) => checked[i]),
+    [selectableVisible, checked],
+  );
 
   // A folder row needs the checked count of an arbitrary subtree. Prefixing the one DFS order once
   // makes that O(1) per visible folder, instead of repeatedly scanning a 100k-file parent on every
@@ -257,7 +270,7 @@ export function PlanTable(props: Props) {
     (shown.has(`${side}.mtime`) ? `${side}.mtime` : shown.has(`${side}.size`) ? `${side}.size` : `${side}.path`);
 
   const rows = (
-    <tbody ref={bodyRef}>
+    <tbody ref={bodyRef} role="rowgroup">
         {rowPlan.slice(win.from, win.to).map((spec, k) => {
           // Zebra striping keys off the real row index, not :nth-child — otherwise the stripes flip as
           // the window scrolls
@@ -279,19 +292,28 @@ export function PlanTable(props: Props) {
               onToggleMany(members, value);
             };
             return (
-              <tr key={`f:${spec.dir}`} className="grp" style={treeStyle}>
-                <td className="c-chk">
+              <tr key={`f:${spec.dir}`} className="grp" style={treeStyle} role="row" aria-rowindex={win.from + k + 2}>
+                <td className="c-chk" role="gridcell" aria-colindex={1}>
                   <TriCheckbox
                     checked={spec.selectable > 0 && nChecked === spec.selectable}
                     indeterminate={nChecked > 0 && nChecked < spec.selectable}
                     disabled={spec.selectable === 0}
+                    ariaLabel={isRoot
+                      ? 'Select visible root-level items'
+                      : `Select visible items in folder ${spec.dir}`}
                     title={isRoot
                       ? 'Check / uncheck visible root-level items'
                       : 'Check / uncheck visible items in this folder and its subfolders'}
                     onChange={toggleFolder}
                   />
                 </td>
-                <td colSpan={nCols - 1} title={`${plan.header.source_root}\n${plan.header.target_root}\n… ${spec.dir || '(root)'}`}>
+                <td
+                  role="gridcell"
+                  aria-colindex={2}
+                  aria-colspan={nCols - 1}
+                  colSpan={nCols - 1}
+                  title={`${plan.header.source_root}\n${plan.header.target_root}\n… ${spec.dir || '(root)'}`}
+                >
                   <button
                     type="button"
                     className="gtree"
@@ -347,7 +369,12 @@ export function PlanTable(props: Props) {
           const cells: Record<ColId, Cell> = {
             chk: {
               children: (
-                <TriCheckbox checked={checked[i]} disabled={!selectable(op)} onChange={(v) => onToggleRow(i, v)} />
+                <TriCheckbox
+                  checked={checked[i]}
+                  disabled={!selectable(op)}
+                  ariaLabel={`${checked[i] ? 'Exclude' : 'Include'} ${op.path} in synchronization`}
+                  onChange={(v) => onToggleRow(i, v)}
+                />
               ),
             },
             's.path': pathCell(sp, plan.header.source_root, m.src, 's'),
@@ -357,21 +384,32 @@ export function PlanTable(props: Props) {
               // With the reason column folded away, the action cell's tooltip carries the reason
               title: [
                 shown.has('reason') ? '' : op.reason,
-                flippable ? 'Click to reverse the direction (click again to restore)' : '',
+                flippable ? 'Activate to reverse the direction (activate again to restore)' : '',
               ].filter(Boolean).join('\n') || undefined,
               children: (
-                <span
-                  className={`act k-${act.kind}${flippable ? ' flippable' : ''}`}
-                  onClick={flippable ? () => onFlip(i) : undefined}
+                flippable ? (
+                <button
+                  type="button"
+                  className={`act k-${act.kind} flippable`}
+                  aria-pressed={flipped[i]}
+                  aria-label={`${flipped[i] ? 'Restore' : 'Reverse'} direction for ${op.path}: ${act.label}`}
+                  onClick={() => onFlip(i)}
                 >
                   {/* Both glyph slots are always rendered at a fixed width: a conflict has no
                       direction, and without a reserved slot its label would start 16px to the left
                       of every other row's — the arrow is the glyph you scan down this column, so its
                       x has to be the same on every row. */}
-                  <span className="act-dir">{act.dir ? DIR_ICON[act.dir] : null}</span>
-                  <span className="act-mark">{MARK[act.kind]}</span>
+                  <span className="act-dir" aria-hidden="true">{act.dir ? DIR_ICON[act.dir] : null}</span>
+                  <span className="act-mark" aria-hidden="true">{MARK[act.kind]}</span>
                   <span className="act-label">{act.label}</span>
-                </span>
+                </button>
+                ) : (
+                  <span className={`act k-${act.kind}`}>
+                    <span className="act-dir" aria-hidden="true">{act.dir ? DIR_ICON[act.dir] : null}</span>
+                    <span className="act-mark" aria-hidden="true">{MARK[act.kind]}</span>
+                    <span className="act-label">{act.label}</span>
+                  </span>
+                )
               ),
             },
             't.path': pathCell(tp, plan.header.target_root, m.dst, 't'),
@@ -386,12 +424,32 @@ export function PlanTable(props: Props) {
               className={[!checked[i] && 'off', flipped[i] && 'flip', groupDir !== null && 'ingrp', alt && 'alt']
                 .filter(Boolean).join(' ')}
               style={groupDir === null ? undefined : ({ '--tree-depth': treeDepth } as CSSProperties)}
-              onContextMenu={(e) => { e.preventDefault(); onContextRow(i, e.clientX, e.clientY); }}
+              role="row"
+              aria-rowindex={win.from + k + 2}
+              aria-selected={checked[i]}
+              tabIndex={0}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.currentTarget.focus();
+                onContextRow(i, e.clientX, e.clientY);
+              }}
+              onKeyDown={(e) => {
+                if (e.key !== 'ContextMenu' && !(e.shiftKey && e.key === 'F10')) return;
+                e.preventDefault();
+                const rect = e.currentTarget.getBoundingClientRect();
+                onContextRow(i, rect.left + 24, rect.top + rect.height / 2);
+              }}
             >
-              {cols.map((c) => {
+              {cols.map((c, columnIndex) => {
                 const cell = cells[c.id];
                 return (
-                  <td key={c.id} className={cell.cls ? `${c.cls} ${cell.cls}` : c.cls} title={cell.title}>
+                  <td
+                    key={c.id}
+                    className={cell.cls ? `${c.cls} ${cell.cls}` : c.cls}
+                    title={cell.title}
+                    role="gridcell"
+                    aria-colindex={columnIndex + 1}
+                  >
                     {cell.children}
                   </td>
                 );
@@ -408,17 +466,36 @@ export function PlanTable(props: Props) {
   return (
     <div
       className="vtable-canvas"
+      role="grid"
+      aria-labelledby={gridLabelId}
+      aria-rowcount={rowPlan.length + 1}
+      aria-colcount={nCols}
+      aria-multiselectable="true"
       style={{ minWidth: tableMinWidth, height: win.canvasHeight }}
     >
-      <table className="plantable vtable-head">
+      <span id={gridLabelId} className="sr-only">Synchronization plan</span>
+      <table className="plantable vtable-head" role="presentation">
         {colGroup()}
-        <thead ref={theadRef}>
-          <tr>
-            {cols.map((c) => (
-              <th key={c.id} className={c.cls} title={c.headTitle}>
+        <thead ref={theadRef} role="rowgroup">
+          <tr role="row" aria-rowindex={1}>
+            {cols.map((c, columnIndex) => {
+              const ownedKeys = c.id === 'chk' ? [] : [c.id, ...(c.adopts?.[mode] ?? [])];
+              const ownsSort = !!sort && ownedKeys.includes(sort.key);
+              return (
+              <th
+                key={c.id}
+                className={c.cls}
+                title={c.headTitle}
+                scope="col"
+                role="columnheader"
+                aria-colindex={columnIndex + 1}
+                aria-sort={ownsSort ? (sort!.dir === 1 ? 'ascending' : 'descending') : undefined}
+              >
                 {c.id === 'chk' ? (
                   <TriCheckbox
                     checked={allChecked}
+                    indeterminate={someChecked && !allChecked}
+                    ariaLabel="Select all selectable rows in the current view"
                     title="Select all / none (current view)"
                     onChange={(v) => onToggleMany(selectableVisible, v)}
                   />
@@ -431,12 +508,14 @@ export function PlanTable(props: Props) {
                   </>
                 )}
               </th>
-            ))}
+              );
+            })}
           </tr>
         </thead>
       </table>
       <table
         className="plantable vtable-body"
+        role="presentation"
         style={{ transform: `translate3d(0, ${win.bodyTop}px, 0)` }}
       >
         {colGroup()}

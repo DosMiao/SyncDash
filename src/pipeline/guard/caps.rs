@@ -22,7 +22,7 @@ pub enum CapSeverity {
     Info,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CapItem {
     /// The job feature concerned ("evidence=sampled", "mtime window", …)
     pub feature: String,
@@ -39,24 +39,123 @@ pub struct CapItem {
 
 impl CapItem {
     pub fn render(&self) -> String {
-        format!("[{}] {}: wanted {}, backend has {} — {}", self.side, self.feature, self.requested, self.actual, self.effect)
+        format!(
+            "[{}] {}: wanted {}, backend has {} — {}",
+            self.side, self.feature, self.requested, self.actual, self.effect
+        )
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CapReport {
     pub items: Vec<CapItem>,
 }
 
 impl CapReport {
     pub fn blockers(&self) -> Vec<&CapItem> {
-        self.items.iter().filter(|i| i.severity == CapSeverity::Block).collect()
+        self.items
+            .iter()
+            .filter(|i| i.severity == CapSeverity::Block)
+            .collect()
     }
     pub fn needs_ack(&self) -> Vec<&CapItem> {
-        self.items.iter().filter(|i| i.severity == CapSeverity::NeedsAck).collect()
+        self.items
+            .iter()
+            .filter(|i| i.severity == CapSeverity::NeedsAck)
+            .collect()
     }
     pub fn infos(&self) -> Vec<&CapItem> {
-        self.items.iter().filter(|i| i.severity == CapSeverity::Info).collect()
+        self.items
+            .iter()
+            .filter(|i| i.severity == CapSeverity::Info)
+            .collect()
+    }
+
+    /// A stable, domain-separated identity for exactly the consent-requiring capability facts.
+    /// Item insertion order is deliberately irrelevant: adding a backend probe must not invalidate
+    /// an otherwise identical grant merely because two independent checks ran in another order.
+    pub fn consent_digest(&self, scope: CapabilityScope) -> String {
+        let mut items = self.needs_ack();
+        items.sort_by(|left, right| {
+            (
+                left.side.as_str(),
+                left.feature.as_str(),
+                left.requested.as_str(),
+                left.actual.as_str(),
+                left.effect.as_str(),
+            )
+                .cmp(&(
+                    right.side.as_str(),
+                    right.feature.as_str(),
+                    right.requested.as_str(),
+                    right.actual.as_str(),
+                    right.effect.as_str(),
+                ))
+        });
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"syncdash-capability-consent-v1\0");
+        hash_field(&mut hasher, scope.as_str().as_bytes());
+        for item in items {
+            hash_field(&mut hasher, item.side.as_bytes());
+            hash_field(&mut hasher, item.feature.as_bytes());
+            hash_field(&mut hasher, item.requested.as_bytes());
+            hash_field(&mut hasher, item.actual.as_bytes());
+            hash_field(&mut hasher, item.effect.as_bytes());
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    pub fn consent_satisfied(&self, scope: CapabilityScope, consent: &CapabilityConsent) -> bool {
+        self.needs_ack().is_empty()
+            || match consent {
+                CapabilityConsent::None => false,
+                CapabilityConsent::ExactDigest(digest) => digest == &self.consent_digest(scope),
+                CapabilityConsent::ExplicitCli => true,
+            }
+    }
+}
+
+fn hash_field(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityScope {
+    CompareRead,
+    ApplyWrite,
+}
+
+impl CapabilityScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CompareRead => "compare_read",
+            Self::ApplyWrite => "apply_write",
+        }
+    }
+}
+
+/// Capability consent is explicit about its authority boundary.
+///
+/// The CLI flag remains intentionally broad for that one foreground invocation. Desktop review
+/// uses only `ExactDigest`; a boolean from a webview can never accept a report that changed after
+/// it was displayed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum CapabilityConsent {
+    #[default]
+    None,
+    ExactDigest(String),
+    ExplicitCli,
+}
+
+impl CapabilityConsent {
+    pub fn explicit_cli(accepted: bool) -> Self {
+        if accepted {
+            Self::ExplicitCli
+        } else {
+            Self::None
+        }
     }
 }
 
@@ -94,7 +193,9 @@ pub fn cap_report_read(
                 severity: CapSeverity::Block,
                 requested: "symlinks recorded in the table".into(),
                 actual: "backend cannot represent symlinks".into(),
-                effect: "the table would silently omit every link — refusing to produce a false picture".into(),
+                effect:
+                    "the table would silently omit every link — refusing to produce a false picture"
+                        .into(),
             });
         }
     }
@@ -152,7 +253,8 @@ pub fn cap_report_read(
                     severity: CapSeverity::Info,
                     requested: "free-space gate before writing".into(),
                     actual: "backend cannot report free space".into(),
-                    effect: "the space gate is inert on this side — writes proceed without it".into(),
+                    effect: "the space gate is inert on this side — writes proceed without it"
+                        .into(),
                 });
             }
         }
@@ -303,9 +405,74 @@ pub fn cap_report_write(
             severity: CapSeverity::NeedsAck,
             requested: "chunk-wise delta updates".into(),
             actual: "a root lives on a remote backend".into(),
-            effect: "delta is disabled this run — updates rewrite files in full over the link".into(),
+            effect: "delta is disabled this run — updates rewrite files in full over the link"
+                .into(),
         });
     }
 
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(feature: &str, side: &str, actual: &str) -> CapItem {
+        CapItem {
+            feature: feature.into(),
+            side: side.into(),
+            severity: CapSeverity::NeedsAck,
+            requested: "requested".into(),
+            actual: actual.into(),
+            effect: "effect".into(),
+        }
+    }
+
+    #[test]
+    fn consent_digest_is_order_independent_but_field_and_scope_exact() {
+        let left = CapReport {
+            items: vec![
+                item("fsync", "target", "no"),
+                item("trash", "source", "remote"),
+            ],
+        };
+        let right = CapReport {
+            items: vec![
+                item("trash", "source", "remote"),
+                item("fsync", "target", "no"),
+            ],
+        };
+        let digest = left.consent_digest(CapabilityScope::ApplyWrite);
+        assert_eq!(digest, right.consent_digest(CapabilityScope::ApplyWrite));
+        assert_ne!(digest, left.consent_digest(CapabilityScope::CompareRead));
+
+        let mut changed = right;
+        changed.items[0].effect.push_str(" changed");
+        assert_ne!(digest, changed.consent_digest(CapabilityScope::ApplyWrite));
+    }
+
+    #[test]
+    fn exact_consent_accepts_only_the_report_and_scope_that_was_reviewed() {
+        let report = CapReport {
+            items: vec![item("fsync", "target", "no")],
+        };
+        let consent =
+            CapabilityConsent::ExactDigest(report.consent_digest(CapabilityScope::ApplyWrite));
+        assert!(report.consent_satisfied(CapabilityScope::ApplyWrite, &consent));
+        assert!(!report.consent_satisfied(CapabilityScope::CompareRead, &consent));
+        assert!(!report.consent_satisfied(CapabilityScope::ApplyWrite, &CapabilityConsent::None));
+        assert!(
+            report.consent_satisfied(CapabilityScope::ApplyWrite, &CapabilityConsent::ExplicitCli)
+        );
+    }
+
+    #[test]
+    fn no_consent_is_needed_when_the_report_has_only_information() {
+        let mut informational = item("space", "target", "unobservable");
+        informational.severity = CapSeverity::Info;
+        let report = CapReport {
+            items: vec![informational],
+        };
+        assert!(report.consent_satisfied(CapabilityScope::ApplyWrite, &CapabilityConsent::None));
+    }
 }

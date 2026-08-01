@@ -10,7 +10,11 @@ use unicode_normalization::UnicodeNormalization;
 /// always write the original string to disk, or you create a renamed file on the far side.
 pub fn norm_key(p: &str, case_insensitive: bool) -> String {
     let nfc: String = p.nfc().collect();
-    if case_insensitive { nfc.to_uppercase() } else { nfc }
+    if case_insensitive {
+        nfc.to_uppercase()
+    } else {
+        nfc
+    }
 }
 
 /// Folding for the case-insensitive case (equivalent to `norm_key(p, true)`).
@@ -21,7 +25,13 @@ pub fn fold(p: &str) -> String {
 /// Hostname → a form safe inside a filename (anything that is not alphanumeric or `-` becomes `-`).
 pub fn safe_host(host: &str) -> String {
     host.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -37,7 +47,10 @@ mod tests {
     fn nfd_and_nfc_spellings_fold_together() {
         // This is the heart of the divergence: without NFC the two strings are unequal,
         // so filter fails to recognize the very file compare recognizes
-        assert_ne!(NFC_E, NFD_E, "premise: the two spellings really do differ byte-wise");
+        assert_ne!(
+            NFC_E, NFD_E,
+            "premise: the two spellings really do differ byte-wise"
+        );
         assert_eq!(norm_key(NFC_E, false), norm_key(NFD_E, false));
         assert_eq!(norm_key(NFC_E, true), norm_key(NFD_E, true));
     }

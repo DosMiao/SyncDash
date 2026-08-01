@@ -12,7 +12,7 @@ import { SchemaSection } from './SchemaSection';
 import { ConfirmDialog, Sheet } from './ui';
 import { useScrollSpy } from '../hooks/useScrollSpy';
 import type { FormValues } from '../../core/jobfields';
-import type { JobFull } from '../../core/ipc';
+import type { JobDeleteDto, JobFull, JobSaveDto } from '../../core/ipc';
 
 export interface EditorApi { setField: (key: string, value: string) => void }
 
@@ -30,9 +30,18 @@ interface Props {
   /// main screen's two roots, and unmounting clears it — which is the whole reason it is a callback ref.
   scopeRef: (el: HTMLElement | null) => void;
   apiRef: React.RefObject<EditorApi | null>;
+  busy: boolean;
   onClose: () => void;
-  onSaved: (name: string, job: JobFull) => void;
-  onDeleted: (name: string) => void;
+  onSaved: (
+    saved: JobSaveDto,
+    job: JobFull,
+    original: { jobId: string; name: string; configRevision: string } | null,
+  ) => void;
+  onDeleted: (deleted: JobDeleteDto) => void;
+  onMutationConflict: (
+    name: string,
+    original: { jobId: string; name: string; configRevision: string } | null,
+  ) => Promise<void>;
   onStatus: (msg: string, cls?: '' | 'err' | 'ok') => void;
 }
 
@@ -40,12 +49,21 @@ interface Props {
 /// every field ED_FIELDS does not surface rides back out from here on save. It is one state and not two
 /// so the two halves cannot drift apart or arrive separately — a save that found values but no base
 /// would have to bail out silently, and a silent no-op on the Save button is the worst kind of dead end.
-interface Loaded { base: JobFull; values: FormValues }
+interface Loaded {
+  base: JobFull;
+  values: FormValues;
+  originalName: string | null;
+  jobId: string | null;
+  configRevision: string | null;
+}
 
 interface SaveError { message: string; field?: string }
 
 export function JobEditor(props: Props) {
-  const { name, focusGroup, dropOn, scopeRef, apiRef, onClose, onSaved, onDeleted, onStatus } = props;
+  const {
+    name, focusGroup, dropOn, scopeRef, apiRef, busy, onClose, onSaved, onDeleted,
+    onMutationConflict, onStatus,
+  } = props;
   const [form, setForm] = useState<Loaded | null>(null);
   /// Set when the file on disk predates the current job schema, i.e. the exclude lines on screen were
   /// produced by the load-time migration and are not in the file yet
@@ -101,9 +119,20 @@ export function JobEditor(props: Props) {
     let live = true;
     const load = async () => {
       let j: JobFull;
+      let originalName: string | null = null;
+      let jobId: string | null = null;
+      let configRevision: string | null = null;
       try {
         // A new job's starting point is engine policy, so it comes from the engine
-        j = name ? await getJob(name) : await defaultJob();
+        if (name) {
+          const detail = await getJob(name);
+          j = detail.job;
+          originalName = detail.name;
+          jobId = detail.job_id;
+          configRevision = detail.config_revision;
+        } else {
+          j = await defaultJob();
+        }
       } catch (e) {
         onStatus(`Failed to read job: ${e}`, 'err');
         onClose();
@@ -112,7 +141,13 @@ export function JobEditor(props: Props) {
       if (!live) return;
       // The rigor detail knobs may be null in an older file (meaning "follow the preset"); the form
       // materializes all four and writes them explicitly on save
-      setForm({ base: j, values: jobToForm(applyRigorPresetDefaults(j), name ?? '') });
+      setForm({
+        base: j,
+        values: jobToForm(applyRigorPresetDefaults(j), originalName ?? ''),
+        originalName,
+        jobId,
+        configRevision,
+      });
       if (name) {
         jobFileSchema(name)
           .then((s) => { if (live && s.on_disk < s.current) setMigratedFrom(s.on_disk); })
@@ -160,7 +195,7 @@ export function JobEditor(props: Props) {
   };
 
   const save = async () => {
-    if (!form) return;
+    if (!form || busy) return;
     const c = formToJob(form.values, form.base);
     if ('error' in c) {
       setSaveError({ message: c.error, field: c.field });
@@ -181,10 +216,38 @@ export function JobEditor(props: Props) {
     setSaveError(null);
     setSaving(true);
     try {
-      await saveJob(c.name, c.job);
-      onSaved(c.name, c.job);
+      if (form.originalName && (!form.jobId || !form.configRevision)) {
+        throw new Error('The loaded job is missing registry identity or revision; close and reopen the editor');
+      }
+      const existing = form.originalName && form.jobId && form.configRevision
+        ? { originalName: form.originalName, expectedRevision: form.configRevision }
+        : undefined;
+      const saved = await saveJob(c.name, c.job, existing);
+      const persistedJob = { ...c.job, job_id: saved.job_id };
+      onSaved(
+        saved,
+        persistedJob,
+        form.originalName && form.jobId && form.configRevision
+          ? {
+              jobId: form.jobId,
+              name: form.originalName,
+              configRevision: form.configRevision,
+            }
+          : null,
+      );
     } catch (e) {
-      const message = `Save failed: ${e}`;
+      let message = `Save failed: ${e}`;
+      try {
+        await onMutationConflict(
+          form.originalName ?? c.name,
+          form.originalName && form.jobId && form.configRevision
+            ? { jobId: form.jobId, name: form.originalName, configRevision: form.configRevision }
+            : null,
+        );
+        message += ' · refreshed the job registry; the editor kept your draft and did not overwrite any file';
+      } catch (refreshError) {
+        message += ` · job-registry refresh failed: ${refreshError}`;
+      }
       setSaveError({ message });
       onStatus(message, 'err');
     } finally {
@@ -193,12 +256,23 @@ export function JobEditor(props: Props) {
   };
 
   const remove = async () => {
-    if (!name) return;
+    if (!form?.originalName || !form.jobId || !form.configRevision || busy) return;
     try {
-      await deleteJob(name);
-      onDeleted(name);
+      const deleted = await deleteJob(form.originalName, form.jobId, form.configRevision);
+      onDeleted(deleted);
     } catch (e) {
-      onStatus(`Delete failed: ${e}`, 'err');
+      let message = `Delete failed: ${e}`;
+      try {
+        await onMutationConflict(form.originalName, {
+          jobId: form.jobId,
+          name: form.originalName,
+          configRevision: form.configRevision,
+        });
+        message += ' · refreshed the job registry; no job file was deleted';
+      } catch (refreshError) {
+        message += ` · job-registry refresh failed: ${refreshError}`;
+      }
+      onStatus(message, 'err');
     }
   };
 
@@ -216,11 +290,12 @@ export function JobEditor(props: Props) {
       onClose={onClose}
       footer={
         <>
-          {name && <button className="btn danger" onClick={() => setAskDelete(true)}>Delete job</button>}
+          {name && <button className="btn danger" disabled={busy} onClick={() => setAskDelete(true)}>Delete job</button>}
           {name && (
             <button
               className="btn"
               title="Copy the schtasks command (run it yourself in an admin terminal; this app does not register system scheduled tasks for you)"
+              disabled={busy}
               onClick={() => {
                 navigator.clipboard?.writeText(schtasksCmd(name)).then(
                   () => onStatus('Scheduled-task command copied — run it in an elevated terminal (this app does not register system tasks for you)', 'ok'),
@@ -232,7 +307,7 @@ export function JobEditor(props: Props) {
           {saveError && <span className="ed-save-error" role="alert">{saveError.message}</span>}
           <span className="spacer" />
           <button className="btn" onClick={onClose}>Cancel (Esc)</button>
-          <button className="btn accent" disabled={!form || saving} onClick={save}>
+          <button className="btn accent" disabled={!form || saving || busy} onClick={save}>
             {saving ? 'Saving…' : 'Save'}
           </button>
         </>
@@ -302,7 +377,7 @@ export function JobEditor(props: Props) {
               '· Neither root is touched — no file on either side is read, moved or removed\n' +
               '· Past run logs and anything already in the trash are left alone'
             }
-            actions={[{ label: 'Delete the job file', danger: true, onConfirm: () => void remove() }]}
+            actions={[{ label: 'Delete the job file', danger: true, disabled: busy, onConfirm: () => void remove() }]}
             onCancel={() => setAskDelete(false)}
           />
         )}

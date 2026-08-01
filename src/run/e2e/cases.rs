@@ -409,7 +409,11 @@ pub const ALL: &[Case] = &[
         name: "the_sampling_floor_is_exact_to_the_byte",
         seeds: SAMPLING,
         source_edits: &[
-            super::corpus::Edit::Patch { path: "big/at-4mib.bin", at: BLIND_OFFSET, xor: 0xFF },
+            super::corpus::Edit::Patch {
+                path: "big/at-4mib.bin",
+                at: BLIND_OFFSET,
+                xor: 0xFF,
+            },
             super::corpus::Edit::Patch {
                 path: "big/at-4mib-minus1.bin",
                 at: BLIND_OFFSET,
@@ -443,8 +447,14 @@ pub const ALL: &[Case] = &[
     Case {
         name: "a_mode_only_change_is_a_chmod_not_a_copy",
         seeds: BASE,
-        source_edits: &[super::corpus::Edit::Chmod { path: "code/lib/core.rs", mode: 0o755 }],
-        target_edits: &[super::corpus::Edit::Chmod { path: "code/lib/core.rs", mode: 0o644 }],
+        source_edits: &[super::corpus::Edit::Chmod {
+            path: "code/lib/core.rs",
+            mode: 0o755,
+        }],
+        target_edits: &[super::corpus::Edit::Chmod {
+            path: "code/lib/core.rs",
+            mode: 0o644,
+        }],
         mode: "mirror",
         rigor: "standard",
         needs: &[Need::UnixMode],

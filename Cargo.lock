@@ -3174,6 +3174,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-services"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "583300ad934cba24ff5292aee751ecc070f7ca6b39a574cc21b7b5e588e06a0b"
+dependencies = [
+ "dispatch2",
+ "libc",
+ "objc2-core-foundation",
+]
+
+[[package]]
 name = "objc2-core-text"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4971,11 +4982,15 @@ version = "0.9.0"
 dependencies = [
  "blake3",
  "clap",
+ "dispatch2",
  "fastcdc",
  "filetime",
+ "getrandom 0.3.4",
  "hostname",
  "keyring",
  "libc",
+ "objc2-core-foundation",
+ "objc2-core-services",
  "rayon",
  "rpassword",
  "russh",
@@ -4998,6 +5013,8 @@ dependencies = [
 name = "syncdash-desktop"
 version = "0.9.0"
 dependencies = [
+ "blake3",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
  "syncdash",

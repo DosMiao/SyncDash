@@ -32,7 +32,10 @@ pub enum RootSpec {
     Local(PathBuf),
     Remote(RemoteSpec),
     /// `scheme://…` where the scheme is not one we know. Never silently local.
-    UnknownScheme { raw: String, scheme: String },
+    UnknownScheme {
+        raw: String,
+        scheme: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,14 +101,20 @@ impl RemoteSpec {
             s.push('@');
         }
         push_host(&mut s, &self.host.to_lowercase());
-        s.push_str(&format!(":{}", self.port.unwrap_or(default_port(&self.scheme))));
+        s.push_str(&format!(
+            ":{}",
+            self.port.unwrap_or(default_port(&self.scheme))
+        ));
         s.push('/');
         s.push_str(&self.root);
         s
     }
 
     pub fn opt(&self, key: &str) -> Option<&str> {
-        self.options.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+        self.options
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
     }
 
     pub fn has_flag(&self, key: &str) -> bool {
@@ -171,7 +180,10 @@ pub fn parse(raw: &str) -> RootSpec {
             if KNOWN_SCHEMES.contains(&scheme.as_str()) {
                 return RootSpec::Remote(parse_remote(&scheme, &s[idx + 3..]));
             }
-            return RootSpec::UnknownScheme { raw: s.to_string(), scheme };
+            return RootSpec::UnknownScheme {
+                raw: s.to_string(),
+                scheme,
+            };
         }
     }
 
@@ -180,7 +192,9 @@ pub fn parse(raw: &str) -> RootSpec {
 
 fn looks_like_drive_path(s: &str) -> bool {
     let b = s.as_bytes();
-    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
         && (b.len() == 2 || b[2] == b'\\' || b[2] == b'/')
 }
 
@@ -224,7 +238,10 @@ fn parse_remote(scheme: &str, rest: &str) -> RemoteSpec {
 
 /// The three characters the grammar cannot carry raw in a user name (FFS's exact set).
 fn decode_user(u: &str) -> String {
-    u.replace("%40", "@").replace("%3A", ":").replace("%3a", ":").replace("%25", "%")
+    u.replace("%40", "@")
+        .replace("%3A", ":")
+        .replace("%3a", ":")
+        .replace("%25", "%")
 }
 
 fn parse_hostport(s: &str) -> (String, Option<u16>) {
@@ -356,8 +373,14 @@ mod tests {
     /// take the unknown-scheme path like any other typo, never fall back to a local path.
     #[test]
     fn unknown_scheme_is_refused_never_treated_as_local() {
-        assert!(matches!(parse("fake://seed1"), RootSpec::UnknownScheme { .. }));
-        assert!(matches!(parse("nfs://server/export"), RootSpec::UnknownScheme { .. }));
+        assert!(matches!(
+            parse("fake://seed1"),
+            RootSpec::UnknownScheme { .. }
+        ));
+        assert!(matches!(
+            parse("nfs://server/export"),
+            RootSpec::UnknownScheme { .. }
+        ));
     }
 
     #[test]
@@ -382,6 +405,9 @@ mod tests {
         assert!(!is_peer(r"D:\Code\x"));
         assert!(!is_peer(r"\\mac\share\x"));
         // The default port matters: a spelled-out :22 and an implicit one must share a key
-        assert_eq!(remote("peer://mac/x").identity(), remote("peer://mac:22/x/").identity());
+        assert_eq!(
+            remote("peer://mac/x").identity(),
+            remote("peer://mac:22/x/").identity()
+        );
     }
 }

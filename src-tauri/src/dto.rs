@@ -9,6 +9,7 @@ use syncdash::pipeline::compare;
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JobDto {
+    pub(crate) job_id: String,
     pub(crate) name: String,
     pub(crate) mode: String,
     pub(crate) rigor: String,
@@ -30,6 +31,53 @@ pub(crate) struct JobDto {
     pub(crate) watch_auto_apply: bool,
     /// 1:N: the effective target list (a single-target job = one entry). When >1 the frontend shows the target selector
     pub(crate) targets: Vec<String>,
+    pub(crate) config_revision: String,
+}
+
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct JobDetailDto {
+    pub(crate) job_id: String,
+    pub(crate) name: String,
+    pub(crate) job: syncdash::job::Job,
+    pub(crate) config_revision: String,
+}
+
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct JobSaveDto {
+    pub(crate) job_id: String,
+    pub(crate) name: String,
+    pub(crate) config_revision: String,
+    pub(crate) effect: syncdash::job::JobMutationEffect,
+    pub(crate) previous_name: Option<String>,
+}
+
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct JobDeleteDto {
+    pub(crate) job_id: String,
+    pub(crate) name: String,
+    pub(crate) config_revision: String,
+    pub(crate) effect: syncdash::job::JobMutationEffect,
+}
+
+/// Immutable provenance for one successful comparison.
+///
+/// The frontend carries this value with the plan. Commands that read cached evidence or can write
+/// files require an exact match, so changing selection cannot silently reinterpret an old plan.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct CompareOwner {
+    #[ts(type = "number")]
+    pub(crate) compare_id: u64,
+    /// Stable registry identity. `job_name` is only the current display/lookup label and may change
+    /// while this comparison remains valid.
+    pub(crate) job_id: String,
+    pub(crate) job_name: String,
+    #[ts(type = "number")]
+    pub(crate) target_index: usize,
+    pub(crate) config_revision: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, ts_rs::TS)]
@@ -50,6 +98,94 @@ pub(crate) struct PlanDto {
     #[serde(default)]
     #[ts(type = "number")]
     pub(crate) equal_bytes: u64,
+    pub(crate) owner: CompareOwner,
+}
+
+/// One reviewed plan row submitted for preflight/apply. The backend reconstructs the operation from
+/// the cached plan; the frontend never gets to submit an independent write instruction.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct SelectedRowDto {
+    #[ts(type = "number")]
+    pub(crate) index: usize,
+    pub(crate) flipped: bool,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum ReviewStatus {
+    DirectAuthorized,
+    ConfirmationRequired,
+    Blocked,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum CapabilitySeverityDto {
+    Block,
+    NeedsAck,
+    Info,
+}
+
+impl From<syncdash::pipeline::guard::caps::CapSeverity> for CapabilitySeverityDto {
+    fn from(value: syncdash::pipeline::guard::caps::CapSeverity) -> Self {
+        match value {
+            syncdash::pipeline::guard::caps::CapSeverity::Block => Self::Block,
+            syncdash::pipeline::guard::caps::CapSeverity::NeedsAck => Self::NeedsAck,
+            syncdash::pipeline::guard::caps::CapSeverity::Info => Self::Info,
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct CapabilityIssueDto {
+    pub(crate) feature: String,
+    pub(crate) side: String,
+    pub(crate) severity: CapabilitySeverityDto,
+    pub(crate) requested: String,
+    pub(crate) actual: String,
+    pub(crate) effect: String,
+}
+
+impl From<&syncdash::pipeline::guard::caps::CapItem> for CapabilityIssueDto {
+    fn from(value: &syncdash::pipeline::guard::caps::CapItem) -> Self {
+        Self {
+            feature: value.feature.clone(),
+            side: value.side.clone(),
+            severity: value.severity.into(),
+            requested: value.requested.clone(),
+            actual: value.actual.clone(),
+            effect: value.effect.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct AuthorizationDto {
+    pub(crate) authorization_token: String,
+    #[ts(type = "number")]
+    pub(crate) expires_at_ms: u64,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct OperationReviewDto {
+    pub(crate) status: ReviewStatus,
+    pub(crate) authorization: Option<AuthorizationDto>,
+    pub(crate) challenge_id: Option<String>,
+    #[ts(type = "number | null")]
+    pub(crate) expires_at_ms: Option<u64>,
+    pub(crate) blockers: Vec<String>,
+    pub(crate) warnings: Vec<String>,
+    pub(crate) capabilities: Vec<CapabilityIssueDto>,
+    pub(crate) requires_health_ack: bool,
+    pub(crate) requires_capability_ack: bool,
+    pub(crate) can_remember_for_session: bool,
+    pub(crate) can_allow_unattended: bool,
 }
 
 #[derive(Serialize, ts_rs::TS)]
@@ -66,20 +202,37 @@ pub(crate) struct ApplyDto {
     pub(crate) cancelled: bool,
 }
 
-#[derive(Serialize, ts_rs::TS)]
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
-pub(crate) struct PreflightDto {
-    pub(crate) ok: bool,
-    pub(crate) blockers: Vec<String>,
-    pub(crate) warnings: Vec<String>,
+pub(crate) enum EndpointReadiness {
+    Empty,
+    Ready,
+    Missing,
+    NotDirectory,
+    Deferred,
+    Invalid,
+    Unobservable,
 }
 
-#[derive(Serialize, Default, ts_rs::TS)]
+#[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct PathInfo {
-    pub(crate) exists: bool,
-    pub(crate) is_dir: bool,
-    pub(crate) has_marker: bool,
+    pub(crate) readiness: EndpointReadiness,
+    pub(crate) exists: Option<bool>,
+    pub(crate) is_dir: Option<bool>,
+    pub(crate) has_marker: Option<bool>,
+}
+
+impl Default for PathInfo {
+    fn default() -> Self {
+        Self {
+            readiness: EndpointReadiness::Empty,
+            exists: None,
+            is_dir: None,
+            has_marker: None,
+        }
+    }
 }
 
 #[derive(Serialize, Default, ts_rs::TS)]
@@ -89,19 +242,23 @@ pub(crate) struct PathVerdict {
     pub(crate) target: PathInfo,
     /// Plain-language warnings; the editor renders them right under the field
     pub(crate) warnings: Vec<String>,
+    /// Readiness facts that are informative rather than failures, such as a network probe deferred
+    /// until Compare owns credentials and a cancellation context.
+    pub(crate) notes: Vec<String>,
 }
 
-// Snapshot cache (the data source for the "Identical" panel)
+// Compare-result repository (the data source for the "Identical" panel)
 //
-// compare already walked both sides in full; dropping the snapshots would force the UI to rescan just to glance at the identical items.
-// Single-slot cache: every compare overwrites it and switching jobs invalidates it; two snapshots at the 20k-entry scale run to a dozen-odd MB.
+// Compare already walked both sides in full; dropping the snapshots would force a rescan merely to
+// inspect identical items. A bounded set of successful job/target/revision results remains available,
+// and every page is authenticated against the exact owner that produced it.
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct SamePage {
     #[ts(type = "number")]
     pub(crate) total: u64,
     pub(crate) rows: Vec<compare::evidence::SameRow>,
-    /// Which job's snapshot is sitting in the cache (on a mismatch the UI prompts for a fresh compare)
+    /// Which job owns this authenticated result
     pub(crate) job: String,
 }
 

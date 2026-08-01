@@ -9,7 +9,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "syncdash", version, about = "Table-driven multi-node file sync (scan -> compare -> apply)")]
+#[command(
+    name = "syncdash",
+    version,
+    about = "Table-driven multi-node file sync (scan -> compare -> apply)"
+)]
 pub struct Cli {
     /// With no subcommand (e.g. double-clicking the exe), open the GUI directly
     #[command(subcommand)]
@@ -76,7 +80,8 @@ pub enum Cmd {
         /// Skip content hashing (fast, but comparison degrades to size+mtime and move detection becomes impossible)
         #[arg(long)]
         no_hash: bool,
-        /// Rigor preset: quick (0 reads) | fast (sampling + cache) | standard (really samples every file each round, the default)
+        /// Rigor preset: quick (0 reads) | fast (sampling + cache) | balanced (cache + write verification)
+        /// | standard (really samples every file each round, the default)
         /// | paranoid (reads every byte each round)
         #[arg(long, default_value = "standard")]
         rigor: String,
@@ -133,9 +138,7 @@ pub enum Cmd {
         out: Option<PathBuf>,
     },
     /// List the sync territories marked by .ffs-sync (the CodeSync ecosystem)
-    Territories {
-        root: PathBuf,
-    },
+    Territories { root: PathBuf },
     /// Generate a cs-<slug>.toml job for every .ffs-sync-marked territory (syncdash's take on the CodeSync generator)
     GenJobs {
         root: PathBuf,
@@ -167,9 +170,7 @@ pub enum Cmd {
         force: bool,
     },
     /// Receive a file on stdin and write it to path (used to ship remote packages: this runs over ssh on the far side, binary-safe on both platforms)
-    Recv {
-        path: PathBuf,
-    },
+    Recv { path: PathBuf },
     /// Emit the FastCDC chunk table for the given files (used for delta transfer; one JSON line per file)
     Chunks {
         #[arg(long)]

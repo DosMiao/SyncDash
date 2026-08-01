@@ -24,10 +24,17 @@ impl RigorResolved {
         let (hash, sampled, use_cache, escalate, verify_writes) = match rigor {
             "quick" => (false, false, false, false, false),
             "fast" => (true, true, true, true, false),
+            "balanced" => (true, true, true, true, true),
             "paranoid" => (true, false, false, false, true),
             _ => (true, true, false, true, true), // standard / custom baseline
         };
-        RigorResolved { hash, sampled, use_cache, escalate, verify_writes }
+        RigorResolved {
+            hash,
+            sampled,
+            use_cache,
+            escalate,
+            verify_writes,
+        }
     }
 
     /// `none` | `full` | anything else = sampled. Overrides whatever the preset chose.
@@ -87,20 +94,32 @@ mod tests {
     #[test]
     fn presets_pick_their_documented_axes() {
         let q = RigorResolved::from_preset("quick");
-        assert!(!q.hash && !q.sampled && !q.use_cache, "quick reads no content at all");
+        assert!(
+            !q.hash && !q.sampled && !q.use_cache,
+            "quick reads no content at all"
+        );
 
         let f = RigorResolved::from_preset("fast");
         assert!(f.hash && f.sampled && f.use_cache && f.escalate);
 
+        let b = RigorResolved::from_preset("balanced");
+        assert!(b.hash && b.sampled && b.use_cache && b.escalate && b.verify_writes);
+
         let p = RigorResolved::from_preset("paranoid");
-        assert!(p.hash && !p.sampled, "paranoid reads whole files, never windows");
+        assert!(
+            p.hash && !p.sampled,
+            "paranoid reads whole files, never windows"
+        );
         assert!(p.verify_writes, "and re-reads what it wrote");
         assert!(!p.use_cache, "trusting a cache would defeat the point");
     }
 
     #[test]
     fn an_unknown_preset_lands_on_standard_rather_than_the_weakest() {
-        assert_eq!(RigorResolved::from_preset("typo"), RigorResolved::from_preset("standard"));
+        assert_eq!(
+            RigorResolved::from_preset("typo"),
+            RigorResolved::from_preset("standard")
+        );
         let s = RigorResolved::from_preset("standard");
         assert!(s.hash && s.escalate && s.verify_writes);
     }
@@ -108,7 +127,10 @@ mod tests {
     #[test]
     fn a_detail_axis_overrides_its_preset() {
         let r = RigorResolved::from_preset("paranoid").with_evidence(Some("none"));
-        assert!(!r.hash && !r.sampled, "evidence=none wins over paranoid's full read");
+        assert!(
+            !r.hash && !r.sampled,
+            "evidence=none wins over paranoid's full read"
+        );
         assert!(r.verify_writes, "but it does not touch the other axes");
 
         let r = RigorResolved::from_preset("quick").with_cache(Some(true));
@@ -119,9 +141,14 @@ mod tests {
     /// preset and evidence flag can put hashing back on behind the user's back.
     #[test]
     fn no_hash_is_applied_last_and_only_turns_things_off() {
-        let r = RigorResolved::from_preset("paranoid").with_evidence(Some("full")).with_no_hash(true);
+        let r = RigorResolved::from_preset("paranoid")
+            .with_evidence(Some("full"))
+            .with_no_hash(true);
         assert!(!r.hash);
         let r = RigorResolved::from_preset("quick").with_no_hash(false);
-        assert!(!r.hash, "no_hash=false does not enable hashing that the preset left off");
+        assert!(
+            !r.hash,
+            "no_hash=false does not enable hashing that the preset left off"
+        );
     }
 }

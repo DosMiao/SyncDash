@@ -139,7 +139,9 @@ pub fn roll_generations(fresh: &mut [Entry], old: &[Entry]) {
     use std::collections::HashMap;
     let prior: HashMap<&str, &Entry> = old.iter().map(|e| (e.path.as_str(), e)).collect();
     for e in fresh.iter_mut() {
-        let Some(o) = prior.get(e.path.as_str()) else { continue };
+        let Some(o) = prior.get(e.path.as_str()) else {
+            continue;
+        };
         // Unchanged content needs no new generation — keeps the history from filling up with one repeated hash
         if o.hash.is_some() && o.hash == e.hash {
             e.prev = o.prev.clone();
@@ -182,22 +184,23 @@ impl Snapshot {
         let head_line = lines
             .next()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty table"))??;
-        let header: Header = serde_json::from_str(&head_line)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad header: {e}")))?;
+        let header: Header = serde_json::from_str(&head_line).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad header: {e}"))
+        })?;
         let mut entries = Vec::new();
         for line in lines {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            let e: Entry = serde_json::from_str(&line)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad entry: {e}")))?;
+            let e: Entry = serde_json::from_str(&line).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad entry: {e}"))
+            })?;
             entries.push(e);
         }
         Ok(Snapshot { header, entries })
     }
 }
-
 
 pub fn os_name() -> String {
     std::env::consts::OS.to_string()
@@ -269,18 +272,27 @@ mod tests {
 
         assert_eq!(back.header.root, snap.header.root);
         assert_eq!(back.header.hashed, snap.header.hashed);
-        assert_eq!(back.header.excluded_dirs, 3, "exclusion counts must survive — the UI reports them");
+        assert_eq!(
+            back.header.excluded_dirs, 3,
+            "exclusion counts must survive — the UI reports them"
+        );
         assert_eq!(back.header.excluded_files, 4);
         assert_eq!(back.entries.len(), 2);
         assert_eq!(back.entries[0].path, "a/one.txt");
         assert_eq!(back.entries[0].hash.as_deref(), Some("abc"));
-        assert_eq!(back.entries[1].hash, None, "an absent hash must stay absent, not become empty string");
+        assert_eq!(
+            back.entries[1].hash, None,
+            "an absent hash must stay absent, not become empty string"
+        );
     }
 
     /// One JSON object per line is what lets an ssh pipe, an archive and an audit share a format.
     #[test]
     fn the_table_is_one_json_object_per_line() {
-        let snap = Snapshot { header: header(), entries: vec![entry("x", 1, None), entry("y", 2, None)] };
+        let snap = Snapshot {
+            header: header(),
+            entries: vec![entry("x", 1, None), entry("y", 2, None)],
+        };
         let mut buf: Vec<u8> = Vec::new();
         snap.write_to(&mut buf).unwrap();
         let text = String::from_utf8(buf).unwrap();
@@ -296,11 +308,21 @@ mod tests {
     #[test]
     fn roll_generations_chains_history_newest_first_and_caps() {
         let mut fresh = vec![entry("f", 1, Some("v4"))];
-        let old = vec![Entry { prev: Some(vec!["v2".into(), "v1".into()]), ..entry("f", 1, Some("v3")) }];
+        let old = vec![Entry {
+            prev: Some(vec!["v2".into(), "v1".into()]),
+            ..entry("f", 1, Some("v3"))
+        }];
         roll_generations(&mut fresh, &old);
         let prev = fresh[0].prev.clone().expect("history must attach");
-        assert_eq!(prev.first().map(String::as_str), Some("v3"), "the previous current hash leads");
-        assert!(prev.len() <= ARCHIVE_GENERATIONS, "history is capped at {ARCHIVE_GENERATIONS}");
+        assert_eq!(
+            prev.first().map(String::as_str),
+            Some("v3"),
+            "the previous current hash leads"
+        );
+        assert!(
+            prev.len() <= ARCHIVE_GENERATIONS,
+            "history is capped at {ARCHIVE_GENERATIONS}"
+        );
     }
 
     /// An unchanged file must not accumulate a generation per scan.
@@ -310,6 +332,9 @@ mod tests {
         let old = vec![entry("f", 1, Some("same"))];
         roll_generations(&mut fresh, &old);
         let prev = fresh[0].prev.clone().unwrap_or_default();
-        assert!(!prev.contains(&"same".to_string()), "the current hash must not also sit in its own history");
+        assert!(
+            !prev.contains(&"same".to_string()),
+            "the current hash must not also sit in its own history"
+        );
     }
 }

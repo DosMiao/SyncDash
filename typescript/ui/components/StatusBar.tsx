@@ -47,22 +47,34 @@ export function StatusBar(props: Props) {
   const c = plan ? counts(plan, visibleCount) : null;
 
   return (
-    <footer className={'status ' + status.cls}>
-      <span className="statusmsg" title={status.msg}>{status.msg}</span>
-      {status.undo && <button className="linkbtn" onClick={onUndo}>{status.undo.label}</button>}
+    <footer className={'status ' + status.cls} aria-label="Application status">
+      <span
+        className="statusmsg"
+        title={status.msg}
+        role={status.cls === 'err' ? 'alert' : 'status'}
+        aria-live={status.cls === 'err' ? 'assertive' : 'polite'}
+        aria-atomic="true"
+      >{status.msg}</span>
+      {status.undo && <button type="button" className="linkbtn" onClick={onUndo}>{status.undo.label}</button>}
       {/* Always rendered, even when empty: .counts carries the margin-left:auto that pushes the right
           group over, and dropping the element would let the zoom stepper slide back to the left. */}
-      <span className="counts" title={c?.title}>
+      <span className="counts" title={c?.title} aria-label={c?.title}>
         {c?.parts.map((p, i) => (
           <span key={p.text} className={p.warn ? 'count-warn' : undefined}>
             {i > 0 ? ' · ' : ''}{p.text}
           </span>
         ))}
       </span>
-      <span className="zoombox">
-        <button className="zbtn" title="Zoom out (Ctrl+−)" onClick={onZoomOut}><Minus size={12} /></button>
-        <button className="zoomval" title="Reset zoom (Ctrl+0)" onClick={onZoomReset}>{Math.round(zoom * 100)}%</button>
-        <button className="zbtn" title="Zoom in (Ctrl++)" onClick={onZoomIn}><Plus size={12} /></button>
+      <span className="zoombox" role="group" aria-label="Zoom controls">
+        <button type="button" className="zbtn" title="Zoom out (Ctrl+−)" aria-label="Zoom out" onClick={onZoomOut}><Minus size={12} /></button>
+        <button
+          type="button"
+          className="zoomval"
+          title="Reset zoom (Ctrl+0)"
+          aria-label={`Reset zoom, currently ${Math.round(zoom * 100)}%`}
+          onClick={onZoomReset}
+        >{Math.round(zoom * 100)}%</button>
+        <button type="button" className="zbtn" title="Zoom in (Ctrl++)" aria-label="Zoom in" onClick={onZoomIn}><Plus size={12} /></button>
       </span>
     </footer>
   );

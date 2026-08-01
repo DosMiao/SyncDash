@@ -34,8 +34,10 @@ pub(super) fn update_with_delta(
     staged.write_at(0, &old)?;
     let old_chunks = crate::model::chunk::chunk_bytes(&old);
     let new_chunks = crate::model::chunk::chunk_bytes(&new);
-    let have: std::collections::HashMap<&str, (u64, u32)> =
-        old_chunks.iter().map(|c| (c.hash.as_str(), (c.off, c.len))).collect();
+    let have: std::collections::HashMap<&str, (u64, u32)> = old_chunks
+        .iter()
+        .map(|c| (c.hash.as_str(), (c.off, c.len)))
+        .collect();
     let mut written = 0u64;
     for c in &new_chunks {
         let start = c.off as usize;
@@ -51,7 +53,9 @@ pub(super) fn update_with_delta(
     }
     // A shorter new file needs its tail truncated
     if (new.len() as u64) < old.len() as u64 {
-        let f = std::fs::OpenOptions::new().write(true).open(staged.path())?;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(staged.path())?;
         f.set_len(new.len() as u64)?;
     }
     // The new content is right there in memory — hash it in full while we're at it, for post-copy verification against the readback from disk

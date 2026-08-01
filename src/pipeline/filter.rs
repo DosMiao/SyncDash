@@ -42,7 +42,11 @@ impl Masks {
     }
 
     fn matches(&self, path: &str, allow_parent: bool) -> bool {
-        if self.wild.iter().any(|m| matches_mask(path, m, allow_parent)) {
+        if self
+            .wild
+            .iter()
+            .any(|m| matches_mask(path, m, allow_parent))
+        {
             return true;
         }
         if allow_parent {
@@ -77,7 +81,11 @@ fn matches_mask(path: &str, mask: &str, allow_parent: bool) -> bool {
         let mut mi = 0usize;
         loop {
             if mi == m.len() {
-                return if allow_parent { pi == p.len() || p[pi] == b'/' } else { pi == p.len() };
+                return if allow_parent {
+                    pi == p.len() || p[pi] == b'/'
+                } else {
+                    pi == p.len()
+                };
             }
             match m[mi] {
                 b'?' => {
@@ -234,7 +242,11 @@ impl PathFilter {
 
     /// Full constructor. `excludes` is the **whole** exclude policy bar SELF: junk presets have already
     /// been materialized into it by the time a filter is built, so there is one list to read and one to trust.
-    pub fn build_full(includes: &[String], excludes: &[String], deletables: &[String]) -> PathFilter {
+    pub fn build_full(
+        includes: &[String],
+        excludes: &[String],
+        deletables: &[String],
+    ) -> PathFilter {
         let extra_excludes = excludes;
         let mut inc = MaskSet::default();
         if includes.is_empty() {
@@ -269,7 +281,13 @@ impl PathFilter {
         for p in deletables {
             parse_phrase(p, &mut del);
         }
-        PathFilter { include: inc, exclude: exc, except: exn, deletable: del, except_blocks_pruning: blocks_pruning }
+        PathFilter {
+            include: inc,
+            exclude: exc,
+            except: exn,
+            deletable: del,
+            except_blocks_pruning: blocks_pruning,
+        }
     }
 
     /// Does this path hit a `!` exception
@@ -351,7 +369,9 @@ pub fn mask_hits(masks: &[String], rels: &[String]) -> Vec<bool> {
             let path = crate::foundation::text::fold(&rel.trim().replace('\\', "/"));
             let parent = path.rfind('/').map(|i| path[..i].to_string());
             set.file_masks.matches(&path, false)
-                || parent.as_deref().map_or(false, |pp| set.folder_masks.matches(pp, true))
+                || parent
+                    .as_deref()
+                    .map_or(false, |pp| set.folder_masks.matches(pp, true))
         })
         .collect()
 }
@@ -371,12 +391,21 @@ mod tests {
     #[test]
     fn nothing_is_excluded_behind_the_excludes_back() {
         let pf = f(&[], &[]);
-        assert!(pf.pass_file("a/.DS_Store"), "an empty exclude list excludes nothing but SELF");
+        assert!(
+            pf.pass_file("a/.DS_Store"),
+            "an empty exclude list excludes nothing but SELF"
+        );
         assert!(pf.pass_file("a/Thumbs.db"));
         assert!(pf.pass_dir("proj/.git").0, ".git is a normal tree");
         assert!(pf.pass_file("proj/node_modules/x/y.js"));
-        assert!(!pf.pass_file("x/.syncdash-root"), "SELF metadata always excluded");
-        assert!(!pf.pass_file("x/.syncdash.lock"), "…and no exclude list can let it back in");
+        assert!(
+            !pf.pass_file("x/.syncdash-root"),
+            "SELF metadata always excluded"
+        );
+        assert!(
+            !pf.pass_file("x/.syncdash.lock"),
+            "…and no exclude list can let it back in"
+        );
     }
 
     #[test]
@@ -411,16 +440,26 @@ mod tests {
         const NFC: &str = "Caf\u{00e9}"; // é as one code point
         const NFD: &str = "Cafe\u{0301}"; // e + combining acute
         assert_ne!(NFC, NFD, "premise: the two spellings differ byte-wise");
-        assert_ne!(NFC.to_uppercase(), NFD.to_uppercase(), "premise: uppercasing alone does not reconcile them");
+        assert_ne!(
+            NFC.to_uppercase(),
+            NFD.to_uppercase(),
+            "premise: uppercasing alone does not reconcile them"
+        );
 
         // Mask written in NFC (a Windows or web UI user typing it)
         let pf = PathFilter::build(&[], &[format!("*/{NFC}/")]);
-        assert!(!pf.pass_file(&format!("photos/{NFC}/a.jpg")), "the NFC spelling must be excluded");
+        assert!(
+            !pf.pass_file(&format!("photos/{NFC}/a.jpg")),
+            "the NFC spelling must be excluded"
+        );
         assert!(
             !pf.pass_file(&format!("photos/{NFD}/a.jpg")),
             "the NFD spelling macOS hands out must be excluded by the very same mask"
         );
-        assert!(!pf.pass_dir(&format!("photos/{NFD}")).0, "and the directory itself");
+        assert!(
+            !pf.pass_dir(&format!("photos/{NFD}")).0,
+            "and the directory itself"
+        );
 
         // ...and symmetrically, a mask typed on macOS must catch the NFC tree on Windows
         let pf2 = PathFilter::build(&[], &[format!("*/{NFD}/")]);
@@ -438,25 +477,40 @@ mod tests {
     fn bang_prefix_is_an_exception() {
         let pf = f(&[], &["*/*.log", "!*/important.log"]);
         assert!(!pf.pass_file("app/debug.log"));
-        assert!(pf.pass_file("app/important.log"), "! must override the exclude");
+        assert!(
+            pf.pass_file("app/important.log"),
+            "! must override the exclude"
+        );
     }
 
     #[test]
     fn anchored_exception_keeps_directory_pruning() {
         // Anchored exceptions (leading /) don't affect pruning: excluded dirs are still not descended into
         let pf = f(&[], &["*/node_modules/", "!/keep/this.txt"]);
-        assert!(!pf.pass_dir("proj/node_modules").1, "anchored ! must not disable pruning");
+        assert!(
+            !pf.pass_dir("proj/node_modules").1,
+            "anchored ! must not disable pruning"
+        );
         // An unanchored exception makes excluded dirs descendable again (cost traded for capability — the same trade-off gitignore makes)
         let pf2 = f(&[], &["*/node_modules/", "!*/keep.txt"]);
-        assert!(pf2.pass_dir("proj/node_modules").1, "unanchored ! must allow descending");
+        assert!(
+            pf2.pass_dir("proj/node_modules").1,
+            "unanchored ! must allow descending"
+        );
     }
 
     #[test]
     fn exception_survives_an_excluded_parent_dir() {
         let pf = f(&[], &["*/logs/", "!*/logs/audit.txt"]);
         assert!(!pf.pass_file("srv/logs/debug.txt"));
-        assert!(pf.pass_file("srv/logs/audit.txt"), "! must beat an excluded parent dir");
-        assert!(pf.pass_dir("srv/logs").1, "must descend to reach the exception");
+        assert!(
+            pf.pass_file("srv/logs/audit.txt"),
+            "! must beat an excluded parent dir"
+        );
+        assert!(
+            pf.pass_dir("srv/logs").1,
+            "must descend to reach the exception"
+        );
     }
 
     #[test]
@@ -487,16 +541,28 @@ mod tests {
         // Empty masks = nothing is hidden
         assert_eq!(m(&[], &["a/b.txt"]), vec![false]);
         // Extension (the shape produced by right-click "exclude this type")
-        assert_eq!(m(&["*/*.log"], &["a/x.log", "x.log", "a/x.txt"]), vec![true, true, false]);
+        assert_eq!(
+            m(&["*/*.log"], &["a/x.log", "x.log", "a/x.txt"]),
+            vec![true, true, false]
+        );
         // Anchored directory (the shape produced by right-click "exclude this directory"): hits only that one dir, not every dir with the same name
         assert_eq!(
-            m(&["/a/logs/"], &["a/logs/x", "a/logs/deep/y", "b/logs/x", "a/log/x"]),
+            m(
+                &["/a/logs/"],
+                &["a/logs/x", "a/logs/deep/y", "b/logs/x", "a/log/x"]
+            ),
             vec![true, true, false, false]
         );
         // The SELF tier must **not** be mixed in: the funnel only answers "did it hit the mask you typed"
-        assert_eq!(m(&["*/*.log"], &["proj/.syncdash-root", "proj/.git/index"]), vec![false, false]);
+        assert_eq!(
+            m(&["*/*.log"], &["proj/.syncdash-root", "proj/.git/index"]),
+            vec![false, false]
+        );
         // Case-insensitive, backslash equivalent
-        assert_eq!(m(&["*/CacheDir/"], &["z\\cachedir\\deep\\f.bin"]), vec![true]);
+        assert_eq!(
+            m(&["*/CacheDir/"], &["z\\cachedir\\deep\\f.bin"]),
+            vec![true]
+        );
     }
 
     #[test]

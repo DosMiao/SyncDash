@@ -111,6 +111,7 @@ One TOML per job, kept in `%APPDATA%\syncdash\jobs\` (mac: `~/.config/syncdash/j
 
 ```toml
 schema = 3                 # job-file schema; older files migrate on load (junk presets -> exclude, then remote_host -> peer://)
+job_id = "0123456789abcdef0123456789abcdef"  # registry-assigned; survives rename, changes after delete/recreate; not in config_revision
 mode = "sync"              # mirror | sync | enrich
 source = 'D:\Code\Utilities\flight'
 target = '\\192.168.0.115\xuanbomiao\Code\Utilities\flight'
@@ -119,13 +120,20 @@ archive = 'C:\Users\xuanb\AppData\Roaming\syncdash\archive\flight.jsonl'   # syn
 # exclude = ['*/big_temp/', '*/*.log']  # FFS syntax. THE WHOLE exclude policy besides this tool's own metadata:
 #                                       # junk presets write their patterns straight into this list, so it always
 #                                       # reads as what runs. `syncdash junk` prints them.
-# rigor = "standard"                    # quick | fast (sampled digest) | standard | paranoid (see "Rigor levels")
+# rigor = "standard"                    # quick | fast | balanced | standard | paranoid (see "Rigor levels")
 # case_sensitive = false                # case-insensitive by default (the NTFS/APFS default behavior)
 # no_hash = false
 ```
 
 `run <job> --apply` **refreshes the archive automatically** when it succeeds (0 errors) in sync mode (conflicting
 paths are dropped from the archive, so the next run reports the conflict again instead of having it silently arbitrated).
+
+The registry assigns `job_id` on first registered load/save without changing the job's semantic
+`config_revision`. Renaming moves that identity with the TOML; deleting and recreating the same name creates a
+different identity, so callers can distinguish replacement from an ordinary edit. Desktop save returns one typed
+effect (`created`, `updated`, `renamed`, or `no_op`) and delete returns `deleted`; save/delete are serialized against
+the same run-entry gate as Compare/Synchronize, so a configuration cannot change between a run's idle check and its
+job load.
 
 ## Logging (v0.10)
 
@@ -191,8 +199,9 @@ borders and layout scale with the text. Both themes are defined there and follow
 floor on the hover surface and take a darker step. Changing any color means re-running the audit against
 `--bg`, `--bg-2` and `--bg-3` — several hues clear the first and fail the third.
 
-Added in v0.3.2: **per-row direction flip** (click the row's action to toggle; the semantics are precomputed by the
-core's `reverse_op`: copy↔delete are inverses, update swaps sides; a flipped row gets a tinted background and a
+Added in v0.3.2: **per-row direction flip** (click the row's action to toggle; copy↔delete are inverses and update
+swaps sides; the frontend derives that preview lazily, while preflight/apply send only row indices + flip flags and
+the Rust core's `reverse_op` reconstructs the executable operation; a flipped row gets a tinted background and a
 dashed outline on its direction arrow), **filter chips** (all/copy/update/move/delete/conflict, live counts, each
 carrying its category's own hue and glyph, 0-item chips dimmed by token — GitDash
 style), **search box** (substring over path/from/reason), **pre-sync confirmation sheet** (per-category counts +
@@ -222,9 +231,23 @@ v0.9 "Progress & Polish" (behavior parameters cross-checked against the FFS 14.1
   red past 7 days); the GUI log panel can review history and detail; CLI `syncdash history [job] [--prune-days N]`.
 - **Job editor** (full-field form: mode / roots / rigor level / filters / safety gates / the three remote fields /
   watch, with create, edit and delete-with-confirmation).
-- **Watch mode** (timed rescans, not inotify): a second-scale `watch_interval_secs` gives "near real-time"; the
-  hash cache means an unchanged tree costs only the walk. Desktop Watch toggle (countdown + notify on differences /
-  auto-apply); CLI `run --watch [--interval N] [--auto-apply]`.
+- **AutoScan while SyncDash is open**: the desktop backend, not the webview, owns its lifecycle and binds every
+  trigger to one exact job identity, revision and target. A pure rename rebinds the displayed name without resetting
+  the watcher generation; delete/recreate cannot inherit the old ticket even if the name and configuration match.
+  The monitor is global rather than navigation-owned: switching jobs or targets leaves it armed, the toolbar always
+  names the job actually being watched, and the first click stops that monitor before a later click may arm the
+  currently selected job. Every pending trigger is retained in the status snapshot with a monotonic per-generation
+  ticket cursor, so listener-start races, a remounted webview and delayed same-generation responses cannot lose,
+  resurrect or cross-wire work. Inactive status retains an orderable generation/cursor tombstone for the same reason.
+  On macOS, two local roots use FSEvents change hints plus periodic
+  full verification; remote roots and platforms without a native adapter report an explicit interval-polling
+  fallback. A change event is never treated as a complete snapshot: every trigger still runs Compare, and a failed
+  or stale ticket does not advance the durable native cursor. The backend records the exact post-trigger Compare ID
+  against the pending ticket; submitting an older public result owner cannot promote it. AutoApply then claims that
+  completed ticket once, reconstructs every executable non-conflict/non-note row on the server with no UI filters or
+  direction flips, and requires both a clean health report and an exact prior session grant before issuing a one-use
+  authorization. `watch_interval_secs` is the polling / maximum full
+  verification interval; CLI `run --watch [--interval N] [--auto-apply]` remains a foreground timed loop.
 - **Remote jobs now take the real remote pipeline in the GUI** (they used to fall silently into the local
   pipeline, re-hashing over UNC an order of magnitude slower); ssh badge in the sidebar.
 - **The old egui UI has been retired and deleted** (removed as agreed once Tauri reached feature parity; the bare
@@ -238,8 +261,10 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
 - **Directory picker / drag-and-drop / path history / path health check**: the editor's two roots no longer have
   to be typed by hand — a browse button (tauri-plugin-dialog), drop a folder in and it fills (Tauri v2 swallows
   the HTML5 drop event, so we go through `onDragDropEvent` + physical-pixel hit testing), a `<datalist>` that
-  remembers the last 12 roots, and `inspect_paths` validating live (exists / is a directory / the two roots are
-  the same / one nests inside the other / `.syncdash-root` present or not).
+  remembers the last 12 roots, and `inspect_paths` validating local roots live (exists / is a directory / the two
+  roots are the same / one nests inside the other / `.syncdash-root` present or not). Network and peer phrases are
+  explicitly **deferred**, not painted as healthy: the editor does not open credentials or a transport merely to
+  color an input, and Compare reports the actual connection/readiness result when it owns a cancellable run.
 - **⇄ Swap**: one click swaps them inside the editor; the toolbar swap **writes back to the TOML** and invalidates
   the current plan (with undo). What FFS swaps is the config held in memory; our jobs are named files on disk —
   without persisting, the two roots in the plan header would say something different from the job file, and both
@@ -267,12 +292,36 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
   (FFS semantics). This fixes a quiet trap in the old behavior — filtering with the search box used to leave
   hidden-but-still-checked rows to go through with Synchronize anyway. The confirmation sheet now spells out
   "N items hidden by filters, not applied", and the stats bar switches to counting checked ∩ visible to match.
+- **Bounded last-successful compare repository**: the desktop retains the eight most recently used completed
+  `PlanDto` review sessions, including which rows are checked and which directions were reversed, keyed by stable
+  `job_id`, selected target and captured configuration revision. Thus compare A → compare B → return to A restores A's result,
+  and different targets of one job retain independent reviews. Only a successful compare publishes a result, so a
+  failed or cancelled attempt cannot evict the last good review. LRU eviction bounds the accumulated snapshot/plan
+  memory; if the frontend copy was evicted while Rust still owns the authenticated entry, selection restores it over
+  IPC without rescanning. The repository is deliberately process-local: after a desktop restart the filesystem may
+  have changed while SyncDash was closed, so the app asks for a fresh Compare instead of presenting persisted evidence
+  as current. The revision is a canonical digest of the job contents, so a content-changing job-file mutation changes
+  it and invalidates only that job/revision; unrelated jobs and targets remain available. A no-op editor save keeps the
+  result because its effective revision is unchanged; a pure rename preserves and relabels that result, while deleting
+  and recreating the same name produces a new identity that cannot see it. Every Compare attempt refreshes the job row after reading an
+  externally edited TOML — including a failed or cancelled attempt, so a removed target or deleted job cannot leave a
+  ghost selection that fails forever. Compare and Apply use a structured review protocol rather than caller-owned
+  consent flags: the backend probes current health/capabilities, binds the job ID, revision, target, retained Compare
+  owner, plan digest and normalized row decisions into an expiring one-use authorization, then recomputes those facts
+  immediately before reserving execution. The webview sends only that token to the execution command; it cannot send a
+  plan, acknowledge a different capability report, or replay the token. Session grants are process-local and scoped to
+  the exact job/revision/target/capability digest; unattended Apply still requires a fresh, server-reconstructed action
+  set and refuses health warnings. Apply also exposes a typed mutation boundary: a proven pre-write rejection keeps the
+  retained Compare result available for another review, while any path that may have started a write invalidates it.
+  An empty selection is rejected before a run is reserved; in particular, AutoScan will never turn a conflict/note-only
+  result into an archive-changing zero-operation apply.
 - **Identical-items panel** (that "22,631" button along the bottom of FFS): lists the files judged identical on
   both sides, paged 300 at a time, with its own path filter; the data source is the two snapshots the last compare
   left in memory — **no rescan**. Rows whose content matches but whose timestamps drift more than 2s across the
-  two sides get the target time marked orange (a common artifact of FAT/SMB granularity). Single-slot cache,
-  overwritten when you switch jobs or re-compare; it works for remote jobs too (the remote snapshot is a complete
-  table pulled back over ssh).
+  two sides get the target time marked orange (a common artifact of FAT/SMB granularity). The retained snapshots follow
+  the same bounded, target-aware repository contract, and their provenance includes the effective target, so two targets
+  of one job cannot read each other's identical rows. It works for remote jobs too (the remote snapshot is a complete table pulled
+  back over ssh).
 - **CSV export**: exports the current view (including checked state and both-side size/time), escaping is done
   exactly once on the Rust side, UTF-8 **with a BOM** — without the BOM, Excel interprets it in the local code
   page and the whole column of Chinese paths turns to mojibake. The enum literals use serde's snake_case, the
@@ -287,8 +336,19 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
 - `scan` writes to stdout by default (ssh-friendly: `ssh mac syncdash scan ~/Data > mac.jsonl`).
 - `apply` is **dry-run by default**; only `--apply` touches anything. Deleted or overwritten files go first into
   the local `%LOCALAPPDATA%\syncdash\trash\<timestamp>\` (mac: `~/.cache/syncdash/trash/...`), never destroyed in place.
+  The common apply boundary rejects absolute, drive-prefixed and traversal-shaped operation paths (including a
+  move's `from`) before opening either backend, so even a hand-authored plan cannot escape its two roots.
 - Hashing is BLAKE3 with a cache: if `(path,size,mtime)` is unchanged the previous result
   is reused; the cache lives in the local user directory and never pollutes the scanned directory.
+  Local on-disk cache reuse is enabled only when the OS supplies durable volume evidence: a macOS
+  volume UUID, Linux filesystem UUID or boot-scoped non-reused `statx` mount ID, or Windows volume
+  GUID. Mount paths, ordinary device/mount numbers, UNC fallbacks and failed probes are diagnostics,
+  not identity; those roots scan cold instead of accepting state from replacement media. File IDs
+  are likewise admitted only for a positive list of filesystems with understood stable-inode semantics.
+  VFS cache identities normalize only scheme and host; case-sensitive usernames and root paths stay
+  distinct. Error-free scans prune absent rows inside the configured filter domain while retaining
+  deliberately excluded rows; a walk error conservatively retains every unseen row. State I/O remains
+  best-effort, but failures are emitted as warnings instead of silently turning every later scan cold.
   Files are **read, never memory-mapped** — a mapped page whose file was truncated or whose volume
   disappeared raises SIGBUS, which kills the process outright instead of returning an error, and in
   `apply` that leaves both root locks on disk. The multi-core gain is given up deliberately;
@@ -305,16 +365,17 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
 Equality test: if both sides have a hash → the hashes must match; otherwise sizes must be equal and
 |Δmtime| ≤ 2s (FAT/SMB time granularity).
 
-### Rigor levels (rigor) — a monotone ladder: each level actually reads more this scan
+### Rigor levels (rigor) — explicit evidence and write-verification profiles
 
 Design principle (the v0.9.3 refactor): **an "identical ✓" must be measured this scan, not remembered from
-cache**. Cache exists at exactly one level, fast (and it says so); from standard up, every file is really read
-every scan. Two cross-cutting reinforcements:
+cache** when fresh evidence is requested. `fast` and `balanced` deliberately trade that property for a warm cache;
+`balanced` adds verified writes, while `standard` and `paranoid` really read every file each scan. Two cross-cutting
+reinforcements:
 
-- **Divergence escalation** (fast/standard): when the sampled digests match but |Δmtime| > 2s, it does not call
+- **Divergence escalation** (fast/balanced/standard): when the sampled digests match but |Δmtime| > 2s, it does not call
   them equal — both sides escalate to a full hash and the verdict is redone. Verified on real hardware: 64 bytes
   changed outside the sampling window of a 400MB file, and the escalation rule caught it on the spot.
-- **Verify after write** (on by default for standard/paranoid): the expected value is **the full blake3 of this
+- **Verify after write** (on by default for balanced/standard/paranoid): the expected value is **the full blake3 of this
   copy's own stream** (the copy reads the whole file anyway, so hashing on the stream is free), re-read after it
   lands and compared; if it doesn't match, no rename. Deeply decoupled from scan evidence.
 
@@ -322,6 +383,7 @@ every scan. Two cross-cutting reinforcements:
 |---|---|---|---|---|---|
 | `quick` | 0 bytes | metadata measured this scan (size+mtime±2s) | ❌ | ❌ | structural sweeps |
 | `fast` | the sampling windows of the changed surface only (cache accelerates the unchanged surface) | the changed surface measured, the unchanged surface remembered from cache | ✅ | ❌ | cloud drives / media libraries (placeholder files hydrate only three small segments) |
+| `balanced` | the sampling windows of the changed surface only (cache accelerates the unchanged surface) | the changed surface measured, the unchanged surface remembered from cache | ✅ | ✅ | frequent external-disk syncs with safe writes |
 | `standard` (default) | **every file's sampling windows, no cache** | head/middle/tail of every file measured this scan | ✅ | ✅ | day to day |
 | `paranoid` | every byte of every file | every byte measured this scan | ✅ | ✅ | first migration / annual cold-backup audit / suspect media |
 
@@ -332,14 +394,14 @@ strictly isolated from full hashes in the cache).
 existence, path normalization, type, size/mtime, symlink target, permission bits, illegal-name preflight, archive
 attribution, apply gates):
 
-| Threat | `quick` | `fast` | `standard` | `paranoid` |
-|---|---|---|---|---|
-| Ordinary modification (changes size/mtime) | immediately | immediately | immediately | immediately |
-| Any change that touched mtime (including outside the sampling window) | immediately (metadata level only) | **immediately** (the escalation rule re-verifies in full) | **immediately** (escalation rule) | immediately |
-| A rewrite that preserves size+mtime (timestomp) | never | immediately inside the sampling window; never outside | **measured every scan** inside the sampling window; never outside | immediately |
-| Silent bitrot | never | never on the unchanged surface (cache) | **measured every scan** inside the sampling window; never outside | immediately |
-| Transfer corruption | never | never | **immediately** (verify after write) | immediately |
-| Move identity | delete+add | paired | paired | paired |
+| Threat | `quick` | `fast` | `balanced` | `standard` | `paranoid` |
+|---|---|---|---|---|---|
+| Ordinary modification (changes size/mtime) | immediately | immediately | immediately | immediately | immediately |
+| Any change that touched mtime (including outside the sampling window) | immediately (metadata level only) | **immediately** (the escalation rule re-verifies in full) | **immediately** (escalation rule) | **immediately** (escalation rule) | immediately |
+| A rewrite that preserves size+mtime (timestomp) | never | immediately inside the sampling window; never outside | immediately inside the sampling window; never outside | **measured every scan** inside the sampling window; never outside | immediately |
+| Silent bitrot | never | never on the unchanged surface (cache) | never on the unchanged surface (cache) | **measured every scan** inside the sampling window; never outside | immediately |
+| Transfer corruption | never | never | **immediately** (verify after write) | **immediately** (verify after write) | immediately |
+| Move identity | delete+add | paired | paired | paired | paired |
 
 ### Cross-platform correctness (v0.2.2)
 
@@ -422,7 +484,12 @@ pairing, to handle whole-directory renames). Measured:
 {"side":"target","action":"move","path":"moved/old_name.dat","from":"old_name.dat","reason":"move-detected-by-hash"}
 ```
 
-One `rename` on target and it's done, zero re-transfer for large files. Scanning with `--no-hash` automatically
+One `rename` on target and it's done, zero re-transfer for large files. Apply first atomically claims the
+exact source name into a same-directory hold, verifies the Compare evidence, and publishes with a native
+no-replace rename. Only an explicit cross-device error selects the copy path; that path stages and verifies
+the complete payload, publishes no-replace, and removes only the claimed hold—never whatever may have
+reappeared at the original name. Rollback either restores the source or reports the exact recoverable hold,
+and `fsync=true` also persists the affected local directory entries. Scanning with `--no-hash` automatically
 falls back to copy+delete (and gives up move detection).
 
 ## Remote mode (v0.4, implemented and verified on real machines)
@@ -634,7 +701,7 @@ strategy is worth reading, but adopting it means going resident).
 - [x] v0.2.2 rigor levels quick/standard/paranoid (verify after copy) + cross-platform correctness: NFC-normalized compare keys, case folding, Windows illegal-name preflight, unix mode recorded (with unit tests)
 - [x] v0.3 Tauri v2 desktop shell (modeled on AlexQuant Desktop: Vite+TS frontend, dual-platform builder scripts, dist committed so the Mac builds with pure cargo and no node);
       rigor levels (quick/standard/paranoid: no hash / cached hash / full re-hash + verify after copy); NFC + case-folded compare keys; Windows illegal-path preflight
-- [x] v0.3.x compare classification-matrix unit tests (the full archive-attribution matrix, 20 tests); two-phase parallel scan (rayon hashes whole files in parallel, splitting internally at ≥32MB); `compare::reverse_op` per-row direction flip (click the row's action to flip; the Tauri shell reuses the very same lib function)
+- [x] v0.3.x compare classification-matrix unit tests (the full archive-attribution matrix, 20 tests); two-phase parallel scan (rayon hashes whole files in parallel, splitting internally at ≥32MB); `compare::reverse_op` per-row direction flip (click the row's action to flip; the frontend previews it and the Tauri shell uses that same lib function to reconstruct the authenticated apply selection)
 - [x] v0.4 remote: `pack` / `apply-pack` — a tar container (plan.jsonl + payload + trailing manifest), plan blake3 + per-file blake3 + a combined hash; nothing touches target until the whole staging area verifies; reuses apply's lock/trash/verify-after-copy; unix mode restored. **Pack on Win → ship over SMB → apply-pack on Mac → remote rescan shows 0 ops; the whole flow verified on real machines**
 - [x] v0.5 `territories` / `gen-jobs`: scan for `.ffs-sync` markers and generate a `cs-<slug>.toml` per territory (sync mode + an automatic archive path) — the syncdash edition of the CodeSync generator, measured generating 11 territories; runs in parallel with FFS, the moment to switch left to the user
 - [x] v0.6 `run --all`/`--prefix`; the end-to-end ssh remote pipeline (enabled just by setting remote_host in the job; verified on real machines: dry → apply → rerun 0 ops, symlinks included); symlink policies exclude/direct (compared by target, with apply creating/replacing/deleting the link itself); renames within the same parent directory are paired first (reason distinguishes rename from move); updating the Mac via a git bundle over SMB (the channel for when the mount is offline)

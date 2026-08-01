@@ -18,11 +18,20 @@ use crate::fs::vfs::{Support, Vfs};
 use crate::model::table::Snapshot;
 
 /// 6 MiB, so it is over the 4 MiB sampling floor and actually gets a `~` digest.
-const BIG: Seed =
-    Seed { path: "big/handbook.bin", seed: 20, size: 6 * 1_048_576, mtime_ms: 1_767_225_600_000 };
+const BIG: Seed = Seed {
+    path: "big/handbook.bin",
+    seed: 20,
+    size: 6 * 1_048_576,
+    mtime_ms: 1_767_225_600_000,
+};
 
 fn archive_job(rigor: &str, at: &std::path::Path) -> Job {
-    Job { mode: "sync".into(), rigor: rigor.into(), archive: Some(at.to_path_buf()), ..bare_job() }
+    Job {
+        mode: "sync".into(),
+        rigor: rigor.into(),
+        archive: Some(at.to_path_buf()),
+        ..bare_job()
+    }
 }
 
 fn scratch_archive(tag: &str) -> std::path::PathBuf {
@@ -47,7 +56,11 @@ fn the_archive_and_the_comparison_must_agree_on_evidence_tier() {
 
     // Round one. The two sides already agree, so this exists only to write the archive.
     let p1 = cycle(&job, &sv, &tv);
-    assert!(p1.ops.is_empty(), "identical trees should need no work: {:?}", p1.ops);
+    assert!(
+        p1.ops.is_empty(),
+        "identical trees should need no work: {:?}",
+        p1.ops
+    );
 
     let archived = Snapshot::load(&arch).expect("archive written");
     let row = archived
@@ -65,7 +78,9 @@ fn the_archive_and_the_comparison_must_agree_on_evidence_tier() {
 
     let reasons: Vec<&str> = out.plan.ops.iter().map(|o| o.reason.as_str()).collect();
     assert!(
-        !reasons.iter().any(|r| r.starts_with("deleted-on-target-but-changed-on-source")),
+        !reasons
+            .iter()
+            .any(|r| r.starts_with("deleted-on-target-but-changed-on-source")),
         "the source never changed, so this must not be a delete-versus-edit conflict — and that \
          conflict is unresolvable by any policy, so it would never clear.\n\
          archive recorded {archived_hash:?} for a file the comparison re-read at the joint tier.\n\
@@ -109,22 +124,31 @@ fn an_archive_from_a_different_rigor_is_refused_not_misread() {
     // The user raises rigor. `paranoid` reads every byte, so nothing it produces can match.
     tv.remove_file(BIG.path).expect("remove on target");
     let (said, ctx) = watched();
-    let out = crate::run::local::compare_resolved(&archive_job("paranoid", &arch), &sv, &tv, &ctx, true)
-        .expect("compare");
+    let out =
+        crate::run::local::compare_resolved(&archive_job("paranoid", &arch), &sv, &tv, &ctx, true)
+            .expect("compare");
 
     let text = said.text();
     assert!(
-        text.contains("archive was written with sampled evidence") && text.contains("compares at full"),
+        text.contains("archive was written with sampled evidence")
+            && text.contains("compares at full"),
         "the refusal has to be stated, not silent — a run that quietly stopped attributing \
          deletions would look identical to one that had no deletions:\n{text}"
     );
     assert!(
-        !out.plan.ops.iter().any(|o| o.reason.contains("deleted-on-target-but-changed-on-source")),
+        !out.plan
+            .ops
+            .iter()
+            .any(|o| o.reason.contains("deleted-on-target-but-changed-on-source")),
         "an unusable archive must not be read as evidence the source changed: {:?}",
         out.plan.ops
     );
     assert_eq!(
-        out.plan.ops.iter().map(|o| o.reason.as_str()).collect::<Vec<_>>(),
+        out.plan
+            .ops
+            .iter()
+            .map(|o| o.reason.as_str())
+            .collect::<Vec<_>>(),
         vec!["only-in-source"],
         "with no usable archive, sync fills both ways and never deletes"
     );

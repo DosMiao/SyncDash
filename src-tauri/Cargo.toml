@@ -21,6 +21,8 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+getrandom = "0.3"
+blake3 = "1"
 syncdash = { path = ".." }
 # Frontend types are generated from Rust; export directory: see `.cargo/config.toml` at the workspace root.
 ts-rs = { version = "12", features = ["serde-compat", "no-serde-warnings"] }

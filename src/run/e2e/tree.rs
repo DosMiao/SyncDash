@@ -62,7 +62,11 @@ fn walk(v: &Arc<dyn Vfs>, rel: &str, out: &mut Vec<Shape>) {
         if is_self_meta(&e.name) {
             continue;
         }
-        let path = if rel.is_empty() { e.name.clone() } else { format!("{rel}/{}", e.name) };
+        let path = if rel.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{rel}/{}", e.name)
+        };
         match e.meta.kind {
             EntryKind::Dir => {
                 out.push(Shape {
@@ -164,7 +168,9 @@ pub fn assert_same(want: &[Shape], got: &[Shape], tol: &Tolerance, what: &str) {
     }
 
     for w in want {
-        let Some(g) = got.iter().find(|g| g.path == w.path) else { continue };
+        let Some(g) = got.iter().find(|g| g.path == w.path) else {
+            continue;
+        };
         let at = &w.path;
         if w.kind != g.kind {
             diffs.push(format!("{at}: kind {:?} != {:?}", g.kind, w.kind));
@@ -189,7 +195,10 @@ pub fn assert_same(want: &[Shape], got: &[Shape], tol: &Tolerance, what: &str) {
         if tol.mtime_at_all && w.kind == EntryKind::File {
             let d = (g.mtime_ms - w.mtime_ms).abs();
             if d > tol.mtime_ms {
-                diffs.push(format!("{at}: mtime off by {d} ms (tolerance {} ms)", tol.mtime_ms));
+                diffs.push(format!(
+                    "{at}: mtime off by {d} ms (tolerance {} ms)",
+                    tol.mtime_ms
+                ));
             }
         }
         if tol.mode && w.mode != g.mode {
@@ -201,7 +210,11 @@ pub fn assert_same(want: &[Shape], got: &[Shape], tol: &Tolerance, what: &str) {
     }
 
     if !diffs.is_empty() {
-        panic!("{what}: {} difference(s)\n  {}", diffs.len(), diffs.join("\n  "));
+        panic!(
+            "{what}: {} difference(s)\n  {}",
+            diffs.len(),
+            diffs.join("\n  ")
+        );
     }
 }
 

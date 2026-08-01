@@ -59,7 +59,6 @@ export function Overview(props: Props) {
   }) => (
     <div
       className={'ovrow' + (ovFilter === rowKey ? ' on' : '') + (depth ? ' ovchild' : '')}
-      onClick={() => onFilter(ovFilter === rowKey ? null : rowKey)}
     >
       <div className="l1">
         {/* A real button rather than testing what the click landed on: the chevron is an <svg> now,
@@ -67,30 +66,49 @@ export function Overview(props: Props) {
         <span className="chev">
           {hasKids ? (
             <button
+              type="button"
               title={expanded.has(rowKey) ? 'Collapse' : 'Expand one level'}
-              onClick={(e) => { e.stopPropagation(); onToggleExpanded(rowKey); }}
+              aria-label={`${expanded.has(rowKey) ? 'Collapse' : 'Expand'} ${label}`}
+              aria-expanded={expanded.has(rowKey)}
+              onClick={() => onToggleExpanded(rowKey)}
             >{expanded.has(rowKey) ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</button>
           ) : null}
         </span>
-        <span className="nm" title={label}>{label}</span>
-        <span className="ct">{items} · {humanSize(bytes) || '0 B'}</span>
+        <button
+          type="button"
+          className="ov-filter"
+          aria-pressed={ovFilter === rowKey}
+          aria-label={`${ovFilter === rowKey ? 'Clear' : 'Filter by'} ${label}, ${items} ${items === 1 ? 'item' : 'items'}, ${humanSize(bytes) || '0 B'}`}
+          onClick={() => onFilter(ovFilter === rowKey ? null : rowKey)}
+        >
+          <span className="nm" title={label}>{label}</span>
+          <span className="ct">{items} · {humanSize(bytes) || '0 B'}</span>
+        </button>
       </div>
       {/* Width through the style prop, i.e. CSSOM — a style="" attribute is blocked by the nonce CSP */}
-      <div className="ovbar"><div style={{ width: `${Math.round(share(bytes, items) * 100)}%` }} /></div>
+      <div className="ovbar" aria-hidden="true"><div style={{ width: `${Math.round(share(bytes, items) * 100)}%` }} /></div>
     </div>
   );
 
   return (
-    <aside className={'overview' + (collapsed ? ' collapsed' : '')}>
+    <aside className={'overview' + (collapsed ? ' collapsed' : '')} aria-label="Difference overview">
       <button
         className="icon-btn ov-toggle"
         title="Overview aggregation (expand / collapse)"
+        aria-label={collapsed ? 'Expand difference overview' : 'Collapse difference overview'}
+        aria-expanded={!collapsed}
         onClick={onToggleCollapsed}
       >{collapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}</button>
       <div className="ov-body">
         <div className="ov-head">
           <span>Overview</span>
-          <button className="icon-btn ov-clear" title="Clear filter" onClick={() => onFilter(null)}>
+          <button
+            className="icon-btn ov-clear"
+            title="Clear filter"
+            aria-label="Clear overview filter"
+            disabled={ovFilter === null}
+            onClick={() => onFilter(null)}
+          >
             <X size={13} />
           </button>
         </div>
