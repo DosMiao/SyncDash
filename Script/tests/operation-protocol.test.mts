@@ -10,7 +10,7 @@ import {
   reviewApplyArgs,
   reviewCompareArgs,
   startAutoScanArgs,
-} from '../../typescript/core/operation-protocol.ts';
+} from '../../typescript/core/operationProtocol.ts';
 import type { CompareOwner } from '../../typescript/core/types/generated/CompareOwner.ts';
 
 const owner: CompareOwner = {
@@ -32,15 +32,30 @@ test('Tauri argument mapping uses camelCase only at the boundary', () => {
     expectedJobId: 'job-stable-id', targetIndex: 2,
   });
   assert.deepEqual(reviewCompareArgs('job-stable-id'), { expectedJobId: 'job-stable-id' });
-  assert.deepEqual(approveOperationArgs('challenge', true, false, true, false), {
+  assert.deepEqual(reviewCompareArgs('job-stable-id', 2, { generation: 8, ticket_id: 13 }), {
+    expectedJobId: 'job-stable-id',
+    targetIndex: 2,
+    autoScanRequest: { generation: 8, ticket_id: 13 },
+  });
+  assert.deepEqual(approveOperationArgs('challenge', {
+    operation: 'interactive_apply',
+    acknowledge_health: true,
+    accept_capabilities: false,
+    session_grant: 'remember_capabilities',
+  }), {
     challengeId: 'challenge',
-    acknowledgeHealth: true,
-    acceptCapabilities: false,
-    rememberForSession: true,
-    allowUnattended: false,
+    approval: {
+      operation: 'interactive_apply',
+      acknowledge_health: true,
+      accept_capabilities: false,
+      session_grant: 'remember_capabilities',
+    },
   });
   assert.deepEqual(compareAuthorizationArgs('compare-token'), { authorizationToken: 'compare-token' });
-  assert.deepEqual(reviewApplyArgs(owner, selected), { owner, selected });
+  assert.deepEqual(reviewApplyArgs(owner.identity, selected), {
+    compareIdentity: owner.identity,
+    selected,
+  });
   assert.deepEqual(autoScanApplyAuthorizationArgs(8, 13), { generation: 8, ticketId: 13 });
   assert.deepEqual(applyAuthorizationArgs('apply-token', 73), {
     authorizationToken: 'apply-token', launchId: 73,

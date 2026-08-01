@@ -16,7 +16,7 @@ import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, ProgressBarStatus } from '@tauri-apps/api/window';
 import {
   cancelRun,
-  closeProgressLaunch,
+  beginProgressWindowClose,
   destroyProgressWindow,
   pauseRun,
   postSyncAction,
@@ -37,6 +37,7 @@ interface RunRejected { launch_id: number; message: string }
 export function ProgressApp() {
   const run = useRef<RunState>(newRunState());
   const pendingLaunch = useRef<PendingLaunch | null>(null);
+  const reportedWindowChromeFailures = useRef(new Set<string>());
   // Bumping this is the only thing that re-renders; the tick below decides how often that happens
   const [, forceRender] = useState(0);
   const rerender = useCallback(() => forceRender((n) => n + 1), []);
@@ -44,6 +45,7 @@ export function ProgressApp() {
   const [autoclose, setAutoclose] = useState(() => localStorage.getItem('sd.autoclose') === '1');
   const [whenFin, setWhenFin] = useState(() => localStorage.getItem('sd.whenfin') ?? 'none');
   const [countdown, setCountdown] = useState<{ kind: string; left: number } | null>(null);
+  const [postActionFailure, setPostActionFailure] = useState<{ kind: string; error: string } | null>(null);
   const [errorsOpen, setErrorsOpen] = useState(false);
   const [rejected, setRejected] = useState<string | null>(null);
   /// Where the Stop button is in its own little lifecycle. A state rather than the button's caption:
@@ -60,6 +62,33 @@ export function ProgressApp() {
     rerender();
   }, [rerender]);
 
+  const reportWindowChromeFailure = useCallback((action: string, error: unknown) => {
+    if (reportedWindowChromeFailures.current.has(action)) return;
+    reportedWindowChromeFailures.current.add(action);
+    run.current.errors.push({
+      path: '', action: 'window', side: '', message: `${action}: ${String(error)}`, warning: true,
+    });
+    rerender();
+  }, [rerender]);
+
+  const requestWindowDestruction = useCallback(async () => {
+    try {
+      await destroyProgressWindow();
+    } catch (error) {
+      reportControlError('Could not close the progress window', error);
+    }
+  }, [reportControlError]);
+
+  const executePostSyncAction = useCallback(async (kind: string) => {
+    setPostActionFailure(null);
+    try {
+      await postSyncAction(kind);
+    } catch (error) {
+      setPostActionFailure({ kind, error: String(error) });
+      reportControlError(`Could not ${kind === 'sleep' ? 'put the computer to sleep' : 'shut down the computer'}`, error);
+    }
+  }, [reportControlError]);
+
   const autocloseRef = useRef(autoclose);
   autocloseRef.current = autoclose;
   const whenFinRef = useRef(whenFin);
@@ -74,6 +103,7 @@ export function ProgressApp() {
     setRejected(null);
     setStop('idle');
     setCountdown(null);
+    setPostActionFailure(null);
     rerender();
     void emit(`progress-window-ready-${id}`);
   }, [rerender]);
@@ -98,12 +128,12 @@ export function ProgressApp() {
     if (!countdown) return;
     if (countdown.left <= 0) {
       setCountdown(null);
-      postSyncAction(countdown.kind).catch(() => {});
+      void executePostSyncAction(countdown.kind);
       return;
     }
     const t = setTimeout(() => setCountdown((c) => (c ? { ...c, left: c.left - 1 } : c)), 1000);
     return () => clearTimeout(t);
-  }, [countdown]);
+  }, [countdown, executePostSyncAction]);
 
   const onEvent = useCallback((ev: RunEv) => {
     const s = run.current;
@@ -118,6 +148,7 @@ export function ProgressApp() {
       setRejected(null);
       setStop('idle');
       setCountdown(null);
+      setPostActionFailure(null);
     }
     const st = run.current;
 
@@ -230,10 +261,12 @@ export function ProgressApp() {
           cur.failed = !ev.cancelled;
         }
         rerender();
-        if (st.closeAfterStop) { win.close().catch(() => {}); break; }
+        if (st.closeAfterStop) { void requestWindowDestruction(); break; }
         if (ev.cancelled) break;
         if ((ev.errors ?? 0) === 0 && autocloseRef.current && st.applying) {
-          setTimeout(() => { if (run.current.summary) win.close().catch(() => {}); }, 1200);
+          setTimeout(() => {
+            if (run.current.summary) void requestWindowDestruction();
+          }, 1200);
           break;
         }
         if ((ev.errors ?? 0) === 0 && whenFinRef.current !== 'none' && st.applying) {
@@ -242,7 +275,7 @@ export function ProgressApp() {
         break;
       }
     }
-  }, [rerender]);
+  }, [requestWindowDestruction, rerender]);
 
   useEffect(() => {
     let disposed = false;
@@ -272,7 +305,7 @@ export function ProgressApp() {
         setRejected(e.payload.message);
         setStop('finished');
         rerender();
-        if (closeAfterStop) destroyProgressWindow().catch(() => {});
+        if (closeAfterStop) void requestWindowDestruction();
       }),
       listen<number>('progress-window-arm', (e) => armLaunch(e.payload)),
     ]).then(async (stops) => {
@@ -302,7 +335,7 @@ export function ProgressApp() {
       disposed = true;
       unlisten?.();
     };
-  }, [armLaunch, onEvent, reportControlError, rerender]);
+  }, [armLaunch, onEvent, reportControlError, requestWindowDestruction, rerender]);
 
   // The numeric readouts step every 500ms (same divider as FFS — figures that flip ten times a second
   // are unreadable). The graphs keep their own 100ms repaint inside <Graph>, off the React tree.
@@ -311,7 +344,6 @@ export function ProgressApp() {
     return () => window.clearInterval(id);
   }, [rerender]);
 
-  // Window title + taskbar (fails silently: macOS has no taskbar progress)
   const s = run.current;
   const pct = percent(s);
   const paused = s.pausedSince > 0;
@@ -320,36 +352,43 @@ export function ProgressApp() {
       ? (s.summary.cancelled ? 'Stopped — SyncDash' : 'Done — SyncDash')
       : rejected ? 'Could not start — SyncDash'
       : s.applying ? `${Math.round(pct)}% — SyncDash` : `${s.phase ? PHASE_LABEL[s.phase] : 'Running'} — SyncDash`;
-    win.setTitle(title).catch(() => {});
-    if (s.summary) win.setProgressBar({ status: ProgressBarStatus.None }).catch(() => {});
+    void win.setTitle(title).catch((error) => {
+      reportWindowChromeFailure('Could not update the progress window title', error);
+    });
+    if (s.summary) void win.setProgressBar({ status: ProgressBarStatus.None }).catch((error) => {
+      reportWindowChromeFailure('Could not clear operating-system progress', error);
+    });
     else if (s.applying) {
-      win.setProgressBar({
+      void win.setProgressBar({
         status: paused ? ProgressBarStatus.Paused : ProgressBarStatus.Normal,
         progress: Math.round(pct),
-      }).catch(() => {});
+      }).catch((error) => {
+        reportWindowChromeFailure('Could not update operating-system progress', error);
+      });
     }
-  }, [paused, pct, rejected, s.applying, s.phase, s.summary]);
+  }, [paused, pct, rejected, reportWindowChromeFailure, s.applying, s.phase, s.summary]);
 
   // Close button = FFS semantics: while running, cooperatively cancel first and leave once Summary arrives
   useEffect(() => {
     const un = win.onCloseRequested(async (e) => {
       e.preventDefault();
-      // React's view may still describe the previous run while a new launch is being armed. Ask
-      // the backend first: clearing a pending reservation or cancelling the matching interactive
-      // run is atomic with begin_run_for_launch, so a close can never start a headless sync.
+      // React may still describe the previous run while a launch is being armed. The backend owns
+      // the atomic reservation-to-Apply transition, so closing cannot start a headless sync.
       run.current.closeAfterStop = true;
-      let launchState: Awaited<ReturnType<typeof closeProgressLaunch>>;
-      try { launchState = await closeProgressLaunch(); }
+      let closeDecision: Awaited<ReturnType<typeof beginProgressWindowClose>>;
+      try { closeDecision = await beginProgressWindowClose(); }
       catch (error) { reportControlError('Could not inspect the active launch before closing', error); return; }
       let current = run.current;
       current.closeAfterStop = true;
-      if (launchState === 'pending') {
+      if (closeDecision.decision === 'pending_launch_cancelled') {
         pendingLaunch.current = null;
-        destroyProgressWindow().catch(() => {});
+        void requestWindowDestruction();
         return;
       }
-      if (launchState === 'active') {
-        if (current.summary) destroyProgressWindow().catch(() => {});
+      if (closeDecision.decision === 'active_run_cancellation_requested') {
+        if (current.runId === closeDecision.run_id && current.summary) {
+          void requestWindowDestruction();
+        }
         else setStop('stopping');
         return;
       }
@@ -369,24 +408,28 @@ export function ProgressApp() {
         catch (error) { reportControlError('Could not stop this run', error); return; }
         if (!had) {
           // Catch a launch reserved while cancelRun was in flight before destroying the window.
-          let racedLaunch: Awaited<ReturnType<typeof closeProgressLaunch>>;
-          try { racedLaunch = await closeProgressLaunch(); }
+          let racedDecision: Awaited<ReturnType<typeof beginProgressWindowClose>>;
+          try { racedDecision = await beginProgressWindowClose(); }
           catch (error) { reportControlError('Could not inspect a raced launch before closing', error); return; }
           current = run.current;
           current.closeAfterStop = true;
-          if (racedLaunch === 'active') {
-            setStop('stopping');
+          if (racedDecision.decision === 'active_run_cancellation_requested') {
+            if (current.runId === racedDecision.run_id && current.summary) {
+              void requestWindowDestruction();
+            } else {
+              setStop('stopping');
+            }
             return;
           }
-          if (racedLaunch === 'pending') pendingLaunch.current = null;
+          if (racedDecision.decision === 'pending_launch_cancelled') pendingLaunch.current = null;
         } else {
           return;
         }
       }
-      destroyProgressWindow().catch(() => {});
+      void requestWindowDestruction();
     });
     return () => { un.then((f) => f()); };
-  }, [reportControlError]);
+  }, [reportControlError, requestWindowDestruction]);
 
   const r60 = windowRate(s, 60000);
   const nErr = s.errors.filter((e) => !e.warning).length;
@@ -488,6 +531,18 @@ export function ProgressApp() {
           <span className="cdtext">{countdown.kind === 'sleep' ? 'Sleep' : 'Shut down'} in {countdown.left}s</span>
           <div className="cdbar"><div className="cdfill" style={{ width: `${countdown.left * 10}%` }} /></div>
           <button className="btn" onClick={() => setCountdown(null)}>Cancel</button>
+        </div>
+      )}
+
+      {postActionFailure && (
+        <div className="countdown show" role="alert">
+          <span className="cdtext">{postActionFailure.error}</span>
+          <button
+            className="btn"
+            disabled={s.running && !s.summary}
+            onClick={() => void executePostSyncAction(postActionFailure.kind)}
+          >Retry</button>
+          <button className="btn" onClick={() => setPostActionFailure(null)}>Dismiss</button>
         </div>
       )}
 

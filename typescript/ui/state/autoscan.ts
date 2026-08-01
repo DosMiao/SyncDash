@@ -1,4 +1,4 @@
-import type { AutoScanStatusDto } from '../../core/ipc';
+import type { AutoScanStatusDto } from '../../core/types/generated/AutoScanStatusDto';
 import type { CompareOwner } from '../../core/types/generated/CompareOwner';
 
 export const AUTOSCAN_TICKET_LEDGER_CAPACITY = 64;
@@ -32,8 +32,7 @@ function statusRank(status: AutoScanStatusDto): number {
 /**
  * Reconcile snapshots, events, and command responses without allowing an older worker generation
  * (or its initial `starting` snapshot) to resurrect or regress the monitor shown in the toolbar.
- * The never-armed DTO uses generation zero; stopped monitors retain their generation/cursor. The
- * zero-generation normalization is a defensive fallback, and a stale status read cannot invoke it.
+ * The never-armed DTO uses generation zero; stopped monitors retain their generation/cursor.
  */
 export function reconcileAutoScanStatus(
   current: AutoScanStatusDto | null,
@@ -43,20 +42,7 @@ export function reconcileAutoScanStatus(
 ): AutoScanStatusDto | null {
   if (!current) return incoming;
 
-  let candidate = incoming;
-  if (!incoming.active && incoming.generation === 0 && current.active) {
-    if (source === 'snapshot' || source === 'start') return current;
-    candidate = {
-      ...incoming,
-      generation: current.generation,
-      latest_ticket_id: Math.max(current.latest_ticket_id, incoming.latest_ticket_id),
-      job_id: current.job_id,
-      job_name: current.job_name,
-      config_revision: current.config_revision,
-      target_index: current.target_index,
-    };
-  }
-
+  const candidate = incoming;
   if (candidate.generation < current.generation) return current;
   if (candidate.generation > current.generation) return candidate;
   if (!sameBinding(current, candidate)) return current;

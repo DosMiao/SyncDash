@@ -8,23 +8,7 @@ use syncdash::fs::vfs::spec::{parse, RootSpec};
 use crate::autoscan::{
     configured_interval, AutoScanBinding, AutoScanController, AutoScanStatusDto,
 };
-use crate::dto::CompareOwner;
-use crate::state::{begin_run_command, finish_run_command, RunState};
-
-struct AutoScanCommandGuard(Arc<RunState>);
-
-impl AutoScanCommandGuard {
-    fn begin(state: Arc<RunState>) -> Self {
-        begin_run_command(&state);
-        Self(state)
-    }
-}
-
-impl Drop for AutoScanCommandGuard {
-    fn drop(&mut self) {
-        finish_run_command(&self.0);
-    }
-}
+use crate::run_lifecycle::RunLifecycle;
 
 fn require_main(window: &tauri::WebviewWindow) -> Result<(), String> {
     if window.label() == "main" {
@@ -39,7 +23,7 @@ pub fn start_autoscan(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     controller: tauri::State<'_, Arc<AutoScanController>>,
-    run_state: tauri::State<'_, Arc<RunState>>,
+    run_lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
     expected_job_id: String,
     expected_revision: String,
     target_index: usize,
@@ -48,7 +32,7 @@ pub fn start_autoscan(
     // Cross the same short gate as Compare/Apply before reading the registry. A concurrent save
     // either finishes first or sees this command in flight, so it cannot leave a freshly armed
     // generation bound to the revision that existed just before its mutation.
-    let _command = AutoScanCommandGuard::begin(run_state.inner().clone());
+    let _command = run_lifecycle.inner().command_lease()?;
     let (job_name, full_job) = syncdash::job::load_by_id(&expected_job_id).map_err(|error| {
         format!(
             "The selected job was deleted or replaced before AutoScan started — refresh it and try again: {error}"
@@ -72,9 +56,8 @@ pub fn start_autoscan(
         (RootSpec::Local(source), RootSpec::Local(target)) => Some((source, target)),
         _ => None,
     };
-    Ok(controller.start(
+    controller.start(
         app,
-        run_state.inner().clone(),
         AutoScanBinding {
             job_id: full_job.job_id.clone(),
             job_name,
@@ -85,7 +68,7 @@ pub fn start_autoscan(
             rigor: job.rigor.clone(),
         },
         local_roots,
-    ))
+    )
 }
 
 #[tauri::command]
@@ -113,8 +96,7 @@ pub fn complete_autoscan(
     generation: u64,
     ticket_id: u64,
     succeeded: bool,
-    owner: Option<CompareOwner>,
 ) -> Result<AutoScanStatusDto, String> {
     require_main(&window)?;
-    controller.complete(generation, ticket_id, succeeded, owner.as_ref())
+    controller.complete(generation, ticket_id, succeeded)
 }

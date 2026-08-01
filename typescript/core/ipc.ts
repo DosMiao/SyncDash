@@ -12,11 +12,14 @@ import {
   reviewApplyArgs,
   reviewCompareArgs,
   startAutoScanArgs,
-} from './operation-protocol';
+} from './operationProtocol';
 import type { ApplyDto } from './types/generated/ApplyDto';
 import type { AppSettings } from './types/generated/AppSettings';
 import type { AuthorizationDto } from './types/generated/AuthorizationDto';
+import type { AutoScanStatusDto } from './types/generated/AutoScanStatusDto';
+import type { AutoScanTriggerDto } from './types/generated/AutoScanTriggerDto';
 import type { CompareOwner } from './types/generated/CompareOwner';
+import type { CompareIdentity } from './types/generated/CompareIdentity';
 import type { Job as JobFull } from './types/generated/Job';
 import type { JobDeleteDto } from './types/generated/JobDeleteDto';
 import type { JobDetailDto } from './types/generated/JobDetailDto';
@@ -26,8 +29,11 @@ import type { JobSaveDto } from './types/generated/JobSaveDto';
 import type { JunkPresetDto } from './types/generated/JunkPresetDto';
 import type { MigrateReport } from './types/generated/MigrateReport';
 import type { OperationReviewDto } from './types/generated/OperationReviewDto';
+import type { OperationApprovalDto } from './types/generated/OperationApprovalDto';
+import type { AutoScanCompareRequestDto } from './types/generated/AutoScanCompareRequestDto';
 import type { PathVerdict } from './types/generated/PathVerdict';
 import type { PlanHeader } from './types/generated/PlanHeader';
+import type { ProgressWindowCloseDecisionDto } from './types/generated/ProgressWindowCloseDecisionDto';
 import type { RowMeta } from './types/generated/RowMeta';
 import type { RunRecord } from './types/generated/RunRecord';
 import type { IdenticalPage } from './types/generated/IdenticalPage';
@@ -63,37 +69,6 @@ export const deleteJob = (name: string, expectedJobId: string, expectedRevision:
   invoke<JobDeleteDto>('delete_job', { name, expectedJobId, expectedRevision });
 export const jobsDir = () => invoke<string>('jobs_dir');
 
-export type AutoScanMode = 'starting' | 'native_fsevents' | 'polling';
-export type AutoScanReason = 'bootstrap' | 'filesystem_change' | 'watch_invalidated' | 'periodic_verification';
-
-export interface AutoScanStatusDto {
-  active: boolean;
-  generation: number;
-  job_id: string | null;
-  job_name: string | null;
-  config_revision: string | null;
-  target_index: number | null;
-  interval_secs: number | null;
-  auto_apply: boolean;
-  mode: AutoScanMode | null;
-  detail: string;
-  active_ticket: number | null;
-  latest_ticket_id: number;
-  pending_trigger: AutoScanTriggerDto | null;
-}
-
-export interface AutoScanTriggerDto {
-  generation: number;
-  ticket_id: number;
-  job_id: string;
-  job_name: string;
-  config_revision: string;
-  target_index: number;
-  auto_apply: boolean;
-  mode: Exclude<AutoScanMode, 'starting'>;
-  reason: AutoScanReason;
-}
-
 export const startAutoScan = (expectedJobId: string, expectedRevision: string, targetIndex: number) =>
   invoke<AutoScanStatusDto>('start_autoscan', startAutoScanArgs(expectedJobId, expectedRevision, targetIndex));
 export const stopAutoScan = () => invoke<AutoScanStatusDto>('stop_autoscan');
@@ -102,29 +77,25 @@ export const completeAutoScan = (
   generation: number,
   ticketId: number,
   succeeded: boolean,
-  owner: CompareOwner | null,
 ) => invoke<AutoScanStatusDto>('complete_autoscan', {
-  generation, ticketId, succeeded, owner,
+  generation, ticketId, succeeded,
 });
 
 // Compare / run
 
-export const reviewCompare = (expectedJobId: string, targetIndex?: number) =>
-  invoke<OperationReviewDto>('review_compare', reviewCompareArgs(expectedJobId, targetIndex));
+export const reviewCompare = (
+  expectedJobId: string,
+  targetIndex?: number,
+  autoScanRequest?: AutoScanCompareRequestDto,
+) => invoke<OperationReviewDto>(
+  'review_compare',
+  reviewCompareArgs(expectedJobId, targetIndex, autoScanRequest),
+);
 
 export const approveOperation = (
   challengeId: string,
-  acknowledgeHealth: boolean,
-  acceptCapabilities: boolean,
-  rememberForSession: boolean,
-  allowUnattended: boolean,
-) => invoke<AuthorizationDto>('approve_operation', approveOperationArgs(
-  challengeId,
-  acknowledgeHealth,
-  acceptCapabilities,
-  rememberForSession,
-  allowUnattended,
-));
+  approval: OperationApprovalDto,
+) => invoke<AuthorizationDto>('approve_operation', approveOperationArgs(challengeId, approval));
 
 export const compareJob = (authorizationToken: string) =>
   invoke<PlanDto>('compare_job', compareAuthorizationArgs(authorizationToken));
@@ -135,8 +106,8 @@ export const touchCompare = (owner: CompareOwner) =>
 export const restoreCompare = (jobId: string, targetIndex: number) =>
   invoke<PlanDto | null>('restore_compare', { jobId, targetIndex });
 
-export const reviewApply = (owner: CompareOwner, selected: SelectedRowDto[]) =>
-  invoke<OperationReviewDto>('review_apply', reviewApplyArgs(owner, selected));
+export const reviewApply = (compareIdentity: CompareIdentity, selected: SelectedRowDto[]) =>
+  invoke<OperationReviewDto>('review_apply', reviewApplyArgs(compareIdentity, selected));
 
 export const authorizeAutoScanApply = (generation: number, ticketId: number) =>
   invoke<AuthorizationDto>('authorize_autoscan_apply', autoScanApplyAuthorizationArgs(generation, ticketId));
@@ -150,8 +121,9 @@ export const replayRunEvents = (purpose: 'compare' | 'apply', afterSequence = 0)
   invoke<RunEventEnvelope[]>('replay_run_events', { purpose, afterSequence });
 export const openProgressWindow = () => invoke<number>('open_progress_window');
 export const cancelProgressLaunch = (launchId: number) => invoke<boolean>('cancel_progress_launch', { launchId });
-export const closeProgressLaunch = () => invoke<'pending' | 'active' | 'none'>('close_progress_launch');
-export const destroyProgressWindow = () => invoke<void>('close_progress_window');
+export const beginProgressWindowClose = () =>
+  invoke<ProgressWindowCloseDecisionDto>('begin_progress_window_close');
+export const destroyProgressWindow = () => invoke<void>('destroy_progress_window');
 export const postSyncAction = (kind: string) => invoke<void>('post_sync_action', { kind });
 
 // Paths / filters / export
@@ -200,4 +172,4 @@ export const logRuns = (job: string | null, limit: number) => invoke<RunRecord[]
 export const logArtifact = (runId: string, which: string) => invoke<string[]>('log_artifact', { runId, which });
 export const logDirPath = (runId: string | null) => invoke<string>('log_dir_path', { runId });
 export const getSettings = () => invoke<AppSettings>('get_settings');
-export const saveSettings = (s: AppSettings) => invoke<MigrateReport>('save_settings', { s, migrate: true });
+export const saveSettings = (settings: AppSettings) => invoke<MigrateReport>('save_settings', { settings, migrate: true });

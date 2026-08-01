@@ -82,6 +82,17 @@ pub(crate) struct CompareOwner {
     pub(crate) job_name: String,
 }
 
+/// Identifies the backend AutoScan trigger for which Compare is being reviewed. The backend turns
+/// this public cursor into a private, one-use permit; it is not itself execution authority.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct AutoScanCompareRequestDto {
+    #[ts(type = "number")]
+    pub(crate) generation: u64,
+    #[ts(type = "number")]
+    pub(crate) ticket_id: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct PlanDto {
@@ -111,15 +122,6 @@ pub(crate) struct SelectedRowDto {
     #[ts(type = "number")]
     pub(crate) index: usize,
     pub(crate) flipped: bool,
-}
-
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
-pub(crate) enum ReviewStatus {
-    DirectAuthorized,
-    ConfirmationRequired,
-    Blocked,
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
@@ -174,20 +176,60 @@ pub(crate) struct AuthorizationDto {
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
-pub(crate) struct OperationReviewDto {
-    pub(crate) status: ReviewStatus,
-    pub(crate) authorization: Option<AuthorizationDto>,
-    pub(crate) challenge_id: Option<String>,
-    #[ts(type = "number | null")]
-    pub(crate) expires_at_ms: Option<u64>,
-    pub(crate) blockers: Vec<String>,
-    pub(crate) warnings: Vec<String>,
-    pub(crate) capabilities: Vec<CapabilityIssueDto>,
-    pub(crate) requires_health_ack: bool,
-    pub(crate) requires_capability_ack: bool,
-    pub(crate) can_remember_for_session: bool,
-    pub(crate) can_allow_unattended: bool,
+pub(crate) enum OperationReviewDto {
+    Blocked {
+        blockers: Vec<String>,
+        warnings: Vec<String>,
+        capabilities: Vec<CapabilityIssueDto>,
+    },
+    DirectAuthorized {
+        authorization: AuthorizationDto,
+        capabilities: Vec<CapabilityIssueDto>,
+    },
+    CompareConfirmationRequired {
+        challenge_id: String,
+        #[ts(type = "number")]
+        expires_at_ms: u64,
+        capabilities: Vec<CapabilityIssueDto>,
+        can_remember_for_session: bool,
+    },
+    InteractiveApplyConfirmationRequired {
+        challenge_id: String,
+        #[ts(type = "number")]
+        expires_at_ms: u64,
+        warnings: Vec<String>,
+        capabilities: Vec<CapabilityIssueDto>,
+        requires_health_ack: bool,
+        requires_capability_ack: bool,
+        can_remember_for_session: bool,
+        can_allow_unattended: bool,
+    },
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum OperationApprovalDto {
+    Compare {
+        accept_capabilities: bool,
+        remember_for_session: bool,
+    },
+    InteractiveApply {
+        acknowledge_health: bool,
+        accept_capabilities: bool,
+        session_grant: ApplySessionGrantDecisionDto,
+    },
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum ApplySessionGrantDecisionDto {
+    None,
+    RememberCapabilities,
+    AllowAutoApply,
 }
 
 #[derive(Serialize, ts_rs::TS)]

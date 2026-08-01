@@ -1,4 +1,4 @@
-//! Process-local retention for successful Compare results.
+//! Process-local retention and execution freshness for successful Compare results.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -10,8 +10,19 @@ const DEFAULT_RETAINED_VERSION_CAPACITY: usize = 16;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CompareResultRepositoryError {
     DuplicateIdentity(CompareIdentity),
-    MissingJobPresentation { job_id: String },
+    MissingJobPresentation {
+        job_id: String,
+    },
     DanglingLatestVersion(CompareIdentity),
+    AwaitingSuccessfulCompare(CompareScope),
+    ResultIsNotExecutionFresh {
+        requested_run_id: u64,
+        fresh_run_id: u64,
+    },
+    FreshResultWasNotRetained(CompareIdentity),
+    VerificationEpochExhausted(CompareScope),
+    VerificationScopeMismatch,
+    VerificationAlreadyPublished(CompareIdentity),
 }
 
 impl std::fmt::Display for CompareResultRepositoryError {
@@ -31,6 +42,40 @@ impl std::fmt::Display for CompareResultRepositoryError {
                 "The latest Compare pointer for run {} has no retained version",
                 identity.compare_run_id
             ),
+            Self::AwaitingSuccessfulCompare(scope) => write!(
+                formatter,
+                "A newer Compare or AutoScan verification started for job '{}' target {} and has not published a successful result — wait for it to succeed or run Compare again",
+                scope.job_id,
+                scope.target_index + 1
+            ),
+            Self::ResultIsNotExecutionFresh {
+                requested_run_id,
+                fresh_run_id,
+            } => write!(
+                formatter,
+                "Compare run {} is retained for viewing but run {} is the execution-eligible result for this job target",
+                requested_run_id, fresh_run_id
+            ),
+            Self::FreshResultWasNotRetained(identity) => write!(
+                formatter,
+                "Execution-eligible Compare run {} is no longer retained — run Compare again",
+                identity.compare_run_id
+            ),
+            Self::VerificationEpochExhausted(scope) => write!(
+                formatter,
+                "The Compare verification sequence for job '{}' target {} is exhausted — restart SyncDash",
+                scope.job_id,
+                scope.target_index + 1
+            ),
+            Self::VerificationScopeMismatch => write!(
+                formatter,
+                "The successful Compare does not belong to its verification ticket's exact job revision and target"
+            ),
+            Self::VerificationAlreadyPublished(identity) => write!(
+                formatter,
+                "The verification ticket already published execution-eligible Compare run {}",
+                identity.compare_run_id
+            ),
         }
     }
 }
@@ -38,14 +83,14 @@ impl std::fmt::Display for CompareResultRepositoryError {
 impl std::error::Error for CompareResultRepositoryError {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CompareScope {
+pub(crate) struct CompareScope {
     job_id: String,
     target_index: usize,
     config_revision: String,
 }
 
 impl CompareScope {
-    fn new(job_id: &str, target_index: usize, config_revision: &str) -> Self {
+    pub(crate) fn new(job_id: &str, target_index: usize, config_revision: &str) -> Self {
         Self {
             job_id: job_id.to_string(),
             target_index,
@@ -60,6 +105,32 @@ impl CompareScope {
             &identity.config_revision,
         )
     }
+
+    pub(crate) fn contains(&self, identity: &CompareIdentity) -> bool {
+        self == &Self::from_identity(identity)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompareExecutionFreshness {
+    AwaitingSuccessfulCompare,
+    Fresh(CompareIdentity),
+}
+
+struct CompareExecutionState {
+    verification_epoch: u64,
+    freshness: CompareExecutionFreshness,
+}
+
+struct LatestComparePublication {
+    verification_epoch: u64,
+    identity: CompareIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompareVerificationTicket {
+    scope: CompareScope,
+    epoch: u64,
 }
 
 struct RetainedPlan {
@@ -71,8 +142,7 @@ struct RetainedPlan {
 }
 
 pub(crate) struct SuccessfulCompareResult {
-    identity: CompareIdentity,
-    job_name: String,
+    owner: CompareOwner,
     plan_digest: String,
     plan: RetainedPlan,
     source: syncdash::model::table::Snapshot,
@@ -97,8 +167,7 @@ impl SuccessfulCompareResult {
             owner,
         } = plan;
         Self {
-            identity: owner.identity,
-            job_name: owner.job_name,
+            owner,
             plan_digest,
             plan: RetainedPlan {
                 header,
@@ -111,6 +180,10 @@ impl SuccessfulCompareResult {
             target,
             compare_options,
         }
+    }
+
+    pub(crate) fn owner(&self) -> &CompareOwner {
+        &self.owner
     }
 }
 
@@ -175,7 +248,8 @@ impl RetainedCompareResult {
 
 struct CompareResultStore {
     versions_by_recency: VecDeque<Arc<CompareResultVersion>>,
-    latest_by_scope: HashMap<CompareScope, CompareIdentity>,
+    latest_by_scope: HashMap<CompareScope, LatestComparePublication>,
+    execution_by_scope: HashMap<CompareScope, CompareExecutionState>,
     job_names: HashMap<String, String>,
     capacity: usize,
 }
@@ -186,39 +260,77 @@ impl CompareResultStore {
         Self {
             versions_by_recency: VecDeque::new(),
             latest_by_scope: HashMap::new(),
+            execution_by_scope: HashMap::new(),
             job_names: HashMap::new(),
             capacity,
         }
     }
 
-    fn insert_version(
+    fn publish_successful_version(
         &mut self,
+        verification: &CompareVerificationTicket,
         version: SuccessfulCompareResult,
     ) -> Result<(), CompareResultRepositoryError> {
         if self
             .versions_by_recency
             .iter()
-            .any(|entry| entry.identity == version.identity)
+            .any(|entry| entry.identity == version.owner.identity)
         {
             return Err(CompareResultRepositoryError::DuplicateIdentity(
-                version.identity,
+                version.owner.identity,
             ));
         }
 
-        let identity = version.identity.clone();
+        let identity = version.owner.identity.clone();
         let scope = CompareScope::from_identity(&identity);
+        if verification.scope != scope {
+            return Err(CompareResultRepositoryError::VerificationScopeMismatch);
+        }
+        let current_epoch = self
+            .execution_by_scope
+            .get(&verification.scope)
+            .map(|state| state.verification_epoch);
+        if current_epoch == Some(verification.epoch) {
+            if let Some(CompareExecutionFreshness::Fresh(published)) = self
+                .execution_by_scope
+                .get(&verification.scope)
+                .map(|state| &state.freshness)
+            {
+                return Err(CompareResultRepositoryError::VerificationAlreadyPublished(
+                    published.clone(),
+                ));
+            }
+        }
         self.job_names
-            .insert(identity.job_id.clone(), version.job_name);
+            .insert(identity.job_id.clone(), version.owner.job_name);
         self.versions_by_recency
             .push_front(Arc::new(CompareResultVersion {
-                identity: version.identity,
+                identity: version.owner.identity,
                 plan_digest: version.plan_digest,
                 plan: version.plan,
                 source: version.source,
                 target: version.target,
                 compare_options: version.compare_options,
             }));
-        self.latest_by_scope.insert(scope, identity);
+        let should_advance_latest = self
+            .latest_by_scope
+            .get(&scope)
+            .is_none_or(|latest| verification.epoch > latest.verification_epoch);
+        if should_advance_latest {
+            self.latest_by_scope.insert(
+                scope.clone(),
+                LatestComparePublication {
+                    verification_epoch: verification.epoch,
+                    identity: identity.clone(),
+                },
+            );
+        }
+        if current_epoch == Some(verification.epoch) {
+            self.execution_by_scope
+                .get_mut(&scope)
+                .expect("the current verification ticket must have execution state")
+                .freshness = CompareExecutionFreshness::Fresh(identity);
+        }
         self.evict_excess_versions();
         Ok(())
     }
@@ -241,7 +353,11 @@ impl CompareResultStore {
         &mut self,
         scope: &CompareScope,
     ) -> Result<Option<RetainedCompareResult>, CompareResultRepositoryError> {
-        let Some(identity) = self.latest_by_scope.get(scope).cloned() else {
+        let Some(identity) = self
+            .latest_by_scope
+            .get(scope)
+            .map(|latest| latest.identity.clone())
+        else {
             return Ok(None);
         };
         self.get_exact(&identity)?.map_or_else(
@@ -252,6 +368,72 @@ impl CompareResultStore {
             },
             |retained| Ok(Some(retained)),
         )
+    }
+
+    fn begin_verification(
+        &mut self,
+        scope: CompareScope,
+    ) -> Result<CompareVerificationTicket, CompareResultRepositoryError> {
+        let state = self
+            .execution_by_scope
+            .entry(scope.clone())
+            .or_insert(CompareExecutionState {
+                verification_epoch: 0,
+                freshness: CompareExecutionFreshness::AwaitingSuccessfulCompare,
+            });
+        state.freshness = CompareExecutionFreshness::AwaitingSuccessfulCompare;
+        let Some(epoch) = state.verification_epoch.checked_add(1) else {
+            return Err(CompareResultRepositoryError::VerificationEpochExhausted(
+                scope,
+            ));
+        };
+        state.verification_epoch = epoch;
+        Ok(CompareVerificationTicket { scope, epoch })
+    }
+
+    fn ensure_execution_fresh(
+        &self,
+        identity: &CompareIdentity,
+    ) -> Result<(), CompareResultRepositoryError> {
+        let scope = CompareScope::from_identity(identity);
+        match self
+            .execution_by_scope
+            .get(&scope)
+            .map(|state| &state.freshness)
+        {
+            Some(CompareExecutionFreshness::Fresh(fresh)) if fresh == identity => {
+                if self
+                    .versions_by_recency
+                    .iter()
+                    .any(|version| version.identity == *identity)
+                {
+                    Ok(())
+                } else {
+                    Err(CompareResultRepositoryError::FreshResultWasNotRetained(
+                        identity.clone(),
+                    ))
+                }
+            }
+            Some(CompareExecutionFreshness::Fresh(fresh)) => {
+                Err(CompareResultRepositoryError::ResultIsNotExecutionFresh {
+                    requested_run_id: identity.compare_run_id,
+                    fresh_run_id: fresh.compare_run_id,
+                })
+            }
+            Some(CompareExecutionFreshness::AwaitingSuccessfulCompare) | None => Err(
+                CompareResultRepositoryError::AwaitingSuccessfulCompare(scope),
+            ),
+        }
+    }
+
+    fn get_fresh_exact(
+        &mut self,
+        identity: &CompareIdentity,
+    ) -> Result<RetainedCompareResult, CompareResultRepositoryError> {
+        self.ensure_execution_fresh(identity)?;
+        self.get_exact(identity)?.ok_or_else(|| {
+            CompareResultRepositoryError::FreshResultWasNotRetained(identity.clone())
+        })
     }
 
     fn touch(
@@ -285,6 +467,8 @@ impl CompareResultStore {
         });
         self.latest_by_scope
             .retain(|scope, _| scope.job_id != job_id || scope.config_revision != config_revision);
+        self.execution_by_scope
+            .retain(|scope, _| scope.job_id != job_id || scope.config_revision != config_revision);
         self.prune_unused_job_names();
     }
 
@@ -292,6 +476,8 @@ impl CompareResultStore {
         self.versions_by_recency
             .retain(|entry| entry.identity.job_id != job_id);
         self.latest_by_scope
+            .retain(|scope, _| scope.job_id != job_id);
+        self.execution_by_scope
             .retain(|scope, _| scope.job_id != job_id);
         self.job_names.remove(job_id);
     }
@@ -316,7 +502,10 @@ impl CompareResultStore {
                 .iter()
                 .rposition(|version| {
                     let scope = CompareScope::from_identity(&version.identity);
-                    self.latest_by_scope.get(&scope) != Some(&version.identity)
+                    self.latest_by_scope
+                        .get(&scope)
+                        .map(|latest| &latest.identity)
+                        != Some(&version.identity)
                 })
                 .unwrap_or(self.versions_by_recency.len() - 1);
             let evicted = self
@@ -326,8 +515,21 @@ impl CompareResultStore {
             let scope = CompareScope::from_identity(&evicted.identity);
             // "Latest" is a publication fact, not the newest survivor of LRU eviction. If that
             // exact version is gone, restore must return none instead of silently adopting an older run.
-            if self.latest_by_scope.get(&scope) == Some(&evicted.identity) {
+            if self
+                .latest_by_scope
+                .get(&scope)
+                .map(|latest| &latest.identity)
+                == Some(&evicted.identity)
+            {
                 self.latest_by_scope.remove(&scope);
+            }
+            if self
+                .execution_by_scope
+                .get(&scope)
+                .map(|state| &state.freshness)
+                == Some(&CompareExecutionFreshness::Fresh(evicted.identity.clone()))
+            {
+                self.execution_by_scope.remove(&scope);
             }
         }
         self.prune_unused_job_names();
@@ -364,11 +566,15 @@ impl CompareResultRepository {
         }
     }
 
-    pub(crate) fn insert_version(
+    pub(crate) fn publish_successful_version(
         &self,
+        verification: &CompareVerificationTicket,
         version: SuccessfulCompareResult,
     ) -> Result<(), CompareResultRepositoryError> {
-        self.store.lock().unwrap().insert_version(version)
+        self.store
+            .lock()
+            .unwrap()
+            .publish_successful_version(verification, version)
     }
 
     pub(crate) fn get_exact(
@@ -376,6 +582,34 @@ impl CompareResultRepository {
         identity: &CompareIdentity,
     ) -> Result<Option<RetainedCompareResult>, CompareResultRepositoryError> {
         self.store.lock().unwrap().get_exact(identity)
+    }
+
+    pub(crate) fn get_fresh_exact(
+        &self,
+        identity: &CompareIdentity,
+    ) -> Result<RetainedCompareResult, CompareResultRepositoryError> {
+        self.store.lock().unwrap().get_fresh_exact(identity)
+    }
+
+    pub(crate) fn begin_verification(
+        &self,
+        scope: CompareScope,
+    ) -> Result<CompareVerificationTicket, CompareResultRepositoryError> {
+        self.store.lock().unwrap().begin_verification(scope)
+    }
+
+    /// Keep the freshness lock through a short reservation edge. All callers acquire other locks
+    /// only after this one; no authorization or lifecycle path may call back into this repository.
+    pub(crate) fn with_fresh_execution_eligibility<T>(
+        &self,
+        identity: &CompareIdentity,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let store = self.store.lock().unwrap();
+        store
+            .ensure_execution_fresh(identity)
+            .map_err(|error| error.to_string())?;
+        operation()
     }
 
     pub(crate) fn latest_for(
@@ -554,15 +788,19 @@ mod tests {
         )
     }
 
+    fn publish(repository: &CompareResultRepository, version: SuccessfulCompareResult) {
+        let scope = CompareScope::from_identity(&version.owner.identity);
+        let verification = repository.begin_verification(scope).unwrap();
+        repository
+            .publish_successful_version(&verification, version)
+            .unwrap();
+    }
+
     #[test]
     fn exact_versions_survive_newer_publications_for_the_same_scope() {
         let repository = CompareResultRepository::with_capacity(4);
-        repository
-            .insert_version(version("job-a", "A", 0, "revision-a", 1))
-            .unwrap();
-        repository
-            .insert_version(version("job-a", "A", 0, "revision-a", 2))
-            .unwrap();
+        publish(&repository, version("job-a", "A", 0, "revision-a", 1));
+        publish(&repository, version("job-a", "A", 0, "revision-a", 2));
 
         let older = repository
             .get_exact(&identity("job-a", 0, "revision-a", 1))
@@ -577,14 +815,207 @@ mod tests {
     }
 
     #[test]
+    fn failed_or_cancelled_newer_compare_preserves_display_but_blocks_execution() {
+        let repository = CompareResultRepository::with_capacity(4);
+        let retained_identity = identity("job-a", 0, "revision-a", 1);
+        publish(&repository, version("job-a", "A", 0, "revision-a", 1));
+        assert!(repository.get_fresh_exact(&retained_identity).is_ok());
+
+        repository
+            .begin_verification(CompareScope::new("job-a", 0, "revision-a"))
+            .unwrap();
+
+        assert!(repository.get_exact(&retained_identity).unwrap().is_some());
+        assert_eq!(
+            repository
+                .latest_for("job-a", 0, "revision-a")
+                .unwrap()
+                .unwrap()
+                .identity(),
+            &retained_identity
+        );
+        let error = match repository.get_fresh_exact(&retained_identity) {
+            Err(error) => error,
+            Ok(_) => panic!("a failed newer Compare must leave the retained result non-executable"),
+        };
+        assert!(matches!(
+            error,
+            CompareResultRepositoryError::AwaitingSuccessfulCompare(_)
+        ));
+        let mut reserved = false;
+        assert!(repository
+            .with_fresh_execution_eligibility(&retained_identity, || {
+                reserved = true;
+                Ok(())
+            })
+            .is_err());
+        assert!(!reserved);
+    }
+
+    #[test]
+    fn successful_republication_restores_only_the_new_exact_result() {
+        let repository = CompareResultRepository::with_capacity(4);
+        let older_identity = identity("job-a", 0, "revision-a", 1);
+        let newer_identity = identity("job-a", 0, "revision-a", 2);
+        publish(&repository, version("job-a", "A", 0, "revision-a", 1));
+        let verification = repository
+            .begin_verification(CompareScope::new("job-a", 0, "revision-a"))
+            .unwrap();
+        repository
+            .publish_successful_version(&verification, version("job-a", "A", 0, "revision-a", 2))
+            .unwrap();
+
+        assert!(repository.get_exact(&older_identity).unwrap().is_some());
+        assert!(matches!(
+            repository.get_fresh_exact(&older_identity),
+            Err(CompareResultRepositoryError::ResultIsNotExecutionFresh { .. })
+        ));
+        assert_eq!(
+            repository
+                .get_fresh_exact(&newer_identity)
+                .unwrap()
+                .identity(),
+            &newer_identity
+        );
+        assert_eq!(
+            repository
+                .with_fresh_execution_eligibility(&newer_identity, || Ok("reserved"))
+                .unwrap(),
+            "reserved"
+        );
+    }
+
+    #[test]
+    fn superseded_success_is_viewable_but_cannot_clear_a_newer_verification() {
+        let repository = CompareResultRepository::with_capacity(4);
+        let scope = CompareScope::new("job-a", 0, "revision-a");
+        let first = repository.begin_verification(scope.clone()).unwrap();
+        let second = repository.begin_verification(scope).unwrap();
+        let first_identity = identity("job-a", 0, "revision-a", 1);
+        let second_identity = identity("job-a", 0, "revision-a", 2);
+
+        repository
+            .publish_successful_version(&first, version("job-a", "A", 0, "revision-a", 1))
+            .unwrap();
+
+        assert!(repository.get_exact(&first_identity).unwrap().is_some());
+        assert!(matches!(
+            repository.get_fresh_exact(&first_identity),
+            Err(CompareResultRepositoryError::AwaitingSuccessfulCompare(_))
+        ));
+        repository
+            .publish_successful_version(&second, version("job-a", "A", 0, "revision-a", 2))
+            .unwrap();
+        assert_eq!(
+            repository
+                .get_fresh_exact(&second_identity)
+                .unwrap()
+                .identity(),
+            &second_identity
+        );
+    }
+
+    #[test]
+    fn late_older_verification_cannot_regress_latest_or_fresh_pointers() {
+        let repository = CompareResultRepository::with_capacity(4);
+        let scope = CompareScope::new("job-a", 0, "revision-a");
+        let first = repository.begin_verification(scope.clone()).unwrap();
+        let second = repository.begin_verification(scope).unwrap();
+        let first_identity = identity("job-a", 0, "revision-a", 1);
+        let second_identity = identity("job-a", 0, "revision-a", 2);
+
+        repository
+            .publish_successful_version(&second, version("job-a", "A", 0, "revision-a", 2))
+            .unwrap();
+        repository
+            .publish_successful_version(&first, version("job-a", "A", 0, "revision-a", 1))
+            .unwrap();
+
+        assert!(repository.get_exact(&first_identity).unwrap().is_some());
+        assert_eq!(
+            repository
+                .latest_for("job-a", 0, "revision-a")
+                .unwrap()
+                .unwrap()
+                .identity(),
+            &second_identity
+        );
+        assert_eq!(
+            repository
+                .get_fresh_exact(&second_identity)
+                .unwrap()
+                .identity(),
+            &second_identity
+        );
+    }
+
+    #[test]
+    fn verification_epoch_exhaustion_stays_fail_closed() {
+        let repository = CompareResultRepository::with_capacity(2);
+        let scope = CompareScope::new("job-a", 0, "revision-a");
+        repository.store.lock().unwrap().execution_by_scope.insert(
+            scope.clone(),
+            CompareExecutionState {
+                verification_epoch: u64::MAX,
+                freshness: CompareExecutionFreshness::Fresh(identity("job-a", 0, "revision-a", 1)),
+            },
+        );
+
+        assert!(matches!(
+            repository.begin_verification(scope),
+            Err(CompareResultRepositoryError::VerificationEpochExhausted(_))
+        ));
+        assert!(matches!(
+            repository.get_fresh_exact(&identity("job-a", 0, "revision-a", 1)),
+            Err(CompareResultRepositoryError::AwaitingSuccessfulCompare(_))
+        ));
+    }
+
+    #[test]
+    fn final_reservation_and_new_verification_have_one_lock_order() {
+        let repository = Arc::new(CompareResultRepository::with_capacity(2));
+        let result_identity = identity("job-a", 0, "revision-a", 1);
+        publish(&repository, version("job-a", "A", 0, "revision-a", 1));
+        let (reservation_entered, entered) = std::sync::mpsc::channel();
+        let (release_reservation, release) = std::sync::mpsc::channel();
+        let reservation_repository = repository.clone();
+        let reserved_identity = result_identity.clone();
+        let reservation = std::thread::spawn(move || {
+            reservation_repository.with_fresh_execution_eligibility(&reserved_identity, || {
+                reservation_entered.send(()).unwrap();
+                release.recv().unwrap();
+                Ok(())
+            })
+        });
+        entered.recv().unwrap();
+
+        let verification_repository = repository.clone();
+        let (verification_began, began) = std::sync::mpsc::channel();
+        let verification = std::thread::spawn(move || {
+            let ticket = verification_repository
+                .begin_verification(CompareScope::new("job-a", 0, "revision-a"))
+                .unwrap();
+            verification_began.send(ticket).unwrap();
+        });
+        assert!(began
+            .recv_timeout(std::time::Duration::from_millis(25))
+            .is_err());
+
+        release_reservation.send(()).unwrap();
+        reservation.join().unwrap().unwrap();
+        began.recv().unwrap();
+        verification.join().unwrap();
+        assert!(matches!(
+            repository.get_fresh_exact(&result_identity),
+            Err(CompareResultRepositoryError::AwaitingSuccessfulCompare(_))
+        ));
+    }
+
+    #[test]
     fn reading_an_older_version_does_not_change_the_latest_pointer() {
         let repository = CompareResultRepository::with_capacity(4);
-        repository
-            .insert_version(version("job-a", "A", 0, "revision-a", 1))
-            .unwrap();
-        repository
-            .insert_version(version("job-a", "A", 0, "revision-a", 2))
-            .unwrap();
+        publish(&repository, version("job-a", "A", 0, "revision-a", 1));
+        publish(&repository, version("job-a", "A", 0, "revision-a", 2));
         repository
             .get_exact(&identity("job-a", 0, "revision-a", 1))
             .unwrap()
@@ -604,21 +1035,11 @@ mod tests {
     #[test]
     fn hot_scope_churn_does_not_evict_another_scopes_only_latest_result() {
         let repository = CompareResultRepository::with_capacity(3);
-        repository
-            .insert_version(version("job-a", "A", 0, "revision-a", 1))
-            .unwrap();
-        repository
-            .insert_version(version("job-b", "B", 0, "revision-b", 2))
-            .unwrap();
-        repository
-            .insert_version(version("job-b", "B", 0, "revision-b", 3))
-            .unwrap();
-        repository
-            .insert_version(version("job-b", "B", 0, "revision-b", 4))
-            .unwrap();
-        repository
-            .insert_version(version("job-b", "B", 0, "revision-b", 5))
-            .unwrap();
+        publish(&repository, version("job-a", "A", 0, "revision-a", 1));
+        publish(&repository, version("job-b", "B", 0, "revision-b", 2));
+        publish(&repository, version("job-b", "B", 0, "revision-b", 3));
+        publish(&repository, version("job-b", "B", 0, "revision-b", 4));
+        publish(&repository, version("job-b", "B", 0, "revision-b", 5));
 
         assert!(repository
             .get_exact(&identity("job-a", 0, "revision-a", 1))
@@ -647,19 +1068,13 @@ mod tests {
     #[test]
     fn latest_pointer_disappears_when_distinct_scopes_exceed_capacity() {
         let repository = CompareResultRepository::with_capacity(2);
-        repository
-            .insert_version(version("job-a", "A", 0, "revision-a", 1))
-            .unwrap();
-        repository
-            .insert_version(version("job-b", "B", 0, "revision-b", 2))
-            .unwrap();
+        publish(&repository, version("job-a", "A", 0, "revision-a", 1));
+        publish(&repository, version("job-b", "B", 0, "revision-b", 2));
         repository
             .get_exact(&identity("job-a", 0, "revision-a", 1))
             .unwrap()
             .unwrap();
-        repository
-            .insert_version(version("job-c", "C", 0, "revision-c", 3))
-            .unwrap();
+        publish(&repository, version("job-c", "C", 0, "revision-c", 3));
 
         assert!(repository
             .latest_for("job-b", 0, "revision-b")
@@ -674,15 +1089,9 @@ mod tests {
     #[test]
     fn invalidation_is_scoped_by_stable_job_identity_and_revision() {
         let repository = CompareResultRepository::with_capacity(4);
-        repository
-            .insert_version(version("job-a", "A", 0, "revision-old", 1))
-            .unwrap();
-        repository
-            .insert_version(version("job-a", "A", 0, "revision-current", 2))
-            .unwrap();
-        repository
-            .insert_version(version("job-b", "A", 0, "revision-old", 3))
-            .unwrap();
+        publish(&repository, version("job-a", "A", 0, "revision-old", 1));
+        publish(&repository, version("job-a", "A", 0, "revision-current", 2));
+        publish(&repository, version("job-b", "A", 0, "revision-old", 3));
 
         repository.invalidate_revision("job-a", "revision-old");
         assert!(repository
@@ -708,12 +1117,8 @@ mod tests {
     #[test]
     fn rename_rebinds_only_presentation_for_every_retained_version() {
         let repository = CompareResultRepository::with_capacity(4);
-        repository
-            .insert_version(version("job-a", "A", 0, "revision-a", 1))
-            .unwrap();
-        repository
-            .insert_version(version("job-a", "A", 0, "revision-a", 2))
-            .unwrap();
+        publish(&repository, version("job-a", "A", 0, "revision-a", 1));
+        publish(&repository, version("job-a", "A", 0, "revision-a", 2));
 
         repository.rebind_job_name("job-a", "Archive");
         let older = repository
@@ -728,9 +1133,7 @@ mod tests {
     #[test]
     fn validation_requires_the_exact_retained_identity_and_plan_digest() {
         let repository = CompareResultRepository::with_capacity(2);
-        repository
-            .insert_version(version("job-a", "A", 1, "revision-a", 7))
-            .unwrap();
+        publish(&repository, version("job-a", "A", 1, "revision-a", 7));
         let owner = owner("job-a", "A", 1, "revision-a", 7);
         let retained = repository.get_exact(&owner.identity).unwrap();
         assert!(validate_retained_compare(
@@ -764,9 +1167,7 @@ mod tests {
     #[test]
     fn missing_presentation_state_fails_closed_instead_of_reusing_a_stale_plan_label() {
         let repository = CompareResultRepository::with_capacity(2);
-        repository
-            .insert_version(version("job-a", "A", 0, "revision-a", 1))
-            .unwrap();
+        publish(&repository, version("job-a", "A", 0, "revision-a", 1));
         repository.store.lock().unwrap().job_names.remove("job-a");
 
         let error = match repository.get_exact(&identity("job-a", 0, "revision-a", 1)) {

@@ -4,7 +4,9 @@
 //! - `dto` — the wire types ts-rs exports to the frontend
 //! - `bridge` — the typed progress event stream shared by both windows
 //! - `compare_results` — exact, versioned retention for successful Compare results
-//! - `state` — single-run mutual exclusion
+//! - `operation_authorization` — typed review challenges and one-use operation authority
+//! - `operation_selection` — exact target and selected-operation resolution
+//! - `run_lifecycle` — active runs, command preparation, and progress-launch reservations
 //! - `cmd` — the commands themselves, grouped by what they act on
 //!
 //! Heavy work goes through `spawn_blocking`; window-creating commands must be `async fn`, because
@@ -13,21 +15,22 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod auth;
 mod autoscan;
 mod bridge;
 mod cmd;
 mod compare_results;
 mod dto;
-mod state;
+mod operation_authorization;
+mod operation_selection;
+mod run_lifecycle;
 
 use std::sync::Arc;
 
-use auth::AuthorizationStore;
 use autoscan::AutoScanController;
 use bridge::RunEventRepository;
 use compare_results::CompareResultRepository;
-use state::RunState;
+use operation_authorization::OperationAuthorizationStore;
+use run_lifecycle::RunLifecycle;
 
 fn main() {
     // A windowed build has no console — the only home for diagnostics outside a run (settings parse
@@ -48,14 +51,21 @@ fn main() {
     if dropped > 0 {
         syncdash::log_info!("app", "Log cleanup: removed the records of {dropped} runs");
     }
+    let lifecycle = Arc::new(RunLifecycle::default());
+    let authorizations = Arc::new(OperationAuthorizationStore::default());
+    let results = Arc::new(CompareResultRepository::default());
+    let autoscan = Arc::new(AutoScanController::new(
+        results.clone(),
+        authorizations.clone(),
+    ));
     tauri::Builder::default()
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     use tauri::{Emitter, Manager};
 
-                    let state = window.state::<Arc<RunState>>();
-                    if state::has_run_activity(state.inner()) {
+                    let lifecycle = window.state::<Arc<RunLifecycle>>();
+                    if lifecycle.has_activity() {
                         api.prevent_close();
                         let _ = window.emit(
                             "main-close-blocked",
@@ -79,10 +89,10 @@ fn main() {
             }
         })
         .plugin(tauri_plugin_dialog::init())
-        .manage(Arc::new(RunState::default()))
-        .manage(Arc::new(AuthorizationStore::default()))
-        .manage(Arc::new(AutoScanController::default()))
-        .manage(Arc::new(CompareResultRepository::default()))
+        .manage(lifecycle)
+        .manage(authorizations)
+        .manage(autoscan)
+        .manage(results)
         .manage(Arc::new(RunEventRepository::default()))
         .manage(app_log)
         .invoke_handler(tauri::generate_handler![
@@ -91,7 +101,7 @@ fn main() {
             cmd::edit::inspect_paths, cmd::edit::mask_match, cmd::edit::junk_presets,
             cmd::results::touch_compare, cmd::results::restore_compare, cmd::results::list_identical, cmd::results::export_csv,
             cmd::logs::run_history, cmd::logs::last_syncs, cmd::logs::run_detail, cmd::logs::log_runs, cmd::logs::log_artifact, cmd::logs::log_dir_path, cmd::logs::app_log_tail, cmd::logs::get_settings, cmd::logs::save_settings,
-            cmd::shell::reveal, cmd::shell::post_sync_action, cmd::shell::open_progress_window, cmd::shell::cancel_progress_launch, cmd::shell::close_progress_launch, cmd::shell::close_progress_window,
+            cmd::shell::reveal, cmd::shell::post_sync_action, cmd::shell::open_progress_window, cmd::shell::cancel_progress_launch, cmd::shell::begin_progress_window_close, cmd::shell::destroy_progress_window,
             cmd::run::review_compare, cmd::run::approve_operation, cmd::run::compare_job, cmd::run::review_apply, cmd::run::authorize_autoscan_apply, cmd::run::apply_job, cmd::run::replay_run_events, cmd::run::cancel_run, cmd::run::pause_run
         ])
         .run(tauri::generate_context!())

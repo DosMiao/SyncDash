@@ -204,22 +204,27 @@ export function reconcileSavedJobSession(
   return changed ? { sessions } : repository;
 }
 
-/// Refresh one exact retained result after the backend confirms its evidence still exists. A delayed
-/// response must not replace a newer result that has since been published for the same scope.
-export function refreshRetainedSession(
+/// Reinsert or refresh one exact session only after the backend confirms that result is retained.
+/// A delayed confirmation never replaces a newer result already published for the same scope.
+export function retainConfirmedSession(
   repository: CompareRepository,
-  previousOwner: CompareOwner,
+  retainedSession: CompareSession,
   currentOwner: CompareOwner,
 ): CompareRepository {
-  if (!sameIdentity(previousOwner, currentOwner)) return repository;
-  const index = repository.sessions.findIndex((session) => sameIdentity(session.plan.owner, previousOwner));
-  if (index < 0) return repository;
-  if (index === 0 && repository.sessions[0].plan.owner.job_name === currentOwner.job_name) return repository;
+  if (!sameIdentity(retainedSession.plan.owner, currentOwner)) return repository;
+  const scopeIndex = repository.sessions.findIndex((session) => sameKey(session.plan.owner, currentOwner));
+  if (scopeIndex >= 0
+    && !sameIdentity(repository.sessions[scopeIndex].plan.owner, currentOwner)) return repository;
+  const currentSession = scopeIndex >= 0 ? repository.sessions[scopeIndex] : retainedSession;
+  const confirmed = currentSession.plan.owner.job_name === currentOwner.job_name
+    ? currentSession
+    : { ...currentSession, plan: { ...currentSession.plan, owner: currentOwner } };
+  if (scopeIndex < 0) {
+    return { sessions: [confirmed, ...repository.sessions].slice(0, COMPARE_SESSION_CAPACITY) };
+  }
+  if (scopeIndex === 0 && repository.sessions[0] === confirmed) return repository;
   const sessions = [...repository.sessions];
-  const [session] = sessions.splice(index, 1);
-  const refreshed = session.plan.owner.job_name === currentOwner.job_name
-    ? session
-    : { ...session, plan: { ...session.plan, owner: currentOwner } };
-  sessions.unshift(refreshed);
+  sessions.splice(scopeIndex, 1);
+  sessions.unshift(confirmed);
   return { sessions };
 }

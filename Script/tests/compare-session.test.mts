@@ -10,7 +10,7 @@ import {
   invalidateSession,
   reconcileRefreshedJobSession,
   reconcileSavedJobSession,
-  refreshRetainedSession,
+  retainConfirmedSession,
   retainRestoredSession,
   retainSuccessfulSession,
   successfulSession,
@@ -199,7 +199,7 @@ test('touch rebinds a renamed owner without changing the compare result identity
   const repository = retain(EMPTY_COMPARE_REPOSITORY, 'A', 0, 'rev-a', 7);
   const previous = owner('A', 0, 'rev-a', 7);
   const current = { ...previous, job_name: 'Renamed' };
-  const rebound = refreshRetainedSession(repository, previous, current);
+  const rebound = retainConfirmedSession(repository, repository.sessions[0], current);
 
   assert.equal(rebound.sessions[0].plan.owner.job_name, 'Renamed');
   assert.equal(rebound.sessions[0].plan.owner.identity.compare_run_id, 7);
@@ -208,14 +208,25 @@ test('touch rebinds a renamed owner without changing the compare result identity
 
 test('a delayed touch cannot replace or expire a newer result for the same scope', () => {
   const olderOwner = owner('A', 0, 'rev-a', 7);
+  const olderSession = successfulSession(plan(olderOwner), [true], [false]);
   const newerRepository = retain(EMPTY_COMPARE_REPOSITORY, 'A', 0, 'rev-a', 8);
 
-  assert.equal(refreshRetainedSession(newerRepository, olderOwner, olderOwner), newerRepository);
+  assert.equal(retainConfirmedSession(newerRepository, olderSession, olderOwner), newerRepository);
   assert.equal(invalidateSession(newerRepository, olderOwner), newerRepository);
   assert.equal(
     activeSession(newerRepository, job('A', 'rev-a'), 0)?.plan.owner.identity.compare_run_id,
     8,
   );
+});
+
+test('backend confirmation can reinsert an exact result removed before an apply rejection', () => {
+  const retained = successfulSession(plan(owner('A', 0, 'rev-a', 7)), [true], [false]);
+  const currentOwner = { ...retained.plan.owner, job_name: 'Renamed' };
+  const restored = retainConfirmedSession(EMPTY_COMPARE_REPOSITORY, retained, currentOwner);
+
+  assert.equal(restored.sessions.length, 1);
+  assert.equal(restored.sessions[0].plan.owner.job_name, 'Renamed');
+  assert.deepEqual(restored.sessions[0].checked, [true]);
 });
 
 test('a delayed restore cannot replace a result published while restoration was in flight', () => {

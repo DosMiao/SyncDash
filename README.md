@@ -29,7 +29,7 @@ SyncDash/
 │   ├─ boot.rs                L3  process startup: worker pool, settings, progress sink (both shells)
 │   ├─ cli/                   L4  args (the --help contract) · dispatch
 │   └─ main.rs                L4  CLI bin (29 lines: parse, dispatch, exit)
-├─ src-tauri/                 L4  Tauri v2 desktop shell: dto · bridge · state · cmd/
+├─ src-tauri/                 L4  Tauri v2 desktop shell: dto · bridge · compare_results · operation_authorization · operation_selection · run_lifecycle · cmd/
 ├─ typescript/                frontend (Vite + React 19; styling is a hand-written CSS token layer, no UI library)
 │   ├─ core/                  framework-free domain + IPC; components never call invoke() directly
 │   │   └─ types/generated/   wire types ts-rs generates from the Rust structs — do not hand-edit
@@ -255,9 +255,14 @@ v0.9 "Progress & Polish" (behavior parameters cross-checked against the FFS 14.1
   resurrect or cross-wire work. Inactive status retains an orderable generation/cursor tombstone for the same reason.
   On macOS, two local roots use FSEvents change hints plus periodic
   full verification; remote roots and platforms without a native adapter report an explicit interval-polling
-  fallback. A change event is never treated as a complete snapshot: every trigger still runs Compare, and a failed
-  or stale ticket does not advance the durable native cursor. The backend records the exact post-trigger Compare ID
-  against the pending ticket; submitting an older public result owner cannot promote it. AutoApply then claims that
+  mode. A change event is never treated as a complete snapshot: every trigger still runs Compare, and a failed
+  or stale ticket does not advance the durable native cursor. Review issues an idempotent one-use permit for the exact
+  generation and ticket; only a Compare authorization carrying that permit can atomically publish and associate its
+  result. Starting any newer Compare, or observing an AutoScan trigger, immediately makes the previous same-scope
+  result view-only and revokes its outstanding Apply authority. A failed or cancelled verification leaves that result
+  visible for review but cannot make it executable again; only a newly published successful Compare restores execution
+  freshness for its exact identity. A manual same-scope Compare or a stale generation cannot promote a result.
+  AutoApply then claims that
   completed ticket once, reconstructs every executable non-conflict/non-note row on the server with no UI filters or
   direction flips, and requires both a clean health report and an exact prior session grant before issuing a one-use
   authorization. `watch_interval_secs` is the polling / maximum full
@@ -324,8 +329,9 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
   and recreating the same name produces a new identity that cannot see it. Every Compare attempt refreshes the job row after reading an
   externally edited TOML — including a failed or cancelled attempt, so a removed target or deleted job cannot leave a
   ghost selection that fails forever. Compare and Apply use a structured review protocol rather than caller-owned
-  consent flags: the backend probes current health/capabilities, binds the job ID, revision, target, retained Compare
-  owner, plan digest and normalized row decisions into an expiring one-use authorization, then recomputes those facts
+  consent flags: the backend probes current health/capabilities and creates one of three typed authorities—Compare,
+  Interactive Apply, or AutoApply. Apply binds the stable Compare identity, plan digest, health/capability digests,
+  and one exact row-selection value containing both decisions and its normalized digest, then recomputes those facts
   immediately before reserving execution. The webview sends only that token to the execution command; it cannot send a
   plan, acknowledge a different capability report, or replay the token. Session grants are process-local and scoped to
   the exact job/revision/target/capability digest; unattended Apply still requires a fresh, server-reconstructed action

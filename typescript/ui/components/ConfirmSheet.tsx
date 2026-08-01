@@ -1,9 +1,10 @@
 import { humanSize } from '../../core/format';
 import {
   operationReviewCanSubmit,
+  operationReviewFailed,
   type ApprovalChoices,
   type OperationReviewState,
-} from '../state/operation-review';
+} from '../state/operationReview';
 import { OperationReviewDetails } from './OperationReviewSheet';
 import { Sheet } from './ui';
 import type { JobDto } from '../../core/types/generated/JobDto';
@@ -37,7 +38,7 @@ export function ConfirmSheet(props: ConfirmSheetProps) {
     ? 'Reviewing…'
     : reviewState.phase === 'approving'
       ? 'Authorizing…'
-      : reviewState.phase === 'error'
+      : operationReviewFailed(reviewState)
         ? 'Review failed'
         : 'Apply';
 
@@ -49,7 +50,7 @@ export function ConfirmSheet(props: ConfirmSheetProps) {
       footer={
         <>
           <button type="button" className="btn" onClick={onCancel}>
-            {blocked || reviewState.phase === 'error' ? 'Close' : 'Cancel (Esc)'}
+            {blocked || operationReviewFailed(reviewState) ? 'Close' : 'Cancel (Esc)'}
           </button>
           <button type="button" className="btn accent" disabled={!canApply} onClick={onConfirm}>
             {actionLabel}

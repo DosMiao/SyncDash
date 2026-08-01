@@ -91,14 +91,14 @@ pub fn post_sync_action(kind: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn open_progress_window(
     app: tauri::AppHandle,
-    state: tauri::State<'_, std::sync::Arc<crate::state::RunState>>,
+    lifecycle: tauri::State<'_, std::sync::Arc<crate::run_lifecycle::RunLifecycle>>,
 ) -> Result<u64, String> {
-    let st = state.inner().clone();
-    let launch_id = crate::state::reserve_progress_launch(&st)?;
+    let lifecycle = lifecycle.inner().clone();
+    let launch_id = lifecycle.reserve_progress_launch()?;
     match prepare_progress_window(&app, launch_id).await {
         Ok(()) => Ok(launch_id),
         Err(e) => {
-            crate::state::release_progress_launch(&st, launch_id);
+            lifecycle.cancel_progress_launch(launch_id);
             Err(e)
         }
     }
@@ -183,30 +183,32 @@ async fn prepare_progress_window(app: &tauri::AppHandle, launch_id: u64) -> Resu
 
 #[tauri::command]
 pub fn cancel_progress_launch(
-    state: tauri::State<'_, std::sync::Arc<crate::state::RunState>>,
+    lifecycle: tauri::State<'_, std::sync::Arc<crate::run_lifecycle::RunLifecycle>>,
     launch_id: u64,
 ) -> bool {
-    crate::state::release_progress_launch(state.inner(), launch_id)
+    lifecycle.cancel_progress_launch(launch_id)
 }
 
 #[tauri::command]
-pub fn close_progress_launch(
-    state: tauri::State<'_, std::sync::Arc<crate::state::RunState>>,
-) -> &'static str {
-    crate::state::close_progress_launch(state.inner())
+pub fn begin_progress_window_close(
+    lifecycle: tauri::State<'_, std::sync::Arc<crate::run_lifecycle::RunLifecycle>>,
+) -> crate::run_lifecycle::ProgressWindowCloseDecisionDto {
+    lifecycle.begin_progress_window_close()
 }
 
 /// Destroy the progress sub-window. Not hide: a hidden sub-window keeps the process alive after the main window closes
 #[tauri::command]
-pub async fn close_progress_window(
+pub async fn destroy_progress_window(
     app: tauri::AppHandle,
-    state: tauri::State<'_, std::sync::Arc<crate::state::RunState>>,
+    lifecycle: tauri::State<'_, std::sync::Arc<crate::run_lifecycle::RunLifecycle>>,
 ) -> Result<(), String> {
     use tauri::Manager;
     let result = match app.get_webview_window("progress") {
         Some(w) => w.destroy().map_err(|e| e.to_string()),
         None => Ok(()),
     };
-    crate::state::finish_progress_window_close(state.inner());
+    if result.is_ok() {
+        lifecycle.finish_progress_window_close();
+    }
     result
 }

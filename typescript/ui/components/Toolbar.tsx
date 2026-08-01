@@ -10,7 +10,7 @@ import { humanSize } from '../../core/format';
 import { RESULT_TYPE_ICON } from '../icons';
 import type { ReactNode } from 'react';
 import type { JobDto } from '../../core/types/generated/JobDto';
-import type { AutoScanStatusDto } from '../../core/ipc';
+import type { AutoScanStatusDto } from '../../core/types/generated/AutoScanStatusDto';
 import { autoScanButtonLabel } from '../state/autoscan';
 
 export interface SelectedRunStats {

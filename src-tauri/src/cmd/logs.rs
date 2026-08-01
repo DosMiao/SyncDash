@@ -73,50 +73,49 @@ pub fn get_settings() -> syncdash::store::settings::AppSettings {
 /// The old location must be resolved **before** the new config is written — ask afterwards and you only get the new value.
 #[tauri::command]
 pub fn save_settings(
-    s: syncdash::store::settings::AppSettings,
+    settings: syncdash::store::settings::AppSettings,
     migrate: bool,
-    run_state: tauri::State<'_, std::sync::Arc<crate::state::RunState>>,
+    run_lifecycle: tauri::State<'_, std::sync::Arc<crate::run_lifecycle::RunLifecycle>>,
     app_log: tauri::State<'_, std::sync::Arc<syncdash::obs::logging::AppLogSink>>,
 ) -> Result<syncdash::store::migrate::MigrateReport, String> {
-    if crate::state::has_run_activity(run_state.inner()) {
-        return Err(
-            "Log settings cannot change while a compare or synchronization is active".into(),
-        );
-    }
-    s.validate()?;
-    let previous = syncdash::store::settings::load();
-    let old_dir = app_log.directory();
-    let new_dir = s.wanted_log_dir();
-    syncdash::obs::logging::AppLogSink::validate_target(&new_dir, s.level).map_err(|error| {
-        format!("The new log directory is unusable; settings were not changed: {error}")
-    })?;
-    syncdash::store::settings::save(&s).map_err(|e| e.to_string())?;
-    let switched = app_log.reconfigure_after(&new_dir, s.level, || {
-        if migrate && old_dir != new_dir {
-            syncdash::store::migrate::migrate_log_dir(&old_dir, &new_dir)
-        } else {
-            syncdash::store::migrate::MigrateReport::default()
+    run_lifecycle.with_idle_mutation("Changing log settings", || {
+        settings.validate()?;
+        let previous = syncdash::store::settings::load();
+        let old_dir = app_log.directory();
+        let new_dir = settings.wanted_log_dir();
+        syncdash::obs::logging::AppLogSink::validate_target(&new_dir, settings.level).map_err(
+            |error| {
+                format!("The new log directory is unusable; settings were not changed: {error}")
+            },
+        )?;
+        syncdash::store::settings::save(&settings).map_err(|error| error.to_string())?;
+        let switched = app_log.reconfigure_after(&new_dir, settings.level, || {
+            if migrate && old_dir != new_dir {
+                syncdash::store::migrate::migrate_log_dir(&old_dir, &new_dir)
+            } else {
+                syncdash::store::migrate::MigrateReport::default()
+            }
+        });
+        let report = match switched {
+            Ok(report) => report,
+            Err(error) => {
+                return Err(match syncdash::store::settings::save(&previous) {
+                    Ok(_) => format!(
+                        "The new log directory became unusable; settings were restored, but migrated history may remain in the selected directory: {error}"
+                    ),
+                    Err(rollback_error) => format!(
+                        "The new log directory became unusable ({error}) and restoring the previous settings failed: {rollback_error}"
+                    ),
+                });
+            }
+        };
+        let dropped = syncdash::obs::runlog::prune(settings.keep_days, settings.max_total_mb);
+        if dropped > 0 {
+            syncdash::log_info!(
+                "settings",
+                "Log cleanup: removed the records of {dropped} runs"
+            );
         }
-    });
-    let report = match switched {
-        Ok(report) => report,
-        Err(error) => {
-            return Err(match syncdash::store::settings::save(&previous) {
-                Ok(_) => format!(
-                    "The new log directory became unusable; settings were restored, but migrated history may remain in the selected directory: {error}"
-                ),
-                Err(rollback_error) => format!(
-                    "The new log directory became unusable ({error}) and restoring the previous settings failed: {rollback_error}"
-                ),
-            });
-        }
-    };
-    let dropped = syncdash::obs::runlog::prune(s.keep_days, s.max_total_mb);
-    if dropped > 0 {
-        syncdash::log_info!(
-            "settings",
-            "Log cleanup: removed the records of {dropped} runs"
-        );
-    }
-    Ok(report)
+        Ok(report)
+    })
 }

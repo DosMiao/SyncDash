@@ -10,14 +10,17 @@ use syncdash::pipeline::compare;
 use crate::compare_results::{validate_retained_compare, CompareResultRepository};
 use crate::dto::PlanDto;
 use crate::dto::{CompareOwner, IdenticalPage};
-use crate::state::resolve_target;
+use crate::operation_selection::resolve_target;
+use crate::run_lifecycle::RunLifecycle;
 
 /// Confirm that one exact locally retained result still exists without crossing its large plan.
 #[tauri::command]
 pub fn touch_compare(
+    lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
     results: tauri::State<'_, Arc<CompareResultRepository>>,
     owner: CompareOwner,
 ) -> Result<Option<CompareOwner>, String> {
+    let _command = lifecycle.inner().command_lease()?;
     let (job_name, full_job) = match job::load_by_id(&owner.identity.job_id) {
         Ok(job) => job,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -44,10 +47,12 @@ pub fn touch_compare(
 /// pretending that old filesystem evidence is still current.
 #[tauri::command]
 pub fn restore_compare(
+    lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
     results: tauri::State<'_, Arc<CompareResultRepository>>,
     job_id: String,
     target_index: Option<usize>,
 ) -> Result<Option<PlanDto>, String> {
+    let _command = lifecycle.inner().command_lease()?;
     let (job_name, full_job) = job::load_by_id(&job_id).map_err(|e| e.to_string())?;
     let config_revision =
         job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
@@ -62,12 +67,14 @@ pub fn restore_compare(
 /// Pagination for the "Identical" panel from that result's retained snapshots — no rescan.
 #[tauri::command]
 pub fn list_identical(
+    lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
     results: tauri::State<'_, Arc<CompareResultRepository>>,
     owner: CompareOwner,
     query: String,
     offset: usize,
     limit: usize,
 ) -> Result<IdenticalPage, String> {
+    let _command = lifecycle.inner().command_lease()?;
     let (job_name, full_job) =
         job::load_by_id(&owner.identity.job_id).map_err(|e| e.to_string())?;
     let config_revision =

@@ -57,8 +57,8 @@ fn slot() -> &'static Slot {
 /// Install the "current run" sink; when the guard lands the sink is removed and the previous one restored.
 ///
 /// **Must be RAII**: leaking the guard cross-contaminates the next run's log directory.
-/// The desktop has `RunState.active` single-run mutual exclusion and the CLI runs `run --all`
-/// sequentially, so a process-wide single slot is safe in itself.
+/// The desktop's `RunLifecycle` permits one active-run lease and the CLI runs `run --all`
+/// sequentially, so a process-wide single slot is safe.
 #[must_use = "the sink is removed the moment the guard lands — bind it to the run's lifetime"]
 pub struct SinkGuard {
     prev: Option<Arc<dyn ProgressSink>>,

@@ -13,8 +13,11 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::Emitter;
 
-use crate::dto::CompareOwner;
-use crate::state::RunState;
+use crate::compare_results::{
+    CompareResultRepository, CompareScope, CompareVerificationTicket, SuccessfulCompareResult,
+};
+use crate::dto::{CompareIdentity, CompareOwner};
+use crate::operation_authorization::OperationAuthorizationStore;
 
 const DEFAULT_INTERVAL_SECS: u64 = 30;
 const WORKER_TICK: Duration = Duration::from_millis(100);
@@ -47,40 +50,69 @@ impl AutoScanBinding {
             && owner.identity.config_revision == self.config_revision
             && owner.identity.target_index == self.target_index
     }
+
+    fn compare_scope(&self) -> CompareScope {
+        CompareScope::new(&self.job_id, self.target_index, &self.config_revision)
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AutoScanMode {
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum AutoScanStatusMode {
     Starting,
     NativeFsevents,
     Polling,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AutoScanReason {
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum AutoScanDetectionMode {
+    NativeFsevents,
+    Polling,
+}
+
+impl From<AutoScanDetectionMode> for AutoScanStatusMode {
+    fn from(mode: AutoScanDetectionMode) -> Self {
+        match mode {
+            AutoScanDetectionMode::NativeFsevents => Self::NativeFsevents,
+            AutoScanDetectionMode::Polling => Self::Polling,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum AutoScanTriggerReason {
     Bootstrap,
     FilesystemChange,
     WatchInvalidated,
     PeriodicVerification,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct AutoScanStatusDto {
     pub(crate) active: bool,
+    #[ts(type = "number")]
     pub(crate) generation: u64,
     pub(crate) job_id: Option<String>,
     pub(crate) job_name: Option<String>,
     pub(crate) config_revision: Option<String>,
+    #[ts(type = "number | null")]
     pub(crate) target_index: Option<usize>,
+    #[ts(type = "number | null")]
     pub(crate) interval_secs: Option<u64>,
     pub(crate) auto_apply: bool,
-    pub(crate) mode: Option<AutoScanMode>,
+    pub(crate) mode: Option<AutoScanStatusMode>,
     pub(crate) detail: String,
     /// Monotonic within one generation and retained after completion, so delayed same-generation
     /// IPC snapshots cannot make older ticket state appear current.
+    #[ts(type = "number")]
     pub(crate) latest_ticket_id: u64,
+    #[ts(type = "number | null")]
     pub(crate) active_ticket: Option<u64>,
     pub(crate) pending_trigger: Option<AutoScanTriggerDto>,
 }
@@ -103,7 +135,24 @@ impl AutoScanStatusDto {
             pending_trigger: None,
         }
     }
+}
 
+#[derive(Clone, Debug)]
+struct AutoScanStatusCore {
+    active: bool,
+    generation: u64,
+    job_id: Option<String>,
+    job_name: Option<String>,
+    config_revision: Option<String>,
+    target_index: Option<usize>,
+    interval_secs: Option<u64>,
+    auto_apply: bool,
+    mode: Option<AutoScanStatusMode>,
+    detail: String,
+    latest_ticket_id: u64,
+}
+
+impl AutoScanStatusCore {
     fn starting(generation: u64, binding: &AutoScanBinding) -> Self {
         Self {
             active: true,
@@ -114,39 +163,61 @@ impl AutoScanStatusDto {
             target_index: Some(binding.target_index),
             interval_secs: Some(binding.interval_secs),
             auto_apply: binding.auto_apply,
-            mode: Some(AutoScanMode::Starting),
+            mode: Some(AutoScanStatusMode::Starting),
             detail: "Preparing backend-owned change detection".into(),
             latest_ticket_id: 0,
-            active_ticket: None,
-            pending_trigger: None,
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct AutoScanTriggerDto {
+    #[ts(type = "number")]
     pub(crate) generation: u64,
+    #[ts(type = "number")]
     pub(crate) ticket_id: u64,
     pub(crate) job_id: String,
     pub(crate) job_name: String,
     pub(crate) config_revision: String,
+    #[ts(type = "number")]
     pub(crate) target_index: usize,
     pub(crate) auto_apply: bool,
-    pub(crate) mode: AutoScanMode,
-    pub(crate) reason: AutoScanReason,
+    pub(crate) mode: AutoScanDetectionMode,
+    pub(crate) reason: AutoScanTriggerReason,
 }
 
-/// One successful AutoScan Compare that may be promoted into exactly one AutoApply authorization.
-/// Display names are relabelled on rename; every authority-bearing field is stable identity.
+/// One-use authority to associate one Compare launch with one exact AutoScan trigger. The permit
+/// is issued before authorization and must travel inside that Compare authorization until the
+/// successful result is registered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AutoScanComparePermit {
+    permit_id: u64,
+    generation: u64,
+    ticket_id: u64,
+    job_id: String,
+    config_revision: String,
+    target_index: usize,
+    verification: CompareVerificationTicket,
+}
+
+impl AutoScanComparePermit {
+    fn owns_compare(&self, owner: &CompareOwner) -> bool {
+        owner.identity.job_id == self.job_id
+            && owner.identity.config_revision == self.config_revision
+            && owner.identity.target_index == self.target_index
+    }
+
+    pub(crate) fn verification(&self) -> &CompareVerificationTicket {
+        &self.verification
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AutoApplyTicket {
-    pub(crate) generation: u64,
-    pub(crate) ticket_id: u64,
-    pub(crate) job_id: String,
-    pub(crate) job_name: String,
-    pub(crate) config_revision: String,
-    pub(crate) target_index: usize,
-    pub(crate) owner: CompareOwner,
+    generation: u64,
+    ticket_id: u64,
+    compare_identity: CompareIdentity,
 }
 
 impl AutoApplyTicket {
@@ -155,38 +226,116 @@ impl AutoApplyTicket {
     }
 
     pub(crate) fn same_authority(&self, other: &Self) -> bool {
-        self.generation == other.generation
-            && self.ticket_id == other.ticket_id
-            && self.job_id == other.job_id
-            && self.config_revision == other.config_revision
-            && self.target_index == other.target_index
-            && self.owner.identity == other.owner.identity
+        self == other
     }
 
-    fn rebind_name(&mut self, job_name: &str) {
-        self.job_name = job_name.to_string();
-        self.owner.job_name = job_name.to_string();
+    pub(crate) fn compare_identity(&self) -> &CompareIdentity {
+        &self.compare_identity
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AutoApplyTicketStage {
-    Completed,
-    Claimed,
-    Authorized,
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        generation: u64,
+        ticket_id: u64,
+        compare_identity: CompareIdentity,
+    ) -> Self {
+        Self {
+            generation,
+            ticket_id,
+            compare_identity,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
-struct AutoApplyTicketRecord {
-    stage: AutoApplyTicketStage,
-    ticket: AutoApplyTicket,
+enum AutoScanTicketLifecycle {
+    Idle,
+    AwaitingCompare {
+        trigger: AutoScanTriggerDto,
+        verification: CompareVerificationTicket,
+    },
+    ComparePermitted {
+        trigger: AutoScanTriggerDto,
+        permit: AutoScanComparePermit,
+    },
+    ComparePublished {
+        trigger: AutoScanTriggerDto,
+        owner: CompareOwner,
+    },
+    AutoApplyCompleted {
+        ticket: AutoApplyTicket,
+    },
+    AutoApplyClaimed {
+        ticket: AutoApplyTicket,
+    },
+    AutoApplyAuthorized {
+        ticket: AutoApplyTicket,
+    },
+}
+
+impl AutoScanTicketLifecycle {
+    fn pending_trigger(&self) -> Option<&AutoScanTriggerDto> {
+        match self {
+            Self::AwaitingCompare { trigger, .. }
+            | Self::ComparePermitted { trigger, .. }
+            | Self::ComparePublished { trigger, .. } => Some(trigger),
+            Self::Idle
+            | Self::AutoApplyCompleted { .. }
+            | Self::AutoApplyClaimed { .. }
+            | Self::AutoApplyAuthorized { .. } => None,
+        }
+    }
+
+    fn rebind_job_name(&mut self, job_name: &str) {
+        match self {
+            Self::AwaitingCompare { trigger, .. } | Self::ComparePermitted { trigger, .. } => {
+                trigger.job_name = job_name.to_string();
+            }
+            Self::ComparePublished { trigger, owner } => {
+                trigger.job_name = job_name.to_string();
+                owner.job_name = job_name.to_string();
+            }
+            Self::Idle
+            | Self::AutoApplyCompleted { .. }
+            | Self::AutoApplyClaimed { .. }
+            | Self::AutoApplyAuthorized { .. } => {}
+        }
+    }
 }
 
 struct AutoScanShared {
-    status: AutoScanStatusDto,
-    pending_compare_min_run_id: Option<u64>,
-    pending_compare_owner: Option<CompareOwner>,
-    auto_apply_ticket: Option<AutoApplyTicketRecord>,
+    status: AutoScanStatusCore,
+    ticket: AutoScanTicketLifecycle,
+}
+
+impl AutoScanShared {
+    fn snapshot(&self) -> AutoScanStatusDto {
+        let pending_trigger = self.ticket.pending_trigger().cloned();
+        AutoScanStatusDto {
+            active: self.status.active,
+            generation: self.status.generation,
+            job_id: self.status.job_id.clone(),
+            job_name: self.status.job_name.clone(),
+            config_revision: self.status.config_revision.clone(),
+            target_index: self.status.target_index,
+            interval_secs: self.status.interval_secs,
+            auto_apply: self.status.auto_apply,
+            mode: self.status.mode,
+            detail: self.status.detail.clone(),
+            latest_ticket_id: self.status.latest_ticket_id,
+            active_ticket: pending_trigger.as_ref().map(|trigger| trigger.ticket_id),
+            pending_trigger,
+        }
+    }
+}
+
+fn allocate_unique_id(counter: &AtomicU64, identity: &str) -> Result<u64, String> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .map_err(|_| format!("The {identity} ID space is exhausted — restart SyncDash"))
 }
 
 enum WorkerCommand {
@@ -202,36 +351,59 @@ struct ActiveAutoScan {
     join: Option<JoinHandle<()>>,
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+struct AutoScanExecutionServices {
+    results: Arc<CompareResultRepository>,
+    authorizations: Arc<OperationAuthorizationStore>,
+}
+
 pub(crate) struct AutoScanController {
     gate: Mutex<()>,
     active: Mutex<Option<ActiveAutoScan>>,
     tombstone: Mutex<Option<AutoScanStatusDto>>,
     generations: AtomicU64,
+    compare_permits: AtomicU64,
+    execution: AutoScanExecutionServices,
 }
 
 impl AutoScanController {
+    pub(crate) fn new(
+        results: Arc<CompareResultRepository>,
+        authorizations: Arc<OperationAuthorizationStore>,
+    ) -> Self {
+        Self {
+            gate: Mutex::new(()),
+            active: Mutex::new(None),
+            tombstone: Mutex::new(None),
+            generations: AtomicU64::new(0),
+            compare_permits: AtomicU64::new(0),
+            execution: AutoScanExecutionServices {
+                results,
+                authorizations,
+            },
+        }
+    }
+
     pub(crate) fn start(
         &self,
         app: tauri::AppHandle,
-        run_state: Arc<RunState>,
         binding: AutoScanBinding,
         local_roots: Option<(PathBuf, PathBuf)>,
-    ) -> AutoScanStatusDto {
+    ) -> Result<AutoScanStatusDto, String> {
         let _gate = self.gate.lock().unwrap();
+        let generation = allocate_unique_id(&self.generations, "AutoScan generation")?;
         self.stop_locked("AutoScan was rearmed");
 
-        let generation = self.generations.fetch_add(1, Ordering::Relaxed) + 1;
-        let initial = AutoScanStatusDto::starting(generation, &binding);
+        let status = AutoScanStatusCore::starting(generation, &binding);
         let shared = Arc::new(Mutex::new(AutoScanShared {
-            status: initial.clone(),
-            pending_compare_min_run_id: None,
-            pending_compare_owner: None,
-            auto_apply_ticket: None,
+            status,
+            ticket: AutoScanTicketLifecycle::Idle,
         }));
+        let initial = shared.lock().unwrap().snapshot();
         let (commands, receiver) = mpsc::channel();
         let worker_shared = shared.clone();
         let worker_binding = binding.clone();
+        let worker_execution = self.execution.clone();
         let join = std::thread::Builder::new()
             .name(format!("syncdash-autoscan-{generation}"))
             .spawn(move || {
@@ -242,10 +414,10 @@ impl AutoScanController {
                     local_roots,
                     receiver,
                     worker_shared,
-                    run_state,
+                    worker_execution,
                 );
             })
-            .expect("AutoScan worker thread creation failed");
+            .map_err(|error| format!("Could not start the AutoScan worker: {error}"))?;
         *self.active.lock().unwrap() = Some(ActiveAutoScan {
             binding,
             generation,
@@ -253,7 +425,7 @@ impl AutoScanController {
             shared,
             join: Some(join),
         });
-        initial
+        Ok(initial)
     }
 
     pub(crate) fn stop(&self) -> AutoScanStatusDto {
@@ -313,26 +485,17 @@ impl AutoScanController {
         active.binding.job_name = job_name.to_string();
         let mut shared = active.shared.lock().ok()?;
         shared.status.job_name = Some(job_name.to_string());
-        if let Some(trigger) = &mut shared.status.pending_trigger {
-            trigger.job_name = job_name.to_string();
-        }
-        if let Some(owner) = &mut shared.pending_compare_owner {
-            owner.job_name = job_name.to_string();
-        }
-        if let Some(record) = &mut shared.auto_apply_ticket {
-            record.ticket.rebind_name(job_name);
-        }
-        Some(shared.status.clone())
+        shared.ticket.rebind_job_name(job_name);
+        Some(shared.snapshot())
     }
 
     pub(crate) fn status(&self) -> AutoScanStatusDto {
-        let active = self.active.lock().unwrap().as_ref().and_then(|active| {
-            active
-                .shared
-                .lock()
-                .ok()
-                .map(|shared| shared.status.clone())
-        });
+        let active = self
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|active| active.shared.lock().ok().map(|shared| shared.snapshot()));
         active
             .or_else(|| self.tombstone.lock().unwrap().clone())
             .unwrap_or_else(AutoScanStatusDto::inactive)
@@ -343,7 +506,6 @@ impl AutoScanController {
         generation: u64,
         ticket_id: u64,
         succeeded: bool,
-        owner: Option<&CompareOwner>,
     ) -> Result<AutoScanStatusDto, String> {
         let _gate = self.gate.lock().unwrap();
         let active_guard = self.active.lock().unwrap();
@@ -353,29 +515,13 @@ impl AutoScanController {
         if active.generation != generation {
             return Err("This AutoScan generation is no longer active".into());
         }
-        let supplied_owner = if succeeded {
-            let owner = owner.ok_or_else(|| {
-                "A successful AutoScan compare must provide its authenticated result owner"
-                    .to_string()
-            })?;
-            if !active.binding.owns_compare(owner) {
-                return Err(
-                    "The compare result does not belong to this AutoScan job identity, revision, and target"
-                        .into(),
-                );
-            }
-            Some(owner)
-        } else {
-            None
-        };
         let mut shared = active
             .shared
             .lock()
             .map_err(|_| "AutoScan status lock is poisoned".to_string())?;
-        let pending = shared
-            .status
-            .pending_trigger
-            .as_ref()
+        let pending_trigger = shared
+            .ticket
+            .pending_trigger()
             .filter(|trigger| {
                 trigger.generation == generation
                     && trigger.ticket_id == ticket_id
@@ -383,29 +529,19 @@ impl AutoScanController {
                     && trigger.config_revision == active.binding.config_revision
                     && trigger.target_index == active.binding.target_index
             })
-            .cloned()
             .ok_or_else(|| {
                 "This AutoScan work ticket is no longer awaiting completion".to_string()
             })?;
-        if shared.status.active_ticket != Some(ticket_id) {
-            return Err("This AutoScan work ticket is no longer awaiting completion".into());
-        }
-        let completed_owner = match supplied_owner {
-            Some(supplied) => {
-                let recorded = shared.pending_compare_owner.as_ref().ok_or_else(|| {
-                    "This AutoScan ticket has no successful server-recorded Compare result"
-                        .to_string()
-                })?;
-                if recorded.identity != supplied.identity {
-                    return Err(
-                        "The supplied Compare result was not produced for this AutoScan ticket"
-                            .into(),
-                    );
-                }
-                Some(recorded.clone())
+        let completed_owner = match (&shared.ticket, succeeded) {
+            (AutoScanTicketLifecycle::ComparePublished { owner, .. }, true) => Some(owner.clone()),
+            (_, true) => {
+                return Err(
+                    "This AutoScan ticket has no successful permitted Compare result".into(),
+                )
             }
-            None => None,
+            (_, false) => None,
         };
+        debug_assert_eq!(pending_trigger.ticket_id, ticket_id);
         active
             .commands
             .send(WorkerCommand::Complete {
@@ -415,78 +551,142 @@ impl AutoScanController {
             .map_err(|_| "The AutoScan worker has stopped".to_string())?;
         // Commit status and AutoApply ownership under one lock. A duplicate completion cannot
         // observe the pending trigger, and a status query can recover either side of this edge.
-        shared.status.active_ticket = None;
-        shared.status.pending_trigger = None;
-        shared.pending_compare_min_run_id = None;
-        shared.pending_compare_owner = None;
-        shared.auto_apply_ticket = None;
-        if let (true, true, Some(mut owner)) =
+        shared.ticket = if let (true, true, Some(owner)) =
             (succeeded, active.binding.auto_apply, completed_owner)
         {
-            owner.job_name = pending.job_name.clone();
-            shared.auto_apply_ticket = Some(AutoApplyTicketRecord {
-                stage: AutoApplyTicketStage::Completed,
+            AutoScanTicketLifecycle::AutoApplyCompleted {
                 ticket: AutoApplyTicket {
                     generation,
                     ticket_id,
-                    job_id: active.binding.job_id.clone(),
-                    job_name: pending.job_name,
-                    config_revision: active.binding.config_revision.clone(),
-                    target_index: active.binding.target_index,
-                    owner,
+                    compare_identity: owner.identity,
                 },
-            });
-        }
+            }
+        } else {
+            AutoScanTicketLifecycle::Idle
+        };
         shared.status.detail = if succeeded {
             "Verification complete; waiting for changes".into()
         } else {
             "Verification did not complete; waiting to retry".into()
         };
-        Ok(shared.status.clone())
+        Ok(shared.snapshot())
     }
 
-    /// Associate a freshly cached successful Compare with the currently pending trigger. This is
-    /// the server-side bridge that prevents a caller from promoting an older cached owner by merely
-    /// supplying its public Compare run ID to `complete_autoscan`.
-    pub(crate) fn record_successful_compare(&self, owner: &CompareOwner) -> bool {
+    /// Issue one exact permit while a trigger is still pending. Manual Compare review never calls
+    /// this method, so even a same-scope manual result cannot satisfy the trigger.
+    pub(crate) fn issue_compare_permit(
+        &self,
+        generation: u64,
+        ticket_id: u64,
+    ) -> Result<AutoScanComparePermit, String> {
         let _gate = self.gate.lock().unwrap();
         let active_guard = self.active.lock().unwrap();
-        let Some(active) = active_guard
+        let active = active_guard
             .as_ref()
-            .filter(|active| active.binding.owns_compare(owner))
-        else {
-            return false;
+            .filter(|active| active.generation == generation)
+            .ok_or_else(|| "This AutoScan generation is no longer active".to_string())?;
+        let mut shared = active
+            .shared
+            .lock()
+            .map_err(|_| "AutoScan status lock is poisoned".to_string())?;
+        let trigger_matches = |trigger: &AutoScanTriggerDto| {
+            trigger.generation == generation
+                && trigger.ticket_id == ticket_id
+                && trigger.job_id == active.binding.job_id
+                && trigger.config_revision == active.binding.config_revision
+                && trigger.target_index == active.binding.target_index
         };
-        let Ok(mut shared) = active.shared.lock() else {
-            return false;
+        let (pending, verification) = match &shared.ticket {
+            AutoScanTicketLifecycle::AwaitingCompare {
+                trigger,
+                verification,
+            } if trigger_matches(trigger) => (trigger.clone(), verification.clone()),
+            AutoScanTicketLifecycle::ComparePermitted { trigger, permit }
+                if trigger_matches(trigger) =>
+            {
+                return Ok(permit.clone());
+            }
+            AutoScanTicketLifecycle::ComparePublished { trigger, .. }
+                if trigger_matches(trigger) =>
+            {
+                return Err("This AutoScan work ticket already has a Compare launch".into());
+            }
+            _ => {
+                return Err("This AutoScan work ticket is no longer awaiting Compare".into());
+            }
         };
-        let Some(pending) = shared.status.pending_trigger.as_ref() else {
-            return false;
+        let permit = AutoScanComparePermit {
+            permit_id: allocate_unique_id(&self.compare_permits, "AutoScan Compare permit")?,
+            generation: pending.generation,
+            ticket_id: pending.ticket_id,
+            job_id: pending.job_id.clone(),
+            config_revision: pending.config_revision.clone(),
+            target_index: pending.target_index,
+            verification,
         };
-        let Some(minimum_compare_run_id) = shared.pending_compare_min_run_id else {
-            return false;
+        shared.ticket = AutoScanTicketLifecycle::ComparePermitted {
+            trigger: pending,
+            permit: permit.clone(),
         };
-        if shared.status.active_ticket != Some(pending.ticket_id)
-            || pending.generation != active.generation
-            || pending.job_id != owner.identity.job_id
-            || pending.config_revision != owner.identity.config_revision
-            || pending.target_index != owner.identity.target_index
-            || owner.identity.compare_run_id < minimum_compare_run_id
-        {
-            return false;
-        }
+        Ok(permit)
+    }
+
+    /// Validate the exact permit, publish the in-memory result, and consume the permit as one
+    /// transition. Stop/rearm holds the same gate, so stale AutoScan work cannot become the latest
+    /// repository result before its ticket association fails.
+    pub(crate) fn publish_successful_compare(
+        &self,
+        permit: &AutoScanComparePermit,
+        result: SuccessfulCompareResult,
+    ) -> Result<(), String> {
+        let owner = result.owner().clone();
+        let _gate = self.gate.lock().unwrap();
+        let active_guard = self.active.lock().unwrap();
+        let Some(active) = active_guard.as_ref().filter(|active| {
+            active.generation == permit.generation && active.binding.owns_compare(&owner)
+        }) else {
+            return Err("The AutoScan generation stopped before Compare completed".into());
+        };
+        let mut shared = active
+            .shared
+            .lock()
+            .map_err(|_| "AutoScan status lock is poisoned".to_string())?;
+        let mut trigger = match &shared.ticket {
+            AutoScanTicketLifecycle::ComparePermitted {
+                trigger,
+                permit: expected,
+            } if trigger.generation == active.generation
+                && permit.owns_compare(&owner)
+                && expected == permit =>
+            {
+                trigger.clone()
+            }
+            AutoScanTicketLifecycle::Idle
+            | AutoScanTicketLifecycle::AutoApplyCompleted { .. }
+            | AutoScanTicketLifecycle::AutoApplyClaimed { .. }
+            | AutoScanTicketLifecycle::AutoApplyAuthorized { .. } => {
+                return Err("The AutoScan ticket completed before Compare".into());
+            }
+            AutoScanTicketLifecycle::AwaitingCompare { .. }
+            | AutoScanTicketLifecycle::ComparePermitted { .. }
+            | AutoScanTicketLifecycle::ComparePublished { .. } => {
+                return Err("This Compare does not own the pending AutoScan permit".into());
+            }
+        };
+        self.execution
+            .results
+            .publish_successful_version(permit.verification(), result)
+            .map_err(|error| error.to_string())?;
         // Compare reloads the registry immediately before caching, so its label is fresher than the
         // trigger's display copy after an external pure rename. Relabel all presentation state while
         // retaining the exact identity/revision/target and ticket cursor.
         shared.status.job_name = Some(owner.job_name.clone());
-        shared
-            .status
-            .pending_trigger
-            .as_mut()
-            .expect("the validated pending trigger must still exist")
-            .job_name = owner.job_name.clone();
-        shared.pending_compare_owner = Some(owner.clone());
-        true
+        trigger.job_name = owner.job_name.clone();
+        shared.ticket = AutoScanTicketLifecycle::ComparePublished {
+            trigger,
+            owner: owner.clone(),
+        };
+        Ok(())
     }
 
     /// Move one exact completed ticket into a non-retryable claimed state. Endpoint probes happen
@@ -505,17 +705,31 @@ impl AutoScanController {
             .shared
             .lock()
             .map_err(|_| "AutoScan status lock is poisoned".to_string())?;
-        let record = shared.auto_apply_ticket.as_mut().ok_or_else(|| {
-            "This AutoScan ticket has no completed AutoApply result to claim".to_string()
-        })?;
-        if record.stage != AutoApplyTicketStage::Completed
-            || !record.ticket.matches_key(generation, ticket_id)
-            || !active_owns_ticket(active, &record.ticket)
-        {
-            return Err("This AutoScan AutoApply ticket is stale or was already used".into());
-        }
-        record.stage = AutoApplyTicketStage::Claimed;
-        Ok(record.ticket.clone())
+        let ticket = match &shared.ticket {
+            AutoScanTicketLifecycle::AutoApplyCompleted { ticket }
+                if ticket.matches_key(generation, ticket_id)
+                    && active_owns_ticket(active, ticket) =>
+            {
+                ticket.clone()
+            }
+            AutoScanTicketLifecycle::Idle
+            | AutoScanTicketLifecycle::AwaitingCompare { .. }
+            | AutoScanTicketLifecycle::ComparePermitted { .. }
+            | AutoScanTicketLifecycle::ComparePublished { .. } => {
+                return Err(
+                    "This AutoScan ticket has no completed AutoApply result to claim".into(),
+                );
+            }
+            AutoScanTicketLifecycle::AutoApplyCompleted { .. }
+            | AutoScanTicketLifecycle::AutoApplyClaimed { .. }
+            | AutoScanTicketLifecycle::AutoApplyAuthorized { .. } => {
+                return Err("This AutoScan AutoApply ticket is stale or was already used".into());
+            }
+        };
+        shared.ticket = AutoScanTicketLifecycle::AutoApplyClaimed {
+            ticket: ticket.clone(),
+        };
+        Ok(ticket)
     }
 
     /// Mint authority only while the claimed ticket is still the active generation's latest work.
@@ -537,26 +751,33 @@ impl AutoScanController {
             .shared
             .lock()
             .map_err(|_| "AutoScan status lock is poisoned".to_string())?;
-        let record = shared
-            .auto_apply_ticket
-            .as_ref()
-            .ok_or_else(|| "This AutoScan AutoApply claim is no longer active".to_string())?;
-        if record.stage != AutoApplyTicketStage::Claimed || !record.ticket.same_authority(ticket) {
-            return Err("This AutoScan AutoApply claim is stale or was already used".into());
-        }
+        let claimed = match &shared.ticket {
+            AutoScanTicketLifecycle::AutoApplyClaimed { ticket: claimed }
+                if claimed.same_authority(ticket) =>
+            {
+                claimed.clone()
+            }
+            AutoScanTicketLifecycle::Idle
+            | AutoScanTicketLifecycle::AwaitingCompare { .. }
+            | AutoScanTicketLifecycle::ComparePermitted { .. }
+            | AutoScanTicketLifecycle::ComparePublished { .. } => {
+                return Err("This AutoScan AutoApply claim is no longer active".into());
+            }
+            AutoScanTicketLifecycle::AutoApplyCompleted { .. }
+            | AutoScanTicketLifecycle::AutoApplyClaimed { .. }
+            | AutoScanTicketLifecycle::AutoApplyAuthorized { .. } => {
+                return Err("This AutoScan AutoApply claim is stale or was already used".into());
+            }
+        };
         match issue() {
             Ok(value) => {
-                shared
-                    .auto_apply_ticket
-                    .as_mut()
-                    .expect("the validated claim must still exist")
-                    .stage = AutoApplyTicketStage::Authorized;
+                shared.ticket = AutoScanTicketLifecycle::AutoApplyAuthorized { ticket: claimed };
                 Ok(value)
             }
             Err(error) => {
                 // The claim itself is one-use. A failed grant lookup or token mint cannot be retried
                 // by retaining an internal ticket value after the public claim edge has closed.
-                shared.auto_apply_ticket = None;
+                shared.ticket = AutoScanTicketLifecycle::Idle;
                 Err(error)
             }
         }
@@ -582,14 +803,24 @@ impl AutoScanController {
             .shared
             .lock()
             .map_err(|_| "AutoScan status lock is poisoned".to_string())?;
-        let record = shared.auto_apply_ticket.as_ref().ok_or_else(|| {
-            "This AutoScan AutoApply authorization is no longer active".to_string()
-        })?;
-        if record.stage != AutoApplyTicketStage::Authorized || !record.ticket.same_authority(ticket)
-        {
-            return Err("This AutoScan AutoApply authorization is stale or already used".into());
+        match &shared.ticket {
+            AutoScanTicketLifecycle::AutoApplyAuthorized { ticket: authorized }
+                if authorized.same_authority(ticket) => {}
+            AutoScanTicketLifecycle::Idle
+            | AutoScanTicketLifecycle::AwaitingCompare { .. }
+            | AutoScanTicketLifecycle::ComparePermitted { .. }
+            | AutoScanTicketLifecycle::ComparePublished { .. } => {
+                return Err("This AutoScan AutoApply authorization is no longer active".into());
+            }
+            AutoScanTicketLifecycle::AutoApplyCompleted { .. }
+            | AutoScanTicketLifecycle::AutoApplyClaimed { .. }
+            | AutoScanTicketLifecycle::AutoApplyAuthorized { .. } => {
+                return Err(
+                    "This AutoScan AutoApply authorization is stale or already used".into(),
+                );
+            }
         }
-        shared.auto_apply_ticket = None;
+        shared.ticket = AutoScanTicketLifecycle::Idle;
         reserve()
     }
 }
@@ -597,10 +828,9 @@ impl AutoScanController {
 fn active_owns_ticket(active: &ActiveAutoScan, ticket: &AutoApplyTicket) -> bool {
     active.generation == ticket.generation
         && active.binding.auto_apply
-        && active.binding.job_id == ticket.job_id
-        && active.binding.config_revision == ticket.config_revision
-        && active.binding.target_index == ticket.target_index
-        && active.binding.owns_compare(&ticket.owner)
+        && active.binding.job_id == ticket.compare_identity.job_id
+        && active.binding.config_revision == ticket.compare_identity.config_revision
+        && active.binding.target_index == ticket.compare_identity.target_index
 }
 
 impl Drop for AutoScanController {
@@ -620,41 +850,80 @@ fn mark_shared_inactive(
     // Preserve generation, ticket cursor, and bound display identity as an orderable tombstone.
     // Only the never-started controller uses the all-zero inactive snapshot.
     shared.status.active = false;
-    shared.status.active_ticket = None;
-    shared.status.pending_trigger = None;
     shared.status.detail = detail.into();
-    shared.pending_compare_min_run_id = None;
-    shared.pending_compare_owner = None;
-    shared.auto_apply_ticket = None;
-    shared.status.clone()
+    shared.ticket = AutoScanTicketLifecycle::Idle;
+    shared.snapshot()
 }
 
 fn publish_status(
     app: &tauri::AppHandle,
     shared: &Arc<Mutex<AutoScanShared>>,
-    mode: AutoScanMode,
+    mode: AutoScanDetectionMode,
     detail: impl Into<String>,
 ) {
     let snapshot = {
         let mut shared = shared.lock().unwrap();
-        shared.status.mode = Some(mode);
+        shared.status.mode = Some(mode.into());
         shared.status.detail = detail.into();
-        shared.status.clone()
+        shared.snapshot()
     };
     let _ = app.emit("autoscan-status", snapshot);
 }
 
-#[allow(clippy::too_many_arguments)]
+fn stop_for_ticket_cursor_exhaustion(app: &tauri::AppHandle, shared: &Arc<Mutex<AutoScanShared>>) {
+    let snapshot = {
+        let mut shared = shared.lock().unwrap();
+        mark_shared_inactive(
+            &mut shared,
+            "AutoScan stopped safely because its ticket cursor was exhausted",
+        )
+    };
+    let _ = app.emit("autoscan-status", snapshot);
+}
+
+fn next_ticket_id(ticket_id: u64) -> Option<u64> {
+    ticket_id.checked_add(1)
+}
+
+fn begin_observed_trigger(
+    binding: &AutoScanBinding,
+    execution: &AutoScanExecutionServices,
+) -> Result<CompareVerificationTicket, String> {
+    let scope = binding.compare_scope();
+    let verification = execution.results.begin_verification(scope.clone());
+    execution.authorizations.revoke_apply_authority(&scope);
+    verification.map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Copy)]
+struct TriggerObservation {
+    generation: u64,
+    ticket_id: u64,
+    mode: AutoScanDetectionMode,
+    reason: AutoScanTriggerReason,
+}
+
 fn publish_trigger(
     app: &tauri::AppHandle,
     shared: &Arc<Mutex<AutoScanShared>>,
-    generation: u64,
+    execution: &AutoScanExecutionServices,
     binding: &AutoScanBinding,
-    run_state: &RunState,
-    ticket_id: u64,
-    mode: AutoScanMode,
-    reason: AutoScanReason,
+    observation: TriggerObservation,
 ) -> bool {
+    // Dirty the executable evidence before any trigger or stopped-status event is observable.
+    // `with_fresh_execution_eligibility` uses the same repository lock, so final Apply reservation
+    // either precedes this observation or fails; an Apply review issued first is revoked below.
+    let verification = match begin_observed_trigger(binding, execution) {
+        Ok(verification) => verification,
+        Err(error) => {
+            let snapshot = {
+                let mut shared = shared.lock().unwrap();
+                mark_shared_inactive(&mut shared, format!("AutoScan stopped safely: {error}"))
+            };
+            let _ = app.emit("autoscan-status", snapshot);
+            return false;
+        }
+    };
     let job_name = match resolve_binding_job_name(binding) {
         Ok(job_name) => job_name,
         Err(error) => {
@@ -667,42 +936,38 @@ fn publish_trigger(
         }
     };
     let trigger = AutoScanTriggerDto {
-        generation,
-        ticket_id,
+        generation: observation.generation,
+        ticket_id: observation.ticket_id,
         job_id: binding.job_id.clone(),
         job_name,
         config_revision: binding.config_revision.clone(),
         target_index: binding.target_index,
         auto_apply: binding.auto_apply,
-        mode,
-        reason,
+        mode: observation.mode,
+        reason: observation.reason,
     };
     {
         let mut shared = shared.lock().unwrap();
         // New work supersedes any completed, claimed, or authorized predecessor before the event
         // becomes observable. A missed event is recoverable from this exact status snapshot.
-        shared.auto_apply_ticket = None;
-        // A zero-delta RMW linearizes against run-id allocation. A Compare reserved before this
-        // trigger can still complete interactively, but cannot be registered as this ticket's work.
-        shared.pending_compare_min_run_id = Some(
-            run_state
-                .seq
-                .fetch_add(0, Ordering::AcqRel)
-                .saturating_add(1),
-        );
-        shared.pending_compare_owner = None;
-        shared.status.latest_ticket_id = ticket_id;
-        shared.status.active_ticket = Some(ticket_id);
-        shared.status.pending_trigger = Some(trigger.clone());
+        shared.status.latest_ticket_id = observation.ticket_id;
         shared.status.job_name = Some(trigger.job_name.clone());
-        shared.status.mode = Some(mode);
-        shared.status.detail = match reason {
-            AutoScanReason::Bootstrap => "Running the initial verification".into(),
-            AutoScanReason::FilesystemChange => "A filesystem change requested verification".into(),
-            AutoScanReason::WatchInvalidated => {
+        shared.status.mode = Some(observation.mode.into());
+        shared.status.detail = match observation.reason {
+            AutoScanTriggerReason::Bootstrap => "Running the initial verification".into(),
+            AutoScanTriggerReason::FilesystemChange => {
+                "A filesystem change requested verification".into()
+            }
+            AutoScanTriggerReason::WatchInvalidated => {
                 "The native event history changed; a full verification is required".into()
             }
-            AutoScanReason::PeriodicVerification => "Running the periodic full verification".into(),
+            AutoScanTriggerReason::PeriodicVerification => {
+                "Running the periodic full verification".into()
+            }
+        };
+        shared.ticket = AutoScanTicketLifecycle::AwaitingCompare {
+            trigger: trigger.clone(),
+            verification,
         };
     }
     let _ = app.emit("autoscan-trigger", trigger);
@@ -753,15 +1018,21 @@ fn run_worker(
     local_roots: Option<(PathBuf, PathBuf)>,
     commands: mpsc::Receiver<WorkerCommand>,
     shared: Arc<Mutex<AutoScanShared>>,
-    run_state: Arc<RunState>,
+    execution: AutoScanExecutionServices,
 ) {
     #[cfg(target_os = "macos")]
     if let Some((source, target)) = local_roots {
         match run_native_macos(
-            app, generation, &binding, &source, &target, &commands, &shared, &run_state,
+            app,
+            generation,
+            &binding,
+            (&source, &target),
+            &commands,
+            &shared,
+            &execution,
         ) {
             NativeExit::Stopped => return,
-            NativeExit::Fallback {
+            NativeExit::PollingRequired {
                 detail,
                 next_ticket,
             } => {
@@ -771,10 +1042,12 @@ fn run_worker(
                     &binding,
                     &commands,
                     &shared,
-                    &run_state,
-                    detail,
-                    next_ticket,
-                    false,
+                    &execution,
+                    PollingStart {
+                        detail,
+                        next_ticket,
+                        immediate: false,
+                    },
                 );
                 return;
             }
@@ -782,13 +1055,13 @@ fn run_worker(
     }
 
     #[cfg(not(target_os = "macos"))]
-    let fallback = if local_roots.is_some() {
+    let polling_detail = if local_roots.is_some() {
         "Native filesystem events are not available on this platform; polling while SyncDash is open"
     } else {
         "Remote roots do not expose a local event journal; polling while SyncDash is open"
     };
     #[cfg(target_os = "macos")]
-    let fallback =
+    let polling_detail =
         "Remote roots do not expose a local FSEvents journal; polling while SyncDash is open";
     run_polling(
         app,
@@ -796,33 +1069,44 @@ fn run_worker(
         &binding,
         &commands,
         &shared,
-        &run_state,
-        fallback.into(),
-        1,
-        true,
+        &execution,
+        PollingStart {
+            detail: polling_detail.into(),
+            next_ticket: 1,
+            immediate: true,
+        },
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+struct PollingStart {
+    detail: String,
+    next_ticket: u64,
+    immediate: bool,
+}
+
 fn run_polling(
     app: &tauri::AppHandle,
     generation: u64,
     binding: &AutoScanBinding,
     commands: &mpsc::Receiver<WorkerCommand>,
     shared: &Arc<Mutex<AutoScanShared>>,
-    run_state: &RunState,
-    detail: String,
-    mut next_ticket: u64,
-    immediate: bool,
+    execution: &AutoScanExecutionServices,
+    start: PollingStart,
 ) {
-    publish_status(app, shared, AutoScanMode::Polling, detail);
+    publish_status(app, shared, AutoScanDetectionMode::Polling, start.detail);
     let interval = binding.interval();
-    let mut deadline = if immediate {
+    let mut deadline = if start.immediate {
         Instant::now()
     } else {
         Instant::now() + interval
     };
-    let mut awaiting = shared.lock().unwrap().status.active_ticket;
+    let mut next_ticket = start.next_ticket;
+    let mut awaiting = shared
+        .lock()
+        .unwrap()
+        .ticket
+        .pending_trigger()
+        .map(|trigger| trigger.ticket_id);
     loop {
         match commands.recv_timeout(WORKER_TICK) {
             Ok(WorkerCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -838,25 +1122,31 @@ fn run_polling(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if awaiting.is_none() && Instant::now() >= deadline {
+            let Some(successor_ticket) = next_ticket_id(next_ticket) else {
+                stop_for_ticket_cursor_exhaustion(app, shared);
+                return;
+            };
             let reason = if next_ticket == 1 {
-                AutoScanReason::Bootstrap
+                AutoScanTriggerReason::Bootstrap
             } else {
-                AutoScanReason::PeriodicVerification
+                AutoScanTriggerReason::PeriodicVerification
             };
             if !publish_trigger(
                 app,
                 shared,
-                generation,
+                execution,
                 binding,
-                run_state,
-                next_ticket,
-                AutoScanMode::Polling,
-                reason,
+                TriggerObservation {
+                    generation,
+                    ticket_id: next_ticket,
+                    mode: AutoScanDetectionMode::Polling,
+                    reason,
+                },
             ) {
                 return;
             }
             awaiting = Some(next_ticket);
-            next_ticket = next_ticket.wrapping_add(1).max(1);
+            next_ticket = successor_ticket;
         }
     }
 }
@@ -864,20 +1154,18 @@ fn run_polling(
 #[cfg(target_os = "macos")]
 enum NativeExit {
     Stopped,
-    Fallback { detail: String, next_ticket: u64 },
+    PollingRequired { detail: String, next_ticket: u64 },
 }
 
 #[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
 fn run_native_macos(
     app: &tauri::AppHandle,
     generation: u64,
     binding: &AutoScanBinding,
-    source: &std::path::Path,
-    target: &std::path::Path,
+    roots: (&std::path::Path, &std::path::Path),
     commands: &mpsc::Receiver<WorkerCommand>,
     shared: &Arc<Mutex<AutoScanShared>>,
-    run_state: &RunState,
+    execution: &AutoScanExecutionServices,
 ) -> NativeExit {
     use syncdash::fs::watch::WatchMessage;
     use syncdash::run::watch::{
@@ -898,10 +1186,10 @@ fn run_native_macos(
             None
         }
     };
-    let watcher = match syncdash::fs::watch::macos::watch_pair(source, target, resume.as_ref()) {
+    let watcher = match syncdash::fs::watch::macos::watch_pair(roots.0, roots.1, resume.as_ref()) {
         Ok(watcher) => watcher,
         Err(error) => {
-            return NativeExit::Fallback {
+            return NativeExit::PollingRequired {
                 detail: format!(
                 "FSEvents could not arm both local roots ({error}); polling while SyncDash is open"
             ),
@@ -923,7 +1211,7 @@ fn run_native_macos(
         }
     }
     if let Err(error) = trigger.arm(watcher.armed().position.clone()) {
-        return NativeExit::Fallback {
+        return NativeExit::PollingRequired {
             detail: format!(
                 "FSEvents returned an invalid cursor ({error}); polling while SyncDash is open"
             ),
@@ -933,7 +1221,7 @@ fn run_native_macos(
     publish_status(
         app,
         shared,
-        AutoScanMode::NativeFsevents,
+        AutoScanDetectionMode::NativeFsevents,
         "Watching both local roots with FSEvents; periodic full verification remains enabled",
     );
 
@@ -973,7 +1261,7 @@ fn run_native_macos(
             Ok(WatchMessage::Trigger(batch)) => {
                 let at_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 if let Err(error) = trigger.observe(ChangeBatch::from(batch), at_ms) {
-                    return NativeExit::Fallback {
+                    return NativeExit::PollingRequired {
                         detail: format!(
                             "FSEvents cursor continuity failed ({error}); polling while SyncDash is open"
                         ),
@@ -982,7 +1270,7 @@ fn run_native_macos(
                 }
             }
             Ok(WatchMessage::BackendError { message, .. }) => {
-                return NativeExit::Fallback {
+                return NativeExit::PollingRequired {
                     detail: format!(
                         "FSEvents stopped reporting reliably ({message}); polling while SyncDash is open"
                     ),
@@ -990,7 +1278,7 @@ fn run_native_macos(
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return NativeExit::Fallback {
+                return NativeExit::PollingRequired {
                     detail: "FSEvents disconnected; polling while SyncDash is open".into(),
                     next_ticket,
                 }
@@ -1003,7 +1291,7 @@ fn run_native_macos(
                 Ok(position) => {
                     let at_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                     if let Err(error) = trigger.request_periodic(position, at_ms) {
-                        return NativeExit::Fallback {
+                        return NativeExit::PollingRequired {
                             detail: format!(
                                 "FSEvents periodic cursor capture failed ({error}); polling while SyncDash is open"
                             ),
@@ -1012,7 +1300,7 @@ fn run_native_macos(
                     }
                 }
                 Err(error) => {
-                    return NativeExit::Fallback {
+                    return NativeExit::PollingRequired {
                         detail: format!(
                         "FSEvents cursor capture failed ({error}); polling while SyncDash is open"
                     ),
@@ -1031,7 +1319,7 @@ fn run_native_macos(
             Ok(Some(ticket)) => ticket,
             Ok(None) => continue,
             Err(error) => {
-                return NativeExit::Fallback {
+                return NativeExit::PollingRequired {
                     detail: format!(
                         "FSEvents orchestration failed ({error}); polling while SyncDash is open"
                     ),
@@ -1042,30 +1330,36 @@ fn run_native_macos(
         let reason = match ticket.coverage {
             WorkCoverage::FullTree {
                 reason: FullScanReason::Bootstrap,
-            } => AutoScanReason::Bootstrap,
+            } => AutoScanTriggerReason::Bootstrap,
             WorkCoverage::FullTree {
                 reason: FullScanReason::Periodic,
-            } => AutoScanReason::PeriodicVerification,
+            } => AutoScanTriggerReason::PeriodicVerification,
             WorkCoverage::FullTree {
                 reason: FullScanReason::WatchInvalidated(_),
             }
             | WorkCoverage::FullTree {
                 reason: FullScanReason::ChangeSetTooLarge { .. },
-            } => AutoScanReason::WatchInvalidated,
+            } => AutoScanTriggerReason::WatchInvalidated,
             WorkCoverage::FullTree { .. } | WorkCoverage::IncrementalEligible { .. } => {
-                AutoScanReason::FilesystemChange
+                AutoScanTriggerReason::FilesystemChange
             }
         };
-        next_ticket = next_ticket.max(ticket.id.wrapping_add(1).max(1));
+        let Some(successor_ticket) = next_ticket_id(ticket.id) else {
+            stop_for_ticket_cursor_exhaustion(app, shared);
+            return NativeExit::Stopped;
+        };
+        next_ticket = next_ticket.max(successor_ticket);
         if !publish_trigger(
             app,
             shared,
-            generation,
+            execution,
             binding,
-            run_state,
-            ticket.id,
-            AutoScanMode::NativeFsevents,
-            reason,
+            TriggerObservation {
+                generation,
+                ticket_id: ticket.id,
+                mode: AutoScanDetectionMode::NativeFsevents,
+                reason,
+            },
         ) {
             return NativeExit::Stopped;
         }
@@ -1134,6 +1428,19 @@ mod tests {
         assert_eq!(configured_interval(&job), 90);
     }
 
+    #[test]
+    fn unique_id_allocation_fails_closed_at_the_u64_limit() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            allocate_unique_id(&counter, "test identity").unwrap(),
+            u64::MAX
+        );
+        assert!(allocate_unique_id(&counter, "test identity")
+            .unwrap_err()
+            .contains("ID space is exhausted"));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
     fn trigger(binding: &AutoScanBinding, generation: u64, ticket_id: u64) -> AutoScanTriggerDto {
         AutoScanTriggerDto {
             generation,
@@ -1143,32 +1450,44 @@ mod tests {
             config_revision: binding.config_revision.clone(),
             target_index: binding.target_index,
             auto_apply: binding.auto_apply,
-            mode: AutoScanMode::Polling,
-            reason: AutoScanReason::FilesystemChange,
+            mode: AutoScanDetectionMode::Polling,
+            reason: AutoScanTriggerReason::FilesystemChange,
         }
+    }
+
+    fn controller() -> AutoScanController {
+        AutoScanController::new(
+            Arc::new(CompareResultRepository::default()),
+            Arc::new(OperationAuthorizationStore::default()),
+        )
     }
 
     fn controller_waiting_for(
         ticket_id: u64,
         auto_apply: bool,
     ) -> (AutoScanController, mpsc::Receiver<WorkerCommand>) {
-        let controller = AutoScanController::default();
+        let controller = controller();
         let mut binding = binding();
         binding.auto_apply = auto_apply;
         let (commands, receiver) = mpsc::channel();
-        let mut status = AutoScanStatusDto::starting(4, &binding);
+        let mut status = AutoScanStatusCore::starting(4, &binding);
         status.latest_ticket_id = ticket_id;
-        status.active_ticket = Some(ticket_id);
-        status.pending_trigger = Some(trigger(&binding, 4, ticket_id));
+        let pending_trigger = trigger(&binding, 4, ticket_id);
+        let verification = controller
+            .execution
+            .results
+            .begin_verification(binding.compare_scope())
+            .unwrap();
         *controller.active.lock().unwrap() = Some(ActiveAutoScan {
             binding,
             generation: 4,
             commands,
             shared: Arc::new(Mutex::new(AutoScanShared {
                 status,
-                pending_compare_min_run_id: Some(1),
-                pending_compare_owner: None,
-                auto_apply_ticket: None,
+                ticket: AutoScanTicketLifecycle::AwaitingCompare {
+                    trigger: pending_trigger,
+                    verification,
+                },
             })),
             join: None,
         });
@@ -1187,17 +1506,103 @@ mod tests {
         }
     }
 
+    fn successful_result(owner: CompareOwner) -> SuccessfulCompareResult {
+        let plan = crate::dto::PlanDto {
+            owner,
+            header: syncdash::model::plan::PlanHeader {
+                schema: syncdash::model::plan::PLAN_SCHEMA,
+                kind: "plan".into(),
+                mode: "mirror".into(),
+                generated_at_ms: 0,
+                source_root: "/source".into(),
+                source_host: "host".into(),
+                target_root: "/target".into(),
+                target_host: "host".into(),
+                op_count: 0,
+                conflict_count: 0,
+                source_entries: 0,
+                target_entries: 0,
+                source_excluded: 0,
+                target_excluded: 0,
+                source_walk_errors: 0,
+                target_walk_errors: 0,
+                source_walk_err_samples: Vec::new(),
+                target_walk_err_samples: Vec::new(),
+                source_icloud_stubs: 0,
+                target_icloud_stubs: 0,
+                source_icloud_stub_samples: Vec::new(),
+                target_icloud_stub_samples: Vec::new(),
+            },
+            ops: Vec::new(),
+            metas: Vec::new(),
+            identical_count: 0,
+            identical_bytes: 0,
+        };
+        let snapshot = |root: &str| syncdash::model::table::Snapshot {
+            header: syncdash::model::table::Header {
+                schema: syncdash::model::table::SCHEMA,
+                kind: "snapshot".into(),
+                root: root.into(),
+                host: "host".into(),
+                os: "test".into(),
+                scanned_at_ms: 0,
+                duration_ms: 0,
+                entry_count: 0,
+                hashed: false,
+                excluded_dirs: 0,
+                excluded_files: 0,
+                walk_errors: 0,
+                walk_err_samples: Vec::new(),
+                icloud_stubs: 0,
+                icloud_stub_samples: Vec::new(),
+                skipped_symlinks: 0,
+                dataless_files: 0,
+                vfs: None,
+            },
+            entries: Vec::new(),
+        };
+        SuccessfulCompareResult::from_plan(
+            "test-plan-digest".into(),
+            plan,
+            snapshot("/source"),
+            snapshot("/target"),
+            syncdash::pipeline::compare::CompareOptions::default(),
+        )
+    }
+
     fn record_current_compare(controller: &AutoScanController) {
-        assert!(controller.record_successful_compare(&owner()));
+        let status = controller.status();
+        let ticket_id = status.active_ticket.unwrap();
+        let permit = controller.issue_compare_permit(4, ticket_id).unwrap();
+        let owner = owner();
+        controller
+            .publish_successful_compare(&permit, successful_result(owner))
+            .unwrap();
+    }
+
+    fn pending_verification(controller: &AutoScanController) -> CompareVerificationTicket {
+        let shared = controller
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .shared
+            .clone();
+        let verification = match &shared.lock().unwrap().ticket {
+            AutoScanTicketLifecycle::AwaitingCompare { verification, .. } => verification.clone(),
+            _ => panic!("test controller must be awaiting Compare"),
+        };
+        verification
     }
 
     #[test]
     fn completion_is_one_use_and_requires_the_exact_generation_and_ticket() {
         let (controller, receiver) = controller_waiting_for(11, false);
-        assert!(controller.complete(3, 11, false, None).is_err());
-        assert!(controller.complete(4, 12, false, None).is_err());
-        controller.complete(4, 11, false, None).unwrap();
-        assert!(controller.complete(4, 11, false, None).is_err());
+        assert!(controller.complete(3, 11, false).is_err());
+        assert!(controller.complete(4, 12, false).is_err());
+        controller.complete(4, 11, false).unwrap();
+        assert!(controller.complete(4, 11, false).is_err());
         assert!(matches!(
             receiver.try_recv(),
             Ok(WorkerCommand::Complete {
@@ -1208,18 +1613,40 @@ mod tests {
     }
 
     #[test]
+    fn observed_trigger_advances_verification_before_ticket_state_is_visible() {
+        let (controller, _receiver) = controller_waiting_for(11, false);
+        let previous = pending_verification(&controller);
+        let binding = controller
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .binding
+            .clone();
+
+        let next = begin_observed_trigger(&binding, &controller.execution).unwrap();
+
+        assert_ne!(next, previous);
+        assert_eq!(pending_verification(&controller), previous);
+    }
+
+    #[test]
     fn successful_completion_requires_an_authenticated_owned_compare() {
         let (controller, receiver) = controller_waiting_for(12, false);
+        assert!(controller.complete(4, 12, true).is_err());
+        assert!(receiver.try_recv().is_err());
+        let permit = controller.issue_compare_permit(4, 12).unwrap();
         let mut wrong = owner();
         wrong.identity.target_index = 0;
-        assert!(controller.complete(4, 12, true, None).is_err());
-        assert!(controller.complete(4, 12, true, Some(&wrong)).is_err());
-        assert!(receiver.try_recv().is_err());
-        record_current_compare(&controller);
-        let mut older = owner();
-        older.identity.compare_run_id -= 1;
-        assert!(controller.complete(4, 12, true, Some(&older)).is_err());
-        controller.complete(4, 12, true, Some(&owner())).unwrap();
+        assert!(controller
+            .publish_successful_compare(&permit, successful_result(wrong))
+            .is_err());
+        let expected_owner = owner();
+        controller
+            .publish_successful_compare(&permit, successful_result(expected_owner))
+            .unwrap();
+        controller.complete(4, 12, true).unwrap();
         assert!(matches!(
             receiver.try_recv(),
             Ok(WorkerCommand::Complete {
@@ -1230,33 +1657,96 @@ mod tests {
     }
 
     #[test]
-    fn compare_reserved_before_the_trigger_cannot_satisfy_the_ticket() {
+    fn manual_same_scope_compare_cannot_satisfy_the_ticket_without_the_exact_permit() {
         let (controller, _receiver) = controller_waiting_for(24, false);
-        controller
-            .active
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .shared
-            .lock()
-            .unwrap()
-            .pending_compare_min_run_id = Some(9);
+        let forged_manual_permit = AutoScanComparePermit {
+            permit_id: 999,
+            generation: 4,
+            ticket_id: 24,
+            job_id: "job-id-photos".into(),
+            config_revision: "revision-a".into(),
+            target_index: 1,
+            verification: pending_verification(&controller),
+        };
+        let expected_owner = owner();
+        assert!(controller
+            .publish_successful_compare(
+                &forged_manual_permit,
+                successful_result(expected_owner.clone()),
+            )
+            .is_err());
+        assert!(controller.complete(4, 24, true).is_err());
 
-        assert!(!controller.record_successful_compare(&owner()));
-        let mut current = owner();
-        current.identity.compare_run_id = 9;
-        assert!(controller.record_successful_compare(&current));
-        assert!(controller.complete(4, 24, true, Some(&owner())).is_err());
-        assert!(controller.complete(4, 24, true, Some(&current)).is_ok());
+        let exact_permit = controller.issue_compare_permit(4, 24).unwrap();
+        controller
+            .publish_successful_compare(&exact_permit, successful_result(expected_owner))
+            .unwrap();
+        assert!(controller.complete(4, 24, true).is_ok());
+    }
+
+    #[test]
+    fn abandoned_review_or_failed_compare_reuses_only_the_same_pending_ticket_permit() {
+        let (controller, _receiver) = controller_waiting_for(27, false);
+        let first = controller.issue_compare_permit(4, 27).unwrap();
+        let permitted = controller.status();
+        assert_eq!(permitted.active_ticket, Some(27));
+        assert_eq!(permitted.pending_trigger.unwrap().ticket_id, 27);
+        let after_abandoned_review = controller.issue_compare_permit(4, 27).unwrap();
+        let after_failed_compare = controller.issue_compare_permit(4, 27).unwrap();
+        assert_eq!(first, after_abandoned_review);
+        assert_eq!(first, after_failed_compare);
+        assert!(controller.issue_compare_permit(4, 28).is_err());
+
+        let expected_owner = owner();
+        controller
+            .publish_successful_compare(&first, successful_result(expected_owner))
+            .unwrap();
+        let published = controller.status();
+        assert_eq!(published.active_ticket, Some(27));
+        assert_eq!(published.pending_trigger.unwrap().ticket_id, 27);
+        assert!(controller.issue_compare_permit(4, 27).is_err());
+    }
+
+    #[test]
+    fn exhausted_permit_ids_leave_the_pending_trigger_retryable() {
+        let (controller, _receiver) = controller_waiting_for(29, false);
+        controller
+            .compare_permits
+            .store(u64::MAX, Ordering::Relaxed);
+
+        assert!(controller.issue_compare_permit(4, 29).is_err());
+        let status = controller.status();
+        assert_eq!(status.active_ticket, Some(29));
+        assert_eq!(status.pending_trigger.unwrap().ticket_id, 29);
+        assert!(controller.complete(4, 29, false).is_ok());
+    }
+
+    #[test]
+    fn stopped_generation_rejects_publication_before_repository_transition() {
+        let (controller, _receiver) = controller_waiting_for(28, false);
+        let permit = controller.issue_compare_permit(4, 28).unwrap();
+        controller.stop();
+        let expected_owner = owner();
+        assert!(controller
+            .publish_successful_compare(&permit, successful_result(expected_owner.clone()),)
+            .is_err());
+        assert!(controller
+            .execution
+            .results
+            .get_exact(&expected_owner.identity)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn successful_compare_refreshes_a_renamed_display_label_without_changing_authority() {
         let (controller, _receiver) = controller_waiting_for(25, true);
+        let permit = controller.issue_compare_permit(4, 25).unwrap();
         let mut renamed = owner();
         renamed.job_name = "externally-renamed".into();
-        assert!(controller.record_successful_compare(&renamed));
+        controller
+            .publish_successful_compare(&permit, successful_result(renamed))
+            .unwrap();
         let status = controller.status();
         assert_eq!(status.job_name.as_deref(), Some("externally-renamed"));
         assert_eq!(
@@ -1268,10 +1758,9 @@ mod tests {
         );
 
         // Display names are deliberately excluded from authority equality.
-        controller.complete(4, 25, true, Some(&owner())).unwrap();
+        controller.complete(4, 25, true).unwrap();
         let ticket = controller.claim_completed_auto_apply(4, 25).unwrap();
-        assert_eq!(ticket.job_name, "externally-renamed");
-        assert_eq!(ticket.owner.job_name, "externally-renamed");
+        assert_eq!(ticket.compare_identity(), &owner().identity);
     }
 
     #[test]
@@ -1294,7 +1783,7 @@ mod tests {
     fn completed_autoapply_ticket_is_claimed_authorized_and_consumed_exactly_once() {
         let (controller, _receiver) = controller_waiting_for(15, true);
         record_current_compare(&controller);
-        let status = controller.complete(4, 15, true, Some(&owner())).unwrap();
+        let status = controller.complete(4, 15, true).unwrap();
         assert_eq!(status.latest_ticket_id, 15);
         assert_eq!(status.active_ticket, None);
         assert_eq!(status.pending_trigger, None);
@@ -1324,7 +1813,7 @@ mod tests {
     fn completed_autoapply_claim_has_exactly_one_concurrent_winner() {
         let (controller, _receiver) = controller_waiting_for(20, true);
         record_current_compare(&controller);
-        controller.complete(4, 20, true, Some(&owner())).unwrap();
+        controller.complete(4, 20, true).unwrap();
         let controller = Arc::new(controller);
         let barrier = Arc::new(Barrier::new(3));
         let mut threads = Vec::new();
@@ -1351,7 +1840,7 @@ mod tests {
     fn failed_authorization_or_reservation_cannot_replay_the_ticket() {
         let (controller, _receiver) = controller_waiting_for(21, true);
         record_current_compare(&controller);
-        controller.complete(4, 21, true, Some(&owner())).unwrap();
+        controller.complete(4, 21, true).unwrap();
         let ticket = controller.claim_completed_auto_apply(4, 21).unwrap();
         assert!(controller
             .authorize_claim(&ticket, || Err::<(), _>("grant disappeared".into()))
@@ -1363,7 +1852,7 @@ mod tests {
 
         let (controller, _receiver) = controller_waiting_for(22, true);
         record_current_compare(&controller);
-        controller.complete(4, 22, true, Some(&owner())).unwrap();
+        controller.complete(4, 22, true).unwrap();
         let ticket = controller.claim_completed_auto_apply(4, 22).unwrap();
         controller
             .authorize_claim(&ticket, || Ok::<_, String>(()))
@@ -1379,12 +1868,12 @@ mod tests {
     #[test]
     fn failed_or_non_autoapply_completion_never_creates_write_authority() {
         let (failed, _receiver) = controller_waiting_for(16, true);
-        failed.complete(4, 16, false, None).unwrap();
+        failed.complete(4, 16, false).unwrap();
         assert!(failed.claim_completed_auto_apply(4, 16).is_err());
 
         let (manual, _receiver) = controller_waiting_for(17, false);
         record_current_compare(&manual);
-        manual.complete(4, 17, true, Some(&owner())).unwrap();
+        manual.complete(4, 17, true).unwrap();
         assert!(manual.claim_completed_auto_apply(4, 17).is_err());
     }
 
@@ -1395,13 +1884,12 @@ mod tests {
         controller
             .rebind_job_name("job-id-photos", "renamed-before-completion")
             .unwrap();
-        controller.complete(4, 18, true, Some(&owner())).unwrap();
+        controller.complete(4, 18, true).unwrap();
         let _ = controller
             .rebind_job_name("job-id-photos", "renamed-after-completion")
             .unwrap();
         let ticket = controller.claim_completed_auto_apply(4, 18).unwrap();
-        assert_eq!(ticket.job_name, "renamed-after-completion");
-        assert_eq!(ticket.owner.job_name, "renamed-after-completion");
+        assert_eq!(ticket.compare_identity(), &owner().identity);
         let stopped = controller.stop();
         assert!(!stopped.active);
         assert_eq!(stopped.generation, 4);
@@ -1414,7 +1902,7 @@ mod tests {
 
     #[test]
     fn job_mutation_stops_only_the_monitored_identity_and_reports_canonical_inactive() {
-        let never_started = AutoScanController::default().status();
+        let never_started = controller().status();
         assert!(!never_started.active);
         assert_eq!(never_started.generation, 0);
         assert_eq!(never_started.latest_ticket_id, 0);
@@ -1467,7 +1955,7 @@ mod tests {
             let barrier = barrier.clone();
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
-                controller.complete(4, 19, false, None).is_ok()
+                controller.complete(4, 19, false).is_ok()
             }));
         }
         barrier.wait();
@@ -1539,5 +2027,12 @@ mod tests {
         registered.job_id = "job-id-replacement".into();
         let error = validate_resolved_binding(&binding, "old-name", &registered).unwrap_err();
         assert!(error.contains("replacement identity"), "{error}");
+    }
+
+    #[test]
+    fn ticket_cursor_never_wraps_within_a_generation() {
+        assert_eq!(next_ticket_id(1), Some(2));
+        assert_eq!(next_ticket_id(u64::MAX - 1), Some(u64::MAX));
+        assert_eq!(next_ticket_id(u64::MAX), None);
     }
 }

@@ -10,7 +10,7 @@ import {
   reconcileAutoScanStatus,
   statusCanOwnAutoScanTrigger,
 } from '../../typescript/ui/state/autoscan.ts';
-import type { AutoScanStatusDto } from '../../typescript/core/ipc.ts';
+import type { AutoScanStatusDto } from '../../typescript/core/types/generated/AutoScanStatusDto.ts';
 import type { AutoScanTicket } from '../../typescript/ui/state/autoscan.ts';
 
 const ticket: AutoScanTicket = {
@@ -94,9 +94,8 @@ test('status reconciliation rejects stale generations and regressions but accept
   assert.equal(reconcileAutoScanStatus(current, status({ generation: 11 }), 'completion', 3), current);
   const orderedInactive = status({ active: false, generation: 12, mode: null, detail: 'Stopped', latest_ticket_id: 0 });
   assert.equal(reconcileAutoScanStatus(current, orderedInactive, 'snapshot'), orderedInactive);
-  const stopped = reconcileAutoScanStatus(current, staleInactive, 'event');
-  assert.equal(stopped?.active, false);
-  assert.equal(stopped?.generation, 12);
+  assert.equal(reconcileAutoScanStatus(current, staleInactive, 'event'), current);
+  const stopped = reconcileAutoScanStatus(current, orderedInactive, 'event');
   assert.equal(reconcileAutoScanStatus(stopped, current, 'event'), stopped);
 });
 

@@ -16,7 +16,7 @@ SyncDash/
 │   ├── run/                L3  orchestrator: local · peer · roots · archive, behind ONE transport router
 │   ├── boot.rs             L3  process startup both shells share
 │   └── cli/ + main.rs      L4  args (the --help contract) · dispatch
-├── src-tauri/              L4  Tauri shell: dto · bridge · state · cmd/{jobs,run,results,edit,logs,shell}
+├── src-tauri/              L4  Tauri shell: dto · bridge · compare_results · operation_authorization · operation_selection · run_lifecycle · cmd/{jobs,run,results,edit,logs,shell}
 ├── typescript/             Vite + React 19 — no UI library, no CSS framework
 │   ├── core/               framework-free domain + ALL IPC; components never call invoke() themselves
 │   │   └── types/generated/    ts-rs output — never hand-edit
