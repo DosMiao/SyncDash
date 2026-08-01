@@ -10,7 +10,6 @@ use std::io::{Read, Write};
 use crate::fs::vfs::error::{VfsError, VfsErrorKind, VfsResult};
 use crate::fs::vfs::{CommitReport, ReadStream, WriteHint, WriteStaged};
 
-
 use super::{map_ftp_err, ConnSlot, Feats};
 
 /// Blocking read over the FTP data connection. EOF finalizes the transfer on the
@@ -32,7 +31,11 @@ impl FtpRead {
         self.finished = true;
         if let Some(data) = self.data.take() {
             if let Some(conn) = self.conn.lock().unwrap().as_mut() {
-                let _ = if aborted { conn.stream.abort(data) } else { conn.stream.finalize_retr_stream(data) };
+                let _ = if aborted {
+                    conn.stream.abort(data)
+                } else {
+                    conn.stream.finalize_retr_stream(data)
+                };
             }
         }
     }
@@ -79,8 +82,12 @@ pub(super) struct FtpStaged {
 impl WriteStaged for FtpStaged {
     fn write(&mut self, buf: &[u8]) -> VfsResult<()> {
         let data = self.data.as_mut().expect("write after seal");
-        data.write_all(buf)
-            .map_err(|e| VfsError::new(VfsErrorKind::Transient, format!("ftp upload write failed: {e}")))?;
+        data.write_all(buf).map_err(|e| {
+            VfsError::new(
+                VfsErrorKind::Transient,
+                format!("ftp upload write failed: {e}"),
+            )
+        })?;
         self.wrote += buf.len() as u64;
         Ok(())
     }
@@ -103,12 +110,16 @@ impl WriteStaged for FtpStaged {
             // Observed against a live server as a 64 KiB file arriving as exactly 32 KiB. The
             // commit-time size check caught it rather than letting a truncated file land, which is
             // what that check is for; this is the cause it was reporting.
-            data.flush()
-                .map_err(|e| VfsError::new(VfsErrorKind::Transient, format!("flushing the upload failed: {e}")))?;
+            data.flush().map_err(|e| {
+                VfsError::new(
+                    VfsErrorKind::Transient,
+                    format!("flushing the upload failed: {e}"),
+                )
+            })?;
             let mut guard = self.conn.lock().unwrap();
-            let conn = guard
-                .as_mut()
-                .ok_or_else(|| VfsError::new(VfsErrorKind::Transient, "connection lost before seal"))?;
+            let conn = guard.as_mut().ok_or_else(|| {
+                VfsError::new(VfsErrorKind::Transient, "connection lost before seal")
+            })?;
             conn.stream
                 .finalize_put_stream(data)
                 .map_err(|e| map_ftp_err("finalize upload", e))?;
@@ -142,7 +153,11 @@ impl WriteStaged for FtpStaged {
             .stream
             .retr_as_stream(&self.tmp_abs)
             .map_err(|e| map_ftp_err("open staged for read-back", e))?;
-        Ok(Box::new(FtpRead { conn: self.conn.clone(), data: Some(Box::new(data)), finished: false }))
+        Ok(Box::new(FtpRead {
+            conn: self.conn.clone(),
+            data: Some(Box::new(data)),
+            finished: false,
+        }))
     }
 
     fn commit(mut self: Box<Self>) -> VfsResult<CommitReport> {
@@ -151,9 +166,9 @@ impl WriteStaged for FtpStaged {
         }
         {
             let mut guard = self.conn.lock().unwrap();
-            let conn = guard
-                .as_mut()
-                .ok_or_else(|| VfsError::new(VfsErrorKind::Transient, "connection lost before commit"))?;
+            let conn = guard.as_mut().ok_or_else(|| {
+                VfsError::new(VfsErrorKind::Transient, "connection lost before commit")
+            })?;
             // Clear the destination (server rename-overwrite behavior varies — never rely on it)
             match conn.stream.rm(&self.dst_abs) {
                 Ok(()) => {}
@@ -175,7 +190,10 @@ impl WriteStaged for FtpStaged {
             if landed != self.wrote {
                 return Err(VfsError::new(
                     VfsErrorKind::Protocol,
-                    format!("after rename the server holds {landed} bytes but the upload carried {}", self.wrote),
+                    format!(
+                        "after rename the server holds {landed} bytes but the upload carried {}",
+                        self.wrote
+                    ),
                 ));
             }
         }
@@ -187,10 +205,10 @@ impl WriteStaged for FtpStaged {
                 let stamp = crate::foundation::time::stamp_compact(ms).replace('-', "");
                 let mut guard = self.conn.lock().unwrap();
                 if let Some(conn) = guard.as_mut() {
-                    match conn
-                        .stream
-                        .custom_command(format!("MFMT {stamp} {}", self.dst_abs), &[suppaftp::Status::File])
-                    {
+                    match conn.stream.custom_command(
+                        format!("MFMT {stamp} {}", self.dst_abs),
+                        &[suppaftp::Status::File],
+                    ) {
                         Ok(_) => report.mtime_ondisk_ms = Some((ms / 1000) * 1000), // second-granular, as accepted
                         Err(e) => report.mtime_error = Some(map_ftp_err("MFMT", e)),
                     }

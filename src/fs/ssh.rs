@@ -34,7 +34,9 @@ impl std::fmt::Display for HostCheckError {
         match self {
             HostCheckError::Ssh(e) => write!(f, "{e}"),
             HostCheckError::Unknown { fingerprint } => write!(f, "unknown host key {fingerprint}"),
-            HostCheckError::Changed { fingerprint } => write!(f, "HOST KEY CHANGED to {fingerprint}"),
+            HostCheckError::Changed { fingerprint } => {
+                write!(f, "HOST KEY CHANGED to {fingerprint}")
+            }
         }
     }
 }
@@ -118,7 +120,10 @@ pub async fn connect(
     display: &str,
 ) -> VfsResult<Session> {
     let config = Arc::new(russh::client::Config::default());
-    let handler = HostCheck { host: host.to_string(), port };
+    let handler = HostCheck {
+        host: host.to_string(),
+        port,
+    };
 
     let mut session = match tokio::time::timeout(
         timeout,
@@ -142,7 +147,8 @@ pub async fn connect(
     let mut key_candidates: Vec<(PathBuf, bool)> = Vec::new(); // (path, explicit)
     if let Some(k) = &creds.keyfile {
         key_candidates.push((k.clone(), true));
-    } else if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+    } else if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    {
         let ssh = PathBuf::from(home).join(".ssh");
         for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
             let p = ssh.join(name);
@@ -154,7 +160,12 @@ pub async fn connect(
     for (path, explicit) in key_candidates {
         match load_secret_key(&path, creds.passphrase.as_deref()) {
             Ok(key) => {
-                let hash = session.best_supported_rsa_hash().await.ok().flatten().flatten();
+                let hash = session
+                    .best_supported_rsa_hash()
+                    .await
+                    .ok()
+                    .flatten()
+                    .flatten();
                 let k = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
                 match session.authenticate_publickey(user, k).await {
                     Ok(r) if r.success() => {
@@ -207,9 +218,15 @@ pub async fn connect(
     if !authed {
         return Err(VfsError::new(
             VfsErrorKind::Auth,
-            format!("authentication to {user}@{host} failed; tried: {}", tried.join("; ")),
+            format!(
+                "authentication to {user}@{host} failed; tried: {}",
+                tried.join("; ")
+            ),
         ));
     }
 
-    Ok(Session { handle: session, tried })
+    Ok(Session {
+        handle: session,
+        tried,
+    })
 }

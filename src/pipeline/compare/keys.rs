@@ -41,7 +41,11 @@ pub(super) fn generation_of(e: &Entry, r: &Entry, win_ms: i64) -> Option<usize> 
 }
 
 /// Normalized key → entry; on a collision (NFD/NFC or case twins) the first one seen is kept and recorded
-pub(super) fn map_of<'a>(snap: &'a Snapshot, kind: EntryKind, ci: bool) -> (BTreeMap<String, &'a Entry>, Vec<String>) {
+pub(super) fn map_of<'a>(
+    snap: &'a Snapshot,
+    kind: EntryKind,
+    ci: bool,
+) -> (BTreeMap<String, &'a Entry>, Vec<String>) {
     let mut m: BTreeMap<String, &Entry> = BTreeMap::new();
     let mut dups = Vec::new();
     for e in snap.entries.iter().filter(|e| e.kind == kind) {

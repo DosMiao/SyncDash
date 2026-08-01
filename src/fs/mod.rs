@@ -73,7 +73,9 @@ pub fn remove_dir_force(p: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir(p) {
         #[cfg(windows)]
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            let Ok(md) = std::fs::symlink_metadata(p) else { return Err(e) };
+            let Ok(md) = std::fs::symlink_metadata(p) else {
+                return Err(e);
+            };
             let mut perms = md.permissions();
             perms.set_readonly(false);
             std::fs::set_permissions(p, perms)?;
@@ -130,7 +132,8 @@ mod tests {
 
         #[cfg(windows)]
         {
-            let e = std::fs::remove_dir(&d).expect_err("premise: Windows refuses a read-only directory");
+            let e = std::fs::remove_dir(&d)
+                .expect_err("premise: Windows refuses a read-only directory");
             assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
         }
         remove_dir_force(&d).expect("force removal must succeed");
@@ -140,7 +143,10 @@ mod tests {
         let full = base.join("full");
         std::fs::create_dir_all(&full).unwrap();
         std::fs::write(full.join("x"), b"x").unwrap();
-        assert!(remove_dir_force(&full).is_err(), "force must not turn into a recursive delete");
+        assert!(
+            remove_dir_force(&full).is_err(),
+            "force must not turn into a recursive delete"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

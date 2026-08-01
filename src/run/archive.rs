@@ -24,9 +24,15 @@ struct ArchiveTemp {
 impl ArchiveTemp {
     fn create(dst: &Path) -> io::Result<(Self, std::fs::File)> {
         let dir = archive_parent(dst);
-        let base = dst.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "archive path has no UTF-8 file name")
-        })?;
+        let base = dst
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "archive path has no UTF-8 file name",
+                )
+            })?;
         for _ in 0..16 {
             let sequence = ARCHIVE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = dir.join(format!(
@@ -34,8 +40,20 @@ impl ArchiveTemp {
                 std::process::id(),
                 sequence
             ));
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => return Ok((ArchiveTemp { path, committed: false }, file)),
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok((
+                        ArchiveTemp {
+                            path,
+                            committed: false,
+                        },
+                        file,
+                    ))
+                }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
             }
@@ -56,14 +74,22 @@ impl Drop for ArchiveTemp {
 }
 
 fn archive_parent(dst: &Path) -> &Path {
-    dst.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."))
+    dst.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 #[cfg(windows)]
 fn archive_backup_path(dst: &Path) -> io::Result<PathBuf> {
-    let base = dst.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "archive path has no UTF-8 file name")
-    })?;
+    let base = dst
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "archive path has no UTF-8 file name",
+            )
+        })?;
     Ok(archive_parent(dst).join(format!("{TEMP_PREFIX}{base}.archive-backup")))
 }
 
@@ -205,13 +231,22 @@ pub fn refresh_archive_with(
         // The previous-generation archive: every row of the new table pushes the old hash onto the prev chain, so that
         // "one generation behind" can be told apart from "concurrent modification" (P1-3, see compare::generation_of)
         recover_archive_target(arch_path)?;
-        let previous = if arch_path.is_file() { Some(Snapshot::load(arch_path)?) } else { None };
+        let previous = if arch_path.is_file() {
+            Some(Snapshot::load(arch_path)?)
+        } else {
+            None
+        };
         snap.header.kind = "archive".into();
-        snap.entries.retain(|e| !conflicted.contains(e.path.as_str()));
+        snap.entries
+            .retain(|e| !conflicted.contains(e.path.as_str()));
         if let Some(prev) = &previous {
             crate::model::table::roll_generations(&mut snap.entries, &prev.entries);
         }
-        write_archive_atomic(arch_path, |writer| snap.write_to(writer), || pp.checkpoint())?;
+        write_archive_atomic(
+            arch_path,
+            |writer| snap.write_to(writer),
+            || pp.checkpoint(),
+        )?;
         ctx.log(
             crate::model::event::LogLevel::Info,
             "run",
@@ -249,7 +284,8 @@ mod tests {
 
     #[test]
     fn archive_replacement_keeps_the_previous_file_until_commit() {
-        let dir = std::env::temp_dir().join(format!("syncdash-archive-atomic-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("syncdash-archive-atomic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let archive = dir.join("archive.jsonl");
@@ -259,7 +295,10 @@ mod tests {
             &archive,
             |writer| {
                 writer.write_all(b"partial replacement\n")?;
-                Err(io::Error::new(io::ErrorKind::Other, "simulated write failure"))
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "simulated write failure",
+                ))
             },
             || Ok(()),
         );
@@ -285,7 +324,10 @@ mod tests {
             .unwrap()
             .flatten()
             .filter(|entry| {
-                entry.file_name().to_string_lossy().starts_with(crate::foundation::names::TEMP_PREFIX)
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(crate::foundation::names::TEMP_PREFIX)
             })
             .collect();
         assert!(leftovers.is_empty());
@@ -297,19 +339,34 @@ mod tests {
         let source = Arc::new(MemVfs::new("archive-failure-source")) as Arc<dyn Vfs>;
         let target = Arc::new(MemVfs::new("archive-failure-target")) as Arc<dyn Vfs>;
         let mut job = Job::default();
-        let dir = std::env::temp_dir().join(format!("syncdash-archive-failure-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("syncdash-archive-failure-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         job.archive = Some(dir.clone()); // File::create on a directory must fail on every platform.
-        let plan = super::super::local::compare_resolved(&job, &source, &target, &RunCtx::null(), false)
-            .unwrap()
-            .plan;
+        let plan =
+            super::super::local::compare_resolved(&job, &source, &target, &RunCtx::null(), false)
+                .unwrap()
+                .plan;
         let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let copy = events.clone();
-        let ctx = RunCtx::new(RunCtl::new(), Arc::new(move |ev| copy.lock().unwrap().push(ev)));
+        let ctx = RunCtx::new(
+            RunCtl::new(),
+            Arc::new(move |ev| copy.lock().unwrap().push(ev)),
+        );
 
-        assert!(!refresh_archive_with(&job, &plan, &source, &super::super::scan_opts(&job), &ctx));
-        assert!(events.lock().unwrap().iter().any(|ev| matches!(ev, ProgressEvent::Error {
+        assert!(!refresh_archive_with(
+            &job,
+            &plan,
+            &source,
+            &super::super::scan_opts(&job),
+            &ctx
+        ));
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|ev| matches!(ev, ProgressEvent::Error {
             action,
             ..
         } if action == "archive")));
@@ -321,26 +378,39 @@ mod tests {
         let source = Arc::new(MemVfs::new("archive-cancel-source")) as Arc<dyn Vfs>;
         let target = Arc::new(MemVfs::new("archive-cancel-target")) as Arc<dyn Vfs>;
         let mut job = Job::default();
-        let dir = std::env::temp_dir().join(format!("syncdash-archive-cancel-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("syncdash-archive-cancel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         job.archive = Some(dir.join("archive.jsonl"));
-        let plan = super::super::local::compare_resolved(&job, &source, &target, &RunCtx::null(), false)
-            .unwrap()
-            .plan;
+        let plan =
+            super::super::local::compare_resolved(&job, &source, &target, &RunCtx::null(), false)
+                .unwrap()
+                .plan;
         let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let copy = events.clone();
         let ctl = RunCtl::new();
         ctl.request_cancel();
         let ctx = RunCtx::new(ctl, Arc::new(move |ev| copy.lock().unwrap().push(ev)));
 
-        assert!(!refresh_archive_with(&job, &plan, &source, &super::super::scan_opts(&job), &ctx));
+        assert!(!refresh_archive_with(
+            &job,
+            &plan,
+            &source,
+            &super::super::scan_opts(&job),
+            &ctx
+        ));
         let events = events.lock().unwrap();
-        assert!(!events.iter().any(|ev| matches!(ev, ProgressEvent::Error { .. })));
-        assert!(matches!(events.last(), Some(ProgressEvent::PhaseEnd {
-            status: crate::model::event::PhaseStatus::Cancelled,
-            ..
-        })));
+        assert!(!events
+            .iter()
+            .any(|ev| matches!(ev, ProgressEvent::Error { .. })));
+        assert!(matches!(
+            events.last(),
+            Some(ProgressEvent::PhaseEnd {
+                status: crate::model::event::PhaseStatus::Cancelled,
+                ..
+            })
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -349,14 +419,16 @@ mod tests {
         let source = Arc::new(MemVfs::new("archive-boundary-source")) as Arc<dyn Vfs>;
         let target = Arc::new(MemVfs::new("archive-boundary-target")) as Arc<dyn Vfs>;
         let mut job = Job::default();
-        let dir = std::env::temp_dir().join(format!("syncdash-archive-boundary-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("syncdash-archive-boundary-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let archive = dir.join("archive.jsonl");
         job.archive = Some(archive.clone());
-        let plan = super::super::local::compare_resolved(&job, &source, &target, &RunCtx::null(), false)
-            .unwrap()
-            .plan;
+        let plan =
+            super::super::local::compare_resolved(&job, &source, &target, &RunCtx::null(), false)
+                .unwrap()
+                .plan;
         let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let copy = events.clone();
         let ctl = RunCtl::new();
@@ -364,22 +436,42 @@ mod tests {
         let ctx = RunCtx::new(
             ctl,
             Arc::new(move |ev| {
-                if matches!(&ev, ProgressEvent::Progress { phase: crate::model::event::Phase::Archive, .. }) {
+                if matches!(
+                    &ev,
+                    ProgressEvent::Progress {
+                        phase: crate::model::event::Phase::Archive,
+                        ..
+                    }
+                ) {
                     cancel.request_cancel();
                 }
                 copy.lock().unwrap().push(ev);
             }),
         );
 
-        assert!(!refresh_archive_with(&job, &plan, &source, &super::super::scan_opts(&job), &ctx));
-        assert!(archive.is_file(), "the cancellation arrived after the atomic archive commit");
+        assert!(!refresh_archive_with(
+            &job,
+            &plan,
+            &source,
+            &super::super::scan_opts(&job),
+            &ctx
+        ));
+        assert!(
+            archive.is_file(),
+            "the cancellation arrived after the atomic archive commit"
+        );
         let events = events.lock().unwrap();
-        assert!(!events.iter().any(|ev| matches!(ev, ProgressEvent::Error { .. })));
-        assert!(matches!(events.last(), Some(ProgressEvent::PhaseEnd {
-            phase: crate::model::event::Phase::Archive,
-            status: crate::model::event::PhaseStatus::Cancelled,
-            ..
-        })));
+        assert!(!events
+            .iter()
+            .any(|ev| matches!(ev, ProgressEvent::Error { .. })));
+        assert!(matches!(
+            events.last(),
+            Some(ProgressEvent::PhaseEnd {
+                phase: crate::model::event::Phase::Archive,
+                status: crate::model::event::PhaseStatus::Cancelled,
+                ..
+            })
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

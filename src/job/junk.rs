@@ -96,7 +96,9 @@ pub const JUNK_PRESETS: &[JunkPreset] = &[
 ];
 
 pub fn junk_preset(id: &str) -> Option<&'static JunkPreset> {
-    JUNK_PRESETS.iter().find(|p| p.id.eq_ignore_ascii_case(id.trim()))
+    JUNK_PRESETS
+        .iter()
+        .find(|p| p.id.eq_ignore_ascii_case(id.trim()))
 }
 
 /// The exclude list a brand-new job starts with: every `default_on` preset, materialized.
@@ -108,7 +110,10 @@ pub fn default_junk_patterns() -> Vec<String> {
 /// Preset ids → their patterns, in table order, deduplicated. Unknown ids are the caller's problem
 /// (`junk_preset` returns None) — silently dropping one would be a filter that isn't what it says it is.
 pub fn expand_junk_presets<I: IntoIterator<Item = S>, S: AsRef<str>>(ids: I) -> Vec<String> {
-    let wanted: Vec<&str> = ids.into_iter().filter_map(|s| junk_preset(s.as_ref()).map(|p| p.id)).collect();
+    let wanted: Vec<&str> = ids
+        .into_iter()
+        .filter_map(|s| junk_preset(s.as_ref()).map(|p| p.id))
+        .collect();
     let mut out = Vec::new();
     for p in JUNK_PRESETS.iter().filter(|p| wanted.contains(&p.id)) {
         for pat in p.patterns {
@@ -140,7 +145,10 @@ mod tests {
     #[test]
     fn presets_expand_into_the_exclude_list() {
         let pf = PathFilter::build(&[], &default_junk_patterns());
-        assert!(!pf.pass_file("a/.DS_Store"), "macOS junk, via the default-on presets");
+        assert!(
+            !pf.pass_file("a/.DS_Store"),
+            "macOS junk, via the default-on presets"
+        );
         assert!(!pf.pass_file(".DS_Store")); // the root level is hit too, via the */x double registration
         assert!(!pf.pass_file("a/Thumbs.db"), "Windows junk, likewise");
         assert!(pf.pass_dir("proj/.git").0, "dev is not default-on");
@@ -155,18 +163,30 @@ mod tests {
         // One platform only
         let pfw = PathFilter::build(&[], &expand_junk_presets(["windows"]));
         assert!(!pfw.pass_file("a/Thumbs.db"));
-        assert!(pfw.pass_file("a/.DS_Store"), "the Windows preset leaves Mac names alone");
+        assert!(
+            pfw.pass_file("a/.DS_Store"),
+            "the Windows preset leaves Mac names alone"
+        );
 
         // The new presets
-        let pfo = PathFilter::build(&[], &expand_junk_presets(["office", "ide", "linux", "synctool"]));
+        let pfo = PathFilter::build(
+            &[],
+            &expand_junk_presets(["office", "ide", "linux", "synctool"]),
+        );
         assert!(!pfo.pass_file("docs/~$report.docx"), "Word owner file");
-        assert!(!pfo.pass_file("docs/.~lock.report.odt#"), "LibreOffice lock file");
+        assert!(
+            !pfo.pass_file("docs/.~lock.report.odt#"),
+            "LibreOffice lock file"
+        );
         assert!(!pfo.pass_dir("proj/.idea").0);
         assert!(!pfo.pass_file("src/main.rs.swp"));
         assert!(!pfo.pass_dir("vol/lost+found").0);
         assert!(!pfo.pass_dir("vol/.Trash-1000").0);
         assert!(!pfo.pass_dir("share/.stfolder").0);
-        assert!(pfo.pass_file("docs/report.docx"), "the real document is untouched");
+        assert!(
+            pfo.pass_file("docs/report.docx"),
+            "the real document is untouched"
+        );
     }
 
     /// Unticking a preset removes exactly its own patterns, which is only sound while no pattern is
@@ -202,12 +222,18 @@ mod tests {
     fn duplicate_detection_folds_case_and_separators() {
         assert!(same_exclude_entry("*/Thumbs.db", "*\\thumbs.DB"));
         assert!(same_exclude_entry("  */.git/  ", "*/.git/"));
-        assert!(!same_exclude_entry("*/.git/", "*/.git"), "trailing / means directory-only — a different rule");
+        assert!(
+            !same_exclude_entry("*/.git/", "*/.git"),
+            "trailing / means directory-only — a different rule"
+        );
         assert!(!same_exclude_entry("*/build/", "*/dist/"));
         // Expanding overlapping requests must not produce the same line twice
         let v = expand_junk_presets(["windows", "windows", "macos"]);
         for (i, a) in v.iter().enumerate() {
-            assert!(!v[i + 1..].iter().any(|b| same_exclude_entry(a, b)), "duplicate line '{a}'");
+            assert!(
+                !v[i + 1..].iter().any(|b| same_exclude_entry(a, b)),
+                "duplicate line '{a}'"
+            );
         }
     }
 }

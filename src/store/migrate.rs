@@ -38,12 +38,16 @@ pub fn migrate_log_dir(old: &Path, new: &Path) -> MigrateReport {
     }
     if let Err(e) = std::fs::create_dir_all(new) {
         r.failed += 1;
-        r.messages.push(format!("cannot create target directory {}: {e}", new.display()));
+        r.messages.push(format!(
+            "cannot create target directory {}: {e}",
+            new.display()
+        ));
         return r;
     }
     let Ok(rd) = std::fs::read_dir(old) else {
         r.failed += 1;
-        r.messages.push(format!("cannot read old directory: {}", old.display()));
+        r.messages
+            .push(format!("cannot read old directory: {}", old.display()));
         return r;
     };
     for e in rd.flatten() {
@@ -65,7 +69,10 @@ pub fn migrate_log_dir(old: &Path, new: &Path) -> MigrateReport {
         move_entry(&from, &to, &mut r);
     }
     if r.moved > 0 || r.failed > 0 {
-        r.messages.push(format!("migration done: {} moved, {} skipped, {} failed", r.moved, r.skipped, r.failed));
+        r.messages.push(format!(
+            "migration done: {} moved, {} skipped, {} failed",
+            r.moved, r.skipped, r.failed
+        ));
     }
     r
 }
@@ -116,19 +123,31 @@ fn move_entry(from: &Path, to: &Path, r: &mut MigrateReport) {
         r.moved += 1;
         return;
     }
-    let copied = if from.is_dir() { copy_dir(from, to) } else { std::fs::copy(from, to).map(|_| ()) };
+    let copied = if from.is_dir() {
+        copy_dir(from, to)
+    } else {
+        std::fs::copy(from, to).map(|_| ())
+    };
     match copied {
         Ok(_) => {
-            let removed = if from.is_dir() { std::fs::remove_dir_all(from) } else { std::fs::remove_file(from) };
+            let removed = if from.is_dir() {
+                std::fs::remove_dir_all(from)
+            } else {
+                std::fs::remove_file(from)
+            };
             if let Err(e) = removed {
                 // Copy succeeded but the old item won't delete: the data at the new location is complete, so not a failure — just say so
-                r.messages.push(format!("copied, but the old item could not be deleted {}: {e}", from.display()));
+                r.messages.push(format!(
+                    "copied, but the old item could not be deleted {}: {e}",
+                    from.display()
+                ));
             }
             r.moved += 1;
         }
         Err(e) => {
             r.failed += 1;
-            r.messages.push(format!("move failed {}: {e}", from.display()));
+            r.messages
+                .push(format!("move failed {}: {e}", from.display()));
         }
     }
 }
@@ -147,14 +166,16 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
 
     fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("syncdash-mig-{tag}-{}", crate::foundation::time::now_ms()));
+        let p = std::env::temp_dir().join(format!(
+            "syncdash-mig-{tag}-{}",
+            crate::foundation::time::now_ms()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -171,11 +192,20 @@ mod tests {
         std::fs::write(new.join("20260102-000000-b-apply").join("keep"), "mine").unwrap();
 
         let r = migrate_log_dir(&old, &new);
-        assert_eq!(r.moved, 1, "only a moves; b collides by name and is skipped: {r:?}");
+        assert_eq!(
+            r.moved, 1,
+            "only a moves; b collides by name and is skipped: {r:?}"
+        );
         assert_eq!(r.skipped, 1);
         assert_eq!(r.failed, 0);
-        assert!(new.join("20260101-000000-a-apply").join("run.jsonl").is_file());
-        assert!(new.join("20260102-000000-b-apply").join("keep").is_file(), "the colliding one must not be overwritten");
+        assert!(new
+            .join("20260101-000000-a-apply")
+            .join("run.jsonl")
+            .is_file());
+        assert!(
+            new.join("20260102-000000-b-apply").join("keep").is_file(),
+            "the colliding one must not be overwritten"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -186,17 +216,28 @@ mod tests {
         std::fs::create_dir_all(&old).unwrap();
         std::fs::create_dir_all(&new).unwrap();
         let idx = crate::foundation::names::RUNLOG_INDEX_FILE;
-        std::fs::write(old.join(idx), "{\"ts_ms\":10,\"job\":\"a\"}\n{\"ts_ms\":30,\"job\":\"a\"}\n").unwrap();
+        std::fs::write(
+            old.join(idx),
+            "{\"ts_ms\":10,\"job\":\"a\"}\n{\"ts_ms\":30,\"job\":\"a\"}\n",
+        )
+        .unwrap();
         std::fs::write(new.join(idx), "{\"ts_ms\":20,\"job\":\"b\"}\n").unwrap();
 
         migrate_log_dir(&old, &new);
         let merged = std::fs::read_to_string(new.join(idx)).unwrap();
         let ts: Vec<i64> = merged
             .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["ts_ms"].as_i64().unwrap())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["ts_ms"]
+                    .as_i64()
+                    .unwrap()
+            })
             .collect();
         assert_eq!(ts, vec![10, 20, 30], "after merging it must be in time order — latest_by_job relies on written-later = newer");
-        assert!(!old.join(idx).exists(), "the old index should be deleted after merging");
+        assert!(
+            !old.join(idx).exists(),
+            "the old index should be deleted after merging"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

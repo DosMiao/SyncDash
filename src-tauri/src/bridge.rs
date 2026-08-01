@@ -129,9 +129,7 @@ fn diagnostic(ev: &ProgressEvent) -> bool {
 }
 
 fn trim_diagnostics(events: &mut VecDeque<RunEvent>) {
-    while events.iter().filter(|event| diagnostic(&event.ev)).count()
-        > MAX_REPLAY_DIAGNOSTICS
-    {
+    while events.iter().filter(|event| diagnostic(&event.ev)).count() > MAX_REPLAY_DIAGNOSTICS {
         let Some(index) = events.iter().position(|event| diagnostic(&event.ev)) else {
             break;
         };
@@ -159,7 +157,9 @@ struct ProgressThrottle {
 
 impl Default for ProgressThrottle {
     fn default() -> Self {
-        Self { last_ms: std::array::from_fn(|_| AtomicU64::new(0)) }
+        Self {
+            last_ms: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
     }
 }
 
@@ -272,8 +272,6 @@ mod tests {
         let next_run = repository.replay("apply", 0);
         assert_eq!(next_run.len(), 1);
         assert!(next_run[0].sequence > replay[1].sequence);
-        assert!(repository
-            .replay("apply", next_run[0].sequence)
-            .is_empty());
+        assert!(repository.replay("apply", next_run[0].sequence).is_empty());
     }
 }

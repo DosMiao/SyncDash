@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::model::plan::Op;
-use crate::obs::progress::{PhaseProgress, RunCtx};
-use super::ApplyOptions;
-use super::ops::exec_op;
-use crate::model::plan::Side;
 use super::ledger::record;
+use super::ops::exec_op;
+use super::ApplyOptions;
+use crate::model::plan::Op;
+use crate::model::plan::Side;
+use crate::obs::progress::{PhaseProgress, RunCtx};
 
 /// Execution environment shared by the worker threads. All counters are atomic and writers sit behind locks — a worker only borrows &Shared.
 pub(super) struct Shared<'a> {
@@ -53,7 +53,13 @@ pub(super) struct Shared<'a> {
 }
 
 impl<'a> Shared<'a> {
-    pub(super) fn exec_other(&self, side: &Side) -> (&std::sync::Arc<dyn crate::fs::vfs::Vfs>, &std::sync::Arc<dyn crate::fs::vfs::Vfs>) {
+    pub(super) fn exec_other(
+        &self,
+        side: &Side,
+    ) -> (
+        &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+        &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    ) {
         match side {
             Side::Target => (self.target, self.source),
             Side::Source => (self.source, self.target),
@@ -97,7 +103,12 @@ impl<'a> Shared<'a> {
     }
 
     /// Ensure a directory exists on `exec`, memoized per (side, rel).
-    pub(super) fn ensure_dir(&self, side: &Side, exec: &std::sync::Arc<dyn crate::fs::vfs::Vfs>, rel: &str) -> std::io::Result<()> {
+    pub(super) fn ensure_dir(
+        &self,
+        side: &Side,
+        exec: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+        rel: &str,
+    ) -> std::io::Result<()> {
         if rel.is_empty() {
             return Ok(());
         }
@@ -124,7 +135,13 @@ pub(super) struct Counters {
 /// pause, and these are threads of our own to park. Handing them to the global pool would mean a
 /// user pressing Pause pins rayon workers for as long as they like. (This used to be justified by
 /// verify's blake3 occupying that pool already; it no longer does — nothing here maps a file.)
-pub(super) fn run_class(class: &[&Op], width: usize, sh: &Shared, pp: &PhaseProgress, acc: &Counters) {
+pub(super) fn run_class(
+    class: &[&Op],
+    width: usize,
+    sh: &Shared,
+    pp: &PhaseProgress,
+    acc: &Counters,
+) {
     if class.is_empty() {
         return;
     }

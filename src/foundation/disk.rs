@@ -27,7 +27,11 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
         ) -> i32;
     }
     // UNC paths (\\host\share\...) are supported too — exactly what an SMB target needs
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
     let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
     if ok == 0 {
@@ -47,7 +51,11 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
             return None;
         }
         // f_frsize is the "fragment size", the right unit for capacity math; fall back to f_bsize when it is 0
-        let unit = if st.f_frsize > 0 { st.f_frsize as u64 } else { st.f_bsize as u64 };
+        let unit = if st.f_frsize > 0 {
+            st.f_frsize as u64
+        } else {
+            st.f_bsize as u64
+        };
         Some((st.f_bavail as u64 * unit, st.f_blocks as u64 * unit))
     }
 }
@@ -58,14 +66,17 @@ mod tests {
 
     #[test]
     fn reports_a_sane_pair_for_the_temp_dir() {
-        let (avail, total) = disk_space(&std::env::temp_dir()).expect("temp dir lives on a real volume");
+        let (avail, total) =
+            disk_space(&std::env::temp_dir()).expect("temp dir lives on a real volume");
         assert!(total > 0, "a mounted volume has a size");
         assert!(avail <= total, "available can never exceed total");
     }
 
     #[test]
     fn a_path_that_does_not_exist_answers_none_rather_than_zero() {
-        let bogus = std::env::temp_dir().join("syncdash-no-such-volume-xyzzy").join("deeper");
+        let bogus = std::env::temp_dir()
+            .join("syncdash-no-such-volume-xyzzy")
+            .join("deeper");
         // Zero would read as "full disk" and block a run that has nothing wrong with it.
         assert_eq!(disk_space(&bogus), None);
     }

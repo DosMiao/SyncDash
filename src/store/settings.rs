@@ -103,7 +103,11 @@ impl AppSettings {
         }
         let fallback = default_log_dir();
         if want != fallback && std::fs::create_dir_all(&fallback).is_ok() {
-            eprintln!("settings: log dir {} unusable, falling back to {}", want.display(), fallback.display());
+            eprintln!(
+                "settings: log dir {} unusable, falling back to {}",
+                want.display(),
+                fallback.display()
+            );
             return fallback;
         }
         std::env::temp_dir().join("syncdash-logs")
@@ -179,8 +183,12 @@ pub fn save(s: &AppSettings) -> std::io::Result<PathBuf> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     let dir = config_dir();
     std::fs::create_dir_all(&dir)?;
-    let text = toml::to_string_pretty(s)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}")))?;
+    let text = toml::to_string_pretty(s).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("toml serialize: {e}"),
+        )
+    })?;
     let p = settings_path();
     let mut staged = crate::fs::staged::Staged::create(&p)?;
     staged.write_all(text.as_bytes())?;
@@ -194,14 +202,22 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("syncdash-set-{tag}-{}", crate::foundation::time::now_ms()));
+        let p = std::env::temp_dir().join(format!(
+            "syncdash-set-{tag}-{}",
+            crate::foundation::time::now_ms()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
 
     #[test]
     fn settings_roundtrip_and_defaults() {
-        let s = AppSettings { log_dir: "D:\\logs".into(), level: LogLevel::Warn, keep_days: 7, ..Default::default() };
+        let s = AppSettings {
+            log_dir: "D:\\logs".into(),
+            level: LogLevel::Warn,
+            keep_days: 7,
+            ..Default::default()
+        };
         let text = toml::to_string_pretty(&s).unwrap();
         let back: AppSettings = toml::from_str(&text).unwrap();
         assert_eq!(s, back);
@@ -224,17 +240,23 @@ mod tests {
         assert!(settings.validate().unwrap_err().contains("NUL"));
     }
 
-
     #[test]
     fn resolved_log_dir_falls_back_when_unwritable() {
         // Put a **file** into the setting where a directory belongs: create_dir_all must fail → it has to fall back somewhere writable
         let root = tmp("fallback");
         let f = root.join("not-a-dir");
         std::fs::write(&f, "x").unwrap();
-        let s = AppSettings { log_dir: f.display().to_string(), ..Default::default() };
+        let s = AppSettings {
+            log_dir: f.display().to_string(),
+            ..Default::default()
+        };
         let got = s.resolved_log_dir();
         assert_ne!(got, f, "must not return a path that cannot be written");
-        assert!(got.is_dir(), "the fallback target must actually exist: {}", got.display());
+        assert!(
+            got.is_dir(),
+            "the fallback target must actually exist: {}",
+            got.display()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

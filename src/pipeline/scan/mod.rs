@@ -27,7 +27,9 @@ use vfs::scan_vfs;
 
 fn local_parallelism(root: &Path) -> usize {
     use crate::fs::vfs::Vfs;
-    crate::fs::vfs::local::LocalVfs::new(root.to_path_buf()).caps().max_parallel_streams
+    crate::fs::vfs::local::LocalVfs::new(root.to_path_buf())
+        .caps()
+        .max_parallel_streams
 }
 
 pub struct ScanOptions {
@@ -135,7 +137,13 @@ pub fn scan_root(
 ) -> std::io::Result<Snapshot> {
     match vfs.as_local() {
         Some(root) => {
-            let mut snap = scan_impl(root, opt, None, Some((ctx, phase)), vfs.caps().max_parallel_streams)?;
+            let mut snap = scan_impl(
+                root,
+                opt,
+                None,
+                Some((ctx, phase)),
+                vfs.caps().max_parallel_streams,
+            )?;
             // The local lane used to leave this empty, which meant a table could not say whether
             // its root was a disk on this machine or a share on another — the very fact that
             // decides where its deletions were preserved.
@@ -179,17 +187,22 @@ mod tests {
     use super::*;
     use crate::fs::vfs::{memory::MemVfs, Vfs};
     use crate::model::event::{Phase, ProgressEvent};
-    use crate::obs::progress::{is_cancelled, RunCtl, RunCtx};
     use crate::model::table::EntryKind;
+    use crate::obs::progress::{is_cancelled, RunCtl, RunCtx};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     fn mk_tree(tag: &str, n: usize) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("syncdash-scanctx-{tag}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("syncdash-scanctx-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sub")).unwrap();
         for i in 0..n {
-            std::fs::write(root.join("sub").join(format!("f{i}.dat")), vec![i as u8; 100]).unwrap();
+            std::fs::write(
+                root.join("sub").join(format!("f{i}.dat")),
+                vec![i as u8; 100],
+            )
+            .unwrap();
         }
         root
     }
@@ -222,24 +235,48 @@ mod tests {
         let root = mk_tree("totals", 20);
         let store: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let s2 = store.clone();
-        let ctx = RunCtx::new(RunCtl::new(), Arc::new(move |ev| s2.lock().unwrap().push(ev)));
+        let ctx = RunCtx::new(
+            RunCtl::new(),
+            Arc::new(move |ev| s2.lock().unwrap().push(ev)),
+        );
         let snap = scan_ctx(&root, &opts(), &ctx, Phase::ScanSource).unwrap();
-        assert_eq!(snap.entries.iter().filter(|e| e.kind == EntryKind::File).count(), 20);
+        assert_eq!(
+            snap.entries
+                .iter()
+                .filter(|e| e.kind == EntryKind::File)
+                .count(),
+            20
+        );
         let evs = store.lock().unwrap();
         let totals = evs.iter().find_map(|e| match e {
-            ProgressEvent::Totals { reset: true, items_total, bytes_total, .. } => Some((*items_total, *bytes_total)),
+            ProgressEvent::Totals {
+                reset: true,
+                items_total,
+                bytes_total,
+                ..
+            } => Some((*items_total, *bytes_total)),
             _ => None,
         });
-        assert_eq!(totals, Some((20, 2000)), "the end of the walk must yield exact totals");
-        assert!(matches!(evs.last(), Some(ProgressEvent::PhaseEnd {
-            phase: Phase::ScanSource,
-            status: crate::model::event::PhaseStatus::Completed,
-            items_done: 20,
-            items_total: 20,
-            bytes_done: 2000,
-            bytes_total: 2000,
-            ..
-        })), "a successful scan must end explicitly with its final counters");
+        assert_eq!(
+            totals,
+            Some((20, 2000)),
+            "the end of the walk must yield exact totals"
+        );
+        assert!(
+            matches!(
+                evs.last(),
+                Some(ProgressEvent::PhaseEnd {
+                    phase: Phase::ScanSource,
+                    status: crate::model::event::PhaseStatus::Completed,
+                    items_done: 20,
+                    items_total: 20,
+                    bytes_done: 2000,
+                    bytes_total: 2000,
+                    ..
+                })
+            ),
+            "a successful scan must end explicitly with its final counters"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -410,25 +447,34 @@ mod tests {
         let root = mk_tree("no-hash-progress", 7);
         let store: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let s2 = store.clone();
-        let ctx = RunCtx::new(RunCtl::new(), Arc::new(move |ev| s2.lock().unwrap().push(ev)));
+        let ctx = RunCtx::new(
+            RunCtl::new(),
+            Arc::new(move |ev| s2.lock().unwrap().push(ev)),
+        );
         let mut opt = opts();
         opt.hash = false;
         scan_ctx(&root, &opt, &ctx, Phase::ScanSource).unwrap();
         let evs = store.lock().unwrap();
-        assert!(evs.iter().any(|ev| matches!(ev, ProgressEvent::Totals {
-            reset: false,
-            items_done: 7,
-            items_total: 7,
-            ..
-        })));
-        assert!(matches!(evs.last(), Some(ProgressEvent::PhaseEnd {
-            status: crate::model::event::PhaseStatus::Completed,
-            items_done: 7,
-            items_total: 7,
-            bytes_done: 0,
-            bytes_total: 0,
-            ..
-        })));
+        assert!(evs.iter().any(|ev| matches!(
+            ev,
+            ProgressEvent::Totals {
+                reset: false,
+                items_done: 7,
+                items_total: 7,
+                ..
+            }
+        )));
+        assert!(matches!(
+            evs.last(),
+            Some(ProgressEvent::PhaseEnd {
+                status: crate::model::event::PhaseStatus::Completed,
+                items_done: 7,
+                items_total: 7,
+                bytes_done: 0,
+                bytes_total: 0,
+                ..
+            })
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -442,7 +488,13 @@ mod tests {
         let ctx = RunCtx::new(
             ctl,
             Arc::new(move |ev| {
-                if matches!(&ev, ProgressEvent::Totals { phase: Phase::ScanSource, .. }) {
+                if matches!(
+                    &ev,
+                    ProgressEvent::Totals {
+                        phase: Phase::ScanSource,
+                        ..
+                    }
+                ) {
                     cancel.request_cancel();
                 }
                 copy.lock().unwrap().push(ev);
@@ -455,11 +507,14 @@ mod tests {
             Err(e) => assert!(is_cancelled(&e)),
             Ok(_) => panic!("a cancelled scan must not return a snapshot"),
         }
-        assert!(matches!(events.lock().unwrap().last(), Some(ProgressEvent::PhaseEnd {
-            phase: Phase::ScanSource,
-            status: crate::model::event::PhaseStatus::Cancelled,
-            ..
-        })));
+        assert!(matches!(
+            events.lock().unwrap().last(),
+            Some(ProgressEvent::PhaseEnd {
+                phase: Phase::ScanSource,
+                status: crate::model::event::PhaseStatus::Cancelled,
+                ..
+            })
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -497,7 +552,10 @@ mod tests {
 
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&root);
-        assert!(denied, "precondition absent: this process can read a 0o000 directory (running as root?)");
+        assert!(
+            denied,
+            "precondition absent: this process can read a 0o000 directory (running as root?)"
+        );
     }
 
     /// The other half of the same rule: a *vanished* entry is a race, not an unreadable tree, so it
@@ -524,9 +582,15 @@ mod tests {
         // A dotfile that merely ends in .icloud-ish text must not trip it
         std::fs::write(root.join("sub").join("notes.icloud.txt"), b"x").unwrap();
         let snap = scan(&root, &opts()).unwrap();
-        assert_eq!(snap.header.icloud_stubs, 1, "exactly the placeholder, not its neighbour");
+        assert_eq!(
+            snap.header.icloud_stubs, 1,
+            "exactly the placeholder, not its neighbour"
+        );
         assert!(
-            snap.header.icloud_stub_samples.iter().any(|s| s.ends_with(".Report.pdf.icloud")),
+            snap.header
+                .icloud_stub_samples
+                .iter()
+                .any(|s| s.ends_with(".Report.pdf.icloud")),
             "the sample must name the placeholder: {:?}",
             snap.header.icloud_stub_samples
         );

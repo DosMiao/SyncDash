@@ -97,15 +97,13 @@ where
         let n = std::io::Read::read(stream, &mut buf[..width])
             .map_err(crate::fs::vfs::error::VfsError::from)?;
         if n == 0 {
-            return Err(crate::fs::vfs::error::VfsError::from(
-                std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "file shrank while hashing: expected {expected_size} bytes, read {}",
-                        expected_size - remaining
-                    ),
+            return Err(crate::fs::vfs::error::VfsError::from(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "file shrank while hashing: expected {expected_size} bytes, read {}",
+                    expected_size - remaining
                 ),
-            ));
+            )));
         }
         hasher.update(&buf[..n]);
         on_read(n as u64);

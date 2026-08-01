@@ -358,12 +358,7 @@ pub(super) fn scan_vfs(
     metrics.finalize_ms = measured.elapsed().as_millis() as u64;
     let measured = std::time::Instant::now();
     if opt.hash {
-        if crate::store::hashcache::save_by_key(
-            &identity,
-            &entries,
-            coverage,
-            &retain_absent,
-        )
+        if crate::store::hashcache::save_by_key(&identity, &entries, coverage, &retain_absent)
             == crate::store::StateWriteStatus::Failed
         {
             metrics.state_failures += 1;

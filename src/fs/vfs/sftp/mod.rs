@@ -19,13 +19,13 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::model::table::EntryKind;
 use super::error::{VfsError, VfsErrorKind, VfsResult};
 use super::spec::RemoteSpec;
 use super::{
-    CaseSense, CredentialProvider, Credentials, ReadStream, Support,
-    VDirEntry, VMeta, Vfs, VfsCaps, WriteHint, WriteStaged,
+    CaseSense, CredentialProvider, Credentials, ReadStream, Support, VDirEntry, VMeta, Vfs,
+    VfsCaps, WriteHint, WriteStaged,
 };
+use crate::model::table::EntryKind;
 
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, StatusCode};
@@ -83,7 +83,10 @@ impl SftpBackend {
         self.conn.get().ok_or_else(|| {
             VfsError::new(
                 VfsErrorKind::Transient,
-                format!("'{}' is not connected — connect() must run first", self.spec.display()),
+                format!(
+                    "'{}' is not connected — connect() must run first",
+                    self.spec.display()
+                ),
             )
         })
     }
@@ -106,12 +109,19 @@ impl SftpBackend {
         // The timeout future must be BUILT inside the runtime (it grabs the timer at
         // construction), hence the async block rather than a bare block_on(timeout(..)).
         let d = self.timeout;
-        match self.rt.block_on(async { tokio::time::timeout(d, fut).await }) {
+        match self
+            .rt
+            .block_on(async { tokio::time::timeout(d, fut).await })
+        {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(map_sftp_err(what, e)),
             Err(_) => Err(VfsError::new(
                 VfsErrorKind::Transient,
-                format!("{what} timed out after {:?} on '{}'", self.timeout, self.spec.display()),
+                format!(
+                    "{what} timed out after {:?} on '{}'",
+                    self.timeout,
+                    self.spec.display()
+                ),
             )),
         }
     }
@@ -125,7 +135,10 @@ impl SftpBackend {
         let listing = {
             let sftp = self.conn()?.sftp.clone();
             let p = self.abs(parent);
-            self.block("read_dir (absence check)", async move { sftp.read_dir(p).await })
+            self.block(
+                "read_dir (absence check)",
+                async move { sftp.read_dir(p).await },
+            )
         };
         match listing {
             Ok(dir) => {
@@ -148,7 +161,6 @@ impl SftpBackend {
             )),
         }
     }
-
 }
 
 /// An attributes packet that asserts NOTHING. Never use `FileAttributes::default()`
@@ -197,9 +209,18 @@ pub(super) fn map_sftp_err(what: &str, e: russh_sftp::client::error::Error) -> V
                 StatusCode::PermissionDenied => VfsErrorKind::PermissionDenied,
                 _ => VfsErrorKind::Protocol,
             };
-            VfsError::new(kind, format!("{what}: server answered {}: {}", s.status_code, s.error_message))
+            VfsError::new(
+                kind,
+                format!(
+                    "{what}: server answered {}: {}",
+                    s.status_code, s.error_message
+                ),
+            )
         }
-        E::Timeout => VfsError::new(VfsErrorKind::Transient, format!("{what}: sftp request timed out")),
+        E::Timeout => VfsError::new(
+            VfsErrorKind::Transient,
+            format!("{what}: sftp request timed out"),
+        ),
         other => VfsError::new(VfsErrorKind::Transient, format!("{what}: {other}")),
     }
 }
@@ -252,7 +273,10 @@ impl Vfs for SftpBackend {
         let user = self.spec.user.clone().ok_or_else(|| {
             VfsError::new(
                 VfsErrorKind::Auth,
-                format!("'{}' names no user — spell it sftp://user@host/…", self.spec.display()),
+                format!(
+                    "'{}' names no user — spell it sftp://user@host/…",
+                    self.spec.display()
+                ),
             )
         })?;
         let creds = self.creds.credentials_for(&self.spec)?;
@@ -264,7 +288,11 @@ impl Vfs for SftpBackend {
             connect_and_open(&host, port, &user, &creds, timeout, &root_spec, &display).await
         })?;
         *self.server_line.lock().unwrap() = Some(built.3);
-        let _ = self.conn.set(Conn { _session: built.0, sftp: Arc::new(built.1), root_abs: built.2 });
+        let _ = self.conn.set(Conn {
+            _session: built.0,
+            sftp: Arc::new(built.1),
+            root_abs: built.2,
+        });
         Ok(())
     }
 
@@ -294,7 +322,10 @@ impl Vfs for SftpBackend {
             if name == "." || name == ".." {
                 continue;
             }
-            out.push(VDirEntry { name, meta: meta_of(&e.metadata()) });
+            out.push(VDirEntry {
+                name,
+                meta: meta_of(&e.metadata()),
+            });
         }
         Ok(out)
     }
@@ -315,28 +346,36 @@ impl Vfs for SftpBackend {
         let sftp = self.conn()?.sftp.clone();
         let p = self.abs(rel);
         let timeout = self.timeout;
-        let res = self.rt.block_on(async move { tokio::time::timeout(timeout, async move {
-            let mut f = sftp.open(p).await?;
-            f.seek(std::io::SeekFrom::Start(off)).await.map_err(russh_sftp::client::error::Error::from)?;
-            let mut buf = vec![0u8; len as usize];
-            let mut got = 0usize;
-            while got < buf.len() {
-                let n = f
-                    .read(&mut buf[got..])
+        let res = self.rt.block_on(async move {
+            tokio::time::timeout(timeout, async move {
+                let mut f = sftp.open(p).await?;
+                f.seek(std::io::SeekFrom::Start(off))
                     .await
                     .map_err(russh_sftp::client::error::Error::from)?;
-                if n == 0 {
-                    break; // short only at EOF, per contract
+                let mut buf = vec![0u8; len as usize];
+                let mut got = 0usize;
+                while got < buf.len() {
+                    let n = f
+                        .read(&mut buf[got..])
+                        .await
+                        .map_err(russh_sftp::client::error::Error::from)?;
+                    if n == 0 {
+                        break; // short only at EOF, per contract
+                    }
+                    got += n;
                 }
-                got += n;
-            }
-            buf.truncate(got);
-            Ok::<_, russh_sftp::client::error::Error>(buf)
-        }).await });
+                buf.truncate(got);
+                Ok::<_, russh_sftp::client::error::Error>(buf)
+            })
+            .await
+        });
         match res {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(map_sftp_err("read_range", e)),
-            Err(_) => Err(VfsError::new(VfsErrorKind::Transient, "read_range timed out")),
+            Err(_) => Err(VfsError::new(
+                VfsErrorKind::Transient,
+                "read_range timed out",
+            )),
         }
     }
 
@@ -394,7 +433,11 @@ impl Vfs for SftpBackend {
         let t2 = tmp_abs.clone();
         // CREATE|EXCL: the server's own O_EXCL refuses to overwrite (the FFS reliance)
         let file = self.block("open staged", async move {
-            s2.open_with_flags(t2, OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::EXCLUDE).await
+            s2.open_with_flags(
+                t2,
+                OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::EXCLUDE,
+            )
+            .await
         })?;
         Ok(Box::new(SftpStaged {
             rt: self.rt.handle().clone(),
@@ -462,14 +505,24 @@ impl Vfs for SftpBackend {
         let secs = (mtime_ms / 1000) as u32;
         // setstat by PATH, after any handle is closed — fsetstat corrupts on some
         // servers (Synology; the FFS finding)
-        let attrs = FileAttributes { mtime: Some(secs), atime: Some(secs), ..attrs_none() };
-        self.block("set_mtime", async move { sftp.set_metadata(p, attrs).await })
+        let attrs = FileAttributes {
+            mtime: Some(secs),
+            atime: Some(secs),
+            ..attrs_none()
+        };
+        self.block(
+            "set_mtime",
+            async move { sftp.set_metadata(p, attrs).await },
+        )
     }
 
     fn set_mode(&self, rel: &str, mode: u32) -> VfsResult<()> {
         let sftp = self.conn()?.sftp.clone();
         let p = self.abs(rel);
-        let attrs = FileAttributes { permissions: Some(mode), ..attrs_none() };
+        let attrs = FileAttributes {
+            permissions: Some(mode),
+            ..attrs_none()
+        };
         self.block("chmod", async move { sftp.set_metadata(p, attrs).await })
     }
 
@@ -500,22 +553,34 @@ async fn connect_and_open(
     timeout: Duration,
     root_spec: &str,
     display: &str,
-) -> VfsResult<(russh::client::Handle<HostCheck>, SftpSession, String, String)> {
+) -> VfsResult<(
+    russh::client::Handle<HostCheck>,
+    SftpSession,
+    String,
+    String,
+)> {
     let session = crate::fs::ssh::connect(host, port, user, creds, timeout, display).await?;
     let auth = session.auth_summary();
     let session = session.handle;
 
-    let channel = session
-        .channel_open_session()
-        .await
-        .map_err(|e| VfsError::new(VfsErrorKind::Transient, format!("cannot open a channel: {e}")))?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .map_err(|e| VfsError::new(VfsErrorKind::Protocol, format!("the server refused the sftp subsystem: {e}")))?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .map_err(|e| VfsError::new(VfsErrorKind::Protocol, format!("sftp handshake failed: {e}")))?;
+    let channel = session.channel_open_session().await.map_err(|e| {
+        VfsError::new(
+            VfsErrorKind::Transient,
+            format!("cannot open a channel: {e}"),
+        )
+    })?;
+    channel.request_subsystem(true, "sftp").await.map_err(|e| {
+        VfsError::new(
+            VfsErrorKind::Protocol,
+            format!("the server refused the sftp subsystem: {e}"),
+        )
+    })?;
+    let sftp = SftpSession::new(channel.into_stream()).await.map_err(|e| {
+        VfsError::new(
+            VfsErrorKind::Protocol,
+            format!("sftp handshake failed: {e}"),
+        )
+    })?;
 
     let root_abs = if root_spec.is_empty() {
         sftp.canonicalize(".")
@@ -526,7 +591,12 @@ async fn connect_and_open(
     };
 
     let server_line = format!("sftp v3 via ssh, auth: {auth}");
-    Ok((session, sftp, root_abs.trim_end_matches('/').to_string(), server_line))
+    Ok((
+        session,
+        sftp,
+        root_abs.trim_end_matches('/').to_string(),
+        server_line,
+    ))
 }
 
 #[cfg(test)]
@@ -535,7 +605,9 @@ mod tests {
     use crate::fs::vfs::spec::{parse, RootSpec};
 
     fn backend(s: &str) -> SftpBackend {
-        let RootSpec::Remote(r) = parse(s) else { panic!() };
+        let RootSpec::Remote(r) = parse(s) else {
+            panic!()
+        };
         SftpBackend::new(r, crate::fs::vfs::cred::default_provider())
     }
 
@@ -560,6 +632,10 @@ mod tests {
     fn write_side_still_needs_a_connection_first() {
         let b = backend("sftp://ben@host/data");
         let e = b.remove_file("x").unwrap_err();
-        assert_eq!(e.kind, VfsErrorKind::Transient, "unconnected is a transient state, never a judgment about files");
+        assert_eq!(
+            e.kind,
+            VfsErrorKind::Transient,
+            "unconnected is a transient state, never a judgment about files"
+        );
     }
 }

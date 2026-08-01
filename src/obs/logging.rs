@@ -14,7 +14,9 @@
 //! identical before and after the rework" hold, so the correctness of the swap (P3) does not depend on
 //! whether the desktop shell or the CLI installed a sink.
 
-use crate::foundation::names::{APP_LOG_FILE, RUNLOG_ERRORS_FILE, RUNLOG_ITEMS_FILE, RUNLOG_RUN_FILE};
+use crate::foundation::names::{
+    APP_LOG_FILE, RUNLOG_ERRORS_FILE, RUNLOG_ITEMS_FILE, RUNLOG_RUN_FILE,
+};
 use crate::model::event::{LogLevel, ProgressEvent};
 use crate::obs::progress::{current, ProgressSink};
 use std::io::Write;
@@ -56,7 +58,6 @@ macro_rules! log_error {
         $crate::obs::logging::emit($crate::model::event::LogLevel::Error, $scope, format!($($arg)*))
     };
 }
-
 
 /// The CLI's old behavior: `Log` goes verbatim to stderr.
 ///
@@ -118,7 +119,10 @@ const FLUSH_EVERY: u32 = 64;
 impl Appender {
     fn create(path: &Path) -> Option<Appender> {
         match std::fs::File::create(path) {
-            Ok(f) => Some(Appender { w: std::io::BufWriter::new(f), since_flush: 0 }),
+            Ok(f) => Some(Appender {
+                w: std::io::BufWriter::new(f),
+                since_flush: 0,
+            }),
             Err(e) => {
                 eprintln!("logging: cannot create {}: {e}", path.display());
                 None
@@ -213,7 +217,9 @@ impl ProgressSink for FileSink {
                 }
             }
             // Phase boundaries and terminal states flush everything while we are here — so Ctrl-C does not take the whole tail with it
-            ProgressEvent::PhaseStart { .. } | ProgressEvent::PhaseEnd { .. } | ProgressEvent::Summary { .. } => {
+            ProgressEvent::PhaseStart { .. }
+            | ProgressEvent::PhaseEnd { .. }
+            | ProgressEvent::Summary { .. } => {
                 Self::put(&self.run, &line, true);
                 self.flush_all();
             }
@@ -356,7 +362,12 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn ev_log(level: LogLevel, msg: &str) -> ProgressEvent {
-        ProgressEvent::Log { ts_ms: 1, level, scope: "t".into(), message: msg.into() }
+        ProgressEvent::Log {
+            ts_ms: 1,
+            level,
+            scope: "t".into(),
+            message: msg.into(),
+        }
     }
 
     fn collecting() -> (Arc<dyn ProgressSink>, Arc<Mutex<Vec<ProgressEvent>>>) {
@@ -381,15 +392,26 @@ mod tests {
             // Once the inner guard lands it must restore a — otherwise the next run's log cross-contaminates the directory
             emit(LogLevel::Info, "t", "after".into());
         }
-        assert_eq!(sa.lock().unwrap().len(), 2, "the outer sink should receive first + after");
-        assert_eq!(sb.lock().unwrap().len(), 1, "the inner sink receives only inner");
+        assert_eq!(
+            sa.lock().unwrap().len(),
+            2,
+            "the outer sink should receive first + after"
+        );
+        assert_eq!(
+            sb.lock().unwrap().len(),
+            1,
+            "the inner sink receives only inner"
+        );
         // Once every guard has landed we are back to "nobody holding the sink"
         assert!(current().is_none());
     }
 
     #[test]
     fn file_sink_routes_three_ways() {
-        let dir = std::env::temp_dir().join(format!("syncdash-logtest-{}", crate::foundation::time::now_ms()));
+        let dir = std::env::temp_dir().join(format!(
+            "syncdash-logtest-{}",
+            crate::foundation::time::now_ms()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         {
             let fs_sink = FileSink::open(&dir, LogLevel::Info);
@@ -427,18 +449,39 @@ mod tests {
         let run = read(RUNLOG_RUN_FILE);
         let errors = read(RUNLOG_ERRORS_FILE);
         let items = read(RUNLOG_ITEMS_FILE);
-        assert_eq!(run.lines().count(), 3, "run.jsonl = info + warn + error, no item/progress:\n{run}");
-        assert!(!run.contains("\"progress\""), "Progress must not be persisted");
-        assert_eq!(errors.lines().count(), 2, "errors.jsonl = warn + error:\n{errors}");
-        assert!(!errors.contains("narrative"), "info does not go into the error detail");
-        assert_eq!(items.lines().count(), 1, "items.jsonl takes only ItemResult:\n{items}");
+        assert_eq!(
+            run.lines().count(),
+            3,
+            "run.jsonl = info + warn + error, no item/progress:\n{run}"
+        );
+        assert!(
+            !run.contains("\"progress\""),
+            "Progress must not be persisted"
+        );
+        assert_eq!(
+            errors.lines().count(),
+            2,
+            "errors.jsonl = warn + error:\n{errors}"
+        );
+        assert!(
+            !errors.contains("narrative"),
+            "info does not go into the error detail"
+        );
+        assert_eq!(
+            items.lines().count(),
+            1,
+            "items.jsonl takes only ItemResult:\n{items}"
+        );
         assert!(items.contains("\"failed\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn file_sink_respects_min_level() {
-        let dir = std::env::temp_dir().join(format!("syncdash-logtest-lv-{}", crate::foundation::time::now_ms()));
+        let dir = std::env::temp_dir().join(format!(
+            "syncdash-logtest-lv-{}",
+            crate::foundation::time::now_ms()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         {
             let fs_sink = FileSink::open(&dir, LogLevel::Warn);
@@ -446,7 +489,11 @@ mod tests {
             fs_sink.emit(ev_log(LogLevel::Error, "boom"));
         }
         let run = std::fs::read_to_string(dir.join(RUNLOG_RUN_FILE)).unwrap();
-        assert_eq!(run.lines().count(), 1, "at level=warn, info is blocked:\n{run}");
+        assert_eq!(
+            run.lines().count(),
+            1,
+            "at level=warn, info is blocked:\n{run}"
+        );
         assert!(run.contains("boom"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -476,7 +523,10 @@ mod tests {
 
         let boundary_events = Arc::new(Mutex::new(Vec::new()));
         let (collector, collected) = collecting();
-        let sink = MultiSink::new(vec![Arc::new(BoundaryOnly(boundary_events.clone())), collector]);
+        let sink = MultiSink::new(vec![
+            Arc::new(BoundaryOnly(boundary_events.clone())),
+            collector,
+        ]);
         sink.emit(ProgressEvent::Progress {
             phase: crate::model::event::Phase::ScanSource,
             ts_ms: 1,

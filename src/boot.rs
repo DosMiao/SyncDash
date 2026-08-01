@@ -30,13 +30,12 @@ pub fn init(sink_for: impl FnOnce(&AppSettings) -> Option<Arc<dyn ProgressSink>>
     let (settings, diagnostic) = crate::store::settings::load_with_diagnostic();
     let guard = sink_for(&settings).map(crate::obs::progress::install);
     if let Some(message) = diagnostic {
-        crate::obs::logging::emit(
-            crate::model::event::LogLevel::Warn,
-            "settings",
-            message,
-        );
+        crate::obs::logging::emit(crate::model::event::LogLevel::Warn, "settings", message);
     }
-    Session { settings, _sink: guard }
+    Session {
+        settings,
+        _sink: guard,
+    }
 }
 
 /// Initialize the global rayon pool (hash worker threads): **lowered priority** —— a standard scan's BLAKE3
@@ -49,5 +48,7 @@ pub fn init_worker_pool() {
         b = b.num_threads(threads);
     }
     // build_global returns Err when a global pool already exists (repeat call) —— swallowing it is fine
-    let _ = b.start_handler(|_| crate::foundation::thread::lower_priority()).build_global();
+    let _ = b
+        .start_handler(|_| crate::foundation::thread::lower_priority())
+        .build_global();
 }

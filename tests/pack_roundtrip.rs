@@ -11,8 +11,7 @@ use syncdash::model::plan::{Action, Op, Plan, PlanHeader, Side};
 use syncdash::transfer::pack;
 
 fn tmp(name: &str) -> PathBuf {
-    let d = std::env::temp_dir()
-        .join(format!("syncdash-packtest-{}-{name}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("syncdash-packtest-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -80,7 +79,10 @@ fn packs_and_applies_a_copy() {
     write(&src, "a/one.txt", b"hello package");
     write(&src, "two.bin", &[7u8; 5000]);
 
-    let plan = plan_of(&tgt.to_string_lossy(), vec![copy_op("a/one.txt"), copy_op("two.bin")]);
+    let plan = plan_of(
+        &tgt.to_string_lossy(),
+        vec![copy_op("a/one.txt"), copy_op("two.bin")],
+    );
     let summary = pack::pack(&plan, &src, &out, None).unwrap();
     assert_eq!(summary.files, 2, "both copy ops must ride in the payload");
     assert!(out.exists());
@@ -88,23 +90,37 @@ fn packs_and_applies_a_copy() {
     let (done, _skipped, errors) = pack::apply_pack(&out, Some(&tgt), true, false, false).unwrap();
     assert_eq!(errors, 0, "a clean package must apply without error");
     assert_eq!(done, 2);
-    assert_eq!(std::fs::read(tgt.join("a/one.txt")).unwrap(), b"hello package");
+    assert_eq!(
+        std::fs::read(tgt.join("a/one.txt")).unwrap(),
+        b"hello package"
+    );
     assert_eq!(std::fs::read(tgt.join("two.bin")).unwrap(), vec![7u8; 5000]);
 }
 
 fn update_op(rel: &str) -> Op {
-    Op { action: Action::Update, ..copy_op(rel) }
+    Op {
+        action: Action::Update,
+        ..copy_op(rel)
+    }
 }
 
 fn body(seed: u32, len: usize) -> Vec<u8> {
-    (0..len as u32).map(|i| (i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 13) as u8).collect()
+    (0..len as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 13) as u8)
+        .collect()
 }
 
 /// Pack `rel` as a delta against the copy the target already holds.
 fn pack_delta(src: &Path, tgt: &Path, out: &Path, rel: &str) -> pack::PackSummary {
     let base = syncdash::model::chunk::chunk_file(tgt, rel).unwrap();
     let plan = plan_of(&tgt.to_string_lossy(), vec![update_op(rel)]);
-    pack::pack(&plan, src, out, Some(&[(rel.to_string(), base)].into_iter().collect())).unwrap()
+    pack::pack(
+        &plan,
+        src,
+        out,
+        Some(&[(rel.to_string(), base)].into_iter().collect()),
+    )
+    .unwrap()
 }
 
 /// The delta lane end to end — the half of this module the roundtrip above never reached.
@@ -126,11 +142,22 @@ fn packs_and_applies_a_delta() {
     write(&src, "big.bin", &new);
 
     let summary = pack_delta(&src, &tgt, &out, "big.bin");
-    assert!(summary.delta_saved > 0, "an edited stretch must ride as a delta, not as the whole file");
+    assert!(
+        summary.delta_saved > 0,
+        "an edited stretch must ride as a delta, not as the whole file"
+    );
 
     let (done, _skipped, errors) = pack::apply_pack(&out, Some(&tgt), true, false, false).unwrap();
-    assert_eq!((done, errors), (1, 0), "a matching base must reassemble without error");
-    assert_eq!(std::fs::read(tgt.join("big.bin")).unwrap(), new, "reassembly must be byte-exact");
+    assert_eq!(
+        (done, errors),
+        (1, 0),
+        "a matching base must reassemble without error"
+    );
+    assert_eq!(
+        std::fs::read(tgt.join("big.bin")).unwrap(),
+        new,
+        "reassembly must be byte-exact"
+    );
 }
 
 /// A recipe is only meaningful against the exact bytes it was computed from. If the target moved on
@@ -153,8 +180,15 @@ fn a_delta_base_that_changed_is_refused() {
     drifted[10..20].fill(0xEE);
     write(&tgt, "big.bin", &drifted);
 
-    assert!(pack::apply_pack(&out, Some(&tgt), true, false, false).is_err(), "a stale base must abort the package");
-    assert_eq!(std::fs::read(tgt.join("big.bin")).unwrap(), drifted, "and nothing may have been written");
+    assert!(
+        pack::apply_pack(&out, Some(&tgt), true, false, false).is_err(),
+        "a stale base must abort the package"
+    );
+    assert_eq!(
+        std::fs::read(tgt.join("big.bin")).unwrap(),
+        drifted,
+        "and nothing may have been written"
+    );
 }
 
 /// Dry run is the default posture everywhere else in this tool; a package is no exception.
@@ -168,7 +202,10 @@ fn dry_run_writes_nothing() {
     let plan = plan_of(&tgt.to_string_lossy(), vec![copy_op("f.txt")]);
     pack::pack(&plan, &src, &out, None).unwrap();
     pack::apply_pack(&out, Some(&tgt), false, false, false).unwrap();
-    assert!(!tgt.join("f.txt").exists(), "do_apply=false must not touch the target");
+    assert!(
+        !tgt.join("f.txt").exists(),
+        "do_apply=false must not touch the target"
+    );
 }
 
 /// The manifest's plan hash is the package's identity. Editing the plan after packing —
@@ -213,7 +250,10 @@ fn a_future_pack_version_is_refused() {
     });
 
     let e = pack::apply_pack(&repacked, Some(&tgt), true, false, false).unwrap_err();
-    assert!(e.to_string().contains("newer than this binary supports"), "{e}");
+    assert!(
+        e.to_string().contains("newer than this binary supports"),
+        "{e}"
+    );
 }
 
 /// Path safety is checked on the plan itself, so a traversal cannot even be attempted.
@@ -232,7 +272,9 @@ fn an_escaping_path_is_refused() {
     // the hash — otherwise this test would pass for the wrong reason.
     let mut new_plan = Vec::new();
     rewrite_member(&out, &repacked, "plan.jsonl", |orig| {
-        let s = String::from_utf8(orig.to_vec()).unwrap().replace("f.txt", "../escaped.txt");
+        let s = String::from_utf8(orig.to_vec())
+            .unwrap()
+            .replace("f.txt", "../escaped.txt");
         new_plan = s.clone().into_bytes();
         new_plan.clone()
     });

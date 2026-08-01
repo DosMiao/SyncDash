@@ -16,9 +16,9 @@
 //! 2. **Plan and execution kept apart**: what v0.9 wrote into the detail were the **planned ops**
 //!    handed to apply, with not one word on which succeeded, failed or were KEPT. Now plan and items are separate files.
 
+use crate::model::event::{LogLevel, ProgressEvent};
 use crate::model::plan::Op;
 use crate::obs::logging::{self, FileSink};
-use crate::model::event::{LogLevel, ProgressEvent};
 use crate::obs::progress::{ApplyOutcome, ProgressSink, RunCtx};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -86,7 +86,15 @@ fn index_path(root: &Path) -> PathBuf {
 }
 
 fn sanitize(name: &str) -> String {
-    name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Reject any name that could escape log_dir. The entry guard for `artifact_lines` / `detail_lines`.
@@ -143,10 +151,17 @@ struct TallySink(Arc<Tally>);
 impl ProgressSink for TallySink {
     fn emit(&self, ev: ProgressEvent) {
         match &ev {
-            ProgressEvent::Log { level: LogLevel::Warn, .. } => {
+            ProgressEvent::Log {
+                level: LogLevel::Warn,
+                ..
+            } => {
                 self.0.warnings.fetch_add(1, Ordering::Relaxed);
             }
-            ProgressEvent::Log { level: LogLevel::Error, .. } | ProgressEvent::Error { .. } => {
+            ProgressEvent::Log {
+                level: LogLevel::Error,
+                ..
+            }
+            | ProgressEvent::Error { .. } => {
                 self.0.errors.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
@@ -182,20 +197,27 @@ impl Recorder {
 
         // Do not thread `progress::current()` in here: `RunCtx::null()` already brought the process's
         // ambient sink (the StderrSink the CLI installs at startup) into `base.sink`; threading it again duplicates output.
-        let mut sinks: Vec<Arc<dyn ProgressSink>> = vec![base.sink.clone(), Arc::new(TallySink(tally.clone()))];
+        let mut sinks: Vec<Arc<dyn ProgressSink>> =
+            vec![base.sink.clone(), Arc::new(TallySink(tally.clone()))];
         let (file, run_id, dir) = match create_run_dir(&root, ts_ms, name, kind) {
             Ok((run_id, dir)) => {
                 write_plan(&dir, ops);
                 // Write a finished:false summary up front — so even if the process is killed, this
                 // directory can still say "who I am and that I did not finish" instead of becoming anonymous debris
-                write_summary(&dir, &pending_record(name, kind, ts_ms, &run_id, ops.len() as u64));
+                write_summary(
+                    &dir,
+                    &pending_record(name, kind, ts_ms, &run_id, ops.len() as u64),
+                );
                 let f = Arc::new(FileSink::open(&dir, cfg.level));
                 sinks.push(f.clone() as Arc<dyn ProgressSink>);
                 (Some(f), Some(run_id), Some(dir))
             }
             Err(e) => {
                 // A directory we cannot create costs us the detail, not the sync — the index line is still written
-                eprintln!("runlog: cannot create a run directory under {}: {e}", root.display());
+                eprintln!(
+                    "runlog: cannot create a run directory under {}: {e}",
+                    root.display()
+                );
                 (None, None, None)
             }
         };
@@ -271,7 +293,10 @@ fn write_summary(dir: &Path, rec: &RunRecord) {
     match serde_json::to_string_pretty(rec) {
         Ok(t) => {
             if let Err(e) = std::fs::write(dir.join(SUMMARY_FILE), t) {
-                eprintln!("runlog: cannot write the summary into {}: {e}", dir.display());
+                eprintln!(
+                    "runlog: cannot write the summary into {}: {e}",
+                    dir.display()
+                );
             }
         }
         Err(e) => eprintln!("runlog: summary serialization failed: {e}"),
@@ -310,30 +335,39 @@ fn append_index(root: &Path, rec: &RunRecord) {
 ///
 /// A watch round every 30s = 2880 a day, and creating a directory each time would flood the log disk;
 /// the single line "when we compared and how many differences we found" is worth keeping on its own.
-pub fn compare_summary(name: &str, kind: &str, ts_ms: i64, ops_found: u64, elapsed_ms: u64, cancelled: bool) {
+pub fn compare_summary(
+    name: &str,
+    kind: &str,
+    ts_ms: i64,
+    ops_found: u64,
+    elapsed_ms: u64,
+    cancelled: bool,
+) {
     let settings = crate::store::settings::load();
     if !settings.logs_compare() {
         return;
     }
     let root = settings.resolved_log_dir();
-    append_index(&root, &RunRecord {
-        ts_ms,
-        job: name.to_string(),
-        kind: kind.to_string(),
-        done: 0,
-        skipped: 0,
-        errors: 0,
-        bytes: 0,
-        elapsed_ms,
-        cancelled,
-        run_id: None,
-        warnings: 0,
-        ops_found: Some(ops_found),
-        finished: true,
-        detail: None,
-    });
+    append_index(
+        &root,
+        &RunRecord {
+            ts_ms,
+            job: name.to_string(),
+            kind: kind.to_string(),
+            done: 0,
+            skipped: 0,
+            errors: 0,
+            bytes: 0,
+            elapsed_ms,
+            cancelled,
+            run_id: None,
+            warnings: 0,
+            ops_found: Some(ops_found),
+            finished: true,
+            detail: None,
+        },
+    );
 }
-
 
 /// History (newest → oldest). job = None means everything; corrupt lines are skipped, never fatal.
 pub fn history(job: Option<&str>, limit: usize) -> Vec<RunRecord> {
@@ -444,7 +478,6 @@ pub fn detail_lines(detail: &str, max: usize) -> Vec<String> {
     text.lines().take(max).map(|s| s.to_string()).collect()
 }
 
-
 fn dir_size(p: &Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(p) else {
         return 0;
@@ -452,7 +485,11 @@ fn dir_size(p: &Path) -> u64 {
     let mut n = 0;
     for e in rd.flatten() {
         let path = e.path();
-        n += if path.is_dir() { dir_size(&path) } else { e.metadata().map(|m| m.len()).unwrap_or(0) };
+        n += if path.is_dir() {
+            dir_size(&path)
+        } else {
+            e.metadata().map(|m| m.len()).unwrap_or(0)
+        };
     }
     n
 }
@@ -508,10 +545,12 @@ pub fn prune(keep_days: u64, max_total_mb: u64) -> u64 {
         let cap = max_total_mb * 1024 * 1024;
         let mut sizes: Vec<u64> = kept
             .iter()
-            .map(|(r, _)| match r.as_ref().and_then(|r| r.run_id.as_deref()) {
-                Some(id) if safe_component(id) => dir_size(&root.join(id)),
-                _ => 0,
-            })
+            .map(
+                |(r, _)| match r.as_ref().and_then(|r| r.run_id.as_deref()) {
+                    Some(id) if safe_component(id) => dir_size(&root.join(id)),
+                    _ => 0,
+                },
+            )
             .collect();
         let mut total: u64 = sizes.iter().sum();
         let mut i = 0;
@@ -552,8 +591,10 @@ pub fn prune(keep_days: u64, max_total_mb: u64) -> u64 {
 }
 
 fn sweep_orphans(root: &Path, kept: &[(Option<RunRecord>, String)], cutoff: i64) {
-    let live: std::collections::HashSet<&str> =
-        kept.iter().filter_map(|(r, _)| r.as_ref().and_then(|r| r.run_id.as_deref())).collect();
+    let live: std::collections::HashSet<&str> = kept
+        .iter()
+        .filter_map(|(r, _)| r.as_ref().and_then(|r| r.run_id.as_deref()))
+        .collect();
     let Ok(rd) = std::fs::read_dir(root) else {
         return;
     };
@@ -613,23 +654,42 @@ mod tests {
         assert_eq!(c.detail.as_deref(), Some("9-j.jsonl"));
         assert!(c.run_id.is_none() && c.ops_found.is_none());
         // v0.9 only wrote a record inside finish, so anything written did finish → old lines must read back as finished
-        assert!(c.finished, "old index lines have no finished field; the default must be true");
+        assert!(
+            c.finished,
+            "old index lines have no finished field; the default must be true"
+        );
     }
 
     #[test]
     fn stamp_matches_known_unix_times() {
         assert_eq!(crate::foundation::time::stamp_compact(0), "19700101-000000");
-        assert_eq!(crate::foundation::time::stamp_compact(946_684_800_000), "20000101-000000"); // 2000-01-01T00:00:00Z
-        assert_eq!(crate::foundation::time::stamp_compact(1_000_000_000_000), "20010909-014640"); // the classic billionth second
-        assert_eq!(crate::foundation::time::stamp_compact(1_709_164_800_000), "20240229-000000"); // leap day
+        assert_eq!(
+            crate::foundation::time::stamp_compact(946_684_800_000),
+            "20000101-000000"
+        ); // 2000-01-01T00:00:00Z
+        assert_eq!(
+            crate::foundation::time::stamp_compact(1_000_000_000_000),
+            "20010909-014640"
+        ); // the classic billionth second
+        assert_eq!(
+            crate::foundation::time::stamp_compact(1_709_164_800_000),
+            "20240229-000000"
+        ); // leap day
     }
 
     #[test]
     fn stamps_sort_chronologically() {
         // Directory names must sort lexicographically as they stand — the entire reason for not pulling in chrono
-        let mut v = vec![crate::foundation::time::stamp_compact(1_000_000_000_000), crate::foundation::time::stamp_compact(0), crate::foundation::time::stamp_compact(946_684_800_000)];
+        let mut v = vec![
+            crate::foundation::time::stamp_compact(1_000_000_000_000),
+            crate::foundation::time::stamp_compact(0),
+            crate::foundation::time::stamp_compact(946_684_800_000),
+        ];
         v.sort();
-        assert_eq!(v, vec!["19700101-000000", "20000101-000000", "20010909-014640"]);
+        assert_eq!(
+            v,
+            vec!["19700101-000000", "20000101-000000", "20010909-014640"]
+        );
     }
 
     #[test]
@@ -646,7 +706,9 @@ mod tests {
 
     #[test]
     fn sanitize_strips_path_chars() {
-        assert!(sanitize("a b/c\\d").chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-'));
+        assert!(sanitize("a b/c\\d")
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-'));
     }
 
     #[test]

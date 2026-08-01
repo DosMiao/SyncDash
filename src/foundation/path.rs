@@ -6,7 +6,11 @@ use std::path::{Path, PathBuf};
 
 /// Table rel (`/`-separated) → native separator.
 pub fn to_native(rel: &str) -> String {
-    if cfg!(windows) { rel.replace('/', "\\") } else { rel.to_string() }
+    if cfg!(windows) {
+        rel.replace('/', "\\")
+    } else {
+        rel.to_string()
+    }
 }
 
 /// root + rel → real path.
@@ -49,7 +53,11 @@ pub fn split_ext(name: &str) -> (&str, &str) {
 /// Infer the separator from how the root is spelled. For CSV export and frontend path joining — what
 /// those get is the far machine's root string, and `cfg!(windows)` describes **this** host, so it guesses wrong.
 pub fn sep_of(root: &str) -> char {
-    if root.contains('\\') { '\\' } else { '/' }
+    if root.contains('\\') {
+        '\\'
+    } else {
+        '/'
+    }
 }
 
 /// Whether a rel of unknown provenance is safe to write to disk.
@@ -69,7 +77,9 @@ pub fn is_safe_rel(rel: &str) -> bool {
         && !rel.starts_with('/')
         && !rel.starts_with('\\')
         && !rel.contains(':')
-        && rel.split(['/', '\\']).all(|seg| !seg.is_empty() && seg != ".." && seg != ".")
+        && rel
+            .split(['/', '\\'])
+            .all(|seg| !seg.is_empty() && seg != ".." && seg != ".")
 }
 
 #[cfg(test)]
@@ -110,9 +120,15 @@ mod tests {
         // Verified escape before the fix: each of these passed the `/`-only split, and on Windows
         // `join_native` then wrote the file outside the sync root.
         assert!(!is_safe_rel(r"..\SIBLING.txt"), "bare backslash traversal");
-        assert!(!is_safe_rel(r"a\..\..\ESCAPED.txt"), "backslash traversal behind a segment");
+        assert!(
+            !is_safe_rel(r"a\..\..\ESCAPED.txt"),
+            "backslash traversal behind a segment"
+        );
         assert!(!is_safe_rel(r"a/b\..\..\..\ESC2.txt"), "mixed separators");
-        assert!(!is_safe_rel(r"\server\share\x"), "leading backslash (UNC-shaped)");
+        assert!(
+            !is_safe_rel(r"\server\share\x"),
+            "leading backslash (UNC-shaped)"
+        );
         assert!(!is_safe_rel(r"a\.\b"), "single-dot segment");
         // A backslash is a legal filename character on unix and must stay syncable: no
         // segment here is `..`, so the name passes as an ordinary (if ugly) file name.
@@ -136,7 +152,11 @@ mod tests {
     #[test]
     fn to_rel_refuses_paths_outside_root() {
         let root = Path::new(if cfg!(windows) { r"D:\R" } else { "/r" });
-        let outside = Path::new(if cfg!(windows) { r"D:\Other\x" } else { "/other/x" });
+        let outside = Path::new(if cfg!(windows) {
+            r"D:\Other\x"
+        } else {
+            "/other/x"
+        });
         assert_eq!(to_rel(outside, root), None);
     }
 }

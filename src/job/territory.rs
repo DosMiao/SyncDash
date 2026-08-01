@@ -16,8 +16,18 @@ use std::path::{Path, PathBuf};
 
 const MARKER: &str = ".ffs-sync";
 const PRUNE_DIRS: &[&str] = &[
-    ".git", "node_modules", "target", "build", "dist", "__pycache__", ".venv", "venv",
-    "worktrees", ".syncdash", "$RECYCLE.BIN", "System Volume Information",
+    ".git",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "worktrees",
+    ".syncdash",
+    "$RECYCLE.BIN",
+    "System Volume Information",
 ];
 
 /// Returns the directories holding a .ffs-sync marker (relative to root, '/'-separated, sorted)
@@ -52,7 +62,13 @@ fn slug(rel: &str) -> String {
     let mut s: String = rel
         .to_lowercase()
         .chars()
-        .map(|c| if c == '/' || c == '\\' || c == ' ' || c == '.' { '-' } else { c })
+        .map(|c| {
+            if c == '/' || c == '\\' || c == ' ' || c == '.' {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect();
     while s.contains("--") {
         s = s.replace("--", "-");
@@ -102,7 +118,10 @@ impl Default for GenOpts {
             // machines corrupt the repository. Hence `dev` in the seed. It is a **default**, not a
             // policy: it is spelled out in the generated file, editable there and in the UI, switchable
             // with --junk, and never reimposed on a re-run.
-            junk: ["windows", "macos", "dev"].iter().map(|s| s.to_string()).collect(),
+            junk: ["windows", "macos", "dev"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             force: false,
         }
     }
@@ -132,13 +151,24 @@ pub fn gen_jobs(
         let name = format!("cs-{}", slug(&rel));
         let path = opts.dest.join(format!("{name}.toml"));
         if path.exists() && !opts.force {
-            out.push(GenOutcome { name, territory: rel, path, written: false });
+            out.push(GenOutcome {
+                name,
+                territory: rel,
+                path,
+                written: false,
+            });
             continue;
         }
         let native = crate::foundation::path::to_native(&rel);
         // target_root may be UNC or posix — join each side with its own separator
-        let mount = if target_root.to_string_lossy().contains('/') && !target_root.to_string_lossy().contains('\\') {
-            format!("{}/{}", target_root.to_string_lossy().trim_end_matches('/'), rel)
+        let mount = if target_root.to_string_lossy().contains('/')
+            && !target_root.to_string_lossy().contains('\\')
+        {
+            format!(
+                "{}/{}",
+                target_root.to_string_lossy().trim_end_matches('/'),
+                rel
+            )
         } else {
             target_root.join(&native).to_string_lossy().into_owned()
         };
@@ -146,7 +176,12 @@ pub fn gen_jobs(
         // writes through, and it rides on the phrase where the rest of the link already lives.
         let target = match remote {
             Some(r) => {
-                let mut p = format!("peer://{}/{}/{}", r.host, r.root_base.trim_end_matches('/').trim_start_matches('/'), rel);
+                let mut p = format!(
+                    "peer://{}/{}/{}",
+                    r.host,
+                    r.root_base.trim_end_matches('/').trim_start_matches('/'),
+                    rel
+                );
                 if let Some(exe) = r.exe.as_deref().filter(|e| !e.trim().is_empty()) {
                     p.push_str(&format!("|exe={exe}"));
                 }
@@ -159,7 +194,11 @@ pub fn gen_jobs(
             mode: opts.mode.clone(),
             source: source_root.join(&native).to_string_lossy().into_owned(),
             target,
-            archive: if opts.mode == "sync" { Some(opts.archives.join(format!("{name}.jsonl"))) } else { None },
+            archive: if opts.mode == "sync" {
+                Some(opts.archives.join(format!("{name}.jsonl")))
+            } else {
+                None
+            },
             include: Vec::new(),
             // The seed selection, materialized in full. Every rule this job will act on is a line here —
             // there is no companion flag that adds more behind it, and no re-run that puts back a line
@@ -172,9 +211,17 @@ pub fn gen_jobs(
             versioning: false,
             ..Default::default()
         };
-        let toml_text = toml::to_string_pretty(&job)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}")))?;
-        let seed = if opts.junk.is_empty() { "none".to_string() } else { opts.junk.join(", ") };
+        let toml_text = toml::to_string_pretty(&job).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("toml serialize: {e}"),
+            )
+        })?;
+        let seed = if opts.junk.is_empty() {
+            "none".to_string()
+        } else {
+            opts.junk.join(", ")
+        };
         let header = format!(
             "# generated by `syncdash gen-jobs` from the .ffs-sync marker: {rel}\n\
              # Seeded once with the junk presets: {seed} ({} patterns, all listed under `exclude` below).\n\
@@ -184,7 +231,12 @@ pub fn gen_jobs(
             junk.len(),
         );
         std::fs::write(&path, format!("{header}{toml_text}"))?;
-        out.push(GenOutcome { name, territory: rel, path, written: true });
+        out.push(GenOutcome {
+            name,
+            territory: rel,
+            path,
+            written: true,
+        });
     }
     Ok(out)
 }
@@ -194,7 +246,10 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("syncdash-terr-{tag}-{}", crate::foundation::time::now_ms()));
+        let p = std::env::temp_dir().join(format!(
+            "syncdash-terr-{tag}-{}",
+            crate::foundation::time::now_ms()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -224,7 +279,13 @@ mod tests {
     fn the_seed_is_visible_in_the_generated_file() {
         let root = tmp("seed");
         let src = territory_tree(&root);
-        let o = gen_jobs(&src, Path::new(r"T:\dst"), &opts(&root, &["windows", "dev"], false), None).unwrap();
+        let o = gen_jobs(
+            &src,
+            Path::new(r"T:\dst"),
+            &opts(&root, &["windows", "dev"], false),
+            None,
+        )
+        .unwrap();
         assert_eq!(o.len(), 1);
         assert!(o[0].written);
 
@@ -234,9 +295,15 @@ mod tests {
         // …and the same lines are literally in the text, not hidden behind a preset name
         let text = std::fs::read_to_string(&o[0].path).unwrap();
         for p in &expect {
-            assert!(text.contains(p.as_str()), "pattern '{p}' must appear verbatim in the job file");
+            assert!(
+                text.contains(p.as_str()),
+                "pattern '{p}' must appear verbatim in the job file"
+            );
         }
-        assert!(!text.contains("dev_excludes"), "no flag may stand in for the list");
+        assert!(
+            !text.contains("dev_excludes"),
+            "no flag may stand in for the list"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -247,9 +314,20 @@ mod tests {
     fn a_rerun_never_resurrects_an_exclude_its_owner_deleted() {
         let root = tmp("keep");
         let src = territory_tree(&root);
-        let o1 = gen_jobs(&src, Path::new(r"T:\dst"), &opts(&root, &["windows", "dev"], false), None).unwrap();
+        let o1 = gen_jobs(
+            &src,
+            Path::new(r"T:\dst"),
+            &opts(&root, &["windows", "dev"], false),
+            None,
+        )
+        .unwrap();
         let path = o1[0].path.clone();
-        assert!(crate::job::load(&path.to_string_lossy()).unwrap().1.exclude.iter().any(|e| e == "*/build/"));
+        assert!(crate::job::load(&path.to_string_lossy())
+            .unwrap()
+            .1
+            .exclude
+            .iter()
+            .any(|e| e == "*/build/"));
 
         // The owner edits the job: */build/ is theirs to keep
         let (_, mut edited) = crate::job::load(&path.to_string_lossy()).unwrap();
@@ -257,16 +335,43 @@ mod tests {
         std::fs::write(&path, toml::to_string_pretty(&edited).unwrap()).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let o2 = gen_jobs(&src, Path::new(r"T:\dst"), &opts(&root, &["windows", "dev"], false), None).unwrap();
-        assert!(!o2[0].written, "an existing job must be reported as kept, not rewritten");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "the file must be byte-identical");
+        let o2 = gen_jobs(
+            &src,
+            Path::new(r"T:\dst"),
+            &opts(&root, &["windows", "dev"], false),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !o2[0].written,
+            "an existing job must be reported as kept, not rewritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the file must be byte-identical"
+        );
         let after = crate::job::load(&path.to_string_lossy()).unwrap().1;
-        assert!(!after.exclude.iter().any(|e| e == "*/build/"), "a deleted exclude stays deleted");
+        assert!(
+            !after.exclude.iter().any(|e| e == "*/build/"),
+            "a deleted exclude stays deleted"
+        );
 
         // --force is the explicit way back, and only then
-        let o3 = gen_jobs(&src, Path::new(r"T:\dst"), &opts(&root, &["windows", "dev"], true), None).unwrap();
+        let o3 = gen_jobs(
+            &src,
+            Path::new(r"T:\dst"),
+            &opts(&root, &["windows", "dev"], true),
+            None,
+        )
+        .unwrap();
         assert!(o3[0].written);
-        assert!(crate::job::load(&path.to_string_lossy()).unwrap().1.exclude.iter().any(|e| e == "*/build/"));
+        assert!(crate::job::load(&path.to_string_lossy())
+            .unwrap()
+            .1
+            .exclude
+            .iter()
+            .any(|e| e == "*/build/"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -276,7 +381,11 @@ mod tests {
         let root = tmp("none");
         let src = territory_tree(&root);
         let o = gen_jobs(&src, Path::new(r"T:\dst"), &opts(&root, &[], false), None).unwrap();
-        assert!(crate::job::load(&o[0].path.to_string_lossy()).unwrap().1.exclude.is_empty());
+        assert!(crate::job::load(&o[0].path.to_string_lossy())
+            .unwrap()
+            .1
+            .exclude
+            .is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

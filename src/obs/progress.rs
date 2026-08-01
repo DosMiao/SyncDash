@@ -17,7 +17,6 @@ use crate::model::event::{LogLevel, Phase, PhaseStatus, ProgressEvent};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-
 pub trait ProgressSink: Send + Sync {
     fn emit(&self, ev: ProgressEvent);
 
@@ -138,7 +137,10 @@ impl RunCtx {
     /// installed. "No interface" does not mean "no need to talk" — this used to hard-code NullSink,
     /// which is exactly how the mount-point warning during a CLI compare got lost.
     pub fn null() -> RunCtx {
-        RunCtx { ctl: RunCtl::new(), sink: current().unwrap_or_else(|| Arc::new(NullSink)) }
+        RunCtx {
+            ctl: RunCtl::new(),
+            sink: current().unwrap_or_else(|| Arc::new(NullSink)),
+        }
     }
     pub fn new(ctl: Arc<RunCtl>, sink: Arc<dyn ProgressSink>) -> RunCtx {
         RunCtx { ctl, sink }
@@ -164,8 +166,11 @@ impl RunCtx {
         }
         if ctl.paused.load(Ordering::Relaxed) {
             if !ctl.pause_announced.swap(true, Ordering::SeqCst) {
-                ctl.paused_since_ms.store(crate::foundation::time::now_ms(), Ordering::SeqCst);
-                self.sink.emit(ProgressEvent::Paused { ts_ms: crate::foundation::time::now_ms() });
+                ctl.paused_since_ms
+                    .store(crate::foundation::time::now_ms(), Ordering::SeqCst);
+                self.sink.emit(ProgressEvent::Paused {
+                    ts_ms: crate::foundation::time::now_ms(),
+                });
             }
             while ctl.paused.load(Ordering::Relaxed) {
                 if ctl.cancel.load(Ordering::Relaxed) {
@@ -220,7 +225,13 @@ pub struct PhaseProgress<'a> {
 const PROGRESS_INTERVAL_MS: u64 = 100;
 
 impl<'a> PhaseProgress<'a> {
-    pub fn begin(ctx: &'a RunCtx, phase: Phase, label: Option<String>, items_total: u64, bytes_total: u64) -> Self {
+    pub fn begin(
+        ctx: &'a RunCtx,
+        phase: Phase,
+        label: Option<String>,
+        items_total: u64,
+        bytes_total: u64,
+    ) -> Self {
         ctx.sink.emit(ProgressEvent::PhaseStart {
             phase,
             ts_ms: crate::foundation::time::now_ms(),
@@ -277,7 +288,12 @@ impl<'a> PhaseProgress<'a> {
             if last != 0 && now.saturating_sub(last) < PROGRESS_INTERVAL_MS {
                 return;
             }
-            match self.last_progress_ms.compare_exchange_weak(last, now, Ordering::Relaxed, Ordering::Relaxed) {
+            match self.last_progress_ms.compare_exchange_weak(
+                last,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => {
                     self.ctx.sink.emit(self.snapshot(current, now));
                     return;
@@ -315,12 +331,15 @@ impl<'a> PhaseProgress<'a> {
             return;
         }
         if actual > planned {
-            self.bytes_total.fetch_add(actual - planned, Ordering::Relaxed);
+            self.bytes_total
+                .fetch_add(actual - planned, Ordering::Relaxed);
         } else {
             let decrease = planned - actual;
-            let _ = self.bytes_total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
-                Some(total.saturating_sub(decrease))
-            });
+            let _ = self
+                .bytes_total
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                    Some(total.saturating_sub(decrease))
+                });
         }
         self.emit_totals(false);
     }
@@ -328,8 +347,10 @@ impl<'a> PhaseProgress<'a> {
     /// Mark an opaque successful stage complete when its worker only returns aggregate totals
     /// (peer pack/apply). Ordinary file/chunk loops must keep using item_done/add_bytes.
     pub fn complete(&self, current: &str) {
-        self.items_done.store(self.items_total.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.bytes_done.store(self.bytes_total.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.items_done
+            .store(self.items_total.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.bytes_done
+            .store(self.bytes_total.load(Ordering::Relaxed), Ordering::Relaxed);
         let now = crate::foundation::time::now_ms();
         if self.ctx.sink.wants_progress() {
             self.ctx.sink.emit(self.snapshot(current, now));
@@ -381,9 +402,17 @@ impl<'a> PhaseProgress<'a> {
     pub fn finish(mut self) -> std::io::Result<()> {
         self.ended = true;
         let cancelled = self.ctx.ctl.cancelled();
-        let status = if cancelled { PhaseStatus::Cancelled } else { PhaseStatus::Completed };
+        let status = if cancelled {
+            PhaseStatus::Cancelled
+        } else {
+            PhaseStatus::Completed
+        };
         self.emit_end(status);
-        if cancelled { Err(cancelled_err()) } else { Ok(()) }
+        if cancelled {
+            Err(cancelled_err())
+        } else {
+            Ok(())
+        }
     }
 
     /// End a phase that returned a handled failure rather than unwinding through `?`.
@@ -408,7 +437,11 @@ impl<'a> PhaseProgress<'a> {
 impl Drop for PhaseProgress<'_> {
     fn drop(&mut self) {
         if !self.ended {
-            let status = if self.ctx.ctl.cancelled() { PhaseStatus::Cancelled } else { PhaseStatus::Failed };
+            let status = if self.ctx.ctl.cancelled() {
+                PhaseStatus::Cancelled
+            } else {
+                PhaseStatus::Failed
+            };
             self.emit_end(status);
         }
     }
@@ -451,14 +484,28 @@ mod tests {
             c2.store(1, Ordering::SeqCst);
         });
         std::thread::sleep(std::time::Duration::from_millis(300));
-        assert_eq!(counter.load(Ordering::SeqCst), 0, "checkpoint must block while paused");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "checkpoint must block while paused"
+        );
         ctx.ctl.set_paused(false);
         h.join().unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 1);
-        assert!(ctx.ctl.paused_total_ms() >= 200, "paused_ms should accumulate, got {}", ctx.ctl.paused_total_ms());
+        assert!(
+            ctx.ctl.paused_total_ms() >= 200,
+            "paused_ms should accumulate, got {}",
+            ctx.ctl.paused_total_ms()
+        );
         let evs = store.lock().unwrap();
-        let paused = evs.iter().filter(|e| matches!(e, ProgressEvent::Paused { .. })).count();
-        let resumed = evs.iter().filter(|e| matches!(e, ProgressEvent::Resumed { .. })).count();
+        let paused = evs
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Paused { .. }))
+            .count();
+        let resumed = evs
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Resumed { .. }))
+            .count();
         assert_eq!((paused, resumed), (1, 1));
     }
 
@@ -480,9 +527,19 @@ mod tests {
             h.join().unwrap();
         }
         let evs = store.lock().unwrap();
-        let paused = evs.iter().filter(|e| matches!(e, ProgressEvent::Paused { .. })).count();
-        let resumed = evs.iter().filter(|e| matches!(e, ProgressEvent::Resumed { .. })).count();
-        assert_eq!((paused, resumed), (1, 1), "4 blocked threads must announce exactly one pair");
+        let paused = evs
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Paused { .. }))
+            .count();
+        let resumed = evs
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Resumed { .. }))
+            .count();
+        assert_eq!(
+            (paused, resumed),
+            (1, 1),
+            "4 blocked threads must announce exactly one pair"
+        );
     }
 
     #[test]
@@ -498,28 +555,48 @@ mod tests {
         assert_eq!(prog.counts(), (2, 2, 300, 300));
         prog.finish().unwrap();
         let evs = store.lock().unwrap();
-        assert!(matches!(evs[0], ProgressEvent::PhaseStart { phase: Phase::ScanSource, .. }));
-        assert!(matches!(evs[1], ProgressEvent::Totals {
-            reset: false,
-            items_done: 0,
-            items_total: 2,
-            bytes_done: 0,
-            bytes_total: 300,
-            ..
-        }));
-        assert_eq!(evs.iter().filter(|e| matches!(e, ProgressEvent::Progress { .. })).count(), 1);
+        assert!(matches!(
+            evs[0],
+            ProgressEvent::PhaseStart {
+                phase: Phase::ScanSource,
+                ..
+            }
+        ));
+        assert!(matches!(
+            evs[1],
+            ProgressEvent::Totals {
+                reset: false,
+                items_done: 0,
+                items_total: 2,
+                bytes_done: 0,
+                bytes_total: 300,
+                ..
+            }
+        ));
+        assert_eq!(
+            evs.iter()
+                .filter(|e| matches!(e, ProgressEvent::Progress { .. }))
+                .count(),
+            1
+        );
         assert!(evs.iter().any(|e| matches!(e, ProgressEvent::Error { .. })));
-        assert!(matches!(evs.last(), Some(ProgressEvent::PhaseEnd {
-            phase: Phase::ScanSource,
-            status: PhaseStatus::Completed,
-            items_done: 2,
-            items_total: 2,
-            bytes_done: 300,
-            bytes_total: 300,
-            ..
-        })));
+        assert!(matches!(
+            evs.last(),
+            Some(ProgressEvent::PhaseEnd {
+                phase: Phase::ScanSource,
+                status: PhaseStatus::Completed,
+                items_done: 2,
+                items_total: 2,
+                bytes_done: 300,
+                bytes_total: 300,
+                ..
+            })
+        ));
         let json = serde_json::to_string(&evs[1]).unwrap();
-        assert!(json.contains("\"kind\":\"totals\"") && json.contains("\"scan-source\""), "serde shape: {json}");
+        assert!(
+            json.contains("\"kind\":\"totals\"") && json.contains("\"scan-source\""),
+            "serde shape: {json}"
+        );
     }
 
     #[test]
@@ -529,12 +606,15 @@ mod tests {
             let prog = PhaseProgress::begin(&ctx, Phase::ScanTarget, None, 10, 100);
             prog.item_done("one");
         }
-        assert!(matches!(store.lock().unwrap().last(), Some(ProgressEvent::PhaseEnd {
-            phase: Phase::ScanTarget,
-            status: PhaseStatus::Failed,
-            items_done: 1,
-            ..
-        })));
+        assert!(matches!(
+            store.lock().unwrap().last(),
+            Some(ProgressEvent::PhaseEnd {
+                phase: Phase::ScanTarget,
+                status: PhaseStatus::Failed,
+                items_done: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -545,11 +625,14 @@ mod tests {
 
         let err = prog.finish().unwrap_err();
         assert!(is_cancelled(&err));
-        assert!(matches!(store.lock().unwrap().last(), Some(ProgressEvent::PhaseEnd {
-            phase: Phase::ScanSource,
-            status: PhaseStatus::Cancelled,
-            ..
-        })));
+        assert!(matches!(
+            store.lock().unwrap().last(),
+            Some(ProgressEvent::PhaseEnd {
+                phase: Phase::ScanSource,
+                status: PhaseStatus::Cancelled,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -575,12 +658,17 @@ mod tests {
         progress.finish().unwrap();
 
         let events = events.lock().unwrap();
-        assert!(!events.iter().any(|event| matches!(event, ProgressEvent::Progress { .. })));
-        assert!(matches!(events.last(), Some(ProgressEvent::PhaseEnd {
-            items_done: 2,
-            bytes_done: 300,
-            status: PhaseStatus::Completed,
-            ..
-        })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::Progress { .. })));
+        assert!(matches!(
+            events.last(),
+            Some(ProgressEvent::PhaseEnd {
+                items_done: 2,
+                bytes_done: 300,
+                status: PhaseStatus::Completed,
+                ..
+            })
+        ));
     }
 }

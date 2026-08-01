@@ -41,7 +41,10 @@ pub fn passphrase_account(keyfile: &std::path::Path) -> String {
 
 fn entry(account: &str) -> VfsResult<keyring::Entry> {
     keyring::Entry::new(SERVICE, account).map_err(|e| {
-        VfsError::new(VfsErrorKind::Io, format!("credential store unavailable: {e}"))
+        VfsError::new(
+            VfsErrorKind::Io,
+            format!("credential store unavailable: {e}"),
+        )
     })
 }
 
@@ -59,9 +62,12 @@ pub fn get_secret(account: &str) -> VfsResult<Option<String>> {
 }
 
 pub fn set_secret(account: &str, secret: &str) -> VfsResult<()> {
-    entry(account)?
-        .set_password(secret)
-        .map_err(|e| VfsError::new(VfsErrorKind::Io, format!("credential store write failed for '{account}': {e}")))?;
+    entry(account)?.set_password(secret).map_err(|e| {
+        VfsError::new(
+            VfsErrorKind::Io,
+            format!("credential store write failed for '{account}': {e}"),
+        )
+    })?;
     index_add(account);
     Ok(())
 }
@@ -90,7 +96,12 @@ fn index_file() -> std::path::PathBuf {
 
 pub fn list_accounts() -> Vec<String> {
     std::fs::read_to_string(index_file())
-        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -115,7 +126,10 @@ fn index_add(account: &str) {
 }
 
 fn index_remove(account: &str) {
-    let v: Vec<String> = list_accounts().into_iter().filter(|a| a != account).collect();
+    let v: Vec<String> = list_accounts()
+        .into_iter()
+        .filter(|a| a != account)
+        .collect();
     write_index(v);
 }
 

@@ -158,8 +158,15 @@ impl Transcript {
         Arc::new(move |ev: crate::model::event::ProgressEvent| {
             use crate::model::event::{LogLevel, ProgressEvent as E};
             let line = match ev {
-                E::Error { action, message, .. } => Some(format!("error[{action}] {message}")),
-                E::Log { level, scope, message, .. } => match level {
+                E::Error {
+                    action, message, ..
+                } => Some(format!("error[{action}] {message}")),
+                E::Log {
+                    level,
+                    scope,
+                    message,
+                    ..
+                } => match level {
                     LogLevel::Info => None,
                     _ => Some(format!("{level:?}[{scope}] {message}")),
                 },
@@ -222,7 +229,11 @@ pub fn bare_job() -> Job {
 
 /// Run every case in `cases::ALL` against one lane.
 pub fn run_all(lane: &str, mk: Roots<'_>) -> Report {
-    let mut rep = Report { lane: lane.to_string(), ran: Vec::new(), skipped: Vec::new() };
+    let mut rep = Report {
+        lane: lane.to_string(),
+        ran: Vec::new(),
+        skipped: Vec::new(),
+    };
     for c in cases::ALL {
         match run_case(lane, c, mk) {
             Outcome::Ran => rep.ran.push(c.name),
@@ -252,7 +263,11 @@ pub fn run_case(lane: &str, case: &Case, mk: Roots<'_>) -> Outcome {
     corpus::prune_empty_dirs(&sv, "");
     corpus::prune_empty_dirs(&tv, "");
 
-    let mut job = Job { mode: case.mode.into(), rigor: case.rigor.into(), ..bare_job() };
+    let mut job = Job {
+        mode: case.mode.into(),
+        rigor: case.rigor.into(),
+        ..bare_job()
+    };
     // A `Need` is two statements in one: what the backends must support, and what the job must
     // therefore ask for. Recording symlinks and comparing mode bits are both off by default, so a
     // case needing the capability needs the setting too — deriving it here keeps the two from being
@@ -284,8 +299,11 @@ pub fn run_case(lane: &str, case: &Case, mk: Roots<'_>) -> Outcome {
     // A per-case batch directory rather than the shared store: this suite runs alongside the rest of
     // the test binary, so it must not write into the developer's real trash, and two cases must
     // never see each other's preserved originals.
-    let trash = std::env::temp_dir()
-        .join(format!("syncdash-e2e-trash-{}-{lane}-{}", std::process::id(), case.name));
+    let trash = std::env::temp_dir().join(format!(
+        "syncdash-e2e-trash-{}-{lane}-{}",
+        std::process::id(),
+        case.name
+    ));
     let _ = std::fs::remove_dir_all(&trash);
 
     let ap = super::local::apply_resolved(
@@ -301,7 +319,13 @@ pub fn run_case(lane: &str, case: &Case, mk: Roots<'_>) -> Outcome {
         std::time::Instant::now(),
         &ctx,
     );
-    assert_eq!(ap.errors, 0, "{what}: apply reported {} error(s)\n{}", ap.errors, said.text());
+    assert_eq!(
+        ap.errors,
+        0,
+        "{what}: apply reported {} error(s)\n{}",
+        ap.errors,
+        said.text()
+    );
     assert!(!ap.cancelled, "{what}: apply reported itself cancelled");
 
     match case.expect.bytes {
@@ -318,7 +342,12 @@ pub fn run_case(lane: &str, case: &Case, mk: Roots<'_>) -> Outcome {
     }
 
     let preserved = preserved_of(&tv, &trash);
-    let want: Vec<String> = case.expect.preserved.iter().map(|s| s.to_string()).collect();
+    let want: Vec<String> = case
+        .expect
+        .preserved
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     assert_eq!(preserved, want, "{what}: preserved originals differ");
     let _ = std::fs::remove_dir_all(&trash);
 
@@ -402,10 +431,16 @@ fn preserved_of(v: &Arc<dyn Vfs>, trash: &std::path::Path) -> Vec<String> {
 /// The explicit trash batch directory lives on the real filesystem regardless of what the roots
 /// are, so it is walked with `std::fs` rather than through a `Vfs`.
 fn collect_fs(dir: &std::path::Path, rel: &str, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let child = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        let child = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
         if e.path().is_dir() {
             collect_fs(&e.path(), &child, out);
         } else {
@@ -418,7 +453,11 @@ fn collect_vfs(v: &Arc<dyn Vfs>, abs: &str, rel: &str, out: &mut Vec<String>) {
     let Ok(entries) = v.read_dir(abs) else { return };
     for e in entries {
         let child_abs = format!("{abs}/{}", e.name);
-        let child_rel = if rel.is_empty() { e.name.clone() } else { format!("{rel}/{}", e.name) };
+        let child_rel = if rel.is_empty() {
+            e.name.clone()
+        } else {
+            format!("{rel}/{}", e.name)
+        };
         if e.meta.kind == crate::model::table::EntryKind::Dir {
             collect_vfs(v, &child_abs, &child_rel, out);
         } else {

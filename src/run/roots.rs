@@ -3,8 +3,6 @@
 //! Every entry point resolves both roots before doing anything else, so an auth failure or an
 //! unreachable host surfaces here rather than half way through a scan.
 
-
-
 /// Open + connect a root phrase to a live backend (a plain local path resolves to `LocalVfs`).
 ///
 /// Connecting here rather than lazily is the point: a protocol root's authentication and reachability

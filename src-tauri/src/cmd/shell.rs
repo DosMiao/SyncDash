@@ -22,12 +22,23 @@ pub fn reveal(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg("-R").arg(p).spawn().map_err(|e| e.to_string())?;
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(p)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let dir = if p.is_dir() { p } else { p.parent().unwrap_or(p) };
-        std::process::Command::new("xdg-open").arg(dir).spawn().map_err(|e| e.to_string())?;
+        let dir = if p.is_dir() {
+            p
+        } else {
+            p.parent().unwrap_or(p)
+        };
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -38,7 +49,10 @@ pub fn post_sync_action(kind: String) -> Result<(), String> {
     #[cfg(windows)]
     let (prog, args): (&str, Vec<&str>) = {
         match kind.as_str() {
-            "sleep" => ("rundll32.exe", vec!["powrprof.dll,SetSuspendState", "0,1,0"]),
+            "sleep" => (
+                "rundll32.exe",
+                vec!["powrprof.dll,SetSuspendState", "0,1,0"],
+            ),
             "shutdown" => ("shutdown", vec!["/s", "/t", "5"]),
             _ => return Err(format!("Unknown post-sync action: {kind}")),
         }
@@ -47,7 +61,10 @@ pub fn post_sync_action(kind: String) -> Result<(), String> {
     let (prog, args): (&str, Vec<&str>) = {
         match kind.as_str() {
             "sleep" => ("pmset", vec!["sleepnow"]),
-            "shutdown" => ("osascript", vec!["-e", "tell application \"System Events\" to shut down"]),
+            "shutdown" => (
+                "osascript",
+                vec!["-e", "tell application \"System Events\" to shut down"],
+            ),
             _ => return Err(format!("Unknown post-sync action: {kind}")),
         }
     };
@@ -59,7 +76,11 @@ pub fn post_sync_action(kind: String) -> Result<(), String> {
             _ => return Err(format!("Unknown post-sync action: {kind}")),
         }
     };
-    std::process::Command::new(prog).args(&args).spawn().map(|_| ()).map_err(|e| e.to_string())
+    std::process::Command::new(prog)
+        .args(&args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Open (or focus) the standalone progress sub-window (Synchronize only; compare progress is shown inline in the main window).
@@ -107,12 +128,16 @@ async fn prepare_progress_window(app: &tauri::AppHandle, launch_id: u64) -> Resu
         let mounted_listener = app.once("progress-window-mounted", move |_| {
             let _ = mounted_tx.send(());
         });
-        let built = tauri::WebviewWindowBuilder::new(app, "progress", tauri::WebviewUrl::App("progress.html".into()))
-            .title("SyncDash — Run")
-            .inner_size(620.0, 500.0)
-            .min_inner_size(440.0, 380.0)
-            .build()
-            .map_err(|e| e.to_string());
+        let built = tauri::WebviewWindowBuilder::new(
+            app,
+            "progress",
+            tauri::WebviewUrl::App("progress.html".into()),
+        )
+        .title("SyncDash — Run")
+        .inner_size(620.0, 500.0)
+        .min_inner_size(440.0, 380.0)
+        .build()
+        .map_err(|e| e.to_string());
         let window = match built {
             Ok(window) => window,
             Err(e) => {

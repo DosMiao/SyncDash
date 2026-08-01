@@ -108,7 +108,15 @@ pub(super) fn scan_impl(
     ctxp: Option<(&crate::obs::progress::RunCtx, crate::model::event::Phase)>,
     max_parallel_streams: usize,
 ) -> std::io::Result<Snapshot> {
-    let pp = ctxp.map(|(ctx, phase)| crate::obs::progress::PhaseProgress::begin(ctx, phase, Some(root.to_string_lossy().into_owned()), 0, 0));
+    let pp = ctxp.map(|(ctx, phase)| {
+        crate::obs::progress::PhaseProgress::begin(
+            ctx,
+            phase,
+            Some(root.to_string_lossy().into_owned()),
+            0,
+            0,
+        )
+    });
     let side = match ctxp.map(|(_, ph)| ph) {
         Some(crate::model::event::Phase::ScanTarget) => "target",
         _ => "source",
@@ -150,7 +158,8 @@ pub(super) fn scan_impl(
     // gives the same MAX_PATH immunity without inventing an unreadable spelling. If it fails we walk
     // the root as given: std applies the long-path prefix internally anyway.
     #[cfg(windows)]
-    let walk_root: std::path::PathBuf = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let walk_root: std::path::PathBuf =
+        std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     #[cfg(not(windows))]
     let walk_root: std::path::PathBuf = root.to_path_buf();
 
@@ -192,7 +201,18 @@ pub(super) fn scan_impl(
             WalkKind::Dir => {
                 let rel = item.rel;
                 if opt.filter.pass_dir(&rel).0 {
-                    entries.push(Entry { path: rel, kind: EntryKind::Dir, size: 0, mtime_ms: item.mtime_ms, hash: None, hash_failed: false, file_id: None, mode: None, link: None, prev: None });
+                    entries.push(Entry {
+                        path: rel,
+                        kind: EntryKind::Dir,
+                        size: 0,
+                        mtime_ms: item.mtime_ms,
+                        hash: None,
+                        hash_failed: false,
+                        file_id: None,
+                        mode: None,
+                        link: None,
+                        prev: None,
+                    });
                 }
             }
             WalkKind::Symlink => {
@@ -200,8 +220,21 @@ pub(super) fn scan_impl(
                     skipped_symlinks += 1;
                 }
                 if opt.symlinks_direct {
-                    let target = std::fs::read_link(&item.abs).ok().map(|t| t.to_string_lossy().into_owned());
-                    entries.push(Entry { path: item.rel, kind: EntryKind::Symlink, size: 0, mtime_ms: item.mtime_ms, hash: None, hash_failed: false, file_id: None, mode: None, link: target, prev: None });
+                    let target = std::fs::read_link(&item.abs)
+                        .ok()
+                        .map(|t| t.to_string_lossy().into_owned());
+                    entries.push(Entry {
+                        path: item.rel,
+                        kind: EntryKind::Symlink,
+                        size: 0,
+                        mtime_ms: item.mtime_ms,
+                        hash: None,
+                        hash_failed: false,
+                        file_id: None,
+                        mode: None,
+                        link: target,
+                        prev: None,
+                    });
                 }
             }
             WalkKind::File => {
@@ -315,13 +348,19 @@ pub(super) fn scan_impl(
     // The item counter shifts gears: during the walk it counts "how many were found", during hashing it restarts from zero counting "how many are done"
     // —— otherwise the UI would sit at N/N from the very start of hashing.
     let bytes_to_hash: u64 = if opt.hash {
-        pending.iter().filter(|p| p.hash.is_none()).map(|p| effective_read(p.size, opt.sampled)).sum()
+        pending
+            .iter()
+            .filter(|p| p.hash.is_none())
+            .map(|p| effective_read(p.size, opt.sampled))
+            .sum()
     } else {
         0
     };
     let legacy_progress_totals = (pending.len() as u64, bytes_to_hash);
     metrics.workers = if opt.hash {
-        max_parallel_streams.max(1).min(rayon::current_num_threads())
+        max_parallel_streams
+            .max(1)
+            .min(rayon::current_num_threads())
     } else {
         0
     };
@@ -351,14 +390,26 @@ pub(super) fn scan_impl(
                     .thread_name(|index| format!("sd-scan-{index}"))
                     .start_handler(|_| crate::foundation::thread::lower_priority())
                     .build()
-                    .map_err(|error| std::io::Error::other(format!("cannot build {width}-thread scan pool: {error}")))?,
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "cannot build {width}-thread scan pool: {error}"
+                        ))
+                    })?,
             )
         } else {
             None
         };
 
         if let Some(cb) = progress {
-            cb(ScanProgress { phase: "hash", files_done: 0, files_total, bytes_total, bytes_done: 0, mib_per_s: 0.0, complete: false });
+            cb(ScanProgress {
+                phase: "hash",
+                files_done: 0,
+                files_total,
+                bytes_total,
+                bytes_done: 0,
+                mib_per_s: 0.0,
+                complete: false,
+            });
         }
 
         // Progress sampling gets a thread of its own (same structure as syncthing's ProgressTicker):
@@ -372,7 +423,15 @@ pub(super) fn scan_impl(
                         let done_files = fd.load(Ordering::Relaxed);
                         let done = bd.load(Ordering::Relaxed);
                         let secs = t_start.elapsed().as_secs_f64().max(0.001);
-                        cb(ScanProgress { phase: "hash", files_done: done_files, files_total, bytes_total, bytes_done: done, mib_per_s: done as f64 / secs / (1024.0 * 1024.0), complete: false });
+                        cb(ScanProgress {
+                            phase: "hash",
+                            files_done: done_files,
+                            files_total,
+                            bytes_total,
+                            bytes_done: done,
+                            mib_per_s: done as f64 / secs / (1024.0 * 1024.0),
+                            complete: false,
+                        });
                     }
                 });
                 stop_tx
@@ -462,9 +521,7 @@ pub(super) fn scan_impl(
                             let current_mt = metadata
                                 .modified()
                                 .ok()
-                                .and_then(|time| {
-                                    time.duration_since(std::time::UNIX_EPOCH).ok()
-                                })
+                                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                                 .map(|duration| duration.as_millis() as i64)
                                 .unwrap_or(0);
                             if metadata.len() != p.size || current_mt != p.raw_mt {
@@ -503,25 +560,30 @@ pub(super) fn scan_impl(
         if let Some(pp) = &pp {
             pp.checkpoint()?; // when the cancellation happened during hashing, this is where we honestly return Interrupted
         }
-
     }
     metrics.hash_ms = measured.elapsed().as_millis() as u64;
     metrics.read_bytes = bytes_done.load(Ordering::Relaxed);
     let measured = std::time::Instant::now();
     for p in pending {
-        entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, hash_failed: p.hash_failed, file_id: p.file_id, mode: p.mode, link: None, prev: None });
+        entries.push(Entry {
+            path: p.rel,
+            kind: EntryKind::File,
+            size: p.size,
+            mtime_ms: p.mt,
+            hash: p.hash,
+            hash_failed: p.hash_failed,
+            file_id: p.file_id,
+            mode: p.mode,
+            link: None,
+            prev: None,
+        });
     }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     metrics.finalize_ms = measured.elapsed().as_millis() as u64;
     let measured = std::time::Instant::now();
     if opt.hash {
-        if crate::store::hashcache::save_local(
-            &local_state,
-            &entries,
-            coverage,
-            &retain_absent,
-        )
+        if crate::store::hashcache::save_local(&local_state, &entries, coverage, &retain_absent)
             == crate::store::StateWriteStatus::Failed
         {
             metrics.state_failures += 1;
@@ -541,7 +603,10 @@ pub(super) fn scan_impl(
     metrics.state_write_ms = measured.elapsed().as_millis() as u64;
     hash_errors += hash_err_count.load(std::sync::atomic::Ordering::Relaxed);
     if hash_errors > 0 {
-        crate::log_warn!("scan", "warning: {hash_errors} file(s) could not be hashed (in use / unreadable)");
+        crate::log_warn!(
+            "scan",
+            "warning: {hash_errors} file(s) could not be hashed (in use / unreadable)"
+        );
     }
 
     let snapshot = Snapshot {
@@ -606,7 +671,8 @@ mod tests {
 
     #[test]
     fn full_hash_reuses_the_worker_buffer_across_files() {
-        let root = std::env::temp_dir().join(format!("syncdash-hash-buffer-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("syncdash-hash-buffer-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let large = vec![17u8; 64 * 1024];
@@ -617,27 +683,21 @@ mod tests {
         std::fs::write(&small_path, &small).unwrap();
 
         let mut buf = Vec::new();
-        let first = full_hash_with_buffer(
-            &large_path,
-            large.len() as u64,
-            &mut buf,
-            || Ok(()),
-            |_| {},
-        )
-        .unwrap();
+        let first =
+            full_hash_with_buffer(&large_path, large.len() as u64, &mut buf, || Ok(()), |_| {})
+                .unwrap();
         assert_eq!(first, blake3::hash(&large).to_hex().to_string());
         let capacity = buf.capacity();
 
-        let second = full_hash_with_buffer(
-            &small_path,
-            small.len() as u64,
-            &mut buf,
-            || Ok(()),
-            |_| {},
-        )
-        .unwrap();
+        let second =
+            full_hash_with_buffer(&small_path, small.len() as u64, &mut buf, || Ok(()), |_| {})
+                .unwrap();
         assert_eq!(second, blake3::hash(&small).to_hex().to_string());
-        assert_eq!(buf.capacity(), capacity, "the next file must reuse rather than replace the worker allocation");
+        assert_eq!(
+            buf.capacity(),
+            capacity,
+            "the next file must reuse rather than replace the worker allocation"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -668,7 +728,8 @@ mod tests {
 
     #[test]
     fn zero_byte_progress_has_one_explicit_completion_boundary() {
-        let root = std::env::temp_dir().join(format!("syncdash-zero-progress-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("syncdash-zero-progress-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         for index in 0..8 {
@@ -681,17 +742,17 @@ mod tests {
             if progress.complete {
                 let state = crate::store::localid::LocalScanStateIdentity::for_root(&root);
                 let cache = crate::store::hashcache::load_local(&state);
-                state_ready_at_completion.store(
-                    cache.len() == 8,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                state_ready_at_completion
+                    .store(cache.len() == 8, std::sync::atomic::Ordering::Relaxed);
             }
             events.lock().unwrap().push(progress);
         };
         scan_with_progress(&root, &opts(), Some(&collect)).unwrap();
         let events = events.into_inner().unwrap();
         assert!(events.len() >= 2);
-        assert!(events[..events.len() - 1].iter().all(|progress| !progress.complete));
+        assert!(events[..events.len() - 1]
+            .iter()
+            .all(|progress| !progress.complete));
         let final_event = events.last().unwrap();
         assert!(final_event.complete);
         assert_eq!(final_event.files_done, 8);
@@ -843,15 +904,29 @@ mod tests {
             use std::os::unix::ffi::OsStringExt;
             std::ffi::OsString::from_vec(vec![b'b', 0xFF, b'c'])
         };
-        assert!(bad.to_str().is_none(), "premise: the name is not valid Unicode");
+        assert!(
+            bad.to_str().is_none(),
+            "premise: the name is not valid Unicode"
+        );
         if std::fs::write(root.join(&bad), b"x").is_err() {
             let _ = std::fs::remove_dir_all(&root);
             return; // this filesystem refuses the name outright, which is also fine
         }
 
-        let snap = scan(&root, &ScanOptions { hash: false, ..opts() }).unwrap();
+        let snap = scan(
+            &root,
+            &ScanOptions {
+                hash: false,
+                ..opts()
+            },
+        )
+        .unwrap();
         let paths: Vec<&str> = snap.entries.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, vec!["good.txt"], "the unrepresentable name must not enter the table");
+        assert_eq!(
+            paths,
+            vec!["good.txt"],
+            "the unrepresentable name must not enter the table"
+        );
         assert!(!paths.iter().any(|p| p.contains('\u{FFFD}')), "a substituted spelling is worse than an omission: it points at a file that does not exist");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -870,13 +945,42 @@ mod tests {
             std::fs::write(root.join(format!("f{i}.txt")), b"x").unwrap();
         }
         let base = root.to_string_lossy().into_owned();
-        let baseline = scan(&root, &ScanOptions { hash: false, ..opts() }).unwrap().entries.len();
+        let baseline = scan(
+            &root,
+            &ScanOptions {
+                hash: false,
+                ..opts()
+            },
+        )
+        .unwrap()
+        .entries
+        .len();
         assert_eq!(baseline, 6, "5 files + 1 dir");
 
-        let spellings = [base.replace('\\', "/"), format!("{base}{}sub{}..", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR), format!("{base}{}", std::path::MAIN_SEPARATOR), format!("{base}{}.", std::path::MAIN_SEPARATOR)];
+        let spellings = [
+            base.replace('\\', "/"),
+            format!(
+                "{base}{}sub{}..",
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR
+            ),
+            format!("{base}{}", std::path::MAIN_SEPARATOR),
+            format!("{base}{}.", std::path::MAIN_SEPARATOR),
+        ];
         for s in spellings {
-            let got = scan(Path::new(&s), &ScanOptions { hash: false, ..opts() }).unwrap_or_else(|e| panic!("scanning {s:?} failed: {e}"));
-            assert_eq!(got.entries.len(), baseline, "{s:?} names the same directory and must produce the same table");
+            let got = scan(
+                Path::new(&s),
+                &ScanOptions {
+                    hash: false,
+                    ..opts()
+                },
+            )
+            .unwrap_or_else(|e| panic!("scanning {s:?} failed: {e}"));
+            assert_eq!(
+                got.entries.len(),
+                baseline,
+                "{s:?} names the same directory and must produce the same table"
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -887,9 +991,22 @@ mod tests {
     fn an_unreadable_root_is_an_error_not_an_empty_table() {
         let missing = std::env::temp_dir().join(format!("syncdash-absent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
-        match scan(&missing, &ScanOptions { hash: false, ..opts() }) {
-            Ok(s) => panic!("a missing root scanned as a {}-entry tree instead of erroring", s.entries.len()),
-            Err(e) => assert!(e.to_string().contains("refusing to report it as an empty tree"), "{e}"),
+        match scan(
+            &missing,
+            &ScanOptions {
+                hash: false,
+                ..opts()
+            },
+        ) {
+            Ok(s) => panic!(
+                "a missing root scanned as a {}-entry tree instead of erroring",
+                s.entries.len()
+            ),
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("refusing to report it as an empty tree"),
+                "{e}"
+            ),
         }
     }
 }

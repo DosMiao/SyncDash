@@ -73,8 +73,17 @@ pub(super) struct SmbRead {
 }
 
 impl SmbRead {
-    pub(super) fn new(rt: tokio::runtime::Handle, timeout: Duration, reader: FileReader) -> SmbRead {
-        SmbRead { rt, timeout, reader: Some(reader), pos: 0 }
+    pub(super) fn new(
+        rt: tokio::runtime::Handle,
+        timeout: Duration,
+        reader: FileReader,
+    ) -> SmbRead {
+        SmbRead {
+            rt,
+            timeout,
+            reader: Some(reader),
+            pos: 0,
+        }
     }
 }
 
@@ -85,7 +94,10 @@ impl std::io::Read for SmbRead {
         };
         let (pos, len) = (self.pos, buf.len() as u64);
         let got = block_on(&self.rt, self.timeout, "read", async move {
-            reader.read_at(pos, len).await.map_err(|e| map_smb_err("read", e))
+            reader
+                .read_at(pos, len)
+                .await
+                .map_err(|e| map_smb_err("read", e))
         })?;
         buf[..got.len()].copy_from_slice(&got);
         self.pos += got.len() as u64;
@@ -146,7 +158,9 @@ impl SmbStaged {
         };
         let (tree, mut conn) = (self.tree.clone(), self.conn.clone());
         self.block("close staged handle", async move {
-            tree.close_handle(&mut conn, file_id).await.map_err(|e| map_smb_err("close", e))
+            tree.close_handle(&mut conn, file_id)
+                .await
+                .map_err(|e| map_smb_err("close", e))
         })
     }
 }
@@ -242,7 +256,9 @@ impl WriteStaged for SmbStaged {
         let (tree, mut conn) = (self.tree.clone(), self.conn.clone());
         let p = self.tmp_share_rel.clone();
         let info = self.block("staged_len", async move {
-            tree.stat(&mut conn, &p).await.map_err(|e| map_smb_err("staged_len", e))
+            tree.stat(&mut conn, &p)
+                .await
+                .map_err(|e| map_smb_err("staged_len", e))
         })?;
         Ok(info.size)
     }
@@ -255,7 +271,11 @@ impl WriteStaged for SmbStaged {
                 .await
                 .map_err(|e| map_smb_err("open staged for read-back", e))
         })?;
-        Ok(Box::new(SmbRead::new(self.rt.clone(), self.timeout, reader)))
+        Ok(Box::new(SmbRead::new(
+            self.rt.clone(),
+            self.timeout,
+            reader,
+        )))
     }
 
     fn commit(mut self: Box<Self>) -> VfsResult<CommitReport> {
@@ -268,7 +288,9 @@ impl WriteStaged for SmbStaged {
             let (tree, mut conn) = (self.tree.clone(), self.conn.clone());
             let dst = self.dst_share_rel.clone();
             match self.block("clear destination", async move {
-                tree.delete_file(&mut conn, &dst).await.map_err(|e| map_smb_err("clear destination", e))
+                tree.delete_file(&mut conn, &dst)
+                    .await
+                    .map_err(|e| map_smb_err("clear destination", e))
             }) {
                 Ok(()) => {}
                 Err(e) if e.kind == VfsErrorKind::NotFound => {}
@@ -279,7 +301,9 @@ impl WriteStaged for SmbStaged {
             let (tree, mut conn) = (self.tree.clone(), self.conn.clone());
             let (t, dst) = (self.tmp_share_rel.clone(), self.dst_share_rel.clone());
             self.block("rename into place", async move {
-                tree.rename(&mut conn, &t, &dst).await.map_err(|e| map_smb_err("rename into place", e))
+                tree.rename(&mut conn, &t, &dst)
+                    .await
+                    .map_err(|e| map_smb_err("rename into place", e))
             })?;
         }
         self.committed = true;
@@ -298,9 +322,12 @@ impl WriteStaged for SmbStaged {
                     let (tree, mut conn) = (self.tree.clone(), self.conn.clone());
                     let dst = self.dst_share_rel.clone();
                     if let Ok(i) = self.block("stat back", async move {
-                        tree.stat(&mut conn, &dst).await.map_err(|e| map_smb_err("stat back", e))
+                        tree.stat(&mut conn, &dst)
+                            .await
+                            .map_err(|e| map_smb_err("stat back", e))
                     }) {
-                        report.mtime_ondisk_ms = Some(basic_info::unix_ms_from_filetime(i.modified.0));
+                        report.mtime_ondisk_ms =
+                            Some(basic_info::unix_ms_from_filetime(i.modified.0));
                     }
                 }
                 Err(e) => report.mtime_error = Some(e),
@@ -322,7 +349,9 @@ impl Drop for SmbStaged {
         let (tree, mut conn) = (self.tree.clone(), self.conn.clone());
         let p = self.tmp_share_rel.clone();
         let _ = self.block("remove abandoned staged file", async move {
-            tree.delete_file(&mut conn, &p).await.map_err(|e| map_smb_err("remove staged", e))
+            tree.delete_file(&mut conn, &p)
+                .await
+                .map_err(|e| map_smb_err("remove staged", e))
         });
     }
 }
