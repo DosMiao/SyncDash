@@ -7,8 +7,10 @@ import type { ApplyDto } from './types/generated/ApplyDto';
 import type { AppSettings } from './types/generated/AppSettings';
 import type { CompareOwner } from './types/generated/CompareOwner';
 import type { Job as JobFull } from './types/generated/Job';
+import type { JobDetailDto } from './types/generated/JobDetailDto';
 import type { JobDto } from './types/generated/JobDto';
 import type { JobFileSchemaDto } from './types/generated/JobFileSchemaDto';
+import type { JobSaveDto } from './types/generated/JobSaveDto';
 import type { JunkPresetDto } from './types/generated/JunkPresetDto';
 import type { MigrateReport } from './types/generated/MigrateReport';
 import type { PathVerdict } from './types/generated/PathVerdict';
@@ -20,23 +22,32 @@ import type { SamePage } from './types/generated/SamePage';
 import type { SameRow } from './types/generated/SameRow';
 import type { SelectedRowDto } from './types/generated/SelectedRowDto';
 
-export type { JobFull, JunkPresetDto };
+export type { JobDetailDto, JobFull, JobSaveDto, JunkPresetDto };
 
 export type { SameRow, SamePage };
 
 // Jobs
 
 export const listJobs = () => invoke<JobDto[]>('list_jobs');
-export const getJob = (name: string) => invoke<JobFull>('get_job', { name });
+export const getJob = (name: string) => invoke<JobDetailDto>('get_job', { name });
 /// What a new job starts from, straight from the engine's `Job::default()` — junk presets already
 /// materialized into `exclude`. Never mirrored in TypeScript: a second copy of engine policy drifts.
 export const defaultJob = () => invoke<JobFull>('default_job');
 /// The schema in the job file on disk, against the one this build writes. `getJob` returns the migrated
 /// job, so this is the only way to tell that the exclude lines on screen are not in the file yet.
 export const jobFileSchema = (name: string) => invoke<JobFileSchemaDto>('job_file_schema', { name });
-/// Returns the canonical revision of the effective configuration that was written.
-export const saveJob = (name: string, job: JobFull) => invoke<string>('save_job', { name, job });
-export const deleteJob = (name: string) => invoke<void>('delete_job', { name });
+export interface ExistingJobRevision {
+  originalName: string;
+  expectedRevision: string;
+}
+
+export const saveJob = (name: string, job: JobFull, existing?: ExistingJobRevision) => invoke<JobSaveDto>('save_job', {
+  name,
+  job,
+  originalName: existing?.originalName,
+  expectedRevision: existing?.expectedRevision,
+});
+export const deleteJob = (name: string, expectedRevision: string) => invoke<void>('delete_job', { name, expectedRevision });
 export const jobsDir = () => invoke<string>('jobs_dir');
 
 // Compare / run
@@ -87,8 +98,8 @@ export const applyJobUnattended = (name: string, plan: PlanDto, selected: Select
 export const preflight = (name: string, plan: PlanDto, selected: SelectedRowDto[], acknowledged: boolean, targetIndex: number) =>
   invoke<PreflightDto>('preflight', { name, plan, selected, acknowledged, targetIndex });
 
-export const cancelRun = () => invoke<boolean>('cancel_run');
-export const pauseRun = (paused: boolean) => invoke<void>('pause_run', { paused });
+export const cancelRun = (runId: number) => invoke<boolean>('cancel_run', { runId });
+export const pauseRun = (runId: number, paused: boolean) => invoke<boolean>('pause_run', { runId, paused });
 export const openProgressWindow = () => invoke<number>('open_progress_window');
 export const cancelProgressLaunch = (launchId: number) => invoke<boolean>('cancel_progress_launch', { launchId });
 export const closeProgressLaunch = () => invoke<'pending' | 'active' | 'none'>('close_progress_launch');

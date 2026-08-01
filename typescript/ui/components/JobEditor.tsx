@@ -34,6 +34,7 @@ interface Props {
   onClose: () => void;
   onSaved: (name: string, job: JobFull, configRevision: string) => void;
   onDeleted: (name: string) => void;
+  onMutationConflict: (name: string) => Promise<void>;
   onStatus: (msg: string, cls?: '' | 'err' | 'ok') => void;
 }
 
@@ -41,12 +42,20 @@ interface Props {
 /// every field ED_FIELDS does not surface rides back out from here on save. It is one state and not two
 /// so the two halves cannot drift apart or arrive separately — a save that found values but no base
 /// would have to bail out silently, and a silent no-op on the Save button is the worst kind of dead end.
-interface Loaded { base: JobFull; values: FormValues }
+interface Loaded {
+  base: JobFull;
+  values: FormValues;
+  originalName: string | null;
+  configRevision: string | null;
+}
 
 interface SaveError { message: string; field?: string }
 
 export function JobEditor(props: Props) {
-  const { name, focusGroup, dropOn, scopeRef, apiRef, busy, onClose, onSaved, onDeleted, onStatus } = props;
+  const {
+    name, focusGroup, dropOn, scopeRef, apiRef, busy, onClose, onSaved, onDeleted,
+    onMutationConflict, onStatus,
+  } = props;
   const [form, setForm] = useState<Loaded | null>(null);
   /// Set when the file on disk predates the current job schema, i.e. the exclude lines on screen were
   /// produced by the load-time migration and are not in the file yet
@@ -102,9 +111,18 @@ export function JobEditor(props: Props) {
     let live = true;
     const load = async () => {
       let j: JobFull;
+      let originalName: string | null = null;
+      let configRevision: string | null = null;
       try {
         // A new job's starting point is engine policy, so it comes from the engine
-        j = name ? await getJob(name) : await defaultJob();
+        if (name) {
+          const detail = await getJob(name);
+          j = detail.job;
+          originalName = detail.name;
+          configRevision = detail.config_revision;
+        } else {
+          j = await defaultJob();
+        }
       } catch (e) {
         onStatus(`Failed to read job: ${e}`, 'err');
         onClose();
@@ -113,7 +131,12 @@ export function JobEditor(props: Props) {
       if (!live) return;
       // The rigor detail knobs may be null in an older file (meaning "follow the preset"); the form
       // materializes all four and writes them explicitly on save
-      setForm({ base: j, values: jobToForm(applyRigorPresetDefaults(j), name ?? '') });
+      setForm({
+        base: j,
+        values: jobToForm(applyRigorPresetDefaults(j), originalName ?? ''),
+        originalName,
+        configRevision,
+      });
       if (name) {
         jobFileSchema(name)
           .then((s) => { if (live && s.on_disk < s.current) setMigratedFrom(s.on_disk); })
@@ -182,10 +205,19 @@ export function JobEditor(props: Props) {
     setSaveError(null);
     setSaving(true);
     try {
-      const configRevision = await saveJob(c.name, c.job);
-      onSaved(c.name, c.job, configRevision);
+      const existing = form.originalName && form.configRevision
+        ? { originalName: form.originalName, expectedRevision: form.configRevision }
+        : undefined;
+      const saved = await saveJob(c.name, c.job, existing);
+      onSaved(saved.name, c.job, saved.config_revision);
     } catch (e) {
-      const message = `Save failed: ${e}`;
+      let message = `Save failed: ${e}`;
+      try {
+        await onMutationConflict(form.originalName ?? c.name);
+        message += ' · refreshed the job registry; the editor kept your draft and did not overwrite any file';
+      } catch (refreshError) {
+        message += ` · job-registry refresh failed: ${refreshError}`;
+      }
       setSaveError({ message });
       onStatus(message, 'err');
     } finally {
@@ -194,12 +226,19 @@ export function JobEditor(props: Props) {
   };
 
   const remove = async () => {
-    if (!name || busy) return;
+    if (!form?.originalName || !form.configRevision || busy) return;
     try {
-      await deleteJob(name);
-      onDeleted(name);
+      await deleteJob(form.originalName, form.configRevision);
+      onDeleted(form.originalName);
     } catch (e) {
-      onStatus(`Delete failed: ${e}`, 'err');
+      let message = `Delete failed: ${e}`;
+      try {
+        await onMutationConflict(form.originalName);
+        message += ' · refreshed the job registry; no job file was deleted';
+      } catch (refreshError) {
+        message += ` · job-registry refresh failed: ${refreshError}`;
+      }
+      onStatus(message, 'err');
     }
   };
 

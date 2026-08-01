@@ -38,6 +38,13 @@ import {
   targetForSelection,
 } from './state/compare-session';
 import type { CompareSession } from './state/compare-session';
+import {
+  ownsFreshAutoScanResult,
+  preflightAllowsApply,
+  reviewedSetKey,
+} from './state/execution-safety';
+import type { AutoScanTicket } from './state/execution-safety';
+import { RequestFence } from './state/request-fence';
 import { ComparePanel } from './components/ComparePanel';
 import { ScanFaultBanner } from './components/ScanFaultBanner';
 import { ConfirmSheet } from './components/ConfirmSheet';
@@ -76,6 +83,7 @@ interface CtxItem {
 }
 
 interface CtxState { x: number; y: number; items: CtxItem[] }
+interface CompareCompletion { plan: PlanDto; maskHit: boolean[] }
 
 function readHistory(): string[] {
   try { return JSON.parse(localStorage.getItem(HIST_KEY) ?? '[]') as string[]; } catch { return []; }
@@ -96,6 +104,7 @@ export function App() {
   // Compare result
   const [compareSession, setCompareSession] = useState<CompareSession | null>(null);
   const [maskHit, setMaskHit] = useState<boolean[]>([]);
+  const maskRequest = useRef(new RequestFence());
   const [busy, setBusy] = useState(false);
   const syncInFlight = useRef(false);
   /// The user ticked "I confirm this is correct" in the confirm sheet (same as CLI --i-know); reset on every new compare
@@ -117,8 +126,11 @@ export function App() {
   const [editor, setEditor] = useState<{ name: string | null; focusGroup?: string } | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const [confirmReviewKey, setConfirmReviewKey] = useState<string | null>(null);
   const [preflight, setPreflight] = useState<PreflightDto | null>(null);
   const [preflightError, setPreflightError] = useState<string | null>(null);
+  const preflightRequest = useRef(0);
+  const confirmReviewKeyRef = useRef<string | null>(null);
   const [funnelAnchor, setFunnelAnchor] = useState<DOMRect | null>(null);
   const [ctx, setCtx] = useState<CtxState | null>(null);
   const [logOpen, setLogOpen] = useState(false);
@@ -128,7 +140,12 @@ export function App() {
   /// The diff table's scroll container. App renders it, so App owns it and hands it down.
   const [tableWrap, setTableWrap] = useState<HTMLDivElement | null>(null);
   /// Pending root swap, held with the job it read so the confirmation can spell out both roots
-  const [askSwap, setAskSwap] = useState<{ name: string; job: ipc.JobFull } | null>(null);
+  const [askSwap, setAskSwap] = useState<{
+    name: string;
+    job: ipc.JobFull;
+    configRevision: string;
+    targetIndex: number;
+  } | null>(null);
   /// The two regions holding droppable path fields. A ref rather than state: the drag handler is
   /// registered once and reads this at drop time, so state here would only hand it a stale closure.
   const dropScope = useRef<{ editor: HTMLElement | null; path: HTMLElement | null }>({ editor: null, path: null });
@@ -144,10 +161,16 @@ export function App() {
   /// Rate EMA (0.7 old + 0.3 new): the instantaneous rate swings wildly with file size
   const cmpRate = useRef(new Map<string, { t: number; b: number; ema: number }>());
   const cmpRunId = useRef(-1);
+  const cmpRunFloor = useRef(-1);
+  const cmpRunReady = useRef(false);
+  const compareInFlight = useRef(false);
 
   // AutoScan (the job field behind it is watch_interval_secs)
   const [watchSecs, setWatchSecs] = useState<number | null>(null);
   const watchNext = useRef(0);
+  const autoScanEnabled = useRef(false);
+  const autoScanGeneration = useRef(0);
+  const autoScanTicket = useRef<AutoScanTicket | null>(null);
 
   const editorApi = useRef<EditorApi | null>(null);
   const { status, set: setStatus, withUndo: setStatusUndo, runUndo } = useStatus('');
@@ -174,6 +197,14 @@ export function App() {
   ), [plan, flipped, chips, search, ovFilter, vfilter, maskHit]);
 
   const final = useMemo(() => finalIdx(visible, checked), [visible, checked]);
+  const reviewedRows = useMemo(() => (plan ? selectedRows(final, flipped) : []), [plan, final, flipped]);
+  const reviewKey = useMemo(() => (
+    plan && currentJob
+      ? reviewedSetKey(plan.owner, currentJob.name, currentJob.config_revision, selTarget, reviewedRows)
+      : null
+  ), [plan, currentJob, selTarget, reviewedRows]);
+  const currentReviewKeyRef = useRef<string | null>(reviewKey);
+  currentReviewKeyRef.current = reviewKey;
 
   const layout = useMemo(() => (
     plan ? buildLayout({ plan, flipped, visible, grouped, sort }) : EMPTY_LAYOUT
@@ -204,8 +235,8 @@ export function App() {
         case 'move': s.mv++; break;
         case 'delete': case 'delete_dir': s.del++; break;
       }
+      if (flipped[i]) s.flips++;
     }
-    s.flips = flipped.filter(Boolean).length;
     return s;
   }, [plan, final, flipped]);
 
@@ -237,15 +268,43 @@ export function App() {
     ipc.lastSyncs().then(setLastMap).catch(() => { /* missing logs are not fatal */ });
   }, []);
 
-  const resetSafetyUi = useCallback(() => {
+  const reportMutationFailure = useCallback(async (name: string, action: string, error: unknown) => {
+    try {
+      await refreshJobs(name);
+      setStatus(`${action}: ${error} · refreshed the job registry; no unseen changes were overwritten`, 'err');
+    } catch (refreshError) {
+      setStatus(`${action}: ${error} · job-registry refresh failed: ${refreshError}`, 'err');
+    }
+  }, [refreshJobs, setStatus]);
+
+  const resetConfirmation = useCallback(() => {
+    preflightRequest.current += 1;
+    confirmReviewKeyRef.current = null;
     setAcknowledged(false);
     setConfirmOpen(false);
+    setConfirmReviewKey(null);
     setPreflight(null);
     setPreflightError(null);
+  }, []);
+
+  const resetSafetyUi = useCallback(() => {
+    resetConfirmation();
     setSameOpen(false);
     setFunnelAnchor(null);
     setCtx(null);
     setAskSwap(null);
+  }, [resetConfirmation]);
+
+  const clearMasks = useCallback(() => {
+    maskRequest.current.invalidate();
+    setMaskHit([]);
+  }, []);
+
+  const stopAutoScan = useCallback(() => {
+    autoScanEnabled.current = false;
+    autoScanTicket.current = null;
+    autoScanGeneration.current += 1;
+    setWatchSecs(null);
   }, []);
 
   const resetNavigationUi = useCallback(() => {
@@ -256,15 +315,26 @@ export function App() {
     setOvExpanded(new Set());
     setSort(null);
     setVfilter(EMPTY_FILTER);
-    setMaskHit([]);
-  }, [resetSafetyUi]);
+    clearMasks();
+  }, [clearMasks, resetSafetyUi]);
+
+  const previousReviewKey = useRef<string | null>(reviewKey);
+  useEffect(() => {
+    if (previousReviewKey.current === reviewKey) return;
+    previousReviewKey.current = reviewKey;
+    setAcknowledged(false);
+    if (!confirmOpen) return;
+    resetConfirmation();
+    setStatus('The reviewed action set changed — open confirmation again', 'err');
+  }, [reviewKey, confirmOpen, resetConfirmation, setStatus]);
 
   useEffect(() => {
     if (!currentJob || currentJob.targets.length === 0 || selTarget < currentJob.targets.length) return;
     setSelTarget(0);
+    stopAutoScan();
     resetNavigationUi();
     setStatus(`'${currentJob.name}' no longer has target ${selTarget + 1}; selected target 1`);
-  }, [currentJob, selTarget, resetNavigationUi, setStatus]);
+  }, [currentJob, selTarget, resetNavigationUi, stopAutoScan, setStatus]);
 
   const invalidateCompareForJob = useCallback((name: string) => {
     setCompareSession((session) => invalidateJobSession(session, name));
@@ -289,20 +359,29 @@ export function App() {
   /// A new plan means a new row set, so the mask cache is stale; the funnel criteria themselves persist
   /// (watching the same files for several rounds is common)
   const recomputeMasks = useCallback(async (p: PlanDto | null, f: boolean[], masks: string[]) => {
-    if (!p) { setMaskHit([]); return; }
-    if (masks.length === 0) { setMaskHit([]); return; }
+    if (!p || masks.length === 0) { clearMasks(); return []; }
+    const owner = p.owner;
+    const ticket = maskRequest.current.start(`${owner.compare_id}\0${owner.job_name}\0${owner.target_index}\0${owner.config_revision}`);
     try {
-      setMaskHit(await ipc.maskMatch(masks, p.ops.map((_, i) => eff(p, f, i).path)));
+      const hits = await ipc.maskMatch(masks, p.ops.map((_, i) => eff(p, f, i).path));
+      if (!maskRequest.current.owns(ticket)) return;
+      setMaskHit(hits);
+      return hits;
     } catch (e) {
+      if (!maskRequest.current.owns(ticket)) return;
       setMaskHit([]);
       setStatus(`Mask matching failed: ${e}`, 'err');
+      return null;
     }
-  }, [setStatus]);
+  }, [clearMasks, setStatus]);
 
   // Actions
 
-  const doCompare = useCallback(async () => {
-    if (!currentJob || busy || editor) return;
+  const doCompare = useCallback(async (autoTicket?: AutoScanTicket): Promise<CompareCompletion | null> => {
+    if (!currentJob || busy || editor || compareInFlight.current) return null;
+    if (autoTicket && (!autoScanEnabled.current || autoScanTicket.current?.generation !== autoTicket.generation)) return null;
+    if (!autoTicket) autoScanTicket.current = null;
+    compareInFlight.current = true;
     const name = currentJob.name;
     const targetIndex = selTarget;
     resetSafetyUi();
@@ -311,6 +390,8 @@ export function App() {
     setCmpStages([]);
     cmpRate.current.clear();
     setCmpCancelling(false);
+    cmpRunFloor.current = cmpRunId.current;
+    cmpRunReady.current = false;
     setCmpActive(true);
     try {
       const p = await ipc.compareJob(name, targetIndex);
@@ -340,21 +421,23 @@ export function App() {
       if (selectedBeforeRefresh.job?.name === name && !refreshProblem) {
         if (!refreshedJob) {
           setSelTarget(0);
-          setWatchSecs(null);
+          stopAutoScan();
           resetNavigationUi();
           navigationWasReset = true;
         } else if (selectedBeforeRefresh.job.config_revision !== refreshedJob.config_revision) {
+          stopAutoScan();
           resetNavigationUi();
           navigationWasReset = true;
         }
       }
       const visibleHere = ownerMatchesSelection(p.owner, selectedJob, selected.targetIndex);
+      let currentMaskHit: boolean[] | null = [];
       if (visibleHere) {
         // resetNavigationUi cleared both the funnel and maskHit. Replaying masks from this render's
         // stale closure would hide rows behind an apparently empty funnel after an external edit.
-        await recomputeMasks(p, f, navigationWasReset ? [] : vfilter.masks);
+        currentMaskHit = await recomputeMasks(p, f, navigationWasReset ? [] : vfilter.masks) ?? null;
       } else {
-        setMaskHit([]);
+        clearMasks();
       }
       // The counts bar to the right already says what was scanned and what is showing, and the
       // placeholder in the table says "identical" in full — this line only has to say the result
@@ -370,6 +453,7 @@ export function App() {
       } else {
         setStatus(`Compare finished for '${name}', but its job or target changed — the result was not attached to the current view`, 'err');
       }
+      return visibleHere && !refreshProblem && currentMaskHit !== null ? { plan: p, maskHit: currentMaskHit } : null;
     } catch (e) {
       const cancelled = String(e) === 'cancelled';
       let suffix = '';
@@ -385,10 +469,11 @@ export function App() {
         if (selected.job?.name === name) {
           if (!refreshedJob) {
             setSelTarget(0);
-            setWatchSecs(null);
+            stopAutoScan();
             resetNavigationUi();
             suffix = ` · '${name}' is no longer a registered job`;
           } else if (selected.job.config_revision !== refreshedJob.config_revision) {
+            stopAutoScan();
             resetNavigationUi();
             suffix = ' · refreshed the changed job configuration';
           }
@@ -399,14 +484,17 @@ export function App() {
       const base = cancelled ? 'Compare cancelled' : `Compare failed: ${e}`;
       if (refreshProblem) suffix = ` · job-list refresh failed: ${refreshProblem}`;
       setStatus(`${base}${suffix}`, cancelled && !refreshProblem ? '' : 'err');
+      return null;
     } finally {
       setCmpActive(false);
       setBusy(false);
+      cmpRunReady.current = false;
+      compareInFlight.current = false;
     }
-  }, [currentJob, busy, editor, selTarget, vfilter.masks, recomputeMasks, refreshJobs, resetNavigationUi, resetSafetyUi, setStatus]);
+  }, [currentJob, busy, editor, selTarget, vfilter.masks, clearMasks, recomputeMasks, refreshJobs, resetNavigationUi, resetSafetyUi, stopAutoScan, setStatus]);
 
   const openConfirm = useCallback(async () => {
-    if (!currentJob || !plan || busy) return;
+    if (!currentJob || !plan || !reviewKey || busy) return;
     const hiddenChecked = checked.filter(Boolean).length - final.length;
     if (final.length === 0) {
       setStatus(
@@ -415,21 +503,50 @@ export function App() {
       );
       return;
     }
+    const request = preflightRequest.current + 1;
+    preflightRequest.current = request;
+    confirmReviewKeyRef.current = reviewKey;
+    setConfirmReviewKey(reviewKey);
+    setAcknowledged(false);
     setPreflight(null);
     setPreflightError(null);
     setConfirmOpen(true);
     try {
-      setPreflight(await ipc.preflight(currentJob.name, plan, selectedRows(final, flipped), acknowledged, selTarget));
+      const result = await ipc.preflight(currentJob.name, plan, reviewedRows, false, selTarget);
+      if (
+        preflightRequest.current !== request
+        || confirmReviewKeyRef.current !== reviewKey
+        || currentReviewKeyRef.current !== reviewKey
+      ) return;
+      setPreflight(result);
     } catch (e) {
+      if (
+        preflightRequest.current !== request
+        || confirmReviewKeyRef.current !== reviewKey
+        || currentReviewKeyRef.current !== reviewKey
+      ) return;
       setPreflightError(String(e));
     }
-  }, [currentJob, plan, busy, checked, final, flipped, acknowledged, selTarget, setStatus]);
+  }, [currentJob, plan, reviewKey, busy, checked, final, reviewedRows, selTarget, setStatus]);
 
   const doSync = useCallback(async () => {
-    setConfirmOpen(false);
-    if (!currentJob || !plan || busy || syncInFlight.current) return;
+    if (
+      !currentJob
+      || !plan
+      || !reviewKey
+      || !confirmOpen
+      || confirmReviewKey !== reviewKey
+      || confirmReviewKeyRef.current !== reviewKey
+      || !preflightAllowsApply(preflight, preflightError, acknowledged)
+    ) {
+      setStatus('Apply is unavailable until the exact reviewed action set passes its safety checks', 'err');
+      return;
+    }
+    if (busy || syncInFlight.current) return;
     syncInFlight.current = true;
-    const selected = selectedRows(final, flipped);
+    const selected = reviewedRows;
+    const acknowledgedForRun = acknowledged;
+    resetConfirmation();
     setBusy(true);
     setStatus(`Synchronizing '${currentJob.name}' (${selected.length} items)...`);
     // Whether the progress window stays during a sync is its own Auto-close / When-finished business
@@ -442,7 +559,7 @@ export function App() {
       // crossing that boundary; only the post-run compare is entitled to publish another one.
       invalidateCompareForJob(currentJob.name);
       resetSafetyUi();
-      const r = await ipc.applyJob(currentJob.name, plan, selected, acknowledged, selTarget, launchId);
+      const r = await ipc.applyJob(currentJob.name, plan, selected, acknowledgedForRun, selTarget, launchId);
       setStatus(
         r.cancelled
           ? `Stopped: cancelled after ${r.done} run — re-checking...`
@@ -460,7 +577,7 @@ export function App() {
       if (launchId !== null) void ipc.cancelProgressLaunch(launchId);
       syncInFlight.current = false;
     }
-  }, [currentJob, plan, busy, final, flipped, acknowledged, selTarget, doCompare, refreshLastSyncs, invalidateCompareForJob, resetSafetyUi, setStatus]);
+  }, [currentJob, plan, reviewKey, confirmOpen, confirmReviewKey, preflight, preflightError, busy, reviewedRows, acknowledged, selTarget, doCompare, refreshLastSyncs, invalidateCompareForJob, resetConfirmation, resetSafetyUi, setStatus]);
 
   const selectJob = useCallback((j: JobDto) => {
     if (currentJob?.name === j.name) return;
@@ -469,11 +586,11 @@ export function App() {
     setCurrentJob(j);
     setSelTarget(targetIndex);
     resetNavigationUi();
-    setWatchSecs(null);
+    stopAutoScan();
     setStatus(restored
       ? `${j.name} · restored ${restored.plan.ops.length} compare items`
       : `${j.name} · ${j.mode}${j.rigor !== 'standard' ? ` · ${j.rigor}` : ''}`);
-  }, [currentJob?.name, compareSession, resetNavigationUi, setStatus]);
+  }, [currentJob?.name, compareSession, resetNavigationUi, stopAutoScan, setStatus]);
 
   /// Write a root edited on the main screen back to the job TOML. Changing a root invalidates the current
   /// plan, so clear it too. For multi-target jobs, only the currently selected target changes.
@@ -482,40 +599,59 @@ export function App() {
     const name = currentJob.name;
     const v = value.trim();
     if (!v) return;
-    let j: ipc.JobFull;
+    let detail: ipc.JobDetailDto;
     try {
-      j = await ipc.getJob(name);
+      detail = await ipc.getJob(name);
     } catch (e) {
-      setStatus(`Failed to read the job before changing ${which}: ${e}`, 'err');
+      await reportMutationFailure(name, `Failed to read the job before changing ${which}`, e);
       return;
     }
-    const ts = j.targets && j.targets.length ? [...j.targets] : [j.target];
+    const j = detail.job;
+    const hasTargetList = j.targets.length > 0;
+    const ts = hasTargetList ? [...j.targets] : [j.target];
     const before = which === 'source' ? j.source : ts[selTarget];
     if (before === v) return; // unchanged means no disk write — otherwise every blur would bump the mtime
     const next: ipc.JobFull = which === 'source'
       ? { ...j, source: v }
-      : { ...j, target: selTarget === 0 ? v : j.target, targets: ts.map((t, i) => (i === selTarget ? v : t)) };
+      : {
+        ...j,
+        target: selTarget === 0 ? v : j.target,
+        targets: hasTargetList ? ts.map((t, i) => (i === selTarget ? v : t)) : [],
+      };
+    let saved: ipc.JobSaveDto;
     try {
-      await ipc.saveJob(name, next);
+      saved = await ipc.saveJob(name, next, {
+        originalName: detail.name,
+        expectedRevision: detail.config_revision,
+      });
     } catch (e) {
-      setStatus(`Failed to write ${which} back to the job: ${e}`, 'err');
+      await reportMutationFailure(name, `Failed to write ${which} back to the job`, e);
       return;
     }
     // The mutation is committed at this point. Retire its old compare immediately, and never let a
     // later list-refresh failure make the UI claim that this successful disk write failed.
+    stopAutoScan();
     invalidateCompareForJob(name);
     resetSafetyUi();
     pushHistory(v);
     const undo = async () => {
-      const cur = await ipc.getJob(name);
       const back: ipc.JobFull = which === 'source'
-        ? { ...cur, source: before }
-        : { ...cur, target: selTarget === 0 ? before : cur.target, targets: (cur.targets ?? []).map((t, i) => (i === selTarget ? before : t)) };
-      await ipc.saveJob(name, back);
-      invalidateCompareForJob(name);
+        ? { ...next, source: before }
+        : { ...next, target: selTarget === 0 ? before : next.target, targets: next.targets.map((t, i) => (i === selTarget ? before : t)) };
+      try {
+        await ipc.saveJob(saved.name, back, {
+          originalName: saved.name,
+          expectedRevision: saved.config_revision,
+        });
+      } catch (e) {
+        await reportMutationFailure(saved.name, `Could not restore ${which}`, e);
+        return;
+      }
+      stopAutoScan();
+      invalidateCompareForJob(saved.name);
       resetSafetyUi();
       try {
-        await refreshJobs(name);
+        await refreshJobs(saved.name);
         setStatus(`Restored ${which}`);
       } catch (e) {
         setStatus(`Restored ${which}, but refreshing the job list failed: ${e}`, 'err');
@@ -528,7 +664,7 @@ export function App() {
     } catch (e) {
       setStatusUndo(`${success}; refreshing the job list failed: ${e}`, 'Undo', undo, 'err');
     }
-  }, [currentJob, selTarget, pushHistory, refreshJobs, invalidateCompareForJob, resetSafetyUi, setStatus, setStatusUndo]);
+  }, [currentJob, selTarget, pushHistory, refreshJobs, reportMutationFailure, invalidateCompareForJob, resetSafetyUi, stopAutoScan, setStatus, setStatusUndo]);
 
   /// The FFS ⇄ swaps the in-memory config; our jobs are named TOML files on disk, so a swap has to hit
   /// the disk — otherwise the two roots in the plan header say something different from the job file, and
@@ -537,35 +673,78 @@ export function App() {
   const requestSwap = useCallback(async () => {
     if (!currentJob || busy) return;
     try {
-      setAskSwap({ name: currentJob.name, job: await ipc.getJob(currentJob.name) });
+      const detail = await ipc.getJob(currentJob.name);
+      const job = detail.job;
+      const targets = job.targets.length ? job.targets : [job.target];
+      if (selTarget >= targets.length) {
+        setStatus(`Target ${selTarget + 1} no longer exists — refresh the job before swapping`, 'err');
+        return;
+      }
+      setAskSwap({
+        name: detail.name,
+        job,
+        configRevision: detail.config_revision,
+        targetIndex: selTarget,
+      });
     } catch (e) {
-      setStatus(`Failed to read job: ${e}`, 'err');
+      await reportMutationFailure(currentJob.name, 'Failed to read job before swapping', e);
     }
-  }, [currentJob, busy, setStatus]);
+  }, [currentJob, busy, selTarget, reportMutationFailure, setStatus]);
 
-  const doSwap = useCallback(async (name: string, j: ipc.JobFull) => {
-    const prev = { source: j.source, target: j.target };
-    try {
-      await ipc.saveJob(name, { ...j, source: j.target, target: j.source });
-    } catch (e) {
-      setStatus(`Swap failed: ${e}`, 'err');
+  const doSwap = useCallback(async (
+    name: string,
+    j: ipc.JobFull,
+    configRevision: string,
+    targetIndex: number,
+  ) => {
+    const targets = j.targets.length ? [...j.targets] : [j.target];
+    const hasTargetList = j.targets.length > 0;
+    const selectedTarget = targets[targetIndex];
+    if (selectedTarget === undefined) {
+      setStatus(`Swap failed: target ${targetIndex + 1} no longer exists`, 'err');
       return;
     }
+    const nextTargets = targets.map((target, index) => (index === targetIndex ? j.source : target));
+    const next: ipc.JobFull = {
+      ...j,
+      source: selectedTarget,
+      target: targetIndex === 0 ? j.source : j.target,
+      targets: hasTargetList ? nextTargets : [],
+    };
+    let saved: ipc.JobSaveDto;
+    try {
+      saved = await ipc.saveJob(name, next, {
+        originalName: name,
+        expectedRevision: configRevision,
+      });
+    } catch (e) {
+      await reportMutationFailure(name, 'Swap failed', e);
+      return;
+    }
+    stopAutoScan();
     invalidateCompareForJob(name);
     resetSafetyUi();
     setChips(new Set());
     setOvFilter(null);
     setOvExpanded(new Set());
     const undo = async () => {
-      const cur = await ipc.getJob(name);
-      await ipc.saveJob(name, { ...cur, ...prev });
-      invalidateCompareForJob(name);
+      try {
+        await ipc.saveJob(saved.name, j, {
+          originalName: saved.name,
+          expectedRevision: saved.config_revision,
+        });
+      } catch (e) {
+        await reportMutationFailure(saved.name, 'Could not undo the root swap', e);
+        return;
+      }
+      stopAutoScan();
+      invalidateCompareForJob(saved.name);
       resetSafetyUi();
       try {
-        await refreshJobs(name);
-        setStatus(`Restored the two roots of '${name}'`);
+        await refreshJobs(saved.name);
+        setStatus(`Restored the two roots of '${saved.name}'`);
       } catch (e) {
-        setStatus(`Restored the two roots of '${name}', but refreshing the job list failed: ${e}`, 'err');
+        setStatus(`Restored the two roots of '${saved.name}', but refreshing the job list failed: ${e}`, 'err');
       }
     };
     const success = `Swapped the two roots of '${name}' — Compare again (Ctrl+R)`;
@@ -575,41 +754,56 @@ export function App() {
     } catch (e) {
       setStatusUndo(`${success}; refreshing the job list failed: ${e}`, 'Undo swap', undo, 'err');
     }
-  }, [refreshJobs, invalidateCompareForJob, resetSafetyUi, setStatus, setStatusUndo]);
+  }, [refreshJobs, reportMutationFailure, invalidateCompareForJob, resetSafetyUi, stopAutoScan, setStatus, setStatusUndo]);
 
   /// Write an exclude back into the job's exclude list. Pruning during the scan only takes effect at the
   /// next Compare, so the message has to say so and leave an undo behind.
   const addExcludes = useCallback(async (masks: string[], label: string) => {
     if (!currentJob) { setStatus('Select a job first', 'err'); return; }
     const name = currentJob.name;
-    let j: ipc.JobFull;
+    let detail: ipc.JobDetailDto;
     try {
-      j = await ipc.getJob(name);
+      detail = await ipc.getJob(name);
     } catch (e) {
-      setStatus(`Failed to read the job before adding the exclude: ${e}`, 'err');
+      await reportMutationFailure(name, 'Failed to read the job before adding the exclude', e);
       return;
     }
+    const j = detail.job;
     const prev = [...j.exclude];
     // Folded the way the engine folds, not by string equality: a mask typed with backslashes, in a
     // different case, or in NFD is the same rule to the filter, and appending it again would leave
     // two lines that mean one thing — and a preset box unticked next to its own pattern
     const { next, added: add } = addExcludeEntries(prev, masks);
     if (!add.length) { setStatus(`The job already has ${masks.length > 1 ? 'all of these masks' : 'this exclude'}`); return; }
+    const nextJob = { ...j, exclude: next };
+    let saved: ipc.JobSaveDto;
     try {
-      await ipc.saveJob(name, { ...j, exclude: next });
+      saved = await ipc.saveJob(name, nextJob, {
+        originalName: detail.name,
+        expectedRevision: detail.config_revision,
+      });
     } catch (e) {
-      setStatus(`Failed to write exclude: ${e}`, 'err');
+      await reportMutationFailure(name, 'Failed to write exclude', e);
       return;
     }
+    stopAutoScan();
     invalidateCompareForJob(name);
     resetSafetyUi();
     const undo = async () => {
-      const cur = await ipc.getJob(name);
-      await ipc.saveJob(name, { ...cur, exclude: prev });
-      invalidateCompareForJob(name);
+      try {
+        await ipc.saveJob(saved.name, j, {
+          originalName: saved.name,
+          expectedRevision: saved.config_revision,
+        });
+      } catch (e) {
+        await reportMutationFailure(saved.name, 'Could not undo the exclude', e);
+        return;
+      }
+      stopAutoScan();
+      invalidateCompareForJob(saved.name);
       resetSafetyUi();
       try {
-        await refreshJobs(name);
+        await refreshJobs(saved.name);
         setStatus('Exclude undone');
       } catch (e) {
         setStatus(`Exclude undone, but refreshing the job list failed: ${e}`, 'err');
@@ -622,7 +816,7 @@ export function App() {
     } catch (e) {
       setStatusUndo(`${success}; refreshing the job list failed: ${e}`, 'Undo exclude', undo, 'err');
     }
-  }, [currentJob, refreshJobs, invalidateCompareForJob, resetSafetyUi, setStatus, setStatusUndo]);
+  }, [currentJob, refreshJobs, reportMutationFailure, invalidateCompareForJob, resetSafetyUi, stopAutoScan, setStatus, setStatusUndo]);
 
   /// Export the current view (the visible set, with check state). Escaping and the BOM are handled once
   /// on the Rust side.
@@ -653,13 +847,15 @@ export function App() {
       const p = await ipc.pickPath({
         directory: true,
         title: `Select the ${which} directory`,
-        defaultPath: which === 'source' ? currentJob?.source : currentJob?.target,
+        defaultPath: which === 'source'
+          ? currentJob?.source
+          : currentJob?.targets[selTarget] ?? currentJob?.target,
       });
       if (p) await saveRoot(which, p);
     } catch (e) {
       setStatus(`Can't open the picker: ${e}`, 'err');
     }
-  }, [currentJob, saveRoot, setStatus]);
+  }, [currentJob, selTarget, saveRoot, setStatus]);
 
   // Row interactions
 
@@ -754,12 +950,15 @@ export function App() {
   useEffect(() => {
     const un = listen<CompareProgressEvent>('run-progress', (ev) => {
       const e = ev.payload;
-      if (e.purpose !== 'compare' || e.run_id < cmpRunId.current) return;
+      if (e.purpose !== 'compare') return;
+      if (!cmpRunReady.current && e.run_id <= cmpRunFloor.current) return;
+      if (e.run_id < cmpRunId.current) return;
       if (e.run_id > cmpRunId.current) {
         cmpRunId.current = e.run_id;
         cmpRate.current.clear();
         setCmpStages([]);
       }
+      cmpRunReady.current = true;
       // A `log` event carries no phase, so the phase guard below would drop it. Errors do carry
       // one, but the guard used to sit above every branch and there was no branch to reach:
       // `phase_start` and `progress` were the only two, and a scan that could not read a directory
@@ -796,6 +995,13 @@ export function App() {
       }
     });
     return () => { un.then((f) => f()); };
+  }, [setStatus]);
+
+  useEffect(() => {
+    const un = listen<string>('main-close-blocked', (event) => {
+      setStatus(event.payload, 'err');
+    });
+    return () => { un.then((dispose) => dispose()); };
   }, [setStatus]);
 
   // P1: drag a directory onto a path box.
@@ -859,23 +1065,100 @@ export function App() {
   useEffect(() => {
     if (!currentJob) { setCfgJob(null); return; }
     let live = true;
-    ipc.getJob(currentJob.name).then((j) => { if (live) setCfgJob(j); }).catch(() => setCfgJob(null));
+    ipc.getJob(currentJob.name).then((detail) => {
+      if (live) setCfgJob(detail.job);
+    }).catch((error) => {
+      if (!live) return;
+      setCfgJob(null);
+      setStatus(`Failed to load '${currentJob.name}' settings: ${error}`, 'err');
+    });
     return () => { live = false; };
-  }, [currentJob]);
+  }, [currentJob, setStatus]);
 
-  // AutoScan (scheduled scans; seconds = near real time)
   const tickRef = useRef<() => void>(() => {});
   tickRef.current = async () => {
-    if (!currentJob) { setWatchSecs(null); return; }
+    if (!currentJob) { stopAutoScan(); return; }
     const iv = (currentJob.watch_interval_secs ?? 30) * 1000;
     const left = watchNext.current - Date.now();
     if (left > 0) {
       if (!busy) setStatus(`AutoScan — next scan in ${Math.ceil(left / 1000)}s (${currentJob.name})`);
       return;
     }
-    if (busy) return; // the previous round hasn't finished — skip this beat
+    if (busy || compareInFlight.current || !autoScanEnabled.current) return;
     watchNext.current = Date.now() + iv;
-    await doCompare();
+    const ticket: AutoScanTicket = {
+      generation: autoScanGeneration.current + 1,
+      jobName: currentJob.name,
+      configRevision: currentJob.config_revision,
+      targetIndex: selTarget,
+      autoApply: currentJob.watch_auto_apply,
+    };
+    autoScanGeneration.current = ticket.generation;
+    autoScanTicket.current = ticket;
+    const completion = await doCompare(ticket);
+    if (!completion) return;
+    const selectedJob = selectionRef.current.job;
+    const currentSelection = selectedJob ? {
+      jobName: selectedJob.name,
+      configRevision: selectedJob.config_revision,
+      targetIndex: selectionRef.current.targetIndex,
+    } : null;
+    if (!ownsFreshAutoScanResult(
+      autoScanEnabled.current,
+      autoScanTicket.current,
+      ticket,
+      completion.plan.owner,
+      currentSelection,
+    )) return;
+    autoScanTicket.current = null;
+
+    const freshPlan = completion.plan;
+    if (freshPlan.ops.length === 0) return;
+    if (!ticket.autoApply) {
+      setStatus(`AutoScan found ${freshPlan.ops.length} differences`, 'err');
+      return;
+    }
+
+    const visibleForCycle = computeVisible({
+      plan: freshPlan,
+      flipped: EMPTY_FLAGS,
+      chips: new Set(),
+      search,
+      ovFilter: null,
+      vfilter,
+      maskHit: completion.maskHit,
+    });
+    const selected = selectedRows(
+      finalIdx(visibleForCycle, freshPlan.ops.map((op) => selectable(op))),
+      EMPTY_FLAGS,
+    );
+    if (selected.length === 0) {
+      setStatus(
+        `AutoScan found ${freshPlan.ops.length} differences, but the current filters leave no executable actions — review required`,
+        'err',
+      );
+      return;
+    }
+
+    setStatus(`AutoScan found ${selected.length} visible differences — running automatically…`);
+    setBusy(true);
+    invalidateCompareForJob(ticket.jobName);
+    resetSafetyUi();
+    try {
+      const result = await ipc.applyJobUnattended(ticket.jobName, freshPlan, selected, ticket.targetIndex);
+      refreshLastSyncs();
+      setLogReload((value) => value + 1);
+      setStatus(
+        result.cancelled
+          ? `Auto-sync stopped after ${result.done} actions`
+          : `Auto-sync finished: ${result.done} run, ${result.skipped} skipped, ${result.errors} errors`,
+        result.errors ? 'err' : 'ok',
+      );
+    } catch (e) {
+      setStatus(`Auto-sync failed: ${e}`, 'err');
+    } finally {
+      setBusy(false);
+    }
   };
 
   useEffect(() => {
@@ -883,43 +1166,6 @@ export function App() {
     const id = window.setInterval(() => tickRef.current(), 1000);
     return () => window.clearInterval(id);
   }, [watchSecs]);
-
-  // Auto-apply is a separate effect so it observes the plan the compare above just produced
-  const autoApplied = useRef<PlanDto | null>(null);
-  useEffect(() => {
-    if (watchSecs === null || busy || !plan || !currentJob || !currentJob.watch_auto_apply) return;
-    if (plan.ops.length === 0 || autoApplied.current === plan) return;
-    autoApplied.current = plan;
-    void (async () => {
-      const selected = selectedRows(
-        plan.ops.flatMap((op, index) => (selectable(op) ? [index] : [])),
-        EMPTY_FLAGS,
-      );
-      if (selected.length === 0) {
-        setStatus(
-          `AutoScan found ${plan.ops.length} conflicts/notes, but no executable differences — review required`,
-          'err',
-        );
-        return;
-      }
-      setStatus(`AutoScan found ${selected.length} differences — running automatically…`);
-      setBusy(true);
-      invalidateCompareForJob(currentJob.name);
-      resetSafetyUi();
-      try {
-        await ipc.applyJobUnattended(currentJob.name, plan, selected, selTarget);
-        refreshLastSyncs();
-      } catch (e) {
-        setStatus(`Auto-sync failed: ${e}`, 'err');
-      }
-      setBusy(false);
-    })();
-  }, [watchSecs, busy, plan, currentJob, selTarget, refreshLastSyncs, invalidateCompareForJob, resetSafetyUi, setStatus]);
-
-  useEffect(() => {
-    if (watchSecs === null || !plan || !currentJob || currentJob.watch_auto_apply) return;
-    if (plan.ops.length > 0) setStatus(`AutoScan found ${plan.ops.length} differences`, 'err');
-  }, [watchSecs, plan, currentJob, setStatus]);
 
   // Keyboard.
   //
@@ -932,19 +1178,15 @@ export function App() {
       // While an overlay owns the screen it owns the keyboard: F5 must not kick off a compare
       // behind an open editor
       if (ctx || editor || settingsOpen || askSwap) return;
-      if (confirmOpen) {
-        if (e.key === 'Enter' && !(preflight && !preflight.ok && !acknowledged)) void doSync();
-        return;
-      }
-      // F5 / F9 = the FFS compare / synchronize keys; Ctrl+R / Enter still work
+      if (confirmOpen) return;
+      // F5 / F9 = the FFS compare / synchronize keys; Ctrl+R also compares
       if (e.key === 'F5') { e.preventDefault(); void doCompare(); }
       else if (e.key === 'F9') { e.preventDefault(); void openConfirm(); }
       else if (mod && e.key.toLowerCase() === 'r') { e.preventDefault(); void doCompare(); }
-      else if (e.key === 'Enter' && !(document.activeElement instanceof HTMLInputElement)) void openConfirm();
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [ctx, editor, settingsOpen, askSwap, confirmOpen, preflight, acknowledged, doSync, doCompare, openConfirm]);
+  }, [ctx, editor, settingsOpen, askSwap, confirmOpen, doCompare, openConfirm]);
 
   // The funnel is anchored to its toolbar button and has no dismissal of its own; the context menu
   // brings its own (outside click, Esc, and any scroll under it), so it is not handled here
@@ -961,11 +1203,11 @@ export function App() {
     for (const i of final) {
       const op = eff(plan, flipped, i);
       if (op.action === 'copy') { t.copy++; t.bytes += op.size ?? 0; }
-      else if (op.action === 'update') { t.update++; t.bytes += op.size ?? 0; }
+      else if (op.action === 'update' || op.action === 'chmod') { t.update++; t.bytes += op.size ?? 0; }
       else if (op.action === 'move') t.move++;
       else if (op.action === 'delete' || op.action === 'delete_dir') { t.del++; t.delBytes += op.size ?? 0; }
+      if (flipped[i]) t.flips++;
     }
-    t.flips = flipped.filter(Boolean).length;
     t.hiddenChecked = checked.filter(Boolean).length - final.length;
     return t;
   }, [plan, final, flipped, checked]);
@@ -991,15 +1233,18 @@ export function App() {
             finalCount={final.length}
             stats={stats}
             busy={busy}
-            canSync={hasRows}
+            canSync={final.length > 0}
             watchSecs={watchSecs}
             onCompare={() => void doCompare()}
             onSync={() => void openConfirm()}
             onToggleLog={() => setLogOpen((v) => !v)}
             onToggleWatch={() => {
-              if (watchSecs !== null) { setWatchSecs(null); setStatus('AutoScan stopped'); return; }
+              if (watchSecs !== null) { stopAutoScan(); setStatus('AutoScan stopped'); return; }
               if (!currentJob) return;
               const iv = currentJob.watch_interval_secs ?? 30;
+              autoScanEnabled.current = true;
+              autoScanTicket.current = null;
+              autoScanGeneration.current += 1;
               watchNext.current = Date.now() + iv * 1000;
               setWatchSecs(iv);
               setStatus(`AutoScan on: compare every ${iv}s (the hash cache means an unchanged tree costs only the walk)${currentJob.watch_auto_apply ? ' · auto-run' : ''}`);
@@ -1019,6 +1264,7 @@ export function App() {
             onSelectTarget={(i) => {
               if (busy || i === selTarget) return;
               setSelTarget(i);
+              stopAutoScan();
               resetNavigationUi();
               const t = (currentJob?.targets ?? [])[i] ?? '';
               const restored = sessionForSelection(compareSession, currentJob, i);
@@ -1094,9 +1340,21 @@ export function App() {
                   stages={cmpStages}
                   cancelling={cmpCancelling}
                   onCancel={() => {
+                    if (!cmpRunReady.current || cmpRunId.current < 0) {
+                      setStatus('Compare is still starting — cancel will be available when its run is registered');
+                      return;
+                    }
+                    const runId = cmpRunId.current;
                     setCmpCancelling(true);
-                    ipc.cancelRun().catch(() => {});
                     setStatus('Cancelling the compare…');
+                    ipc.cancelRun(runId).then((accepted) => {
+                      if (accepted) return;
+                      setCmpCancelling(false);
+                      setStatus('That compare already finished; no newer run was cancelled');
+                    }).catch((e) => {
+                      setCmpCancelling(false);
+                      setStatus(`Cancel failed: ${e}`, 'err');
+                    });
                   }}
                 />
               ) : sameOpen && plan ? (
@@ -1181,7 +1439,7 @@ export function App() {
             setVfilter(next);
             if (next.masks.join('\n') !== vfilter.masks.join('\n')) void recomputeMasks(plan, flipped, next.masks);
           }}
-          onClear={() => { setVfilter(EMPTY_FILTER); setMaskHit([]); }}
+          onClear={() => { setVfilter(EMPTY_FILTER); clearMasks(); }}
           onPromote={(masks) => {
             if (!masks.length) { setStatus('Write at least one mask first', 'err'); return; }
             setFunnelAnchor(null);
@@ -1200,17 +1458,29 @@ export function App() {
           busy={busy}
           onClose={() => setEditor(null)}
           onSaved={async (name, job, configRevision) => {
+            const originalName = editor.name;
+            const renamed = originalName !== null && originalName !== name;
+            const renamedSelected = renamed && currentJob?.name === originalName;
             setEditor(null);
-            const reconciled = reconcileSavedJobSession(compareSession, name, configRevision);
+            stopAutoScan();
+            const reconciled = renamed
+              ? invalidateJobSession(compareSession, originalName)
+              : reconcileSavedJobSession(compareSession, name, configRevision);
             if (reconciled !== compareSession) {
               setCompareSession(reconciled);
               resetSafetyUi();
             }
+            if (renamedSelected) {
+              setCurrentJob(null);
+              setSelTarget(0);
+              resetNavigationUi();
+            }
             pushHistory(job.source);
             pushHistory(job.target);
             try {
-              await refreshJobs(currentJob?.name === name ? name : undefined);
-              if (currentJob?.name === name) setCfgJob(job);
+              const list = await refreshJobs(!renamed && currentJob?.name === name ? name : undefined);
+              if (renamedSelected) setCurrentJob(list.find((candidate) => candidate.name === name) ?? null);
+              if (currentJob?.name === name || renamedSelected) setCfgJob(job);
               setStatus(`Saved '${name}'`, 'ok');
             } catch (e) {
               setStatus(`Saved '${name}', but refreshing the job list failed: ${e}`, 'err');
@@ -1221,8 +1491,21 @@ export function App() {
             invalidateCompareForJob(name);
             resetSafetyUi();
             if (currentJob?.name === name) { setCurrentJob(null); setSelTarget(0); }
-            await refreshJobs();
-            setStatus(`Deleted '${name}'`);
+            try {
+              await refreshJobs();
+              setStatus(`Deleted '${name}'`);
+            } catch (e) {
+              setStatus(`Deleted '${name}', but refreshing the job list failed: ${e}`, 'err');
+            }
+          }}
+          onMutationConflict={async (name) => {
+            const list = await refreshJobs(name);
+            const refreshed = list.find((candidate) => candidate.name === name) ?? null;
+            setCompareSession((session) => reconcileRefreshedJobSession(session, name, refreshed));
+            if (currentJob?.name === name && currentJob.config_revision !== refreshed?.config_revision) {
+              stopAutoScan();
+              resetNavigationUi();
+            }
           }}
           onStatus={setStatus}
         />
@@ -1238,13 +1521,22 @@ export function App() {
         <ConfirmDialog
           title={`Swap the two roots of '${askSwap.name}'?`}
           message={
-            `source ← ${askSwap.job.target}\ntarget ← ${askSwap.job.source}\n\n` +
+            `source ← ${(askSwap.job.targets.length ? askSwap.job.targets : [askSwap.job.target])[askSwap.targetIndex]}\n` +
+            `target ${askSwap.targetIndex + 1} ← ${askSwap.job.source}\n\n` +
             (askSwap.job.mode === 'mirror'
               ? 'In mirror mode this reverses which side is authoritative: after the swap, the original target wins.\n\n'
               : '') +
             'The job file is rewritten and the current compare result is discarded. The status bar keeps an undo.'
           }
-          actions={[{ label: 'Swap them', onConfirm: () => void doSwap(askSwap.name, askSwap.job) }]}
+          actions={[{
+            label: 'Swap them',
+            onConfirm: () => void doSwap(
+              askSwap.name,
+              askSwap.job,
+              askSwap.configRevision,
+              askSwap.targetIndex,
+            ),
+          }]}
           onCancel={() => setAskSwap(null)}
         />
       )}
@@ -1256,7 +1548,7 @@ export function App() {
           preflightError={preflightError}
           acknowledged={acknowledged}
           onAcknowledge={setAcknowledged}
-          onCancel={() => setConfirmOpen(false)}
+          onCancel={resetConfirmation}
           onConfirm={() => void doSync()}
         />
       )}

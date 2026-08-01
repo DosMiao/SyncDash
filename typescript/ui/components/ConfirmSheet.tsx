@@ -1,4 +1,5 @@
 import { humanSize } from '../../core/format';
+import { preflightAllowsApply } from '../state/execution-safety';
 import { Sheet } from './ui';
 import type { JobDto } from '../../core/types/generated/JobDto';
 import type { PreflightDto } from '../../core/types/generated/PreflightDto';
@@ -28,9 +29,8 @@ interface Props {
 
 export function ConfirmSheet(props: Props) {
   const { job, totals: t, preflight, preflightError, acknowledged, onAcknowledge, onCancel, onConfirm } = props;
-  // Gate checks (free disk space / delete ratio) belong in front of the user before the run is
-  // started, not surfacing at run time in an invisible stderr line
   const blocked = !!preflight && !preflight.ok;
+  const canApply = preflightAllowsApply(preflight, preflightError, acknowledged);
 
   return (
     <Sheet
@@ -39,8 +39,8 @@ export function ConfirmSheet(props: Props) {
       footer={
         <>
           <button className="btn" onClick={onCancel}>Cancel (Esc)</button>
-          <button className="btn accent" disabled={blocked && !acknowledged} onClick={onConfirm}>
-            Apply (Enter)
+          <button className="btn accent" disabled={!canApply} onClick={onConfirm}>
+            Apply
           </button>
         </>
       }
@@ -69,15 +69,23 @@ export function ConfirmSheet(props: Props) {
       {preflight?.warnings.map((w, k) => (
         <div className="mrow warn" key={`w${k}`}><span>Warning</span><span className="dim">{w}</span></div>
       ))}
+      {!preflight && !preflightError && (
+        <div className="mrow"><span>Safety checks</span><span className="dim">Checking…</span></div>
+      )}
       {blocked && preflight!.blockers.map((b, k) => (
         <div className="mrow danger" key={`b${k}`}><span>Blocked</span><span className="dim">{b}</span></div>
       ))}
-      {blocked && (
+      {blocked && preflight!.acknowledgeable && (
         <div className="mrow">
           <label className="chkline">
             <input type="checkbox" checked={acknowledged} onChange={(e) => onAcknowledge(e.target.checked)} />
             I confirm this is correct, continue (same as the CLI&apos;s --i-know)
           </label>
+        </div>
+      )}
+      {blocked && !preflight!.acknowledgeable && (
+        <div className="mrow danger">
+          <span>Action required</span><span className="dim">Resolve the blockers above and compare again.</span>
         </div>
       )}
       {preflightError && (

@@ -43,6 +43,15 @@ export function ProgressApp() {
   /// day anyone edits the wording.
   const [stop, setStop] = useState<'idle' | 'stopping' | 'finished'>('idle');
 
+  const reportControlError = useCallback((action: string, error: unknown) => {
+    run.current.errors.push({
+      path: '', action: 'control', side: '', message: `${action}: ${String(error)}`, warning: false,
+    });
+    setErrorsOpen(true);
+    setStop('idle');
+    rerender();
+  }, [rerender]);
+
   const autocloseRef = useRef(autoclose);
   autocloseRef.current = autoclose;
   const whenFinRef = useRef(whenFin);
@@ -294,8 +303,9 @@ export function ProgressApp() {
       // the backend first: clearing a pending reservation or cancelling the matching interactive
       // run is atomic with begin_run_for_launch, so a close can never start a headless sync.
       run.current.closeAfterStop = true;
-      const launchState = await closeProgressLaunch().catch(() => null);
-      if (launchState === null) return;
+      let launchState: Awaited<ReturnType<typeof closeProgressLaunch>>;
+      try { launchState = await closeProgressLaunch(); }
+      catch (error) { reportControlError('Could not inspect the active launch before closing', error); return; }
       let current = run.current;
       current.closeAfterStop = true;
       if (launchState === 'pending') {
@@ -313,13 +323,20 @@ export function ProgressApp() {
       // apply; retain the prior cooperative-cancel behavior for that case.
       if (current.running && !current.summary) {
         setStop('stopping');
-        if (current.pausedSince) { current.pausedSince = 0; await pauseRun(false).catch(() => {}); }
-        const had = await cancelRun().catch(() => null);
-        if (had === null) return;
+        if (current.runId < 0) return;
+        if (current.pausedSince) {
+          current.pausedSince = 0;
+          try { await pauseRun(current.runId, false); }
+          catch (error) { reportControlError('Could not resume before stopping', error); return; }
+        }
+        let had: boolean;
+        try { had = await cancelRun(current.runId); }
+        catch (error) { reportControlError('Could not stop this run', error); return; }
         if (!had) {
           // Catch a launch reserved while cancelRun was in flight before destroying the window.
-          const racedLaunch = await closeProgressLaunch().catch(() => null);
-          if (racedLaunch === null) return;
+          let racedLaunch: Awaited<ReturnType<typeof closeProgressLaunch>>;
+          try { racedLaunch = await closeProgressLaunch(); }
+          catch (error) { reportControlError('Could not inspect a raced launch before closing', error); return; }
           current = run.current;
           current.closeAfterStop = true;
           if (racedLaunch === 'active') {
@@ -334,7 +351,7 @@ export function ProgressApp() {
       destroyProgressWindow().catch(() => {});
     });
     return () => { un.then((f) => f()); };
-  }, []);
+  }, [reportControlError]);
 
   const r60 = windowRate(s, 60000);
   const nErr = s.errors.filter((e) => !e.warning).length;
@@ -445,10 +462,18 @@ export function ProgressApp() {
           disabled={!s.running || !!s.summary}
           onClick={async () => {
             const wantPause = run.current.pausedSince === 0;
+            const previousPausedSince = run.current.pausedSince;
             // optimistic toggle, corrected once the event arrives
             run.current.pausedSince = wantPause ? Date.now() : 0;
             rerender();
-            await pauseRun(wantPause).catch(() => {});
+            try {
+              const accepted = await pauseRun(run.current.runId, wantPause);
+              if (!accepted) throw new Error('the run already finished');
+            }
+            catch (error) {
+              run.current.pausedSince = previousPausedSince;
+              reportControlError(wantPause ? 'Could not pause this run' : 'Could not resume this run', error);
+            }
           }}
         >{paused ? <><Play size={12} /> Continue</> : <><Pause size={12} /> Pause</>}</button>
         <button
@@ -458,8 +483,14 @@ export function ProgressApp() {
             setStop('stopping');
             const st = run.current;
             // Stop pressed while paused: resume first, otherwise the cancel never reaches a checkpoint
-            if (st.pausedSince) { st.pausedSince = 0; await pauseRun(false).catch(() => {}); }
-            const had = await cancelRun().catch(() => false);
+            if (st.pausedSince) {
+              st.pausedSince = 0;
+              try { await pauseRun(st.runId, false); }
+              catch (error) { reportControlError('Could not resume before stopping', error); return; }
+            }
+            let had: boolean;
+            try { had = await cancelRun(st.runId); }
+            catch (error) { reportControlError('Could not stop this run', error); return; }
             // no active run (it already finished on its own) — don't leave the button stuck on "Stopping…"
             if (!had) setStop('finished');
           }}

@@ -240,6 +240,41 @@ impl Job {
         }
     }
 
+    /// Validate every persisted engine setting before the job can be compared or written.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_choice("mode", &self.mode, &["mirror", "sync", "enrich"])?;
+        validate_choice(
+            "rigor",
+            &self.rigor,
+            &["quick", "fast", "balanced", "standard", "paranoid", "custom"],
+        )?;
+        if let Some(evidence) = self.evidence.as_deref() {
+            validate_choice("evidence", evidence, &["none", "sampled", "full"])?;
+        }
+        validate_choice("symlinks", &self.symlinks, &["exclude", "direct"])?;
+        validate_choice("on_conflict", &self.on_conflict, &["report", "copy", "newer"])?;
+
+        validate_ratio("min_free_pct", self.min_free_pct)?;
+        validate_non_negative("max_delete_ratio", self.max_delete_ratio)?;
+        if self.max_conflicts < -1 {
+            return Err("max_conflicts must be -1 (unlimited) or zero or greater".into());
+        }
+        if let Some(parallel) = self.parallel {
+            if !(1..=16).contains(&parallel) {
+                return Err("parallel must be between 1 and 16".into());
+            }
+        }
+        if self.watch_interval_secs == Some(0) {
+            return Err("watch_interval_secs must be at least 1 when watch is enabled".into());
+        }
+        if self.watch_auto_apply && self.watch_interval_secs.is_none() {
+            return Err("watch_auto_apply requires watch_interval_secs".into());
+        }
+
+        self.validate_multi_target()?;
+        validate_root_relationships(&self.source, &self.target_list())
+    }
+
     /// Validity of the job's shape (multi-target rules + root phrases — the error must be clear before comparing)
     pub fn validate_multi_target(&self) -> Result<(), String> {
         if self.targets.len() > 1 {
@@ -262,15 +297,34 @@ impl Job {
     /// nothing left to keep apart.
     pub fn validate_roots(&self) -> Result<(), String> {
         use crate::fs::vfs::spec::{is_peer, parse, RootSpec, KNOWN_SCHEMES};
+        if self.source.trim().is_empty() {
+            return Err("source root cannot be empty".into());
+        }
+        let targets = self.target_list();
+        if targets.iter().any(|target| target.trim().is_empty()) {
+            return Err("target root cannot be empty".into());
+        }
         for (label, s) in std::iter::once(("source", &self.source))
-            .chain(std::iter::once(("target", &self.target)))
-            .chain(self.targets.iter().map(|t| ("targets", t)))
+            .chain(targets.iter().map(|target| ("target", target)))
         {
-            if let RootSpec::UnknownScheme { scheme, .. } = parse(s) {
-                return Err(format!(
-                    "{label} '{s}': unknown scheme '{scheme}://' — refusing to treat it as a local path (known: {})",
-                    KNOWN_SCHEMES.join(", ")
-                ));
+            match parse(s) {
+                RootSpec::UnknownScheme { scheme, .. } => {
+                    return Err(format!(
+                        "{label} '{s}': unknown scheme '{scheme}://' — refusing to treat it as a local path (known: {})",
+                        KNOWN_SCHEMES.join(", ")
+                    ));
+                }
+                RootSpec::Remote(remote) if remote.host.trim().is_empty() => {
+                    return Err(format!("{label} '{s}': remote root host cannot be empty"));
+                }
+                RootSpec::Remote(remote)
+                    if remote.root.split('/').any(|segment| segment == "..") =>
+                {
+                    return Err(format!(
+                        "{label} '{s}': remote root cannot contain a '..' segment"
+                    ));
+                }
+                _ => {}
             }
         }
         // The peer lane is directional by construction: this side builds a package and the far
@@ -291,6 +345,183 @@ impl Job {
         j.target = t.to_string();
         j.targets = Vec::new();
         j
+    }
+}
+
+fn validate_choice(field: &str, value: &str, accepted: &[&str]) -> Result<(), String> {
+    if accepted.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{field} must be one of {} (got '{value}')",
+            accepted.join(", ")
+        ))
+    }
+}
+
+fn validate_ratio(field: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite() {
+        return Err(format!("{field} must be a finite number"));
+    }
+    if !(0.0..=1.0).contains(&value) {
+        return Err(format!("{field} must be between 0 and 1"));
+    }
+    Ok(())
+}
+
+fn validate_non_negative(field: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite() {
+        return Err(format!("{field} must be a finite number"));
+    }
+    if value < 0.0 {
+        return Err(format!("{field} must be zero or greater"));
+    }
+    Ok(())
+}
+
+#[derive(PartialEq, Eq)]
+struct ComparableLocalRoot {
+    prefix: String,
+    segments: Vec<String>,
+}
+
+#[derive(PartialEq, Eq)]
+struct ComparableRemoteRoot {
+    endpoint: String,
+    segments: Vec<String>,
+}
+
+fn comparable_remote_root(raw: &str) -> Option<ComparableRemoteRoot> {
+    use crate::fs::vfs::spec::{default_port, parse, RootSpec};
+    let RootSpec::Remote(remote) = parse(raw) else {
+        return None;
+    };
+    let user = remote.user.as_deref().unwrap_or("");
+    let endpoint = format!(
+        "{}://{}@{}:{}",
+        remote.scheme,
+        user,
+        remote.host.to_lowercase(),
+        remote.port.unwrap_or(default_port(&remote.scheme)),
+    );
+    let case_insensitive = remote.scheme == "smb";
+    let segments = remote
+        .root
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .map(|segment| {
+            if case_insensitive {
+                segment.to_lowercase()
+            } else {
+                segment.to_string()
+            }
+        })
+        .collect();
+    Some(ComparableRemoteRoot { endpoint, segments })
+}
+
+fn comparable_local_root(raw: &str) -> Option<ComparableLocalRoot> {
+    use crate::fs::vfs::spec::{parse, RootSpec};
+    let RootSpec::Local(_) = parse(raw) else {
+        return None;
+    };
+
+    let unified = raw.trim().replace('\\', "/");
+    let windows = cfg!(windows)
+        || unified.starts_with("//")
+        || unified.as_bytes().get(1) == Some(&b':');
+    let normalized = if windows {
+        unified.to_lowercase()
+    } else {
+        unified
+    };
+    let prefix = if normalized.starts_with("//") {
+        "//"
+    } else if normalized.starts_with('/') {
+        "/"
+    } else if normalized.as_bytes().get(1) == Some(&b':') {
+        &normalized[..2]
+    } else {
+        ""
+    };
+    let body = normalized
+        .strip_prefix(prefix)
+        .unwrap_or(&normalized)
+        .trim_start_matches('/');
+    let mut segments = Vec::new();
+    for segment in body.split('/').filter(|segment| !segment.is_empty() && *segment != ".") {
+        if segment == ".." {
+            if matches!(segments.last().map(String::as_str), Some(last) if last != "..") {
+                segments.pop();
+            } else if prefix.is_empty() {
+                segments.push(segment.to_string());
+            }
+        } else {
+            segments.push(segment.to_string());
+        }
+    }
+    Some(ComparableLocalRoot { prefix: prefix.to_string(), segments })
+}
+
+fn validate_root_relationships(source: &str, targets: &[String]) -> Result<(), String> {
+    let source_local = comparable_local_root(source);
+    let source_remote = comparable_remote_root(source);
+    let source_identity = root_identity(source);
+    let mut seen = Vec::<String>::new();
+    for (index, target) in targets.iter().enumerate() {
+        let identity = root_identity(target);
+        if identity == source_identity {
+            return Err("source and target must be different directories".into());
+        }
+        if seen.iter().any(|existing| existing == &identity) {
+            return Err(format!("target {} duplicates an earlier target", index + 1));
+        }
+        seen.push(identity);
+
+        if let (Some(source_root), Some(target_root)) =
+            (source_local.as_ref(), comparable_local_root(target))
+        {
+            if source_root.prefix == target_root.prefix {
+                if target_root.segments.starts_with(&source_root.segments) {
+                    return Err("target cannot be nested inside source".into());
+                }
+                if source_root.segments.starts_with(&target_root.segments) {
+                    return Err("source cannot be nested inside target".into());
+                }
+            }
+        }
+
+        if let (Some(source_root), Some(target_root)) =
+            (source_remote.as_ref(), comparable_remote_root(target))
+        {
+            if source_root.endpoint == target_root.endpoint {
+                if target_root.segments.starts_with(&source_root.segments) {
+                    return Err("target cannot be nested inside source".into());
+                }
+                if source_root.segments.starts_with(&target_root.segments) {
+                    return Err("source cannot be nested inside target".into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_root_pair(source: &str, target: &str) -> Result<(), String> {
+    validate_root_relationships(source, &[target.to_string()])
+}
+
+fn root_identity(raw: &str) -> String {
+    match crate::fs::vfs::spec::parse(raw) {
+        crate::fs::vfs::spec::RootSpec::Remote(remote) => {
+            format!("remote:{}", remote.identity())
+        }
+        crate::fs::vfs::spec::RootSpec::Local(_) => comparable_local_root(raw)
+            .map(|root| format!("local:{}:{}", root.prefix, root.segments.join("/")))
+            .unwrap_or_else(|| format!("local:{}", raw.trim())),
+        crate::fs::vfs::spec::RootSpec::UnknownScheme { raw, .. } => {
+            format!("unknown:{raw}")
+        }
     }
 }
 
@@ -583,23 +814,190 @@ pub fn load_all() -> Vec<(String, Job)> {
     out
 }
 
-/// Save a job (used by the GUI editor). Returns the file path.
-pub fn save_job(name: &str, job: &Job) -> std::io::Result<PathBuf> {
-    let dir = crate::foundation::dirs::jobs_dir();
-    std::fs::create_dir_all(&dir)?;
-    // Stamp the version here rather than trusting the caller: a file written by this build is current
-    // by construction, and a stale `schema` on the way in would make the next load re-run the v1
-    // migration and re-add preset patterns the user had just deleted.
-    let job = &Job { schema: SCHEMA, ..job.clone() };
-    let text = toml::to_string_pretty(job)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}")))?;
-    let path = registered_job_path(name)?;
-    std::fs::write(&path, text)?;
-    Ok(path)
+#[derive(Debug)]
+pub struct SavedJob {
+    pub name: String,
+    pub path: PathBuf,
+    pub config_revision: String,
 }
 
-pub fn delete_job(name: &str) -> std::io::Result<()> {
-    std::fs::remove_file(registered_job_path(name)?)
+struct JobMutationLock {
+    _file: std::fs::File,
+}
+
+fn lock_job_mutations(dir: &Path) -> std::io::Result<JobMutationLock> {
+    std::fs::create_dir_all(dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(dir.join(".syncdash-jobs.lock"))?;
+    file.lock()?;
+    Ok(JobMutationLock { _file: file })
+}
+
+fn registered_job_path_in(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+    registered_job_path(name).map(|path| {
+        path.file_name()
+            .map(|file_name| dir.join(file_name))
+            .unwrap_or(path)
+    })
+}
+
+fn invalid_job(reason: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid job: {reason}"))
+}
+
+fn current_revision_at(path: &Path) -> std::io::Result<String> {
+    let (_, current) = load_path(path)?;
+    config_revision(&current).map_err(invalid_job)
+}
+
+fn require_revision(path: &Path, name: &str, expected: &str) -> std::io::Result<()> {
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("job not found: {name}"),
+        ));
+    }
+    let current = current_revision_at(path)?;
+    if current != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "job '{name}' changed on disk (expected revision {expected}, found {current}) — reload before saving"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn staged_job(path: &Path, job: &Job) -> std::io::Result<crate::fs::staged::Staged> {
+    let text = toml::to_string_pretty(job)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}")))?;
+    let mut staged = crate::fs::staged::Staged::create(path)?;
+    staged.write_all_from(&mut text.as_bytes())?;
+    staged.seal(true)?;
+    Ok(staged)
+}
+
+fn rename_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(source, destination)?;
+    if let Err(error) = std::fs::remove_file(source) {
+        if let Err(rollback) = std::fs::remove_file(destination) {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot remove the old job name: {error}; removing the collision-safe link also failed: {rollback}"
+                ),
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Create, update, or rename one registered job without overwriting an unseen revision.
+pub fn save_job(
+    name: &str,
+    job: &Job,
+    original_name: Option<&str>,
+    expected_revision: Option<&str>,
+) -> std::io::Result<SavedJob> {
+    job.validate().map_err(invalid_job)?;
+    let job = Job { schema: SCHEMA, ..job.clone() };
+    let config_revision = config_revision(&job).map_err(invalid_job)?;
+    let dir = crate::foundation::dirs::jobs_dir();
+    save_job_in(
+        &dir,
+        name,
+        &job,
+        original_name,
+        expected_revision,
+        config_revision,
+    )
+}
+
+fn save_job_in(
+    dir: &Path,
+    name: &str,
+    job: &Job,
+    original_name: Option<&str>,
+    expected_revision: Option<&str>,
+    config_revision: String,
+) -> std::io::Result<SavedJob> {
+    let _lock = lock_job_mutations(dir)?;
+    let destination = registered_job_path_in(dir, name)?;
+    match (original_name, expected_revision) {
+        (None, None) => {
+            if destination.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("job '{name}' already exists — reload it before saving"),
+                ));
+            }
+            let staged = staged_job(&destination, job)?;
+            if destination.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("job '{name}' was created while this save was being prepared"),
+                ));
+            }
+            staged.commit()?;
+        }
+        (Some(original_name), Some(expected_revision)) => {
+            let original = registered_job_path_in(dir, original_name)?;
+            require_revision(&original, original_name, expected_revision)?;
+            if original == destination {
+                let staged = staged_job(&destination, job)?;
+                require_revision(&original, original_name, expected_revision)?;
+                staged.commit()?;
+            } else {
+                if destination.exists() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("cannot rename job '{original_name}' to '{name}': destination already exists"),
+                    ));
+                }
+                let staged = staged_job(&destination, job)?;
+                require_revision(&original, original_name, expected_revision)?;
+                if destination.exists() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("job '{name}' was created while this rename was being prepared"),
+                    ));
+                }
+                rename_without_overwrite(&original, &destination)?;
+                if let Err(error) = staged.commit() {
+                    if let Err(rollback) = rename_without_overwrite(&destination, &original) {
+                        return Err(std::io::Error::new(
+                            error.kind(),
+                            format!("cannot save renamed job: {error}; restoring the original name also failed: {rollback}"),
+                        ));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "original_name and expected_revision must be supplied together for an update",
+            ));
+        }
+    }
+    Ok(SavedJob { name: name.to_string(), path: destination, config_revision })
+}
+
+pub fn delete_job(name: &str, expected_revision: &str) -> std::io::Result<()> {
+    delete_job_in(&crate::foundation::dirs::jobs_dir(), name, expected_revision)
+}
+
+fn delete_job_in(dir: &Path, name: &str, expected_revision: &str) -> std::io::Result<()> {
+    let _lock = lock_job_mutations(dir)?;
+    let path = registered_job_path_in(dir, name)?;
+    require_revision(&path, name, expected_revision)?;
+    std::fs::remove_file(path)
 }
 
 pub const SAMPLE: &str = r#"# <name>.toml in the jobs directory — one file, one job
@@ -895,6 +1293,204 @@ mod revision_tests {
         let error = config_revision(&job).unwrap_err();
         assert!(error.contains("min_free_pct"), "{error}");
         assert!(error.contains("finite"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    fn valid_job() -> Job {
+        Job {
+            source: "/data/source".into(),
+            target: "/data/target".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn persisted_choices_are_closed_vocabularies() {
+        let cases = [
+            ("mode", "unknown"),
+            ("rigor", "typo"),
+            ("evidence", "sometimes"),
+            ("symlinks", "follow"),
+            ("on_conflict", "overwrite"),
+        ];
+        for (field, value) in cases {
+            let mut job = valid_job();
+            match field {
+                "mode" => job.mode = value.into(),
+                "rigor" => job.rigor = value.into(),
+                "evidence" => job.evidence = Some(value.into()),
+                "symlinks" => job.symlinks = value.into(),
+                "on_conflict" => job.on_conflict = value.into(),
+                _ => unreachable!(),
+            }
+            let error = job.validate().unwrap_err();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn numeric_settings_refuse_non_finite_and_out_of_range_values() {
+        for (field, value) in [
+            ("min_free_pct", f64::NAN),
+            ("min_free_pct", -0.1),
+            ("min_free_pct", 1.1),
+            ("max_delete_ratio", f64::INFINITY),
+            ("max_delete_ratio", -0.1),
+        ] {
+            let mut job = valid_job();
+            if field == "min_free_pct" {
+                job.min_free_pct = value;
+            } else {
+                job.max_delete_ratio = value;
+            }
+            let error = job.validate().unwrap_err();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+
+        let mut job = valid_job();
+        job.max_delete_ratio = 1.1;
+        assert!(job.validate().is_ok(), "a ratio >= 1 disables the deletion gate");
+        let mut job = valid_job();
+        job.parallel = Some(17);
+        assert!(job.validate().unwrap_err().contains("parallel"));
+        let mut job = valid_job();
+        job.max_conflicts = -2;
+        assert!(job.validate().unwrap_err().contains("max_conflicts"));
+        let mut job = valid_job();
+        job.watch_interval_secs = Some(0);
+        assert!(job.validate().unwrap_err().contains("watch_interval_secs"));
+        let mut job = valid_job();
+        job.watch_auto_apply = true;
+        assert!(job.validate().unwrap_err().contains("watch_auto_apply"));
+    }
+
+    #[test]
+    fn roots_must_be_present_distinct_and_not_nested() {
+        let mut job = valid_job();
+        job.source.clear();
+        assert!(job.validate().unwrap_err().contains("source root cannot be empty"));
+
+        let mut job = valid_job();
+        job.target = "/data/source".into();
+        assert!(job.validate().unwrap_err().contains("different directories"));
+
+        let mut job = valid_job();
+        job.target = "/data/source/child".into();
+        assert!(job.validate().unwrap_err().contains("target cannot be nested"));
+
+        let mut job = valid_job();
+        job.source = r"C:\Data\Source".into();
+        job.target = r"c:/data/source/child".into();
+        assert!(job.validate().unwrap_err().contains("target cannot be nested"));
+
+        let mut job = valid_job();
+        job.targets = vec!["/data/a".into(), "/data/a".into()];
+        assert!(job.validate().unwrap_err().contains("duplicates"));
+
+        let mut job = valid_job();
+        job.source = "sftp://user@host/data/source".into();
+        job.target = "sftp://user@HOST:22/data/source/child".into();
+        assert!(job.validate().unwrap_err().contains("target cannot be nested"));
+
+        let mut job = valid_job();
+        job.source = "sftp://host/data".into();
+        job.target = "sftp://host/data/../escape".into();
+        assert!(job.validate().unwrap_err().contains("cannot contain a '..'"));
+    }
+
+    #[test]
+    fn persistence_uses_atomic_create_and_revision_checked_update_rename_delete() {
+        let dir = std::env::temp_dir().join(format!(
+            "syncdash-job-cas-{}-{}",
+            std::process::id(),
+            crate::foundation::time::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = valid_job();
+        let first_revision = config_revision(&first).unwrap();
+        let created = save_job_in(
+            &dir,
+            "photos",
+            &first,
+            None,
+            None,
+            first_revision.clone(),
+        )
+        .unwrap();
+        assert_eq!(created.config_revision, first_revision);
+
+        let mut second = first.clone();
+        second.exclude.push("*.tmp".into());
+        let second_revision = config_revision(&second).unwrap();
+        let stale = save_job_in(
+            &dir,
+            "photos",
+            &second,
+            Some("photos"),
+            Some("stale-revision"),
+            second_revision.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(stale.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(current_revision_at(&created.path).unwrap(), first_revision);
+
+        let renamed = save_job_in(
+            &dir,
+            "archive",
+            &second,
+            Some("photos"),
+            Some(&first_revision),
+            second_revision.clone(),
+        )
+        .unwrap();
+        assert!(!dir.join("photos.toml").exists());
+        assert_eq!(current_revision_at(&renamed.path).unwrap(), second_revision);
+
+        let stale_delete = delete_job_in(&dir, "archive", &first_revision).unwrap_err();
+        assert_eq!(stale_delete.kind(), std::io::ErrorKind::WouldBlock);
+        delete_job_in(&dir, "archive", &second_revision).unwrap();
+        assert!(!renamed.path.exists());
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !crate::fs::staged::is_temp_name(&entry.file_name().to_string_lossy()))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn create_and_rename_never_overwrite_an_existing_job() {
+        let dir = std::env::temp_dir().join(format!(
+            "syncdash-job-collision-{}-{}",
+            std::process::id(),
+            crate::foundation::time::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = valid_job();
+        let revision = config_revision(&job).unwrap();
+        save_job_in(&dir, "one", &job, None, None, revision.clone()).unwrap();
+        save_job_in(&dir, "two", &job, None, None, revision.clone()).unwrap();
+
+        let create = save_job_in(&dir, "one", &job, None, None, revision.clone()).unwrap_err();
+        assert_eq!(create.kind(), std::io::ErrorKind::AlreadyExists);
+        let rename = save_job_in(
+            &dir,
+            "two",
+            &job,
+            Some("one"),
+            Some(&revision),
+            revision.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(rename.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(dir.join("one.toml").is_file());
+        assert!(dir.join("two.toml").is_file());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

@@ -3,7 +3,7 @@
 use syncdash::job::{self};
 use syncdash::run;
 
-use crate::dto::{JobDto, JobFileSchemaDto};
+use crate::dto::{JobDetailDto, JobDto, JobFileSchemaDto, JobSaveDto};
 
 #[tauri::command]
 pub fn list_jobs() -> Result<Vec<JobDto>, String> {
@@ -38,10 +38,11 @@ pub fn jobs_dir() -> String {
     syncdash::foundation::dirs::jobs_dir().display().to_string()
 }
 
-/// M5: the editor reads the full Job (the list_jobs DTO is only a summary)
 #[tauri::command]
-pub fn get_job(name: String) -> Result<job::Job, String> {
-    job::load_named(&name).map(|(_, j)| j).map_err(|e| e.to_string())
+pub fn get_job(name: String) -> Result<JobDetailDto, String> {
+    let (name, job) = job::load_named(&name).map_err(|e| e.to_string())?;
+    let config_revision = job::config_revision(&job).map_err(|e| format!("Job '{name}': {e}"))?;
+    Ok(JobDetailDto { name, job, config_revision })
 }
 
 /// What a brand-new job starts from, including the default-on junk presets already materialized into
@@ -61,21 +62,27 @@ pub fn job_file_schema(name: String) -> Result<JobFileSchemaDto, String> {
         .map_err(|e| e.to_string())
 }
 
-/// M5: save a job (create, or overwrite the TOML of the same name)
 #[tauri::command]
-pub fn save_job(name: String, job: job::Job) -> Result<String, String> {
-    if name.trim().is_empty() {
-        return Err("Job name cannot be empty".into());
-    }
-    let config_revision = job::config_revision(&job).map_err(|e| format!("Job '{name}': {e}"))?;
-    job::save_job(&name, &job).map_err(|e| e.to_string())?;
-    Ok(config_revision)
+pub fn save_job(
+    name: String,
+    job: job::Job,
+    original_name: Option<String>,
+    expected_revision: Option<String>,
+) -> Result<JobSaveDto, String> {
+    let saved = job::save_job(
+        &name,
+        &job,
+        original_name.as_deref(),
+        expected_revision.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(JobSaveDto {
+        name: saved.name,
+        config_revision: saved.config_revision,
+    })
 }
 
-/// M5: delete the job's config file (not a single byte of data is touched)
 #[tauri::command]
-pub fn delete_job(name: String) -> Result<(), String> {
-    job::delete_job(&name).map_err(|e| e.to_string())
+pub fn delete_job(name: String, expected_revision: String) -> Result<(), String> {
+    job::delete_job(&name, &expected_revision).map_err(|e| e.to_string())
 }
-
-// P1: path health check and "show in file explorer"

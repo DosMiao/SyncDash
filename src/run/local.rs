@@ -13,14 +13,37 @@ use crate::pipeline::{apply, compare, scan};
 use super::CompareOutcome;
 use super::archive::refresh_archive_with;
 use super::roots::resolve_root;
-use std::path::Path;
+
+fn schedule_scans<S, T, FS, FT>(
+    same_local_volume: bool,
+    scan_source: FS,
+    scan_target: FT,
+) -> std::io::Result<(S, T)>
+where
+    S: Send,
+    T: Send,
+    FS: FnOnce() -> std::io::Result<S> + Send,
+    FT: FnOnce() -> std::io::Result<T> + Send,
+{
+    if same_local_volume {
+        let source = scan_source()?;
+        let target = scan_target()?;
+        Ok((source, target))
+    } else {
+        std::thread::scope(|scope| {
+            let source = scope.spawn(scan_source);
+            let target = scope.spawn(scan_target);
+            Ok((source.join().unwrap()?, target.join().unwrap()?))
+        })
+    }
+}
 
 /// The same pipeline, but it also hands back both snapshots (throwing them away would force the UI to scan all over again)
 /// `accept_caps` = the user consented (--accept-caps / a ticked confirmation box) to the
 /// NeedsAck lines of the capability report. Without consent a degraded run refuses to start.
 pub fn compare_job_detailed(job: &Job, ctx: &crate::obs::progress::RunCtx, accept_caps: bool) -> std::io::Result<CompareOutcome> {
     // The single pipeline handles a single target only: multi-target jobs are derived through for_target first (the CLI run loop / the desktop target picker)
-    job.validate_multi_target().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    job.validate().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     if job.targets.len() > 1 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -101,26 +124,18 @@ pub fn compare_resolved(
             ));
         }
     }
-    // Scan both sides in parallel: source and target are almost always on different disks/links (local disk vs SMB,
-    // OneDrive vs an external drive), so serial execution is pure queueing — in parallel, wall clock ≈ the slower side.
-    // Each side emits its own PhaseStart at the same moment, so the progress panel ticks on two rows at once.
-    let same_device = match (sv.as_local(), tv.as_local()) {
+    // Different volumes/links scan in parallel, so wall clock is approximately the slower side.
+    // Two roots on the same mounted volume scan sequentially to avoid competing metadata walks;
+    // this is a filesystem identity (`st_dev`/volume root), not a claim about the physical disk.
+    let same_local_volume = match (sv.as_local(), tv.as_local()) {
         (Some(source), Some(target)) => crate::fs::vfs::local::same_device(source, target),
         _ => false,
     };
-    let (s, t) = if same_device {
-        (
-            scan::scan_root(&sv, &opt, ctx, Phase::ScanSource),
-            scan::scan_root(&tv, &opt, ctx, Phase::ScanTarget),
-        )
-    } else {
-        std::thread::scope(|sc| {
-            let hs = sc.spawn(|| scan::scan_root(&sv, &opt, ctx, Phase::ScanSource));
-            let ht = sc.spawn(|| scan::scan_root(&tv, &opt, ctx, Phase::ScanTarget));
-            (hs.join().unwrap(), ht.join().unwrap())
-        })
-    };
-    let (mut s, mut t) = (s?, t?);
+    let (mut s, mut t) = schedule_scans(
+        same_local_volume,
+        || scan::scan_root(sv, &opt, ctx, Phase::ScanSource),
+        || scan::scan_root(tv, &opt, ctx, Phase::ScanTarget),
+    )?;
     // The consented degradations ride on the snapshot itself — a table must say how its
     // evidence was gathered
     {
@@ -181,20 +196,7 @@ pub fn compare_resolved(
     // Disagreement escalation: in the sampled evidence tier, a file whose digests match but whose mtimes differ by >2s may not simply be ruled identical (the knob can turn this off)
     let rr = job.rigor_resolved();
     let plan = if rr.sampled && rr.escalate {
-        match (sv.as_local(), tv.as_local()) {
-            (Some(sp), Some(tp)) => {
-                let (sp, tp) = (sp.to_path_buf(), tp.to_path_buf());
-                escalate_sampled_disagreements(job, plan, &s, &t, ctx, &sp, &tp)
-            }
-            _ => {
-                ctx.log(
-                    crate::model::event::LogLevel::Info,
-                    "compare",
-                    "escalation skipped: a root lives on a remote backend (full re-reads over the VFS arrive with the write lane)".to_string(),
-                );
-                plan
-            }
-        }
+        escalate_sampled_disagreements(job, plan, &s, &t, ctx, sv, tv, &pp)?
     } else {
         plan
     };
@@ -205,37 +207,62 @@ pub fn compare_resolved(
 /// The escalation rule: when the two signals fight (the sampled digest says "identical", mtime says "touched"), believe neither silently —
 /// **escalate that file to a full hash on both sides** and rule again. This shrinks the blind spot of fast/balanced/standard from
 /// "any change outside the sampling window" to "outside the sampling window *and* timestamp-preserving" (≈ the timestomp case).
-/// The escalation set is naturally tiny (near zero on a normal tree), so reading each one in full costs next to nothing. Local pipeline only (the remote side has no cheap way to re-read).
+/// The escalation set is naturally tiny (near zero on a normal tree), so reading each one in full
+/// costs next to nothing. Reads stay on the VFS surface so local and protocol roots get the same
+/// safety rule and the same classified failures.
 fn escalate_sampled_disagreements(
     job: &Job,
     mut plan: Plan,
     s: &Snapshot,
     t: &Snapshot,
     ctx: &crate::obs::progress::RunCtx,
-    src_root: &Path,
-    tgt_root: &Path,
-) -> Plan {
+    source: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    target: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    pp: &crate::obs::progress::PhaseProgress<'_>,
+) -> std::io::Result<Plan> {
     use crate::model::plan::Side;
     use crate::model::event::LogLevel;
     use crate::model::table::EntryKind;
-    use rayon::prelude::*;
-    // The same no-hash window compare uses — a backend with coarser mtimes widens both together
-    let slack_ms: i64 = job.compare_opts().mtime_window_ms;
+    // The same equality window used by the comparison above. Protocol roots such as FTP can be
+    // coarser than the job default, and that precision must not manufacture escalation work.
+    let slack_ms = job
+        .compare_opts()
+        .mtime_window_ms
+        .max(source.caps().mtime_precision_ms as i64)
+        .max(target.caps().mtime_precision_ms as i64);
 
-    /// Read granularity for the escalation re-read.
-    const READ_CHUNK: u64 = 8 * 1024 * 1024;
+    const MAX_READ_CHUNK: usize = 8 * 1024 * 1024;
 
-    fn full_hash(p: &Path) -> std::io::Result<String> {
+    fn full_hash(
+        vfs: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+        side: &str,
+        rel: &str,
+        pp: &crate::obs::progress::PhaseProgress<'_>,
+    ) -> std::io::Result<String> {
         use std::io::Read;
-        let mut f = std::fs::File::open(p)?;
+        pp.checkpoint()?;
+        let mut stream = vfs.open_read(rel).map_err(|error| {
+            let error: std::io::Error = error.into();
+            std::io::Error::new(
+                error.kind(),
+                format!("cannot fully verify {side} '{rel}': open failed: {error}"),
+            )
+        })?;
         let mut h = blake3::Hasher::new();
-        let mut buf = vec![0u8; f.metadata()?.len().clamp(1, READ_CHUNK) as usize];
+        let mut buf = vec![0u8; stream.block_size().clamp(64 * 1024, MAX_READ_CHUNK)];
         loop {
-            let n = f.read(&mut buf)?;
+            pp.checkpoint()?;
+            let n = stream.read(&mut buf).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("cannot fully verify {side} '{rel}': read failed: {error}"),
+                )
+            })?;
             if n == 0 {
                 break;
             }
             h.update(&buf[..n]);
+            pp.add_bytes(n as u64, rel);
         }
         Ok(h.finalize().to_hex().to_string())
     }
@@ -256,33 +283,63 @@ fn escalate_sampled_disagreements(
         })
         .collect();
     if suspects.is_empty() {
-        return plan;
+        return Ok(plan);
     }
-    ctx.log(LogLevel::Info, "compare", format!("escalation: {} file(s) with equal digests but mtime differing >2s — re-verifying both sides in full", suspects.len()));
+    let bytes_total = suspects.iter().fold(0u64, |total, (source, target)| {
+        total.saturating_add(source.size).saturating_add(target.size)
+    });
+    pp.set_totals(suspects.len() as u64, bytes_total);
+    ctx.log(
+        LogLevel::Info,
+        "compare",
+        format!(
+            "escalation: {} file(s) with equal sampled digests but mtimes outside the comparison window — re-verifying both sides in full",
+            suspects.len()
+        ),
+    );
+    // One VFS object can represent a single protocol session (FTP is the canonical case), so
+    // escalation must not open multiple suspects concurrently behind that backend's back. The
+    // set is normally empty or one item; sequential reads are the safe and realistic schedule.
     let extra: Vec<Op> = suspects
-        .par_iter()
-        .filter_map(|(se, te)| {
-            let hs = full_hash(&crate::foundation::path::join_native(src_root, &se.path)).ok()?;
-            let ht = full_hash(&crate::foundation::path::join_native(tgt_root, &te.path)).ok()?;
-            if hs == ht {
-                return None; // the digest wasn't lying: only the mtime drifted
-            }
-            let reason = "escalated: sampled digests equal, mtime differs, full hashes differ";
-            match job.mode.as_str() {
+        .iter()
+        .map(|(se, te)| -> std::io::Result<Option<Op>> {
+            let hs = full_hash(
+                source,
+                "source",
+                &se.path,
+                pp,
+            )?;
+            let ht = full_hash(
+                target,
+                "target",
+                &te.path,
+                pp,
+            )?;
+            let op = if hs == ht {
+                None
+            } else {
+                let reason = "escalated: sampled digests equal, mtime differs, full hashes differ";
+                match job.mode.as_str() {
                 // mirror: source wins unconditionally
-                "mirror" => Some(Op { side: Side::Target, action: Action::Update, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: Some(hs), link: None, mode: None, reason: reason.into() }),
+                    "mirror" => Some(Op { side: Side::Target, action: Action::Update, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: Some(hs), link: None, mode: None, reason: reason.into() }),
                 // sync: both sides differ in content with no attribution → report the conflict honestly, a human rules
-                "sync" => Some(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: None, link: None, mode: None, reason: reason.into() }),
+                    "sync" => Some(Op { side: Side::Target, action: Action::Conflict, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: None, link: None, mode: None, reason: reason.into() }),
                 // enrich: update only when source is strictly newer
-                _ => {
-                    if se.mtime_ms > te.mtime_ms + slack_ms {
-                        Some(Op { side: Side::Target, action: Action::Update, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: Some(hs), link: None, mode: None, reason: reason.into() })
-                    } else {
-                        None
+                    _ => {
+                        if se.mtime_ms > te.mtime_ms + slack_ms {
+                            Some(Op { side: Side::Target, action: Action::Update, path: se.path.clone(), from: None, size: Some(se.size), mtime_ms: Some(se.mtime_ms), hash: Some(hs), link: None, mode: None, reason: reason.into() })
+                        } else {
+                            None
+                        }
                     }
                 }
-            }
+            };
+            pp.item_done(&se.path);
+            Ok(op)
         })
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect();
     if !extra.is_empty() {
         ctx.log(LogLevel::Warn, "compare", format!("escalation confirmed {} file(s) really do differ in content (changes outside the sampling window); added to the plan", extra.len()));
@@ -291,19 +348,68 @@ fn escalate_sampled_disagreements(
         plan.header.conflict_count += new_conflicts;
         plan.ops.extend(extra);
     }
-    plan
+    Ok(plan)
 }
 
 /// Run the gates without executing — the GUI calls this before raising the confirmation sheet, so the refusal
 /// reasons are shown to the person in full instead of landing only on a stderr nobody reads.
-pub fn preflight_job(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::pipeline::guard::Verdict {
-    crate::pipeline::guard::run_all(
+pub fn preflight_job(
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    acknowledged: bool,
+) -> std::io::Result<crate::pipeline::guard::Verdict> {
+    job.validate()
+        .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))?;
+    let source = resolve_root(&job.source)?;
+    let target = resolve_root(&job.target)?;
+    Ok(preflight_resolved(
+        job,
+        plan,
         ops,
-        Path::new(&plan.header.source_root),
-        Path::new(&plan.header.target_root),
+        acknowledged,
+        &source,
+        &target,
+    ))
+}
+
+pub fn preflight_resolved(
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    acknowledged: bool,
+    source: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    target: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+) -> crate::pipeline::guard::Verdict {
+    let mut verdict = crate::pipeline::guard::Verdict {
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let source_label = root_label(source);
+    let target_label = root_label(target);
+    if source_label != plan.header.source_root || target_label != plan.header.target_root {
+        verdict.blockers.push(format!(
+            "this plan was made for '{}' → '{}' but the job resolves to '{}' → '{}' — run Compare again",
+            plan.header.source_root,
+            plan.header.target_root,
+            source_label,
+            target_label,
+        ));
+        return verdict;
+    }
+    crate::pipeline::guard::run_all_vfs(
+        ops,
+        source,
+        target,
         &plan.header,
         &job.guards(acknowledged),
     )
+}
+
+fn root_label(vfs: &std::sync::Arc<dyn crate::fs::vfs::Vfs>) -> String {
+    vfs.as_local()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| vfs.display())
 }
 
 /// The refusal shape both halves of the apply gate share: one `Error` event, and an outcome that did
@@ -404,10 +510,7 @@ pub fn apply_resolved(
     // The plan must be the one made for THESE roots. The header carries the label the
     // scan wrote: the local (possibly translated) path for local lanes, the display
     // phrase for generic-lane roots.
-    let label = |v: &std::sync::Arc<dyn crate::fs::vfs::Vfs>| {
-        v.as_local().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| v.display())
-    };
-    if label(sv) != plan.header.source_root || label(tv) != plan.header.target_root {
+    if root_label(sv) != plan.header.source_root || root_label(tv) != plan.header.target_root {
         let out = refuse_apply(
             ctx,
             ops.len(),
@@ -416,8 +519,8 @@ pub fn apply_resolved(
                 "this plan was made for '{}' → '{}' but the job resolves to '{}' → '{}' — run compare again",
                 plan.header.source_root,
                 plan.header.target_root,
-                label(sv),
-                label(tv)
+                root_label(sv),
+                root_label(tv)
             ),
         );
         return finish_apply(ctx, t0, out);
@@ -500,7 +603,7 @@ pub fn apply_resolved(
 pub fn run_local_job(name: &str, job: &Job, do_apply: bool, verbose: bool, acknowledged: bool, accept_caps: bool) -> std::io::Result<(u64, u64, u64, u64)> {
     // 1:N (the original requirement): one source → each target compared and executed independently.
     // One plan and one run log per target; source-side hashing is absorbed by the cache (in the fast tier, near-zero reads from the second target on).
-    job.validate_multi_target().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    job.validate().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let targets = job.target_list();
     let multi = targets.len() > 1;
     let mut tot = (0u64, 0u64, 0u64, 0u64);
@@ -545,9 +648,220 @@ mod tests {
     use super::*;
     use crate::fs::vfs::memory::MemVfs;
     use crate::fs::vfs::Vfs;
-    use crate::model::event::ProgressEvent;
-    use crate::obs::progress::{RunCtl, RunCtx};
+    use crate::model::event::{Phase, PhaseStatus, ProgressEvent};
+    use crate::obs::progress::{PhaseProgress, RunCtl, RunCtx};
     use std::sync::{Arc, Mutex};
+
+    fn escalation_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, Snapshot, Snapshot, Plan, Job) {
+        let base = std::env::temp_dir().join(format!("syncdash-escalation-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let source = base.join("source");
+        let target = base.join("target");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(source.join("suspect.bin"), b"same").unwrap();
+        std::fs::write(target.join("suspect.bin"), b"same").unwrap();
+
+        let scan_one = |root: &std::path::Path| {
+            scan::scan(
+                root,
+                &scan::ScanOptions {
+                    hash: false,
+                    sampled: false,
+                    use_cache: false,
+                    symlinks_direct: false,
+                    filter: crate::pipeline::filter::PathFilter::build(&[], &[]),
+                },
+            )
+            .unwrap()
+        };
+        let mut source_snapshot = scan_one(&source);
+        let mut target_snapshot = scan_one(&target);
+        let source_entry = source_snapshot.entries.iter_mut().find(|entry| entry.path == "suspect.bin").unwrap();
+        source_entry.hash = Some("~same-sample".into());
+        source_entry.mtime_ms = 10_000;
+        let target_entry = target_snapshot.entries.iter_mut().find(|entry| entry.path == "suspect.bin").unwrap();
+        target_entry.hash = Some("~same-sample".into());
+        target_entry.mtime_ms = 0;
+        source_snapshot.header.hashed = true;
+        target_snapshot.header.hashed = true;
+
+        let mut job = Job::default();
+        job.mode = "mirror".into();
+        job.rigor = "fast".into();
+        let plan = compare::compare(
+            &source_snapshot,
+            &target_snapshot,
+            &job.mode,
+            None,
+            false,
+            &job.compare_opts(),
+        );
+        assert!(plan.ops.is_empty(), "the sampled evidence alone calls this pair identical");
+        (source, target, source_snapshot, target_snapshot, plan, job)
+    }
+
+    #[test]
+    fn same_volume_scan_stops_before_target_when_source_fails() {
+        let target_called = std::sync::atomic::AtomicBool::new(false);
+        let result: std::io::Result<((), ())> = schedule_scans(
+            true,
+            || Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "source failed")),
+            || {
+                target_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result.unwrap_err().to_string(), "source failed");
+        assert!(!target_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn escalation_read_failure_aborts_instead_of_retaining_identical() {
+        let (source, target, source_snapshot, target_snapshot, plan, job) =
+            escalation_fixture("read-failure");
+        std::fs::remove_file(source.join("suspect.bin")).unwrap();
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let copy = events.clone();
+        let ctx = RunCtx::new(RunCtl::new(), Arc::new(move |event| copy.lock().unwrap().push(event)));
+        let pp = PhaseProgress::begin(&ctx, Phase::Compare, None, 0, 0);
+        let source_vfs = Arc::new(crate::fs::vfs::local::LocalVfs::new(source.clone())) as Arc<dyn Vfs>;
+        let target_vfs = Arc::new(crate::fs::vfs::local::LocalVfs::new(target.clone())) as Arc<dyn Vfs>;
+
+        let error = match escalate_sampled_disagreements(
+            &job,
+            plan,
+            &source_snapshot,
+            &target_snapshot,
+            &ctx,
+            &source_vfs,
+            &target_vfs,
+            &pp,
+        ) {
+            Ok(_) => panic!("an unreadable full-verification file must abort comparison"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("cannot fully verify source 'suspect.bin'"), "{error}");
+        drop(pp);
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(event, ProgressEvent::Totals {
+            phase: Phase::Compare,
+            items_total: 1,
+            bytes_total: 8,
+            ..
+        })));
+        assert!(matches!(events.last(), Some(ProgressEvent::PhaseEnd {
+            phase: Phase::Compare,
+            status: PhaseStatus::Failed,
+            ..
+        })));
+        let _ = std::fs::remove_dir_all(source.parent().unwrap());
+    }
+
+    #[test]
+    fn escalation_honors_cancellation_before_reopening_files() {
+        let (source, target, source_snapshot, target_snapshot, plan, job) =
+            escalation_fixture("cancel");
+        let ctl = RunCtl::new();
+        ctl.request_cancel();
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let copy = events.clone();
+        let ctx = RunCtx::new(ctl, Arc::new(move |event| copy.lock().unwrap().push(event)));
+        let pp = PhaseProgress::begin(&ctx, Phase::Compare, None, 0, 0);
+        let source_vfs = Arc::new(crate::fs::vfs::local::LocalVfs::new(source.clone())) as Arc<dyn Vfs>;
+        let target_vfs = Arc::new(crate::fs::vfs::local::LocalVfs::new(target.clone())) as Arc<dyn Vfs>;
+
+        let error = match escalate_sampled_disagreements(
+            &job,
+            plan,
+            &source_snapshot,
+            &target_snapshot,
+            &ctx,
+            &source_vfs,
+            &target_vfs,
+            &pp,
+        ) {
+            Ok(_) => panic!("cancelled escalation must not complete"),
+            Err(error) => error,
+        };
+        assert!(crate::obs::progress::is_cancelled(&error));
+        drop(pp);
+        assert!(matches!(events.lock().unwrap().last(), Some(ProgressEvent::PhaseEnd {
+            phase: Phase::Compare,
+            status: PhaseStatus::Cancelled,
+            ..
+        })));
+        let _ = std::fs::remove_dir_all(source.parent().unwrap());
+    }
+
+    #[test]
+    fn escalation_rechecks_nonlocal_vfs_roots_instead_of_skipping_them() {
+        let source = MemVfs::new("escalate-vfs-source").without(|caps| caps.max_parallel_streams = 1);
+        let target = MemVfs::new("escalate-vfs-target").without(|caps| caps.max_parallel_streams = 1);
+        source.seed_bytes("suspect.bin", b"src!", 10_000);
+        target.seed_bytes("suspect.bin", b"tgt!", 0);
+        let source = Arc::new(source) as Arc<dyn Vfs>;
+        let target = Arc::new(target) as Arc<dyn Vfs>;
+        let opt = scan::ScanOptions {
+            hash: false,
+            sampled: false,
+            use_cache: false,
+            symlinks_direct: false,
+            filter: crate::pipeline::filter::PathFilter::build(&[], &[]),
+        };
+        let mut source_snapshot = scan::scan_root(
+            &source,
+            &opt,
+            &RunCtx::null(),
+            Phase::ScanSource,
+        )
+        .unwrap();
+        let mut target_snapshot = scan::scan_root(
+            &target,
+            &opt,
+            &RunCtx::null(),
+            Phase::ScanTarget,
+        )
+        .unwrap();
+        source_snapshot.entries[0].hash = Some("~same-sample".into());
+        target_snapshot.entries[0].hash = Some("~same-sample".into());
+        source_snapshot.header.hashed = true;
+        target_snapshot.header.hashed = true;
+        let mut job = Job::default();
+        job.mode = "mirror".into();
+        job.rigor = "fast".into();
+        let plan = compare::compare(
+            &source_snapshot,
+            &target_snapshot,
+            &job.mode,
+            None,
+            false,
+            &job.compare_opts(),
+        );
+        assert!(plan.ops.is_empty());
+        let ctx = RunCtx::null();
+        let pp = PhaseProgress::begin(&ctx, Phase::Compare, None, 0, 0);
+
+        let plan = escalate_sampled_disagreements(
+            &job,
+            plan,
+            &source_snapshot,
+            &target_snapshot,
+            &ctx,
+            &source,
+            &target,
+            &pp,
+        )
+        .unwrap();
+        pp.finish().unwrap();
+
+        assert_eq!(plan.ops.len(), 1);
+        assert_eq!(plan.ops[0].action, Action::Update);
+        assert!(plan.ops[0].reason.starts_with("escalated:"));
+    }
 
     /// The generic VFS lane end to end: `as_local()` is None on both sides, so this drives
     /// `scan_vfs` rather than the walkdir fast path, then compares and plans.
@@ -599,6 +913,43 @@ mod tests {
             ],
             "same.bin must compare equal; the three drifts must each classify"
         );
+    }
+
+    #[test]
+    fn preflight_uses_the_open_vfs_roots_instead_of_display_paths() {
+        let source = MemVfs::new("preflight-source");
+        let target = MemVfs::new("preflight-target");
+        source.seed_bytes(crate::foundation::names::MARKER_NAME, b"source", 1);
+        target.seed_bytes(crate::foundation::names::MARKER_NAME, b"target", 1);
+        let (source, target) = (
+            Arc::new(source) as Arc<dyn Vfs>,
+            Arc::new(target) as Arc<dyn Vfs>,
+        );
+        let mut job = Job::default();
+        job.require_marker = true;
+        let plan = compare_resolved(&job, &source, &target, &RunCtx::null(), false)
+            .unwrap()
+            .plan;
+
+        let verdict = preflight_resolved(&job, &plan, &[], false, &source, &target);
+
+        assert!(verdict.ok(), "VFS markers must satisfy preflight: {:?}", verdict.blockers);
+    }
+
+    #[test]
+    fn preflight_rejects_a_plan_for_different_resolved_roots() {
+        let source = Arc::new(MemVfs::new("preflight-source")) as Arc<dyn Vfs>;
+        let target = Arc::new(MemVfs::new("preflight-target")) as Arc<dyn Vfs>;
+        let job = Job::default();
+        let mut plan = compare_resolved(&job, &source, &target, &RunCtx::null(), false)
+            .unwrap()
+            .plan;
+        plan.header.target_root = "mem://another-target".into();
+
+        let verdict = preflight_resolved(&job, &plan, &[], false, &source, &target);
+
+        assert!(!verdict.ok());
+        assert!(verdict.blockers[0].contains("run Compare again"));
     }
 
     /// A backend that cannot serve ranged reads degrades the sampled evidence tier. That must

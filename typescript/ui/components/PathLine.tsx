@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ArrowLeftRight, FolderOpen } from 'lucide-react';
 import { summarizePresets } from '../../core/junk';
 import { pathState, usePathVerdict } from '../hooks/usePathVerdict';
+import { rootEditKeyAction } from '../state/execution-safety';
 import { useJunkPresets } from './JunkPresets';
 import { PathVerdictBox } from './PathVerdictBox';
 import type { JobDto } from '../../core/types/generated/JobDto';
@@ -121,6 +122,8 @@ export function PathLine(props: Props) {
   const targetValue = targets[selTarget] ?? '';
   const [src, setSrc] = useState(job?.source ?? '');
   const [tgt, setTgt] = useState(targetValue);
+  const suppressSourceBlur = useRef(false);
+  const suppressTargetBlur = useRef(false);
 
   // Re-seed whenever the job (or the selected target of a 1:N job) changes underneath the box
   useEffect(() => { setSrc(job?.source ?? ''); }, [job?.name, job?.source]);
@@ -151,10 +154,19 @@ export function PathLine(props: Props) {
           value={src}
           onChange={(e) => setSrc(e.target.value)}
           // change fires only on Enter or blur — nothing is written to disk while typing
-          onBlur={() => onCommit('source', src)}
+          onBlur={() => {
+            if (suppressSourceBlur.current) { suppressSourceBlur.current = false; return; }
+            onCommit('source', src);
+          }}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
-            if (e.key === 'Escape') { setSrc(job?.source ?? ''); (e.target as HTMLInputElement).blur(); }
+            const action = rootEditKeyAction(e.key);
+            if (!action) return;
+            e.preventDefault();
+            if (action === 'revert') {
+              suppressSourceBlur.current = true;
+              setSrc(job?.source ?? '');
+            }
+            (e.target as HTMLInputElement).blur();
           }}
         />
         <button className="pbtn" title="Browse…" disabled={!job || busy} onClick={() => onBrowse('source')}>
@@ -162,7 +174,7 @@ export function PathLine(props: Props) {
         </button>
         <button
           className="pbtn"
-          title={job ? `Swap: ${job.source} ⇄ ${job.target} (written back to the job file)` : 'Swap source / target'}
+          title={job ? `Swap: ${job.source} ⇄ ${targetValue} (written back to the job file)` : 'Swap source / target'}
           disabled={!job || busy}
           onClick={onSwap}
         ><ArrowLeftRight size={13} /></button>
@@ -178,10 +190,19 @@ export function PathLine(props: Props) {
           title={tgt}
           value={tgt}
           onChange={(e) => setTgt(e.target.value)}
-          onBlur={() => onCommit('target', tgt)}
+          onBlur={() => {
+            if (suppressTargetBlur.current) { suppressTargetBlur.current = false; return; }
+            onCommit('target', tgt);
+          }}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
-            if (e.key === 'Escape') { setTgt(targetValue); (e.target as HTMLInputElement).blur(); }
+            const action = rootEditKeyAction(e.key);
+            if (!action) return;
+            e.preventDefault();
+            if (action === 'revert') {
+              suppressTargetBlur.current = true;
+              setTgt(targetValue);
+            }
+            (e.target as HTMLInputElement).blur();
           }}
         />
         <button className="pbtn" title="Browse…" disabled={!job || busy} onClick={() => onBrowse('target')}>

@@ -34,11 +34,26 @@ fn main() {
         syncdash::log_info!("app", "Log cleanup: removed the records of {dropped} runs");
     }
     tauri::Builder::default()
-        // Main window closes → cascade-destroy the progress sub-window; a leftover window keeps Tauri from exiting ("the app won't close")
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
-                    use tauri::Manager;
+                    use tauri::{Emitter, Manager};
+
+                    let state = window.state::<Arc<RunState>>();
+                    if state::has_run_activity(state.inner()) {
+                        api.prevent_close();
+                        let _ = window.emit(
+                            "main-close-blocked",
+                            "A compare or synchronization is still running. Cancel it before closing SyncDash.",
+                        );
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                        if let Some(progress) = window.app_handle().get_webview_window("progress") {
+                            let _ = progress.show();
+                            let _ = progress.set_focus();
+                        }
+                        return;
+                    }
 
                     if let Some(p) = window.app_handle().get_webview_window("progress") {
                         let _ = p.destroy();

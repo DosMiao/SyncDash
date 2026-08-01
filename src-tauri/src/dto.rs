@@ -33,6 +33,21 @@ pub(crate) struct JobDto {
     pub(crate) config_revision: String,
 }
 
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct JobDetailDto {
+    pub(crate) name: String,
+    pub(crate) job: syncdash::job::Job,
+    pub(crate) config_revision: String,
+}
+
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct JobSaveDto {
+    pub(crate) name: String,
+    pub(crate) config_revision: String,
+}
+
 /// Immutable provenance for one successful comparison.
 ///
 /// The frontend carries this value with the plan. Commands that read cached evidence or can write
@@ -97,6 +112,7 @@ pub(crate) struct ApplyDto {
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct PreflightDto {
     pub(crate) ok: bool,
+    pub(crate) acknowledgeable: bool,
     pub(crate) blockers: Vec<String>,
     pub(crate) warnings: Vec<String>,
 }

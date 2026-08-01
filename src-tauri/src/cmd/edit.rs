@@ -4,14 +4,6 @@
 
 use crate::dto::{JunkPresetDto, PathInfo, PathVerdict};
 
-/// Normalize to a comparable form: lowercase + '/' separators + no trailing separator.
-/// Used only to decide "are the two roots the same / nested"; it never affects sync semantics.
-fn norm_root(p: &str) -> String {
-    let s = p.trim().replace('\\', "/").to_lowercase();
-    let s = s.trim_end_matches('/');
-    s.to_string()
-}
-
 /// Live health check for the editor: whether the path exists, whether it is a directory, whether it
 /// carries a mount-point marker, and how the two roots relate (identical / nested). A mistyped path costs
 /// too much to be reported only in the status bar once Compare runs.
@@ -67,20 +59,16 @@ pub fn inspect_paths(source: String, target: String) -> PathVerdict {
     }
     if t_note.is_none() {
         if !t.is_empty() && !v.target.exists {
-            v.warnings.push(format!("target does not exist: {t} (it will be created on the first sync)"));
+            v.warnings.push(format!(
+                "target does not exist: {t} (Compare will refuse until the endpoint is available)"
+            ));
         } else if !t.is_empty() && !v.target.is_dir {
             v.warnings.push("target is not a directory".into());
         }
     }
-    let (ns, nt) = (norm_root(s), norm_root(t));
-    if !ns.is_empty() && ns == nt {
-        v.warnings.push("source and target are the same directory".into());
-    } else if !ns.is_empty() && !nt.is_empty() {
-        // Nesting: mirror pours the outer contents into the inner root, then treats what it poured in as new outer content — it eats its own tail
-        if nt.starts_with(&format!("{ns}/")) {
-            v.warnings.push("target sits under source — nested roots copy into themselves".into());
-        } else if ns.starts_with(&format!("{nt}/")) {
-            v.warnings.push("source sits under target — nested roots copy into themselves".into());
+    if !s.is_empty() && !t.is_empty() {
+        if let Err(reason) = syncdash::job::validate_root_pair(s, t) {
+            v.warnings.push(reason);
         }
     }
     v
@@ -108,4 +96,30 @@ pub fn junk_presets() -> Vec<JunkPresetDto> {
             default_on: p.default_on,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_targets_are_not_promised_to_be_created() {
+        let verdict = inspect_paths("/definitely/missing/source".into(), "/definitely/missing/target".into());
+        let message = verdict.warnings.join("\n");
+        assert!(message.contains("Compare will refuse"), "{message}");
+        assert!(!message.contains("will be created"), "{message}");
+    }
+
+    #[test]
+    fn remote_nested_roots_use_engine_validation() {
+        let verdict = inspect_paths(
+            "sftp://user@host/data".into(),
+            "sftp://user@HOST:22/data/child".into(),
+        );
+        assert!(
+            verdict.warnings.iter().any(|warning| warning.contains("target cannot be nested")),
+            "{:?}",
+            verdict.warnings
+        );
+    }
 }

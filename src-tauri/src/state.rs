@@ -29,15 +29,23 @@ pub(crate) struct CachedSnaps {
 
 #[derive(Default)]
 pub(crate) struct SnapCache(pub(crate) Mutex<Option<CachedSnaps>>);
+
+#[derive(Clone)]
+pub(crate) struct ActiveRun {
+    pub(crate) id: u64,
+    pub(crate) ctl: Arc<RunCtl>,
+}
+
 #[derive(Default)]
 pub(crate) struct RunState {
     gate: Mutex<()>,
-    pub(crate) active: Mutex<Option<Arc<RunCtl>>>,
+    active: Mutex<Option<ActiveRun>>,
     active_launch: Mutex<Option<u64>>,
     pending_launch: Mutex<Option<u64>>,
     progress_window_closing: Mutex<bool>,
     pub(crate) seq: AtomicU64,
     launch_seq: AtomicU64,
+    commands_in_flight: AtomicU64,
 }
 
 pub(crate) fn begin_run(st: &RunState) -> Result<(u64, Arc<RunCtl>), String> {
@@ -79,8 +87,8 @@ pub(crate) fn close_progress_launch(st: &RunState) -> &'static str {
         return "pending";
     }
     if st.active_launch.lock().unwrap().is_some() {
-        if let Some(ctl) = st.active.lock().unwrap().as_ref() {
-            ctl.request_cancel();
+        if let Some(run) = st.active.lock().unwrap().as_ref() {
+            run.ctl.request_cancel();
         }
         return "active";
     }
@@ -110,16 +118,70 @@ pub(crate) fn begin_run_for_launch(
         None if pending.is_some() => return Err("A synchronization is already preparing to start".into()),
         None => {}
     }
+    let run_id = st.seq.fetch_add(1, Ordering::Relaxed) + 1;
     let ctl = RunCtl::new();
-    *g = Some(ctl.clone());
+    *g = Some(ActiveRun { id: run_id, ctl: ctl.clone() });
     *st.active_launch.lock().unwrap() = launch_id;
-    Ok((st.seq.fetch_add(1, Ordering::Relaxed) + 1, ctl))
+    Ok((run_id, ctl))
 }
 
-pub(crate) fn end_run(st: &RunState) {
+pub(crate) fn end_run(st: &RunState, run_id: u64) -> bool {
     let _gate = st.gate.lock().unwrap();
-    *st.active.lock().unwrap() = None;
+    let mut active = st.active.lock().unwrap();
+    if active.as_ref().map(|run| run.id) != Some(run_id) {
+        return false;
+    }
+    *active = None;
     *st.active_launch.lock().unwrap() = None;
+    true
+}
+
+pub(crate) fn has_run_activity(st: &RunState) -> bool {
+    let _gate = st.gate.lock().unwrap();
+    st.active.lock().unwrap().is_some()
+        || st.pending_launch.lock().unwrap().is_some()
+        || st.commands_in_flight.load(Ordering::Acquire) > 0
+}
+
+pub(crate) fn begin_run_command(st: &RunState) {
+    let _gate = st.gate.lock().unwrap();
+    st.commands_in_flight.fetch_add(1, Ordering::AcqRel);
+}
+
+pub(crate) fn finish_run_command(st: &RunState) {
+    let _gate = st.gate.lock().unwrap();
+    let previous = st.commands_in_flight.fetch_sub(1, Ordering::AcqRel);
+    debug_assert!(previous > 0, "run-command activity underflow");
+}
+
+pub(crate) fn request_cancel(st: &RunState, run_id: u64) -> Result<bool, String> {
+    let active = st.active.lock().unwrap();
+    let Some(run) = active.as_ref() else {
+        return Ok(false);
+    };
+    if run.id != run_id {
+        return Err(format!(
+            "Run {run_id} is no longer active; run {} is active now",
+            run.id
+        ));
+    }
+    run.ctl.request_cancel();
+    Ok(true)
+}
+
+pub(crate) fn set_paused(st: &RunState, run_id: u64, paused: bool) -> Result<bool, String> {
+    let active = st.active.lock().unwrap();
+    let Some(run) = active.as_ref() else {
+        return Ok(false);
+    };
+    if run.id != run_id {
+        return Err(format!(
+            "Run {run_id} is no longer active; run {} is active now",
+            run.id
+        ));
+    }
+    run.ctl.set_paused(paused);
+    Ok(true)
 }
 
 // Event bridge
@@ -402,11 +464,13 @@ mod tests {
         assert!(begin_run(&state).is_err());
         assert!(begin_run_for_launch(&state, Some(launch + 1)).is_err());
 
-        let (_, ctl) = begin_run_for_launch(&state, Some(launch)).unwrap();
-        assert!(Arc::ptr_eq(state.active.lock().unwrap().as_ref().unwrap(), &ctl));
+        let (run_id, ctl) = begin_run_for_launch(&state, Some(launch)).unwrap();
+        let active = state.active.lock().unwrap().as_ref().unwrap().clone();
+        assert_eq!(active.id, run_id);
+        assert!(Arc::ptr_eq(&active.ctl, &ctl));
         assert_eq!(close_progress_launch(&state), "active");
         assert!(ctl.cancelled());
-        end_run(&state);
+        assert!(end_run(&state, run_id));
         assert!(state.active.lock().unwrap().is_none());
     }
 
@@ -428,6 +492,37 @@ mod tests {
 
         finish_progress_window_close(&state);
         assert!(reserve_progress_launch(&state).is_ok());
+    }
+
+    #[test]
+    fn delayed_controls_cannot_target_a_newer_run() {
+        let state = RunState::default();
+        let (first, _) = begin_run(&state).unwrap();
+        assert!(end_run(&state, first));
+        let (second, ctl) = begin_run(&state).unwrap();
+
+        let cancel = request_cancel(&state, first).unwrap_err();
+        assert!(cancel.contains(&format!("run {second}")), "{cancel}");
+        let pause = set_paused(&state, first, true).unwrap_err();
+        assert!(pause.contains(&format!("run {second}")), "{pause}");
+        assert!(!ctl.cancelled());
+
+        assert!(set_paused(&state, second, true).unwrap());
+        assert!(request_cancel(&state, second).unwrap());
+        assert!(ctl.cancelled());
+        assert!(!end_run(&state, first));
+        assert!(has_run_activity(&state));
+        assert!(end_run(&state, second));
+        assert!(!has_run_activity(&state));
+    }
+
+    #[test]
+    fn command_activity_closes_the_pre_run_window_race() {
+        let state = RunState::default();
+        begin_run_command(&state);
+        assert!(has_run_activity(&state));
+        finish_run_command(&state);
+        assert!(!has_run_activity(&state));
     }
 }
 

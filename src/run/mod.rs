@@ -114,6 +114,7 @@ pub fn compare(
     ctx: &crate::obs::progress::RunCtx,
     accept_caps: bool,
 ) -> std::io::Result<CompareOutcome> {
+    validate_job(job)?;
     if is_peer_job(job) {
         // The peer scans its own disk and sends back a table; capability consent is a property of
         // the roots this process opens, so it has nothing to apply to.
@@ -124,9 +125,15 @@ pub fn compare(
 }
 
 /// Gate a plan before applying it.
-pub fn preflight(job: &Job, plan: &Plan, ops: &[Op], acknowledged: bool) -> crate::pipeline::guard::Verdict {
+pub fn preflight(
+    job: &Job,
+    plan: &Plan,
+    ops: &[Op],
+    acknowledged: bool,
+) -> std::io::Result<crate::pipeline::guard::Verdict> {
+    validate_job(job)?;
     if is_peer_job(job) {
-        preflight_peer_job(job, plan, ops, acknowledged)
+        Ok(preflight_peer_job(job, plan, ops, acknowledged))
     } else {
         preflight_job(job, plan, ops, acknowledged)
     }
@@ -145,6 +152,7 @@ pub fn apply(
     accept_caps: bool,
     ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
+    validate_job(job)?;
     if is_peer_job(job) {
         apply_peer_job_with(name, job, plan, ops, verbose, acknowledged, ctx)
     } else {
@@ -161,11 +169,17 @@ pub fn run_job(
     acknowledged: bool,
     accept_caps: bool,
 ) -> std::io::Result<(u64, u64, u64, u64)> {
+    validate_job(job)?;
     if is_peer_job(job) {
         run_peer_job(name, job, do_apply, verbose, acknowledged)
     } else {
         run_local_job(name, job, do_apply, verbose, acknowledged, accept_caps)
     }
+}
+
+fn validate_job(job: &Job) -> std::io::Result<()> {
+    job.validate()
+        .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))
 }
 
 pub fn compare_job(job: &Job) -> std::io::Result<Plan> {
