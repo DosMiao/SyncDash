@@ -372,6 +372,40 @@ mod tests {
     }
 
     #[test]
+    fn filtered_no_cache_vfs_scan_retains_hashes_outside_its_domain() {
+        let memory = Arc::new(MemVfs::new(&format!(
+            "filtered-no-cache-vfs-{}",
+            std::process::id()
+        )));
+        memory.seed_bytes("included.bin", b"old!", 1_700_000_000_000);
+        memory.seed_bytes("excluded/keep.bin", b"outside", 1_700_000_000_000);
+        let vfs: Arc<dyn Vfs> = memory.clone();
+
+        let first = scan_root(&vfs, &opts(), &RunCtx::null(), Phase::ScanSource).unwrap();
+        let old_hash = first
+            .entries
+            .iter()
+            .find(|entry| entry.path == "included.bin")
+            .and_then(|entry| entry.hash.clone())
+            .unwrap();
+
+        memory.seed_bytes("included.bin", b"new!", 1_700_000_000_000);
+        let mut filtered = opts();
+        filtered.filter = crate::pipeline::filter::PathFilter::build(&[], &["/excluded/".into()]);
+        let second = scan_root(&vfs, &filtered, &RunCtx::null(), Phase::ScanSource).unwrap();
+        let new_hash = second
+            .entries
+            .iter()
+            .find(|entry| entry.path == "included.bin")
+            .and_then(|entry| entry.hash.as_deref())
+            .unwrap();
+        assert_ne!(new_hash, old_hash);
+
+        let cache = crate::store::hashcache::load_by_key(&vfs.identity());
+        assert!(cache.contains_key("excluded/keep.bin"));
+    }
+
+    #[test]
     fn no_hash_scan_ends_with_all_discovered_items_done() {
         let root = mk_tree("no-hash-progress", 7);
         let store: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));

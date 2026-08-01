@@ -55,7 +55,9 @@ pub(super) fn scan_vfs(
     // snapshot's VfsNote records the tier that actually ran.
     let sampled = opt.sampled && caps.ranged_read.yes();
     let measured = std::time::Instant::now();
-    let cache = if opt.hash && opt.use_cache {
+    // A no-cache scan must not reuse these hashes, but it still needs the previous table in order
+    // to retain rows deliberately outside the active filter domain when reconciliation completes.
+    let cache = if opt.hash {
         crate::store::hashcache::load_by_key(&identity)
     } else {
         HashMap::new()

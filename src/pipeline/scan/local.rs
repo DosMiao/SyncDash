@@ -118,7 +118,10 @@ pub(super) fn scan_impl(
     let mut metrics = ScanMetrics::default();
     let local_state = crate::store::localid::LocalScanStateIdentity::for_root(root);
     let measured = std::time::Instant::now();
-    let cache = if opt.hash && opt.use_cache {
+    // No-cache rigor tiers still need the previous table to preserve rows outside this scan's
+    // filter domain. `use_cache` controls reuse below; loading here does not turn old hashes into
+    // evidence for any file observed by this scan.
+    let cache = if opt.hash {
         crate::store::hashcache::load_local(&local_state)
     } else {
         HashMap::new()
@@ -777,6 +780,49 @@ mod tests {
             "a same-size replacement with the same coarse raw mtime must be re-read",
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn filtered_no_cache_scan_retains_hashes_outside_its_domain() {
+        let root = std::env::temp_dir().join(format!(
+            "syncdash-filtered-no-cache-local-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("excluded")).unwrap();
+        let included = root.join("included.bin");
+        std::fs::write(&included, b"old!").unwrap();
+        std::fs::write(root.join("excluded/keep.bin"), b"outside").unwrap();
+        let stamp = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(&included, stamp).unwrap();
+
+        let first = scan(&root, &opts()).unwrap();
+        let old_hash = first
+            .entries
+            .iter()
+            .find(|entry| entry.path == "included.bin")
+            .and_then(|entry| entry.hash.clone())
+            .unwrap();
+
+        // Same size and mtime would be a cache hit if loading state accidentally weakened the
+        // no-cache tier. The filtered scan must re-read this file while retaining the other row.
+        std::fs::write(&included, b"new!").unwrap();
+        filetime::set_file_mtime(&included, stamp).unwrap();
+        let mut filtered = opts();
+        filtered.filter = PathFilter::build(&[], &["/excluded/".into()]);
+        let second = scan(&root, &filtered).unwrap();
+        let new_hash = second
+            .entries
+            .iter()
+            .find(|entry| entry.path == "included.bin")
+            .and_then(|entry| entry.hash.as_deref())
+            .unwrap();
+        assert_ne!(new_hash, old_hash);
+
+        let state = crate::store::localid::LocalScanStateIdentity::for_root(&root);
+        let cache = crate::store::hashcache::load_local(&state);
+        assert!(cache.contains_key("excluded/keep.bin"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
