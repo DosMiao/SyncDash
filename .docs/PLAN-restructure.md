@@ -5,6 +5,10 @@
 > Baseline at time of writing: `cargo check --workspace --all-targets` clean, **231 tests green**
 > (219 + 12, 1 ignored, 0.72s), `tsc --noEmit` clean, ts-rs output byte-identical on regeneration.
 >
+> **Current status:** historical completion ledger. Its Rust phase records remain useful, but its
+> frontend inventory predates the current Result Workspace / Run Scope architecture. Use
+> `AGENTS.md` and `README.md` for live file names, ownership boundaries and validation counts.
+>
 > Supersedes the L2-and-above half of `PLAN-refactor.md`. That document's L0/L1 half
 > (`foundation/`, `model/`, `obs/`, `store/`, `fs/`) **has been executed**; its frontend phases
 > describe a vanilla `main.ts` that no longer exists. Its L2/L3/L4 half was never done — that is

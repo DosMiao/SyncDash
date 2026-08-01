@@ -132,7 +132,7 @@ The registry assigns `job_id` on first registered load/save without changing the
 `config_revision`. Renaming moves that identity with the TOML; deleting and recreating the same name creates a
 different identity, so callers can distinguish replacement from an ordinary edit. Desktop save returns one typed
 effect (`created`, `updated`, `renamed`, or `no_op`) and delete returns `deleted`; save/delete are serialized against
-the same run-entry gate as Compare/Synchronize, so a configuration cannot change between a run's idle check and its
+the same run-entry gate as Compare/Apply, so a configuration cannot change between a run's idle check and its
 job load.
 
 ## Logging (v0.10)
@@ -186,10 +186,11 @@ mirror_stderr = true     # the CLI also mirrors verbatim to stderr (terminal exp
 An FFS-shaped dark two-pane UI: the job list on the left (mode badges: mirror blue / sync green / enrich orange) →
 **Compare** (runs in the background via spawn_blocking, the UI never freezes) → the diff table, laid out
 symmetrically around what happens: checkbox + source path / size / time + **action** + target path / size / time +
-reason. The action is coloured text with a direction arrow and a per-category glyph (`→ ⧉ copy`, `← 🗑 delete`,
-`⚡ conflict`) — the same glyph and hue the matching filter chip and stats segment use, from one map in
-`typescript/ui/icons.tsx` →
-stats bar (items / selected / bytes to transfer / conflicts) → **Synchronize** applies the checked rows and
+reason. The action is colored text with a direction arrow and a per-result-type glyph (`→ ⧉ copy`, `← 🗑 delete`,
+`⚡ conflict`) — the same glyph and hue used by its matching Run Scope facet. `RESULT_TYPE_ICON` owns the
+React glyphs, while `.result-type-*` CSS classes own the shared semantic hues → executable stats (selected
+copy / update / move / delete + bytes to transfer) → the toolbar's mode-named action opens an **Apply** review
+for the checked, in-scope rows and
 **re-compares automatically** afterwards to verify convergence. conflict/note rows are locked and cannot be
 checked. Frontend: Vite + React 19, styled by the hand-written token layer in `typescript/styles.css` — no UI
 or styling library. Every size and color resolves through that one file, with a hard floor of 11px type and
@@ -199,12 +200,24 @@ borders and layout scale with the text. Both themes are defined there and follow
 floor on the hover surface and take a darker step. Changing any color means re-running the audit against
 `--bg`, `--bg-2` and `--bg-3` — several hues clear the first and fail the third.
 
+The current result workspace separates three concerns. **Result Set** switches between Differences and the
+authenticated, paged Identical snapshot. **Run Scope** determines execution membership from result type, search,
+folder scope and Advanced Filters; `typescript/core/runScope.ts` returns indices in engine plan order, and pending or failed
+mask matching fails closed. **View** controls grouping, folding, sorting and relative/full paths without changing
+what will run. `typescript/ui/hooks/useRunScopeController.ts` owns the complete scope state and its one-time
+`sd.ov` → `sd.scope`
+preference migration. In Differences, the Result bar exposes `Found → In Scope → Selected`, while
+`deriveApplyAvailability` is the single guard shared by the toolbar and confirmation flow: Apply is available only
+for checked executable rows in the Differences view. `ResultBar`, `RunScopePanel`, `AdvancedFiltersPopover` and
+`IdenticalResultsPanel` render these domains; they do not carry duplicate execution logic.
+
 Added in v0.3.2: **per-row direction flip** (click the row's action to toggle; copy↔delete are inverses and update
 swaps sides; the frontend derives that preview lazily, while preflight/apply send only row indices + flip flags and
 the Rust core's `reverse_op` reconstructs the executable operation; a flipped row gets a tinted background and a
 dashed outline on its direction arrow), **filter chips** (all/copy/update/move/delete/conflict, live counts, each
-carrying its category's own hue and glyph, 0-item chips dimmed by token — GitDash
-style), **search box** (substring over path/from/reason), **pre-sync confirmation sheet** (per-category counts +
+carrying its category's own hue and glyph, 0-item chips dimmed by token — later superseded by the current exhaustive
+result-type facets), **search box** (substring over
+path/from/reason), **pre-sync confirmation sheet** (per-category counts +
 bytes, deletions highlighted in red), **keyboard shortcuts** (Ctrl/⌘+R compare, Ctrl/⌘+F search, Enter
 synchronize, Esc close overlay), **immersive Mac title bar**.
 
@@ -223,9 +236,10 @@ v0.9 "Progress & Polish" (behavior parameters cross-checked against the FFS 14.1
   `.syncdash.tmp.*` residue), **error accumulation panel** (errors do not halt the run — FFS semantics; stderr is
   lost in a windowed build, so errors and warnings all ride the event stream), **Auto-close** and
   **When finished** (sleep/shutdown, with a 10-second cancellable countdown).
-- **Overview aggregation sidebar** (collapsible, to the left of the diff table): aggregates items/bytes/share bars
-  by top-level directory, click to filter the diff table, the second level expands lazily; **iconified stats bar**
-  (zeros greyed out, non-zeros bold and colored).
+- **Overview aggregation sidebar** (collapsible, to the left of the diff table): aggregated items/bytes/share bars
+  by top-level directory, clicked to filter the diff table, with the second level expanded lazily; **iconified stats
+  bar** (zeros grayed out, non-zeros bold and colored). The current Result Workspace described above supersedes
+  this first aggregation-only design.
 - **Run logs**: every real apply writes a `logs/runs.jsonl` index entry plus per-run detail (the finalized op list
   + accumulated errors); the sidebar job rows show **last sync** (a result-colored dot + relative time, turning
   red past 7 days); the GUI log panel can review history and detail; CLI `syncdash history [job] [--prune-days N]`.
@@ -282,16 +296,20 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
   `core/grouping.ts` owns display order for exactly this reason: it used to be split between the row sort and the
   group builder, which is why the two had to be mutually exclusive. A column the responsive layout folds away hands
   its sort key to the surviving column on the same side, so no key is ever unreachable.
-- **Status-bar counts**: `Showing X / Y · Z hidden, not run · Scanned A ⇄ B · Identical K` (FFS's "Showing 481 of 23,112").
+- **Status-bar counts** originally read `Showing X / Y · Z hidden, not run · Scanned A ⇄ B · Identical K`.
+  The current Result bar replaces Showing with the explicit `Found → In Scope → Selected` sequence;
   `source_entries`/`target_entries` had been sitting in the plan header all along.
-- **Funnel filter** (applies to the current result, no rescan): name mask (FFS syntax) + size range + time span.
+- **Funnel filter** (renamed **Advanced Filters** in the current Result Workspace; applies to the current result,
+  no rescan): name mask (FFS syntax) + size range + time span.
   Mask matching goes back to Rust's `filter::mask_hits` — the frontend never writes a second glob of its own,
   because only then does a mask you tried out in the UI behave the same once written into the job's exclude. A
   button at the bottom of the panel **promotes** a temporary mask into a persistent job exclude.
-- ⚠ **The view is the action set**: rows hidden by the funnel / search / category chips **will not be applied**
-  (FFS semantics). This fixes a quiet trap in the old behavior — filtering with the search box used to leave
-  hidden-but-still-checked rows to go through with Synchronize anyway. The confirmation sheet now spells out
-  "N items hidden by filters, not applied", and the stats bar switches to counting checked ∩ visible to match.
+- ⚠ **The view became the action set** in v0.9.2; the current model names that boundary explicitly as **Run Scope**.
+  Rows outside Advanced Filters / search / result-type / folder scope **will not be applied** (fail-closed
+  semantics). This fixes a quiet trap in the old behavior — filtering with the search
+  box used to leave hidden-but-still-checked rows to go through with Synchronize anyway. The confirmation sheet
+  spells out checked rows outside scope, and executable stats count `checked ∩ in scope`. Sorting, tree folding and
+  path formatting are presentation only and do not change that set.
 - **Bounded last-successful compare repository**: the desktop retains the eight most recently used completed
   `PlanDto` review sessions, including which rows are checked and which directions were reversed, keyed by stable
   `job_id`, selected target and captured configuration revision. Thus compare A → compare B → return to A restores A's result,
@@ -315,22 +333,25 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
   retained Compare result available for another review, while any path that may have started a write invalidates it.
   An empty selection is rejected before a run is reserved; in particular, AutoScan will never turn a conflict/note-only
   result into an archive-changing zero-operation apply.
-- **Identical-items panel** (that "22,631" button along the bottom of FFS): lists the files judged identical on
+- **Identical-items panel** (now the **Identical** result tab): lists the files judged identical on
   both sides, paged 300 at a time, with its own path filter; the data source is the two snapshots the last compare
-  left in memory — **no rescan**. Rows whose content matches but whose timestamps drift more than 2s across the
+  left in memory, together with the exact capability-adjusted comparison options — **no rescan and no
+  re-derivation from a changed job**. Rows whose content matches but whose timestamps drift more than 2s across the
   two sides get the target time marked orange (a common artifact of FAT/SMB granularity). The retained snapshots follow
   the same bounded, target-aware repository contract, and their provenance includes the effective target, so two targets
   of one job cannot read each other's identical rows. It works for remote jobs too (the remote snapshot is a complete table pulled
   back over ssh).
-- **CSV export**: exports the current view (including checked state and both-side size/time), escaping is done
+- **CSV export** originally exported the current view; it now exports the current Run Scope in display order
+  (including checked state and both-side size/time). Escaping is done
   exactly once on the Rust side, UTF-8 **with a BOM** — without the BOM, Excel interprets it in the local code
   page and the whole column of Chinese paths turns to mojibake. The enum literals use serde's snake_case, the
   same source as the plan JSONL and the event stream.
 - **Scheduled-task command** (our counterpart to FFS's "Save as batch job"): one click in the editor copies
   `schtasks /create ... syncdash run <job> --yes`. **It does not register the system scheduled task for you** —
   that is a system-settings-level action, and a human should press it themselves in an admin terminal.
-- **Category chips became independent toggles** (so you can look at "added + deleted" alone), F5 / F9 = compare /
-  synchronize, the Compare and Synchronize buttons gained subtitles spelling out the current rigor and mode, and
+- **Category chips became independent toggles** (so you could look at "added + deleted" alone); the current UI
+  replaces them with the six exhaustive result-type facets. F5 / F9 = compare / synchronize, the Compare and
+  Synchronize buttons gained subtitles spelling out the current rigor and mode, and
   the gear beside them jumps to the matching group in the editor.
 
 - `scan` writes to stdout by default (ssh-friendly: `ssh mac syncdash scan ~/Data > mac.jsonl`).
@@ -722,7 +743,7 @@ strategy is worth reading, but adopting it means going resident).
       empty files are no longer mis-paired into "renames", ambiguous pairings honestly report their candidate count, case-collision preflight, scan progress (CLI `--progress` + a GUI progress bar)
 - [x] v0.9 **"Progress & Polish" — catching up on FFS 14.10's during-apply experience** (90 tests): a unified progress/cancel/pause event-stream foundation;
       five-phase parallel apply (`parallel`); a standalone progress sub-window (dual cumulative graphs / rate / ETA / pause / stop / When-finished);
-      the Overview aggregation sidebar + iconified stats bar; run logs + "last sync"; the full-field Tauri job editor; watch-mode timed rescans
+      the Overview aggregation sidebar + executable stats bar (the current Result Workspace later replaced Overview); run logs + "last sync"; the full-field Tauri job editor; watch-mode timed rescans
       (`watch_interval_secs`/`--watch`); the real remote pipeline for remote jobs in the GUI; **egui retired and deleted** (see the GUI section above)
 - [x] v0.10 one unified diagnostic path (the Logging section above), and **`smb://` became an in-process SMB2 client**.
       It used to hand the phrase to the operating system — a UNC path via `WNetAddConnection2W` on Windows, `mount_smbfs`
