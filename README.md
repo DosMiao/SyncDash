@@ -308,6 +308,10 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
   move's `from`) before opening either backend, so even a hand-authored plan cannot escape its two roots.
 - Hashing is BLAKE3 with a cache: if `(path,size,mtime)` is unchanged the previous result
   is reused; the cache lives in the local user directory and never pollutes the scanned directory.
+  VFS cache identities normalize only scheme and host; case-sensitive usernames and root paths stay
+  distinct. Error-free scans prune absent rows inside the configured filter domain while retaining
+  deliberately excluded rows; a walk error conservatively retains every unseen row. State I/O remains
+  best-effort, but failures are emitted as warnings instead of silently turning every later scan cold.
   Files are **read, never memory-mapped** — a mapped page whose file was truncated or whose volume
   disappeared raises SIGBUS, which kills the process outright instead of returning an error, and in
   `apply` that leaves both root locks on disk. The multi-core gain is given up deliberately;

@@ -5,7 +5,7 @@
 //! of small files, while preserving the local scanner's strict path and error contracts.
 
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -96,15 +96,113 @@ impl ParsedEntry<'_> {
     }
 }
 
+#[derive(Debug)]
+struct RootBulkCompatibilityError {
+    root: PathBuf,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for RootBulkCompatibilityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "scan of '{}' could not use bulk directory metadata: {}",
+            self.root.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for RootBulkCompatibilityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn is_root_bulk_compatibility_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<RootBulkCompatibilityError>())
+        .is_some()
+}
+
+fn system_bulk_read(fd: RawFd, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let count = unsafe {
+        // SAFETY: `fd` names a readable directory, ATTRS is fully initialized, and `buffer` is
+        // valid writable memory for the supplied length.
+        libc::getattrlistbulk(
+            fd,
+            &ATTRS as *const libc::attrlist as *mut libc::c_void,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            libc::FSOPT_NOFOLLOW as u64,
+        )
+    };
+    if count < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(count as usize)
+    }
+}
+
 pub(super) fn walk<C, V>(
     root: &Path,
     filter: &PathFilter,
-    mut checkpoint: C,
-    mut visit: V,
+    checkpoint: C,
+    visit: V,
 ) -> std::io::Result<WalkStats>
 where
     C: FnMut() -> std::io::Result<()>,
     V: FnMut(WalkEntry),
+{
+    walk_with_bulk(root, filter, checkpoint, visit, system_bulk_read)
+}
+
+fn walk_with_bulk<C, V, B>(
+    root: &Path,
+    filter: &PathFilter,
+    mut checkpoint: C,
+    mut visit: V,
+    mut bulk_read: B,
+) -> std::io::Result<WalkStats>
+where
+    C: FnMut() -> std::io::Result<()>,
+    V: FnMut(WalkEntry),
+    B: FnMut(RawFd, &mut [u8]) -> std::io::Result<usize>,
+{
+    let mut emitted = false;
+    let result = {
+        let mut emit = |entry| {
+            emitted = true;
+            visit(entry);
+        };
+        walk_bulk(root, filter, &mut checkpoint, &mut emit, &mut bulk_read)
+    };
+
+    match result {
+        Err(error) if !emitted && is_root_bulk_compatibility_error(&error) => {
+            crate::log_warn!(
+                "scan",
+                "{}; falling back to the compatible WalkDir enumerator before publishing any entries",
+                error
+            );
+            super::local_walk::walk(root, filter, checkpoint, visit)
+        }
+        result => result,
+    }
+}
+
+fn walk_bulk<C, V, B>(
+    root: &Path,
+    filter: &PathFilter,
+    checkpoint: &mut C,
+    visit: &mut V,
+    bulk_read: &mut B,
+) -> std::io::Result<WalkStats>
+where
+    C: FnMut() -> std::io::Result<()>,
+    V: FnMut(WalkEntry),
+    B: FnMut(RawFd, &mut [u8]) -> std::io::Result<usize>,
 {
     let mut stats = WalkStats::default();
     let mut directories = vec![PathBuf::new()];
@@ -133,40 +231,46 @@ where
 
         loop {
             checkpoint()?;
-            let count = unsafe {
-                // SAFETY: `dir` owns a readable directory descriptor, ATTRS is fully initialized,
-                // and `buffer` is valid writable memory for the supplied length.
-                libc::getattrlistbulk(
-                    dir.as_raw_fd(),
-                    &ATTRS as *const libc::attrlist as *mut libc::c_void,
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                    libc::FSOPT_NOFOLLOW as u64,
-                )
-            };
-            if count < 0 {
-                let error = std::io::Error::last_os_error();
-                if dir_rel.as_os_str().is_empty() {
+            let count = match bulk_read(dir.as_raw_fd(), &mut buffer) {
+                Ok(count) => count,
+                Err(error)
+                    if dir_rel.as_os_str().is_empty()
+                        && matches!(
+                            error.raw_os_error(),
+                            Some(libc::ENOTSUP) | Some(libc::EINVAL)
+                        ) =>
+                {
                     return Err(std::io::Error::new(
+                        error.kind(),
+                        RootBulkCompatibilityError {
+                            root: root.to_path_buf(),
+                            source: error,
+                        },
+                    ));
+                }
+                Err(error) => {
+                    if dir_rel.as_os_str().is_empty() {
+                        return Err(std::io::Error::new(
                         error.kind(),
                         format!(
                             "scan of '{}' could not read the root itself: {error} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
                             root.display()
                         ),
                     ));
+                    }
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        stats.note_error(format!("{}: {error}", dir_abs.display()));
+                        break;
+                    }
+                    return Err(subtree_error(root, &dir_abs, error));
                 }
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    stats.note_error(format!("{}: {error}", dir_abs.display()));
-                    break;
-                }
-                return Err(subtree_error(root, &dir_abs, error));
-            }
+            };
             if count == 0 {
                 break;
             }
 
             let mut offset = 0usize;
-            for _ in 0..count as usize {
+            for _ in 0..count {
                 checkpoint()?;
                 let record = record_at(&buffer, offset).map_err(|error| {
                     std::io::Error::new(
@@ -563,6 +667,82 @@ mod tests {
         assert_eq!(bulk_stats, reference_stats);
         assert_eq!(bulk_stats.excluded_dirs, 1);
         assert_eq!(bulk_stats.excluded_files, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unsupported_root_bulk_call_falls_back_to_walkdir_with_parity() {
+        let root = test_root("compatibility-fallback");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("keep/nested")).unwrap();
+        std::fs::write(root.join("keep/a.txt"), b"alpha").unwrap();
+        std::fs::write(root.join("keep/nested/b.txt"), b"beta").unwrap();
+        std::fs::write(root.join("excluded.tmp"), b"ignored").unwrap();
+        let filter = PathFilter::build(&[], &["*/*.tmp".to_string()]);
+        let (reference_entries, reference_stats) = collect_reference(&root, &filter);
+
+        for errno in [libc::ENOTSUP, libc::EINVAL] {
+            let calls = std::cell::Cell::new(0usize);
+            let mut entries = Vec::new();
+            let stats = walk_with_bulk(
+                &root,
+                &filter,
+                || Ok(()),
+                |entry| entries.push(entry),
+                |_fd, _buffer| {
+                    calls.set(calls.get() + 1);
+                    Err(std::io::Error::from_raw_os_error(errno))
+                },
+            )
+            .unwrap();
+            entries.sort_by(|left, right| left.rel.cmp(&right.rel));
+
+            assert_eq!(
+                calls.get(),
+                1,
+                "fallback must abandon bulk enumeration immediately"
+            );
+            assert_eq!(entries, reference_entries, "errno {errno}");
+            assert_eq!(stats, reference_stats, "errno {errno}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compatibility_error_after_emission_never_restarts_the_walk() {
+        let root = test_root("compatibility-after-emission");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("already-emitted.txt"), b"content").unwrap();
+        let filter = PathFilter::build(&[], &[]);
+        let calls = std::cell::Cell::new(0usize);
+        let mut entries = Vec::new();
+
+        let error = walk_with_bulk(
+            &root,
+            &filter,
+            || Ok(()),
+            |entry| entries.push(entry),
+            |fd, buffer| {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    system_bulk_read(fd, buffer)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            !entries.is_empty(),
+            "the first bulk batch must establish the no-restart boundary"
+        );
+        assert!(is_root_bulk_compatibility_error(&error));
+        assert_eq!(calls.get(), 2);
 
         let _ = std::fs::remove_dir_all(&root);
     }

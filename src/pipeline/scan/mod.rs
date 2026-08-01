@@ -70,6 +70,7 @@ pub(crate) struct ScanMetrics {
     pub hash_ms: u64,
     pub finalize_ms: u64,
     pub state_write_ms: u64,
+    pub state_failures: u64,
     pub files: u64,
     pub cache_hits: u64,
     pub read_bytes: u64,
@@ -82,7 +83,7 @@ impl ScanMetrics {
             crate::model::event::LogLevel::Info,
             "scan",
             format!(
-                "scan metrics: side={side} lane={lane} files={} cache_hits={} read_bytes={} workers={} cache_load_ms={} mtime_load_ms={} walk_ms={} hash_ms={} finalize_ms={} state_write_ms={}",
+                "scan metrics: side={side} lane={lane} files={} cache_hits={} read_bytes={} workers={} cache_load_ms={} mtime_load_ms={} walk_ms={} hash_ms={} finalize_ms={} state_write_ms={} state_failures={}",
                 self.files,
                 self.cache_hits,
                 self.read_bytes,
@@ -93,6 +94,7 @@ impl ScanMetrics {
                 self.hash_ms,
                 self.finalize_ms,
                 self.state_write_ms,
+                self.state_failures,
             ),
         );
     }
@@ -175,6 +177,7 @@ pub(crate) fn vfs_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::vfs::{memory::MemVfs, Vfs};
     use crate::model::event::{Phase, ProgressEvent};
     use crate::obs::progress::{is_cancelled, RunCtl, RunCtx};
     use crate::model::table::EntryKind;
@@ -201,6 +204,19 @@ mod tests {
         }
     }
 
+    fn saw_intermediate_bytes(events: &[ProgressEvent], total: u64) -> bool {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ProgressEvent::Progress {
+                    bytes_done,
+                    bytes_total,
+                    ..
+                } if *bytes_total == total && *bytes_done > 0 && *bytes_done < total
+            )
+        })
+    }
+
     #[test]
     fn scan_ctx_reports_exact_totals() {
         let root = mk_tree("totals", 20);
@@ -225,6 +241,134 @@ mod tests {
             ..
         })), "a successful scan must end explicitly with its final counters");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn local_large_file_reports_intermediate_hash_bytes() {
+        const SIZE: usize = 17 * 1024 * 1024;
+        let root = std::env::temp_dir().join(format!(
+            "syncdash-local-chunk-progress-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("large.bin"), vec![7u8; SIZE]).unwrap();
+
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let copy = events.clone();
+        let ctx = RunCtx::new(
+            RunCtl::new(),
+            Arc::new(move |event| {
+                if matches!(&event, ProgressEvent::Totals { reset: true, .. }) {
+                    // The discovery event may have just consumed the progress throttle window.
+                    // Make the first hash chunk observable without relying on disk speed.
+                    std::thread::sleep(std::time::Duration::from_millis(110));
+                }
+                copy.lock().unwrap().push(event);
+            }),
+        );
+
+        scan_ctx(&root, &opts(), &ctx, Phase::ScanSource).unwrap();
+        assert!(
+            saw_intermediate_bytes(&events.lock().unwrap(), SIZE as u64),
+            "a multi-chunk local read must advance bytes before the file completes",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_local_open_does_not_credit_the_planned_file_size() {
+        const SIZE: usize = 4096;
+        let root = std::env::temp_dir().join(format!(
+            "syncdash-local-failed-read-progress-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("vanishes.bin");
+        std::fs::write(&file, vec![3u8; SIZE]).unwrap();
+
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let copy = events.clone();
+        let ctx = RunCtx::new(
+            RunCtl::new(),
+            Arc::new(move |event| {
+                if matches!(&event, ProgressEvent::Totals { reset: true, .. }) {
+                    let _ = std::fs::remove_file(&file);
+                }
+                copy.lock().unwrap().push(event);
+            }),
+        );
+
+        let snapshot = scan_ctx(&root, &opts(), &ctx, Phase::ScanSource).unwrap();
+        assert!(snapshot.entries.iter().any(|entry| entry.hash_failed));
+        assert!(matches!(
+            events.lock().unwrap().last(),
+            Some(ProgressEvent::PhaseEnd {
+                bytes_done: 0,
+                bytes_total,
+                ..
+            }) if *bytes_total == SIZE as u64
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn vfs_large_file_reports_intermediate_hash_bytes() {
+        const SIZE: usize = 200_000;
+        let memory = Arc::new(MemVfs::new("scan-vfs-chunk-progress"));
+        memory.seed_file("large.bin", SIZE, 1_700_000_000_000);
+        let vfs: Arc<dyn Vfs> = memory;
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let copy = events.clone();
+        let ctx = RunCtx::new(
+            RunCtl::new(),
+            Arc::new(move |event| {
+                if matches!(&event, ProgressEvent::Totals { reset: true, .. }) {
+                    std::thread::sleep(std::time::Duration::from_millis(110));
+                }
+                copy.lock().unwrap().push(event);
+            }),
+        );
+
+        scan_root(&vfs, &opts(), &ctx, Phase::ScanSource).unwrap();
+        assert!(
+            saw_intermediate_bytes(&events.lock().unwrap(), SIZE as u64),
+            "a multi-chunk VFS read must advance bytes before the file completes",
+        );
+    }
+
+    #[test]
+    fn failed_vfs_open_does_not_credit_the_planned_file_size() {
+        const SIZE: usize = 4096;
+        let memory = Arc::new(MemVfs::new("scan-vfs-failed-read-progress"));
+        memory.seed_file("vanishes.bin", SIZE, 1_700_000_000_000);
+        let remover = memory.clone();
+        let vfs: Arc<dyn Vfs> = memory;
+        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let copy = events.clone();
+        let ctx = RunCtx::new(
+            RunCtl::new(),
+            Arc::new(move |event| {
+                if matches!(&event, ProgressEvent::Totals { reset: true, .. }) {
+                    remover.remove_file("vanishes.bin").unwrap();
+                }
+                copy.lock().unwrap().push(event);
+            }),
+        );
+
+        let snapshot = scan_root(&vfs, &opts(), &ctx, Phase::ScanSource).unwrap();
+        assert!(snapshot.entries.iter().any(|entry| entry.hash_failed));
+        assert!(matches!(
+            events.lock().unwrap().last(),
+            Some(ProgressEvent::PhaseEnd {
+                bytes_done: 0,
+                bytes_total,
+                ..
+            }) if *bytes_total == SIZE as u64
+        ));
     }
 
     #[test]

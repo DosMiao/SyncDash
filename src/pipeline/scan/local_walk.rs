@@ -7,7 +7,6 @@
 
 use std::path::{Path, PathBuf};
 
-#[cfg(any(not(target_os = "macos"), test))]
 use crate::pipeline::filter::PathFilter;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -115,7 +114,6 @@ fn metadata_mtime_ms(md: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
 pub(super) fn walk<C, V>(
     root: &Path,
     filter: &PathFilter,

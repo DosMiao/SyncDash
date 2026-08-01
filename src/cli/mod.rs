@@ -257,8 +257,13 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     (false, false) => 0,
                 };
                 let pct = if p.complete { 100 } else { work_pct.min(99) };
-                eprint!("\r{} {:>3}%  {}/{} files  {}/{}  {:.1} MiB/s   ", p.phase, pct,
-                    p.files_done, p.files_total,
+                let files = if p.phase == "walk" && !p.complete && p.files_total == 0 {
+                    format!("{}/? files", p.files_done)
+                } else {
+                    format!("{}/{} files", p.files_done, p.files_total)
+                };
+                eprint!("\r{} {:>3}%  {}  {}/{}  {:.1} MiB/s   ", p.phase, pct,
+                    files,
                     syncdash::foundation::fmt::human_bytes(p.bytes_done),
                     syncdash::foundation::fmt::human_bytes(p.bytes_total), p.mib_per_s);
             };

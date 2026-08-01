@@ -5,8 +5,9 @@
 //! policy remain one implementation. Hash parallelism is per *file*, not within one: reads use an
 //! explicit loop rather than mapping because a vanished mapping kills the process with SIGBUS.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::foundation::time::now_ms;
 use crate::model::table::{os_name, Entry, EntryKind, Header, Snapshot, SCHEMA};
@@ -23,6 +24,7 @@ use super::macos_bulk::walk as walk_local;
 /// Read granularity, and therefore how often cancel/pause is honored mid-file.
 const READ_CHUNK: u64 = 8 * 1024 * 1024;
 const PROGRESS_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+const WALK_PROGRESS_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 fn progress_sample_due(stop: &std::sync::mpsc::Receiver<()>) -> bool {
     matches!(
@@ -31,12 +33,30 @@ fn progress_sample_due(stop: &std::sync::mpsc::Receiver<()>) -> bool {
     )
 }
 
-fn full_hash_with_buffer(
+fn walk_progress_sample_due(
+    last: &mut Option<std::time::Duration>,
+    now: std::time::Duration,
+) -> bool {
+    let due = last.map_or(true, |previous| {
+        now.saturating_sub(previous) >= WALK_PROGRESS_SAMPLE_INTERVAL
+    });
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
+fn full_hash_with_buffer<C, P>(
     path: &Path,
     size: u64,
     buf: &mut Vec<u8>,
-    mut checkpoint: impl FnMut() -> std::io::Result<()>,
-) -> std::io::Result<String> {
+    mut checkpoint: C,
+    mut on_read: P,
+) -> std::io::Result<String>
+where
+    C: FnMut() -> std::io::Result<()>,
+    P: FnMut(u64),
+{
     use std::io::Read;
 
     let mut f = std::fs::File::open(path)?;
@@ -47,13 +67,23 @@ fn full_hash_with_buffer(
         buf.resize(len, 0);
     }
     let mut hasher = blake3::Hasher::new();
-    loop {
+    let mut remaining = size;
+    while remaining > 0 {
         checkpoint()?;
-        let n = f.read(&mut buf[..len])?;
+        let width = remaining.min(len as u64) as usize;
+        let n = f.read(&mut buf[..width])?;
         if n == 0 {
-            break;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "file shrank while hashing: expected {size} bytes, read {}",
+                    size - remaining
+                ),
+            ));
         }
         hasher.update(&buf[..n]);
+        on_read(n as u64);
+        remaining -= n as u64;
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -96,6 +126,7 @@ pub(super) fn scan_impl(
     metrics.cache_load_ms = measured.elapsed().as_millis() as u64;
     let measured = std::time::Instant::now();
     let mtime_fixes = crate::store::mtimefix::load_local(&local_state);
+    let mut matched_mtime_fixes = HashSet::new();
     metrics.mtime_load_ms = measured.elapsed().as_millis() as u64;
     let mut entries: Vec<Entry> = Vec::new();
     let mut hash_errors = 0u64;
@@ -133,6 +164,7 @@ pub(super) fn scan_impl(
         rel: String,
         abs: std::path::PathBuf,
         size: u64,
+        raw_mt: i64,
         mt: i64,
         hash: Option<String>, // cache hit
         /// Set when hashing was attempted and failed: distinct from `hash: None`, which also covers
@@ -142,6 +174,8 @@ pub(super) fn scan_impl(
         mode: Option<u32>,
     }
     let mut pending: Vec<PendingFile> = Vec::new();
+    let legacy_walk_started = std::time::Instant::now();
+    let mut legacy_walk_last_sample = None;
 
     let measured = std::time::Instant::now();
     let walk_stats = walk_local(
@@ -186,11 +220,16 @@ pub(super) fn scan_impl(
                 // / SMB truncation); convert it back to what we meant so compare need not lean on a tolerance
                 let raw_mt = item.mtime_ms;
                 let mt = match mtime_fixes.get(&rel) {
-                    Some((ondisk, intended)) if *ondisk == raw_mt => *intended,
+                    Some((ondisk, intended)) if *ondisk == raw_mt => {
+                        matched_mtime_fixes.insert(rel.clone());
+                        *intended
+                    }
                     _ => raw_mt,
                 };
                 let mut hash = None;
-                if opt.hash && opt.use_cache {
+                // A correction has no stable object token in the legacy table. Re-read content
+                // instead of letting a same-size replacement inherit the previous object's hash.
+                if opt.hash && opt.use_cache && !matched_mtime_fixes.contains(&rel) {
                     if let Some((cs, cm, ch)) = cache.get(&rel) {
                         // Cached values are isolated per mode: a `~` prefix means sampled digest, which must never stand in for a full hash (or the reverse)
                         let want_sampled = opt.sampled && size >= SAMPLE_MIN;
@@ -203,6 +242,7 @@ pub(super) fn scan_impl(
                     rel,
                     abs: item.abs,
                     size,
+                    raw_mt,
                     mt,
                     hash,
                     hash_failed: false,
@@ -219,6 +259,22 @@ pub(super) fn scan_impl(
                 if let Some(pp) = &pp {
                     pp.item_done(&pending.last().unwrap().rel);
                 }
+                if let Some(cb) = progress {
+                    if walk_progress_sample_due(
+                        &mut legacy_walk_last_sample,
+                        legacy_walk_started.elapsed(),
+                    ) {
+                        cb(ScanProgress {
+                            phase: "walk",
+                            files_done: pending.len() as u64,
+                            files_total: 0,
+                            bytes_total: 0,
+                            bytes_done: 0,
+                            mib_per_s: 0.0,
+                            complete: false,
+                        });
+                    }
+                }
             }
         },
     )?;
@@ -226,6 +282,21 @@ pub(super) fn scan_impl(
     let walk_err_samples = walk_stats.walk_err_samples;
     let excl_dirs = walk_stats.excluded_dirs;
     let excl_files = walk_stats.excluded_files;
+    let coverage = if walk_errors == 0 {
+        crate::store::ScanCoverage::Complete
+    } else {
+        crate::store::ScanCoverage::Partial
+    };
+    let retain_absent: HashSet<String> = if coverage == crate::store::ScanCoverage::Complete {
+        cache
+            .keys()
+            .chain(mtime_fixes.keys())
+            .filter(|path| !opt.filter.pass_file(path))
+            .cloned()
+            .collect()
+    } else {
+        HashSet::new()
+    };
     metrics.walk_ms = measured.elapsed().as_millis() as u64;
     metrics.files = pending.len() as u64;
     metrics.cache_hits = pending.iter().filter(|file| file.hash.is_some()).count() as u64;
@@ -245,10 +316,7 @@ pub(super) fn scan_impl(
     } else {
         0
     };
-    let legacy_progress_totals = opt
-        .hash
-        .then_some((pending.len() as u64, bytes_to_hash));
-    metrics.read_bytes = bytes_to_hash;
+    let legacy_progress_totals = (pending.len() as u64, bytes_to_hash);
     metrics.workers = if opt.hash {
         max_parallel_streams.max(1).min(rayon::current_num_threads())
     } else {
@@ -263,15 +331,14 @@ pub(super) fn scan_impl(
     }
 
     let hash_err_count = std::sync::atomic::AtomicU64::new(0);
+    let files_done = AtomicU64::new(0);
+    let bytes_done = AtomicU64::new(0);
     let measured = std::time::Instant::now();
     if opt.hash {
         use rayon::prelude::*;
-        use std::sync::atomic::{AtomicU64, Ordering};
         // Only cache misses are actually read; the progress bar is only accurate if it counts their bytes
         let bytes_total = bytes_to_hash;
         let files_total = pending.len() as u64;
-        let files_done = AtomicU64::new(0);
-        let bytes_done = AtomicU64::new(0);
         let global_width = rayon::current_num_threads();
         let width = max_parallel_streams.max(1).min(global_width);
         let scan_pool = if width < global_width {
@@ -288,7 +355,7 @@ pub(super) fn scan_impl(
         };
 
         if let Some(cb) = progress {
-            cb(ScanProgress { phase: "walk", files_done: 0, files_total, bytes_total, bytes_done: 0, mib_per_s: 0.0, complete: false });
+            cb(ScanProgress { phase: "hash", files_done: 0, files_total, bytes_total, bytes_done: 0, mib_per_s: 0.0, complete: false });
         }
 
         // Progress sampling gets a thread of its own (same structure as syncthing's ProgressTicker):
@@ -333,7 +400,30 @@ pub(super) fn scan_impl(
                     if p.hash.is_none() {
                         // fast rigor tier: large files only read the three sample windows (a cloud placeholder hydrates only those three too)
                         if opt.sampled && p.size >= SAMPLE_MIN {
-                            match sampled_digest_with_buffer(&p.abs, p.size, buf) {
+                            let result = sampled_digest_with_buffer(&p.abs, p.size, buf, |n| {
+                                bytes_done.fetch_add(n, Ordering::Relaxed);
+                                if let Some(pp) = &pp {
+                                    pp.add_bytes(n, &p.rel);
+                                }
+                            })
+                            .and_then(|hash| {
+                                let metadata = std::fs::symlink_metadata(&p.abs)?;
+                                let current_mt = metadata
+                                    .modified()
+                                    .ok()
+                                    .and_then(|time| {
+                                        time.duration_since(std::time::UNIX_EPOCH).ok()
+                                    })
+                                    .map(|duration| duration.as_millis() as i64)
+                                    .unwrap_or(0);
+                                if metadata.len() != p.size || current_mt != p.raw_mt {
+                                    return Err(std::io::Error::other(
+                                        "file changed while content evidence was being read",
+                                    ));
+                                }
+                                Ok(hash)
+                            });
+                            match result {
                                 Ok(d) => p.hash = Some(d),
                                 Err(e) => {
                                     p.hash_failed = true;
@@ -343,20 +433,44 @@ pub(super) fn scan_impl(
                                     }
                                 }
                             }
-                            let eff = effective_read(p.size, true);
-                            bytes_done.fetch_add(eff, Ordering::Relaxed);
                             if let Some(pp) = &pp {
-                                pp.add_bytes(eff, &p.rel);
                                 pp.item_done(&p.rel);
                             }
                             files_done.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
-                        let res = full_hash_with_buffer(&p.abs, p.size, buf, || match &pp {
-                            Some(pp) => pp.checkpoint(),
-                            None => Ok(()),
-                        });
-                        match res {
+                        let res = full_hash_with_buffer(
+                            &p.abs,
+                            p.size,
+                            buf,
+                            || match &pp {
+                                Some(pp) => pp.checkpoint(),
+                                None => Ok(()),
+                            },
+                            |n| {
+                                bytes_done.fetch_add(n, Ordering::Relaxed);
+                                if let Some(pp) = &pp {
+                                    pp.add_bytes(n, &p.rel);
+                                }
+                            },
+                        );
+                        match res.and_then(|hash| {
+                            let metadata = std::fs::symlink_metadata(&p.abs)?;
+                            let current_mt = metadata
+                                .modified()
+                                .ok()
+                                .and_then(|time| {
+                                    time.duration_since(std::time::UNIX_EPOCH).ok()
+                                })
+                                .map(|duration| duration.as_millis() as i64)
+                                .unwrap_or(0);
+                            if metadata.len() != p.size || current_mt != p.raw_mt {
+                                return Err(std::io::Error::other(
+                                    "file changed while content evidence was being read",
+                                ));
+                            }
+                            Ok(hash)
+                        }) {
                             Ok(hash) => p.hash = Some(hash),
                             Err(e) if crate::obs::progress::is_cancelled(&e) => return, // cancellation is not a hash error
                             Err(e) => {
@@ -366,10 +480,6 @@ pub(super) fn scan_impl(
                                     pp.error(&p.rel, "hash", side, &e.to_string());
                                 }
                             }
-                        }
-                        bytes_done.fetch_add(p.size, Ordering::Relaxed);
-                        if let Some(pp) = &pp {
-                            pp.add_bytes(p.size, &p.rel);
                         }
                     }
                     if let Some(pp) = &pp {
@@ -393,6 +503,7 @@ pub(super) fn scan_impl(
 
     }
     metrics.hash_ms = measured.elapsed().as_millis() as u64;
+    metrics.read_bytes = bytes_done.load(Ordering::Relaxed);
     let measured = std::time::Instant::now();
     for p in pending {
         entries.push(Entry { path: p.rel, kind: EntryKind::File, size: p.size, mtime_ms: p.mt, hash: p.hash, hash_failed: p.hash_failed, file_id: p.file_id, mode: p.mode, link: None, prev: None });
@@ -402,10 +513,27 @@ pub(super) fn scan_impl(
     metrics.finalize_ms = measured.elapsed().as_millis() as u64;
     let measured = std::time::Instant::now();
     if opt.hash {
-        crate::store::hashcache::save_local(&local_state, &entries);
+        if crate::store::hashcache::save_local(
+            &local_state,
+            &entries,
+            coverage,
+            &retain_absent,
+        )
+            == crate::store::StateWriteStatus::Failed
+        {
+            metrics.state_failures += 1;
+        }
     }
-    if walk_errors == 0 {
-        crate::store::mtimefix::prune_local(&local_state, &mtime_fixes, &entries);
+    if crate::store::mtimefix::reconcile_local(
+        &local_state,
+        &mtime_fixes,
+        &entries,
+        coverage,
+        &matched_mtime_fixes,
+        &retain_absent,
+    ) == crate::store::StateWriteStatus::Failed
+    {
+        metrics.state_failures += 1;
     }
     metrics.state_write_ms = measured.elapsed().as_millis() as u64;
     hash_errors += hash_err_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -442,8 +570,17 @@ pub(super) fn scan_impl(
     if let Some(pp) = pp {
         pp.finish()?;
     }
-    if let (Some(cb), Some((files_total, bytes_total))) = (progress, legacy_progress_totals) {
-        cb(ScanProgress { phase: "hash", files_done: files_total, files_total, bytes_total, bytes_done: bytes_total, mib_per_s: 0.0, complete: true });
+    if let Some(cb) = progress {
+        let (files_total, bytes_total) = legacy_progress_totals;
+        cb(ScanProgress {
+            phase: if opt.hash { "hash" } else { "walk" },
+            files_done: files_total,
+            files_total,
+            bytes_total,
+            bytes_done: bytes_done.load(Ordering::Relaxed),
+            mib_per_s: 0.0,
+            complete: true,
+        });
     }
     Ok(snapshot)
 }
@@ -477,11 +614,25 @@ mod tests {
         std::fs::write(&small_path, &small).unwrap();
 
         let mut buf = Vec::new();
-        let first = full_hash_with_buffer(&large_path, large.len() as u64, &mut buf, || Ok(())).unwrap();
+        let first = full_hash_with_buffer(
+            &large_path,
+            large.len() as u64,
+            &mut buf,
+            || Ok(()),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(first, blake3::hash(&large).to_hex().to_string());
         let capacity = buf.capacity();
 
-        let second = full_hash_with_buffer(&small_path, small.len() as u64, &mut buf, || Ok(())).unwrap();
+        let second = full_hash_with_buffer(
+            &small_path,
+            small.len() as u64,
+            &mut buf,
+            || Ok(()),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(second, blake3::hash(&small).to_hex().to_string());
         assert_eq!(buf.capacity(), capacity, "the next file must reuse rather than replace the worker allocation");
 
@@ -493,6 +644,23 @@ mod tests {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         stop_tx.send(()).unwrap();
         assert!(!progress_sample_due(&stop_rx));
+    }
+
+    #[test]
+    fn walk_progress_cadence_is_immediate_then_throttled() {
+        let mut last = None;
+        assert!(walk_progress_sample_due(
+            &mut last,
+            std::time::Duration::ZERO
+        ));
+        assert!(!walk_progress_sample_due(
+            &mut last,
+            WALK_PROGRESS_SAMPLE_INTERVAL - std::time::Duration::from_millis(1),
+        ));
+        assert!(walk_progress_sample_due(
+            &mut last,
+            WALK_PROGRESS_SAMPLE_INTERVAL,
+        ));
     }
 
     #[test]
@@ -530,6 +698,83 @@ mod tests {
         assert!(
             state_ready_at_completion.load(std::sync::atomic::Ordering::Relaxed),
             "the completion callback must run after the finished hash cache is visible",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_hash_progress_still_has_one_terminal_completion() {
+        let root =
+            std::env::temp_dir().join(format!("syncdash-no-hash-progress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..3 {
+            std::fs::write(root.join(format!("file-{index}")), b"contents").unwrap();
+        }
+
+        let events = std::sync::Mutex::new(Vec::new());
+        let collect = |progress: ScanProgress| events.lock().unwrap().push(progress);
+        let mut options = opts();
+        options.hash = false;
+        scan_with_progress(&root, &options, Some(&collect)).unwrap();
+
+        let events = events.into_inner().unwrap();
+        assert_eq!(events.iter().filter(|event| event.complete).count(), 1);
+        assert!(events.iter().any(|event| {
+            event.phase == "walk"
+                && !event.complete
+                && event.files_done > 0
+                && event.files_total == 0
+        }));
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal.phase, "walk");
+        assert_eq!(terminal.files_done, 3);
+        assert_eq!(terminal.files_total, 3);
+        assert_eq!(terminal.bytes_done, 0);
+        assert_eq!(terminal.bytes_total, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrected_mtime_never_reuses_a_hash_for_a_replacement_object() {
+        let root = std::env::temp_dir().join(format!(
+            "syncdash-corrected-cache-replacement-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("same.bin");
+        let raw_ms = 1_700_000_000_000i64;
+        let intended_ms = raw_ms + 1_500;
+        let stamp = filetime::FileTime::from_unix_time(raw_ms / 1_000, 0);
+        std::fs::write(&file, b"old!").unwrap();
+        filetime::set_file_mtime(&file, stamp).unwrap();
+
+        let state = crate::store::localid::LocalScanStateIdentity::for_root(&root);
+        assert_ne!(
+            crate::store::mtimefix::record_local(
+                &state,
+                &[("same.bin".into(), raw_ms, intended_ms)],
+            ),
+            crate::store::StateWriteStatus::Failed,
+        );
+        let mut options = opts();
+        options.use_cache = true;
+        let first = scan(&root, &options).unwrap();
+        let first_hash = first.entries[0].hash.clone().unwrap();
+        assert_eq!(first.entries[0].mtime_ms, intended_ms);
+
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, b"new!").unwrap();
+        filetime::set_file_mtime(&file, stamp).unwrap();
+        let second = scan(&root, &options).unwrap();
+        assert_eq!(second.entries[0].mtime_ms, intended_ms);
+        assert_ne!(
+            second.entries[0].hash.as_deref(),
+            Some(first_hash.as_str()),
+            "a same-size replacement with the same coarse raw mtime must be re-read",
         );
 
         let _ = std::fs::remove_dir_all(&root);
