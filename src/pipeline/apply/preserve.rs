@@ -83,13 +83,10 @@ fn copy_to_trash(
 /// - **Is there a real path?** (`local_of`) — the rdelta version store needs one. It writes into
 ///   `<root>/.version_syncDash/`, so it stays a move *within* the root and is safe anywhere a
 ///   path exists, share or not.
-/// - **Can the central trash store take it?** (`local_trash`) — that store lives on this machine.
-///   A move into it from a share or another local volume is cross-volume, and `move_to_trash`
-///   answers a failed rename by copying every byte before removal. Those roots take the in-root
-///   retention area instead, which is the same rename a genuinely remote root gets.
-///
-/// The two used to be one test, and the second question was never asked — `VfsCaps::local_trash`
-/// was set correctly by the SMB backend and read by nobody.
+/// - **Can the configured trash path take it?** A local root and that actual path must be on the
+///   same device. A move into it from a share or another local volume is cross-volume, and
+///   `move_to_trash` answers a failed rename by copying every byte before removal. Those roots take
+///   the in-root retention area instead, which is the same rename a genuinely remote root gets.
 pub(super) fn preserve(
     sh: &Shared,
     op: &Op,

@@ -266,17 +266,15 @@ pub fn apply_vfs(
     let source_local = source.as_local().map(|p| p.to_path_buf());
     let target_local = target.as_local().map(|p| p.to_path_buf());
     let trash = opt.trash.clone().unwrap_or_else(default_trash);
-    // `local_trash` describes the normal store, while tests/callers may supply another path.
-    // Narrow it against the actual batch directory: a cross-volume rename would otherwise fall
-    // back to copying every deleted/overwritten byte before removal.
-    let source_trash_ok = source.caps().local_trash
-        && source_local
-            .as_deref()
-            .is_some_and(|root| crate::fs::vfs::local::same_device(root, &trash));
-    let target_trash_ok = target.caps().local_trash
-        && target_local
-            .as_deref()
-            .is_some_and(|root| crate::fs::vfs::local::same_device(root, &trash));
+    // `local_trash` describes only the normal store. Callers may configure another path, so the
+    // actual batch directory decides reachability for every real local root. Protocol roots have
+    // no local path and therefore always retain originals inside themselves.
+    let source_trash_ok = source_local
+        .as_deref()
+        .is_some_and(|root| crate::fs::vfs::local::same_device(root, &trash));
+    let target_trash_ok = target_local
+        .as_deref()
+        .is_some_and(|root| crate::fs::vfs::local::same_device(root, &trash));
 
     // The FFS dir_lock idea: lock both roots (with a heartbeat) before touching anything, so two machines cannot apply to the same directory at once.
     // Pause spins on 100ms instead of suspending and returning precisely so these two locks' heartbeat threads keep beating while paused.

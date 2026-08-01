@@ -610,16 +610,12 @@ fn delete_dirs_deepest_first_regardless_of_input_order() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A root with a real path that cannot reach the configured central trash by rename. A mounted
-/// `\\nas\share` and an external local volume share this shape even though their media differ.
-///
-/// This exact combination is where the cross-volume trash bug lived: `as_local()` is `Some`, so
-/// delta, mmap hashing and the version store all correctly apply, while the central trash store
-/// sits on the other side of a network link. The wrapper also lets the route report be tested
-/// without depending on whatever volumes happen to be mounted on the test machine.
-struct InRootOnly(syncdash::fs::vfs::local::LocalVfs, Medium);
+/// A route fixture backed by real files. It can hide its local path to model a protocol root, or
+/// expose the path while denying `local_trash` to model a local root that cannot reach the default
+/// store. That distinction pins the configured-path behavior without depending on mounted media.
+struct RouteFixture(syncdash::fs::vfs::local::LocalVfs, Medium, bool);
 
-impl syncdash::fs::vfs::Vfs for InRootOnly {
+impl syncdash::fs::vfs::Vfs for RouteFixture {
     fn caps(&self) -> VfsCaps {
         VfsCaps { medium: self.1, local_trash: false, ..self.0.caps() }
     }
@@ -630,7 +626,11 @@ impl syncdash::fs::vfs::Vfs for InRootOnly {
         self.0.identity()
     }
     fn as_local(&self) -> Option<&std::path::Path> {
-        self.0.as_local()
+        if self.2 {
+            self.0.as_local()
+        } else {
+            None
+        }
     }
     fn connect(&self) -> VfsResult<()> {
         self.0.connect()
@@ -679,7 +679,7 @@ impl syncdash::fs::vfs::Vfs for InRootOnly {
     }
 }
 
-struct RenameDrift(InRootOnly);
+struct RenameDrift(RouteFixture);
 
 impl syncdash::fs::vfs::Vfs for RenameDrift {
     fn caps(&self) -> VfsCaps {
@@ -757,9 +757,10 @@ fn move_fallback_rechecks_destination_before_staging_a_copy() {
     std::fs::write(t.join("old.txt"), b"planned source").unwrap();
     let source: Arc<dyn syncdash::fs::vfs::Vfs> =
         Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s));
-    let target: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(RenameDrift(InRootOnly(
+    let target: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(RenameDrift(RouteFixture(
         syncdash::fs::vfs::local::LocalVfs::new(t.clone()),
         Medium::FixedDisk,
+        true,
     )));
     let mut moving = op(Action::Move, "new.txt");
     moving.from = Some("old.txt".into());
@@ -794,9 +795,10 @@ fn an_off_machine_root_preserves_in_place_instead_of_downloading() {
     let sv: Arc<dyn syncdash::fs::vfs::Vfs> =
         Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s.clone()));
     let tv: Arc<dyn syncdash::fs::vfs::Vfs> =
-        Arc::new(InRootOnly(
+        Arc::new(RouteFixture(
             syncdash::fs::vfs::local::LocalVfs::new(t.clone()),
             Medium::NetworkShare,
+            false,
         ));
     let out = apply::apply_vfs(
         &[op(Action::Update, "f.txt")],
@@ -826,7 +828,7 @@ fn an_off_machine_root_preserves_in_place_instead_of_downloading() {
 }
 
 #[test]
-fn an_external_local_root_reports_the_in_root_preservation_path() {
+fn a_protocol_root_reports_the_in_root_preservation_path() {
     let base = tmproot("external-retention-report");
     let (s, t, tr) = (base.join("s"), base.join("external"), base.join("central-trash"));
     std::fs::create_dir_all(&s).unwrap();
@@ -836,9 +838,10 @@ fn an_external_local_root_reports_the_in_root_preservation_path() {
 
     let sv: Arc<dyn syncdash::fs::vfs::Vfs> =
         Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s));
-    let tv: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(InRootOnly(
+    let tv: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(RouteFixture(
         syncdash::fs::vfs::local::LocalVfs::new(t.clone()),
         Medium::RemovableDisk,
+        false,
     ));
     let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let copy = events.clone();
@@ -910,6 +913,48 @@ fn an_on_machine_root_still_uses_the_central_trash_store() {
         message,
         ..
     } if message.starts_with("trash (central;") && message.contains(&tr.display().to_string()))));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// `VfsCaps::local_trash` describes reachability of the default store, not a custom path. An
+/// external disk may be unable to reach that default while a user-selected trash directory on the
+/// disk is a same-device rename target.
+#[test]
+fn a_custom_same_volume_trash_is_not_blocked_by_the_default_store_capability() {
+    let base = tmproot("custom-same-volume-trash");
+    let (s, t, tr) = (base.join("s"), base.join("external"), base.join("external-trash"));
+    std::fs::create_dir_all(&s).unwrap();
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(s.join("f.txt"), b"new").unwrap();
+    std::fs::write(t.join("f.txt"), b"old").unwrap();
+
+    let sv: Arc<dyn syncdash::fs::vfs::Vfs> =
+        Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s));
+    let tv: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(RouteFixture(
+        syncdash::fs::vfs::local::LocalVfs::new(t.clone()),
+        Medium::RemovableDisk,
+        true,
+    ));
+    assert!(
+        !tv.caps().local_trash,
+        "the fixture models an external root whose default store is unreachable"
+    );
+
+    let out = apply::apply_vfs(
+        &[op(Action::Update, "f.txt")],
+        &sv,
+        &tv,
+        &opts(tr.clone()),
+        &RunCtx::null(),
+    );
+
+    assert_eq!((out.done, out.errors), (1, 0));
+    assert_eq!(std::fs::read(t.join("f.txt")).unwrap(), b"new");
+    assert_eq!(std::fs::read(tr.join("target/f.txt")).unwrap(), b"old");
+    assert!(
+        !t.join(".syncdash").exists(),
+        "same-volume custom trash should not use in-root retention"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
