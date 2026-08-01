@@ -1,9 +1,12 @@
 //! Job files: list, read, write, delete, and the schema the editor renders from.
 
+use std::sync::Arc;
+
 use syncdash::job::{self};
 use syncdash::run;
 
 use crate::dto::{JobDetailDto, JobDto, JobFileSchemaDto, JobSaveDto};
+use crate::state::ResultRepository;
 
 #[tauri::command]
 pub fn list_jobs() -> Result<Vec<JobDto>, String> {
@@ -64,6 +67,7 @@ pub fn job_file_schema(name: String) -> Result<JobFileSchemaDto, String> {
 
 #[tauri::command]
 pub fn save_job(
+    results: tauri::State<'_, Arc<ResultRepository>>,
     name: String,
     job: job::Job,
     original_name: Option<String>,
@@ -76,6 +80,19 @@ pub fn save_job(
         expected_revision.as_deref(),
     )
     .map_err(|e| e.to_string())?;
+    if let (Some(original_name), Some(expected_revision)) =
+        (original_name.as_deref(), expected_revision.as_deref())
+    {
+        if original_name != saved.name {
+            results.0.lock().unwrap().invalidate_job(original_name);
+        } else if expected_revision != saved.config_revision {
+            results
+                .0
+                .lock()
+                .unwrap()
+                .invalidate_revision(original_name, expected_revision);
+        }
+    }
     Ok(JobSaveDto {
         name: saved.name,
         config_revision: saved.config_revision,
@@ -83,6 +100,12 @@ pub fn save_job(
 }
 
 #[tauri::command]
-pub fn delete_job(name: String, expected_revision: String) -> Result<(), String> {
-    job::delete_job(&name, &expected_revision).map_err(|e| e.to_string())
+pub fn delete_job(
+    results: tauri::State<'_, Arc<ResultRepository>>,
+    name: String,
+    expected_revision: String,
+) -> Result<(), String> {
+    job::delete_job(&name, &expected_revision).map_err(|e| e.to_string())?;
+    results.0.lock().unwrap().invalidate_job(&name);
+    Ok(())
 }

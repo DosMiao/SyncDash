@@ -15,7 +15,8 @@ use crate::dto::{ApplyDto, CompareOwner, PlanDto, PreflightDto, SelectedRowDto};
 use crate::state::{
     begin_run, begin_run_command, begin_run_for_launch, end_run, finish_run_command,
     release_progress_launch, request_cancel, resolve_selected_ops, resolve_target, set_paused,
-    user_err, validate_cached_compare, CachedSnaps, CompareProvenance, RunState, SnapCache,
+    user_err, validate_cached_compare, CachedCompare, CompareProvenance, ResultKey,
+    ResultRepository, RunState,
 };
 
 #[derive(Clone, serde::Serialize)]
@@ -30,6 +31,40 @@ struct ActiveRunGuard {
 }
 
 struct RunCommandGuard(Arc<RunState>);
+
+struct AppliedResultGuard {
+    results: Arc<ResultRepository>,
+    job_name: String,
+    config_revision: String,
+    invalidate_on_drop: bool,
+}
+
+impl AppliedResultGuard {
+    fn new(results: Arc<ResultRepository>, job_name: &str, config_revision: &str) -> Self {
+        Self {
+            results,
+            job_name: job_name.to_string(),
+            config_revision: config_revision.to_string(),
+            invalidate_on_drop: true,
+        }
+    }
+
+    fn retain_for_safe_rejection(&mut self) {
+        self.invalidate_on_drop = false;
+    }
+}
+
+impl Drop for AppliedResultGuard {
+    fn drop(&mut self) {
+        if self.invalidate_on_drop {
+            self.results
+                .0
+                .lock()
+                .unwrap()
+                .invalidate_revision(&self.job_name, &self.config_revision);
+        }
+    }
+}
 
 impl RunCommandGuard {
     fn begin(state: Arc<RunState>) -> Self {
@@ -70,14 +105,14 @@ pub fn pause_run(
 pub async fn compare_job(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RunState>>,
-    snaps: tauri::State<'_, Arc<SnapCache>>,
+    results: tauri::State<'_, Arc<ResultRepository>>,
     name: String,
     target_index: Option<usize>,
     accept_caps: Option<bool>,
 ) -> Result<PlanDto, String> {
     let st = state.inner().clone();
     let _command = RunCommandGuard::begin(st.clone());
-    let cache = snaps.inner().clone();
+    let results = results.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (job_name, full_job) = job::load_named(&name).map_err(|e| e.to_string())?;
         let config_revision =
@@ -148,10 +183,24 @@ pub async fn compare_job(
             equal_count: ev.equal_count,
             equal_bytes: ev.equal_bytes,
         };
-        // Snapshots are kept for the "Identical" panel. Publish the owner, original-plan digest,
-        // and both snapshots together only after compare and evidence construction all succeeded.
-        *cache.0.lock().unwrap() = Some(CachedSnaps {
+        // Publish only after compare and evidence construction both succeeded. Hold the repository
+        // while re-reading the registered revision: an in-app save/delete publishes its invalidation
+        // under this same lock, so an old result cannot be inserted behind a completed mutation.
+        let mut repository = results.0.lock().unwrap();
+        let (_, current_job) = job::load_named(&owner.job_name).map_err(|error| {
+            format!("Job '{}' changed while Compare was running: {error}", owner.job_name)
+        })?;
+        let current_revision = job::config_revision(&current_job)
+            .map_err(|error| format!("Job '{}': {error}", owner.job_name))?;
+        if current_revision != owner.config_revision {
+            return Err(format!(
+                "Job '{}' changed while Compare was running — run Compare again",
+                owner.job_name
+            ));
+        }
+        repository.insert(CachedCompare {
             provenance: CompareProvenance { owner, plan_digest },
+            plan: dto.clone(),
             source: out.source,
             target: out.target,
         });
@@ -165,14 +214,14 @@ pub async fn compare_job(
 /// so "why won't it let me sync" has somewhere to be answered instead of only appearing on stderr.
 #[tauri::command]
 pub async fn preflight(
-    snaps: tauri::State<'_, Arc<SnapCache>>,
+    results: tauri::State<'_, Arc<ResultRepository>>,
     name: String,
     plan: PlanDto,
     selected: Vec<SelectedRowDto>,
     acknowledged: bool,
     target_index: Option<usize>,
 ) -> Result<PreflightDto, String> {
-    let cache = snaps.inner().clone();
+    let results = results.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         if name != plan.owner.job_name {
             return Err(format!(
@@ -187,9 +236,11 @@ pub async fn preflight(
         let full = Plan { header: plan.header.clone(), ops: plan.ops.clone() };
         let plan_digest = full.digest();
         {
-            let cached = cache.0.lock().unwrap();
+            let mut repository = results.0.lock().unwrap();
+            let key = ResultKey::new(&job_name, target_index, &config_revision);
+            let cached = repository.get(&key);
             validate_cached_compare(
-                cached.as_ref().map(|c| &c.provenance),
+                cached.map(|result| &result.provenance),
                 &plan.owner,
                 &job_name,
                 target_index,
@@ -229,7 +280,7 @@ pub async fn preflight(
 pub async fn apply_job(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RunState>>,
-    snaps: tauri::State<'_, Arc<SnapCache>>,
+    results: tauri::State<'_, Arc<ResultRepository>>,
     name: String,
     plan: PlanDto,
     selected: Vec<SelectedRowDto>,
@@ -240,7 +291,7 @@ pub async fn apply_job(
 ) -> Result<ApplyDto, String> {
     let st = state.inner().clone();
     let _command = RunCommandGuard::begin(st.clone());
-    let cache = snaps.inner().clone();
+    let results = results.inner().clone();
     let reject_state = state.inner().clone();
     let requested_launch = launch_id;
     let run_app = app.clone();
@@ -261,12 +312,14 @@ pub async fn apply_job(
         let (target_index, job) = resolve_target(&full_job, target_index).map_err(|e| (e, false))?;
         let full = Plan { header: plan.header.clone(), ops: plan.ops.clone() };
         let plan_digest = full.digest();
-        // Keep the cache slot stable through the gate and run reservation. If a compare is already
-        // scanning, begin_run will reject this apply before a write; if this apply reserves first,
-        // no compare can replace the validated slot in the gap before execution starts.
-        let cached = cache.0.lock().unwrap();
+        // Keep the repository stable through the gate and run reservation. If a compare is already
+        // scanning, begin_run rejects this apply before a write; if this apply reserves first, no
+        // compare can replace the authenticated job/target/revision entry before execution starts.
+        let mut repository = results.0.lock().unwrap();
+        let key = ResultKey::new(&job_name, target_index, &config_revision);
+        let cached = repository.get(&key);
         validate_cached_compare(
-            cached.as_ref().map(|c| &c.provenance),
+            cached.map(|result| &result.provenance),
             &plan.owner,
             &job_name,
             target_index,
@@ -282,7 +335,9 @@ pub async fn apply_job(
             return Err((v.blockers.join("\n"), false));
         }
         let (run_id, ctl) = begin_run_for_launch(&st, launch_id).map_err(|e| (e, false))?;
-        drop(cached);
+        drop(repository);
+        let mut applied_result =
+            AppliedResultGuard::new(results.clone(), &job_name, &config_revision);
         let _active_run = ActiveRunGuard { state: st.clone(), run_id };
         let ctx = make_ctx(&run_app, run_id, ctl, "apply");
         // M4: every real apply writes a run-log entry (the Recorder also collects error events into the detail file)
@@ -294,7 +349,13 @@ pub async fn apply_job(
             &job_name, &job, &full, &ops, None, false, acknowledged, accept_caps.unwrap_or(false), &rec.ctx,
         ) {
             Ok(o) => o,
-            Err(e) => return Err((user_err(e), true)),
+            Err(e) => {
+                let message = user_err(e);
+                if message.contains("--accept-caps") {
+                    applied_result.retain_for_safe_rejection();
+                }
+                return Err((message, true));
+            }
         };
         rec.finish(&out, t0.elapsed().as_millis() as u64);
         Ok(ApplyDto {

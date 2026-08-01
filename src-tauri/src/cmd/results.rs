@@ -8,12 +8,55 @@ use syncdash::pipeline::compare;
 use syncdash::job;
 
 use crate::dto::{CompareOwner, SamePage};
-use crate::state::{resolve_target, validate_cached_compare, SnapCache};
+use crate::dto::PlanDto;
+use crate::state::{
+    resolve_target, validate_cached_compare, ResultKey, ResultRepository,
+};
 
-/// Pagination for the "Identical" panel. The data source is the snapshot left by the last compare — no rescan.
+/// Touch a locally retained owner without sending its potentially large plan through the webview.
+/// Returning a different owner means the backend has a newer successful compare for this key.
+#[tauri::command]
+pub fn touch_compare(
+    results: tauri::State<'_, Arc<ResultRepository>>,
+    owner: CompareOwner,
+) -> Result<Option<CompareOwner>, String> {
+    let (job_name, full_job) = job::load_named(&owner.job_name).map_err(|e| e.to_string())?;
+    let config_revision =
+        job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
+    if owner.config_revision != config_revision {
+        return Ok(None);
+    }
+    let (target_index, _) = resolve_target(&full_job, Some(owner.target_index))?;
+    let key = ResultKey::new(&job_name, target_index, &config_revision);
+    Ok(results
+        .0
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map(|cached| cached.provenance.owner.clone()))
+}
+
+/// Restore the most recent successful result for the authoritative job/target/revision. The
+/// repository is process-local by design: a desktop restart requires a fresh scan rather than
+/// pretending that old filesystem evidence is still current.
+#[tauri::command]
+pub fn restore_compare(
+    results: tauri::State<'_, Arc<ResultRepository>>,
+    name: String,
+    target_index: Option<usize>,
+) -> Result<Option<PlanDto>, String> {
+    let (job_name, full_job) = job::load_named(&name).map_err(|e| e.to_string())?;
+    let config_revision =
+        job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
+    let (target_index, _) = resolve_target(&full_job, target_index)?;
+    let key = ResultKey::new(&job_name, target_index, &config_revision);
+    Ok(results.0.lock().unwrap().get(&key).map(|cached| cached.plan.clone()))
+}
+
+/// Pagination for the "Identical" panel from that result's retained snapshots — no rescan.
 #[tauri::command]
 pub fn list_same(
-    snaps: tauri::State<'_, Arc<SnapCache>>,
+    results: tauri::State<'_, Arc<ResultRepository>>,
     owner: CompareOwner,
     query: String,
     offset: usize,
@@ -23,16 +66,18 @@ pub fn list_same(
     let config_revision =
         job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
     let (target_index, job) = resolve_target(&full_job, Some(owner.target_index))?;
-    let g = snaps.0.lock().unwrap();
+    let key = ResultKey::new(&job_name, target_index, &config_revision);
+    let mut repository = results.0.lock().unwrap();
+    let cached = repository.get(&key);
     validate_cached_compare(
-        g.as_ref().map(|c| &c.provenance),
+        cached.map(|result| &result.provenance),
         &owner,
         &job_name,
         target_index,
         &config_revision,
         None,
     )?;
-    let c = g.as_ref().expect("successful cache validation requires a cached comparison");
+    let c = cached.expect("successful repository validation requires a cached comparison");
     let (total, rows) = compare::evidence::same_page(&c.source, &c.target, &job.compare_opts(), &query, offset, limit.min(2000));
     Ok(SamePage { total, rows, job: job_name })
 }

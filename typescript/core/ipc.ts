@@ -79,6 +79,12 @@ async function withCapsConsent<T>(cmd: string, args: Record<string, unknown>): P
 export const compareJob = (name: string, targetIndex: number) =>
   withCapsConsent<PlanDto>('compare_job', { name, targetIndex });
 
+export const touchCompare = (owner: CompareOwner) =>
+  invoke<CompareOwner | null>('touch_compare', { owner });
+
+export const restoreCompare = (name: string, targetIndex: number) =>
+  invoke<PlanDto | null>('restore_compare', { name, targetIndex });
+
 export const applyJob = (
   name: string,
   plan: PlanDto,

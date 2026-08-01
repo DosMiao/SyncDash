@@ -3,6 +3,6 @@ import type { SameRow } from "./SameRow";
 
 export type SamePage = { total: number, rows: Array<SameRow>, 
 /**
- * Which job's snapshot is sitting in the cache (on a mismatch the UI prompts for a fresh compare)
+ * Which job owns this authenticated result
  */
 job: string, };

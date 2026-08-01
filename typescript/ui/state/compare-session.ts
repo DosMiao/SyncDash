@@ -2,16 +2,39 @@ import type { PlanDto } from '../../core/plan';
 import type { CompareOwner } from '../../core/types/generated/CompareOwner';
 import type { JobDto } from '../../core/types/generated/JobDto';
 
-/// The only retained compare result. Keeping its provenance beside the review vectors prevents a
-/// plan from ever being interpreted through whichever job happens to be selected now.
+export const COMPARE_SESSION_CAPACITY = 8;
+
 export interface CompareSession {
   plan: PlanDto;
   checked: boolean[];
   flipped: boolean[];
 }
 
+export interface CompareRepository {
+  sessions: CompareSession[];
+}
+
+export const EMPTY_COMPARE_REPOSITORY: CompareRepository = { sessions: [] };
+
 export function successfulSession(plan: PlanDto, checked: boolean[], flipped: boolean[]): CompareSession {
   return { plan, checked, flipped };
+}
+
+function sameKey(left: CompareOwner, right: CompareOwner): boolean {
+  return left.job_name === right.job_name
+    && left.target_index === right.target_index
+    && left.config_revision === right.config_revision;
+}
+
+export function retainSuccessfulSession(
+  repository: CompareRepository,
+  session: CompareSession,
+): CompareRepository {
+  const sessions = [
+    session,
+    ...repository.sessions.filter((candidate) => !sameKey(candidate.plan.owner, session.plan.owner)),
+  ].slice(0, COMPARE_SESSION_CAPACITY);
+  return { sessions };
 }
 
 export function ownerMatchesSelection(owner: CompareOwner, job: JobDto | null, targetIndex: number): boolean {
@@ -22,43 +45,95 @@ export function ownerMatchesSelection(owner: CompareOwner, job: JobDto | null, t
 }
 
 export function activeSession(
-  session: CompareSession | null,
+  repository: CompareRepository,
   job: JobDto | null,
   targetIndex: number,
 ): CompareSession | null {
-  return session && ownerMatchesSelection(session.plan.owner, job, targetIndex) ? session : null;
+  return repository.sessions.find((session) => ownerMatchesSelection(session.plan.owner, job, targetIndex)) ?? null;
 }
 
-/// Returning to the job that owns the one retained result also returns to that result's target.
-/// A changed config revision makes the slot ineligible even when the job name stayed the same.
-export function targetForSelection(session: CompareSession | null, job: JobDto): number {
-  if (!session || session.plan.owner.job_name !== job.name || session.plan.owner.config_revision !== job.config_revision) return 0;
-  const index = session.plan.owner.target_index;
-  return index >= 0 && index < job.targets.length ? index : 0;
+export function touchSession(
+  repository: CompareRepository,
+  job: JobDto | null,
+  targetIndex: number,
+): CompareRepository {
+  const index = repository.sessions.findIndex((session) => ownerMatchesSelection(session.plan.owner, job, targetIndex));
+  if (index <= 0) return repository;
+  const sessions = [...repository.sessions];
+  const [session] = sessions.splice(index, 1);
+  sessions.unshift(session);
+  return { sessions };
 }
 
-export function invalidateJobSession(session: CompareSession | null, jobName: string): CompareSession | null {
-  return session?.plan.owner.job_name === jobName ? null : session;
+export function updateSession(
+  repository: CompareRepository,
+  job: JobDto | null,
+  targetIndex: number,
+  update: (session: CompareSession) => CompareSession,
+): CompareRepository {
+  const index = repository.sessions.findIndex((session) => ownerMatchesSelection(session.plan.owner, job, targetIndex));
+  if (index < 0) return repository;
+  const sessions = [...repository.sessions];
+  sessions[index] = update(sessions[index]);
+  return { sessions };
 }
 
-/// A successful job-list refresh is authoritative. A changed revision keeps the bounded slot but
-/// makes it inactive through ownerMatchesSelection; a missing job retires its slot so recreating a
-/// file with the same name cannot resurrect an orphaned result.
-export function reconcileRefreshedJobSession(
-  session: CompareSession | null,
-  jobName: string,
-  refreshedJob: JobDto | null,
-): CompareSession | null {
-  return refreshedJob ? session : invalidateJobSession(session, jobName);
+export function targetForSelection(repository: CompareRepository, job: JobDto): number {
+  const session = repository.sessions.find((candidate) => (
+    candidate.plan.owner.job_name === job.name
+    && candidate.plan.owner.config_revision === job.config_revision
+    && candidate.plan.owner.target_index >= 0
+    && candidate.plan.owner.target_index < job.targets.length
+  ));
+  return session?.plan.owner.target_index ?? 0;
 }
 
-/// Saving an effectively identical job is not invalidation. The backend returns the canonical
-/// revision it wrote, so this decision does not depend on a second, fallible list refresh.
-export function reconcileSavedJobSession(
-  session: CompareSession | null,
+export function invalidateJobRevision(
+  repository: CompareRepository,
   jobName: string,
   configRevision: string,
-): CompareSession | null {
-  if (session?.plan.owner.job_name !== jobName) return session;
-  return session.plan.owner.config_revision === configRevision ? session : null;
+): CompareRepository {
+  const sessions = repository.sessions.filter((session) => (
+    session.plan.owner.job_name !== jobName
+    || session.plan.owner.config_revision !== configRevision
+  ));
+  return sessions.length === repository.sessions.length ? repository : { sessions };
+}
+
+export function invalidateSession(
+  repository: CompareRepository,
+  owner: CompareOwner,
+): CompareRepository {
+  const sessions = repository.sessions.filter((session) => !sameKey(session.plan.owner, owner));
+  return sessions.length === repository.sessions.length ? repository : { sessions };
+}
+
+export function invalidateJobSession(repository: CompareRepository, jobName: string): CompareRepository {
+  const sessions = repository.sessions.filter((session) => session.plan.owner.job_name !== jobName);
+  return sessions.length === repository.sessions.length ? repository : { sessions };
+}
+
+export function reconcileRefreshedJobSession(
+  repository: CompareRepository,
+  jobName: string,
+  refreshedJob: JobDto | null,
+): CompareRepository {
+  if (!refreshedJob) return invalidateJobSession(repository, jobName);
+  const sessions = repository.sessions.filter((session) => (
+    session.plan.owner.job_name !== jobName
+    || session.plan.owner.config_revision === refreshedJob.config_revision
+  ));
+  return sessions.length === repository.sessions.length ? repository : { sessions };
+}
+
+export function reconcileSavedJobSession(
+  repository: CompareRepository,
+  originalName: string,
+  originalRevision: string,
+  savedName: string,
+  savedRevision: string,
+): CompareRepository {
+  if (originalName === savedName && originalRevision === savedRevision) return repository;
+  if (originalName !== savedName) return invalidateJobSession(repository, originalName);
+  return invalidateJobRevision(repository, originalName, originalRevision);
 }

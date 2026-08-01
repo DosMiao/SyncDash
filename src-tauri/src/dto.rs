@@ -134,18 +134,18 @@ pub(crate) struct PathVerdict {
     pub(crate) warnings: Vec<String>,
 }
 
-// Snapshot cache (the data source for the "Identical" panel)
+// Compare-result repository (the data source for the "Identical" panel)
 //
-// compare already walked both sides in full; dropping the snapshots would force the UI to rescan just to glance at the identical items.
-// Single-slot cache: every *successful* compare overwrites it; merely changing the selected job does
-// not. Two snapshots at the 20k-entry scale run to a dozen-odd MB.
+// Compare already walked both sides in full; dropping the snapshots would force a rescan merely to
+// inspect identical items. A bounded set of successful job/target/revision results remains available,
+// and every page is authenticated against the exact owner that produced it.
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct SamePage {
     #[ts(type = "number")]
     pub(crate) total: u64,
     pub(crate) rows: Vec<compare::evidence::SameRow>,
-    /// Which job's snapshot is sitting in the cache (on a mismatch the UI prompts for a fresh compare)
+    /// Which job owns this authenticated result
     pub(crate) job: String,
 }
 

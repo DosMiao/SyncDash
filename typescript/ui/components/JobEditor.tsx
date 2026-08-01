@@ -32,8 +32,13 @@ interface Props {
   apiRef: React.RefObject<EditorApi | null>;
   busy: boolean;
   onClose: () => void;
-  onSaved: (name: string, job: JobFull, configRevision: string) => void;
-  onDeleted: (name: string) => void;
+  onSaved: (
+    name: string,
+    job: JobFull,
+    configRevision: string,
+    original: { name: string; configRevision: string } | null,
+  ) => void;
+  onDeleted: (name: string, configRevision: string) => void;
   onMutationConflict: (name: string) => Promise<void>;
   onStatus: (msg: string, cls?: '' | 'err' | 'ok') => void;
 }
@@ -209,7 +214,14 @@ export function JobEditor(props: Props) {
         ? { originalName: form.originalName, expectedRevision: form.configRevision }
         : undefined;
       const saved = await saveJob(c.name, c.job, existing);
-      onSaved(saved.name, c.job, saved.config_revision);
+      onSaved(
+        saved.name,
+        c.job,
+        saved.config_revision,
+        form.originalName && form.configRevision
+          ? { name: form.originalName, configRevision: form.configRevision }
+          : null,
+      );
     } catch (e) {
       let message = `Save failed: ${e}`;
       try {
@@ -229,7 +241,7 @@ export function JobEditor(props: Props) {
     if (!form?.originalName || !form.configRevision || busy) return;
     try {
       await deleteJob(form.originalName, form.configRevision);
-      onDeleted(form.originalName);
+      onDeleted(form.originalName, form.configRevision);
     } catch (e) {
       let message = `Delete failed: ${e}`;
       try {

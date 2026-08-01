@@ -268,16 +268,19 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
   (FFS semantics). This fixes a quiet trap in the old behavior — filtering with the search box used to leave
   hidden-but-still-checked rows to go through with Synchronize anyway. The confirmation sheet now spells out
   "N items hidden by filters, not applied", and the stats bar switches to counting checked ∩ visible to match.
-- **Bounded last-successful compare session**: the desktop retains exactly one completed `PlanDto`, including
-  which rows are checked and which directions were reversed, and shows it only when its job, selected target and
-  captured configuration revision still match. Navigation hides a non-matching session; it does not destroy it.
-  Thus compare A → select B without comparing → return to A restores A's result, while a successful compare for B
-  replaces A in the one slot. A failed or cancelled compare never replaces the last successful one. The revision
-  is a canonical digest of the job contents, so a content-changing job-file mutation changes it and prevents the
-  old result from being restored or run; the recorded job/target/revision is provenance, not a best-effort guess
-  from the currently selected row. A no-op editor save keeps the result because its effective revision is unchanged,
-  and every Compare attempt refreshes the job row after reading an externally edited TOML — including a failed or
-  cancelled attempt, so a removed target or deleted job cannot leave a ghost selection that fails forever. Preflight/apply
+- **Bounded last-successful compare repository**: the desktop retains the eight most recently used completed
+  `PlanDto` review sessions, including which rows are checked and which directions were reversed, keyed by job,
+  selected target and captured configuration revision. Thus compare A → compare B → return to A restores A's result,
+  and different targets of one job retain independent reviews. Only a successful compare publishes a result, so a
+  failed or cancelled attempt cannot evict the last good review. LRU eviction bounds the accumulated snapshot/plan
+  memory; if the frontend copy was evicted while Rust still owns the authenticated entry, selection restores it over
+  IPC without rescanning. The repository is deliberately process-local: after a desktop restart the filesystem may
+  have changed while SyncDash was closed, so the app asks for a fresh Compare instead of presenting persisted evidence
+  as current. The revision is a canonical digest of the job contents, so a content-changing job-file mutation changes
+  it and invalidates only that job/revision; unrelated jobs and targets remain available. A no-op editor save keeps the
+  result because its effective revision is unchanged, and every Compare attempt refreshes the job row after reading an
+  externally edited TOML — including a failed or cancelled attempt, so a removed target or deleted job cannot leave a
+  ghost selection that fails forever. Preflight/apply
   load only that registered job name (never a same-stem path elsewhere), accept row index + flip decisions rather than
   caller-authored operations, and reconstruct the executable subset from the cached plan before either the local or peer
   write path can start. An empty selection is rejected before a run is reserved; in particular, AutoScan will never turn a
@@ -285,10 +288,9 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
 - **Identical-items panel** (that "22,631" button along the bottom of FFS): lists the files judged identical on
   both sides, paged 300 at a time, with its own path filter; the data source is the two snapshots the last compare
   left in memory — **no rescan**. Rows whose content matches but whose timestamps drift more than 2s across the
-  two sides get the target time marked orange (a common artifact of FAT/SMB granularity). This cache follows the
-  same bounded, target-aware last-successful contract: selecting another job or target only hides it, and the next
-  successful compare overwrites it. Its provenance includes the effective target, so two targets of one job cannot
-  read each other's identical rows. It works for remote jobs too (the remote snapshot is a complete table pulled
+  two sides get the target time marked orange (a common artifact of FAT/SMB granularity). The retained snapshots follow
+  the same bounded, target-aware repository contract, and their provenance includes the effective target, so two targets
+  of one job cannot read each other's identical rows. It works for remote jobs too (the remote snapshot is a complete table pulled
   back over ssh).
 - **CSV export**: exports the current view (including checked state and both-side size/time), escaping is done
   exactly once on the Rust side, UTF-8 **with a BOM** — without the BOM, Excel interprets it in the local code

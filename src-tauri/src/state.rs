@@ -2,10 +2,11 @@
 //!
 //! One run at a time, so cancel and pause always have an unambiguous target. An interactive apply
 //! reserves its launch before opening the progress window; consuming that same ID is part of
-//! beginning the run, so duplicate starts and pre-start window closes cannot race it. The snapshot
-//! cache is a single slot: compare already walked both sides in full, and dropping the snapshots
-//! would make the "Identical" panel rescan just to be looked at.
+//! beginning the run, so duplicate starts and pre-start window closes cannot race it. Successful
+//! compare results live in a bounded, target-aware repository: navigation can return to several
+//! recent reviews without rescanning, while exact provenance still gates every evidence read/write.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +14,9 @@ use syncdash::job::{self};
 use syncdash::model::plan::{Action, Op};
 use syncdash::obs::progress::RunCtl;
 
-use crate::dto::{CompareOwner, SelectedRowDto};
+use crate::dto::{CompareOwner, PlanDto, SelectedRowDto};
+
+pub(crate) const RESULT_REPOSITORY_CAPACITY: usize = 8;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CompareProvenance {
@@ -21,14 +24,91 @@ pub(crate) struct CompareProvenance {
     pub(crate) plan_digest: String,
 }
 
-pub(crate) struct CachedSnaps {
+pub(crate) struct CachedCompare {
     pub(crate) provenance: CompareProvenance,
+    pub(crate) plan: PlanDto,
     pub(crate) source: syncdash::model::table::Snapshot,
     pub(crate) target: syncdash::model::table::Snapshot,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResultKey {
+    job_name: String,
+    target_index: usize,
+    config_revision: String,
+}
+
+impl ResultKey {
+    pub(crate) fn new(job_name: &str, target_index: usize, config_revision: &str) -> Self {
+        Self {
+            job_name: job_name.to_string(),
+            target_index,
+            config_revision: config_revision.to_string(),
+        }
+    }
+
+    fn from_owner(owner: &CompareOwner) -> Self {
+        Self::new(&owner.job_name, owner.target_index, &owner.config_revision)
+    }
+}
+
+pub(crate) struct ResultStore {
+    entries: VecDeque<CachedCompare>,
+    capacity: usize,
+}
+
+impl Default for ResultStore {
+    fn default() -> Self {
+        Self { entries: VecDeque::new(), capacity: RESULT_REPOSITORY_CAPACITY }
+    }
+}
+
+impl ResultStore {
+    #[cfg(test)]
+    fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity > 0);
+        Self { entries: VecDeque::new(), capacity }
+    }
+
+    pub(crate) fn insert(&mut self, cached: CachedCompare) {
+        let key = ResultKey::from_owner(&cached.provenance.owner);
+        if let Some(index) = self.position(&key) {
+            self.entries.remove(index);
+        }
+        self.entries.push_front(cached);
+        self.entries.truncate(self.capacity);
+    }
+
+    pub(crate) fn get(&mut self, key: &ResultKey) -> Option<&CachedCompare> {
+        let index = self.position(key)?;
+        if index != 0 {
+            let cached = self.entries.remove(index).expect("a located compare result must exist");
+            self.entries.push_front(cached);
+        }
+        self.entries.front()
+    }
+
+    pub(crate) fn invalidate_revision(&mut self, job_name: &str, config_revision: &str) {
+        self.entries.retain(|cached| {
+            let owner = &cached.provenance.owner;
+            owner.job_name != job_name || owner.config_revision != config_revision
+        });
+    }
+
+    pub(crate) fn invalidate_job(&mut self, job_name: &str) {
+        self.entries
+            .retain(|cached| cached.provenance.owner.job_name != job_name);
+    }
+
+    fn position(&self, key: &ResultKey) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|cached| ResultKey::from_owner(&cached.provenance.owner) == *key)
+    }
+}
+
 #[derive(Default)]
-pub(crate) struct SnapCache(pub(crate) Mutex<Option<CachedSnaps>>);
+pub(crate) struct ResultRepository(pub(crate) Mutex<ResultStore>);
 
 #[derive(Clone)]
 pub(crate) struct ActiveRun {
@@ -301,7 +381,8 @@ pub(crate) fn user_err(e: std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syncdash::model::plan::Side;
+    use syncdash::model::plan::{PlanHeader, Side};
+    use syncdash::model::table::{Header, Snapshot};
 
     fn owner(compare_id: u64) -> CompareOwner {
         CompareOwner {
@@ -329,6 +410,113 @@ mod tests {
             mode: None,
             reason: "compared".into(),
         }
+    }
+
+    fn cached(job_name: &str, target_index: usize, revision: &str, compare_id: u64) -> CachedCompare {
+        let owner = CompareOwner {
+            compare_id,
+            job_name: job_name.into(),
+            target_index,
+            config_revision: revision.into(),
+        };
+        let plan_header = PlanHeader {
+            schema: syncdash::model::plan::PLAN_SCHEMA,
+            kind: "plan".into(),
+            mode: "mirror".into(),
+            generated_at_ms: 0,
+            source_root: "/source".into(),
+            source_host: "host".into(),
+            target_root: "/target".into(),
+            target_host: "host".into(),
+            op_count: 0,
+            conflict_count: 0,
+            source_entries: 0,
+            target_entries: 0,
+            source_excluded: 0,
+            target_excluded: 0,
+            source_walk_errors: 0,
+            target_walk_errors: 0,
+            source_walk_err_samples: Vec::new(),
+            target_walk_err_samples: Vec::new(),
+            source_icloud_stubs: 0,
+            target_icloud_stubs: 0,
+            source_icloud_stub_samples: Vec::new(),
+            target_icloud_stub_samples: Vec::new(),
+        };
+        let snapshot = |root: &str| Snapshot {
+            header: Header {
+                schema: syncdash::model::table::SCHEMA,
+                kind: "snapshot".into(),
+                root: root.into(),
+                host: "host".into(),
+                os: "test".into(),
+                scanned_at_ms: 0,
+                duration_ms: 0,
+                entry_count: 0,
+                hashed: false,
+                excluded_dirs: 0,
+                excluded_files: 0,
+                walk_errors: 0,
+                walk_err_samples: Vec::new(),
+                icloud_stubs: 0,
+                icloud_stub_samples: Vec::new(),
+                skipped_symlinks: 0,
+                dataless_files: 0,
+                vfs: None,
+            },
+            entries: Vec::new(),
+        };
+        CachedCompare {
+            provenance: CompareProvenance { owner: owner.clone(), plan_digest: "digest".into() },
+            plan: PlanDto {
+                header: plan_header,
+                ops: Vec::new(),
+                metas: Vec::new(),
+                equal_count: 0,
+                equal_bytes: 0,
+                owner,
+            },
+            source: snapshot("/source"),
+            target: snapshot("/target"),
+        }
+    }
+
+    #[test]
+    fn result_repository_is_lru_bounded_and_replaces_only_the_same_key() {
+        let mut store = ResultStore::with_capacity(2);
+        store.insert(cached("A", 0, "rev-a", 1));
+        store.insert(cached("B", 0, "rev-b", 2));
+        assert!(store.get(&ResultKey::new("A", 0, "rev-a")).is_some());
+
+        store.insert(cached("C", 0, "rev-c", 3));
+        assert!(store.get(&ResultKey::new("B", 0, "rev-b")).is_none());
+        assert!(store.get(&ResultKey::new("A", 0, "rev-a")).is_some());
+        assert!(store.get(&ResultKey::new("C", 0, "rev-c")).is_some());
+
+        store.insert(cached("A", 0, "rev-a", 4));
+        assert_eq!(store.entries.len(), 2);
+        assert_eq!(
+            store.get(&ResultKey::new("A", 0, "rev-a")).unwrap().provenance.owner.compare_id,
+            4
+        );
+    }
+
+    #[test]
+    fn result_repository_invalidates_only_the_named_revision() {
+        let mut store = ResultStore::with_capacity(4);
+        store.insert(cached("A", 0, "rev-old", 1));
+        store.insert(cached("A", 0, "rev-current", 2));
+        store.insert(cached("B", 0, "rev-old", 3));
+
+        store.invalidate_revision("A", "rev-old");
+
+        assert!(store.get(&ResultKey::new("A", 0, "rev-old")).is_none());
+        assert!(store.get(&ResultKey::new("A", 0, "rev-current")).is_some());
+        assert!(store.get(&ResultKey::new("B", 0, "rev-old")).is_some());
+
+        store.invalidate_job("A");
+        assert!(store.get(&ResultKey::new("A", 0, "rev-current")).is_none());
+        assert!(store.get(&ResultKey::new("B", 0, "rev-old")).is_some());
     }
 
     #[test]
