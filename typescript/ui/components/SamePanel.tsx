@@ -27,7 +27,7 @@ export function SamePanel({ owner, onClose }: { owner: CompareOwner; onClose: ()
   }, [q]);
 
   const load = useCallback(async (offset: number) => {
-    const key = `${owner.compare_id}\0${owner.job_name}\0${owner.target_index}\0${owner.config_revision}\0${query}\0${offset}`;
+    const key = `${owner.compare_id}\0${owner.job_id}\0${owner.target_index}\0${owner.config_revision}\0${query}\0${offset}`;
     const ticket = fence.current.start(key);
     setLoading(true);
     if (offset === 0) {

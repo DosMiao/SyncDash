@@ -10,6 +10,7 @@ import {
   invalidateSession,
   reconcileRefreshedJobSession,
   reconcileSavedJobSession,
+  rebindSessionOwner,
   retainSuccessfulSession,
   successfulSession,
   targetForSelection,
@@ -20,10 +21,11 @@ import type { CompareRepository } from '../../typescript/ui/state/compare-sessio
 import type { PlanDto } from '../../typescript/core/plan.ts';
 import type { CompareOwner } from '../../typescript/core/types/generated/CompareOwner.ts';
 import type { JobDto } from '../../typescript/core/types/generated/JobDto.ts';
+import type { JobSaveDto } from '../../typescript/core/types/generated/JobSaveDto.ts';
 import { selectedRows } from '../../typescript/core/plan.ts';
 
-function owner(jobName: string, targetIndex: number, revision: string, compareId = 1): CompareOwner {
-  return { compare_id: compareId, job_name: jobName, target_index: targetIndex, config_revision: revision };
+function owner(jobName: string, targetIndex: number, revision: string, compareId = 1, jobId = `id-${jobName}`): CompareOwner {
+  return { compare_id: compareId, job_id: jobId, job_name: jobName, target_index: targetIndex, config_revision: revision };
 }
 
 function plan(o: CompareOwner): PlanDto {
@@ -37,8 +39,18 @@ function plan(o: CompareOwner): PlanDto {
   };
 }
 
-function job(name: string, revision: string, targets = ['target']): JobDto {
-  return { name, config_revision: revision, targets } as JobDto;
+function job(name: string, revision: string, targets = ['target'], jobId = `id-${name}`): JobDto {
+  return { job_id: jobId, name, config_revision: revision, targets } as JobDto;
+}
+
+function mutation(
+  effect: JobSaveDto['effect'],
+  name: string,
+  revision: string,
+  jobId = `id-${name}`,
+  previousName: string | null = null,
+): JobSaveDto {
+  return { effect, job_id: jobId, name, config_revision: revision, previous_name: previousName };
 }
 
 function retain(
@@ -73,6 +85,13 @@ test('target and config revision are both part of result ownership', () => {
   assert.equal(activeSession(repository, job('A', 'rev-new', ['a0', 'a1']), 1), null);
   assert.equal(targetForSelection(repository, job('A', 'rev-new', ['a0', 'a1'])), 0);
   assert.equal(targetForSelection(repository, job('A', 'rev-a', ['only-target'])), 0);
+});
+
+test('stable identity, not a reused display name, owns a retained result', () => {
+  const repository = retain(EMPTY_COMPARE_REPOSITORY, 'A', 0, 'rev-a', 1);
+
+  assert.ok(activeSession(repository, job('A', 'rev-a'), 0));
+  assert.equal(activeSession(repository, job('A', 'rev-a', ['target'], 'replacement-id'), 0), null);
 });
 
 test('the repository is LRU bounded and a failed compare has no state transition to evict success', () => {
@@ -123,20 +142,30 @@ test('effective mutation invalidates only the affected job revision while a no-o
   repository = retain(repository, 'A', 0, 'rev-new', 2);
   repository = retain(repository, 'B', 0, 'rev-a', 3);
 
-  const noOp = reconcileSavedJobSession(repository, 'A', 'rev-a', 'A', 'rev-a');
+  const original = { jobId: 'id-A', name: 'A', configRevision: 'rev-a' };
+  const noOp = reconcileSavedJobSession(repository, mutation('no_op', 'A', 'rev-a', 'id-A'), original);
   assert.equal(noOp, repository);
 
-  const changed = reconcileSavedJobSession(repository, 'A', 'rev-a', 'A', 'rev-next');
+  const changed = reconcileSavedJobSession(
+    repository,
+    mutation('updated', 'A', 'rev-next', 'id-A'),
+    original,
+  );
   assert.equal(activeSession(changed, job('A', 'rev-a'), 0), null);
   assert.ok(activeSession(changed, job('A', 'rev-new'), 0));
   assert.ok(activeSession(changed, job('B', 'rev-a'), 0));
 
-  const renamed = reconcileSavedJobSession(repository, 'A', 'rev-a', 'Renamed', 'rev-a');
-  assert.equal(renamed.sessions.filter((session) => session.plan.owner.job_name === 'A').length, 0);
+  const renamed = reconcileSavedJobSession(
+    repository,
+    mutation('renamed', 'Renamed', 'rev-a', 'id-A', 'A'),
+    original,
+  );
+  assert.equal(activeSession(renamed, job('Renamed', 'rev-a', ['target'], 'id-A'), 0)?.plan.owner.compare_id, 1);
+  assert.equal(renamed.sessions.find((session) => session.plan.owner.job_id === 'id-A')?.plan.owner.job_name, 'Renamed');
   assert.ok(activeSession(renamed, job('B', 'rev-a'), 0));
 
   assert.equal(invalidateJobRevision(repository, 'missing', 'rev-a'), repository);
-  assert.equal(invalidateJobSession(repository, 'B').sessions.length, 2);
+  assert.equal(invalidateJobSession(repository, 'id-B').sessions.length, 2);
 });
 
 test('authoritative refresh drops only obsolete revisions or all results for a missing job', () => {
@@ -144,14 +173,26 @@ test('authoritative refresh drops only obsolete revisions or all results for a m
   repository = retain(repository, 'A', 0, 'rev-new', 2);
   repository = retain(repository, 'B', 0, 'rev-b', 3);
 
-  const refreshed = reconcileRefreshedJobSession(repository, 'A', job('A', 'rev-new'));
+  const original = { jobId: 'id-A', name: 'A', configRevision: 'rev-a' };
+  const refreshed = reconcileRefreshedJobSession(repository, original, job('Renamed', 'rev-new', ['target'], 'id-A'));
   assert.equal(activeSession(refreshed, job('A', 'rev-a'), 0), null);
-  assert.ok(activeSession(refreshed, job('A', 'rev-new'), 0));
+  assert.ok(activeSession(refreshed, job('Renamed', 'rev-new', ['target'], 'id-A'), 0));
   assert.ok(activeSession(refreshed, job('B', 'rev-b'), 0));
 
-  const missing = reconcileRefreshedJobSession(repository, 'A', null);
+  const missing = reconcileRefreshedJobSession(repository, original, null);
   assert.equal(missing.sessions.length, 1);
   assert.ok(activeSession(missing, job('B', 'rev-b'), 0));
+});
+
+test('touch rebinds a renamed owner without changing the compare result identity', () => {
+  const repository = retain(EMPTY_COMPARE_REPOSITORY, 'A', 0, 'rev-a', 7);
+  const previous = owner('A', 0, 'rev-a', 7);
+  const current = { ...previous, job_name: 'Renamed' };
+  const rebound = rebindSessionOwner(repository, previous, current);
+
+  assert.equal(rebound.sessions[0].plan.owner.job_name, 'Renamed');
+  assert.equal(rebound.sessions[0].plan.owner.compare_id, 7);
+  assert.equal(rebound.sessions[0].plan.owner.job_id, 'id-A');
 });
 
 test('the apply payload contains only authenticated row decisions', () => {

@@ -8,6 +8,7 @@ import type { ApplyDto } from './types/generated/ApplyDto';
 import type { AppSettings } from './types/generated/AppSettings';
 import type { CompareOwner } from './types/generated/CompareOwner';
 import type { Job as JobFull } from './types/generated/Job';
+import type { JobDeleteDto } from './types/generated/JobDeleteDto';
 import type { JobDetailDto } from './types/generated/JobDetailDto';
 import type { JobDto } from './types/generated/JobDto';
 import type { JobFileSchemaDto } from './types/generated/JobFileSchemaDto';
@@ -23,7 +24,7 @@ import type { SamePage } from './types/generated/SamePage';
 import type { SameRow } from './types/generated/SameRow';
 import type { SelectedRowDto } from './types/generated/SelectedRowDto';
 
-export type { JobDetailDto, JobFull, JobSaveDto, JunkPresetDto };
+export type { JobDeleteDto, JobDetailDto, JobFull, JobSaveDto, JunkPresetDto };
 
 export type { SameRow, SamePage };
 
@@ -48,8 +49,51 @@ export const saveJob = (name: string, job: JobFull, existing?: ExistingJobRevisi
   originalName: existing?.originalName,
   expectedRevision: existing?.expectedRevision,
 });
-export const deleteJob = (name: string, expectedRevision: string) => invoke<void>('delete_job', { name, expectedRevision });
+export const deleteJob = (name: string, expectedJobId: string, expectedRevision: string) =>
+  invoke<JobDeleteDto>('delete_job', { name, expectedJobId, expectedRevision });
 export const jobsDir = () => invoke<string>('jobs_dir');
+
+export type AutoScanMode = 'starting' | 'native_fsevents' | 'polling';
+export type AutoScanReason = 'bootstrap' | 'filesystem_change' | 'watch_invalidated' | 'periodic_verification';
+
+export interface AutoScanStatusDto {
+  active: boolean;
+  generation: number;
+  job_id: string | null;
+  job_name: string | null;
+  config_revision: string | null;
+  target_index: number | null;
+  interval_secs: number | null;
+  auto_apply: boolean;
+  mode: AutoScanMode | null;
+  detail: string;
+  active_ticket: number | null;
+}
+
+export interface AutoScanTriggerDto {
+  generation: number;
+  ticket_id: number;
+  job_id: string;
+  job_name: string;
+  config_revision: string;
+  target_index: number;
+  auto_apply: boolean;
+  mode: Exclude<AutoScanMode, 'starting'>;
+  reason: AutoScanReason;
+}
+
+export const startAutoScan = (name: string, expectedJobId: string, expectedRevision: string, targetIndex: number) =>
+  invoke<AutoScanStatusDto>('start_autoscan', { name, expectedJobId, expectedRevision, targetIndex });
+export const stopAutoScan = () => invoke<AutoScanStatusDto>('stop_autoscan');
+export const autoScanStatus = () => invoke<AutoScanStatusDto>('autoscan_status');
+export const completeAutoScan = (
+  generation: number,
+  ticketId: number,
+  succeeded: boolean,
+  owner: CompareOwner | null,
+) => invoke<AutoScanStatusDto>('complete_autoscan', {
+  generation, ticketId, succeeded, owner,
+});
 
 // Compare / run
 
@@ -77,14 +121,14 @@ async function withCapsConsent<T>(cmd: string, args: Record<string, unknown>): P
   }
 }
 
-export const compareJob = (name: string, targetIndex: number) =>
-  withCapsConsent<PlanDto>('compare_job', { name, targetIndex });
+export const compareJob = (name: string, expectedJobId: string, targetIndex: number) =>
+  withCapsConsent<PlanDto>('compare_job', { name, expectedJobId, targetIndex });
 
 export const touchCompare = (owner: CompareOwner) =>
   invoke<CompareOwner | null>('touch_compare', { owner });
 
-export const restoreCompare = (name: string, targetIndex: number) =>
-  invoke<PlanDto | null>('restore_compare', { name, targetIndex });
+export const restoreCompare = (jobId: string, targetIndex: number) =>
+  invoke<PlanDto | null>('restore_compare', { jobId, targetIndex });
 
 export const applyJob = (
   name: string,

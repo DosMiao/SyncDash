@@ -111,6 +111,7 @@ One TOML per job, kept in `%APPDATA%\syncdash\jobs\` (mac: `~/.config/syncdash/j
 
 ```toml
 schema = 3                 # job-file schema; older files migrate on load (junk presets -> exclude, then remote_host -> peer://)
+job_id = "0123456789abcdef0123456789abcdef"  # registry-assigned; survives rename, changes after delete/recreate; not in config_revision
 mode = "sync"              # mirror | sync | enrich
 source = 'D:\Code\Utilities\flight'
 target = '\\192.168.0.115\xuanbomiao\Code\Utilities\flight'
@@ -126,6 +127,13 @@ archive = 'C:\Users\xuanb\AppData\Roaming\syncdash\archive\flight.jsonl'   # syn
 
 `run <job> --apply` **refreshes the archive automatically** when it succeeds (0 errors) in sync mode (conflicting
 paths are dropped from the archive, so the next run reports the conflict again instead of having it silently arbitrated).
+
+The registry assigns `job_id` on first registered load/save without changing the job's semantic
+`config_revision`. Renaming moves that identity with the TOML; deleting and recreating the same name creates a
+different identity, so callers can distinguish replacement from an ordinary edit. Desktop save returns one typed
+effect (`created`, `updated`, `renamed`, or `no_op`) and delete returns `deleted`; save/delete are serialized against
+the same run-entry gate as Compare/Synchronize, so a configuration cannot change between a run's idle check and its
+job load.
 
 ## Logging (v0.10)
 
@@ -223,9 +231,14 @@ v0.9 "Progress & Polish" (behavior parameters cross-checked against the FFS 14.1
   red past 7 days); the GUI log panel can review history and detail; CLI `syncdash history [job] [--prune-days N]`.
 - **Job editor** (full-field form: mode / roots / rigor level / filters / safety gates / the three remote fields /
   watch, with create, edit and delete-with-confirmation).
-- **Watch mode** (timed rescans, not inotify): a second-scale `watch_interval_secs` gives "near real-time"; the
-  hash cache means an unchanged tree costs only the walk. Desktop Watch toggle (countdown + notify on differences /
-  auto-apply); CLI `run --watch [--interval N] [--auto-apply]`.
+- **AutoScan while SyncDash is open**: the desktop backend, not the webview, owns its lifecycle and binds every
+  trigger to one exact job identity, revision and target. A pure rename rebinds the displayed name without resetting
+  the watcher generation; delete/recreate cannot inherit the old ticket even if the name and configuration match.
+  On macOS, two local roots use FSEvents change hints plus periodic
+  full verification; remote roots and platforms without a native adapter report an explicit interval-polling
+  fallback. A change event is never treated as a complete snapshot: every trigger still runs Compare, and a failed
+  or stale ticket does not advance the durable native cursor. `watch_interval_secs` is the polling / maximum full
+  verification interval; CLI `run --watch [--interval N] [--auto-apply]` remains a foreground timed loop.
 - **Remote jobs now take the real remote pipeline in the GUI** (they used to fall silently into the local
   pipeline, re-hashing over UNC an order of magnitude slower); ssh badge in the sidebar.
 - **The old egui UI has been retired and deleted** (removed as agreed once Tauri reached feature parity; the bare
@@ -239,8 +252,10 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
 - **Directory picker / drag-and-drop / path history / path health check**: the editor's two roots no longer have
   to be typed by hand — a browse button (tauri-plugin-dialog), drop a folder in and it fills (Tauri v2 swallows
   the HTML5 drop event, so we go through `onDragDropEvent` + physical-pixel hit testing), a `<datalist>` that
-  remembers the last 12 roots, and `inspect_paths` validating live (exists / is a directory / the two roots are
-  the same / one nests inside the other / `.syncdash-root` present or not).
+  remembers the last 12 roots, and `inspect_paths` validating local roots live (exists / is a directory / the two
+  roots are the same / one nests inside the other / `.syncdash-root` present or not). Network and peer phrases are
+  explicitly **deferred**, not painted as healthy: the editor does not open credentials or a transport merely to
+  color an input, and Compare reports the actual connection/readiness result when it owns a cancellable run.
 - **⇄ Swap**: one click swaps them inside the editor; the toolbar swap **writes back to the TOML** and invalidates
   the current plan (with undo). What FFS swaps is the config held in memory; our jobs are named files on disk —
   without persisting, the two roots in the plan header would say something different from the job file, and both
@@ -269,8 +284,8 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
   hidden-but-still-checked rows to go through with Synchronize anyway. The confirmation sheet now spells out
   "N items hidden by filters, not applied", and the stats bar switches to counting checked ∩ visible to match.
 - **Bounded last-successful compare repository**: the desktop retains the eight most recently used completed
-  `PlanDto` review sessions, including which rows are checked and which directions were reversed, keyed by job,
-  selected target and captured configuration revision. Thus compare A → compare B → return to A restores A's result,
+  `PlanDto` review sessions, including which rows are checked and which directions were reversed, keyed by stable
+  `job_id`, selected target and captured configuration revision. Thus compare A → compare B → return to A restores A's result,
   and different targets of one job retain independent reviews. Only a successful compare publishes a result, so a
   failed or cancelled attempt cannot evict the last good review. LRU eviction bounds the accumulated snapshot/plan
   memory; if the frontend copy was evicted while Rust still owns the authenticated entry, selection restores it over
@@ -278,10 +293,12 @@ v0.9.2 "FFS parity" (catching up on the batch of buttons FFS users press every d
   have changed while SyncDash was closed, so the app asks for a fresh Compare instead of presenting persisted evidence
   as current. The revision is a canonical digest of the job contents, so a content-changing job-file mutation changes
   it and invalidates only that job/revision; unrelated jobs and targets remain available. A no-op editor save keeps the
-  result because its effective revision is unchanged, and every Compare attempt refreshes the job row after reading an
+  result because its effective revision is unchanged; a pure rename preserves and relabels that result, while deleting
+  and recreating the same name produces a new identity that cannot see it. Every Compare attempt refreshes the job row after reading an
   externally edited TOML — including a failed or cancelled attempt, so a removed target or deleted job cannot leave a
   ghost selection that fails forever. Preflight/apply
-  load only that registered job name (never a same-stem path elsewhere), accept row index + flip decisions rather than
+  load only that registered job name (never a same-stem path elsewhere), prove its stable identity against the compare
+  owner, accept row index + flip decisions rather than
   caller-authored operations, and reconstruct the executable subset from the cached plan before either the local or peer
   write path can start. An empty selection is rejected before a run is reserved; in particular, AutoScan will never turn a
   conflict/note-only result into an archive-changing zero-operation apply.

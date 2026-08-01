@@ -22,6 +22,11 @@ pub struct Job {
     #[serde(default = "default_schema")]
     #[ts(type = "number")]
     pub schema: u32,
+    /// Opaque identity of the registered job file. It is assigned once when a job enters the jobs
+    /// directory, moves with a rename, and is deliberately excluded from `config_revision`.
+    /// An empty value is valid only for an unsaved/default job.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub job_id: String,
     /// mirror | sync | enrich
     pub mode: String,
     /// Root phrase: a local path, or `scheme://…` for a VFS root (sftp/ftp/ftps/smb).
@@ -133,6 +138,7 @@ impl Default for Job {
             // wrong made every job written straight to TOML (gen-jobs) come back through the v1
             // migration on load and silently acquire preset patterns nobody selected.
             schema: SCHEMA,
+            job_id: String::new(),
             mode: "mirror".into(),
             source: String::new(),
             target: String::new(),
@@ -183,7 +189,8 @@ fn default_schema() -> u32 {
 ///
 /// Hash the migrated, current-schema `Job` value rather than the TOML bytes on disk: formatting,
 /// comments, and key order are not configuration changes, while every field the engine can observe
-/// is. The domain prefix versions this canonical encoding independently of the job-file schema.
+/// is. `job_id` is registry metadata rather than engine policy, so it is cleared before encoding.
+/// The domain prefix versions this canonical encoding independently of the job-file schema.
 pub fn config_revision(job: &Job) -> Result<String, String> {
     for (field, value) in [
         ("min_free_pct", job.min_free_pct),
@@ -195,7 +202,11 @@ pub fn config_revision(job: &Job) -> Result<String, String> {
             ));
         }
     }
-    let canonical = Job { schema: SCHEMA, ..job.clone() };
+    let canonical = Job {
+        schema: SCHEMA,
+        job_id: String::new(),
+        ..job.clone()
+    };
     let bytes = serde_json::to_vec(&canonical)
         .map_err(|e| format!("cannot identify this job configuration: {e}"))?;
     let mut hasher = blake3::Hasher::new();
@@ -246,13 +257,19 @@ impl Job {
         validate_choice(
             "rigor",
             &self.rigor,
-            &["quick", "fast", "balanced", "standard", "paranoid", "custom"],
+            &[
+                "quick", "fast", "balanced", "standard", "paranoid", "custom",
+            ],
         )?;
         if let Some(evidence) = self.evidence.as_deref() {
             validate_choice("evidence", evidence, &["none", "sampled", "full"])?;
         }
         validate_choice("symlinks", &self.symlinks, &["exclude", "direct"])?;
-        validate_choice("on_conflict", &self.on_conflict, &["report", "copy", "newer"])?;
+        validate_choice(
+            "on_conflict",
+            &self.on_conflict,
+            &["report", "copy", "newer"],
+        )?;
 
         validate_ratio("min_free_pct", self.min_free_pct)?;
         validate_non_negative("max_delete_ratio", self.max_delete_ratio)?;
@@ -281,7 +298,11 @@ impl Job {
             if self.mode == "sync" {
                 return Err("sync mode does not support multiple targets (N-way merge needs version-vector attribution) — use paired sync jobs instead (hub-and-spoke)".into());
             }
-            if self.target_list().iter().any(|t| crate::fs::vfs::spec::is_peer(t)) {
+            if self
+                .target_list()
+                .iter()
+                .any(|t| crate::fs::vfs::spec::is_peer(t))
+            {
                 return Err("peer:// targets do not support multiple targets yet".into());
             }
         }
@@ -427,9 +448,8 @@ fn comparable_local_root(raw: &str) -> Option<ComparableLocalRoot> {
     };
 
     let unified = raw.trim().replace('\\', "/");
-    let windows = cfg!(windows)
-        || unified.starts_with("//")
-        || unified.as_bytes().get(1) == Some(&b':');
+    let windows =
+        cfg!(windows) || unified.starts_with("//") || unified.as_bytes().get(1) == Some(&b':');
     let normalized = if windows {
         unified.to_lowercase()
     } else {
@@ -449,7 +469,10 @@ fn comparable_local_root(raw: &str) -> Option<ComparableLocalRoot> {
         .unwrap_or(&normalized)
         .trim_start_matches('/');
     let mut segments = Vec::new();
-    for segment in body.split('/').filter(|segment| !segment.is_empty() && *segment != ".") {
+    for segment in body
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+    {
         if segment == ".." {
             if matches!(segments.last().map(String::as_str), Some(last) if last != "..") {
                 segments.pop();
@@ -460,7 +483,10 @@ fn comparable_local_root(raw: &str) -> Option<ComparableLocalRoot> {
             segments.push(segment.to_string());
         }
     }
-    Some(ComparableLocalRoot { prefix: prefix.to_string(), segments })
+    Some(ComparableLocalRoot {
+        prefix: prefix.to_string(),
+        segments,
+    })
 }
 
 fn validate_root_relationships(source: &str, targets: &[String]) -> Result<(), String> {
@@ -539,7 +565,12 @@ impl Job {
     }
 
     /// The read-side capability query (window already widened to the coarser backend)
-    pub fn read_caps_query(&self, window_ms: i64, src_local: bool, tgt_local: bool) -> crate::pipeline::guard::caps::ReadCapsQuery {
+    pub fn read_caps_query(
+        &self,
+        window_ms: i64,
+        src_local: bool,
+        tgt_local: bool,
+    ) -> crate::pipeline::guard::caps::ReadCapsQuery {
         let rr = self.rigor_resolved();
         crate::pipeline::guard::caps::ReadCapsQuery {
             hash: rr.hash,
@@ -554,7 +585,11 @@ impl Job {
     }
 
     /// The write-side capability query (see `guard::caps::cap_report_write`)
-    pub fn write_caps_query(&self, src_local: bool, tgt_local: bool) -> crate::pipeline::guard::caps::WriteCapsQuery {
+    pub fn write_caps_query(
+        &self,
+        src_local: bool,
+        tgt_local: bool,
+    ) -> crate::pipeline::guard::caps::WriteCapsQuery {
         crate::pipeline::guard::caps::WriteCapsQuery {
             fsync: self.fsync,
             verify: self.rigor_resolved().verify_writes,
@@ -589,7 +624,11 @@ impl Job {
         }
     }
 
-    pub fn apply_opts(&self, trash: Option<PathBuf>, verbose: bool) -> crate::pipeline::apply::ApplyOptions {
+    pub fn apply_opts(
+        &self,
+        trash: Option<PathBuf>,
+        verbose: bool,
+    ) -> crate::pipeline::apply::ApplyOptions {
         crate::pipeline::apply::ApplyOptions {
             dry_run: false,
             trash,
@@ -598,7 +637,11 @@ impl Job {
             verify: self.rigor_resolved().verify_writes,
             versioning: self.versioning,
             fsync: self.fsync,
-            filter: Some(crate::pipeline::filter::PathFilter::build_full(&self.include, &self.exclude, &self.deletable)),
+            filter: Some(crate::pipeline::filter::PathFilter::build_full(
+                &self.include,
+                &self.exclude,
+                &self.deletable,
+            )),
             delta: self.delta,
             parallel: self.parallel.unwrap_or(4).clamp(1, 16),
         }
@@ -623,7 +666,10 @@ pub fn resolve_path(name_or_path: &str) -> std::io::Result<PathBuf> {
     if !cand.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("job not found: {name_or_path} (looked at {})", cand.display()),
+            format!(
+                "job not found: {name_or_path} (looked at {})",
+                cand.display()
+            ),
         ));
     }
     Ok(cand)
@@ -679,27 +725,51 @@ fn file_schema_at(path: &Path) -> std::io::Result<u32> {
         schema: u32,
     }
     let text = std::fs::read_to_string(&path)?;
-    let parsed: OnlySchema = toml::from_str(&text)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad job file {}: {e}", path.display())))?;
+    let parsed: OnlySchema = toml::from_str(&text).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bad job file {}: {e}", path.display()),
+        )
+    })?;
     Ok(parsed.schema)
 }
 
 pub fn load(name_or_path: &str) -> std::io::Result<(String, Job)> {
-    let path = resolve_path(name_or_path)?;
-    load_path(&path)
+    let path = PathBuf::from(name_or_path);
+    if path.is_file() {
+        load_path(&path)
+    } else {
+        load_named(name_or_path)
+    }
 }
 
 /// Load exactly one job registered in the jobs directory. Unlike `load`, this never interprets the
 /// argument as a path, so an IPC caller cannot substitute an old same-stem file from elsewhere.
 pub fn load_named(name: &str) -> std::io::Result<(String, Job)> {
-    load_path(&existing_registered_job_path(name)?)
+    let dir = crate::foundation::dirs::jobs_dir();
+    let _lock = lock_job_mutations(&dir)?;
+    let path = registered_job_path_in(&dir, name)?;
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("job not found: {name} (looked at {})", path.display()),
+        ));
+    }
+    load_registered_path(&path)
 }
 
 fn load_path(path: &Path) -> std::io::Result<(String, Job)> {
-    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let text = std::fs::read_to_string(&path)?;
-    let mut job: Job = toml::from_str(&text)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad job file {}: {e}", path.display())))?;
+    let mut job: Job = toml::from_str(&text).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bad job file {}: {e}", path.display()),
+        )
+    })?;
     // Each migration guards its own version and none of them stamps `schema`; the stamp happens
     // once, here, after the last one. A migration that stamped SCHEMA itself would skip every
     // later migration the moment one was added.
@@ -780,12 +850,21 @@ struct LegacyPeerKeys {
 /// keeps a migrated job doing exactly what it did before, which is the whole bar for a migration —
 /// quietly losing the pull direction would be a data-flow change disguised as a rename.
 fn migrate_v2_peer_target(job: &mut Job, text: &str) {
-    let Ok(legacy) = toml::from_str::<LegacyPeerKeys>(text) else { return };
-    let Some(host) = legacy.remote_host.filter(|h| !h.trim().is_empty()) else { return };
+    let Ok(legacy) = toml::from_str::<LegacyPeerKeys>(text) else {
+        return;
+    };
+    let Some(host) = legacy.remote_host.filter(|h| !h.trim().is_empty()) else {
+        return;
+    };
     let mut phrase = format!(
         "peer://{}/{}",
         host.trim(),
-        legacy.remote_root.unwrap_or_default().trim().replace('\\', "/").trim_matches('/')
+        legacy
+            .remote_root
+            .unwrap_or_default()
+            .trim()
+            .replace('\\', "/")
+            .trim_matches('/')
     );
     if let Some(exe) = legacy.remote_exe.filter(|e| !e.trim().is_empty()) {
         phrase.push_str(&format!("|exe={}", exe.trim()));
@@ -798,27 +877,148 @@ fn migrate_v2_peer_target(job: &mut Job, text: &str) {
     job.target = phrase;
 }
 
-pub fn load_all() -> Vec<(String, Job)> {
+pub fn load_all() -> std::io::Result<Vec<(String, Job)>> {
+    let dir = crate::foundation::dirs::jobs_dir();
+    let _lock = lock_job_mutations(&dir)?;
     let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(crate::foundation::dirs::jobs_dir()) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().map(|x| x == "toml").unwrap_or(false) {
-                if let Ok(pair) = load(&p.to_string_lossy()) {
-                    out.push(pair);
-                }
-            }
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            out.push(load_registered_path(&path)?);
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+
+    let mut identities = std::collections::BTreeMap::new();
+    for (name, job) in &out {
+        if let Some(previous) = identities.insert(job.job_id.as_str(), name.as_str()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "jobs '{previous}' and '{name}' carry the same job_id '{}' — each registered job must have a unique identity",
+                    job.job_id
+                ),
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve a registered job by its stable identity rather than its mutable filename. Result and
+/// AutoScan ownership use this after a rename so an old display name can never make evidence attach
+/// to a newly-created job that happens to reuse that name.
+pub fn load_by_id(job_id: &str) -> std::io::Result<(String, Job)> {
+    validate_job_id(job_id)?;
+    load_all()?
+        .into_iter()
+        .find(|(_, job)| job.job_id == job_id)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("job identity not found: {job_id}"),
+            )
+        })
+}
+
+fn validate_job_id(job_id: &str) -> std::io::Result<()> {
+    if job_id.len() == 32
+        && job_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "job_id must be 32 lowercase hexadecimal characters",
+        ))
+    }
+}
+
+fn new_job_id() -> std::io::Result<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| std::io::Error::other(format!("cannot create a job identity: {error}")))?;
+    let mut id = String::with_capacity(bytes.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        id.push(HEX[(byte >> 4) as usize] as char);
+        id.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(id)
+}
+
+fn staged_text(path: &Path, text: &str) -> std::io::Result<crate::fs::staged::Staged> {
+    let mut staged = crate::fs::staged::Staged::create(path)?;
+    staged.write_all_from(&mut text.as_bytes())?;
+    staged.seal(true)?;
+    Ok(staged)
+}
+
+/// Materialize identity metadata without serializing the whole job. Prepending one top-level key
+/// preserves comments and, critically, leaves an old `schema` visible to the editor until the user
+/// explicitly saves the migrated configuration.
+fn load_registered_path(path: &Path) -> std::io::Result<(String, Job)> {
+    let (name, mut job) = load_path(path)?;
+    if job.job_id.is_empty() {
+        let text = std::fs::read_to_string(path)?;
+        let parsed: toml::Value = toml::from_str(&text).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad job file {}: {error}", path.display()),
+            )
+        })?;
+        if parsed.get("job_id").is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad job file {}: job_id cannot be empty", path.display()),
+            ));
+        }
+        job.job_id = new_job_id()?;
+        let with_identity = format!("job_id = \"{}\"\n{text}", job.job_id);
+        staged_text(path, &with_identity)?.commit()?;
+    } else {
+        validate_job_id(&job.job_id).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("bad job file {}: {error}", path.display()),
+            )
+        })?;
+    }
+    Ok((name, job))
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub enum JobMutationEffect {
+    Created,
+    Updated,
+    Renamed,
+    NoOp,
+    Deleted,
 }
 
 #[derive(Debug)]
 pub struct SavedJob {
     pub name: String,
     pub path: PathBuf,
+    pub job_id: String,
     pub config_revision: String,
+    pub effect: JobMutationEffect,
+    pub previous_name: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct DeletedJob {
+    pub name: String,
+    pub job_id: String,
+    pub config_revision: String,
+    pub effect: JobMutationEffect,
 }
 
 struct JobMutationLock {
@@ -845,7 +1045,10 @@ fn registered_job_path_in(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
 }
 
 fn invalid_job(reason: String) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid job: {reason}"))
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("invalid job: {reason}"),
+    )
 }
 
 fn current_revision_at(path: &Path) -> std::io::Result<String> {
@@ -873,12 +1076,13 @@ fn require_revision(path: &Path, name: &str, expected: &str) -> std::io::Result<
 }
 
 fn staged_job(path: &Path, job: &Job) -> std::io::Result<crate::fs::staged::Staged> {
-    let text = toml::to_string_pretty(job)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("toml serialize: {e}")))?;
-    let mut staged = crate::fs::staged::Staged::create(path)?;
-    staged.write_all_from(&mut text.as_bytes())?;
-    staged.seal(true)?;
-    Ok(staged)
+    let text = toml::to_string_pretty(job).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("toml serialize: {e}"),
+        )
+    })?;
+    staged_text(path, &text)
 }
 
 fn rename_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -905,7 +1109,10 @@ pub fn save_job(
     expected_revision: Option<&str>,
 ) -> std::io::Result<SavedJob> {
     job.validate().map_err(invalid_job)?;
-    let job = Job { schema: SCHEMA, ..job.clone() };
+    let job = Job {
+        schema: SCHEMA,
+        ..job.clone()
+    };
     let config_revision = config_revision(&job).map_err(invalid_job)?;
     let dir = crate::foundation::dirs::jobs_dir();
     save_job_in(
@@ -928,15 +1135,25 @@ fn save_job_in(
 ) -> std::io::Result<SavedJob> {
     let _lock = lock_job_mutations(dir)?;
     let destination = registered_job_path_in(dir, name)?;
+    let mut persisted = job.clone();
+    let mut effect = JobMutationEffect::Created;
+    let mut previous_name = None;
     match (original_name, expected_revision) {
         (None, None) => {
+            if !persisted.job_id.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a new job must not supply job_id; the registry assigns a fresh identity",
+                ));
+            }
             if destination.exists() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     format!("job '{name}' already exists — reload it before saving"),
                 ));
             }
-            let staged = staged_job(&destination, job)?;
+            persisted.job_id = new_job_id()?;
+            let staged = staged_job(&destination, &persisted)?;
             if destination.exists() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
@@ -948,18 +1165,41 @@ fn save_job_in(
         (Some(original_name), Some(expected_revision)) => {
             let original = registered_job_path_in(dir, original_name)?;
             require_revision(&original, original_name, expected_revision)?;
+            let (_, current) = load_registered_path(&original)?;
+            if persisted.job_id != current.job_id {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "job '{original_name}' was replaced since this editor loaded it (expected job_id '{}', found '{}') — reload before saving",
+                        persisted.job_id, current.job_id
+                    ),
+                ));
+            }
             if original == destination {
-                let staged = staged_job(&destination, job)?;
+                if config_revision == expected_revision && file_schema_at(&original)? == SCHEMA {
+                    return Ok(SavedJob {
+                        name: name.to_string(),
+                        path: destination,
+                        job_id: persisted.job_id,
+                        config_revision,
+                        effect: JobMutationEffect::NoOp,
+                        previous_name: None,
+                    });
+                }
+                effect = JobMutationEffect::Updated;
+                let staged = staged_job(&destination, &persisted)?;
                 require_revision(&original, original_name, expected_revision)?;
                 staged.commit()?;
             } else {
+                effect = JobMutationEffect::Renamed;
+                previous_name = Some(original_name.to_string());
                 if destination.exists() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::AlreadyExists,
                         format!("cannot rename job '{original_name}' to '{name}': destination already exists"),
                     ));
                 }
-                let staged = staged_job(&destination, job)?;
+                let staged = staged_job(&destination, &persisted)?;
                 require_revision(&original, original_name, expected_revision)?;
                 if destination.exists() {
                     return Err(std::io::Error::new(
@@ -986,22 +1226,60 @@ fn save_job_in(
             ));
         }
     }
-    Ok(SavedJob { name: name.to_string(), path: destination, config_revision })
+    Ok(SavedJob {
+        name: name.to_string(),
+        path: destination,
+        job_id: persisted.job_id,
+        config_revision,
+        effect,
+        previous_name,
+    })
 }
 
-pub fn delete_job(name: &str, expected_revision: &str) -> std::io::Result<()> {
-    delete_job_in(&crate::foundation::dirs::jobs_dir(), name, expected_revision)
+pub fn delete_job(
+    name: &str,
+    expected_job_id: &str,
+    expected_revision: &str,
+) -> std::io::Result<DeletedJob> {
+    delete_job_in(
+        &crate::foundation::dirs::jobs_dir(),
+        name,
+        expected_job_id,
+        expected_revision,
+    )
 }
 
-fn delete_job_in(dir: &Path, name: &str, expected_revision: &str) -> std::io::Result<()> {
+fn delete_job_in(
+    dir: &Path,
+    name: &str,
+    expected_job_id: &str,
+    expected_revision: &str,
+) -> std::io::Result<DeletedJob> {
     let _lock = lock_job_mutations(dir)?;
     let path = registered_job_path_in(dir, name)?;
     require_revision(&path, name, expected_revision)?;
-    std::fs::remove_file(path)
+    let (_, current) = load_registered_path(&path)?;
+    if current.job_id != expected_job_id {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "job '{name}' was replaced since this editor loaded it (expected job_id '{expected_job_id}', found '{}') — reload before deleting",
+                current.job_id
+            ),
+        ));
+    }
+    std::fs::remove_file(path)?;
+    Ok(DeletedJob {
+        name: name.to_string(),
+        job_id: current.job_id,
+        config_revision: expected_revision.to_string(),
+        effect: JobMutationEffect::Deleted,
+    })
 }
 
 pub const SAMPLE: &str = r#"# <name>.toml in the jobs directory — one file, one job
-schema = 2                              # job-file schema; a file without it is migrated on load (junk presets -> exclude)
+schema = 3                              # job-file schema; a file without it is migrated on load (junk presets -> exclude)
+# job_id is assigned by the registry on first load/save; do not copy it to another job
 mode = "mirror"                         # mirror | sync | enrich
 source = 'D:\some\dir'                  # a Windows path; on mac/Linux e.g. '/Users/me/Code'
 target = '\\host\share\dir'             # or a root phrase: smb:// sftp:// ftp:// ftps:// peer://
@@ -1067,7 +1345,10 @@ mod migration_tests {
     use crate::pipeline::filter::PathFilter;
 
     fn load_text(tag: &str, text: &str) -> Job {
-        let p = std::env::temp_dir().join(format!("syncdash-job-{tag}-{}.toml", crate::foundation::time::now_ms()));
+        let p = std::env::temp_dir().join(format!(
+            "syncdash-job-{tag}-{}.toml",
+            crate::foundation::time::now_ms()
+        ));
         std::fs::write(&p, text).unwrap();
         let (_, j) = load(&p.to_string_lossy()).unwrap();
         let _ = std::fs::remove_file(&p);
@@ -1079,7 +1360,10 @@ mod migration_tests {
     #[test]
     fn legacy_presets_land_in_exclude_and_filter_identically() {
         // os_excludes = "auto" + dev_excludes = true, the shape `gen-jobs` wrote for every cs-* job
-        let j = load_text("auto-dev", &format!("{HEAD}os_excludes = 'auto'\ndev_excludes = true\n"));
+        let j = load_text(
+            "auto-dev",
+            &format!("{HEAD}os_excludes = 'auto'\ndev_excludes = true\n"),
+        );
         assert_eq!(j.schema, SCHEMA);
         assert_eq!(j.exclude, expand_junk_presets(["windows", "macos", "dev"]));
         let pf = PathFilter::build(&j.include, &j.exclude);
@@ -1099,7 +1383,10 @@ mod migration_tests {
         let j = load_text("mac", &format!("{HEAD}os_excludes = 'mac'\n"));
         assert_eq!(j.exclude, expand_junk_presets(["macos"]));
         assert!(!PathFilter::build(&[], &j.exclude).pass_file("a/.DS_Store"));
-        assert!(PathFilter::build(&[], &j.exclude).pass_file("a/Thumbs.db"), "'mac' must not drag Windows in");
+        assert!(
+            PathFilter::build(&[], &j.exclude).pass_file("a/Thumbs.db"),
+            "'mac' must not drag Windows in"
+        );
     }
 
     #[test]
@@ -1110,13 +1397,22 @@ mod migration_tests {
             &format!("{HEAD}os_excludes = 'windows'\nexclude = ['*/big_temp/', '*\\Thumbs.db', '!*/keep.log']\n"),
         );
         // The user had already written Thumbs.db by hand (backslash, different case): one line, not two
-        assert_eq!(j.exclude.iter().filter(|e| e.to_lowercase().contains("thumbs.db")).count(), 1);
+        assert_eq!(
+            j.exclude
+                .iter()
+                .filter(|e| e.to_lowercase().contains("thumbs.db"))
+                .count(),
+            1
+        );
         // Their own entries survive, in their own order, after the preset block
         assert!(j.exclude.contains(&"*/big_temp/".to_string()));
         assert!(j.exclude.contains(&"!*/keep.log".to_string()));
         let pf = PathFilter::build(&[], &j.exclude);
         assert!(!pf.pass_file("x/big_temp/f"));
-        assert!(pf.pass_file("x/keep.log"), "the ! exception must survive the migration");
+        assert!(
+            pf.pass_file("x/keep.log"),
+            "the ! exception must survive the migration"
+        );
     }
 
     /// The regression this whole version field exists to prevent: once migrated, a user who deletes a
@@ -1124,10 +1420,20 @@ mod migration_tests {
     /// that silently disagrees with what the editor shows.
     #[test]
     fn a_v2_job_is_never_re_migrated() {
-        let j = load_text("v2", &format!("schema = 2\n{HEAD}exclude = ['*/only_this/']\n"));
-        assert_eq!(j.exclude, vec!["*/only_this/".to_string()], "v2 files are taken at their word");
+        let j = load_text(
+            "v2",
+            &format!("schema = 2\n{HEAD}exclude = ['*/only_this/']\n"),
+        );
+        assert_eq!(
+            j.exclude,
+            vec!["*/only_this/".to_string()],
+            "v2 files are taken at their word"
+        );
         let j = load_text("v2-empty", &format!("schema = 2\n{HEAD}"));
-        assert!(j.exclude.is_empty(), "an empty exclude in a v2 file means empty");
+        assert!(
+            j.exclude.is_empty(),
+            "an empty exclude in a v2 file means empty"
+        );
     }
 
     /// v2 → v3 must keep a peer job doing exactly what it did. The subtle half is `mount=`: a v2
@@ -1142,10 +1448,14 @@ mod migration_tests {
              remote_host = 'mac'\nremote_root = '/Users/ben/Code/x'\nremote_exe = '~/bin/syncdash'\n",
         );
         assert_eq!(j.schema, SCHEMA);
-        assert_eq!(j.target, r"peer://mac/Users/ben/Code/x|exe=~/bin/syncdash|mount=\\mac\share\x");
+        assert_eq!(
+            j.target,
+            r"peer://mac/Users/ben/Code/x|exe=~/bin/syncdash|mount=\\mac\share\x"
+        );
         // …and it still routes to the peer lane, which is the behaviour that must not change
         assert!(crate::fs::vfs::spec::is_peer(&j.target));
-        let crate::fs::vfs::spec::RootSpec::Remote(r) = crate::fs::vfs::spec::parse(&j.target) else {
+        let crate::fs::vfs::spec::RootSpec::Remote(r) = crate::fs::vfs::spec::parse(&j.target)
+        else {
             panic!("a migrated peer target must parse as a remote root")
         };
         assert_eq!(r.host, "mac");
@@ -1161,14 +1471,20 @@ mod migration_tests {
             "schema = 2\nmode = 'mirror'\nsource = 'D:\\Code\\x'\ntarget = ''\n\
              remote_host = 'mac'\nremote_root = '/Users/ben/x'\n",
         );
-        assert_eq!(j.target, "peer://mac/Users/ben/x", "no exe and no mount = nothing to declare");
+        assert_eq!(
+            j.target, "peer://mac/Users/ben/x",
+            "no exe and no mount = nothing to declare"
+        );
     }
 
     /// A v2 job with no peer keeps its target untouched — the migration must not touch the
     /// overwhelming majority of jobs, which are plain local-to-local.
     #[test]
     fn a_v2_job_without_a_peer_keeps_its_target() {
-        let j = load_text("v2-nopeer", "schema = 2\nmode = 'mirror'\nsource = 'S'\ntarget = 'T'\n");
+        let j = load_text(
+            "v2-nopeer",
+            "schema = 2\nmode = 'mirror'\nsource = 'S'\ntarget = 'T'\n",
+        );
         assert_eq!(j.target, "T");
         assert!(!crate::fs::vfs::spec::is_peer(&j.target));
     }
@@ -1184,8 +1500,15 @@ mod migration_tests {
              remote_host = 'mac'\nremote_root = '/Users/ben/x'\n",
         );
         assert_eq!(j.schema, SCHEMA);
-        assert_eq!(j.exclude, expand_junk_presets(["windows"]), "the v1 junk migration still ran");
-        assert_eq!(j.target, "peer://mac/Users/ben/x|mount=T", "…and so did the v2 one");
+        assert_eq!(
+            j.exclude,
+            expand_junk_presets(["windows"]),
+            "the v1 junk migration still ran"
+        );
+        assert_eq!(
+            j.target, "peer://mac/Users/ben/x|mount=T",
+            "…and so did the v2 one"
+        );
     }
 
     /// A Job built in memory and written straight to TOML — which is what `gen-jobs` does, bypassing
@@ -1194,18 +1517,28 @@ mod migration_tests {
     /// never chose. Exclusions appearing on their own is the failure mode this whole design is against.
     #[test]
     fn a_job_written_straight_to_toml_round_trips_untouched() {
-        assert_eq!(Job::default().schema, SCHEMA, "a Job built by current code is current-shape");
+        assert_eq!(
+            Job::default().schema,
+            SCHEMA,
+            "a Job built by current code is current-shape"
+        );
         let j = Job {
             source: "S".into(),
             target: "T".into(),
             exclude: vec!["*/only_mine/".into()],
             ..Default::default()
         };
-        let p = std::env::temp_dir().join(format!("syncdash-job-rt-{}.toml", crate::foundation::time::now_ms()));
+        let p = std::env::temp_dir().join(format!(
+            "syncdash-job-rt-{}.toml",
+            crate::foundation::time::now_ms()
+        ));
         std::fs::write(&p, toml::to_string_pretty(&j).unwrap()).unwrap();
         let (_, back) = load(&p.to_string_lossy()).unwrap();
         let _ = std::fs::remove_file(&p);
-        assert_eq!(back.exclude, j.exclude, "no rule may appear that the author did not write");
+        assert_eq!(
+            back.exclude, j.exclude,
+            "no rule may appear that the author did not write"
+        );
         assert_eq!(back.schema, SCHEMA);
     }
 
@@ -1213,12 +1546,26 @@ mod migration_tests {
     /// that omitted the field would round-trip a v2 job back to v1 and the next load would re-add presets.
     #[test]
     fn saving_stamps_the_current_schema() {
-        let stale = Job { schema: 1, exclude: vec!["*/mine/".into()], ..Default::default() };
-        let text = toml::to_string_pretty(&Job { schema: SCHEMA, ..stale.clone() }).unwrap();
+        let stale = Job {
+            schema: 1,
+            exclude: vec!["*/mine/".into()],
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&Job {
+            schema: SCHEMA,
+            ..stale.clone()
+        })
+        .unwrap();
         assert!(text.contains(&format!("schema = {SCHEMA}")));
         // …and the migration would have fired on the stale one, which is exactly what stamping prevents
-        let j = load_text("stale", &format!("schema = 1\n{HEAD}exclude = ['*/mine/']\n"));
-        assert!(j.exclude.len() > 1, "premise: schema 1 does trigger the migration");
+        let j = load_text(
+            "stale",
+            &format!("schema = 1\n{HEAD}exclude = ['*/mine/']\n"),
+        );
+        assert!(
+            j.exclude.len() > 1,
+            "premise: schema 1 does trigger the migration"
+        );
     }
 
     /// `file_schema` reports the file, not the loaded job — that difference is the whole point of it.
@@ -1227,15 +1574,26 @@ mod migration_tests {
     #[test]
     fn file_schema_reports_the_file_not_the_migrated_job() {
         let write = |tag: &str, text: &str| {
-            let p = std::env::temp_dir().join(format!("syncdash-fs-{tag}-{}.toml", crate::foundation::time::now_ms()));
+            let p = std::env::temp_dir().join(format!(
+                "syncdash-fs-{tag}-{}.toml",
+                crate::foundation::time::now_ms()
+            ));
             std::fs::write(&p, text).unwrap();
             p
         };
 
         // A v1 file: on disk it is 1, while the job load hands back is already migrated to current
         let p = write("v1", &format!("{HEAD}os_excludes = 'auto'\n"));
-        assert_eq!(file_schema(&p.to_string_lossy()).unwrap(), 1, "no schema key = v1");
-        assert_eq!(load(&p.to_string_lossy()).unwrap().1.schema, SCHEMA, "…but the loaded job is migrated");
+        assert_eq!(
+            file_schema(&p.to_string_lossy()).unwrap(),
+            1,
+            "no schema key = v1"
+        );
+        assert_eq!(
+            load(&p.to_string_lossy()).unwrap().1.schema,
+            SCHEMA,
+            "…but the loaded job is migrated"
+        );
         let _ = std::fs::remove_file(&p);
 
         // An intermediate version reports itself, not the version it will become on load
@@ -1249,7 +1607,32 @@ mod migration_tests {
         assert_eq!(file_schema(&p.to_string_lossy()).unwrap(), SCHEMA);
         let _ = std::fs::remove_file(&p);
 
-        assert!(file_schema("no-such-job-exists-here").is_err(), "a missing file is an error, not a version");
+        assert!(
+            file_schema("no-such-job-exists-here").is_err(),
+            "a missing file is an error, not a version"
+        );
+    }
+
+    #[test]
+    fn assigning_registered_identity_preserves_legacy_schema_and_comments() {
+        let path = std::env::temp_dir().join(format!(
+            "syncdash-job-id-migration-{}-{}.toml",
+            std::process::id(),
+            crate::foundation::time::now_ms()
+        ));
+        let text = format!("# keep this explanation\n{HEAD}os_excludes = 'off'\n");
+        std::fs::write(&path, &text).unwrap();
+
+        let (_, first) = load_registered_path(&path).unwrap();
+        let (_, second) = load_registered_path(&path).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(first.job_id, second.job_id);
+        validate_job_id(&first.job_id).unwrap();
+        assert_eq!(file_schema_at(&path).unwrap(), 1);
+        assert!(persisted.contains("# keep this explanation"));
+        assert_eq!(persisted.matches("job_id =").count(), 1);
+
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -1259,9 +1642,19 @@ mod revision_tests {
 
     #[test]
     fn registered_job_names_cannot_be_reinterpreted_as_paths() {
-        for invalid in ["../photos", "folder/photos", r"folder\photos", "/tmp/photos", "C:photos"] {
+        for invalid in [
+            "../photos",
+            "folder/photos",
+            r"folder\photos",
+            "/tmp/photos",
+            "C:photos",
+        ] {
             let error = registered_job_path(invalid).unwrap_err();
-            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{invalid}: {error}");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{invalid}: {error}"
+            );
         }
         let path = registered_job_path("photos.archive").unwrap();
         assert_eq!(path.file_name().unwrap(), "photos.archive.toml");
@@ -1277,19 +1670,38 @@ mod revision_tests {
             exclude: vec!["*.tmp".into()],
             ..Default::default()
         };
-        let current_schema = Job { schema: SCHEMA, ..original.clone() };
+        let current_schema = Job {
+            schema: SCHEMA,
+            ..original.clone()
+        };
 
         let revision = config_revision(&original).unwrap();
         assert_eq!(revision.len(), 64);
         assert_eq!(revision, config_revision(&current_schema).unwrap());
 
-        let changed = Job { exclude: vec!["*.tmp".into(), "*.bak".into()], ..current_schema };
+        let identified = Job {
+            job_id: "0123456789abcdef0123456789abcdef".into(),
+            ..current_schema.clone()
+        };
+        assert_eq!(
+            revision,
+            config_revision(&identified).unwrap(),
+            "registry identity is not an engine configuration change"
+        );
+
+        let changed = Job {
+            exclude: vec!["*.tmp".into(), "*.bak".into()],
+            ..current_schema
+        };
         assert_ne!(revision, config_revision(&changed).unwrap());
     }
 
     #[test]
     fn revision_rejects_non_finite_configuration_numbers() {
-        let job = Job { min_free_pct: f64::NAN, ..Default::default() };
+        let job = Job {
+            min_free_pct: f64::NAN,
+            ..Default::default()
+        };
         let error = config_revision(&job).unwrap_err();
         assert!(error.contains("min_free_pct"), "{error}");
         assert!(error.contains("finite"), "{error}");
@@ -1353,7 +1765,10 @@ mod validation_tests {
 
         let mut job = valid_job();
         job.max_delete_ratio = 1.1;
-        assert!(job.validate().is_ok(), "a ratio >= 1 disables the deletion gate");
+        assert!(
+            job.validate().is_ok(),
+            "a ratio >= 1 disables the deletion gate"
+        );
         let mut job = valid_job();
         job.parallel = Some(17);
         assert!(job.validate().unwrap_err().contains("parallel"));
@@ -1372,20 +1787,32 @@ mod validation_tests {
     fn roots_must_be_present_distinct_and_not_nested() {
         let mut job = valid_job();
         job.source.clear();
-        assert!(job.validate().unwrap_err().contains("source root cannot be empty"));
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .contains("source root cannot be empty"));
 
         let mut job = valid_job();
         job.target = "/data/source".into();
-        assert!(job.validate().unwrap_err().contains("different directories"));
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .contains("different directories"));
 
         let mut job = valid_job();
         job.target = "/data/source/child".into();
-        assert!(job.validate().unwrap_err().contains("target cannot be nested"));
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .contains("target cannot be nested"));
 
         let mut job = valid_job();
         job.source = r"C:\Data\Source".into();
         job.target = r"c:/data/source/child".into();
-        assert!(job.validate().unwrap_err().contains("target cannot be nested"));
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .contains("target cannot be nested"));
 
         let mut job = valid_job();
         job.targets = vec!["/data/a".into(), "/data/a".into()];
@@ -1394,12 +1821,18 @@ mod validation_tests {
         let mut job = valid_job();
         job.source = "sftp://user@host/data/source".into();
         job.target = "sftp://user@HOST:22/data/source/child".into();
-        assert!(job.validate().unwrap_err().contains("target cannot be nested"));
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .contains("target cannot be nested"));
 
         let mut job = valid_job();
         job.source = "sftp://host/data".into();
         job.target = "sftp://host/data/../escape".into();
-        assert!(job.validate().unwrap_err().contains("cannot contain a '..'"));
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .contains("cannot contain a '..'"));
     }
 
     #[test]
@@ -1412,18 +1845,28 @@ mod validation_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let first = valid_job();
         let first_revision = config_revision(&first).unwrap();
-        let created = save_job_in(
+        let created =
+            save_job_in(&dir, "photos", &first, None, None, first_revision.clone()).unwrap();
+        assert_eq!(created.config_revision, first_revision);
+        assert_eq!(created.effect, JobMutationEffect::Created);
+        validate_job_id(&created.job_id).unwrap();
+
+        let identified_first = Job {
+            job_id: created.job_id.clone(),
+            ..first.clone()
+        };
+        let no_op = save_job_in(
             &dir,
             "photos",
-            &first,
-            None,
-            None,
+            &identified_first,
+            Some("photos"),
+            Some(&first_revision),
             first_revision.clone(),
         )
         .unwrap();
-        assert_eq!(created.config_revision, first_revision);
+        assert_eq!(no_op.effect, JobMutationEffect::NoOp);
 
-        let mut second = first.clone();
+        let mut second = identified_first;
         second.exclude.push("*.tmp".into());
         let second_revision = config_revision(&second).unwrap();
         let stale = save_job_in(
@@ -1438,28 +1881,59 @@ mod validation_tests {
         assert_eq!(stale.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(current_revision_at(&created.path).unwrap(), first_revision);
 
-        let renamed = save_job_in(
+        let updated = save_job_in(
             &dir,
-            "archive",
+            "photos",
             &second,
             Some("photos"),
             Some(&first_revision),
             second_revision.clone(),
         )
         .unwrap();
+        assert_eq!(updated.effect, JobMutationEffect::Updated);
+        assert_eq!(updated.job_id, created.job_id);
+
+        let renamed = save_job_in(
+            &dir,
+            "archive",
+            &second,
+            Some("photos"),
+            Some(&second_revision),
+            second_revision.clone(),
+        )
+        .unwrap();
+        assert_eq!(renamed.effect, JobMutationEffect::Renamed);
+        assert_eq!(renamed.previous_name.as_deref(), Some("photos"));
+        assert_eq!(renamed.job_id, created.job_id);
         assert!(!dir.join("photos.toml").exists());
         assert_eq!(current_revision_at(&renamed.path).unwrap(), second_revision);
 
-        let stale_delete = delete_job_in(&dir, "archive", &first_revision).unwrap_err();
+        let stale_delete =
+            delete_job_in(&dir, "archive", &renamed.job_id, &first_revision).unwrap_err();
         assert_eq!(stale_delete.kind(), std::io::ErrorKind::WouldBlock);
-        delete_job_in(&dir, "archive", &second_revision).unwrap();
+        let replaced_delete = delete_job_in(
+            &dir,
+            "archive",
+            "ffffffffffffffffffffffffffffffff",
+            &second_revision,
+        )
+        .unwrap_err();
+        assert_eq!(replaced_delete.kind(), std::io::ErrorKind::WouldBlock);
+        let deleted = delete_job_in(&dir, "archive", &renamed.job_id, &second_revision).unwrap();
+        assert_eq!(deleted.effect, JobMutationEffect::Deleted);
+        assert_eq!(deleted.job_id, renamed.job_id);
         assert!(!renamed.path.exists());
-        assert!(
-            std::fs::read_dir(&dir)
-                .unwrap()
-                .flatten()
-                .all(|entry| !crate::fs::staged::is_temp_name(&entry.file_name().to_string_lossy()))
+
+        let recreated =
+            save_job_in(&dir, "archive", &first, None, None, first_revision.clone()).unwrap();
+        assert_ne!(
+            recreated.job_id, deleted.job_id,
+            "delete and recreate is a new logical job"
         );
+        assert!(std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .all(|entry| !crate::fs::staged::is_temp_name(&entry.file_name().to_string_lossy())));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1473,15 +1947,19 @@ mod validation_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let job = valid_job();
         let revision = config_revision(&job).unwrap();
-        save_job_in(&dir, "one", &job, None, None, revision.clone()).unwrap();
+        let one = save_job_in(&dir, "one", &job, None, None, revision.clone()).unwrap();
         save_job_in(&dir, "two", &job, None, None, revision.clone()).unwrap();
 
         let create = save_job_in(&dir, "one", &job, None, None, revision.clone()).unwrap_err();
         assert_eq!(create.kind(), std::io::ErrorKind::AlreadyExists);
+        let identified = Job {
+            job_id: one.job_id,
+            ..job
+        };
         let rename = save_job_in(
             &dir,
             "two",
-            &job,
+            &identified,
             Some("one"),
             Some(&revision),
             revision.clone(),
@@ -1499,7 +1977,10 @@ mod rigor_tests {
     use super::*;
 
     fn job(rigor: &str) -> Job {
-        Job { rigor: rigor.into(), ..Default::default() }
+        Job {
+            rigor: rigor.into(),
+            ..Default::default()
+        }
     }
 
     #[test]

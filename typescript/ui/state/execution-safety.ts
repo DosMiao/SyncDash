@@ -4,17 +4,17 @@ import type { SelectedRowDto } from '../../core/types/generated/SelectedRowDto';
 
 export function reviewedSetKey(
   owner: CompareOwner,
-  jobName: string,
+  jobId: string,
   configRevision: string,
   targetIndex: number,
   selected: SelectedRowDto[],
 ): string {
   return JSON.stringify([
     owner.compare_id,
-    owner.job_name,
+    owner.job_id,
     owner.config_revision,
     owner.target_index,
-    jobName,
+    jobId,
     configRevision,
     targetIndex,
     selected.map((row) => [row.index, row.flipped]),
@@ -33,6 +33,8 @@ export function preflightAllowsApply(
 
 export interface AutoScanTicket {
   generation: number;
+  ticketId: number;
+  jobId: string;
   jobName: string;
   configRevision: string;
   targetIndex: number;
@@ -40,7 +42,7 @@ export interface AutoScanTicket {
 }
 
 export interface AutoScanSelection {
-  jobName: string;
+  jobId: string;
   configRevision: string;
   targetIndex: number;
 }
@@ -56,13 +58,14 @@ export function ownsFreshAutoScanResult(
     && active !== null
     && selection !== null
     && active.generation === ticket.generation
-    && active.jobName === ticket.jobName
+    && active.ticketId === ticket.ticketId
+    && active.jobId === ticket.jobId
     && active.configRevision === ticket.configRevision
     && active.targetIndex === ticket.targetIndex
-    && ticket.jobName === owner.job_name
+    && ticket.jobId === owner.job_id
     && ticket.configRevision === owner.config_revision
     && ticket.targetIndex === owner.target_index
-    && ticket.jobName === selection.jobName
+    && ticket.jobId === selection.jobId
     && ticket.configRevision === selection.configRevision
     && ticket.targetIndex === selection.targetIndex;
 }

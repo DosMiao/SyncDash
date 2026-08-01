@@ -12,7 +12,7 @@ import { SchemaSection } from './SchemaSection';
 import { ConfirmDialog, Sheet } from './ui';
 import { useScrollSpy } from '../hooks/useScrollSpy';
 import type { FormValues } from '../../core/jobfields';
-import type { JobFull } from '../../core/ipc';
+import type { JobDeleteDto, JobFull, JobSaveDto } from '../../core/ipc';
 
 export interface EditorApi { setField: (key: string, value: string) => void }
 
@@ -33,13 +33,15 @@ interface Props {
   busy: boolean;
   onClose: () => void;
   onSaved: (
-    name: string,
+    saved: JobSaveDto,
     job: JobFull,
-    configRevision: string,
-    original: { name: string; configRevision: string } | null,
+    original: { jobId: string; name: string; configRevision: string } | null,
   ) => void;
-  onDeleted: (name: string, configRevision: string) => void;
-  onMutationConflict: (name: string) => Promise<void>;
+  onDeleted: (deleted: JobDeleteDto) => void;
+  onMutationConflict: (
+    name: string,
+    original: { jobId: string; name: string; configRevision: string } | null,
+  ) => Promise<void>;
   onStatus: (msg: string, cls?: '' | 'err' | 'ok') => void;
 }
 
@@ -51,6 +53,7 @@ interface Loaded {
   base: JobFull;
   values: FormValues;
   originalName: string | null;
+  jobId: string | null;
   configRevision: string | null;
 }
 
@@ -117,6 +120,7 @@ export function JobEditor(props: Props) {
     const load = async () => {
       let j: JobFull;
       let originalName: string | null = null;
+      let jobId: string | null = null;
       let configRevision: string | null = null;
       try {
         // A new job's starting point is engine policy, so it comes from the engine
@@ -124,6 +128,7 @@ export function JobEditor(props: Props) {
           const detail = await getJob(name);
           j = detail.job;
           originalName = detail.name;
+          jobId = detail.job_id;
           configRevision = detail.config_revision;
         } else {
           j = await defaultJob();
@@ -140,6 +145,7 @@ export function JobEditor(props: Props) {
         base: j,
         values: jobToForm(applyRigorPresetDefaults(j), originalName ?? ''),
         originalName,
+        jobId,
         configRevision,
       });
       if (name) {
@@ -210,22 +216,34 @@ export function JobEditor(props: Props) {
     setSaveError(null);
     setSaving(true);
     try {
-      const existing = form.originalName && form.configRevision
+      if (form.originalName && (!form.jobId || !form.configRevision)) {
+        throw new Error('The loaded job is missing registry identity or revision; close and reopen the editor');
+      }
+      const existing = form.originalName && form.jobId && form.configRevision
         ? { originalName: form.originalName, expectedRevision: form.configRevision }
         : undefined;
       const saved = await saveJob(c.name, c.job, existing);
+      const persistedJob = { ...c.job, job_id: saved.job_id };
       onSaved(
-        saved.name,
-        c.job,
-        saved.config_revision,
-        form.originalName && form.configRevision
-          ? { name: form.originalName, configRevision: form.configRevision }
+        saved,
+        persistedJob,
+        form.originalName && form.jobId && form.configRevision
+          ? {
+              jobId: form.jobId,
+              name: form.originalName,
+              configRevision: form.configRevision,
+            }
           : null,
       );
     } catch (e) {
       let message = `Save failed: ${e}`;
       try {
-        await onMutationConflict(form.originalName ?? c.name);
+        await onMutationConflict(
+          form.originalName ?? c.name,
+          form.originalName && form.jobId && form.configRevision
+            ? { jobId: form.jobId, name: form.originalName, configRevision: form.configRevision }
+            : null,
+        );
         message += ' · refreshed the job registry; the editor kept your draft and did not overwrite any file';
       } catch (refreshError) {
         message += ` · job-registry refresh failed: ${refreshError}`;
@@ -238,14 +256,18 @@ export function JobEditor(props: Props) {
   };
 
   const remove = async () => {
-    if (!form?.originalName || !form.configRevision || busy) return;
+    if (!form?.originalName || !form.jobId || !form.configRevision || busy) return;
     try {
-      await deleteJob(form.originalName, form.configRevision);
-      onDeleted(form.originalName, form.configRevision);
+      const deleted = await deleteJob(form.originalName, form.jobId, form.configRevision);
+      onDeleted(deleted);
     } catch (e) {
       let message = `Delete failed: ${e}`;
       try {
-        await onMutationConflict(form.originalName);
+        await onMutationConflict(form.originalName, {
+          jobId: form.jobId,
+          name: form.originalName,
+          configRevision: form.configRevision,
+        });
         message += ' · refreshed the job registry; no job file was deleted';
       } catch (refreshError) {
         message += ` · job-registry refresh failed: ${refreshError}`;

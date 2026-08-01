@@ -34,16 +34,16 @@ struct RunCommandGuard(Arc<RunState>);
 
 struct AppliedResultGuard {
     results: Arc<ResultRepository>,
-    job_name: String,
+    job_id: String,
     config_revision: String,
     invalidate_on_drop: bool,
 }
 
 impl AppliedResultGuard {
-    fn new(results: Arc<ResultRepository>, job_name: &str, config_revision: &str) -> Self {
+    fn new(results: Arc<ResultRepository>, job_id: &str, config_revision: &str) -> Self {
         Self {
             results,
-            job_name: job_name.to_string(),
+            job_id: job_id.to_string(),
             config_revision: config_revision.to_string(),
             invalidate_on_drop: true,
         }
@@ -61,7 +61,7 @@ impl Drop for AppliedResultGuard {
                 .0
                 .lock()
                 .unwrap()
-                .invalidate_revision(&self.job_name, &self.config_revision);
+                .invalidate_revision(&self.job_id, &self.config_revision);
         }
     }
 }
@@ -120,6 +120,7 @@ pub async fn compare_job(
     results: tauri::State<'_, Arc<ResultRepository>>,
     events: tauri::State<'_, Arc<RunEventRepository>>,
     name: String,
+    expected_job_id: String,
     target_index: Option<usize>,
     accept_caps: Option<bool>,
 ) -> Result<PlanDto, String> {
@@ -129,11 +130,19 @@ pub async fn compare_job(
     let events = events.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (job_name, full_job) = job::load_named(&name).map_err(|e| e.to_string())?;
+        if full_job.job_id != expected_job_id {
+            return Err(format!(
+                "Job '{job_name}' was replaced before Compare started — refresh it and try again"
+            ));
+        }
         let config_revision =
             job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
         let (target_index, job) = resolve_target(&full_job, target_index)?;
         let (run_id, ctl) = begin_run(&st)?;
-        let _active_run = ActiveRunGuard { state: st.clone(), run_id };
+        let _active_run = ActiveRunGuard {
+            state: st.clone(),
+            run_id,
+        };
         let ctx = make_ctx(&app, events, run_id, ctl, "compare");
         // Take over the process-level log outlet during compare too: the diagnostics in `trash`/`lock`/`scan`
         // that cannot reach a ctx go through the macro registry, and without installing here they fall back to stderr — in a windowed build that means never said.
@@ -146,7 +155,10 @@ pub async fn compare_job(
         // not a failure to paper over.
         let outlet: Arc<dyn syncdash::obs::progress::ProgressSink> =
             match syncdash::obs::progress::current() {
-                Some(prev) => Arc::new(syncdash::obs::logging::MultiSink::new(vec![ctx.sink.clone(), prev])),
+                Some(prev) => Arc::new(syncdash::obs::logging::MultiSink::new(vec![
+                    ctx.sink.clone(),
+                    prev,
+                ])),
                 None => ctx.sink.clone(),
             };
         let _log_guard = syncdash::obs::progress::install(outlet);
@@ -164,19 +176,24 @@ pub async fn compare_job(
             ts_ms,
             r.as_ref().map(|o| o.plan.ops.len() as u64).unwrap_or(0),
             t0.elapsed().as_millis() as u64,
-            r.as_ref().err().map(syncdash::obs::progress::is_cancelled).unwrap_or(false),
+            r.as_ref()
+                .err()
+                .map(syncdash::obs::progress::is_cancelled)
+                .unwrap_or(false),
         );
         let out = r.map_err(user_err)?;
         let plan_digest = out.plan.digest();
-        let owner = CompareOwner {
+        let mut owner = CompareOwner {
             compare_id: run_id,
+            job_id: full_job.job_id.clone(),
             job_name,
             target_index,
             config_revision,
         };
         // Evidence layer: measured size/mtime on both sides + equal-item counts. It shares the same
         // norm_key/files_equal as compare(), so the definitions cannot drift apart.
-        let ev = compare::evidence::evidence(&out.source, &out.target, &out.plan, &job.compare_opts());
+        let ev =
+            compare::evidence::evidence(&out.source, &out.target, &out.plan, &job.compare_opts());
         let metas = ev
             .metas
             .into_iter()
@@ -189,7 +206,7 @@ pub async fn compare_job(
                 }
             })
             .collect();
-        let dto = PlanDto {
+        let mut dto = PlanDto {
             owner: owner.clone(),
             header: out.plan.header,
             ops: out.plan.ops,
@@ -201,8 +218,11 @@ pub async fn compare_job(
         // while re-reading the registered revision: an in-app save/delete publishes its invalidation
         // under this same lock, so an old result cannot be inserted behind a completed mutation.
         let mut repository = results.0.lock().unwrap();
-        let (_, current_job) = job::load_named(&owner.job_name).map_err(|error| {
-            format!("Job '{}' changed while Compare was running: {error}", owner.job_name)
+        let (current_name, current_job) = job::load_by_id(&owner.job_id).map_err(|error| {
+            format!(
+                "Job '{}' was deleted or replaced while Compare was running: {error}",
+                owner.job_name
+            )
         })?;
         let current_revision = job::config_revision(&current_job)
             .map_err(|error| format!("Job '{}': {error}", owner.job_name))?;
@@ -212,6 +232,8 @@ pub async fn compare_job(
                 owner.job_name
             ));
         }
+        owner.job_name = current_name;
+        dto.owner = owner.clone();
         repository.insert(CachedCompare {
             provenance: CompareProvenance { owner, plan_digest },
             plan: dto.clone(),
@@ -237,25 +259,23 @@ pub async fn preflight(
 ) -> Result<PreflightDto, String> {
     let results = results.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if name != plan.owner.job_name {
-            return Err(format!(
-                "This compare result belongs to job '{}', not '{}' — run Compare again",
-                plan.owner.job_name, name
-            ));
-        }
         let (job_name, full_job) = job::load_named(&name).map_err(|e| e.to_string())?;
         let config_revision =
             job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
         let (target_index, job) = resolve_target(&full_job, target_index)?;
-        let full = Plan { header: plan.header.clone(), ops: plan.ops.clone() };
+        let full = Plan {
+            header: plan.header.clone(),
+            ops: plan.ops.clone(),
+        };
         let plan_digest = full.digest();
         {
             let mut repository = results.0.lock().unwrap();
-            let key = ResultKey::new(&job_name, target_index, &config_revision);
+            let key = ResultKey::new(&full_job.job_id, target_index, &config_revision);
             let cached = repository.get(&key);
             validate_cached_compare(
                 cached.map(|result| &result.provenance),
                 &plan.owner,
+                &full_job.job_id,
                 &job_name,
                 target_index,
                 &config_revision,
@@ -311,78 +331,91 @@ pub async fn apply_job(
     let reject_state = state.inner().clone();
     let requested_launch = launch_id;
     let run_app = app.clone();
-    let joined = tauri::async_runtime::spawn_blocking(move || -> Result<ApplyDto, (String, bool)> {
-        if name != plan.owner.job_name {
-            return Err((
-                format!(
-                    "This compare result belongs to job '{}', not '{}' — run Compare again",
-                    plan.owner.job_name, name
-                ),
-                false,
-            ));
-        }
-        let (job_name, full_job) =
-            job::load_named(&name).map_err(|e| (e.to_string(), false))?;
-        let config_revision = job::config_revision(&full_job)
-            .map_err(|e| (format!("Job '{job_name}': {e}"), false))?;
-        let (target_index, job) = resolve_target(&full_job, target_index).map_err(|e| (e, false))?;
-        let full = Plan { header: plan.header.clone(), ops: plan.ops.clone() };
-        let plan_digest = full.digest();
-        // Keep the repository stable through the gate and run reservation. If a compare is already
-        // scanning, begin_run rejects this apply before a write; if this apply reserves first, no
-        // compare can replace the authenticated job/target/revision entry before execution starts.
-        let mut repository = results.0.lock().unwrap();
-        let key = ResultKey::new(&job_name, target_index, &config_revision);
-        let cached = repository.get(&key);
-        validate_cached_compare(
-            cached.map(|result| &result.provenance),
-            &plan.owner,
-            &job_name,
-            target_index,
-            &config_revision,
-            Some(&plan_digest),
-        )
-        .map_err(|e| (e, false))?;
-        let ops = resolve_selected_ops(&full.ops, &selected).map_err(|e| (e, false))?;
-        // Touch nothing when a gate fails, and hand the reason back to the UI
-        let v = run::preflight(&job, &full, &ops, acknowledged)
-            .map_err(|error| (user_err(error), false))?;
-        if !v.ok() {
-            return Err((v.blockers.join("\n"), false));
-        }
-        let (run_id, ctl) = begin_run_for_launch(&st, launch_id).map_err(|e| (e, false))?;
-        drop(repository);
-        let mut applied_result =
-            AppliedResultGuard::new(results.clone(), &job_name, &config_revision);
-        let _active_run = ActiveRunGuard { state: st.clone(), run_id };
-        let ctx = make_ctx(&run_app, events, run_id, ctl, "apply");
-        // M4: every real apply writes a run-log entry (the Recorder also collects error events into the detail file)
-        let t0 = std::time::Instant::now();
-        let rec = syncdash::obs::runlog::Recorder::start(&job_name, &run::run_kind(&job, "apply"), &ctx, &ops);
-        // A degraded apply without consent refuses with the NeedsAck lines; the frontend shows
-        // them and re-invokes with accept_caps=true if the user agrees.
-        let out = match run::apply(
-            &job_name, &job, &full, &ops, None, false, acknowledged, accept_caps.unwrap_or(false), &rec.ctx,
-        ) {
-            Ok(o) => o,
-            Err(e) => {
-                let message = user_err(e);
-                if message.contains("--accept-caps") {
-                    applied_result.retain_for_safe_rejection();
-                }
-                return Err((message, true));
+    let joined =
+        tauri::async_runtime::spawn_blocking(move || -> Result<ApplyDto, (String, bool)> {
+            let (job_name, full_job) =
+                job::load_named(&name).map_err(|e| (e.to_string(), false))?;
+            let config_revision = job::config_revision(&full_job)
+                .map_err(|e| (format!("Job '{job_name}': {e}"), false))?;
+            let (target_index, job) =
+                resolve_target(&full_job, target_index).map_err(|e| (e, false))?;
+            let full = Plan {
+                header: plan.header.clone(),
+                ops: plan.ops.clone(),
+            };
+            let plan_digest = full.digest();
+            // Keep the repository stable through the gate and run reservation. If a compare is already
+            // scanning, begin_run rejects this apply before a write; if this apply reserves first, no
+            // compare can replace the authenticated job/target/revision entry before execution starts.
+            let mut repository = results.0.lock().unwrap();
+            let key = ResultKey::new(&full_job.job_id, target_index, &config_revision);
+            let cached = repository.get(&key);
+            validate_cached_compare(
+                cached.map(|result| &result.provenance),
+                &plan.owner,
+                &full_job.job_id,
+                &job_name,
+                target_index,
+                &config_revision,
+                Some(&plan_digest),
+            )
+            .map_err(|e| (e, false))?;
+            let ops = resolve_selected_ops(&full.ops, &selected).map_err(|e| (e, false))?;
+            // Touch nothing when a gate fails, and hand the reason back to the UI
+            let v = run::preflight(&job, &full, &ops, acknowledged)
+                .map_err(|error| (user_err(error), false))?;
+            if !v.ok() {
+                return Err((v.blockers.join("\n"), false));
             }
-        };
-        rec.finish(&out, t0.elapsed().as_millis() as u64);
-        Ok(ApplyDto {
-            done: out.done,
-            skipped: out.skipped,
-            errors: out.errors,
-            bytes_copied: out.bytes_copied,
-            cancelled: out.cancelled,
+            let (run_id, ctl) = begin_run_for_launch(&st, launch_id).map_err(|e| (e, false))?;
+            drop(repository);
+            let mut applied_result =
+                AppliedResultGuard::new(results.clone(), &full_job.job_id, &config_revision);
+            let _active_run = ActiveRunGuard {
+                state: st.clone(),
+                run_id,
+            };
+            let ctx = make_ctx(&run_app, events, run_id, ctl, "apply");
+            // M4: every real apply writes a run-log entry (the Recorder also collects error events into the detail file)
+            let t0 = std::time::Instant::now();
+            let rec = syncdash::obs::runlog::Recorder::start(
+                &job_name,
+                &run::run_kind(&job, "apply"),
+                &ctx,
+                &ops,
+            );
+            // A degraded apply without consent refuses with the NeedsAck lines; the frontend shows
+            // them and re-invokes with accept_caps=true if the user agrees.
+            let out = match run::apply(
+                &job_name,
+                &job,
+                &full,
+                &ops,
+                None,
+                false,
+                acknowledged,
+                accept_caps.unwrap_or(false),
+                &rec.ctx,
+            ) {
+                Ok(o) => o,
+                Err(e) => {
+                    let message = user_err(e);
+                    if message.contains("--accept-caps") {
+                        applied_result.retain_for_safe_rejection();
+                    }
+                    return Err((message, true));
+                }
+            };
+            rec.finish(&out, t0.elapsed().as_millis() as u64);
+            Ok(ApplyDto {
+                done: out.done,
+                skipped: out.skipped,
+                errors: out.errors,
+                bytes_copied: out.bytes_copied,
+                cancelled: out.cancelled,
+            })
         })
-    })
-    .await;
+        .await;
     let result = match joined {
         Ok(result) => result,
         Err(e) => {
@@ -394,7 +427,10 @@ pub async fn apply_job(
                 release_progress_launch(&reject_state, launch_id);
                 let _ = app.emit(
                     "run-rejected",
-                    RunRejected { launch_id, message: message.clone() },
+                    RunRejected {
+                        launch_id,
+                        message: message.clone(),
+                    },
                 );
             }
             return Err(message);
@@ -408,7 +444,10 @@ pub async fn apply_job(
                     if release_progress_launch(&reject_state, launch_id) {
                         let _ = app.emit(
                             "run-rejected",
-                            RunRejected { launch_id, message: message.clone() },
+                            RunRejected {
+                                launch_id,
+                                message: message.clone(),
+                            },
                         );
                     }
                 }
@@ -429,7 +468,10 @@ mod tests {
             let state = state.clone();
             move || {
                 let (run_id, _) = begin_run(&state).unwrap();
-                let _active_run = ActiveRunGuard { state: state.clone(), run_id };
+                let _active_run = ActiveRunGuard {
+                    state: state.clone(),
+                    run_id,
+                };
                 panic!("worker panic");
             }
         }));

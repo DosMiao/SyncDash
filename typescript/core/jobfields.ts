@@ -94,8 +94,14 @@ export const ED_FIELDS: FSpec[] = [
   },
   { key: 'deletable', label: 'Deletable', kind: 'lines', desc: 'May be removed along with a deleted parent directory.' },
 
-  { key: 'watch_interval_secs', label: 'Scheduled scan interval', kind: 'num', group: 'AutoScan', desc: 'Seconds; empty = off. For UNC targets use 30 or more.' },
-  { key: 'watch_auto_apply', label: 'Run automatically when differences are found', kind: 'bool' },
+  {
+    key: 'watch_interval_secs', label: 'Maximum verification interval', kind: 'num', group: 'AutoScan',
+    desc: 'Seconds. Local macOS roots also react to FSEvents; remote/unsupported roots poll at this interval while SyncDash is open.',
+  },
+  {
+    key: 'watch_auto_apply', label: 'Run automatically when differences are found', kind: 'bool',
+    help: 'Auto-run never grants permission to degraded capabilities or health warnings. If the exact job revision, target, capability set, and action set lack unattended authorization, AutoScan stops at review required.',
+  },
 ];
 
 export const SET_FIELDS: FSpec[] = [

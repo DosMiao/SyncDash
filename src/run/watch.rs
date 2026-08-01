@@ -42,9 +42,15 @@ pub enum Invalidation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FullScanReason {
     Bootstrap,
+    /// A backend-owned maximum verification interval elapsed without a native change event.
+    /// Native events are only trigger hints, so periodically rebuilding the full snapshot keeps
+    /// the automation honest even when a platform journal is unavailable or incomplete.
+    Periodic,
     EvidencePolicy(RigorPolicy),
     WatchInvalidated(Invalidation),
-    ChangeSetTooLarge { limit: usize },
+    ChangeSetTooLarge {
+        limit: usize,
+    },
 }
 
 /// The strongest coverage the watcher state permits.
@@ -276,6 +282,39 @@ impl WatchTrigger {
         Ok(())
     }
 
+    /// Latch a full-tree verification at a known live watcher position.
+    ///
+    /// The desktop adapter uses this for its maximum verification interval. It supplies the
+    /// watcher's position captured immediately before this call, so a successful compare can
+    /// durably commit exactly the events it covered. A periodic request never erases a stronger
+    /// invalidation or a change batch already waiting to run.
+    pub fn request_periodic(
+        &mut self,
+        through: WatchPosition,
+        at_ms: u64,
+    ) -> Result<(), WatchStateError> {
+        if !self.armed {
+            return Err(WatchStateError::NotArmed);
+        }
+        through
+            .validate()
+            .map_err(WatchStateError::InvalidPosition)?;
+        if self
+            .observed
+            .as_ref()
+            .is_some_and(|previous| !position_follows(previous, &through))
+        {
+            self.full_scan = Some(FullScanReason::WatchInvalidated(
+                Invalidation::CursorDiscontinuity,
+            ));
+        } else if self.full_scan.is_none() {
+            self.full_scan = Some(FullScanReason::Periodic);
+        }
+        self.observed = Some(through);
+        self.debounce_until_ms = Some(at_ms);
+        Ok(())
+    }
+
     /// Return the next stable unit of work once the quiet period has elapsed.
     pub fn next_work(&mut self, now_ms: u64) -> Result<Option<WorkTicket>, WatchStateError> {
         if !self.armed {
@@ -495,6 +534,49 @@ mod tests {
             ticket.coverage,
             WorkCoverage::FullTree {
                 reason: FullScanReason::Bootstrap
+            }
+        );
+    }
+
+    #[test]
+    fn periodic_verification_is_full_tree_and_commits_the_captured_position() {
+        let initial = position("a", 0);
+        let periodic = position("a", 7);
+        let mut trigger = WatchTrigger::new(RigorPolicy::Quick, config(100, 512));
+        finish_bootstrap(&mut trigger, initial);
+
+        trigger.request_periodic(periodic.clone(), 500).unwrap();
+        let ticket = trigger.next_work(500).unwrap().unwrap();
+        assert_eq!(ticket.through, periodic);
+        assert_eq!(
+            ticket.coverage,
+            WorkCoverage::FullTree {
+                reason: FullScanReason::Periodic
+            }
+        );
+        trigger.complete_success(ticket.id, |_| Ok(())).unwrap();
+        assert_eq!(trigger.committed_position(), Some(&periodic));
+    }
+
+    #[test]
+    fn periodic_verification_does_not_downgrade_a_latched_invalidation() {
+        let mut trigger = WatchTrigger::new(RigorPolicy::Quick, config(0, 512));
+        finish_bootstrap(&mut trigger, position("a", 0));
+        trigger
+            .observe(
+                ChangeBatch {
+                    through: position("a", 1),
+                    changed_paths: Vec::new(),
+                    invalidation: Some(Invalidation::CursorDiscontinuity),
+                },
+                1,
+            )
+            .unwrap();
+        trigger.request_periodic(position("a", 1), 1).unwrap();
+        assert_eq!(
+            trigger.next_work(1).unwrap().unwrap().coverage,
+            WorkCoverage::FullTree {
+                reason: FullScanReason::WatchInvalidated(Invalidation::CursorDiscontinuity)
             }
         );
     }

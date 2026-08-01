@@ -6,7 +6,7 @@ import type { RunRecord } from '../../core/types/generated/RunRecord';
 
 interface Props {
   jobs: JobDto[];
-  currentName: string | null;
+  currentJobId: string | null;
   /// job name → most recent run, for the second line on each card
   lastMap: Record<string, RunRecord>;
   busy: boolean;
@@ -32,7 +32,7 @@ function LastRun({ r }: { r: RunRecord }) {
 }
 
 export function Sidebar(props: Props) {
-  const { jobs, currentName, lastMap, busy, appVersion, jobsDir, onSelect, onEdit, onNew } = props;
+  const { jobs, currentJobId, lastMap, busy, appVersion, jobsDir, onSelect, onEdit, onNew } = props;
   const jobButtons = useRef<Array<HTMLButtonElement | null>>([]);
 
   const moveFocus = (from: number, direction: -1 | 1 | 'first' | 'last') => {
@@ -48,10 +48,10 @@ export function Sidebar(props: Props) {
       <div className="brand">Sync<span>Dash</span></div>
       <nav className="joblist" aria-label="Jobs">
         {jobs.map((j, index) => {
-          const active = currentName === j.name;
+          const active = currentJobId === j.job_id;
           return (
           <div
-            key={j.name}
+            key={j.job_id}
             className={'job' + (active ? ' active' : '')}
             title={`${j.source}\n→ ${j.target}` + (j.remote ? '\n(applied by a peer syncdash over ssh)' : '')}
           >
@@ -61,7 +61,7 @@ export function Sidebar(props: Props) {
               className="job-select"
               disabled={busy}
               aria-current={active ? 'page' : undefined}
-              tabIndex={active || (!currentName && index === 0) ? 0 : -1}
+              tabIndex={active || (!currentJobId && index === 0) ? 0 : -1}
               onClick={() => { if (!active) onSelect(j); }}
               onKeyDown={(e) => {
                 if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {

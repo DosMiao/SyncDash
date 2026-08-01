@@ -4985,6 +4985,7 @@ dependencies = [
  "dispatch2",
  "fastcdc",
  "filetime",
+ "getrandom 0.3.4",
  "hostname",
  "keyring",
  "libc",
@@ -5012,6 +5013,7 @@ dependencies = [
 name = "syncdash-desktop"
 version = "0.9.0"
 dependencies = [
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
  "syncdash",

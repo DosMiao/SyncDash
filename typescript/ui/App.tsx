@@ -35,10 +35,12 @@ import {
   invalidateSession,
   invalidateJobSession,
   ownerMatchesSelection,
+  rebindSessionOwner,
   reconcileRefreshedJobSession,
   reconcileSavedJobSession,
   retainSuccessfulSession,
   successfulSession,
+  snapshotJob,
   targetForSelection,
   updateSession,
 } from './state/compare-session';
@@ -148,6 +150,7 @@ export function App() {
   const [tableWrap, setTableWrap] = useState<HTMLDivElement | null>(null);
   /// Pending root swap, held with the job it read so the confirmation can spell out both roots
   const [askSwap, setAskSwap] = useState<{
+    jobId: string;
     name: string;
     job: ipc.JobFull;
     configRevision: string;
@@ -172,12 +175,14 @@ export function App() {
   const cmpRunReady = useRef(false);
   const compareInFlight = useRef(false);
 
-  // AutoScan (the job field behind it is watch_interval_secs)
-  const [watchSecs, setWatchSecs] = useState<number | null>(null);
-  const watchNext = useRef(0);
+  // AutoScan is backend-owned. The webview renders status and handles exact trigger tickets; it
+  // never owns the clock or assumes that remaining mounted means the watcher is still alive.
+  const [autoScanStatus, setAutoScanStatus] = useState<ipc.AutoScanStatusDto | null>(null);
   const autoScanEnabled = useRef(false);
-  const autoScanGeneration = useRef(0);
   const autoScanTicket = useRef<AutoScanTicket | null>(null);
+  const autoScanControlRequest = useRef(0);
+  const autoScanTriggerRef = useRef<(trigger: ipc.AutoScanTriggerDto) => Promise<void>>(async () => {});
+  const watchSecs = autoScanStatus?.active ? (autoScanStatus.interval_secs ?? null) : null;
 
   const editorApi = useRef<EditorApi | null>(null);
   const { status, set: setStatus, withUndo: setStatusUndo, runUndo } = useStatus('');
@@ -207,7 +212,7 @@ export function App() {
   const reviewedRows = useMemo(() => (plan ? selectedRows(final, flipped) : []), [plan, final, flipped]);
   const reviewKey = useMemo(() => (
     plan && currentJob
-      ? reviewedSetKey(plan.owner, currentJob.name, currentJob.config_revision, selTarget, reviewedRows)
+      ? reviewedSetKey(plan.owner, currentJob.job_id, currentJob.config_revision, selTarget, reviewedRows)
       : null
   ), [plan, currentJob, selTarget, reviewedRows]);
   const currentReviewKeyRef = useRef<string | null>(reviewKey);
@@ -266,7 +271,9 @@ export function App() {
       // listJobs is the authoritative registry. The name guard prevents a delayed refresh from
       // hijacking a newer selection; when that guarded job disappeared, retaining `cur` would
       // instead leave a ghost row that every later Compare retries.
-      setCurrentJob((cur) => (cur?.name === keepName ? list.find((x) => x.name === keepName) ?? null : cur));
+      setCurrentJob((cur) => (
+        cur?.name === keepName ? list.find((x) => x.job_id === cur.job_id) ?? null : cur
+      ));
     }
     return list;
   }, []);
@@ -308,11 +315,19 @@ export function App() {
   }, []);
 
   const stopAutoScan = useCallback(() => {
+    const request = autoScanControlRequest.current + 1;
+    autoScanControlRequest.current = request;
     autoScanEnabled.current = false;
     autoScanTicket.current = null;
-    autoScanGeneration.current += 1;
-    setWatchSecs(null);
-  }, []);
+    setAutoScanStatus(null);
+    void ipc.stopAutoScan().then((next) => {
+      if (autoScanControlRequest.current === request) setAutoScanStatus(next);
+    }).catch((error) => {
+      if (autoScanControlRequest.current === request) {
+        setStatus(`AutoScan could not be stopped cleanly: ${error}`, 'err');
+      }
+    });
+  }, [setStatus]);
 
   const resetNavigationUi = useCallback(() => {
     resetSafetyUi();
@@ -343,12 +358,12 @@ export function App() {
     setStatus(`'${currentJob.name}' no longer has target ${selTarget + 1}; selected target 1`);
   }, [currentJob, selTarget, resetNavigationUi, stopAutoScan, setStatus]);
 
-  const invalidateCompareRevision = useCallback((name: string, configRevision: string) => {
-    setCompareRepository((repository) => invalidateJobRevision(repository, name, configRevision));
+  const invalidateCompareRevision = useCallback((jobId: string, configRevision: string) => {
+    setCompareRepository((repository) => invalidateJobRevision(repository, jobId, configRevision));
   }, []);
 
-  const invalidateCompareJob = useCallback((name: string) => {
-    setCompareRepository((repository) => invalidateJobSession(repository, name));
+  const invalidateCompareJob = useCallback((jobId: string) => {
+    setCompareRepository((repository) => invalidateJobSession(repository, jobId));
   }, []);
 
   const setChecked = useCallback((next: boolean[] | ((prev: boolean[]) => boolean[])) => {
@@ -370,7 +385,7 @@ export function App() {
   const recomputeMasks = useCallback(async (p: PlanDto | null, f: boolean[], masks: string[]) => {
     if (!p || masks.length === 0) { clearMasks(); return []; }
     const owner = p.owner;
-    const ticket = maskRequest.current.start(`${owner.compare_id}\0${owner.job_name}\0${owner.target_index}\0${owner.config_revision}`);
+    const ticket = maskRequest.current.start(`${owner.compare_id}\0${owner.job_id}\0${owner.target_index}\0${owner.config_revision}`);
     try {
       const hits = await ipc.maskMatch(masks, p.ops.map((_, i) => eff(p, f, i).path));
       if (!maskRequest.current.owns(ticket)) return;
@@ -390,7 +405,7 @@ export function App() {
     retained: ReturnType<typeof sessionForSelection>,
     announce = true,
   ) => {
-    const ticket = restoreRequest.current.start(`${job.name}\0${targetIndex}\0${job.config_revision}`);
+    const ticket = restoreRequest.current.start(`${job.job_id}\0${targetIndex}\0${job.config_revision}`);
     const publish = (restored: PlanDto | null) => {
       if (!restoreRequest.current.owns(ticket) || !restored) return;
       const selected = selectionRef.current;
@@ -408,7 +423,7 @@ export function App() {
       if (announce) setStatus(`Could not restore '${job.name}' result: ${error}`, 'err');
     };
     if (!retained) {
-      void ipc.restoreCompare(job.name, targetIndex).then(publish).catch(failed);
+      void ipc.restoreCompare(job.job_id, targetIndex).then(publish).catch(failed);
       return;
     }
     void ipc.touchCompare(retained.plan.owner).then(async (backendOwner) => {
@@ -419,10 +434,14 @@ export function App() {
         return;
       }
       if (backendOwner.compare_id === retained.plan.owner.compare_id) {
-        setCompareRepository((repository) => retainSuccessfulSession(repository, retained));
+        setCompareRepository((repository) => rebindSessionOwner(
+          retainSuccessfulSession(repository, retained),
+          retained.plan.owner,
+          backendOwner,
+        ));
         return;
       }
-      publish(await ipc.restoreCompare(job.name, targetIndex));
+      publish(await ipc.restoreCompare(job.job_id, targetIndex));
     }).catch(failed);
   }, [setStatus]);
 
@@ -435,6 +454,7 @@ export function App() {
     restoreRequest.current.invalidate();
     compareInFlight.current = true;
     const name = currentJob.name;
+    const comparedJob = snapshotJob(currentJob);
     const targetIndex = selTarget;
     resetSafetyUi();
     setBusy(true);
@@ -446,7 +466,7 @@ export function App() {
     cmpRunReady.current = false;
     setCmpActive(true);
     try {
-      const p = await ipc.compareJob(name, targetIndex);
+      const p = await ipc.compareJob(name, comparedJob.jobId, targetIndex);
       const f = p.ops.map(() => false);
       setCompareRepository((repository) => retainSuccessfulSession(
         repository,
@@ -465,15 +485,19 @@ export function App() {
       let refreshProblem: unknown = null;
       try {
         const list = await refreshJobs(name);
-        refreshedJob = list.find((job) => job.name === name) ?? null;
-        setCompareRepository((repository) => reconcileRefreshedJobSession(repository, name, refreshedJob));
+        refreshedJob = list.find((job) => job.job_id === p.owner.job_id) ?? null;
+        setCompareRepository((repository) => reconcileRefreshedJobSession(
+          repository,
+          { jobId: p.owner.job_id, name: p.owner.job_name, configRevision: p.owner.config_revision },
+          refreshedJob,
+        ));
       } catch (e) {
         refreshProblem = e;
       }
       const selected = selectionRef.current;
-      const selectedJob = selected.job?.name === name && !refreshProblem ? refreshedJob : selected.job;
+      const selectedJob = selected.job?.job_id === p.owner.job_id && !refreshProblem ? refreshedJob : selected.job;
       let navigationWasReset = false;
-      if (selectedBeforeRefresh.job?.name === name && !refreshProblem) {
+      if (selectedBeforeRefresh.job?.job_id === p.owner.job_id && !refreshProblem) {
         if (!refreshedJob) {
           setSelTarget(0);
           stopAutoScan();
@@ -519,9 +543,9 @@ export function App() {
         // stale list row cannot trap every subsequent attempt on the same invalid selection.
         const selected = selectionRef.current;
         const list = await refreshJobs(name);
-        const refreshedJob = list.find((job) => job.name === name) ?? null;
-        setCompareRepository((repository) => reconcileRefreshedJobSession(repository, name, refreshedJob));
-        if (selected.job?.name === name) {
+        const refreshedJob = list.find((job) => job.job_id === comparedJob.jobId) ?? null;
+        setCompareRepository((repository) => reconcileRefreshedJobSession(repository, comparedJob, refreshedJob));
+        if (selected.job?.job_id === comparedJob.jobId) {
           if (!refreshedJob) {
             setSelTarget(0);
             stopAutoScan();
@@ -612,7 +636,7 @@ export function App() {
       launchId = await ipc.openProgressWindow();
       // Once apply is invoked, any rejection may still follow partial writes. Retire this plan before
       // crossing that boundary; only the post-run compare is entitled to publish another one.
-      invalidateCompareRevision(currentJob.name, currentJob.config_revision);
+      invalidateCompareRevision(currentJob.job_id, currentJob.config_revision);
       resetSafetyUi();
       const r = await ipc.applyJob(currentJob.name, plan, selected, acknowledgedForRun, selTarget, launchId);
       setStatus(
@@ -636,7 +660,7 @@ export function App() {
   }, [currentJob, activeCompare, plan, reviewKey, confirmOpen, confirmReviewKey, preflight, preflightError, busy, reviewedRows, acknowledged, selTarget, doCompare, refreshLastSyncs, invalidateCompareRevision, requestResultRestore, resetConfirmation, resetSafetyUi, setStatus]);
 
   const selectJob = useCallback((j: JobDto) => {
-    if (currentJob?.name === j.name) return;
+    if (currentJob?.job_id === j.job_id) return;
     const targetIndex = targetForSelection(compareRepository, j);
     const restored = sessionForSelection(compareRepository, j, targetIndex);
     selectionRef.current = { job: j, targetIndex };
@@ -648,7 +672,7 @@ export function App() {
       ? `${j.name} · restored ${restored.plan.ops.length} compare items`
       : `${j.name} · ${j.mode}${j.rigor !== 'standard' ? ` · ${j.rigor}` : ''}`);
     requestResultRestore(j, targetIndex, restored);
-  }, [currentJob?.name, compareRepository, requestResultRestore, resetNavigationUi, stopAutoScan, setStatus]);
+  }, [currentJob?.job_id, compareRepository, requestResultRestore, resetNavigationUi, stopAutoScan, setStatus]);
 
   /// Write a root edited on the main screen back to the job TOML. Changing a root invalidates the current
   /// plan, so clear it too. For multi-target jobs, only the currently selected target changes.
@@ -691,10 +715,8 @@ export function App() {
     stopAutoScan();
     setCompareRepository((repository) => reconcileSavedJobSession(
       repository,
-      detail.name,
-      detail.config_revision,
-      saved.name,
-      saved.config_revision,
+      saved,
+      { jobId: detail.job_id, name: detail.name, configRevision: detail.config_revision },
     ));
     resetSafetyUi();
     pushHistory(v);
@@ -709,10 +731,8 @@ export function App() {
         });
         setCompareRepository((repository) => reconcileSavedJobSession(
           repository,
-          saved.name,
-          saved.config_revision,
-          restored.name,
-          restored.config_revision,
+          restored,
+          { jobId: saved.job_id, name: saved.name, configRevision: saved.config_revision },
         ));
       } catch (e) {
         await reportMutationFailure(saved.name, `Could not restore ${which}`, e);
@@ -751,6 +771,7 @@ export function App() {
         return;
       }
       setAskSwap({
+        jobId: detail.job_id,
         name: detail.name,
         job,
         configRevision: detail.config_revision,
@@ -762,6 +783,7 @@ export function App() {
   }, [currentJob, busy, selTarget, reportMutationFailure, setStatus]);
 
   const doSwap = useCallback(async (
+    jobId: string,
     name: string,
     j: ipc.JobFull,
     configRevision: string,
@@ -794,10 +816,8 @@ export function App() {
     stopAutoScan();
     setCompareRepository((repository) => reconcileSavedJobSession(
       repository,
-      name,
-      configRevision,
-      saved.name,
-      saved.config_revision,
+      saved,
+      { jobId, name, configRevision },
     ));
     resetSafetyUi();
     setChips(new Set());
@@ -811,10 +831,8 @@ export function App() {
         });
         setCompareRepository((repository) => reconcileSavedJobSession(
           repository,
-          saved.name,
-          saved.config_revision,
-          restored.name,
-          restored.config_revision,
+          restored,
+          { jobId: saved.job_id, name: saved.name, configRevision: saved.config_revision },
         ));
       } catch (e) {
         await reportMutationFailure(saved.name, 'Could not undo the root swap', e);
@@ -871,10 +889,8 @@ export function App() {
     stopAutoScan();
     setCompareRepository((repository) => reconcileSavedJobSession(
       repository,
-      detail.name,
-      detail.config_revision,
-      saved.name,
-      saved.config_revision,
+      saved,
+      { jobId: detail.job_id, name: detail.name, configRevision: detail.config_revision },
     ));
     resetSafetyUi();
     const undo = async () => {
@@ -885,10 +901,8 @@ export function App() {
         });
         setCompareRepository((repository) => reconcileSavedJobSession(
           repository,
-          saved.name,
-          saved.config_revision,
-          restored.name,
-          restored.config_revision,
+          restored,
+          { jobId: saved.job_id, name: saved.name, configRevision: saved.config_revision },
         ));
       } catch (e) {
         await reportMutationFailure(saved.name, 'Could not undo the exclude', e);
@@ -1170,7 +1184,7 @@ export function App() {
         let v = first;
         try {
           const info = await ipc.inspectPaths(first, '');
-          if (info.source.exists && !info.source.is_dir) {
+          if (info.source.readiness === 'not_directory') {
             const i = Math.max(v.lastIndexOf('\\'), v.lastIndexOf('/'));
             if (i > 0) v = v.slice(0, i);
           }
@@ -1207,47 +1221,68 @@ export function App() {
     return () => { live = false; };
   }, [currentJob, setStatus]);
 
-  const tickRef = useRef<() => void>(() => {});
-  tickRef.current = async () => {
-    if (!currentJob) { stopAutoScan(); return; }
-    const iv = (currentJob.watch_interval_secs ?? 30) * 1000;
-    const left = watchNext.current - Date.now();
-    if (left > 0) {
-      if (!busy) setStatus(`AutoScan — next scan in ${Math.ceil(left / 1000)}s (${currentJob.name})`);
+  autoScanTriggerRef.current = async (trigger) => {
+    const ticket: AutoScanTicket = {
+      generation: trigger.generation,
+      ticketId: trigger.ticket_id,
+      jobId: trigger.job_id,
+      jobName: trigger.job_name,
+      configRevision: trigger.config_revision,
+      targetIndex: trigger.target_index,
+      autoApply: trigger.auto_apply,
+    };
+    const selectedJob = selectionRef.current.job;
+    const selectedHere = selectedJob
+      && selectedJob.job_id === ticket.jobId
+      && selectedJob.config_revision === ticket.configRevision
+      && selectionRef.current.targetIndex === ticket.targetIndex;
+    if (!autoScanEnabled.current || !selectedHere || busy || compareInFlight.current) {
+      try {
+        await ipc.completeAutoScan(ticket.generation, ticket.ticketId, false, null);
+      } catch {
+        // A stop/re-arm consumes the old generation. There is no current failure to surface.
+      }
       return;
     }
-    if (busy || compareInFlight.current || !autoScanEnabled.current) return;
-    watchNext.current = Date.now() + iv;
-    const ticket: AutoScanTicket = {
-      generation: autoScanGeneration.current + 1,
-      jobName: currentJob.name,
-      configRevision: currentJob.config_revision,
-      targetIndex: selTarget,
-      autoApply: currentJob.watch_auto_apply,
-    };
-    autoScanGeneration.current = ticket.generation;
+
     autoScanTicket.current = ticket;
     const completion = await doCompare(ticket);
-    if (!completion) return;
-    const selectedJob = selectionRef.current.job;
-    const currentSelection = selectedJob ? {
-      jobName: selectedJob.name,
-      configRevision: selectedJob.config_revision,
+    const currentJobForResult = selectionRef.current.job;
+    const currentSelection = currentJobForResult ? {
+      jobId: currentJobForResult.job_id,
+      configRevision: currentJobForResult.config_revision,
       targetIndex: selectionRef.current.targetIndex,
     } : null;
-    if (!ownsFreshAutoScanResult(
+    const owned = completion !== null && ownsFreshAutoScanResult(
       autoScanEnabled.current,
       autoScanTicket.current,
       ticket,
       completion.plan.owner,
       currentSelection,
-    )) return;
+    );
+    try {
+      const next = await ipc.completeAutoScan(
+        ticket.generation,
+        ticket.ticketId,
+        owned,
+        owned ? completion.plan.owner : null,
+      );
+      if (autoScanEnabled.current && next.generation === ticket.generation) {
+        setAutoScanStatus(next);
+      }
+    } catch (error) {
+      if (autoScanEnabled.current && autoScanTicket.current?.generation === ticket.generation) {
+        setStatus(`AutoScan could not commit its compare ticket: ${error}`, 'err');
+      }
+      return;
+    }
+    if (!owned || !completion) return;
     autoScanTicket.current = null;
 
     const freshPlan = completion.plan;
     if (freshPlan.ops.length === 0) return;
     if (!ticket.autoApply) {
-      setStatus(`AutoScan found ${freshPlan.ops.length} differences`, 'err');
+      setStatus(`AutoScan found ${freshPlan.ops.length} differences — review required`, 'err');
       return;
     }
 
@@ -1272,12 +1307,17 @@ export function App() {
       return;
     }
 
-    setStatus(`AutoScan found ${selected.length} visible differences — running automatically…`);
+    setStatus(`AutoScan found ${selected.length} visible differences — checking unattended authorization…`);
     setBusy(true);
-    invalidateCompareRevision(ticket.jobName, ticket.configRevision);
+    invalidateCompareRevision(ticket.jobId, ticket.configRevision);
     resetSafetyUi();
     try {
-      const result = await ipc.applyJobUnattended(ticket.jobName, freshPlan, selected, ticket.targetIndex);
+      const result = await ipc.applyJobUnattended(
+        freshPlan.owner.job_name,
+        freshPlan,
+        selected,
+        ticket.targetIndex,
+      );
       refreshLastSyncs();
       setLogReload((value) => value + 1);
       setStatus(
@@ -1287,17 +1327,49 @@ export function App() {
         result.errors ? 'err' : 'ok',
       );
     } catch (e) {
-      setStatus(`Auto-sync failed: ${e}`, 'err');
+      setStatus(`Auto-sync needs review or failed safely: ${e}`, 'err');
     } finally {
       setBusy(false);
     }
   };
 
   useEffect(() => {
-    if (watchSecs === null) return;
-    const id = window.setInterval(() => tickRef.current(), 1000);
-    return () => window.clearInterval(id);
-  }, [watchSecs]);
+    let disposed = false;
+    const removers: Array<() => void> = [];
+    void ipc.autoScanStatus().then((next) => {
+      if (disposed) return;
+      autoScanEnabled.current = next.active;
+      setAutoScanStatus(next);
+    }).catch((error) => {
+      if (!disposed) setStatus(`AutoScan status is unavailable: ${error}`, 'err');
+    });
+    void listen<ipc.AutoScanStatusDto>('autoscan-status', ({ payload }) => {
+      if (disposed) return;
+      autoScanEnabled.current = payload.active;
+      setAutoScanStatus((current) => {
+        if (current?.generation === payload.generation
+          && current.mode !== 'starting'
+          && payload.mode === 'starting') return current;
+        return payload;
+      });
+      if (payload.active) setStatus(`AutoScan: ${payload.detail}`);
+    }).then((remove) => {
+      if (disposed) remove(); else removers.push(remove);
+    }).catch((error) => {
+      if (!disposed) setStatus(`AutoScan status subscription failed: ${error}`, 'err');
+    });
+    void listen<ipc.AutoScanTriggerDto>('autoscan-trigger', ({ payload }) => {
+      if (!disposed) void autoScanTriggerRef.current(payload);
+    }).then((remove) => {
+      if (disposed) remove(); else removers.push(remove);
+    }).catch((error) => {
+      if (!disposed) setStatus(`AutoScan trigger subscription failed: ${error}`, 'err');
+    });
+    return () => {
+      disposed = true;
+      for (const remove of removers) remove();
+    };
+  }, [setStatus]);
 
   // Keyboard.
   //
@@ -1349,7 +1421,7 @@ export function App() {
       <div className="app">
         <Sidebar
           jobs={jobs}
-          currentName={currentJob?.name ?? null}
+          currentJobId={currentJob?.job_id ?? null}
           lastMap={lastMap}
           busy={busy}
           appVersion={appVersion}
@@ -1367,19 +1439,37 @@ export function App() {
             busy={busy}
             canSync={final.length > 0}
             watchSecs={watchSecs}
+            watchMode={autoScanStatus?.active ? (autoScanStatus.mode ?? null) : null}
             onCompare={() => void doCompare()}
             onSync={() => void openConfirm()}
             onToggleLog={() => setLogOpen((v) => !v)}
             onToggleWatch={() => {
               if (watchSecs !== null) { stopAutoScan(); setStatus('AutoScan stopped'); return; }
               if (!currentJob) return;
-              const iv = currentJob.watch_interval_secs ?? 30;
+              const request = autoScanControlRequest.current + 1;
+              autoScanControlRequest.current = request;
               autoScanEnabled.current = true;
               autoScanTicket.current = null;
-              autoScanGeneration.current += 1;
-              watchNext.current = Date.now() + iv * 1000;
-              setWatchSecs(iv);
-              setStatus(`AutoScan on: compare every ${iv}s (the hash cache means an unchanged tree costs only the walk)${currentJob.watch_auto_apply ? ' · auto-run' : ''}`);
+              setStatus(`Starting AutoScan for '${currentJob.name}'…`);
+              void ipc.startAutoScan(
+                currentJob.name,
+                currentJob.job_id,
+                currentJob.config_revision,
+                selTarget,
+              ).then((next) => {
+                if (autoScanControlRequest.current !== request) {
+                  void ipc.stopAutoScan();
+                  return;
+                }
+                autoScanEnabled.current = next.active;
+                setAutoScanStatus(next);
+                setStatus(`AutoScan: ${next.detail}${next.auto_apply ? ' · unattended apply requires an exact prior grant' : ''}`);
+              }).catch((error) => {
+                if (autoScanControlRequest.current !== request) return;
+                autoScanEnabled.current = false;
+                setAutoScanStatus(null);
+                setStatus(`AutoScan could not start: ${error}`, 'err');
+              });
             }}
           />
           <PathLine
@@ -1417,7 +1507,7 @@ export function App() {
               chips={chips}
               onChips={setChips}
               onSearch={setSearch}
-              searchKey={currentJob?.name ?? ''}
+              searchKey={currentJob?.job_id ?? ''}
               funnelCount={funnelActive(vfilter)}
               funnelOpen={!!funnelAnchor}
               sameOpen={sameOpen}
@@ -1508,7 +1598,7 @@ export function App() {
                   sort={sort}
                   collapsedDirs={collapsedDirs}
                   wrap={tableWrap}
-                  resetKey={`${currentJob?.name}|${search}|${[...chips].join()}|${ovFilter}|${sort?.key}${sort?.dir}|${grouped}`}
+                  resetKey={`${currentJob?.job_id}|${search}|${[...chips].join()}|${ovFilter}|${sort?.key}${sort?.dir}|${grouped}`}
                   onToggleRow={toggleRow}
                   onToggleMany={toggleMany}
                   onFlip={flipRow}
@@ -1593,57 +1683,61 @@ export function App() {
           apiRef={editorApi}
           busy={busy}
           onClose={() => setEditor(null)}
-          onSaved={async (name, job, configRevision, original) => {
-            const originalName = original?.name ?? null;
-            const renamed = originalName !== null && originalName !== name;
-            const renamedSelected = renamed && currentJob?.name === originalName;
+          onSaved={async (saved, job, original) => {
+            const selectedIdentity = !!original && currentJob?.job_id === original.jobId;
+            const semanticMutation = !!original
+              && saved.config_revision !== original.configRevision;
+            const preserveRuntime = !!original
+              && !semanticMutation
+              && (saved.effect === 'renamed' || saved.effect === 'updated' || saved.effect === 'no_op');
             setEditor(null);
-            stopAutoScan();
-            const effectiveMutation = !!original
-              && (original.name !== name || original.configRevision !== configRevision);
-            if (original && effectiveMutation) {
+            if (original) {
               setCompareRepository((repository) => reconcileSavedJobSession(
                 repository,
-                original.name,
-                original.configRevision,
-                name,
-                configRevision,
+                saved,
+                original,
               ));
-              resetSafetyUi();
             }
-            if (renamedSelected) {
-              setCurrentJob(null);
-              setSelTarget(0);
-              resetNavigationUi();
+            if (original && !preserveRuntime) {
+              stopAutoScan();
+              resetSafetyUi();
             }
             pushHistory(job.source);
             pushHistory(job.target);
             try {
-              const list = await refreshJobs(!renamed && currentJob?.name === name ? name : undefined);
-              if (renamedSelected) setCurrentJob(list.find((candidate) => candidate.name === name) ?? null);
-              if (currentJob?.name === name || renamedSelected) setCfgJob(job);
-              setStatus(`Saved '${name}'`, 'ok');
+              await refreshJobs(selectedIdentity ? original?.name : undefined);
+              if (selectedIdentity) setCfgJob(job);
+              setStatus(
+                saved.effect === 'no_op' ? `No changes to save for '${saved.name}'` : `Saved '${saved.name}'`,
+                'ok',
+              );
             } catch (e) {
-              setStatus(`Saved '${name}', but refreshing the job list failed: ${e}`, 'err');
+              setStatus(`Saved '${saved.name}', but refreshing the job list failed: ${e}`, 'err');
             }
           }}
-          onDeleted={async (name) => {
+          onDeleted={async (deleted) => {
             setEditor(null);
-            invalidateCompareJob(name);
+            invalidateCompareJob(deleted.job_id);
             resetSafetyUi();
-            if (currentJob?.name === name) { setCurrentJob(null); setSelTarget(0); }
+            if (currentJob?.job_id === deleted.job_id) {
+              stopAutoScan();
+              setCurrentJob(null);
+              setSelTarget(0);
+            }
             try {
               await refreshJobs();
-              setStatus(`Deleted '${name}'`);
+              setStatus(`Deleted '${deleted.name}'`);
             } catch (e) {
-              setStatus(`Deleted '${name}', but refreshing the job list failed: ${e}`, 'err');
+              setStatus(`Deleted '${deleted.name}', but refreshing the job list failed: ${e}`, 'err');
             }
           }}
-          onMutationConflict={async (name) => {
+          onMutationConflict={async (name, original) => {
             const list = await refreshJobs(name);
-            const refreshed = list.find((candidate) => candidate.name === name) ?? null;
-            setCompareRepository((repository) => reconcileRefreshedJobSession(repository, name, refreshed));
-            if (currentJob?.name === name && currentJob.config_revision !== refreshed?.config_revision) {
+            if (!original) return;
+            const refreshed = list.find((candidate) => candidate.job_id === original.jobId) ?? null;
+            setCompareRepository((repository) => reconcileRefreshedJobSession(repository, original, refreshed));
+            if (currentJob?.job_id === original.jobId
+              && (!refreshed || currentJob.config_revision !== refreshed.config_revision)) {
               stopAutoScan();
               resetNavigationUi();
             }
@@ -1672,6 +1766,7 @@ export function App() {
           actions={[{
             label: 'Swap them',
             onConfirm: () => void doSwap(
+              askSwap.jobId,
               askSwap.name,
               askSwap.job,
               askSwap.configRevision,

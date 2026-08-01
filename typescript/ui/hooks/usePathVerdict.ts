@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { endpointInputState } from '../../core/endpoint-readiness';
 import { inspectPaths } from '../../core/ipc';
 import type { PathInfo } from '../../core/types/generated/PathInfo';
 import type { PathVerdict } from '../../core/types/generated/PathVerdict';
@@ -26,7 +27,5 @@ export function usePathVerdict(source: string, target: string, enabled = true): 
 
 /// '' | 'good' | 'bad' for a root input, from the verdict for that side
 export function pathState(info: PathInfo | undefined, value: string): string {
-  if (!info) return '';
-  if (info.is_dir) return 'good';
-  return value.trim() ? 'bad' : '';
+  return endpointInputState(info, value);
 }

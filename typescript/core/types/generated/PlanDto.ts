@@ -4,14 +4,14 @@ import type { Op } from "./Op";
 import type { PlanHeader } from "./PlanHeader";
 import type { RowMeta } from "./RowMeta";
 
-export type PlanDto = { header: PlanHeader, ops: Array<Op>, 
+export type PlanDto = { header: PlanHeader, ops: Array<Op>,
 /**
  * One entry per op: the size/mtime measured on both sides at compare time (for the table columns and sorting).
  * Copy rows already carry their sole side's size/mtime in `Op`, so their entry is null and the
  * frontend reconstructs it. This matters at six figures: two nested JSON objects per copy row
  * otherwise account for most of WebKit's retained allocations.
  */
-metas: Array<RowMeta | null>, 
+metas: Array<RowMeta | null>,
 /**
  * Count/bytes of the files judged equal on both sides (the denominator of "showing X of Y")
  */

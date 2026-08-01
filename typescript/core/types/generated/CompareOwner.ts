@@ -6,4 +6,9 @@
  * The frontend carries this value with the plan. Commands that read cached evidence or can write
  * files require an exact match, so changing selection cannot silently reinterpret an old plan.
  */
-export type CompareOwner = { compare_id: number, job_name: string, target_index: number, config_revision: string, };
+export type CompareOwner = { compare_id: number,
+/**
+ * Stable registry identity. `job_name` is only the current display/lookup label and may change
+ * while this comparison remains valid.
+ */
+job_id: string, job_name: string, target_index: number, config_revision: string, };

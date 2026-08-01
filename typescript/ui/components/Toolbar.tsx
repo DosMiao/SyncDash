@@ -10,6 +10,7 @@ import { humanSize } from '../../core/format';
 import { MARK } from '../icons';
 import type { ReactNode } from 'react';
 import type { JobDto } from '../../core/types/generated/JobDto';
+import type { AutoScanMode } from '../../core/ipc';
 
 export interface PlanStats {
   copy: number;
@@ -32,6 +33,7 @@ interface Props {
   /// Seconds between scheduled scans while AutoScan is on, null when it is off. The job field behind
   /// it is still `watch_interval_secs` — AutoScan is what this control is called on screen.
   watchSecs: number | null;
+  watchMode: AutoScanMode | null;
   onCompare: () => void;
   onSync: () => void;
   onToggleLog: () => void;
@@ -50,7 +52,7 @@ function Seg({ cls, icon, n, title }: { cls?: string; icon: ReactNode; n: number
 }
 
 export function Toolbar(props: Props) {
-  const { job, hasPlan, finalCount, stats, busy, canSync, watchSecs, onCompare, onSync, onToggleLog, onToggleWatch } = props;
+  const { job, hasPlan, finalCount, stats, busy, canSync, watchSecs, watchMode, onCompare, onSync, onToggleLog, onToggleWatch } = props;
 
   // An unknown tier shows just its name, with no dangling "·" (the rigor ladder will gain tiers later)
   const rh = job ? RIGOR_HINT[job.rigor] : undefined;
@@ -111,7 +113,13 @@ export function Toolbar(props: Props) {
             keeps working after you look away, so it should be legible from across the room */}
         <button
           className={'btn' + (watchSecs !== null ? ' on-solid' : '')}
-          title="Compare automatically on the job's scan interval"
+          title={watchSecs === null
+            ? "Compare automatically while SyncDash is open"
+            : watchMode === 'native_fsevents'
+              ? 'Watching both local roots with FSEvents, with periodic full verification'
+              : watchMode === 'polling'
+                ? 'Polling on the configured interval while SyncDash is open'
+                : 'Preparing backend-owned change detection'}
           disabled={!job}
           onClick={onToggleWatch}
         >

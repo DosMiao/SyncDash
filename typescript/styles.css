@@ -604,8 +604,9 @@ tr.flip .act-dir { outline: 1px dashed currentColor; outline-offset: 1px; border
 
 .pwarn { display: flex; flex-direction: column; gap: 2px; font-size: var(--fs-sm); padding-left: 2px; }
 /* The icon sits on the text's line rather than above it — these are one-line remarks, not headings */
-.vwarn, .vok { display: flex; align-items: center; gap: 4px; }
+.vwarn, .vnote, .vok { display: flex; align-items: center; gap: 4px; }
 .vwarn { color: var(--c-orange); }
+.vnote { color: var(--text-2); }
 .vok { color: var(--c-green); }
 
 /* Fixed cap, not a %: inside the path grid a percentage would feed back into the track sizing

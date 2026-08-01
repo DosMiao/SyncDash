@@ -3,6 +3,7 @@
 //! Each one is thin: validate, call the library, project into a DTO. Anything longer than that
 //! belongs in `syncdash`, where the CLI can reach it too.
 
+pub mod autoscan;
 pub mod edit;
 pub mod jobs;
 pub mod logs;

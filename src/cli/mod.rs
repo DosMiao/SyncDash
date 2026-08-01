@@ -35,8 +35,10 @@ fn detach_console() {
     }
 }
 
-
-pub(crate) fn write_out<F: Fn(&mut dyn std::io::Write) -> std::io::Result<()>>(out: &Option<PathBuf>, f: F) -> std::io::Result<()> {
+pub(crate) fn write_out<F: Fn(&mut dyn std::io::Write) -> std::io::Result<()>>(
+    out: &Option<PathBuf>,
+    f: F,
+) -> std::io::Result<()> {
     match out {
         Some(p) => {
             let file = std::fs::File::create(p)?;
@@ -54,7 +56,11 @@ pub(crate) fn write_out<F: Fn(&mut dyn std::io::Write) -> std::io::Result<()>>(o
 /// v0.9 M5: with egui retired, GUI = the Tauri desktop app. Look for syncdash-desktop next to this binary and launch it;
 /// if it isn't there, say plainly where to get it instead of exiting silently.
 fn launch_desktop() -> std::io::Result<i32> {
-    let exe_name = if cfg!(windows) { "syncdash-desktop.exe" } else { "syncdash-desktop" };
+    let exe_name = if cfg!(windows) {
+        "syncdash-desktop.exe"
+    } else {
+        "syncdash-desktop"
+    };
     let cand = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join(exe_name)));
@@ -97,9 +103,13 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             Ok(0)
         }
         Cmd::Jobs => {
-            let jobs = job::load_all();
+            let jobs = job::load_all()?;
             if jobs.is_empty() {
-                println!("no jobs in {}\n\nsample job file:\n{}", syncdash::foundation::dirs::jobs_dir().display(), job::SAMPLE);
+                println!(
+                    "no jobs in {}\n\nsample job file:\n{}",
+                    syncdash::foundation::dirs::jobs_dir().display(),
+                    job::SAMPLE
+                );
             } else {
                 for (name, j) in jobs {
                     println!("{:<24} {:<7} {}  ->  {}", name, j.mode, j.source, j.target);
@@ -107,9 +117,20 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Run { job, all, prefix, apply: do_apply, i_know, accept_caps, verbose, watch, interval, auto_apply } => {
+        Cmd::Run {
+            job,
+            all,
+            prefix,
+            apply: do_apply,
+            i_know,
+            accept_caps,
+            verbose,
+            watch,
+            interval,
+            auto_apply,
+        } => {
             let list: Vec<(String, job::Job)> = if all || prefix.is_some() {
-                job::load_all()
+                job::load_all()?
                     .into_iter()
                     .filter(|(n, _)| prefix.as_deref().map(|p| n.starts_with(p)).unwrap_or(true))
                     .collect()
@@ -137,7 +158,9 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                         let res = run::run_job(name, j, auto, verbose, i_know, accept_caps);
                         match res {
                             Ok((d, _s, e, c)) if d + e + c > 0 => {
-                                eprintln!("[{name}] watch: {d} done, {e} error(s), {c} conflict(s)");
+                                eprintln!(
+                                    "[{name}] watch: {d} done, {e} error(s), {c} conflict(s)"
+                                );
                             }
                             Ok(_) => {}
                             Err(err) => eprintln!("[{name}] watch error: {err}"),
@@ -182,9 +205,15 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
         Cmd::Junk { patterns } => {
             match patterns {
                 Some(ids) => {
-                    let ids: Vec<&str> = ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                    let ids: Vec<&str> = ids
+                        .iter()
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .collect();
                     if let Some(bad) = ids.iter().find(|id| junk::junk_preset(id).is_none()) {
-                        eprintln!("error: unknown junk preset '{bad}' — run `syncdash junk` for the list");
+                        eprintln!(
+                            "error: unknown junk preset '{bad}' — run `syncdash junk` for the list"
+                        );
                         return Ok(2);
                     }
                     for p in junk::expand_junk_presets(&ids) {
@@ -194,7 +223,16 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 None => {
                     println!("Junk presets — each one is a macro over a job's `exclude` list, nothing more:\n");
                     for p in junk::JUNK_PRESETS {
-                        println!("{}{}  ({})", p.id, if p.default_on { " [on for new jobs]" } else { "" }, p.label);
+                        println!(
+                            "{}{}  ({})",
+                            p.id,
+                            if p.default_on {
+                                " [on for new jobs]"
+                            } else {
+                                ""
+                            },
+                            p.label
+                        );
                         println!("  {}", p.hint);
                         println!("  {}\n", p.patterns.join("  "));
                     }
@@ -204,17 +242,38 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Scan { root, out, no_hash, rigor, evidence, cache, force_rehash, fast, symlinks_direct, junk, include, exclude, progress } => {
+        Cmd::Scan {
+            root,
+            out,
+            no_hash,
+            rigor,
+            evidence,
+            cache,
+            force_rehash,
+            fast,
+            symlinks_direct,
+            junk,
+            include,
+            exclude,
+            progress,
+        } => {
             if !root.is_dir() {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
             }
             // An unknown preset id is an error, never a silent no-op: a scan that quietly excluded less
             // than asked is exactly the kind of near-miss that only shows up as a surprise in a plan
-            let ids: Vec<&str> = junk.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none")).collect();
+            let ids: Vec<&str> = junk
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+                .collect();
             if let Some(bad) = ids.iter().find(|id| junk::junk_preset(id).is_none()) {
                 let known: Vec<&str> = junk::JUNK_PRESETS.iter().map(|p| p.id).collect();
-                eprintln!("error: unknown junk preset '{bad}' (known: {}, or `none`)", known.join(", "));
+                eprintln!(
+                    "error: unknown junk preset '{bad}' (known: {}, or `none`)",
+                    known.join(", ")
+                );
                 return Ok(2);
             }
             let mut excludes = junk::expand_junk_presets(&ids);
@@ -246,7 +305,11 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             };
             let bar = |p: scan::ScanProgress| {
                 let ratio = |done: u64, total: u64| -> u64 {
-                    if total == 0 { 0 } else { ((done.min(total) as u128 * 100) / total as u128) as u64 }
+                    if total == 0 {
+                        0
+                    } else {
+                        ((done.min(total) as u128 * 100) / total as u128) as u64
+                    }
                 };
                 let file_pct = ratio(p.files_done, p.files_total);
                 let byte_pct = ratio(p.bytes_done, p.bytes_total);
@@ -262,10 +325,15 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 } else {
                     format!("{}/{} files", p.files_done, p.files_total)
                 };
-                eprint!("\r{} {:>3}%  {}  {}/{}  {:.1} MiB/s   ", p.phase, pct,
+                eprint!(
+                    "\r{} {:>3}%  {}  {}/{}  {:.1} MiB/s   ",
+                    p.phase,
+                    pct,
                     files,
                     syncdash::foundation::fmt::human_bytes(p.bytes_done),
-                    syncdash::foundation::fmt::human_bytes(p.bytes_total), p.mib_per_s);
+                    syncdash::foundation::fmt::human_bytes(p.bytes_total),
+                    p.mib_per_s
+                );
             };
             let snap = if progress {
                 let r = scan::scan_with_progress(&root, &sopt, Some(&bar))?;
@@ -281,7 +349,15 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             write_out(&out, |w| snap.write_to(w))?;
             Ok(0)
         }
-        Cmd::Compare { source, target, mode, archive, resolve_newer, case_sensitive, out } => {
+        Cmd::Compare {
+            source,
+            target,
+            mode,
+            archive,
+            resolve_newer,
+            case_sensitive,
+            out,
+        } => {
             let s = table::Snapshot::load(&source)?;
             let t = table::Snapshot::load(&target)?;
             let a = match &archive {
@@ -293,10 +369,23 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 Mode::Sync => "sync",
                 Mode::Enrich => "enrich",
             };
-            let plan = compare::compare(&s, &t, mode_str, a.as_ref(), resolve_newer, &compare::CompareOptions { case_insensitive: !case_sensitive, ..Default::default() });
+            let plan = compare::compare(
+                &s,
+                &t,
+                mode_str,
+                a.as_ref(),
+                resolve_newer,
+                &compare::CompareOptions {
+                    case_insensitive: !case_sensitive,
+                    ..Default::default()
+                },
+            );
             eprintln!(
                 "plan: {} op(s), {} conflict(s)  [{} -> {}]",
-                plan.header.op_count, plan.header.conflict_count, plan.header.source_root, plan.header.target_root
+                plan.header.op_count,
+                plan.header.conflict_count,
+                plan.header.source_root,
+                plan.header.target_root
             );
             write_out(&out, |w| plan.write_to(w))?;
             Ok(if plan.header.conflict_count > 0 { 1 } else { 0 })
@@ -313,7 +402,17 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::GenJobs { root, target_root, mode, rigor, remote_host, remote_root_base, remote_exe, junk, force } => {
+        Cmd::GenJobs {
+            root,
+            target_root,
+            mode,
+            rigor,
+            remote_host,
+            remote_root_base,
+            remote_exe,
+            junk,
+            force,
+        } => {
             let remote = remote_host.map(|h| territory::RemoteGen {
                 host: h,
                 root_base: remote_root_base.unwrap_or_default(),
@@ -328,14 +427,32 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 .collect();
             if let Some(bad) = ids.iter().find(|id| junk::junk_preset(id).is_none()) {
                 let known: Vec<&str> = junk::JUNK_PRESETS.iter().map(|p| p.id).collect();
-                eprintln!("error: unknown junk preset '{bad}' (known: {}, or `none`)", known.join(", "));
+                eprintln!(
+                    "error: unknown junk preset '{bad}' (known: {}, or `none`)",
+                    known.join(", ")
+                );
                 return Ok(2);
             }
             let n_pat = junk::expand_junk_presets(&ids).len();
-            let opts = territory::GenOpts { mode, rigor, junk: ids.clone(), force, ..Default::default() };
+            let opts = territory::GenOpts {
+                mode,
+                rigor,
+                junk: ids.clone(),
+                force,
+                ..Default::default()
+            };
             let outs = territory::gen_jobs(&root, &target_root, &opts, remote.as_ref())?;
             for o in &outs {
-                println!("{:<44} <- {}{}", o.name, o.territory, if o.written { "" } else { "   [kept — already exists]" });
+                println!(
+                    "{:<44} <- {}{}",
+                    o.name,
+                    o.territory,
+                    if o.written {
+                        ""
+                    } else {
+                        "   [kept — already exists]"
+                    }
+                );
             }
             let written = outs.iter().filter(|o| o.written).count();
             let kept = outs.len() - written;
@@ -350,11 +467,21 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Pack { plan, out, source_root } => {
+        Cmd::Pack {
+            plan,
+            out,
+            source_root,
+        } => {
             let p = syncdash::model::plan::Plan::load(&plan)?;
             let sr = source_root.unwrap_or_else(|| PathBuf::from(&p.header.source_root));
             let s = pack::pack(&p, &sr, &out, None)?;
-            println!("packed: {} op(s), {} payload file(s), {} bytes -> {}", s.ops, s.files, s.bytes, out.display());
+            println!(
+                "packed: {} op(s), {} payload file(s), {} bytes -> {}",
+                s.ops,
+                s.files,
+                s.bytes,
+                out.display()
+            );
             Ok(0)
         }
         Cmd::Recv { path } => {
@@ -387,24 +514,49 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
             let list = syncdash::store::version::list(&root)?;
             if list.is_empty() {
-                println!("no versions under {}", root.join(syncdash::foundation::names::VERSION_STORE_DIR).display());
+                println!(
+                    "no versions under {}",
+                    root.join(syncdash::foundation::names::VERSION_STORE_DIR)
+                        .display()
+                );
             } else {
                 for v in &list {
-                    println!("{}  {}  ops={} preserved={} bytes={}", v.id, v.host, v.ops, v.preserved, v.bytes);
+                    println!(
+                        "{}  {}  ops={} preserved={} bytes={}",
+                        v.id, v.host, v.ops, v.preserved, v.bytes
+                    );
                 }
             }
             Ok(0)
         }
-        Cmd::Restore { root, version, files, apply: do_apply } => {
-            let (restored, skipped, errors) = syncdash::store::version::restore(&root, &version, &files, !do_apply)?;
+        Cmd::Restore {
+            root,
+            version,
+            files,
+            apply: do_apply,
+        } => {
+            let (restored, skipped, errors) =
+                syncdash::store::version::restore(&root, &version, &files, !do_apply)?;
             println!(
                 "{}: {restored} restored, {skipped} skipped, {errors} error(s)",
-                if do_apply { "restore" } else { "dry-run (rerun with --apply)" }
+                if do_apply {
+                    "restore"
+                } else {
+                    "dry-run (rerun with --apply)"
+                }
             );
             Ok(if errors > 0 { 1 } else { 0 })
         }
-        Cmd::ApplyPack { pkg, target_root, apply: do_apply, remove_pkg, versioning, verbose } => {
-            let (done, skipped, errors) = pack::apply_pack(&pkg, target_root.as_deref(), do_apply, verbose, versioning)?;
+        Cmd::ApplyPack {
+            pkg,
+            target_root,
+            apply: do_apply,
+            remove_pkg,
+            versioning,
+            verbose,
+        } => {
+            let (done, skipped, errors) =
+                pack::apply_pack(&pkg, target_root.as_deref(), do_apply, verbose, versioning)?;
             println!(
                 "{}: {done} done, {skipped} skipped, {errors} error(s)",
                 if do_apply { "applied" } else { "dry-run" }
@@ -415,7 +567,8 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             Ok(if errors > 0 { 1 } else { 0 })
         }
         Cmd::Mark { root, job, note } => {
-            let (path, created) = syncdash::pipeline::guard::marker::write_marker(&root, &job, &note)?;
+            let (path, created) =
+                syncdash::pipeline::guard::marker::write_marker(&root, &job, &note)?;
             if created {
                 println!("marked: {}", path.display());
             } else {
@@ -423,10 +576,13 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 println!(
                     "already marked: {}{}",
                     path.display(),
-                    m.map(|m| format!("  (job '{}', by {} )", m.job, m.host)).unwrap_or_default()
+                    m.map(|m| format!("  (job '{}', by {} )", m.job, m.host))
+                        .unwrap_or_default()
                 );
             }
-            println!("set `require_marker = true` in the job to have syncdash refuse to run without it");
+            println!(
+                "set `require_marker = true` in the job to have syncdash refuse to run without it"
+            );
             Ok(0)
         }
         Cmd::Caps { phrase } => match run::describe_root(&phrase) {
@@ -445,7 +601,9 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             match cmd {
                 CredCmd::Set { phrase, stdin } => {
                     let RootSpec::Remote(r) = parse(&phrase) else {
-                        eprintln!("not a remote phrase: {phrase} (expected scheme://user@host/...)");
+                        eprintln!(
+                            "not a remote phrase: {phrase} (expected scheme://user@host/...)"
+                        );
                         return Ok(2);
                     };
                     let Some(acc) = cred::account_for(&r) else {
@@ -496,7 +654,8 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     Ok(0)
                 }
                 CredCmd::Test { phrase } => {
-                    let v = syncdash::fs::vfs::open(&phrase, &cred::default_provider()).map_err(std::io::Error::from)?;
+                    let v = syncdash::fs::vfs::open(&phrase, &cred::default_provider())
+                        .map_err(std::io::Error::from)?;
                     match v.connect() {
                         Ok(()) => {
                             println!("connected: {}", v.display());
@@ -519,7 +678,11 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             }
         }
         Cmd::Logs { cmd } => run_logs(cmd),
-        Cmd::History { job, limit, prune_days } => {
+        Cmd::History {
+            job,
+            limit,
+            prune_days,
+        } => {
             if let Some(days) = prune_days {
                 // 0 = don't stack the total-size gate: the meaning of `--prune-days N` is exactly "by days only"
                 let n = syncdash::obs::runlog::prune(days, 0);
@@ -561,11 +724,19 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 TrashCmd::Runs => {
                     let runs = syncdash::store::trash::list_runs();
                     if runs.is_empty() {
-                        println!("no trash runs under {}", syncdash::store::trash::trash_root().display());
+                        println!(
+                            "no trash runs under {}",
+                            syncdash::store::trash::trash_root().display()
+                        );
                     }
                     let mut total = 0u64;
                     for r in &runs {
-                        println!("{:<16} {:>7} files  {:>10}", r.id, r.files, human_bytes(r.bytes));
+                        println!(
+                            "{:<16} {:>7} files  {:>10}",
+                            r.id,
+                            r.files,
+                            human_bytes(r.bytes)
+                        );
                         total += r.bytes;
                     }
                     if !runs.is_empty() {
@@ -581,15 +752,34 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     println!("{} version(s)", hits.len());
                     Ok(0)
                 }
-                TrashCmd::Restore { pattern, into, run, apply: do_apply } => {
-                    let (r, s, e) = syncdash::store::trash::restore(&pattern, run.as_deref(), &into, !do_apply)?;
+                TrashCmd::Restore {
+                    pattern,
+                    into,
+                    run,
+                    apply: do_apply,
+                } => {
+                    let (r, s, e) = syncdash::store::trash::restore(
+                        &pattern,
+                        run.as_deref(),
+                        &into,
+                        !do_apply,
+                    )?;
                     println!(
                         "{}: {r} restored, {s} skipped, {e} error(s)",
-                        if do_apply { "restore" } else { "dry-run (rerun with --apply)" }
+                        if do_apply {
+                            "restore"
+                        } else {
+                            "dry-run (rerun with --apply)"
+                        }
                     );
                     Ok(if e > 0 { 1 } else { 0 })
                 }
-                TrashCmd::Prune { keep_days, max_gib, no_staggered, apply: do_apply } => {
+                TrashCmd::Prune {
+                    keep_days,
+                    max_gib,
+                    no_staggered,
+                    apply: do_apply,
+                } => {
                     let ret = syncdash::store::trash::Retention {
                         keep_days,
                         max_bytes: max_gib * 1024 * 1024 * 1024,
@@ -598,14 +788,29 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     let (n, freed) = syncdash::store::trash::prune(&ret, !do_apply)?;
                     println!(
                         "{}: {n} run(s), {} freed",
-                        if do_apply { "pruned" } else { "dry-run (rerun with --apply)" },
+                        if do_apply {
+                            "pruned"
+                        } else {
+                            "dry-run (rerun with --apply)"
+                        },
                         human_bytes(freed)
                     );
                     Ok(0)
                 }
             }
         }
-        Cmd::Apply { plan, apply: do_apply, source_root, target_root, trash, verify, versioning, delta, no_fsync, verbose } => {
+        Cmd::Apply {
+            plan,
+            apply: do_apply,
+            source_root,
+            target_root,
+            trash,
+            verify,
+            versioning,
+            delta,
+            no_fsync,
+            verbose,
+        } => {
             let p = syncdash::model::plan::Plan::load(&plan)?;
             let sr = source_root.unwrap_or_else(|| PathBuf::from(&p.header.source_root));
             let tr = target_root.unwrap_or_else(|| PathBuf::from(&p.header.target_root));
@@ -615,11 +820,29 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     return Ok(2);
                 }
             }
-            let (done, skipped, errors) = apply::apply(&p.ops, &sr, &tr, &apply::ApplyOptions { dry_run: !do_apply, trash, verbose, verify, versioning, delta, fsync: !no_fsync, ..Default::default() });
+            let (done, skipped, errors) = apply::apply(
+                &p.ops,
+                &sr,
+                &tr,
+                &apply::ApplyOptions {
+                    dry_run: !do_apply,
+                    trash,
+                    verbose,
+                    verify,
+                    versioning,
+                    delta,
+                    fsync: !no_fsync,
+                    ..Default::default()
+                },
+            );
             println!(
                 "{}: {done} done, {skipped} {}, {errors} error(s)",
                 if do_apply { "applied" } else { "dry-run" },
-                if do_apply { "skipped" } else { "pending (rerun with --apply)" },
+                if do_apply {
+                    "skipped"
+                } else {
+                    "pending (rerun with --apply)"
+                },
             );
             Ok(if errors > 0 { 1 } else { 0 })
         }

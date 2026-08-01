@@ -33,22 +33,22 @@ pub(crate) struct CachedCompare {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResultKey {
-    job_name: String,
+    job_id: String,
     target_index: usize,
     config_revision: String,
 }
 
 impl ResultKey {
-    pub(crate) fn new(job_name: &str, target_index: usize, config_revision: &str) -> Self {
+    pub(crate) fn new(job_id: &str, target_index: usize, config_revision: &str) -> Self {
         Self {
-            job_name: job_name.to_string(),
+            job_id: job_id.to_string(),
             target_index,
             config_revision: config_revision.to_string(),
         }
     }
 
     fn from_owner(owner: &CompareOwner) -> Self {
-        Self::new(&owner.job_name, owner.target_index, &owner.config_revision)
+        Self::new(&owner.job_id, owner.target_index, &owner.config_revision)
     }
 }
 
@@ -59,7 +59,10 @@ pub(crate) struct ResultStore {
 
 impl Default for ResultStore {
     fn default() -> Self {
-        Self { entries: VecDeque::new(), capacity: RESULT_REPOSITORY_CAPACITY }
+        Self {
+            entries: VecDeque::new(),
+            capacity: RESULT_REPOSITORY_CAPACITY,
+        }
     }
 }
 
@@ -67,7 +70,10 @@ impl ResultStore {
     #[cfg(test)]
     fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0);
-        Self { entries: VecDeque::new(), capacity }
+        Self {
+            entries: VecDeque::new(),
+            capacity,
+        }
     }
 
     pub(crate) fn insert(&mut self, cached: CachedCompare) {
@@ -82,22 +88,36 @@ impl ResultStore {
     pub(crate) fn get(&mut self, key: &ResultKey) -> Option<&CachedCompare> {
         let index = self.position(key)?;
         if index != 0 {
-            let cached = self.entries.remove(index).expect("a located compare result must exist");
+            let cached = self
+                .entries
+                .remove(index)
+                .expect("a located compare result must exist");
             self.entries.push_front(cached);
         }
         self.entries.front()
     }
 
-    pub(crate) fn invalidate_revision(&mut self, job_name: &str, config_revision: &str) {
+    pub(crate) fn invalidate_revision(&mut self, job_id: &str, config_revision: &str) {
         self.entries.retain(|cached| {
             let owner = &cached.provenance.owner;
-            owner.job_name != job_name || owner.config_revision != config_revision
+            owner.job_id != job_id || owner.config_revision != config_revision
         });
     }
 
-    pub(crate) fn invalidate_job(&mut self, job_name: &str) {
+    pub(crate) fn invalidate_job(&mut self, job_id: &str) {
         self.entries
-            .retain(|cached| cached.provenance.owner.job_name != job_name);
+            .retain(|cached| cached.provenance.owner.job_id != job_id);
+    }
+
+    /// A rename changes only the human label. Keep authenticated evidence and update both copies of
+    /// the owner carried by each cached result so restored plans immediately show the current name.
+    pub(crate) fn rebind_job_name(&mut self, job_id: &str, job_name: &str) {
+        for cached in &mut self.entries {
+            if cached.provenance.owner.job_id == job_id {
+                cached.provenance.owner.job_name = job_name.to_string();
+                cached.plan.owner.job_name = job_name.to_string();
+            }
+        }
     }
 
     fn position(&self, key: &ResultKey) -> Option<usize> {
@@ -138,7 +158,9 @@ pub(crate) fn reserve_progress_launch(st: &RunState) -> Result<u64, String> {
         return Err("The progress window is closing — wait a moment and try again".into());
     }
     if st.active.lock().unwrap().is_some() {
-        return Err("Another run is already in progress — cancel it or wait for it to finish".into());
+        return Err(
+            "Another run is already in progress — cancel it or wait for it to finish".into(),
+        );
     }
     let mut pending = st.pending_launch.lock().unwrap();
     if pending.is_some() {
@@ -189,18 +211,25 @@ pub(crate) fn begin_run_for_launch(
     let _gate = st.gate.lock().unwrap();
     let mut g = st.active.lock().unwrap();
     if g.is_some() {
-        return Err("Another run is already in progress — cancel it or wait for it to finish".into());
+        return Err(
+            "Another run is already in progress — cancel it or wait for it to finish".into(),
+        );
     }
     let mut pending = st.pending_launch.lock().unwrap();
     match launch_id {
         Some(id) if *pending == Some(id) => *pending = None,
         Some(_) => return Err("This synchronization launch is no longer active".into()),
-        None if pending.is_some() => return Err("A synchronization is already preparing to start".into()),
+        None if pending.is_some() => {
+            return Err("A synchronization is already preparing to start".into())
+        }
         None => {}
     }
     let run_id = st.seq.fetch_add(1, Ordering::Relaxed) + 1;
     let ctl = RunCtl::new();
-    *g = Some(ActiveRun { id: run_id, ctl: ctl.clone() });
+    *g = Some(ActiveRun {
+        id: run_id,
+        ctl: ctl.clone(),
+    });
     *st.active_launch.lock().unwrap() = launch_id;
     Ok((run_id, ctl))
 }
@@ -221,6 +250,26 @@ pub(crate) fn has_run_activity(st: &RunState) -> bool {
     st.active.lock().unwrap().is_some()
         || st.pending_launch.lock().unwrap().is_some()
         || st.commands_in_flight.load(Ordering::Acquire) > 0
+}
+
+/// Run a short registry mutation only after proving the run pipeline is idle, while holding the
+/// same gate every compare/apply entry point must cross. This closes the check-then-write race: a
+/// run command that arrives during the filesystem mutation waits, then reads the completed job.
+pub(crate) fn with_run_idle<T>(
+    st: &RunState,
+    operation: &str,
+    mutate: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _gate = st.gate.lock().unwrap();
+    if st.active.lock().unwrap().is_some()
+        || st.pending_launch.lock().unwrap().is_some()
+        || st.commands_in_flight.load(Ordering::Acquire) > 0
+    {
+        return Err(format!(
+            "{operation} is unavailable while Compare or Synchronize is preparing or running"
+        ));
+    }
+    mutate()
 }
 
 pub(crate) fn begin_run_command(st: &RunState) {
@@ -268,29 +317,34 @@ pub(crate) fn set_paused(st: &RunState, run_id: u64, paused: bool) -> Result<boo
 /// 1:N: resolve a multi-target job into "the single-job view of the currently selected target"
 /// (the engine's single pipeline is reused as-is). Return the normalized index with it so every
 /// caller binds provenance to the same target when the optional argument is absent.
-pub(crate) fn resolve_target(job: &job::Job, target_index: Option<usize>) -> Result<(usize, job::Job), String> {
+pub(crate) fn resolve_target(
+    job: &job::Job,
+    target_index: Option<usize>,
+) -> Result<(usize, job::Job), String> {
     job.validate_multi_target()?;
     let list = job.target_list();
     let idx = target_index.unwrap_or(0);
-    let t = list.get(idx).ok_or_else(|| format!("target index {idx} is out of range ({} total)", list.len()))?;
+    let t = list
+        .get(idx)
+        .ok_or_else(|| format!("target index {idx} is out of range ({} total)", list.len()))?;
     Ok((idx, job.for_target(t)))
 }
 
 /// Prove that a submitted result is still the exact successful compare cached by this process.
-/// Invocation context is checked before the cache, giving a useful reason when the job or target
+/// Invocation context is checked before the cache, giving a useful reason when the job identity or target
 /// changed; the exact cached owner and digest then prevent stale or client-mutated plans from use.
 pub(crate) fn validate_cached_compare(
     cached: Option<&CompareProvenance>,
     owner: &CompareOwner,
+    job_id: &str,
     job_name: &str,
     target_index: usize,
     config_revision: &str,
     plan_digest: Option<&str>,
 ) -> Result<(), String> {
-    if owner.job_name != job_name {
+    if owner.job_id != job_id {
         return Err(format!(
-            "This compare result belongs to job '{}', not '{}' — run Compare again",
-            owner.job_name, job_name
+            "This compare result belongs to a different job identity than '{job_name}' — run Compare again"
         ));
     }
     if owner.target_index != target_index {
@@ -301,12 +355,18 @@ pub(crate) fn validate_cached_compare(
         ));
     }
     if owner.config_revision != config_revision {
-        return Err(format!("Job '{job_name}' changed since this compare — run Compare again"));
+        return Err(format!(
+            "Job '{job_name}' changed since this compare — run Compare again"
+        ));
     }
     let Some(cached) = cached else {
         return Err("This compare result is no longer cached — run Compare again".into());
     };
-    if cached.owner != *owner {
+    if cached.owner.compare_id != owner.compare_id
+        || cached.owner.job_id != owner.job_id
+        || cached.owner.target_index != owner.target_index
+        || cached.owner.config_revision != owner.config_revision
+    {
         return Err("A newer compare result replaced this one — run Compare again".into());
     }
     if let Some(plan_digest) = plan_digest {
@@ -375,7 +435,11 @@ pub(crate) fn resolve_selected_ops(
 }
 
 pub(crate) fn user_err(e: std::io::Error) -> String {
-    if syncdash::obs::progress::is_cancelled(&e) { "cancelled".into() } else { e.to_string() }
+    if syncdash::obs::progress::is_cancelled(&e) {
+        "cancelled".into()
+    } else {
+        e.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -387,6 +451,7 @@ mod tests {
     fn owner(compare_id: u64) -> CompareOwner {
         CompareOwner {
             compare_id,
+            job_id: "job-id-photos".into(),
             job_name: "photos".into(),
             target_index: 1,
             config_revision: "revision-a".into(),
@@ -394,7 +459,10 @@ mod tests {
     }
 
     fn provenance(compare_id: u64) -> CompareProvenance {
-        CompareProvenance { owner: owner(compare_id), plan_digest: "plan-a".into() }
+        CompareProvenance {
+            owner: owner(compare_id),
+            plan_digest: "plan-a".into(),
+        }
     }
 
     fn op(action: Action, path: &str) -> Op {
@@ -412,9 +480,16 @@ mod tests {
         }
     }
 
-    fn cached(job_name: &str, target_index: usize, revision: &str, compare_id: u64) -> CachedCompare {
+    fn cached(
+        job_id: &str,
+        job_name: &str,
+        target_index: usize,
+        revision: &str,
+        compare_id: u64,
+    ) -> CachedCompare {
         let owner = CompareOwner {
             compare_id,
+            job_id: job_id.into(),
             job_name: job_name.into(),
             target_index,
             config_revision: revision.into(),
@@ -467,7 +542,10 @@ mod tests {
             entries: Vec::new(),
         };
         CachedCompare {
-            provenance: CompareProvenance { owner: owner.clone(), plan_digest: "digest".into() },
+            provenance: CompareProvenance {
+                owner: owner.clone(),
+                plan_digest: "digest".into(),
+            },
             plan: PlanDto {
                 header: plan_header,
                 ops: Vec::new(),
@@ -484,39 +562,65 @@ mod tests {
     #[test]
     fn result_repository_is_lru_bounded_and_replaces_only_the_same_key() {
         let mut store = ResultStore::with_capacity(2);
-        store.insert(cached("A", 0, "rev-a", 1));
-        store.insert(cached("B", 0, "rev-b", 2));
-        assert!(store.get(&ResultKey::new("A", 0, "rev-a")).is_some());
+        store.insert(cached("id-a", "A", 0, "rev-a", 1));
+        store.insert(cached("id-b", "B", 0, "rev-b", 2));
+        assert!(store.get(&ResultKey::new("id-a", 0, "rev-a")).is_some());
 
-        store.insert(cached("C", 0, "rev-c", 3));
-        assert!(store.get(&ResultKey::new("B", 0, "rev-b")).is_none());
-        assert!(store.get(&ResultKey::new("A", 0, "rev-a")).is_some());
-        assert!(store.get(&ResultKey::new("C", 0, "rev-c")).is_some());
+        store.insert(cached("id-c", "C", 0, "rev-c", 3));
+        assert!(store.get(&ResultKey::new("id-b", 0, "rev-b")).is_none());
+        assert!(store.get(&ResultKey::new("id-a", 0, "rev-a")).is_some());
+        assert!(store.get(&ResultKey::new("id-c", 0, "rev-c")).is_some());
 
-        store.insert(cached("A", 0, "rev-a", 4));
+        store.insert(cached("id-a", "A renamed", 0, "rev-a", 4));
         assert_eq!(store.entries.len(), 2);
         assert_eq!(
-            store.get(&ResultKey::new("A", 0, "rev-a")).unwrap().provenance.owner.compare_id,
+            store
+                .get(&ResultKey::new("id-a", 0, "rev-a"))
+                .unwrap()
+                .provenance
+                .owner
+                .compare_id,
             4
         );
     }
 
     #[test]
-    fn result_repository_invalidates_only_the_named_revision() {
+    fn result_repository_invalidates_only_the_stable_identity_revision() {
         let mut store = ResultStore::with_capacity(4);
-        store.insert(cached("A", 0, "rev-old", 1));
-        store.insert(cached("A", 0, "rev-current", 2));
-        store.insert(cached("B", 0, "rev-old", 3));
+        store.insert(cached("id-a", "A", 0, "rev-old", 1));
+        store.insert(cached("id-a", "A", 0, "rev-current", 2));
+        store.insert(cached("id-b", "A", 0, "rev-old", 3));
 
-        store.invalidate_revision("A", "rev-old");
+        store.invalidate_revision("id-a", "rev-old");
 
-        assert!(store.get(&ResultKey::new("A", 0, "rev-old")).is_none());
-        assert!(store.get(&ResultKey::new("A", 0, "rev-current")).is_some());
-        assert!(store.get(&ResultKey::new("B", 0, "rev-old")).is_some());
+        assert!(store.get(&ResultKey::new("id-a", 0, "rev-old")).is_none());
+        assert!(store
+            .get(&ResultKey::new("id-a", 0, "rev-current"))
+            .is_some());
+        assert!(store.get(&ResultKey::new("id-b", 0, "rev-old")).is_some());
 
-        store.invalidate_job("A");
-        assert!(store.get(&ResultKey::new("A", 0, "rev-current")).is_none());
-        assert!(store.get(&ResultKey::new("B", 0, "rev-old")).is_some());
+        store.invalidate_job("id-a");
+        assert!(store
+            .get(&ResultKey::new("id-a", 0, "rev-current"))
+            .is_none());
+        assert!(store.get(&ResultKey::new("id-b", 0, "rev-old")).is_some());
+    }
+
+    #[test]
+    fn result_repository_rebinds_rename_but_isolates_name_reuse() {
+        let mut store = ResultStore::with_capacity(4);
+        store.insert(cached("id-original", "A", 0, "rev", 1));
+        store.insert(cached("id-replacement", "A", 0, "rev", 2));
+
+        store.rebind_job_name("id-original", "Renamed");
+
+        let original = store.get(&ResultKey::new("id-original", 0, "rev")).unwrap();
+        assert_eq!(original.provenance.owner.job_name, "Renamed");
+        assert_eq!(original.plan.owner.job_name, "Renamed");
+        let replacement = store
+            .get(&ResultKey::new("id-replacement", 0, "rev"))
+            .unwrap();
+        assert_eq!(replacement.provenance.owner.job_name, "A");
     }
 
     #[test]
@@ -525,6 +629,7 @@ mod tests {
         assert!(validate_cached_compare(
             Some(&cached),
             &owner(7),
+            "job-id-photos",
             "photos",
             1,
             "revision-a",
@@ -535,6 +640,7 @@ mod tests {
         let newer = validate_cached_compare(
             Some(&provenance(8)),
             &owner(7),
+            "job-id-photos",
             "photos",
             1,
             "revision-a",
@@ -546,6 +652,7 @@ mod tests {
         let mutated = validate_cached_compare(
             Some(&cached),
             &owner(7),
+            "job-id-photos",
             "photos",
             1,
             "revision-a",
@@ -561,17 +668,19 @@ mod tests {
         let wrong_job = validate_cached_compare(
             Some(&cached),
             &owner(7),
-            "documents",
+            "replacement-id",
+            "photos",
             1,
             "revision-a",
             None,
         )
         .unwrap_err();
-        assert!(wrong_job.contains("belongs to job"), "{wrong_job}");
+        assert!(wrong_job.contains("different job identity"), "{wrong_job}");
 
         let wrong_target = validate_cached_compare(
             Some(&cached),
             &owner(7),
+            "job-id-photos",
             "photos",
             0,
             "revision-a",
@@ -583,6 +692,7 @@ mod tests {
         let changed_job = validate_cached_compare(
             Some(&cached),
             &owner(7),
+            "job-id-photos",
             "photos",
             1,
             "revision-b",
@@ -594,6 +704,7 @@ mod tests {
         let gone = validate_cached_compare(
             None,
             &owner(7),
+            "job-id-photos",
             "photos",
             1,
             "revision-a",
@@ -605,10 +716,19 @@ mod tests {
 
     #[test]
     fn selected_rows_are_reconstructed_from_the_plan_including_valid_reversals() {
-        let plan = [op(Action::Copy, "safe/file.txt"), op(Action::Update, "other.txt")];
+        let plan = [
+            op(Action::Copy, "safe/file.txt"),
+            op(Action::Update, "other.txt"),
+        ];
         let selected = [
-            SelectedRowDto { index: 1, flipped: false },
-            SelectedRowDto { index: 0, flipped: true },
+            SelectedRowDto {
+                index: 1,
+                flipped: false,
+            },
+            SelectedRowDto {
+                index: 0,
+                flipped: true,
+            },
         ];
         let resolved = resolve_selected_ops(&plan, &selected).unwrap();
         assert_eq!(resolved.len(), 2);
@@ -620,27 +740,48 @@ mod tests {
 
     #[test]
     fn selected_rows_reject_injection_duplicates_and_non_operations() {
-        let plan = [op(Action::Copy, "safe/file.txt"), op(Action::Conflict, "conflict.txt")];
+        let plan = [
+            op(Action::Copy, "safe/file.txt"),
+            op(Action::Conflict, "conflict.txt"),
+        ];
 
         let empty = resolve_selected_ops(&plan, &[]).unwrap_err();
         assert!(empty.contains("No executable rows"), "{empty}");
 
-        let outside = resolve_selected_ops(&plan, &[SelectedRowDto { index: 2, flipped: false }])
-            .unwrap_err();
+        let outside = resolve_selected_ops(
+            &plan,
+            &[SelectedRowDto {
+                index: 2,
+                flipped: false,
+            }],
+        )
+        .unwrap_err();
         assert!(outside.contains("outside"), "{outside}");
 
         let duplicate = resolve_selected_ops(
             &plan,
             &[
-                SelectedRowDto { index: 0, flipped: false },
-                SelectedRowDto { index: 0, flipped: true },
+                SelectedRowDto {
+                    index: 0,
+                    flipped: false,
+                },
+                SelectedRowDto {
+                    index: 0,
+                    flipped: true,
+                },
             ],
         )
         .unwrap_err();
         assert!(duplicate.contains("more than once"), "{duplicate}");
 
-        let report = resolve_selected_ops(&plan, &[SelectedRowDto { index: 1, flipped: false }])
-            .unwrap_err();
+        let report = resolve_selected_ops(
+            &plan,
+            &[SelectedRowDto {
+                index: 1,
+                flipped: false,
+            }],
+        )
+        .unwrap_err();
         assert!(report.contains("not an operation"), "{report}");
     }
 
@@ -711,6 +852,23 @@ mod tests {
         assert!(has_run_activity(&state));
         finish_run_command(&state);
         assert!(!has_run_activity(&state));
+    }
+
+    #[test]
+    fn idle_mutations_refuse_every_run_command_state() {
+        let state = RunState::default();
+        begin_run_command(&state);
+        let mut called = false;
+        let error = with_run_idle(&state, "Saving jobs", || {
+            called = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!called);
+        assert!(error.contains("preparing or running"), "{error}");
+        finish_run_command(&state);
+
+        assert_eq!(with_run_idle(&state, "Saving jobs", || Ok(42)).unwrap(), 42);
     }
 }
 

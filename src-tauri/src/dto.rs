@@ -9,6 +9,7 @@ use syncdash::pipeline::compare;
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JobDto {
+    pub(crate) job_id: String,
     pub(crate) name: String,
     pub(crate) mode: String,
     pub(crate) rigor: String,
@@ -36,6 +37,7 @@ pub(crate) struct JobDto {
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JobDetailDto {
+    pub(crate) job_id: String,
     pub(crate) name: String,
     pub(crate) job: syncdash::job::Job,
     pub(crate) config_revision: String,
@@ -44,8 +46,20 @@ pub(crate) struct JobDetailDto {
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JobSaveDto {
+    pub(crate) job_id: String,
     pub(crate) name: String,
     pub(crate) config_revision: String,
+    pub(crate) effect: syncdash::job::JobMutationEffect,
+    pub(crate) previous_name: Option<String>,
+}
+
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct JobDeleteDto {
+    pub(crate) job_id: String,
+    pub(crate) name: String,
+    pub(crate) config_revision: String,
+    pub(crate) effect: syncdash::job::JobMutationEffect,
 }
 
 /// Immutable provenance for one successful comparison.
@@ -57,6 +71,9 @@ pub(crate) struct JobSaveDto {
 pub(crate) struct CompareOwner {
     #[ts(type = "number")]
     pub(crate) compare_id: u64,
+    /// Stable registry identity. `job_name` is only the current display/lookup label and may change
+    /// while this comparison remains valid.
+    pub(crate) job_id: String,
     pub(crate) job_name: String,
     #[ts(type = "number")]
     pub(crate) target_index: usize,
@@ -117,12 +134,37 @@ pub(crate) struct PreflightDto {
     pub(crate) warnings: Vec<String>,
 }
 
-#[derive(Serialize, Default, ts_rs::TS)]
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum EndpointReadiness {
+    Empty,
+    Ready,
+    Missing,
+    NotDirectory,
+    Deferred,
+    Invalid,
+    Unobservable,
+}
+
+#[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct PathInfo {
-    pub(crate) exists: bool,
-    pub(crate) is_dir: bool,
-    pub(crate) has_marker: bool,
+    pub(crate) readiness: EndpointReadiness,
+    pub(crate) exists: Option<bool>,
+    pub(crate) is_dir: Option<bool>,
+    pub(crate) has_marker: Option<bool>,
+}
+
+impl Default for PathInfo {
+    fn default() -> Self {
+        Self {
+            readiness: EndpointReadiness::Empty,
+            exists: None,
+            is_dir: None,
+            has_marker: None,
+        }
+    }
 }
 
 #[derive(Serialize, Default, ts_rs::TS)]
@@ -132,6 +174,9 @@ pub(crate) struct PathVerdict {
     pub(crate) target: PathInfo,
     /// Plain-language warnings; the editor renders them right under the field
     pub(crate) warnings: Vec<String>,
+    /// Readiness facts that are informative rather than failures, such as a network probe deferred
+    /// until Compare owns credentials and a cancellation context.
+    pub(crate) notes: Vec<String>,
 }
 
 // Compare-result repository (the data source for the "Identical" panel)
