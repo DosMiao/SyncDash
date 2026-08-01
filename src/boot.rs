@@ -27,8 +27,15 @@ pub struct Session {
 /// app log at the resolved log directory.
 pub fn init(sink_for: impl FnOnce(&AppSettings) -> Option<Arc<dyn ProgressSink>>) -> Session {
     init_worker_pool();
-    let settings = crate::store::settings::load();
+    let (settings, diagnostic) = crate::store::settings::load_with_diagnostic();
     let guard = sink_for(&settings).map(crate::obs::progress::install);
+    if let Some(message) = diagnostic {
+        crate::obs::logging::emit(
+            crate::model::event::LogLevel::Warn,
+            "settings",
+            message,
+        );
+    }
     Session { settings, _sink: guard }
 }
 

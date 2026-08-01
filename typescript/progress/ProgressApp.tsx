@@ -14,8 +14,16 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Check, Pause, Play, RefreshCw, Square, TriangleAlert } from 'lucide-react';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, ProgressBarStatus } from '@tauri-apps/api/window';
-import { cancelRun, closeProgressLaunch, destroyProgressWindow, pauseRun, postSyncAction } from '../core/ipc';
+import {
+  cancelRun,
+  closeProgressLaunch,
+  destroyProgressWindow,
+  pauseRun,
+  postSyncAction,
+  replayRunEvents,
+} from '../core/ipc';
 import { humanDuration, humanSize } from '../core/format';
+import { mergeRunEventReplay } from '../core/runEvents';
 import { applyZoom, readZoom } from '../core/zoom';
 import { Graph } from './Graph';
 import type { RunEv, RunState, Sample } from './runstate';
@@ -239,8 +247,20 @@ export function ProgressApp() {
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
+    let ready = false;
+    let lastSequence = 0;
+    const queued: RunEv[] = [];
+    const publish = (event: RunEv) => {
+      if (!ready) {
+        queued.push(event);
+        return;
+      }
+      if (event.sequence <= lastSequence) return;
+      lastSequence = event.sequence;
+      onEvent(event);
+    };
     void Promise.all([
-      listen<RunEv>('run-progress', (e) => onEvent(e.payload)),
+      listen<RunEv>('run-progress', (e) => publish(e.payload)),
       listen<RunRejected>('run-rejected', (e) => {
         const pending = pendingLaunch.current;
         if (!pending || e.payload.launch_id !== pending.id) return;
@@ -261,13 +281,28 @@ export function ProgressApp() {
         return;
       }
       unlisten = () => { for (const stopListening of stops) stopListening(); };
+      try {
+        const replay = await replayRunEvents('apply');
+        if (!disposed) {
+          const pending = mergeRunEventReplay(replay, queued);
+          queued.length = 0;
+          ready = true;
+          for (const event of pending) publish(event);
+        }
+      } catch (error) {
+        if (disposed) return;
+        ready = true;
+        for (const event of queued.splice(0)) publish(event);
+        reportControlError('Could not restore progress after reconnect', error);
+      }
+      if (disposed) return;
       await emit('progress-window-mounted');
     });
     return () => {
       disposed = true;
       unlisten?.();
     };
-  }, [armLaunch, onEvent, rerender]);
+  }, [armLaunch, onEvent, reportControlError, rerender]);
 
   // The numeric readouts step every 500ms (same divider as FFS — figures that flip ten times a second
   // are unreadable). The graphs keep their own 100ms repaint inside <Graph>, off the React tree.

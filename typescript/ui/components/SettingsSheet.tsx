@@ -16,6 +16,8 @@ interface Props {
 
 export function SettingsSheet({ onClose, onSaved, onStatus }: Props) {
   const [values, setValues] = useState<FormValues | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
 
   useEffect(() => {
     let live = true;
@@ -26,14 +28,22 @@ export function SettingsSheet({ onClose, onSaved, onStatus }: Props) {
   }, []);
 
   const save = async () => {
-    if (!values) return;
+    if (!values || saving) return;
+    setSaving(true);
+    setError('');
     try {
       const rep = await saveSettings(formToSettings(values));
       const moved = rep.moved ? `, migrated ${rep.moved} items` : '';
+      const skipped = rep.skipped ? `, kept ${rep.skipped} colliding items in the old location` : '';
       const failed = rep.failed ? `, ${rep.failed} failed` : '';
-      onSaved(`Log settings saved${moved}${failed}`, rep.failed ? 'err' : 'ok');
+      const detail = rep.messages.length ? ` — ${rep.messages.join('; ')}` : '';
+      onSaved(`Log settings saved and active${moved}${skipped}${failed}${detail}`, rep.failed ? 'err' : 'ok');
     } catch (e) {
-      onStatus(`Failed to save settings: ${e}`, 'err');
+      const message = `Failed to save settings: ${e}`;
+      setError(message);
+      onStatus(message, 'err');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -44,12 +54,15 @@ export function SettingsSheet({ onClose, onSaved, onStatus }: Props) {
       onClose={onClose}
       footer={
         <>
-          <button className="btn" onClick={onClose}>Cancel (Esc)</button>
-          <button className="btn accent" onClick={save}>Save</button>
+          <button type="button" className="btn" onClick={onClose}>Cancel (Esc)</button>
+          <button type="button" className="btn accent" disabled={!values || saving} onClick={save}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
         </>
       }
     >
       <div className="ed-pane">
+        {error && <div className="alert err" role="alert">{error}</div>}
         {values && SET_GROUPS.map((g) => (
           <div key={g} className="ed-section">
             <div className="section-title">{g}</div>

@@ -8,6 +8,7 @@
 //! far side is skipped rather than overwritten, because the two are different machines' histories
 //! and neither is authoritative.
 
+use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -53,7 +54,9 @@ pub fn migrate_log_dir(old: &Path, new: &Path) -> MigrateReport {
         let to = new.join(&name);
         if to.exists() {
             if name == crate::foundation::names::RUNLOG_INDEX_FILE {
-                merge_index(&from, &to, &mut r);
+                merge_jsonl(&from, &to, "run index", &mut r);
+            } else if name == crate::foundation::names::APP_LOG_FILE {
+                merge_jsonl(&from, &to, "application log", &mut r);
             } else {
                 r.skipped += 1;
             }
@@ -67,9 +70,9 @@ pub fn migrate_log_dir(old: &Path, new: &Path) -> MigrateReport {
     r
 }
 
-/// Merge two indexes. The index is append-only JSONL, and `latest_by_job` uses "written later = newer" to pick
-/// the most recent run — plain concatenation would distort that, so we sort by ts_ms and rewrite.
-fn merge_index(from: &Path, into: &Path, r: &mut MigrateReport) {
+/// Merge two timestamped JSONL streams. The run index is append-only and `latest_by_job` uses
+/// "written later = newer"; the app log is also easier to audit in chronological order.
+fn merge_jsonl(from: &Path, into: &Path, label: &str, r: &mut MigrateReport) {
     let mut lines: Vec<(i64, String)> = Vec::new();
     for p in [from, into] {
         let Ok(t) = std::fs::read_to_string(p) else {
@@ -89,14 +92,20 @@ fn merge_index(from: &Path, into: &Path, r: &mut MigrateReport) {
     }
     lines.sort_by_key(|(ts, _)| *ts);
     let body: String = lines.iter().map(|(_, l)| format!("{l}\n")).collect();
-    match std::fs::write(into, body) {
+    let rewrite = (|| -> std::io::Result<()> {
+        let mut staged = crate::fs::staged::Staged::create(into)?;
+        staged.write_all(body.as_bytes())?;
+        staged.seal(true)?;
+        staged.commit()
+    })();
+    match rewrite {
         Ok(_) => {
             let _ = std::fs::remove_file(from);
             r.moved += 1;
         }
         Err(e) => {
             r.failed += 1;
-            r.messages.push(format!("index merge failed: {e}"));
+            r.messages.push(format!("{label} merge failed: {e}"));
         }
     }
 }
@@ -197,5 +206,31 @@ mod tests {
         let r = migrate_log_dir(&root, &root);
         assert_eq!((r.moved, r.skipped, r.failed), (0, 0, 0));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migration_merges_the_opened_application_log_in_timestamp_order() {
+        let root = tmp("app-log");
+        let (old, new) = (root.join("old"), root.join("new"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        let name = crate::foundation::names::APP_LOG_FILE;
+        std::fs::write(old.join(name), "{\"ts_ms\":30}\n{\"ts_ms\":10}\n").unwrap();
+        std::fs::write(new.join(name), "{\"ts_ms\":20}\n").unwrap();
+
+        let report = migrate_log_dir(&old, &new);
+
+        assert_eq!(report.failed, 0);
+        let text = std::fs::read_to_string(new.join(name)).unwrap();
+        let times: Vec<i64> = text
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["ts_ms"]
+                    .as_i64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(times, vec![10, 20, 30]);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

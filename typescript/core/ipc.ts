@@ -3,6 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import type { PlanDto, OpDto } from './plan';
+import type { RunEventEnvelope } from './runEvents';
 import type { ApplyDto } from './types/generated/ApplyDto';
 import type { AppSettings } from './types/generated/AppSettings';
 import type { CompareOwner } from './types/generated/CompareOwner';
@@ -106,6 +107,8 @@ export const preflight = (name: string, plan: PlanDto, selected: SelectedRowDto[
 
 export const cancelRun = (runId: number) => invoke<boolean>('cancel_run', { runId });
 export const pauseRun = (runId: number, paused: boolean) => invoke<boolean>('pause_run', { runId, paused });
+export const replayRunEvents = (purpose: 'compare' | 'apply', afterSequence = 0) =>
+  invoke<RunEventEnvelope[]>('replay_run_events', { purpose, afterSequence });
 export const openProgressWindow = () => invoke<number>('open_progress_window');
 export const cancelProgressLaunch = (launchId: number) => invoke<boolean>('cancel_progress_launch', { launchId });
 export const closeProgressLaunch = () => invoke<'pending' | 'active' | 'none'>('close_progress_launch');

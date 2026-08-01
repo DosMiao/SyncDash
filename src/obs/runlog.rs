@@ -81,8 +81,8 @@ pub fn logs_dir() -> PathBuf {
     crate::store::settings::load().resolved_log_dir()
 }
 
-fn index_path() -> PathBuf {
-    logs_dir().join(INDEX_FILE)
+fn index_path(root: &Path) -> PathBuf {
+    root.join(INDEX_FILE)
 }
 
 fn sanitize(name: &str) -> String {
@@ -94,8 +94,42 @@ fn safe_component(s: &str) -> bool {
     !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains("..")
 }
 
+pub fn log_path(run_id: Option<&str>) -> Result<PathBuf, String> {
+    let root = logs_dir();
+    match run_id {
+        Some(id) if safe_component(id) => Ok(root.join(id)),
+        Some(_) => Err("Invalid run identifier".into()),
+        None => Ok(root),
+    }
+}
 
+static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
+fn create_run_dir(
+    root: &Path,
+    ts_ms: i64,
+    name: &str,
+    kind: &str,
+) -> std::io::Result<(String, PathBuf)> {
+    std::fs::create_dir_all(root)?;
+    loop {
+        let sequence = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
+        let run_id = format!(
+            "{}-{:03}-{}-{}-{}-{sequence}",
+            crate::foundation::time::stamp_compact(ts_ms),
+            ts_ms.rem_euclid(1_000),
+            sanitize(name),
+            sanitize(kind),
+            std::process::id(),
+        );
+        let dir = root.join(&run_id);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok((run_id, dir)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// Tallies the makeup of the error detail in passing — the source of summary's "3 warnings, 2 errors".
 #[derive(Default)]
@@ -130,6 +164,8 @@ pub struct Recorder {
     name: String,
     kind: String,
     ts_ms: i64,
+    root: PathBuf,
+    dir: Option<PathBuf>,
     run_id: Option<String>,
     file: Option<Arc<FileSink>>,
     tally: Arc<Tally>,
@@ -141,27 +177,26 @@ impl Recorder {
     pub fn start(name: &str, kind: &str, base: &RunCtx, ops: &[Op]) -> Recorder {
         let cfg = crate::store::settings::load();
         let ts_ms = crate::foundation::time::now_ms() as i64;
-        let run_id = format!("{}-{}-{}", crate::foundation::time::stamp_compact(ts_ms), sanitize(name), sanitize(kind));
-        let dir = cfg.resolved_log_dir().join(&run_id);
+        let root = cfg.resolved_log_dir();
         let tally = Arc::new(Tally::default());
 
         // Do not thread `progress::current()` in here: `RunCtx::null()` already brought the process's
         // ambient sink (the StderrSink the CLI installs at startup) into `base.sink`; threading it again duplicates output.
         let mut sinks: Vec<Arc<dyn ProgressSink>> = vec![base.sink.clone(), Arc::new(TallySink(tally.clone()))];
-        let (file, run_id) = match std::fs::create_dir_all(&dir) {
-            Ok(_) => {
+        let (file, run_id, dir) = match create_run_dir(&root, ts_ms, name, kind) {
+            Ok((run_id, dir)) => {
                 write_plan(&dir, ops);
                 // Write a finished:false summary up front — so even if the process is killed, this
                 // directory can still say "who I am and that I did not finish" instead of becoming anonymous debris
                 write_summary(&dir, &pending_record(name, kind, ts_ms, &run_id, ops.len() as u64));
                 let f = Arc::new(FileSink::open(&dir, cfg.level));
                 sinks.push(f.clone() as Arc<dyn ProgressSink>);
-                (Some(f), Some(run_id))
+                (Some(f), Some(run_id), Some(dir))
             }
             Err(e) => {
                 // A directory we cannot create costs us the detail, not the sync — the index line is still written
-                eprintln!("runlog: cannot create {}: {e}", dir.display());
-                (None, None)
+                eprintln!("runlog: cannot create a run directory under {}: {e}", root.display());
+                (None, None, None)
             }
         };
 
@@ -172,6 +207,8 @@ impl Recorder {
             name: name.to_string(),
             kind: kind.to_string(),
             ts_ms,
+            root,
+            dir,
             run_id,
             file,
             tally,
@@ -201,11 +238,11 @@ impl Recorder {
             finished: true,
             detail: None,
         };
-        if let Some(id) = &self.run_id {
+        if let Some(dir) = &self.dir {
             // Overwrite the finished:false placeholder written by start
-            write_summary(&logs_dir().join(id), &rec);
+            write_summary(dir, &rec);
         }
-        append_index(&rec);
+        append_index(&self.root, &rec);
         rec
     }
 }
@@ -255,9 +292,13 @@ fn write_plan(dir: &Path, ops: &[Op]) {
     }
 }
 
-fn append_index(rec: &RunRecord) {
+fn append_index(root: &Path, rec: &RunRecord) {
     let append = || -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(index_path())?;
+        std::fs::create_dir_all(root)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(index_path(root))?;
         writeln!(f, "{}", serde_json::to_string(rec)?)
     };
     if let Err(e) = append() {
@@ -270,10 +311,12 @@ fn append_index(rec: &RunRecord) {
 /// A watch round every 30s = 2880 a day, and creating a directory each time would flood the log disk;
 /// the single line "when we compared and how many differences we found" is worth keeping on its own.
 pub fn compare_summary(name: &str, kind: &str, ts_ms: i64, ops_found: u64, elapsed_ms: u64, cancelled: bool) {
-    if !crate::store::settings::load().logs_compare() {
+    let settings = crate::store::settings::load();
+    if !settings.logs_compare() {
         return;
     }
-    append_index(&RunRecord {
+    let root = settings.resolved_log_dir();
+    append_index(&root, &RunRecord {
         ts_ms,
         job: name.to_string(),
         kind: kind.to_string(),
@@ -294,7 +337,12 @@ pub fn compare_summary(name: &str, kind: &str, ts_ms: i64, ops_found: u64, elaps
 
 /// History (newest → oldest). job = None means everything; corrupt lines are skipped, never fatal.
 pub fn history(job: Option<&str>, limit: usize) -> Vec<RunRecord> {
-    let Ok(text) = std::fs::read_to_string(index_path()) else {
+    let root = logs_dir();
+    history_at(&root, job, limit)
+}
+
+fn history_at(root: &Path, job: Option<&str>, limit: usize) -> Vec<RunRecord> {
+    let Ok(text) = std::fs::read_to_string(index_path(root)) else {
         return Vec::new();
     };
     let mut out: Vec<RunRecord> = text
@@ -314,10 +362,11 @@ pub fn history(job: Option<&str>, limit: usize) -> Vec<RunRecord> {
 /// completely invisible, and those are exactly the ones that most need to be seen. This merges in the
 /// directory's `summary.json` (the `finished:false` placeholder written by `start`).
 pub fn history_merged(job: Option<&str>, limit: usize) -> Vec<RunRecord> {
-    let mut out = history(job, usize::MAX);
+    let root = logs_dir();
+    let mut out = history_at(&root, job, usize::MAX);
     let known: std::collections::HashSet<String> =
         out.iter().filter_map(|r| r.run_id.clone()).collect();
-    if let Ok(rd) = std::fs::read_dir(logs_dir()) {
+    if let Ok(rd) = std::fs::read_dir(&root) {
         for e in rd.flatten() {
             let p = e.path();
             if !p.is_dir() {
@@ -348,7 +397,8 @@ pub fn history_merged(job: Option<&str>, limit: usize) -> Vec<RunRecord> {
 /// compare lines do not count — they moved no data, and calling one "last sync" would be a lie.
 pub fn latest_by_job() -> std::collections::HashMap<String, RunRecord> {
     let mut m = std::collections::HashMap::new();
-    let Ok(text) = std::fs::read_to_string(index_path()) else {
+    let root = logs_dir();
+    let Ok(text) = std::fs::read_to_string(index_path(&root)) else {
         return m;
     };
     for l in text.lines() {
@@ -483,7 +533,13 @@ pub fn prune(keep_days: u64, max_total_mb: u64) -> u64 {
 
     if dropped > 0 {
         let body: String = kept.iter().map(|(_, l)| format!("{l}\n")).collect();
-        if let Err(e) = std::fs::write(&idx, body) {
+        let rewrite = (|| -> std::io::Result<()> {
+            let mut staged = crate::fs::staged::Staged::create(&idx)?;
+            staged.write_all(body.as_bytes())?;
+            staged.seal(true)?;
+            staged.commit()
+        })();
+        if let Err(e) = rewrite {
             eprintln!("runlog: rewriting the index failed: {e}");
         }
         // Sweep orphan directories too (left by a crash, absent from the index). Only touch those older
@@ -585,10 +641,25 @@ mod tests {
         assert!(safe_component("20260101-000000-job-apply"));
         assert!(artifact_lines("../secrets", "run", 10).is_empty());
         assert!(artifact_lines("ok-id", "no-such-artifact", 10).is_empty());
+        assert!(log_path(Some("../secrets")).is_err());
     }
 
     #[test]
     fn sanitize_strips_path_chars() {
         assert!(sanitize("a b/c\\d").chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-'));
+    }
+
+    #[test]
+    fn run_directories_are_unique_inside_the_same_millisecond() {
+        let root = std::env::temp_dir().join(format!(
+            "syncdash-run-id-{}-{}",
+            std::process::id(),
+            crate::foundation::time::now_ms()
+        ));
+        let first = create_run_dir(&root, 1_700_000_000_123, "job", "apply").unwrap();
+        let second = create_run_dir(&root, 1_700_000_000_123, "job", "apply").unwrap();
+        assert_ne!(first.0, second.0);
+        assert!(first.1.is_dir() && second.1.is_dir());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

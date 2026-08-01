@@ -235,14 +235,92 @@ impl Drop for FileSink {
 /// App-level rolling log (events outside a run: startup, settings errors, prune, migration).
 /// Single-file append, flushed per line — these events are sparse and all happen at moments where something may be about to go wrong.
 pub struct AppLogSink {
-    w: Mutex<Option<std::fs::File>>,
+    target: Mutex<AppLogTarget>,
+}
+
+struct AppLogTarget {
+    w: Option<std::fs::File>,
     min_level: LogLevel,
+    dir: std::path::PathBuf,
 }
 
 impl AppLogSink {
     pub fn open(dir: &Path, min_level: LogLevel) -> AppLogSink {
-        let f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(APP_LOG_FILE)).ok();
-        AppLogSink { w: Mutex::new(f), min_level }
+        let target = Self::open_target(dir, min_level).unwrap_or_else(|_| AppLogTarget {
+            w: None,
+            min_level,
+            dir: dir.to_path_buf(),
+        });
+        AppLogSink {
+            target: Mutex::new(target),
+        }
+    }
+
+    fn open_target(dir: &Path, min_level: LogLevel) -> std::io::Result<AppLogTarget> {
+        std::fs::create_dir_all(dir)?;
+        let w = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(APP_LOG_FILE))?;
+        Ok(AppLogTarget {
+            w: Some(w),
+            min_level,
+            dir: dir.to_path_buf(),
+        })
+    }
+
+    pub fn validate_target(dir: &Path, min_level: LogLevel) -> std::io::Result<()> {
+        drop(Self::open_target(dir, min_level)?);
+        Ok(())
+    }
+
+    /// Switch future app-level diagnostics to the saved location without restarting the desktop.
+    /// The destination is probed first; if the final open loses a race, the previous target is reopened.
+    pub fn reconfigure(&self, dir: &Path, min_level: LogLevel) -> std::io::Result<()> {
+        self.reconfigure_after(dir, min_level, || ())
+    }
+
+    pub fn reconfigure_after<T>(
+        &self,
+        dir: &Path,
+        min_level: LogLevel,
+        action: impl FnOnce() -> T,
+    ) -> std::io::Result<T> {
+        Self::validate_target(dir, min_level)?;
+        let mut target = self
+            .target
+            .lock()
+            .map_err(|_| std::io::Error::other("application log sink lock is poisoned"))?;
+        let previous_dir = target.dir.clone();
+        let previous_level = target.min_level;
+        target.w.take();
+        let output = action();
+        match Self::open_target(dir, min_level) {
+            Ok(replacement) => {
+                *target = replacement;
+                Ok(output)
+            }
+            Err(error) => {
+                match Self::open_target(&previous_dir, previous_level) {
+                    Ok(previous) => *target = previous,
+                    Err(restore_error) => {
+                        target.dir = previous_dir;
+                        target.min_level = previous_level;
+                        return Err(std::io::Error::other(format!(
+                            "{error}; restoring the previous application log also failed: {restore_error}"
+                        )));
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub fn directory(&self) -> std::path::PathBuf {
+        self.target
+            .lock()
+            .map(|target| target.dir.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -251,14 +329,14 @@ impl ProgressSink for AppLogSink {
         let ProgressEvent::Log { level, .. } = &ev else {
             return;
         };
-        if *level < self.min_level {
-            return;
-        }
         let Ok(line) = serde_json::to_string(&ev) else {
             return;
         };
-        if let Ok(mut g) = self.w.lock() {
-            if let Some(f) = g.as_mut() {
+        if let Ok(mut target) = self.target.lock() {
+            if *level < target.min_level {
+                return;
+            }
+            if let Some(f) = target.w.as_mut() {
                 let _ = writeln!(f, "{line}");
             }
         }
@@ -416,5 +494,52 @@ mod tests {
     #[test]
     fn level_ordering_is_info_warn_error() {
         assert!(LogLevel::Info < LogLevel::Warn && LogLevel::Warn < LogLevel::Error);
+    }
+
+    #[test]
+    fn app_log_reconfigure_routes_only_future_events_to_the_new_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "syncdash-app-log-reconfigure-{}-{}",
+            std::process::id(),
+            crate::foundation::time::now_ms()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        let sink = AppLogSink::open(&first, LogLevel::Info);
+        sink.emit(ev_log(LogLevel::Info, "before"));
+        sink.reconfigure(&second, LogLevel::Warn).unwrap();
+        sink.emit(ev_log(LogLevel::Info, "filtered"));
+        sink.emit(ev_log(LogLevel::Warn, "after"));
+
+        let old = std::fs::read_to_string(first.join(APP_LOG_FILE)).unwrap();
+        let new = std::fs::read_to_string(second.join(APP_LOG_FILE)).unwrap();
+        assert!(old.contains("before") && !old.contains("after"));
+        assert!(new.contains("after") && !new.contains("filtered"));
+        assert_eq!(sink.directory(), second);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_log_switch_releases_the_old_file_during_migration() {
+        let root = std::env::temp_dir().join(format!(
+            "syncdash-app-log-migrate-{}-{}",
+            std::process::id(),
+            crate::foundation::time::now_ms()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        let sink = AppLogSink::open(&first, LogLevel::Info);
+        sink.emit(ev_log(LogLevel::Info, "before"));
+
+        let removed = sink
+            .reconfigure_after(&second, LogLevel::Info, || {
+                std::fs::remove_file(first.join(APP_LOG_FILE))
+            })
+            .unwrap();
+
+        removed.unwrap();
+        sink.emit(ev_log(LogLevel::Info, "after"));
+        assert!(second.join(APP_LOG_FILE).is_file());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

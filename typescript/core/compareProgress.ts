@@ -1,21 +1,6 @@
-import type { PhaseStatus } from './types/generated/PhaseStatus';
+import type { RunEventEnvelope } from './runEvents';
 
-export interface CompareProgressEvent {
-  kind: string;
-  run_id: number;
-  purpose: string;
-  phase?: string;
-  status?: PhaseStatus;
-  reset?: boolean;
-  label?: string | null;
-  ts_ms?: number;
-  items_done?: number;
-  items_total?: number;
-  bytes_done?: number;
-  bytes_total?: number;
-  action?: string;
-  message?: string;
-}
+export type CompareProgressEvent = RunEventEnvelope;
 
 export interface CmpStage {
   phase: string;

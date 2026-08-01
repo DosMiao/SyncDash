@@ -35,17 +35,28 @@ pub fn reveal(path: String) -> Result<(), String> {
 /// When-finished action (same as FFS): sleep / shutdown. The countdown and confirmation both happen in the frontend before this is called.
 #[tauri::command]
 pub fn post_sync_action(kind: String) -> Result<(), String> {
-    let (prog, args): (&str, Vec<&str>) = if cfg!(windows) {
+    #[cfg(windows)]
+    let (prog, args): (&str, Vec<&str>) = {
         match kind.as_str() {
             "sleep" => ("rundll32.exe", vec!["powrprof.dll,SetSuspendState", "0,1,0"]),
             "shutdown" => ("shutdown", vec!["/s", "/t", "5"]),
-            _ => return Ok(()),
+            _ => return Err(format!("Unknown post-sync action: {kind}")),
         }
-    } else {
+    };
+    #[cfg(target_os = "macos")]
+    let (prog, args): (&str, Vec<&str>) = {
         match kind.as_str() {
             "sleep" => ("pmset", vec!["sleepnow"]),
             "shutdown" => ("osascript", vec!["-e", "tell application \"System Events\" to shut down"]),
-            _ => return Ok(()),
+            _ => return Err(format!("Unknown post-sync action: {kind}")),
+        }
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (prog, args): (&str, Vec<&str>) = {
+        match kind.as_str() {
+            "sleep" => ("systemctl", vec!["suspend"]),
+            "shutdown" => ("systemctl", vec!["poweroff"]),
+            _ => return Err(format!("Unknown post-sync action: {kind}")),
         }
     };
     std::process::Command::new(prog).args(&args).spawn().map(|_| ()).map_err(|e| e.to_string())

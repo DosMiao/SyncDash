@@ -19,6 +19,7 @@ mod state;
 
 use std::sync::Arc;
 
+use bridge::RunEventRepository;
 use state::{ResultRepository, RunState};
 
 fn main() {
@@ -71,6 +72,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(RunState::default()))
         .manage(Arc::new(ResultRepository::default()))
+        .manage(Arc::new(RunEventRepository::default()))
         .manage(app_log)
         .invoke_handler(tauri::generate_handler![
             cmd::jobs::list_jobs, cmd::jobs::jobs_dir, cmd::jobs::get_job, cmd::jobs::default_job, cmd::jobs::job_file_schema, cmd::jobs::save_job, cmd::jobs::delete_job,
@@ -78,7 +80,7 @@ fn main() {
             cmd::results::touch_compare, cmd::results::restore_compare, cmd::results::list_same, cmd::results::export_csv,
             cmd::logs::run_history, cmd::logs::last_syncs, cmd::logs::run_detail, cmd::logs::log_runs, cmd::logs::log_artifact, cmd::logs::log_dir_path, cmd::logs::app_log_tail, cmd::logs::get_settings, cmd::logs::save_settings,
             cmd::shell::reveal, cmd::shell::post_sync_action, cmd::shell::open_progress_window, cmd::shell::cancel_progress_launch, cmd::shell::close_progress_launch, cmd::shell::close_progress_window,
-            cmd::run::compare_job, cmd::run::preflight, cmd::run::apply_job, cmd::run::cancel_run, cmd::run::pause_run
+            cmd::run::compare_job, cmd::run::preflight, cmd::run::apply_job, cmd::run::replay_run_events, cmd::run::cancel_run, cmd::run::pause_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running SyncDash");

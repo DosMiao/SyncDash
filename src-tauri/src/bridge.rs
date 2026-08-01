@@ -4,8 +4,9 @@
 //! can drop late events from a cancelled run, and a purpose so the sub-window takes only apply
 //! while the main panel takes only compare.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::Emitter;
@@ -16,12 +17,126 @@ use syncdash::obs::progress::{ProgressSink, RunCtl, RunCtx};
 /// The run-progress payload sent to the frontend: run_id lets the frontend drop late events from a cancelled run;
 /// purpose separates compare from apply — the sub-window only accepts apply (otherwise the automatic re-check compare
 /// after a sync would hijack the open result window into a forever-spinning "comparing"), the main panel only accepts compare.
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub(crate) struct RunEvent {
-    run_id: u64,
-    purpose: &'static str,
+    pub(crate) sequence: u64,
+    pub(crate) run_id: u64,
+    pub(crate) purpose: &'static str,
     #[serde(flatten)]
-    ev: ProgressEvent,
+    pub(crate) ev: ProgressEvent,
+}
+
+const MAX_REPLAY_DIAGNOSTICS: usize = 256;
+
+#[derive(Default)]
+struct RunEventStore {
+    run_id: Option<u64>,
+    purpose: Option<&'static str>,
+    next_sequence: u64,
+    events: VecDeque<RunEvent>,
+}
+
+#[derive(Default)]
+pub(crate) struct RunEventRepository(Mutex<RunEventStore>);
+
+impl RunEventRepository {
+    fn record(&self, run_id: u64, purpose: &'static str, ev: ProgressEvent) -> RunEvent {
+        let mut store = self.0.lock().unwrap();
+        if store.run_id != Some(run_id) {
+            store.run_id = Some(run_id);
+            store.purpose = Some(purpose);
+            store.events.clear();
+        }
+        store.next_sequence = store.next_sequence.saturating_add(1);
+        let event = RunEvent {
+            sequence: store.next_sequence,
+            run_id,
+            purpose,
+            ev,
+        };
+        compact_for(&mut store.events, &event.ev);
+        if replayable(&event.ev) {
+            store.events.push_back(event.clone());
+            trim_diagnostics(&mut store.events);
+        }
+        event
+    }
+
+    pub(crate) fn replay(&self, purpose: &str, after_sequence: u64) -> Vec<RunEvent> {
+        let store = self.0.lock().unwrap();
+        if store.purpose != Some(purpose) {
+            return Vec::new();
+        }
+        store
+            .events
+            .iter()
+            .filter(|event| event.sequence > after_sequence)
+            .cloned()
+            .collect()
+    }
+}
+
+fn replayable(ev: &ProgressEvent) -> bool {
+    !matches!(
+        ev,
+        ProgressEvent::ItemResult { .. }
+            | ProgressEvent::Log {
+                level: syncdash::model::event::LogLevel::Info,
+                ..
+            }
+    )
+}
+
+fn compact_for(events: &mut VecDeque<RunEvent>, next: &ProgressEvent) {
+    match next {
+        ProgressEvent::Progress { phase, .. } => {
+            events.retain(|event| {
+                !matches!(&event.ev, ProgressEvent::Progress { phase: old, .. } if old == phase)
+            });
+        }
+        ProgressEvent::Totals { phase, .. } => {
+            events.retain(|event| {
+                !matches!(
+                    &event.ev,
+                    ProgressEvent::Progress { phase: old, .. }
+                        | ProgressEvent::Totals { phase: old, .. }
+                        if old == phase
+                )
+            });
+        }
+        ProgressEvent::Paused { .. } | ProgressEvent::Resumed { .. } => {
+            events.retain(|event| {
+                !matches!(
+                    &event.ev,
+                    ProgressEvent::Paused { .. } | ProgressEvent::Resumed { .. }
+                )
+            });
+        }
+        _ => {}
+    }
+}
+
+fn diagnostic(ev: &ProgressEvent) -> bool {
+    matches!(
+        ev,
+        ProgressEvent::Error { .. }
+            | ProgressEvent::Log {
+                level: syncdash::model::event::LogLevel::Warn
+                    | syncdash::model::event::LogLevel::Error,
+                ..
+            }
+    )
+}
+
+fn trim_diagnostics(events: &mut VecDeque<RunEvent>) {
+    while events.iter().filter(|event| diagnostic(&event.ev)).count()
+        > MAX_REPLAY_DIAGNOSTICS
+    {
+        let Some(index) = events.iter().position(|event| diagnostic(&event.ev)) else {
+            break;
+        };
+        events.remove(index);
+    }
 }
 
 fn phase_slot(p: Phase) -> usize {
@@ -62,6 +177,7 @@ impl ProgressThrottle {
 /// PhaseStart/Totals/PhaseEnd/Error/Paused/Resumed/Summary pass straight through.
 pub(crate) struct TauriSink {
     app: tauri::AppHandle,
+    events: Arc<RunEventRepository>,
     run_id: u64,
     purpose: &'static str,
     throttle: ProgressThrottle,
@@ -74,14 +190,27 @@ impl ProgressSink for TauriSink {
                 return;
             }
         }
-        let _ = self.app.emit("run-progress", RunEvent { run_id: self.run_id, purpose: self.purpose, ev });
+        let event = self.events.record(self.run_id, self.purpose, ev);
+        let _ = self.app.emit("run-progress", event);
     }
 }
 
-pub(crate) fn make_ctx(app: &tauri::AppHandle, run_id: u64, ctl: Arc<RunCtl>, purpose: &'static str) -> RunCtx {
+pub(crate) fn make_ctx(
+    app: &tauri::AppHandle,
+    events: Arc<RunEventRepository>,
+    run_id: u64,
+    ctl: Arc<RunCtl>,
+    purpose: &'static str,
+) -> RunCtx {
     RunCtx::new(
         ctl,
-        Arc::new(TauriSink { app: app.clone(), run_id, purpose, throttle: ProgressThrottle::default() }),
+        Arc::new(TauriSink {
+            app: app.clone(),
+            events,
+            run_id,
+            purpose,
+            throttle: ProgressThrottle::default(),
+        }),
     )
 }
 
@@ -97,5 +226,54 @@ mod tests {
         assert!(throttle.allows(Phase::ScanTarget, 1_001));
         assert!(!throttle.allows(Phase::ScanSource, 1_050));
         assert!(throttle.allows(Phase::ScanSource, 1_100));
+    }
+
+    #[test]
+    fn replay_is_run_scoped_and_coalesces_progress_without_losing_boundaries() {
+        let repository = RunEventRepository::default();
+        repository.record(
+            1,
+            "compare",
+            ProgressEvent::PhaseStart {
+                phase: Phase::ScanSource,
+                ts_ms: 1,
+                label: None,
+                items_total: 0,
+                bytes_total: 0,
+            },
+        );
+        for done in [1, 2] {
+            repository.record(
+                1,
+                "compare",
+                ProgressEvent::Progress {
+                    phase: Phase::ScanSource,
+                    ts_ms: done,
+                    items_done: done,
+                    items_total: 2,
+                    bytes_done: done,
+                    bytes_total: 2,
+                    current_path: format!("{done}.txt"),
+                },
+            );
+        }
+
+        let replay = repository.replay("compare", 0);
+        assert_eq!(replay.len(), 2);
+        assert!(matches!(&replay[0].ev, ProgressEvent::PhaseStart { .. }));
+        assert!(matches!(
+            &replay[1].ev,
+            ProgressEvent::Progress { items_done: 2, .. }
+        ));
+        assert!(repository.replay("apply", 0).is_empty());
+
+        repository.record(2, "apply", ProgressEvent::Paused { ts_ms: 3 });
+        assert!(repository.replay("compare", 0).is_empty());
+        let next_run = repository.replay("apply", 0);
+        assert_eq!(next_run.len(), 1);
+        assert!(next_run[0].sequence > replay[1].sequence);
+        assert!(repository
+            .replay("apply", next_run[0].sequence)
+            .is_empty());
     }
 }

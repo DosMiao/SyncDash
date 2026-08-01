@@ -10,7 +10,7 @@ use syncdash::pipeline::compare;
 use syncdash::{job, run};
 use tauri::Emitter;
 
-use crate::bridge::make_ctx;
+use crate::bridge::{make_ctx, RunEvent, RunEventRepository};
 use crate::dto::{ApplyDto, CompareOwner, PlanDto, PreflightDto, SelectedRowDto};
 use crate::state::{
     begin_run, begin_run_command, begin_run_for_launch, end_run, finish_run_command,
@@ -102,10 +102,23 @@ pub fn pause_run(
 }
 
 #[tauri::command]
+pub fn replay_run_events(
+    events: tauri::State<'_, Arc<RunEventRepository>>,
+    purpose: String,
+    after_sequence: Option<u64>,
+) -> Result<Vec<RunEvent>, String> {
+    if !matches!(purpose.as_str(), "compare" | "apply") {
+        return Err(format!("Unknown run purpose: {purpose}"));
+    }
+    Ok(events.replay(&purpose, after_sequence.unwrap_or(0)))
+}
+
+#[tauri::command]
 pub async fn compare_job(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RunState>>,
     results: tauri::State<'_, Arc<ResultRepository>>,
+    events: tauri::State<'_, Arc<RunEventRepository>>,
     name: String,
     target_index: Option<usize>,
     accept_caps: Option<bool>,
@@ -113,6 +126,7 @@ pub async fn compare_job(
     let st = state.inner().clone();
     let _command = RunCommandGuard::begin(st.clone());
     let results = results.inner().clone();
+    let events = events.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (job_name, full_job) = job::load_named(&name).map_err(|e| e.to_string())?;
         let config_revision =
@@ -120,7 +134,7 @@ pub async fn compare_job(
         let (target_index, job) = resolve_target(&full_job, target_index)?;
         let (run_id, ctl) = begin_run(&st)?;
         let _active_run = ActiveRunGuard { state: st.clone(), run_id };
-        let ctx = make_ctx(&app, run_id, ctl, "compare");
+        let ctx = make_ctx(&app, events, run_id, ctl, "compare");
         // Take over the process-level log outlet during compare too: the diagnostics in `trash`/`lock`/`scan`
         // that cannot reach a ctx go through the macro registry, and without installing here they fall back to stderr — in a windowed build that means never said.
         //
@@ -281,6 +295,7 @@ pub async fn apply_job(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<RunState>>,
     results: tauri::State<'_, Arc<ResultRepository>>,
+    events: tauri::State<'_, Arc<RunEventRepository>>,
     name: String,
     plan: PlanDto,
     selected: Vec<SelectedRowDto>,
@@ -292,6 +307,7 @@ pub async fn apply_job(
     let st = state.inner().clone();
     let _command = RunCommandGuard::begin(st.clone());
     let results = results.inner().clone();
+    let events = events.inner().clone();
     let reject_state = state.inner().clone();
     let requested_launch = launch_id;
     let run_app = app.clone();
@@ -339,7 +355,7 @@ pub async fn apply_job(
         let mut applied_result =
             AppliedResultGuard::new(results.clone(), &job_name, &config_revision);
         let _active_run = ActiveRunGuard { state: st.clone(), run_id };
-        let ctx = make_ctx(&run_app, run_id, ctl, "apply");
+        let ctx = make_ctx(&run_app, events, run_id, ctl, "apply");
         // M4: every real apply writes a run-log entry (the Recorder also collects error events into the detail file)
         let t0 = std::time::Instant::now();
         let rec = syncdash::obs::runlog::Recorder::start(&job_name, &run::run_kind(&job, "apply"), &ctx, &ops);

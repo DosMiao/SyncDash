@@ -50,6 +50,7 @@ import {
 } from './state/execution-safety';
 import type { AutoScanTicket } from './state/execution-safety';
 import { RequestFence } from './state/request-fence';
+import { mergeRunEventReplay } from '../core/runEvents';
 import { ComparePanel } from './components/ComparePanel';
 import { ScanFaultBanner } from './components/ScanFaultBanner';
 import { ConfirmSheet } from './components/ConfirmSheet';
@@ -1041,8 +1042,12 @@ export function App() {
 
   // Progress event streams
   useEffect(() => {
-    const un = listen<CompareProgressEvent>('run-progress', (ev) => {
-      const e = ev.payload;
+    let disposed = false;
+    let dispose: (() => void) | undefined;
+    let ready = false;
+    let lastSequence = 0;
+    const queued: CompareProgressEvent[] = [];
+    const handle = (e: CompareProgressEvent) => {
       if (e.purpose !== 'compare') return;
       if (!cmpRunReady.current && e.run_id <= cmpRunFloor.current) return;
       if (e.run_id < cmpRunId.current) return;
@@ -1086,8 +1091,42 @@ export function App() {
       } else if (e.kind === 'phase_end') {
         setCmpStages((prev) => reduceCompareStages(prev, e));
       }
-    });
-    return () => { un.then((f) => f()); };
+    };
+    const publish = (event: CompareProgressEvent) => {
+      if (!ready) {
+        queued.push(event);
+        return;
+      }
+      if (event.sequence <= lastSequence) return;
+      lastSequence = event.sequence;
+      handle(event);
+    };
+    void listen<CompareProgressEvent>('run-progress', (event) => publish(event.payload))
+      .then(async (unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        dispose = unlisten;
+        let replay: CompareProgressEvent[] = [];
+        try {
+          replay = await ipc.replayRunEvents('compare');
+        } catch (error) {
+          setStatus(`Could not restore compare progress after reconnect: ${error}`, 'err');
+        }
+        if (disposed) return;
+        const pending = mergeRunEventReplay(replay, queued);
+        queued.length = 0;
+        ready = true;
+        for (const event of pending) publish(event);
+      })
+      .catch((error) => {
+        if (!disposed) setStatus(`Could not subscribe to compare progress: ${error}`, 'err');
+      });
+    return () => {
+      disposed = true;
+      dispose?.();
+    };
   }, [setStatus]);
 
   useEffect(() => {

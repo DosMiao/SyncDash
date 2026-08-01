@@ -2,11 +2,17 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { reduceCompareStages } from '../../typescript/core/compareProgress.ts';
+import type { CompareProgressEvent } from '../../typescript/core/compareProgress.ts';
+import { mergeRunEventReplay } from '../../typescript/core/runEvents.ts';
 import { endStage, newRunState, percent, startStage } from '../../typescript/progress/runstate.ts';
 import type { StageRow } from '../../typescript/progress/runstate.ts';
 
-const event = (kind: string, phase: string, extra: Record<string, unknown> = {}) => ({
-  kind, phase, run_id: 1, purpose: 'compare', ...extra,
+const event = (
+  kind: CompareProgressEvent['kind'],
+  phase: CompareProgressEvent['phase'],
+  extra: Partial<CompareProgressEvent> = {},
+): CompareProgressEvent => ({
+  sequence: 1, kind, phase, run_id: 1, purpose: 'compare', ts_ms: 1, ...extra,
 });
 
 test('parallel scan start does not complete the other scan', () => {
@@ -83,4 +89,14 @@ test('a repeated phase cannot erase an earlier failure', () => {
   assert.equal(row.active, false);
   assert.equal(row.done, false);
   assert.equal(row.failed, true);
+});
+
+test('reconnect merges the snapshot with events received during the request exactly once', () => {
+  const one = event('phase_start', 'scan-source', { sequence: 1 });
+  const two = event('progress', 'scan-source', { sequence: 2, items_done: 1 });
+  const three = event('progress', 'scan-source', { sequence: 3, items_done: 2 });
+
+  const merged = mergeRunEventReplay([one, two], [two, three]);
+
+  assert.deepEqual(merged.map((item) => item.sequence), [1, 2, 3]);
 });
