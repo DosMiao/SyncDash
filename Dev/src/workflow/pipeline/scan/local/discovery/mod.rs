@@ -1,7 +1,7 @@
 //! Metadata discovery for a local root, independent from content evidence collection.
 
 #[cfg(target_os = "macos")]
-mod macos_bulk;
+mod bulk;
 mod walk;
 
 use crate::model::table::{ObservedDirectory, ObservedEntry, ObservedSymlink};
@@ -12,7 +12,7 @@ use super::state::LocalScanState;
 use walk::WalkKind;
 
 #[cfg(target_os = "macos")]
-use macos_bulk::walk as walk_local;
+use bulk::walk as walk_local;
 #[cfg(not(target_os = "macos"))]
 use walk::walk as walk_local;
 
