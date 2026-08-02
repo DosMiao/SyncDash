@@ -128,7 +128,10 @@ function workspaceByResultKey(
   return null;
 }
 
-function fresh(resultPlan: PlanDto, verificationEpoch: number): CompareScopeExecutionStatusDto {
+function fresh(
+  resultPlan: PlanDto,
+  verificationEpoch: number,
+): Extract<CompareScopeExecutionStatusDto, { status: 'fresh' }> {
   return {
     status: 'fresh',
     scope: compareScopeFromIdentity(resultPlan.owner.identity),
