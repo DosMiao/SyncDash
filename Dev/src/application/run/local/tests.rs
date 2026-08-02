@@ -1,5 +1,4 @@
 use super::super::roots::resolve_root;
-use super::apply::finish_apply;
 use super::compare::{escalate_sampled_disagreements, schedule_scans};
 use super::*;
 use crate::fs::vfs::memory::MemVfs;
@@ -616,11 +615,7 @@ fn terminal_summary_observes_a_last_moment_cancel_request() {
     ctl.request_cancel();
     let ctx = RunCtx::new(ctl, Arc::new(move |ev| copy.lock().unwrap().push(ev)));
 
-    let out = finish_apply(
-        &ctx,
-        std::time::Instant::now(),
-        crate::obs::progress::ApplyOutcome::default(),
-    );
+    let out = crate::obs::progress::ApplyOutcome::default().finish(&ctx, std::time::Instant::now());
     assert!(out.cancelled);
     assert!(matches!(
         events.lock().unwrap().last(),

@@ -87,32 +87,13 @@ pub fn run_peer_job_with(
 }
 
 fn emit_cancel_summary(ctx: &crate::obs::progress::RunCtx, t0: std::time::Instant) {
-    emit_apply_summary(
-        ctx,
-        t0,
-        crate::obs::progress::ApplyOutcome {
-            cancelled: true,
-            ..Default::default()
-        },
-    );
+    crate::obs::progress::ApplyOutcome {
+        cancelled: true,
+        ..Default::default()
+    }
+    .finish(ctx, t0);
 }
 
-pub(super) fn emit_apply_summary(
-    ctx: &crate::obs::progress::RunCtx,
-    t0: std::time::Instant,
-    out: crate::obs::progress::ApplyOutcome,
-) {
-    ctx.sink.emit(crate::model::event::ProgressEvent::Summary {
-        ts_ms: crate::foundation::time::now_ms(),
-        done: out.done,
-        skipped: out.skipped,
-        errors: out.errors,
-        bytes_done: out.bytes_copied,
-        elapsed_ms: t0.elapsed().as_millis() as u64,
-        paused_ms: ctx.ctl.paused_total_ms(),
-        cancelled: out.cancelled,
-    });
-}
 use crate::job::SingleTargetJob;
 use crate::model::plan::Op;
 
