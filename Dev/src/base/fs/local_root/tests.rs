@@ -271,6 +271,30 @@ fn identity_checked_removal_restores_a_different_current_entry() {
     let _ = std::fs::remove_dir_all(root_path);
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn opened_file_identity_is_stable_and_distinguishes_entries() {
+    let root_path = test_directory("file-identity");
+    std::fs::write(root_path.join("first"), b"first").unwrap();
+    std::fs::write(root_path.join("second"), b"second").unwrap();
+    let root = LocalRoot::open(root_path.clone()).unwrap();
+    let first = root.open_read(&path("first")).unwrap();
+    let same_file = first.try_clone().unwrap();
+    let second = root.open_read(&path("second")).unwrap();
+
+    assert_eq!(
+        file_identity(&first).unwrap(),
+        file_identity(&same_file).unwrap()
+    );
+    assert_ne!(
+        file_identity(&first).unwrap(),
+        file_identity(&second).unwrap()
+    );
+
+    drop((first, same_file, second, root));
+    let _ = std::fs::remove_dir_all(root_path);
+}
+
 #[test]
 fn no_replace_rename_moves_a_directory_as_one_entry_operation() {
     let root_path = test_directory("no-replace-directory");

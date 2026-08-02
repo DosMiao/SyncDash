@@ -126,9 +126,9 @@ pub(in crate::pipeline::apply::execute) fn execute(
                         .mtime_ms
                         .or_else(|| live_meta.as_ref().map(|metadata| metadata.mtime_ms));
                     let mtime_error = intended.and_then(|mtime| staged.set_mtime(mtime).err());
-                    if let Some(m) = op.mode {
-                        #[cfg(unix)]
-                        staged.set_mode(m)?;
+                    #[cfg(unix)]
+                    if let Some(mode) = op.mode {
+                        staged.set_mode(mode)?;
                     }
                     if sh.opt.fsync {
                         staged.sync_file()?;

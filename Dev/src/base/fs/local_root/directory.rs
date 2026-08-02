@@ -477,7 +477,7 @@ impl LocalDirectory {
     }
 
     pub(super) fn identity(&self) -> std::io::Result<FileIdentity> {
-        file_identity(&self.handle.metadata()?)
+        file_identity(&self.handle)
     }
 
     pub(super) fn identity_of(&self, name: &OsStr) -> std::io::Result<FileIdentity> {

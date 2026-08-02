@@ -50,8 +50,9 @@ pub(super) struct FileIdentity {
 }
 
 #[cfg(unix)]
-pub(super) fn file_identity(metadata: &std::fs::Metadata) -> std::io::Result<FileIdentity> {
+pub(super) fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
     Ok(FileIdentity {
         device: metadata.dev(),
         file: metadata.ino(),
@@ -59,26 +60,25 @@ pub(super) fn file_identity(metadata: &std::fs::Metadata) -> std::io::Result<Fil
 }
 
 #[cfg(windows)]
-pub(super) fn file_identity(metadata: &std::fs::Metadata) -> std::io::Result<FileIdentity> {
-    use std::os::windows::fs::MetadataExt;
+pub(super) fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let result = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(FileIdentity {
-        device: metadata.volume_serial_number().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "volume identity is unavailable for this directory handle",
-            )
-        })? as u64,
-        file: metadata.file_index().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "file identity is unavailable for this directory handle",
-            )
-        })?,
+        device: u64::from(information.dwVolumeSerialNumber),
+        file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
     })
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(super) fn file_identity(_metadata: &std::fs::Metadata) -> std::io::Result<FileIdentity> {
+pub(super) fn file_identity(_file: &std::fs::File) -> std::io::Result<FileIdentity> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "stable directory identity is unavailable on this platform",

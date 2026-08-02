@@ -218,7 +218,7 @@ impl LocalRoot {
         opened_file: &std::fs::File,
     ) -> std::io::Result<()> {
         let (parent, name) = self.open_parent(relative)?;
-        let expected_identity = file_identity(&opened_file.metadata()?)?;
+        let expected_identity = file_identity(opened_file)?;
         for _ in 0..1024 {
             let claimed_name =
                 EntryName::try_from(format!("{TEMP_PREFIX}remove.{}", random_token()?))
@@ -230,8 +230,7 @@ impl LocalRoot {
             }
             let claimed_identity = parent
                 .open_read(claimed_name.as_os_str())
-                .and_then(|file| file.metadata())
-                .and_then(|metadata| file_identity(&metadata));
+                .and_then(|file| file_identity(&file));
             match claimed_identity {
                 Ok(identity) if identity == expected_identity => {
                     return match parent.remove_file_force(claimed_name.as_os_str()) {
