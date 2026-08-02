@@ -84,7 +84,8 @@ pub(in crate::pipeline::apply::execute) fn execute(
                                 ));
                     }
                     if op.hash.as_ref().is_some_and(|expected| {
-                        !expected.starts_with('~') && expected != &delta.output_hash
+                        crate::model::digest::verifiable_digest(expected)
+                            .is_some_and(|full| full != delta.output_hash)
                     }) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -199,7 +200,7 @@ pub(in crate::pipeline::apply::execute) fn execute(
     let expected_full_hash = op
         .hash
         .as_deref()
-        .filter(|expected| !expected.starts_with('~'));
+        .filter(|expected| !crate::model::digest::is_sampled_digest(expected));
     let mut hasher = if sh.opt.verify || expected_full_hash.is_some() {
         Some(blake3::Hasher::new())
     } else {

@@ -2,7 +2,7 @@
 
 use crate::foundation::path::RootRelativePath;
 use crate::fs::local_root::LocalRoot;
-use crate::model::table::Blake3Digest;
+use crate::model::digest::Blake3Digest;
 
 /// Read granularity, and therefore how often cancel and pause are honored mid-file.
 const READ_CHUNK: u64 = 8 * 1024 * 1024;

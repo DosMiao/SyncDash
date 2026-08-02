@@ -36,7 +36,7 @@ pub fn write_marker(root: &Path, job: &str, note: &str) -> std::io::Result<(Path
     }
     let m = Marker {
         job: job.to_string(),
-        host: crate::model::table::host_name(),
+        host: crate::foundation::machine::host_name(),
         created_at_ms: crate::foundation::time::now_ms(),
         note: note.to_string(),
     };

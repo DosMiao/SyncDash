@@ -46,13 +46,13 @@ impl SampledDigestBuilder {
         }
     }
 
-    pub(crate) fn finish(self) -> crate::model::table::Blake3Digest {
+    pub(crate) fn finish(self) -> crate::model::digest::Blake3Digest {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&self.size.to_le_bytes());
         for (_, window) in self.windows {
             hasher.update(&window);
         }
-        crate::model::table::Blake3Digest::from_hash(hasher.finalize())
+        crate::model::digest::Blake3Digest::from_hash(hasher.finalize())
     }
 }
 
@@ -69,7 +69,7 @@ pub(super) fn effective_read(size: u64, sampled: bool) -> u64 {
 pub(super) fn sampled_digest(
     path: &Path,
     size: u64,
-) -> std::io::Result<crate::model::table::Blake3Digest> {
+) -> std::io::Result<crate::model::digest::Blake3Digest> {
     sampled_digest_with_buffer(path, size, &mut Vec::new(), |_| {})
 }
 
@@ -79,7 +79,7 @@ pub(super) fn sampled_digest_with_buffer<P>(
     size: u64,
     buf: &mut Vec<u8>,
     on_read: P,
-) -> std::io::Result<crate::model::table::Blake3Digest>
+) -> std::io::Result<crate::model::digest::Blake3Digest>
 where
     P: FnMut(u64),
 {
@@ -92,7 +92,7 @@ pub(super) fn sampled_digest_stream<R, P>(
     size: u64,
     buf: &mut Vec<u8>,
     mut on_read: P,
-) -> std::io::Result<crate::model::table::Blake3Digest>
+) -> std::io::Result<crate::model::digest::Blake3Digest>
 where
     R: std::io::Read + std::io::Seek + ?Sized,
     P: FnMut(u64),
@@ -116,7 +116,7 @@ where
         }
         hasher.update(&buf[..read]);
     }
-    Ok(crate::model::table::Blake3Digest::from_hash(
+    Ok(crate::model::digest::Blake3Digest::from_hash(
         hasher.finalize(),
     ))
 }
@@ -126,7 +126,7 @@ pub(super) fn sampled_digest_vfs<P>(
     rel: &str,
     size: u64,
     mut on_read: P,
-) -> Result<crate::model::table::Blake3Digest, crate::fs::vfs::error::VfsError>
+) -> Result<crate::model::digest::Blake3Digest, crate::fs::vfs::error::VfsError>
 where
     P: FnMut(u64),
 {
@@ -137,7 +137,7 @@ where
         on_read(buf.len() as u64);
         hasher.update(&buf);
     }
-    Ok(crate::model::table::Blake3Digest::from_hash(
+    Ok(crate::model::digest::Blake3Digest::from_hash(
         hasher.finalize(),
     ))
 }
@@ -148,7 +148,7 @@ fn full_hash_stream<R, C, P>(
     expected_size: u64,
     mut checkpoint: C,
     mut on_read: P,
-) -> Result<crate::model::table::Blake3Digest, crate::fs::vfs::error::VfsError>
+) -> Result<crate::model::digest::Blake3Digest, crate::fs::vfs::error::VfsError>
 where
     R: std::io::Read + ?Sized,
     C: FnMut() -> Result<(), crate::fs::vfs::error::VfsError>,
@@ -175,7 +175,7 @@ where
         on_read(n as u64);
         remaining -= n as u64;
     }
-    Ok(crate::model::table::Blake3Digest::from_hash(
+    Ok(crate::model::digest::Blake3Digest::from_hash(
         hasher.finalize(),
     ))
 }
@@ -186,7 +186,7 @@ pub(super) fn full_hash_vfs<P>(
     expected_size: u64,
     pp: &crate::obs::progress::PhaseProgress<'_>,
     on_read: P,
-) -> Result<crate::model::table::Blake3Digest, crate::fs::vfs::error::VfsError>
+) -> Result<crate::model::digest::Blake3Digest, crate::fs::vfs::error::VfsError>
 where
     P: FnMut(u64),
 {

@@ -217,13 +217,13 @@ pub fn cap_report_read(
     }
 
     // A widened no-hash window is a blind spot exactly when there is no content evidence
-    if q.window_ms > crate::model::plan::MTIME_SLACK_MS {
+    if q.window_ms > crate::pipeline::compare::MTIME_SLACK_MS {
         let secs = q.window_ms / 1000;
         r.items.push(CapItem {
             feature: "mtime window".into(),
             side: "both".into(),
             severity: if q.hash { CapSeverity::Info } else { CapSeverity::NeedsAck },
-            requested: format!("±{}s equality window", crate::model::plan::MTIME_SLACK_MS / 1000),
+            requested: format!("±{}s equality window", crate::pipeline::compare::MTIME_SLACK_MS / 1000),
             actual: format!("backend timestamps are only ±{secs}s precise"),
             effect: if q.hash {
                 format!("timestamp equality widens to ±{secs}s; content evidence still decides")

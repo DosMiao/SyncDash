@@ -5,11 +5,7 @@ use crate::model::plan::{Action, Plan, Side};
 use crate::transfer::pack::format::{package_error, Manifest, PACK_SCHEMA};
 
 fn validate_digest(value: &str, label: &str) -> std::io::Result<()> {
-    if value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if crate::model::digest::is_blake3_hex(value) {
         Ok(())
     } else {
         Err(package_error(format!(

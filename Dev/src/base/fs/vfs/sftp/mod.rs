@@ -132,40 +132,23 @@ impl SftpBackend {
         }
     }
 
-    /// The FFS defense, verbatim: a NoSuchFile answer is only *confirmed* absence
-    /// after the parent directory has been listed and really does not carry the name.
-    /// A listing that still shows it — or that cannot be obtained — is `Transient`.
+    /// Absence is confirmed by [`super::absence::confirm_absent`]; this backend supplies only
+    /// its own parent listing. The blocking call and its timeout stay inside the closure, because
+    /// a listing that times out must reach the shared rule as an error, not as an empty directory.
     fn confirm_absent(&self, rel: &str) -> VfsResult<()> {
-        let (parent, name) = crate::foundation::path::split_parent(rel);
-        let parent = parent.trim_end_matches('/');
-        let listing = {
+        super::absence::confirm_absent(rel, |parent| {
             let sftp = self.conn()?.sftp.clone();
             let p = self.abs(parent);
             self.block(
                 "read_dir (absence check)",
                 async move { sftp.read_dir(p).await },
             )
-        };
-        match listing {
-            Ok(dir) => {
-                for e in dir {
-                    if e.file_name() == name {
-                        return Err(VfsError::new(
-                            VfsErrorKind::Transient,
-                            format!(
-                                "the server reported '{rel}' missing but its parent still lists it — treating as a temporary fault, not a deletion"
-                            ),
-                        ));
-                    }
-                }
-                Ok(())
-            }
-            Err(e) if e.kind == VfsErrorKind::NotFound => Ok(()), // parent gone too: absence stands
-            Err(e) => Err(VfsError::new(
-                VfsErrorKind::Transient,
-                format!("cannot confirm '{rel}' is really absent (parent listing failed: {e})"),
-            )),
-        }
+            .map(|dir| {
+                dir.into_iter()
+                    .map(|entry| entry.file_name().to_owned())
+                    .collect()
+            })
+        })
     }
 }
 

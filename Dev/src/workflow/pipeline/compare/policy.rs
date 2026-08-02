@@ -2,7 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::plan::MTIME_SLACK_MS;
+/// How far apart two mtimes may be and still count as the same instant.
+///
+/// FAT stores timestamps at 2-second granularity and SMB shares round-trip through it, so a file
+/// copied between two such volumes comes back with a time that differs from its source by up to
+/// two seconds without anything having changed. Without this window every such file would compare
+/// as modified on every run.
+///
+/// This is a knob on how a comparison is made, not part of the artifact it emits — it appears in
+/// no PlanHeader, no Op and no plan JSONL — so it lives beside the `CompareOptions` default it
+/// supplies rather than in the plan format module.
+pub const MTIME_SLACK_MS: i64 = 2000;
 
 /// Conflict handling policy. The default reports conflicts without arbitration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

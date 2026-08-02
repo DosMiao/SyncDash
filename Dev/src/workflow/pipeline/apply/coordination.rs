@@ -104,10 +104,10 @@ pub(super) fn execute(
     // have no local capability and therefore always retain originals inside themselves.
     let source_trash_ok = source_local_root
         .as_ref()
-        .is_some_and(|root| crate::fs::vfs::local::same_device(root.display_path(), &trash));
+        .is_some_and(|root| crate::foundation::volume::same_device(root.display_path(), &trash));
     let target_trash_ok = target_local_root
         .as_ref()
-        .is_some_and(|root| crate::fs::vfs::local::same_device(root.display_path(), &trash));
+        .is_some_and(|root| crate::foundation::volume::same_device(root.display_path(), &trash));
 
     // Lock both roots before touching either one, so two machines cannot apply to the same
     // directory concurrently. The immutable generation claim proves ownership; its heartbeat

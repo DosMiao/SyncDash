@@ -2,7 +2,7 @@ use super::hashing::reader::{full_hash_with_buffer, standard_mtime_ms};
 use super::progress::{hash_sample_due, walk_sample_due, WALK_INTERVAL};
 use super::*;
 use crate::foundation::path::RootRelativePath;
-use crate::model::table::Blake3Digest;
+use crate::model::digest::Blake3Digest;
 use crate::pipeline::filter::PathFilter;
 use crate::pipeline::scan::{scan, scan_with_progress, ScanOptions};
 use std::path::Path;

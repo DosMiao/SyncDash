@@ -455,7 +455,7 @@ impl VersionWriter {
         let manifest = VersionManifest {
             id: self.id.clone(),
             ts_ms: crate::foundation::time::now_ms(),
-            host: crate::model::table::host_name(),
+            host: crate::foundation::machine::host_name(),
             entries: self.entries.clone(),
         };
         let manifest_body = serde_json::to_vec_pretty(&manifest)?;

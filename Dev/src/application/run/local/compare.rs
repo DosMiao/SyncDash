@@ -208,7 +208,7 @@ pub fn compare_resolved_with_consent(
     // this is a filesystem identity (`st_dev`/volume root), not a claim about the physical disk.
     let same_local_volume = match (sv.local_root(), tv.local_root()) {
         (Some(source), Some(target)) => {
-            crate::fs::vfs::local::same_device(source.display_path(), target.display_path())
+            crate::foundation::volume::same_device(source.display_path(), target.display_path())
         }
         _ => false,
     };
@@ -281,9 +281,10 @@ pub(super) fn escalate_sampled_disagreements(
     target: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     pp: &crate::obs::progress::PhaseProgress<'_>,
 ) -> std::io::Result<Plan> {
+    use crate::model::digest::Blake3Digest;
     use crate::model::event::LogLevel;
     use crate::model::plan::Side;
-    use crate::model::table::{Blake3Digest, FileIdentityObservation, ObservedFile};
+    use crate::model::table::{FileIdentityObservation, ObservedFile};
     // The same equality window used by the comparison above. Protocol roots such as FTP can be
     // coarser than the job default, and that precision must not manufacture escalation work.
     let slack_ms = job

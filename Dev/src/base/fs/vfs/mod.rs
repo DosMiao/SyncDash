@@ -16,6 +16,7 @@
 //!   interruption anywhere leaves either the old file or the new one, never half;
 //! - an mtime that fails to stick is reported by `CommitReport`, not treated as a failed copy.
 
+mod absence;
 pub mod error;
 pub mod spec;
 

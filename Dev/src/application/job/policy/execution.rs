@@ -72,7 +72,7 @@ impl Job {
             sync_mode: self.sync_mode,
             max_conflicts: self.max_conflicts,
             // Root resolution widens this to the coarser backend precision.
-            mtime_window_ms: crate::model::plan::MTIME_SLACK_MS,
+            mtime_window_ms: crate::pipeline::compare::MTIME_SLACK_MS,
         }
     }
 

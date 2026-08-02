@@ -181,7 +181,7 @@ pub(super) fn verify_source_evidence(
         )));
     }
     match operation.hash.as_deref() {
-        Some(expected) if expected.starts_with('~') => {
+        Some(expected) if crate::model::digest::is_sampled_digest(expected) => {
             if evidence.sampled_hash != expected {
                 return Err(package_error(format!(
                     "source file content changed after Compare: {}",

@@ -15,9 +15,7 @@ mod tests;
 
 use crate::foundation::time::now_ms;
 use crate::fs::local_root::LocalRoot;
-use crate::model::table::{
-    os_name, TableArtifact, TableEvidence, TableHeader, TableKind, TABLE_SCHEMA,
-};
+use crate::model::table::{TableArtifact, TableEvidence, TableHeader, TableKind, TABLE_SCHEMA};
 
 use super::{ProgressFn, ScanMetrics, ScanOptions, ScanProgress};
 
@@ -130,8 +128,8 @@ pub(crate) fn scan_local_root_impl(
             schema: TABLE_SCHEMA,
             kind: TableKind::Snapshot,
             root: root.display_path().to_string_lossy().into_owned(),
-            host: crate::model::table::host_name(),
-            os: os_name(),
+            host: crate::foundation::machine::host_name(),
+            os: crate::foundation::machine::os_name(),
             scanned_at_ms,
             duration_ms: started.elapsed().as_millis() as u64,
             entry_count: discovered.entries.len() as u64,

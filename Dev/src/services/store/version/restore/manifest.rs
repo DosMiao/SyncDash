@@ -10,10 +10,7 @@ use super::super::{
 };
 
 fn is_full_hash(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    crate::model::digest::is_blake3_hex(value)
 }
 
 fn require_full_hash(value: &str, label: &str, relative: &RootRelativePath) -> std::io::Result<()> {

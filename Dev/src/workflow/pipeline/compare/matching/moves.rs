@@ -7,7 +7,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::super::is_conflict_copy;
-use crate::model::table::{Blake3Digest, FileIdentityObservation, ObservedEntry, ObservedFile};
+use crate::model::digest::Blake3Digest;
+use crate::model::table::{FileIdentityObservation, ObservedEntry, ObservedFile};
 
 fn full_identity(entry: &ObservedEntry) -> Option<(&ObservedFile, &Blake3Digest)> {
     let file = entry.as_file()?;

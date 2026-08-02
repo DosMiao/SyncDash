@@ -5,6 +5,7 @@
 //! here is engine policy: a type may say how it is spelled on disk, never when to act on it.
 
 pub mod chunk;
+pub mod digest;
 pub mod event;
 pub mod plan;
 pub mod table;

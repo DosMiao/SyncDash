@@ -1,5 +1,6 @@
 //! Strict JSONL observations exchanged by scan, compare, peer, and archive flows.
 
+use crate::model::digest::Blake3Digest;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -112,87 +113,6 @@ pub struct TableHeader {
     #[serde(deserialize_with = "deserialize_required_option")]
     pub vfs: Option<VfsNote>,
 }
-
-#[derive(Serialize, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[serde(transparent)]
-pub struct Blake3Digest(String);
-
-impl Blake3Digest {
-    pub fn parse(value: impl Into<String>) -> Result<Self, DigestError> {
-        let value = value.into();
-        if value.len() != 64
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(DigestError(value));
-        }
-        Ok(Self(value))
-    }
-
-    pub fn hash_bytes(bytes: &[u8]) -> Self {
-        Self(blake3::hash(bytes).to_hex().to_string())
-    }
-
-    pub fn from_hash(hash: blake3::Hash) -> Self {
-        Self(hash.to_hex().to_string())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
-
-impl fmt::Display for Blake3Digest {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for Blake3Digest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(value).map_err(serde::de::Error::custom)
-    }
-}
-
-impl TryFrom<String> for Blake3Digest {
-    type Error = DigestError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::parse(value)
-    }
-}
-
-impl TryFrom<&str> for Blake3Digest {
-    type Error = DigestError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::parse(value)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DigestError(String);
-
-impl fmt::Display for DigestError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "invalid BLAKE3 digest {:?}: expected exactly 64 lowercase hexadecimal characters",
-            self.0
-        )
-    }
-}
-
-impl std::error::Error for DigestError {}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -568,16 +488,6 @@ pub fn roll_generations(fresh: &mut [ObservedEntry], old: &[ObservedEntry]) {
         history.truncate(ARCHIVE_GENERATIONS);
         fresh_file.previous_identities = history;
     }
-}
-
-pub fn os_name() -> String {
-    std::env::consts::OS.to_string()
-}
-
-pub fn host_name() -> String {
-    hostname::get()
-        .map(|host| host.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "unknown".into())
 }
 
 #[cfg(test)]

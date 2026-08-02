@@ -314,7 +314,7 @@ pub(in crate::pipeline::apply::execute) fn verify_move_evidence(
             exec,
             hold,
             expected_size,
-            expected_hash.starts_with('~'),
+            crate::model::digest::is_sampled_digest(expected_hash),
             pp,
         )?;
         if &got != expected_hash {
@@ -404,11 +404,9 @@ pub(in crate::pipeline::apply::execute) fn copy_claimed_move(
         ));
     }
     let copy_hash = copy_hash.finalize().to_hex().to_string();
-    if op
-        .hash
-        .as_ref()
-        .is_some_and(|expected| !expected.starts_with('~') && expected != &copy_hash)
-    {
+    if op.hash.as_ref().is_some_and(|expected| {
+        crate::model::digest::verifiable_digest(expected).is_some_and(|full| full != copy_hash)
+    }) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("move source content changed during copy: {hold}"),
