@@ -1,6 +1,6 @@
 //! Compare launch origin and exact capability fingerprint.
 
-use crate::features::operations::autoscan_authority::AutoScanComparePermit;
+use crate::features::autoscan::authority::AutoScanComparePermit;
 
 use super::target::JobTargetRevision;
 

@@ -4,9 +4,9 @@ use syncdash::job;
 use syncdash::model::plan::{Op, Plan};
 
 use crate::contracts::compare::{CompareIdentity, CompareOwner, ReviewedRowDecisionDto};
+use crate::features::autoscan::authority::AutoApplyTicket;
 use crate::features::compare::evidence::repository::validation::validate_retained_compare;
 use crate::features::compare::evidence::repository::CompareResultRepository;
-use crate::features::operations::autoscan_authority::AutoApplyTicket;
 use crate::features::operations::decisions::resolve_reviewed_operations;
 use crate::features::operations::target::resolve_job_target;
 

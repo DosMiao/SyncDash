@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use tauri::Emitter;
 
+use crate::features::autoscan::authority::AutoScanComparePermit;
 use crate::features::autoscan::controller::AutoScanController;
 use crate::features::autoscan::model::AutoScanVerificationTerminal;
 use crate::features::compare::evidence::model::scope::CompareScope;
 use crate::features::compare::evidence::repository::CompareResultRepository;
-use crate::features::operations::autoscan_authority::AutoScanComparePermit;
 use crate::window::MAIN_WINDOW_LABEL;
 
 #[derive(Clone, serde::Serialize)]

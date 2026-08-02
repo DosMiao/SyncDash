@@ -2,11 +2,11 @@
 
 use super::transition::terminalize_repository_verification;
 use super::AutoScanController;
+use crate::features::autoscan::authority::AutoScanComparePermit;
 use crate::features::autoscan::model::{AutoScanStatusDto, AutoScanVerificationTerminal};
 use crate::features::autoscan::runtime::{AutoScanTerminalAuthority, WorkerCommand};
 use crate::features::autoscan::state::AutoScanTicketLifecycle;
 use crate::features::autoscan::worker::observation::mark_shared_inactive;
-use crate::features::operations::autoscan_authority::AutoScanComparePermit;
 
 impl AutoScanController {
     pub(crate) fn decline_trigger(

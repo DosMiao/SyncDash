@@ -1,4 +1,13 @@
 //! Exact one-use authority handed between AutoScan and operation authorization.
+//!
+//! Owned by AutoScan because AutoScan mints it: both types are constructed only in
+//! `controller/compare.rs`, and this module imports nothing from `operations`.
+//!
+//! The `operations -> autoscan` edge this leaves is deliberate and must not be "fixed". Operation
+//! authorization has to be able to name the permit it is validating, and
+//! `AutoScanCompareTerminalGuard::drop` has to terminalize a permit when a Compare task ends
+//! without publishing — an unattended write authority that outlives its trigger is exactly what
+//! this vocabulary exists to prevent.
 
 use crate::contracts::compare::{CompareIdentity, CompareOwner};
 use crate::features::compare::evidence::model::verification::CompareVerificationTicket;

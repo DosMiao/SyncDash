@@ -1,7 +1,7 @@
 //! Exact ownership predicates for AutoScan-generated Apply tickets.
 
+use crate::features::autoscan::authority::AutoApplyTicket;
 use crate::features::autoscan::runtime::ActiveAutoScan;
-use crate::features::operations::autoscan_authority::AutoApplyTicket;
 
 pub(super) fn active_owns_ticket(active: &ActiveAutoScan, ticket: &AutoApplyTicket) -> bool {
     let identity = ticket.compare_identity();

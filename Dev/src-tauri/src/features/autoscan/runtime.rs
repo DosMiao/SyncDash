@@ -7,10 +7,10 @@ use std::thread::JoinHandle;
 use tauri::Emitter;
 
 use crate::contracts::compare::CompareScopeExecutionStatusDto;
+use crate::features::autoscan::authority::AutoScanComparePermit;
 use crate::features::compare::evidence::model::result::SuccessfulComparePublication;
 use crate::features::compare::evidence::repository::CompareResultRepository;
 use crate::features::operations::authorization::store::OperationAuthorizationStore;
-use crate::features::operations::autoscan_authority::AutoScanComparePermit;
 use crate::window::MAIN_WINDOW_LABEL;
 
 use super::model::{AutoScanBinding, AutoScanStatusDto};
