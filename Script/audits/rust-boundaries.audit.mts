@@ -148,5 +148,19 @@ test('Tauri commands stay thin delivery', async () => {
       /\bcrate::ipc::commands::/,
       'command -> command',
     ),
+    // Blocking engine work and window construction are lifecycle, not delivery. The CSV export
+    // transaction and the progress-window mount/arm handshake now live in features/.
+    assertFilesAvoid(
+      'Dev/src-tauri/src/ipc/commands',
+      /\bspawn_blocking\b|\bWebviewWindowBuilder\b/,
+      'command delivery -> blocking work or window construction',
+    ),
+    // A command module with its own tests is a module with its own behavior. Everything worth
+    // testing here has an owner in features/, and its tests moved with it.
+    assertFilesAvoid(
+      'Dev/src-tauri/src/ipc/commands',
+      /#\[cfg\(test\)\]/,
+      'command delivery -> owned behavior',
+    ),
   ]);
 });

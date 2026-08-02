@@ -1,8 +1,14 @@
+//! Projecting a completed job mutation onto its wire shape.
+//!
+//! The status-delivery warnings are the reason this is worth a test: a save that succeeded but
+//! could not notify every listener must report both facts, and dropping the warnings on the way
+//! out would present a partially-delivered save as a clean one.
+
 use syncdash::job;
 
 use crate::contracts::jobs::JobSaveDto;
 
-pub(super) fn job_save_dto(
+pub(crate) fn job_save_dto(
     saved: job::SavedJob,
     status_delivery_warnings: Vec<String>,
 ) -> JobSaveDto {

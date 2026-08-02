@@ -3,11 +3,14 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use builder_core::{
-    format_duration, normalize_standard_command, parse_common_args, parse_tier_selection,
-    print_standard_info, project_root_from_manifest, standard_project_command, BuildError,
-    BuildResult, BuildTier as Tier, Host, InfoLine, Runtime,
+    confirm_cleanup, execute_cleanup, format_duration, load_cleanup_manifest,
+    normalize_standard_command, parse_common_args, parse_tier_selection, plan_cleanup,
+    print_cleanup_plan, print_standard_info, project_root_from_manifest, standard_project_command,
+    verify_cleanup_plan_authorization, BuildError, BuildResult, BuildTier as Tier, CleanLevel,
+    CleanTargetSelection, CleanupManifest, Host, InfoLine, Runtime,
 };
 
+const PROJECT_ID: &str = "syncdash";
 const PROJECT_NAME: &str = "SyncDash";
 const VITE_PORT: u16 = 5173;
 const BUNDLE_ID: &str = "com.dosmiao.syncdash";
@@ -32,6 +35,11 @@ fn run() -> BuildResult<()> {
     } else {
         normalize_command(&args.command)
     };
+    let _operation_lock = if command_requires_operation_lock(&command) {
+        Some(runtime.acquire_operation_lock()?)
+    } else {
+        None
+    };
 
     match command.as_slice() {
         [action] if action == "quit" => Ok(()),
@@ -44,7 +52,8 @@ fn run() -> BuildResult<()> {
         [action, tier] if action == "run" => run_tier(&runtime, tier),
         [action] if action == "kill" => kill_only(&runtime),
         [action] if action == "unlock" => kill_and_unlock(&runtime),
-        [action] if action == "clean" => clean(&runtime),
+        [action] if action == "clean" => clean(&runtime, CleanLevel::Build),
+        [action, level] if action == "clean" => clean(&runtime, CleanLevel::parse(level)?),
         [action] if action == "app-self" => build_app_self(&runtime),
         [action] if action == "reveal" => reveal(&runtime),
         [action] if action == "doctor" => doctor(&runtime),
@@ -75,6 +84,26 @@ fn normalize_command(input: &[String]) -> Vec<String> {
         }
         _ => command,
     }
+}
+
+fn command_requires_operation_lock(command: &[String]) -> bool {
+    command.first().is_some_and(|action| {
+        matches!(
+            action.as_str(),
+            "dev" | "build" | "run" | "kill" | "unlock" | "clean" | "app-self"
+        )
+    })
+}
+
+fn cleanup_manifest(runtime: &Runtime) -> BuildResult<CleanupManifest> {
+    let manifest = load_cleanup_manifest(runtime.root())?;
+    if manifest.project() != PROJECT_ID {
+        return Err(BuildError::new(format!(
+            "cleanup manifest project {:?} does not match {PROJECT_ID:?}",
+            manifest.project()
+        )));
+    }
+    Ok(manifest)
 }
 
 fn release_dir(runtime: &Runtime) -> PathBuf {
@@ -409,16 +438,28 @@ fn kill_and_unlock(runtime: &Runtime) -> BuildResult<()> {
     }
 }
 
-fn clean(runtime: &Runtime) -> BuildResult<()> {
+fn clean(runtime: &Runtime, level: CleanLevel) -> BuildResult<()> {
+    let manifest = cleanup_manifest(runtime)?;
+    let plan = plan_cleanup(runtime, &manifest, level, CleanTargetSelection::Project)?;
+    print_cleanup_plan(&plan);
+    verify_cleanup_plan_authorization(&plan)?;
+    if !plan.has_ready_targets() {
+        return execute_cleanup(runtime, &plan)?.require_success();
+    }
+    if !confirm_cleanup(runtime, &plan)? {
+        println!("  Clean cancelled; no outputs were removed.");
+        return Ok(());
+    }
+
     free_desktop(runtime)?;
     free_cli(runtime)?;
-    runtime.run(
-        "cargo",
-        ["clean", "--manifest-path", "Cargo.toml"],
-        runtime.root(),
-        &[],
-    )?;
-    println!("  Clean complete; committed dist/ was preserved.");
+    let report = execute_cleanup(runtime, &plan)?;
+    report.require_success()?;
+    if runtime.dry_run() {
+        println!("  Cleanup dry run complete; committed dist/ would be preserved.");
+    } else {
+        println!("  Clean complete; committed dist/ was preserved.");
+    }
     Ok(())
 }
 
@@ -445,8 +486,8 @@ fn info(runtime: &Runtime) -> BuildResult<()> {
             detail: "macOS: build, verify, and install the self-use app",
         },
         InfoLine {
-            suffix: "clean",
-            detail: "clean Cargo outputs while preserving committed dist/",
+            suffix: "clean [build|deep]",
+            detail: "remove declared rebuildable outputs while preserving committed dist/",
         },
     ];
     print_standard_info(runtime, PROJECT_NAME, &extra);
@@ -459,6 +500,11 @@ fn doctor(runtime: &Runtime) -> BuildResult<()> {
     runtime.assert_file("package.json", "frontend package")?;
     runtime.assert_file("Dev/src-tauri/Cargo.toml", "Tauri manifest")?;
     runtime.require_directory(&runtime.path("dist"), "committed frontend output")?;
+    cleanup_manifest(runtime)?;
+    println!(
+        "  [ok] cleanup manifest: {}",
+        runtime.path("tools/builder/cleanup.toml").display()
+    );
     println!(
         "  [ok] cargo: {}",
         runtime.require_program("cargo")?.display()
@@ -474,6 +520,10 @@ fn doctor(runtime: &Runtime) -> BuildResult<()> {
     println!(
         "  [ok] npx:   {}",
         runtime.require_program("npx")?.display()
+    );
+    println!(
+        "  [ok] git:   {}",
+        runtime.require_program("git")?.display()
     );
     println!("SyncDash builder doctor passed.");
     Ok(())
@@ -495,23 +545,39 @@ fn print_help() {
            build cli                     standalone CLI only, Dist policy\n\
            run dev|dist|max|release\n\
            run desktop                   legacy alias for Dist\n\
-           kill | unlock | clean | doctor | info\n\
+           kill | unlock | clean [build|deep] | doctor | info\n\
            app-self                      macOS only\n\
            reveal\n\n\
          Global flags:\n\
            --dry-run\n\
+           --yes                            confirm a cleanup plan without prompting\n\
            --host windows|macos           with --dry-run only"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_command;
+    use super::{command_requires_operation_lock, normalize_command};
 
     #[test]
     fn menu_aliases_map_to_stable_commands() {
         assert_eq!(normalize_command(&["4".to_owned()]), ["build", "installer"]);
         assert_eq!(normalize_command(&["123".to_owned()]), ["build", "123"]);
         assert_eq!(normalize_command(&["s".to_owned()]), ["run", "dist"]);
+        assert_eq!(normalize_command(&["C".to_owned()]), ["clean"]);
+        assert_eq!(
+            normalize_command(&["CLEAN".to_owned(), "DEEP".to_owned()]),
+            ["clean", "deep"]
+        );
+    }
+
+    #[test]
+    fn state_changing_commands_require_the_operation_lock() {
+        for action in ["dev", "build", "run", "kill", "unlock", "clean", "app-self"] {
+            assert!(command_requires_operation_lock(&[action.to_owned()]));
+        }
+        for action in ["quit", "reveal", "doctor", "info", "help"] {
+            assert!(!command_requires_operation_lock(&[action.to_owned()]));
+        }
     }
 }

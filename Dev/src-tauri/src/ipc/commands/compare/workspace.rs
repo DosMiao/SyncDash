@@ -6,8 +6,9 @@ use crate::contracts::compare::{
     CompareIdentity, CompareResultForgetDto, CompareWorkspaceLookupDto,
 };
 use crate::features::compare::evidence::repository::{
-    CompareResultForgetOutcome, CompareResultRepository, CompareWorkspaceJobState,
+    CompareResultForgetOutcome, CompareResultRepository,
 };
+use crate::features::compare::workspace;
 use crate::features::jobs::target::resolve_target;
 use crate::features::operations::lifecycle::coordinator::RunLifecycle;
 use crate::ipc::{require_window_role, WindowRole};
@@ -21,22 +22,7 @@ pub fn reconcile_compare_workspace(
 ) -> Result<CompareWorkspaceLookupDto, String> {
     require_window_role(&window, WindowRole::Main)?;
     let _command = lifecycle.inner().command_lease()?;
-    let job_state = match job::load_by_id(&compare_identity.job_id) {
-        Ok((job_name, full_job)) => {
-            let config_revision = job::config_revision(&full_job)
-                .map_err(|error| format!("Job '{job_name}': {error}"))?;
-            if config_revision == compare_identity.config_revision {
-                resolve_target(&full_job, Some(compare_identity.target_index))?;
-                CompareWorkspaceJobState::Current { job_name }
-            } else {
-                CompareWorkspaceJobState::ConfigurationChanged
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            CompareWorkspaceJobState::Deleted
-        }
-        Err(error) => return Err(error.to_string()),
-    };
+    let job_state = workspace::job_state_for(&compare_identity)?;
     results
         .reconcile_exact_workspace(&compare_identity, job_state)
         .map_err(|error| error.to_string())
@@ -56,7 +42,7 @@ pub fn restore_compare(
     let (job_name, full_job) = job::load_by_id(&job_id).map_err(|e| e.to_string())?;
     let current_config_revision =
         job::config_revision(&full_job).map_err(|e| format!("Job '{job_name}': {e}"))?;
-    require_expected_config_revision(
+    workspace::require_expected_config_revision(
         &job_name,
         &expected_config_revision,
         &current_config_revision,
@@ -96,28 +82,4 @@ pub fn forget_compare_result(
             }
         },
     )
-}
-
-fn require_expected_config_revision(
-    job_name: &str,
-    expected_config_revision: &str,
-    current_config_revision: &str,
-) -> Result<(), String> {
-    if current_config_revision != expected_config_revision {
-        return Err(format!("Job '{job_name}' changed before its Compare workspace could be restored — refresh the job and try again"));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn restore_revision_rejects_a_delayed_selection_request() {
-        assert!(require_expected_config_revision("Archive", "revision-a", "revision-a").is_ok());
-        let error =
-            require_expected_config_revision("Archive", "revision-a", "revision-b").unwrap_err();
-        assert!(error.contains("changed before its Compare workspace could be restored"));
-    }
 }
