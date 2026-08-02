@@ -49,7 +49,7 @@ After any frontend change, refresh the committed bundle:
 npm run build
 ```
 
-Use the repository Builder for project builds, development launches, optimized artifacts, installers, and running built artifacts:
+Use the repository Builder for project builds, development launches, optimized artifacts, installers, and running built artifacts. Before any Builder or maintenance action, read `../../Experience/builder/skills/builder-workflow/SKILL.md`.
 
 ```bash
 ./builder.command info
@@ -60,7 +60,7 @@ Use the repository Builder for project builds, development launches, optimized a
 ./builder.command run dist
 ```
 
-On Windows, use the corresponding `builder.bat` commands. `cargo check`/`test`, type generation, and the documented `npm run build` dist refresh remain direct commands. The root Cargo package builds the CLI; desktop artifacts come from the desktop package through Builder.
+On Windows, use the corresponding `builder.bat` commands. `cargo check`/`test`, type generation, and the documented `npm run build` dist refresh remain direct commands. Optimized Dist, Max, Release, and compact numbered tiers build only the desktop artifact under `target/builder-tiers/<tier>/`. `build cli` is the sole standalone-CLI Builder path, uses Dist policy, and writes `target/release/syncdash[.exe]`; optimized desktop tiers never build it implicitly.
 
 A desktop process may be closed by Builder when replacing its binary. A running `syncdash` CLI may be applying changes and holding root leases, so report it and obtain explicit approval before terminating it. Interactive GUI acceptance remains the user's step unless they ask for a launch.
 

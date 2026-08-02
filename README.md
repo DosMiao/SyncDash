@@ -198,7 +198,7 @@ npm run typecheck
 
 After changing a Rust `#[ts(export)]` type, run `npm run gen:types`. After a frontend change, run `npm run build` and include the refreshed committed `dist/`; optimized macOS builds embed it without requiring Node.
 
-Use the repository Builder for builds and launches:
+Use the repository Builder for builds and launches. Its Windows and macOS launchers share the Rust implementation under `tools/builder/`:
 
 ```bash
 ./builder.command info
@@ -209,7 +209,7 @@ Use the repository Builder for builds and launches:
 ./builder.command run dist
 ```
 
-Use the equivalent `builder.bat` commands on Windows. Tiers `1`, `2`, and `3` are Dist, Max, and Release; compact inputs build them sequentially. The root Cargo package is the CLI, while Builder selects and packages the desktop crate and matching CLI correctly.
+Use the equivalent `builder.bat` commands on Windows. Tiers `1`, `2`, and `3` are Dist, Max, and Release; compact inputs build them sequentially. These optimized tiers package only the desktop artifact under `target/builder-tiers/<tier>/`. `build cli` is the sole standalone-CLI path, uses the Dist policy, and writes `target/release/syncdash[.exe]`; desktop tier builds never build the CLI implicitly. `--dry-run --host windows|macos` prints the complete plan without building or launching anything.
 
 Backend behavior is checked by `src/fs/vfs/conformance.rs`; end-to-end mode behavior lives in `src/run/e2e/`. Live SFTP, SMB, FTP, and exFAT lanes are ignored by default and enabled through their documented `SYNCDASH_E2E_*` environment variables.
 

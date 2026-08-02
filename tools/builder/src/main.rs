@@ -105,10 +105,6 @@ fn tier_desktop_binary(runtime: &Runtime, tier: Tier) -> PathBuf {
     ))
 }
 
-fn tier_cli_binary(runtime: &Runtime, tier: Tier) -> PathBuf {
-    tier_dir(runtime, tier).join(format!("syncdash{}", runtime.host().exe_suffix()))
-}
-
 fn free_desktop(runtime: &Runtime) -> BuildResult<()> {
     println!();
     println!("  [Kill] Freeing syncdash-desktop ...");
@@ -189,38 +185,38 @@ fn build_tiers(runtime: &Runtime, tiers: &[Tier]) -> BuildResult<()> {
         Host::Macos => require_committed_dist(runtime)?,
     }
     free_desktop(runtime)?;
-    free_cli(runtime)?;
     runtime.wait_unlocked(&desktop_binary(runtime))?;
-    runtime.wait_unlocked(&cli_binary(runtime))?;
     runtime.total(|| {
         let frontend_steps = usize::from(runtime.host() == Host::Windows);
-        let step_count = frontend_steps + tiers.len() * 2;
+        let step_count = frontend_steps + tiers.len();
         let mut step = 1;
         if runtime.host() == Host::Windows {
             frontend_step(runtime, &format!("[{step}/{step_count}]"))?;
             step += 1;
         }
-        let mut results: Vec<(Tier, Duration, u64, u64)> = Vec::new();
+        let mut results: Vec<(Tier, Duration, u64)> = Vec::new();
         for tier in tiers.iter().copied() {
             let environment = tier.release_environment(runtime.host());
             let started = std::time::Instant::now();
-            desktop_step(runtime, &format!("[{step}/{step_count}]"), &environment)?;
+            desktop_step(
+                runtime,
+                &format!("[{step}/{step_count}]"),
+                tier,
+                &environment,
+            )?;
             step += 1;
-            cli_step(runtime, &format!("[{step}/{step_count}]"), &environment)?;
-            step += 1;
-            let (desktop_mb, cli_mb) = pack_tier(runtime, tier)?;
-            results.push((tier, started.elapsed(), desktop_mb, cli_mb));
+            let desktop_mb = pack_desktop_tier(runtime, tier)?;
+            results.push((tier, started.elapsed(), desktop_mb));
         }
 
         println!();
-        println!("  ===== SELECTED TIERS BUILT OK =====");
-        for (tier, elapsed, desktop_mb, cli_mb) in results {
+        println!("  ===== SELECTED DESKTOP TIERS BUILT OK =====");
+        for (tier, elapsed, desktop_mb) in results {
             println!(
-                "  {:<9} {}  desktop {} MB  cli {} MB",
+                "  {:<9} {}  desktop {} MB",
                 tier.output_label(),
                 format_duration(elapsed),
-                desktop_mb,
-                cli_mb
+                desktop_mb
             );
         }
         Ok(())
@@ -233,7 +229,7 @@ fn build_cli(runtime: &Runtime) -> BuildResult<()> {
     runtime.wait_unlocked(&cli_binary(runtime))?;
     let environment = Tier::Dist.release_environment(runtime.host());
     runtime.total(|| {
-        cli_step(runtime, "[1/1]", &environment)?;
+        cli_step(runtime, "[1/1]", Tier::Dist, &environment)?;
         runtime.print_artifact(&cli_binary(runtime), "CLI OK - syncdash")
     })
 }
@@ -249,11 +245,12 @@ fn frontend_step(runtime: &Runtime, counter: &str) -> BuildResult<()> {
 fn desktop_step(
     runtime: &Runtime,
     counter: &str,
+    tier: Tier,
     environment: &[(String, Option<String>)],
 ) -> BuildResult<()> {
     runtime
         .phase(
-            &format!("{counter} CARGO - syncdash-desktop, release"),
+            &format!("{counter} CARGO - SyncDash {} Desktop", tier.output_label()),
             || {
                 runtime.run(
                     "cargo",
@@ -269,44 +266,44 @@ fn desktop_step(
 fn cli_step(
     runtime: &Runtime,
     counter: &str,
+    tier: Tier,
     environment: &[(String, Option<String>)],
 ) -> BuildResult<()> {
     runtime
-        .phase(&format!("{counter} CARGO - syncdash, release"), || {
-            runtime.run(
-                "cargo",
-                ["build", "--release", "-p", "syncdash"],
-                runtime.root(),
-                environment,
-            )
-        })
+        .phase(
+            &format!("{counter} CARGO - SyncDash {} CLI", tier.output_label()),
+            || {
+                runtime.run(
+                    "cargo",
+                    ["build", "--release", "-p", "syncdash"],
+                    runtime.root(),
+                    environment,
+                )
+            },
+        )
         .map(|_| ())
 }
 
-fn pack_tier(runtime: &Runtime, tier: Tier) -> BuildResult<(u64, u64)> {
+fn pack_desktop_tier(runtime: &Runtime, tier: Tier) -> BuildResult<u64> {
     let directory = tier_dir(runtime, tier);
     runtime.remove_directory(&directory)?;
     runtime.create_directory(&directory)?;
     let desktop = tier_desktop_binary(runtime, tier);
-    let cli = tier_cli_binary(runtime, tier);
     runtime.copy_file(&desktop_binary(runtime), &desktop)?;
-    runtime.copy_file(&cli_binary(runtime), &cli)?;
     if runtime.host() == Host::Macos {
         runtime.run(
             "chmod",
-            ["+x".as_ref(), desktop.as_os_str(), cli.as_os_str()],
+            ["+x".as_ref(), desktop.as_os_str()],
             runtime.root(),
             &[],
         )?;
     }
     let desktop_mb = runtime.file_size_mb(&desktop)?;
-    let cli_mb = runtime.file_size_mb(&cli)?;
     runtime.print_artifact(
         &desktop,
         &format!("PACKAGED - SyncDash {}", tier.output_label()),
     )?;
-    runtime.print_artifact(&cli, &format!("CLI - SyncDash {}", tier.output_label()))?;
-    Ok((desktop_mb, cli_mb))
+    Ok(desktop_mb)
 }
 
 fn build_installer(runtime: &Runtime) -> BuildResult<()> {
@@ -398,7 +395,6 @@ fn kill_and_unlock(runtime: &Runtime) -> BuildResult<()> {
             runtime.wait_unlocked(&cli_binary(runtime))?;
             for tier in [Tier::Dist, Tier::Max, Tier::Release] {
                 runtime.wait_unlocked(&tier_desktop_binary(runtime, tier))?;
-                runtime.wait_unlocked(&tier_cli_binary(runtime, tier))?;
             }
             Ok(())
         }
@@ -440,7 +436,7 @@ fn info(runtime: &Runtime) -> BuildResult<()> {
     let extra = [
         InfoLine {
             suffix: "build cli",
-            detail: "build only the standalone CLI using Dist settings",
+            detail: "only CLI build path; never part of numbered tiers",
         },
         InfoLine {
             suffix: "app-self",
@@ -492,9 +488,9 @@ fn print_help() {
         "SyncDash builder\n\n\
          Commands:\n\
            dev\n\
-           build dist|max|release|12|13|23|123|installer\n\
+           build dist|max|release|12|13|23|123|installer  Desktop tiers\n\
            build desktop                 legacy alias for Dist\n\
-           build cli                     standalone CLI only\n\
+           build cli                     standalone CLI only, Dist policy\n\
            run dev|dist|max|release\n\
            run desktop                   legacy alias for Dist\n\
            kill | unlock | clean | doctor | info\n\
