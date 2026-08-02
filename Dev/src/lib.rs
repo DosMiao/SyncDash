@@ -7,14 +7,14 @@
 //! L3  orchestration  run (including durable run history) · job · boot (process startup)
 //! L2  domain         pipeline (scan/compare/apply/filter/guard) · transfer (peer/pack)
 //! L1  services       obs (progress/logging) · store (settings/trash/version)
-//! L0  foundation     foundation -> model (plan/event/table/chunk) -> fs (staged/lock)
+//! L0  foundation     foundation -> model (plan/event/table/chunk/digest) -> fs (staged/lock)
 //! ```
 //!
 //! Dependencies point downward, and L0 is itself strictly ordered: `foundation` depends on nothing
 //! in this crate, `model` may use `foundation`, and `fs` may use both.
 //!
 //! Exported logging macros are the accepted upward edge from filesystem code into observability.
-//! There are three call sites, and they are deliberate: `fs/lock.rs` twice, where a heartbeat or
+//! There are three call sites, and they are deliberate: `fs/lock/` twice, where a heartbeat or
 //! release failure has no return channel because it happens on a background thread and in `Drop`,
 //! and `fs/vfs/sftp/staged.rs` once, on the same reasoning. `model` owns persisted vocabulary,
 //! not engines.
