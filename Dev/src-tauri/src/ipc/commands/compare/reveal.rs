@@ -4,20 +4,8 @@ use crate::contracts::compare::{CompareFileSideDto, CompareIdentity};
 use crate::features::compare::evidence::repository::CompareResultRepository;
 use crate::features::compare::export::presentation::{operation_side_paths, presented_operation};
 use crate::features::compare::export::receipt::CsvExportReceiptRepository;
+use crate::features::compare::reveal::local_compare_path;
 use crate::ipc::{require_window_role, WindowRole};
-
-fn local_compare_path(root: &str, relative: &str) -> Result<std::path::PathBuf, String> {
-    let relative = syncdash::foundation::path::RootRelativePath::new(relative)
-        .map_err(|error| error.to_string())?;
-    let syncdash::fs::vfs::spec::RootSpec::Local(root) = syncdash::fs::vfs::spec::parse(root)
-    else {
-        return Err("File Manager reveal is only available for roots on this computer".into());
-    };
-    Ok(syncdash::foundation::path::join_native(
-        &root,
-        relative.as_str(),
-    ))
-}
 
 #[tauri::command]
 pub fn reveal_compare_row(
@@ -62,23 +50,4 @@ pub fn reveal_csv_export(
 ) -> Result<(), String> {
     require_window_role(&window, WindowRole::Main)?;
     receipts.consume_with(&receipt_id, crate::ipc::native::reveal::reveal_path)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reveal_paths_accept_only_safe_entries_under_local_roots() {
-        let path = local_compare_path("/root", "folder/file.txt").unwrap();
-        assert_eq!(
-            path,
-            syncdash::foundation::path::join_native(
-                std::path::Path::new("/root"),
-                "folder/file.txt"
-            )
-        );
-        assert!(local_compare_path("/root", "../outside").is_err());
-        assert!(local_compare_path("sftp://host/root", "file.txt").is_err());
-    }
 }

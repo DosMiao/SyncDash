@@ -2,5 +2,4 @@
 
 mod delivery;
 pub(crate) mod mutation;
-mod projection;
 pub(crate) mod query;

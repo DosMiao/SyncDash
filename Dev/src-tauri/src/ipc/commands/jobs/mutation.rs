@@ -13,7 +13,7 @@ use crate::features::operations::lifecycle::coordinator::RunLifecycle;
 use crate::ipc::{require_window_role, WindowRole};
 
 use super::delivery::deliver_statuses;
-use super::projection::job_save_dto;
+use crate::features::jobs::mutation::projection::job_save_dto;
 
 fn execute_job_root_mutation<F>(
     app: &tauri::AppHandle,

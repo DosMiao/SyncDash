@@ -2,3 +2,4 @@
 
 pub(crate) mod effects;
 pub(crate) mod model;
+pub(crate) mod projection;

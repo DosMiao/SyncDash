@@ -5,6 +5,7 @@ pub(crate) mod coordinator;
 pub(crate) mod lease;
 pub(crate) mod model;
 mod preparation;
+pub(crate) mod progress_window;
 mod reservation;
 mod state;
 
