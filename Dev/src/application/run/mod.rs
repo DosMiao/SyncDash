@@ -353,28 +353,16 @@ pub fn apply_with_capability_consent_classified(
     ctx: &crate::obs::progress::RunCtx,
 ) -> ApplyExecution {
     if is_peer_target(job) {
-        let capabilities = peer::apply_capabilities(job, ops);
-        let blockers = capabilities.blockers();
-        if !blockers.is_empty() {
-            return ApplyExecution::failed_before_write(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                blockers
-                    .iter()
-                    .map(|item| item.render())
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ));
-        }
-        if !capabilities.consent_satisfied(
-            crate::pipeline::guard::caps::CapabilityScope::ApplyWrite,
+        peer::apply_peer_job_with_classified(
+            name,
+            job,
+            plan,
+            ops,
+            verbose,
+            acknowledged,
             consent,
-        ) {
-            return ApplyExecution::failed_before_write(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "peer apply capability limitations require exact review or --accept-caps",
-            ));
-        }
-        peer::apply_peer_job_with_classified(name, job, plan, ops, verbose, acknowledged, ctx)
+            ctx,
+        )
     } else {
         local::apply_job_guarded_with_consent_classified(
             job,
@@ -403,7 +391,7 @@ pub fn run_job(
         let target = job
             .select_target(0)
             .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))?;
-        run_peer_job(name, &target, do_apply, verbose, acknowledged)
+        run_peer_job(name, &target, do_apply, verbose, acknowledged, accept_caps)
     } else {
         run_local_job(name, job, do_apply, verbose, acknowledged, accept_caps)
     }

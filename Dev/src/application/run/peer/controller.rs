@@ -4,6 +4,7 @@ pub fn run_peer_job(
     do_apply: bool,
     verbose: bool,
     acknowledged: bool,
+    accept_caps: bool,
 ) -> std::io::Result<(u64, u64, u64, u64)> {
     run_peer_job_with(
         name,
@@ -11,18 +12,21 @@ pub fn run_peer_job(
         do_apply,
         verbose,
         acknowledged,
+        accept_caps,
         &crate::obs::progress::RunCtx::null(),
     )
 }
 
 /// Keep the CLI's combined Compare/Apply flow on the same progress contract as the desktop's
 /// separate commands, including a terminal Summary when Compare is cancelled.
+#[allow(clippy::too_many_arguments)] // each argument is an independently reviewed run decision
 pub fn run_peer_job_with(
     name: &str,
     job: &SingleTargetJob,
     do_apply: bool,
     verbose: bool,
     acknowledged: bool,
+    accept_caps: bool,
     ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<(u64, u64, u64, u64)> {
     let plan = match crate::run::compare_peer_job_with(name, job, ctx) {
@@ -63,7 +67,16 @@ pub fn run_peer_job_with(
         ctx,
         &ops,
     );
-    let out = apply_peer_job_with(name, job, &plan, &ops, verbose, acknowledged, &rec.ctx)?;
+    let out = apply_peer_job_with(
+        name,
+        job,
+        &plan,
+        &ops,
+        verbose,
+        acknowledged,
+        &crate::pipeline::guard::caps::CapabilityConsent::explicit_cli(accept_caps),
+        &rec.ctx,
+    )?;
     let _ = rec.finish(&out, t0.elapsed().as_millis() as u64);
     Ok((
         out.done,
