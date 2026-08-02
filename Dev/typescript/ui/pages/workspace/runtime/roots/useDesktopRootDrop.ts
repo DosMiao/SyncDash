@@ -1,6 +1,6 @@
 import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from 'react';
 import { getMainWebview } from '#core/infrastructure/tauri/mainWindow.ts';
-import { inspectPaths } from '#core/infrastructure/tauri/commands/main.ts';
+import { inspectPaths } from '#core/infrastructure/tauri/commands/paths.ts';
 import type { RootField } from '#core/application/jobs/rootEditor.ts';
 import type { StatusApi } from '#ui/shared/status/useStatus.ts';
 import type { JobEditorApi } from '#ui/features/jobs/model/job-editor/jobEditorModel.ts';

@@ -1,5 +1,5 @@
 import { useCallback } from 'react';
-import * as ipc from '#core/infrastructure/tauri/commands/main.ts';
+import * as autoscanIpc from '#core/infrastructure/tauri/commands/autoscan.ts';
 import {
   autoScanToggleAction,
   reconcileAutoScanStatus,
@@ -58,7 +58,7 @@ export function useAutoScanControls({
     controlPendingRef.current = 'stop';
     setControlPending('stop');
     setWorkspaceStatus('Stopping AutoScan…');
-    void ipc.stopAutoScan().then((next) => {
+    void autoscanIpc.stopAutoScan().then((next) => {
       if (controlRequestRef.current !== request) return;
       acceptStatus(next, 'stop');
       ticketRef.current = null;
@@ -97,7 +97,7 @@ export function useAutoScanControls({
     controlPendingRef.current = 'start';
     setControlPending('start');
     setWorkspaceStatus(`Starting AutoScan for '${monitoredJob.name}'…`);
-    void ipc.startAutoScan(
+    void autoscanIpc.startAutoScan(
       monitoredJob.job_id,
       monitoredJob.config_revision,
       monitoredTarget,

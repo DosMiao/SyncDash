@@ -1,6 +1,8 @@
+import type { JobRootMutationDto } from '#core/types/generated/JobRootMutationDto.ts';
+import type { JobSaveDto } from '#core/types/generated/JobSaveDto.ts';
 import { useCallback } from 'react';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
-import * as ipc from '#core/infrastructure/tauri/commands/main.ts';
+import * as jobsIpc from '#core/infrastructure/tauri/commands/jobs.ts';
 import { rootDraftIsDirty } from '#core/application/jobs/rootEditor.ts';
 import type {
   RootEditorAction,
@@ -41,7 +43,7 @@ interface RootMutationsOptions {
   setAskSwap: Dispatch<SetStateAction<RootSwapRequest | null>>;
   describeMutationFailure: (name: string, action: string, error: unknown) => Promise<string>;
   reconcileSavedWorkspaceJob: (
-    saved: ipc.JobSaveDto,
+    saved: JobSaveDto,
     previous: JobIdentitySnapshot | null,
   ) => void;
   resetSafetyUi: () => void;
@@ -104,9 +106,9 @@ export function useRootMutations({
     const before = workspace.committed[field];
     rootSaveInFlightRef.current = { workspaceKey, requestId };
     dispatchRootEditor({ type: 'save_started', workspaceKey, requestId, field });
-    let result: ipc.JobRootMutationDto;
+    let result: JobRootMutationDto;
     try {
-      result = await ipc.updateJobRoot(
+      result = await jobsIpc.updateJobRoot(
         owner.jobName,
         owner.jobId,
         owner.configRevision,
@@ -144,9 +146,9 @@ export function useRootMutations({
     resetSafetyUi();
     pushHistory(value);
     const undo = async () => {
-      let restored: ipc.JobRootMutationDto;
+      let restored: JobRootMutationDto;
       try {
-        restored = await ipc.updateJobRoot(
+        restored = await jobsIpc.updateJobRoot(
           result.mutation.name,
           result.mutation.job_id,
           result.mutation.config_revision,
@@ -249,9 +251,9 @@ export function useRootMutations({
 
   const doSwap = useCallback(async (request: RootSwapRequest) => {
     setBusy(true);
-    let result: ipc.JobRootMutationDto;
+    let result: JobRootMutationDto;
     try {
-      result = await ipc.swapJobRoots(
+      result = await jobsIpc.swapJobRoots(
         request.owner.jobName,
         request.owner.jobId,
         request.owner.configRevision,
@@ -283,9 +285,9 @@ export function useRootMutations({
     pushHistory(committed.values.target);
     setBusy(false);
     const undo = async () => {
-      let restored: ipc.JobRootMutationDto;
+      let restored: JobRootMutationDto;
       try {
-        restored = await ipc.swapJobRoots(
+        restored = await jobsIpc.swapJobRoots(
           result.mutation.name,
           result.mutation.job_id,
           result.mutation.config_revision,

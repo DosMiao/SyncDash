@@ -1,6 +1,6 @@
 import { useEffect, type Dispatch, type SetStateAction } from 'react';
 import { getAppVersion } from '#core/infrastructure/tauri/mainWindow.ts';
-import { jobsDir } from '#core/infrastructure/tauri/commands/main.ts';
+import { jobsDir } from '#core/infrastructure/tauri/commands/jobs.ts';
 import type { JobDto } from '#core/types/generated/JobDto.ts';
 import type { StatusApi } from '#ui/shared/status/useStatus.ts';
 

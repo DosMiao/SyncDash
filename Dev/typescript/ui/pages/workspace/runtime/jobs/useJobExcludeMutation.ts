@@ -1,5 +1,7 @@
+import type { JobDetailDto } from '#core/types/generated/JobDetailDto.ts';
+import type { JobSaveDto } from '#core/types/generated/JobSaveDto.ts';
 import { useCallback } from 'react';
-import * as ipc from '#core/infrastructure/tauri/commands/main.ts';
+import * as jobsIpc from '#core/infrastructure/tauri/commands/jobs.ts';
 import { addExcludeEntries } from '#core/domain/jobs/junk.ts';
 import type { JobDto } from '#core/types/generated/JobDto.ts';
 import type { StatusApi } from '#ui/shared/status/useStatus.ts';
@@ -8,7 +10,7 @@ import { statusDeliveryWarning, type JobIdentitySnapshot } from '../../model/wor
 interface JobExcludeMutationOptions {
   selectedJob: JobDto | null;
   describeMutationFailure: (name: string, action: string, error: unknown) => Promise<string>;
-  reconcileSavedWorkspaceJob: (saved: ipc.JobSaveDto, previous: JobIdentitySnapshot | null) => void;
+  reconcileSavedWorkspaceJob: (saved: JobSaveDto, previous: JobIdentitySnapshot | null) => void;
   refreshJobs: () => Promise<JobDto[]>;
   resetSafetyUi: () => void;
   setStatus: StatusApi['setMessage'];
@@ -27,9 +29,9 @@ export function useJobExcludeMutation({
   return useCallback(async (masks: string[], label: string) => {
     if (!selectedJob) { setStatus('Select a job first', 'err'); return; }
     const name = selectedJob.name;
-    let detail: ipc.JobDetailDto;
+    let detail: JobDetailDto;
     try {
-      detail = await ipc.getJob(name);
+      detail = await jobsIpc.getJob(name);
     } catch (error) {
       setStatus(await describeMutationFailure(
         name,
@@ -47,9 +49,9 @@ export function useJobExcludeMutation({
     }
 
     const updatedJob = { ...jobConfiguration, exclude: nextExcludes };
-    let saved: ipc.JobSaveDto;
+    let saved: JobSaveDto;
     try {
-      saved = await ipc.saveJob(name, updatedJob, {
+      saved = await jobsIpc.saveJob(name, updatedJob, {
         originalName: detail.name,
         expectedRevision: detail.config_revision,
       });
@@ -64,9 +66,9 @@ export function useJobExcludeMutation({
     resetSafetyUi();
 
     const undo = async () => {
-      let restored: ipc.JobSaveDto;
+      let restored: JobSaveDto;
       try {
-        restored = await ipc.saveJob(saved.name, jobConfiguration, {
+        restored = await jobsIpc.saveJob(saved.name, jobConfiguration, {
           originalName: saved.name,
           expectedRevision: saved.config_revision,
         });

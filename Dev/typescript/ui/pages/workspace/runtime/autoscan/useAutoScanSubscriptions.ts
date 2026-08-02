@@ -1,6 +1,6 @@
 import { useEffect, type MutableRefObject } from 'react';
 import { listenToMainWindowEvent } from '#core/infrastructure/tauri/mainWindow.ts';
-import { autoScanStatus } from '#core/infrastructure/tauri/commands/main.ts';
+import { autoScanStatus } from '#core/infrastructure/tauri/commands/autoscan.ts';
 import type { AutoScanStatusDto } from '#core/types/generated/AutoScanStatusDto.ts';
 import type { AutoScanTriggerDto } from '#core/types/generated/AutoScanTriggerDto.ts';
 import type { AutoScanStatusSource } from '#core/application/autoscan/autoscan.ts';

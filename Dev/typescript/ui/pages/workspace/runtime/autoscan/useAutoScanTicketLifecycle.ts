@@ -1,5 +1,7 @@
+import type { AuthorizationDto } from '#core/types/generated/AuthorizationDto.ts';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
-import * as ipc from '#core/infrastructure/tauri/commands/main.ts';
+import * as applyIpc from '#core/infrastructure/tauri/commands/apply.ts';
+import * as autoscanIpc from '#core/infrastructure/tauri/commands/autoscan.ts';
 import {
   monitorOwnsAutoScanResult,
   monitorOwnsAutoScanTicket,
@@ -82,7 +84,7 @@ export function useAutoScanTicketLifecycle({
     const recoverOrDecline = async (reason: string) => {
       let observed;
       try {
-        observed = await ipc.autoScanStatus();
+        observed = await autoscanIpc.autoScanStatus();
         acceptStatus(observed, 'snapshot');
         observed = statusRef.current ?? observed;
       } catch (error) {
@@ -100,7 +102,7 @@ export function useAutoScanTicketLifecycle({
         return;
       }
       try {
-        const declined = await ipc.declineAutoScanTrigger(ticket.generation, ticket.ticketId);
+        const declined = await autoscanIpc.declineAutoScanTrigger(ticket.generation, ticket.ticketId);
         acceptStatus(declined, 'decline', ticket);
         const authoritative = statusRef.current ?? declined;
         if (statusCompletesAutoScanTicket(authoritative, ticket)) {
@@ -114,7 +116,7 @@ export function useAutoScanTicketLifecycle({
         }
       } catch (declineError) {
         try {
-          const recovered = await ipc.autoScanStatus();
+          const recovered = await autoscanIpc.autoScanStatus();
           acceptStatus(recovered, 'snapshot');
           const authoritative = statusRef.current ?? recovered;
           if (statusCompletesAutoScanTicket(authoritative, ticket)) {
@@ -172,7 +174,7 @@ export function useAutoScanTicketLifecycle({
     let monitor = statusRef.current;
     if (!statusCanOwnAutoScanTrigger(monitor, ticket)) {
       try {
-        const snapshot = await ipc.autoScanStatus();
+        const snapshot = await autoscanIpc.autoScanStatus();
         acceptStatus(snapshot, 'snapshot');
         monitor = statusRef.current;
       } catch (error) {
@@ -193,7 +195,7 @@ export function useAutoScanTicketLifecycle({
 
     let publishedStatus;
     try {
-      publishedStatus = await ipc.autoScanStatus();
+      publishedStatus = await autoscanIpc.autoScanStatus();
       acceptStatus(publishedStatus, 'snapshot');
       publishedStatus = statusRef.current ?? publishedStatus;
     } catch (error) {
@@ -245,9 +247,9 @@ export function useAutoScanTicketLifecycle({
     autoApplyInFlightRef.current = true;
     setBusy(true);
     try {
-      let authorization: ipc.AuthorizationDto;
+      let authorization: AuthorizationDto;
       try {
-        authorization = await ipc.authorizeAutoScanApply(ticket.generation, ticket.ticketId);
+        authorization = await autoscanIpc.authorizeAutoScanApply(ticket.generation, ticket.ticketId);
       } catch (error) {
         setWorkspaceStatus(
           `AutoApply did not run: interactive review is required for this exact job revision, target, and capability set: ${error}`,
@@ -264,7 +266,7 @@ export function useAutoScanTicketLifecycle({
         return;
       }
       try {
-        const result = await ipc.applyJob(authorization.authorization_token);
+        const result = await applyIpc.applyJob(authorization.authorization_token);
         refreshLatestRunSummaries();
         setLogReload((value) => value + 1);
         setWorkspaceStatus(

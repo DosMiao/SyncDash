@@ -61,9 +61,16 @@ function displayPathSeparator(root: string): string {
   return root.includes('\\') ? '\\' : '/';
 }
 
+/// Root phrase + portable relative path → the path spelled the way the *far* machine spells it.
+///
+/// Mirrors Rust `foundation::path::join_display`, which is the arbiter. Every trailing separator is
+/// trimmed, of either flavour — not just one of the inferred flavour. A root recorded as
+/// `//server/share//` or `C:\root\\` is ordinary for UNC phrases and hand-edited job files, and
+/// trimming only the last one emitted a doubled separator here while the CSV export emitted a
+/// single one, for the same row.
 export function joinDisplayPath(root: string, relativePath: string): string {
   const separator = displayPathSeparator(root);
-  const normalizedRoot = root.endsWith(separator) ? root.slice(0, -1) : root;
+  const normalizedRoot = root.replace(/[/\\]+$/, '');
   const nativeRelativePath = separator === '\\' ? relativePath.replace(/\//g, '\\') : relativePath;
   return normalizedRoot + separator + nativeRelativePath;
 }

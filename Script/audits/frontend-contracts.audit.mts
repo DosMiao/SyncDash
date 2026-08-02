@@ -111,6 +111,31 @@ test('frontend dependency layers follow the Dev tree', async () => {
     for (const { specifier, target } of edges) {
       if (!target) continue;
 
+
+      // Window authority: each window may reach only its own command surface. The comment on
+      // commands/main.ts used to be the only statement of this rule, which meant deleting that
+      // file would have deleted the rule.
+      const PROGRESS_ONLY = 'Dev/typescript/core/infrastructure/tauri/commands/progress.ts';
+      const MAIN_ONLY = /^Dev\/typescript\/core\/infrastructure\/tauri\/commands\/(?:apply|autoscan|compare|jobs|logs|operations|paths|settings)\.ts$/;
+      const inProgressWindow = /^Dev\/typescript\/ui\/(?:pages|windows)\/progress\//.test(repositoryPath);
+      const inWorkspaceWindow = /^Dev\/typescript\/ui\/(?:pages|windows)\/(?:workspace|main)\//.test(repositoryPath)
+        || repositoryPath.startsWith('Dev/typescript/ui/features/');
+
+      if (inWorkspaceWindow) {
+        assert.notEqual(
+          target,
+          PROGRESS_ONLY,
+          `${repositoryPath} reaches progress-window authority through ${specifier}`,
+        );
+      }
+      if (inProgressWindow) {
+        assert.doesNotMatch(
+          target,
+          MAIN_ONLY,
+          `${repositoryPath} reaches main-window command authority through ${specifier}`,
+        );
+      }
+
       if (repositoryPath.startsWith('Dev/typescript/core/domain/')) {
         assert.doesNotMatch(
           target,
