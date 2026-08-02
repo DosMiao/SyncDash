@@ -15,7 +15,8 @@ use crate::fs::vfs::Support;
 
 use self::manifest::{load_restore_entries, RestorePayload};
 use self::transaction::restore_entry;
-use super::{acquire_version_root, check_version_lease, invalid_data};
+use super::content::invalid_data;
+use super::retention::{acquire_version_root, check_version_lease};
 
 /// Restore selected version entries while retaining every displaced destination inside the root.
 /// Empty `files` means all entries; a dry run validates the manifest and every selected payload.

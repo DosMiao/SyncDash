@@ -193,6 +193,32 @@ impl ApplyOutcome {
     pub fn into_tuple(self) -> (u64, u64, u64) {
         (self.done, self.skipped, self.errors)
     }
+
+    /// Emit this run's one terminal event and return the outcome it reported.
+    ///
+    /// Every apply invocation has exactly one Summary, including failures that never reach
+    /// `Phase::Apply`. The progress window derives its running state from this boundary: without
+    /// it a refused run keeps spinning after the engine has already released the run slot.
+    ///
+    /// The rule lives on the type that owns the counters so both lanes must pass through it. It
+    /// was previously written out once per lane, which is one place too many for "exactly one".
+    ///
+    /// The cancellation fold is applied here rather than by the caller. `|=` makes it idempotent,
+    /// so a lane that already folded its own cancellation loses nothing.
+    pub fn finish(mut self, ctx: &RunCtx, started: std::time::Instant) -> Self {
+        self.cancelled |= ctx.ctl.cancelled();
+        ctx.sink.emit(crate::model::event::ProgressEvent::Summary {
+            ts_ms: crate::foundation::time::now_ms(),
+            done: self.done,
+            skipped: self.skipped,
+            errors: self.errors,
+            bytes_done: self.bytes_copied,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            paused_ms: ctx.ctl.paused_total_ms(),
+            cancelled: self.cancelled,
+        });
+        self
+    }
 }
 
 /// Single-phase counters plus emitter. Worker threads only borrow &self (everything inside is atomic).

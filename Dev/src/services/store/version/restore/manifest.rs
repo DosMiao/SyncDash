@@ -4,10 +4,8 @@ use std::path::PathBuf;
 use crate::foundation::path::{EntryName, RootRelativePath};
 use crate::fs::local_root::LocalRoot;
 
-use super::super::{
-    hash_local_file, invalid_data, read_version_metadata, relative_path, PreservedEntry,
-    VersionManifest, VersionPayloadKind,
-};
+use super::super::content::{hash_local_file, invalid_data, read_version_metadata, relative_path};
+use super::super::model::{PreservedEntry, VersionManifest, VersionPayloadKind};
 
 fn is_full_hash(value: &str) -> bool {
     crate::model::digest::is_blake3_hex(value)
@@ -68,7 +66,7 @@ pub(super) fn verify_reverse_delta(
     require_full_hash(expected_base_hash, "base hash", relative)?;
     let mut base = root.open_read(relative)?;
     let base_size = base.metadata()?.len();
-    let mut buffer = vec![0u8; super::super::READ_CHUNK as usize];
+    let mut buffer = vec![0u8; super::super::content::READ_CHUNK as usize];
     let mut base_hasher = blake3::Hasher::new();
     loop {
         checkpoint()?;

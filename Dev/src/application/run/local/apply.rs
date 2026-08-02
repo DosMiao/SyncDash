@@ -131,28 +131,6 @@ fn refuse_apply(
     }
 }
 
-/// Every apply invocation has one terminal event, including failures before `Phase::Apply` can
-/// start. The progress window derives its running state from this boundary; without it a refused
-/// run keeps spinning after the engine has already released the run slot.
-pub(super) fn finish_apply(
-    ctx: &crate::obs::progress::RunCtx,
-    t0: std::time::Instant,
-    mut out: crate::obs::progress::ApplyOutcome,
-) -> crate::obs::progress::ApplyOutcome {
-    out.cancelled |= ctx.ctl.cancelled();
-    ctx.sink.emit(crate::model::event::ProgressEvent::Summary {
-        ts_ms: crate::foundation::time::now_ms(),
-        done: out.done,
-        skipped: out.skipped,
-        errors: out.errors,
-        bytes_done: out.bytes_copied,
-        elapsed_ms: t0.elapsed().as_millis() as u64,
-        paused_ms: ctx.ctl.paused_total_ms(),
-        cancelled: out.cancelled,
-    });
-    out
-}
-
 pub fn apply_job_guarded_with(
     job: &SingleTargetJob,
     plan: &Plan,
@@ -216,21 +194,17 @@ pub fn apply_job_guarded_with_consent_classified(
     let sv = match resolve_root(&configuration.source) {
         Ok(v) => v,
         Err(e) => {
-            return super::super::ApplyExecution::rejected(finish_apply(
-                ctx,
-                t0,
-                refuse_apply(ctx, ops.len(), "resolve-roots", e.to_string()),
-            ))
+            return super::super::ApplyExecution::rejected(
+                refuse_apply(ctx, ops.len(), "resolve-roots", e.to_string()).finish(ctx, t0),
+            )
         }
     };
     let tv = match resolve_root(job.target()) {
         Ok(v) => v,
         Err(e) => {
-            return super::super::ApplyExecution::rejected(finish_apply(
-                ctx,
-                t0,
-                refuse_apply(ctx, ops.len(), "resolve-roots", e.to_string()),
-            ))
+            return super::super::ApplyExecution::rejected(
+                refuse_apply(ctx, ops.len(), "resolve-roots", e.to_string()).finish(ctx, t0),
+            )
         }
     };
     apply_resolved_with_consent_classified(
@@ -346,7 +320,7 @@ pub fn apply_resolved_with_consent_classified(
                 root_label(tv)
             ),
         );
-        return super::super::ApplyExecution::rejected(finish_apply(ctx, t0, out));
+        return super::super::ApplyExecution::rejected(out.finish(ctx, t0));
     }
     // Write-side capability report: gaps listed BEFORE anything is touched
     {
@@ -374,7 +348,7 @@ pub fn apply_resolved_with_consent_classified(
                     .collect::<Vec<_>>()
                     .join("; "),
             );
-            return super::super::ApplyExecution::rejected(finish_apply(ctx, t0, out));
+            return super::super::ApplyExecution::rejected(out.finish(ctx, t0));
         }
         let acks = wr.needs_ack();
         if !wr.consent_satisfied(
@@ -397,7 +371,7 @@ pub fn apply_resolved_with_consent_classified(
                     acks.iter().map(|i| i.render()).collect::<Vec<_>>().join("\n  ")
                 ),
                 );
-            return super::super::ApplyExecution::rejected(finish_apply(ctx, t0, out));
+            return super::super::ApplyExecution::rejected(out.finish(ctx, t0));
         }
     }
     let verdict =
@@ -420,7 +394,7 @@ pub fn apply_resolved_with_consent_classified(
             bytes_copied: 0,
             cancelled: false,
         };
-        return super::super::ApplyExecution::rejected(finish_apply(ctx, t0, out));
+        return super::super::ApplyExecution::rejected(out.finish(ctx, t0));
     }
     let ap = apply::apply_vfs(ops, sv, tv, &job.apply_opts(trash, verbose), ctx);
     let mut out = ApplyOutcome {
@@ -441,5 +415,5 @@ pub fn apply_resolved_with_consent_classified(
             out.errors += 1;
         }
     }
-    super::super::ApplyExecution::started(finish_apply(ctx, t0, out))
+    super::super::ApplyExecution::started(out.finish(ctx, t0))
 }

@@ -1,8 +1,9 @@
 //! Moving the run-log directory when `settings.log_dir` changes.
 //!
-//! Split out of `settings` because it is a cross-volume directory mover, not configuration: it was
-//! 127 of that module's 261 production lines and shared nothing with them but the field that
-//! triggers it.
+//! It moves run history, so it belongs to run history. It sat under `store` as `migrate.rs`, next
+//! to schema migrations it has nothing to do with — this changes no format and reads no record; it
+//! relocates directories. The name mattered too: four unrelated things in this repository are
+//! called "migration", and only the other three are about schemas.
 //!
 //! Best-effort throughout, and never destructive: a run directory whose name already exists on the
 //! far side is skipped rather than overwritten, because the two are different machines' histories

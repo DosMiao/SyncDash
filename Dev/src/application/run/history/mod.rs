@@ -10,6 +10,7 @@ mod migration;
 mod model;
 mod paths;
 mod recording;
+mod relocation;
 mod repository;
 mod retention;
 mod storage;
@@ -19,6 +20,7 @@ pub use model::{
 };
 pub use paths::logs_dir;
 pub use recording::{compare_summary, Recorder};
+pub use relocation::{migrate_log_dir, MigrateReport};
 pub use repository::{
     artifact_lines, history, history_merged, history_merged_for_registered_job, latest_by_job,
     with_validated_reveal_target,

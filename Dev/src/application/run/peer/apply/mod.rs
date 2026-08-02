@@ -10,7 +10,6 @@ use crate::model::plan::{Op, Plan};
 pub(super) use self::classification::classify_peer_completion;
 use self::execution::apply_peer_inner;
 use self::policy::enforce_apply_capabilities;
-use super::controller::emit_apply_summary;
 
 pub use policy::{apply_capabilities, preflight_peer_job};
 
@@ -69,6 +68,6 @@ pub fn apply_peer_job_with_classified(
             ..Default::default()
         },
     };
-    emit_apply_summary(ctx, t0, terminal);
+    terminal.finish(ctx, t0);
     classify_peer_completion(writes_started, r)
 }

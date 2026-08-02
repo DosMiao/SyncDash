@@ -5,7 +5,7 @@ use super::authorization::grant::SettingsAuthority;
 
 pub(crate) struct SavedSettings {
     pub(crate) snapshot: syncdash::store::settings::AppSettingsSnapshot,
-    pub(crate) migration: syncdash::store::migrate::MigrateReport,
+    pub(crate) migration: syncdash::run::history::MigrateReport,
 }
 
 pub(crate) fn save(
@@ -40,9 +40,9 @@ pub(crate) fn save(
     let saved_snapshot = update.snapshot.clone();
     let switched = app_log.reconfigure_after(&new_dir, settings.level, || {
         if old_dir != new_dir {
-            syncdash::store::migrate::migrate_log_dir(&old_dir, &new_dir)
+            syncdash::run::history::migrate_log_dir(&old_dir, &new_dir)
         } else {
-            syncdash::store::migrate::MigrateReport::default()
+            syncdash::run::history::MigrateReport::default()
         }
     });
     let migration = match switched {
