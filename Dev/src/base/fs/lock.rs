@@ -461,7 +461,7 @@ impl RootLock {
                 ledger_id: anchor.ledger_id.clone(),
                 generation,
                 owner_id: super::vfs::random_name_token().map_err(std::io::Error::from)?,
-                host: crate::model::table::host_name(),
+                host: crate::foundation::machine::host_name(),
                 pid: std::process::id(),
                 started_ms: crate::foundation::time::now_ms(),
             };

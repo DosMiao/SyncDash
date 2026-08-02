@@ -490,16 +490,6 @@ pub fn roll_generations(fresh: &mut [ObservedEntry], old: &[ObservedEntry]) {
     }
 }
 
-pub fn os_name() -> String {
-    std::env::consts::OS.to_string()
-}
-
-pub fn host_name() -> String {
-    hostname::get()
-        .map(|host| host.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "unknown".into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

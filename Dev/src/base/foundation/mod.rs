@@ -6,8 +6,10 @@
 pub mod dirs;
 pub mod disk;
 pub mod fmt;
+pub mod machine;
 pub mod names;
 pub mod path;
 pub mod text;
 pub mod thread;
 pub mod time;
+pub mod volume;

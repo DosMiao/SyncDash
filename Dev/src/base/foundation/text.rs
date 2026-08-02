@@ -22,19 +22,6 @@ pub fn fold(p: &str) -> String {
     norm_key(p, true)
 }
 
-/// Hostname → a form safe inside a filename (anything that is not alphanumeric or `-` becomes `-`).
-pub fn safe_host(host: &str) -> String {
-    host.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,14 +55,5 @@ mod tests {
         for s in ["A/b.TXT", NFC_E, NFD_E, "", "混合Case"] {
             assert_eq!(fold(s), norm_key(s, true));
         }
-    }
-
-    #[test]
-    fn host_becomes_filename_safe() {
-        assert_eq!(safe_host("WIN01"), "WIN01");
-        assert_eq!(safe_host("my.host:2222"), "my-host-2222");
-        // Fixture data: the assertion is that non-ASCII host characters each collapse
-        // to '-'. An ASCII input would map to itself and assert nothing.
-        assert_eq!(safe_host("主机"), "--");
     }
 }

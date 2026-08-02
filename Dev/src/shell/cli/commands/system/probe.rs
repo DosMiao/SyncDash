@@ -10,7 +10,7 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
                 "schema": table::TABLE_SCHEMA,
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,
-                "host": table::host_name(),
+                "host": syncdash::foundation::machine::host_name(),
                 "exe": std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned()),
                 "jobs_dir": syncdash::foundation::dirs::jobs_dir().to_string_lossy().into_owned(),
             });

@@ -208,7 +208,7 @@ pub fn compare_resolved_with_consent(
     // this is a filesystem identity (`st_dev`/volume root), not a claim about the physical disk.
     let same_local_volume = match (sv.local_root(), tv.local_root()) {
         (Some(source), Some(target)) => {
-            crate::fs::vfs::local::same_device(source.display_path(), target.display_path())
+            crate::foundation::volume::same_device(source.display_path(), target.display_path())
         }
         _ => false,
     };

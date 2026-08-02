@@ -229,7 +229,7 @@ pub(crate) fn pack_to_open_file(
         schema: PACK_SCHEMA,
         pack_version: PACK_VERSION,
         created_ms: now_ms(),
-        source_host: crate::model::table::host_name(),
+        source_host: crate::foundation::machine::host_name(),
         source_os: std::env::consts::OS.to_string(),
         target_root_hint: plan.header.target_root.clone(),
         op_count: target_ops.len() as u64,

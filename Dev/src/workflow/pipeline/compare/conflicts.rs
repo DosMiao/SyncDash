@@ -1,8 +1,8 @@
 //! Conflict-copy identity and naming rules.
 
+use crate::foundation::machine::safe_host;
 use crate::foundation::names::CONFLICT_INFIX;
 use crate::foundation::path::{base_name, split_ext, split_parent};
-use crate::foundation::text::safe_host;
 use crate::foundation::time::stamp_compact;
 
 /// Conflict-copy name: `report.pdf` → `report.sync-conflict-20260726-143000-WIN01.pdf`.

@@ -184,7 +184,7 @@ fn case_for_fs(fs_name: &str) -> CaseSense {
 /// the complete old file off the removable disk. In-root retention is both safer and faster there.
 fn central_trash_reaches(root: &Path, medium: Medium) -> bool {
     !matches!(medium, Medium::NetworkShare | Medium::Unknown)
-        && same_device(root, &crate::foundation::dirs::data_dir())
+        && crate::foundation::volume::same_device(root, &crate::foundation::dirs::data_dir())
 }
 
 fn scan_streams(volume: &Volume) -> usize {
@@ -208,80 +208,6 @@ fn scan_streams(volume: &Volume) -> usize {
         }
     };
     crate::foundation::thread::configured_worker_limit().map_or(base, |limit| base.min(limit))
-}
-
-#[cfg(unix)]
-pub fn same_device(left: &Path, right: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    fn device(path: &Path) -> Option<u64> {
-        let mut candidate = Some(path);
-        while let Some(path) = candidate {
-            match std::fs::metadata(path) {
-                Ok(metadata) => return Some(metadata.dev()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    candidate = path.parent();
-                }
-                Err(_) => return None,
-            }
-        }
-        None
-    }
-
-    matches!((device(left), device(right)), (Some(left), Some(right)) if left == right)
-}
-
-#[cfg(windows)]
-pub fn same_device(left: &Path, right: &Path) -> bool {
-    match (
-        win_root_of(&left.to_string_lossy()),
-        win_root_of(&right.to_string_lossy()),
-    ) {
-        (WinRoot::Drive(left), WinRoot::Drive(right))
-        | (WinRoot::Share(left), WinRoot::Share(right)) => left.eq_ignore_ascii_case(&right),
-        _ => false,
-    }
-}
-
-/// The volume root Windows' volume APIs want, derived from a root path.
-///
-/// `GetDriveTypeW` and `GetVolumeInformationW` both take a volume root with a trailing backslash
-/// and nothing deeper. Kept pure so the spellings — UNC, extended-length, bare drive — are
-/// testable without those volumes existing.
-#[cfg(any(windows, test))]
-#[derive(Debug, PartialEq, Eq)]
-enum WinRoot {
-    /// `D:\` — the drive type has to be asked for.
-    Drive(String),
-    /// `\\host\share\` — reached over the network by construction, no call needed.
-    Share(String),
-    Unknown,
-}
-
-#[cfg(any(windows, test))]
-fn win_root_of(path: &str) -> WinRoot {
-    let s = path.replace('/', "\\");
-    // Extended-length prefixes bypass Win32 path parsing but name the same volumes.
-    let s = if let Some(r) = s.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{r}")
-    } else if let Some(r) = s.strip_prefix(r"\\?\") {
-        r.to_string()
-    } else {
-        s
-    };
-    if let Some(rest) = s.strip_prefix(r"\\") {
-        let mut seg = rest.splitn(3, '\\');
-        let (host, share) = (seg.next().unwrap_or(""), seg.next().unwrap_or(""));
-        if host.is_empty() || share.is_empty() {
-            return WinRoot::Unknown;
-        }
-        return WinRoot::Share(format!(r"\\{host}\{share}\"));
-    }
-    let b = s.as_bytes();
-    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
-        return WinRoot::Drive(format!("{}:\\", (b[0] as char).to_ascii_uppercase()));
-    }
-    WinRoot::Unknown
 }
 
 /// `GetDriveTypeW`'s return values. A CD-ROM counts as removable: what matters downstream is
@@ -317,10 +243,10 @@ fn probe(root: &Path) -> Volume {
     }
     const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
 
-    let (vol_root, shape) = match win_root_of(&root.to_string_lossy()) {
-        WinRoot::Drive(d) => (d, Medium::Unknown),
-        WinRoot::Share(s) => (s, Medium::NetworkShare),
-        WinRoot::Unknown => return Volume::unknown(),
+    let (vol_root, shape) = match crate::foundation::volume::win_root_of(&root.to_string_lossy()) {
+        crate::foundation::volume::WinRoot::Drive(d) => (d, Medium::Unknown),
+        crate::foundation::volume::WinRoot::Share(s) => (s, Medium::NetworkShare),
+        crate::foundation::volume::WinRoot::Unknown => return Volume::unknown(),
     };
     let wide: Vec<u16> = std::ffi::OsStr::new(&vol_root)
         .encode_wide()
@@ -783,40 +709,6 @@ mod volume_tests {
     use super::*;
 
     #[test]
-    fn a_unc_root_is_a_share_whatever_the_spelling() {
-        assert_eq!(
-            win_root_of(r"\\nas\photos\2026"),
-            WinRoot::Share(r"\\nas\photos\".into())
-        );
-        assert_eq!(
-            win_root_of(r"\\nas\photos"),
-            WinRoot::Share(r"\\nas\photos\".into())
-        );
-        // The extended-length UNC spelling names the same share
-        assert_eq!(
-            win_root_of(r"\\?\UNC\nas\photos\sub"),
-            WinRoot::Share(r"\\nas\photos\".into())
-        );
-        // A host with no share names no volume — better Unknown than a wrong guess
-        assert_eq!(win_root_of(r"\\nas"), WinRoot::Unknown);
-    }
-
-    #[test]
-    fn a_drive_root_survives_every_spelling() {
-        assert_eq!(win_root_of(r"D:\Code\x"), WinRoot::Drive(r"D:\".into()));
-        assert_eq!(win_root_of("D:/Code/x"), WinRoot::Drive(r"D:\".into()));
-        assert_eq!(win_root_of("d:/code"), WinRoot::Drive(r"D:\".into()));
-        assert_eq!(win_root_of("D:"), WinRoot::Drive(r"D:\".into()));
-        // \\?\ is a parsing escape, not a different volume
-        assert_eq!(
-            win_root_of(r"\\?\D:\very\long"),
-            WinRoot::Drive(r"D:\".into())
-        );
-        // A relative root names no volume
-        assert_eq!(win_root_of("relative/dir"), WinRoot::Unknown);
-    }
-
-    #[test]
     fn drive_types_map_to_media() {
         assert_eq!(medium_for_win_drive_type(3), Medium::FixedDisk);
         assert_eq!(medium_for_win_drive_type(4), Medium::NetworkShare);
@@ -909,7 +801,8 @@ mod volume_tests {
     #[test]
     fn the_central_trash_is_claimed_only_for_the_same_physical_volume() {
         let root = std::env::temp_dir();
-        let same_volume = same_device(&root, &crate::foundation::dirs::data_dir());
+        let same_volume =
+            crate::foundation::volume::same_device(&root, &crate::foundation::dirs::data_dir());
         assert_eq!(central_trash_reaches(&root, Medium::FixedDisk), same_volume);
         assert_eq!(
             central_trash_reaches(&root, Medium::RemovableDisk),
@@ -930,7 +823,10 @@ mod volume_tests {
         );
         assert_eq!(
             caps.local_trash,
-            same_device(&std::env::temp_dir(), &crate::foundation::dirs::data_dir())
+            crate::foundation::volume::same_device(
+                &std::env::temp_dir(),
+                &crate::foundation::dirs::data_dir(),
+            )
         );
         // Probing twice must not re-probe or disagree with itself
         assert_eq!(v.volume(), v.volume());
@@ -951,15 +847,5 @@ mod volume_tests {
         assert!((1..=8).contains(&scan_streams(&exfat)));
         assert!((1..=4).contains(&scan_streams(&network)));
         assert!(!file_ids_stable_for_fs(&exfat.fs_name));
-    }
-
-    #[test]
-    fn nested_roots_are_recognized_as_the_same_device() {
-        let root = std::env::temp_dir().join(format!("syncdash-device-{}", std::process::id()));
-        let nested = root.join("nested");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&nested).unwrap();
-        assert!(same_device(&root, &nested));
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

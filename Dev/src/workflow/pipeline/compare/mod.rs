@@ -18,7 +18,7 @@ mod policy;
 
 pub use conflicts::{conflict_name, is_conflict_copy};
 pub use planning::compare;
-pub use policy::{CompareOptions, ConflictPolicy};
+pub use policy::{CompareOptions, ConflictPolicy, MTIME_SLACK_MS};
 
 #[cfg(test)]
 mod tests;

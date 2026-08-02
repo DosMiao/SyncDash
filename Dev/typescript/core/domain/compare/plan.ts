@@ -36,7 +36,8 @@ export const SORT_LABEL: Record<SortKey, string> = {
   reason: 'reason',
 };
 
-/// Same value as `MTIME_SLACK_MS` on the Rust side: FAT/SMB timestamp granularity.
+/// Same value as `pipeline::compare::policy::MTIME_SLACK_MS` on the Rust side: FAT/SMB
+/// timestamp granularity. Presentation only — the engine's own comparison already applied it.
 export const MTIME_SLACK_MS = 2000;
 
 // Materialize and cache reversals only for requested rows; eager copies duplicate large plan graphs.

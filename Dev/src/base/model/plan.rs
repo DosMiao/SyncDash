@@ -10,8 +10,6 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const MTIME_SLACK_MS: i64 = 2000;
-
 /// The plan file format's own version, distinct from `table::TABLE_SCHEMA` — a plan and a snapshot are
 /// different artifacts and have no reason to move together. The header carried the table's number
 /// for want of one of its own, and nothing read it back, so the field was decoration.

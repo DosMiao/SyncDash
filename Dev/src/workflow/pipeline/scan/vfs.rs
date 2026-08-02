@@ -400,7 +400,7 @@ pub(super) fn scan_vfs(
             schema: TABLE_SCHEMA,
             kind: TableKind::Snapshot,
             root: vfs.display(),
-            host: crate::model::table::host_name(),
+            host: crate::foundation::machine::host_name(),
             os: caps.protocol.to_string(),
             scanned_at_ms: started,
             duration_ms: t0.elapsed().as_millis() as u64,
