@@ -209,32 +209,17 @@ impl SmbBackend {
         }
     }
 
-    /// The FFS defense, same as the sftp backend: a not-found answer only becomes *confirmed*
-    /// absence once the parent has been listed and really does not carry the name. Anything
-    /// else — including a listing we cannot obtain — is `Transient`, because a transient fault
-    /// reported as a deletion is the one failure mode this tool exists not to have.
+    /// Absence is confirmed by [`super::absence::confirm_absent`]; this backend supplies only
+    /// its own parent listing.
     fn confirm_absent(&self, rel: &str) -> VfsResult<()> {
-        let (parent, name) = crate::foundation::path::split_parent(rel);
-        let parent = parent.trim_end_matches('/');
-        match self.read_dir(parent) {
-            Ok(entries) => {
-                if entries.iter().any(|e| e.name.as_str() == name) {
-                    return Err(VfsError::new(
-                        VfsErrorKind::Transient,
-                        format!(
-                            "the server reported '{rel}' missing but its parent still lists it — treating as a temporary fault, not a deletion"
-                        ),
-                    ));
-                }
-                Ok(())
-            }
-            // Parent gone too: the absence stands on its own.
-            Err(e) if e.kind == VfsErrorKind::NotFound => Ok(()),
-            Err(e) => Err(VfsError::new(
-                VfsErrorKind::Transient,
-                format!("cannot confirm '{rel}' is really absent (parent listing failed: {e})"),
-            )),
-        }
+        super::absence::confirm_absent(rel, |parent| {
+            self.read_dir(parent).map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| entry.name.as_str().to_owned())
+                    .collect()
+            })
+        })
     }
 }
 
