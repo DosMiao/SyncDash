@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "progress-window",
+  "description": "Apply-progress controls and the minimum UI APIs used by the progress window",
+  "windows": ["progress"],
+  "permissions": [
+    "progress-commands",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:window:allow-set-title",
+    "core:window:allow-set-progress-bar",
+    "core:webview:allow-set-webview-zoom"
+  ]
+}

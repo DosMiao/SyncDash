@@ -1,96 +1,123 @@
-//! Run history, log artifacts, and application settings.
+use std::sync::Arc;
 
-/// M4: run history (newest → oldest). job = null shows everything
-#[tauri::command]
-pub fn run_history(
-    job: Option<String>,
-    limit: Option<usize>,
-) -> Vec<syncdash::obs::runlog::RunRecord> {
-    syncdash::obs::runlog::history(job.as_deref(), limit.unwrap_or(50))
+use tauri_plugin_dialog::DialogExt;
+
+use crate::dto::{LogDirectorySelectionDto, SettingsSaveDto, SettingsSnapshotDto};
+use crate::run_lifecycle::RunLifecycle;
+use crate::settings_authority::SettingsAuthority;
+use crate::window_role::{require_window_role, WindowRole};
+
+const RUN_HISTORY_LIMIT: usize = 100;
+const LOG_ARTIFACT_LINE_LIMIT: usize = 5_000;
+
+fn authorize_log_directory_change(
+    previous: &syncdash::store::settings::AppSettings,
+    next: &syncdash::store::settings::AppSettings,
+    expected_revision: &str,
+    grant_id: Option<&str>,
+    authority: &SettingsAuthority,
+) -> Result<(), String> {
+    let previous_directory = previous.wanted_log_dir();
+    let next_directory = next.wanted_log_dir();
+    if previous_directory == next_directory
+        || next_directory == syncdash::store::settings::default_log_dir()
+    {
+        return Ok(());
+    }
+    let grant_id = grant_id.ok_or_else(|| {
+        "Changing the log directory requires a fresh selection from the native picker".to_string()
+    })?;
+    authority.consume_log_directory_grant(grant_id, expected_revision, &next_directory)
 }
 
-/// M4: the most recent run per job — the data behind the sidebar's "last sync" dot
 #[tauri::command]
-pub fn last_syncs() -> std::collections::HashMap<String, syncdash::obs::runlog::RunRecord> {
-    syncdash::obs::runlog::latest_by_job()
+pub fn latest_run_records(
+    window: tauri::WebviewWindow,
+) -> Result<Vec<syncdash::obs::runlog::LatestRunRecord>, String> {
+    require_window_role(&window, WindowRole::Main)?;
+    syncdash::obs::runlog::latest_by_job().map_err(|error| error.to_string())
 }
 
-/// M4: the detail lines of one run (raw JSONL; line count capped)
-#[tauri::command]
-pub fn run_detail(detail: String) -> Vec<String> {
-    syncdash::obs::runlog::detail_lines(&detail, 2000)
-}
-
-// v0.10: centralized logging and app settings
-/// The run list. Unlike `run_history`, this one also folds in **interrupted runs** (the ones missing
-/// from the index that left only a directory behind) — the crashed run is exactly the one worth seeing.
+/// Include interrupted runs that have a directory but no final index entry; they are the runs whose
+/// evidence is most important to retain.
 #[tauri::command]
 pub fn log_runs(
-    job: Option<String>,
-    limit: Option<usize>,
-) -> Vec<syncdash::obs::runlog::RunRecord> {
-    syncdash::obs::runlog::history_merged(job.as_deref(), limit.unwrap_or(100))
+    window: tauri::WebviewWindow,
+    job_id: Option<String>,
+) -> Result<Vec<syncdash::obs::runlog::RunRecord>, String> {
+    require_window_role(&window, WindowRole::Main)?;
+    syncdash::obs::runlog::history_merged_for_registered_job(job_id.as_deref(), RUN_HISTORY_LIMIT)
+        .map_err(|error| error.to_string())
 }
 
-/// One artifact of a run (which ∈ run / errors / items / plan / summary).
-/// Line count capped: the apply manifest records everything, one large sync runs to tens of thousands of lines, and shipping all of it over IPC would freeze the UI.
+/// Apply manifests can contain tens of thousands of lines, so the server fixes the IPC memory bound.
 #[tauri::command]
-pub fn log_artifact(run_id: String, which: String, max: Option<usize>) -> Vec<String> {
-    syncdash::obs::runlog::artifact_lines(&run_id, &which, max.unwrap_or(5000))
-}
-
-/// The log root directory (the "open folder" button hands it to the existing `reveal`)
-#[tauri::command]
-pub fn log_dir_path(run_id: Option<String>) -> Result<String, String> {
-    syncdash::obs::runlog::log_path(run_id.as_deref()).map(|path| path.display().to_string())
-}
-
-/// Events outside of a run (startup, settings errors, prune, migration). Returns the last n lines.
-#[tauri::command]
-pub fn app_log_tail(n: Option<usize>) -> Vec<String> {
-    let n = n.unwrap_or(500);
-    let p = syncdash::obs::runlog::logs_dir().join(syncdash::foundation::names::APP_LOG_FILE);
-    let Ok(text) = std::fs::read_to_string(p) else {
-        return Vec::new();
-    };
-    let lines: Vec<&str> = text.lines().collect();
-    lines
-        .iter()
-        .rev()
-        .take(n)
-        .rev()
-        .map(|s| s.to_string())
-        .collect()
+pub fn log_artifact(
+    window: tauri::WebviewWindow,
+    record_id: String,
+    artifact: syncdash::obs::runlog::LogArtifactKind,
+) -> Result<Vec<String>, String> {
+    require_window_role(&window, WindowRole::Main)?;
+    syncdash::obs::runlog::artifact_lines(&record_id, artifact, LOG_ARTIFACT_LINE_LIMIT)
 }
 
 #[tauri::command]
-pub fn get_settings() -> syncdash::store::settings::AppSettings {
-    syncdash::store::settings::load()
+pub fn reveal_log_location(
+    window: tauri::WebviewWindow,
+    record_id: Option<String>,
+) -> Result<(), String> {
+    require_window_role(&window, WindowRole::Main)?;
+    syncdash::obs::runlog::with_validated_reveal_target(
+        record_id.as_deref(),
+        crate::cmd::shell::reveal_path,
+    )
 }
 
-/// Save settings. `migrate` = move the whole old directory over when the log directory changes.
-///
-/// The old location must be resolved **before** the new config is written — ask afterwards and you only get the new value.
+#[tauri::command]
+pub fn get_settings(window: tauri::WebviewWindow) -> Result<SettingsSnapshotDto, String> {
+    require_window_role(&window, WindowRole::Main)?;
+    Ok(syncdash::store::settings::load_snapshot().into())
+}
+
 #[tauri::command]
 pub fn save_settings(
+    window: tauri::WebviewWindow,
     settings: syncdash::store::settings::AppSettings,
-    migrate: bool,
-    run_lifecycle: tauri::State<'_, std::sync::Arc<crate::run_lifecycle::RunLifecycle>>,
-    app_log: tauri::State<'_, std::sync::Arc<syncdash::obs::logging::AppLogSink>>,
-) -> Result<syncdash::store::migrate::MigrateReport, String> {
+    expected_revision: String,
+    log_directory_grant: Option<String>,
+    settings_authority: tauri::State<'_, Arc<SettingsAuthority>>,
+    run_lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
+    app_log: tauri::State<'_, Arc<syncdash::obs::logging::AppLogSink>>,
+) -> Result<SettingsSaveDto, String> {
+    require_window_role(&window, WindowRole::Main)?;
     run_lifecycle.with_idle_mutation("Changing log settings", || {
         settings.validate()?;
-        let previous = syncdash::store::settings::load();
+        let previous = syncdash::store::settings::load_snapshot();
+        if previous.revision != expected_revision {
+            return Err(format!(
+                "Settings changed on disk (expected revision {expected_revision}, found {}) — reload before saving",
+                previous.revision
+            ));
+        }
         let old_dir = app_log.directory();
         let new_dir = settings.wanted_log_dir();
+        authorize_log_directory_change(
+            &previous.settings,
+            &settings,
+            &expected_revision,
+            log_directory_grant.as_deref(),
+            &settings_authority,
+        )?;
         syncdash::obs::logging::AppLogSink::validate_target(&new_dir, settings.level).map_err(
             |error| {
                 format!("The new log directory is unusable; settings were not changed: {error}")
             },
         )?;
-        syncdash::store::settings::save(&settings).map_err(|error| error.to_string())?;
+        let update = syncdash::store::settings::save_if_revision(&settings, &expected_revision)
+            .map_err(|error| error.to_string())?;
+        let saved_snapshot = update.snapshot.clone();
         let switched = app_log.reconfigure_after(&new_dir, settings.level, || {
-            if migrate && old_dir != new_dir {
+            if old_dir != new_dir {
                 syncdash::store::migrate::migrate_log_dir(&old_dir, &new_dir)
             } else {
                 syncdash::store::migrate::MigrateReport::default()
@@ -99,7 +126,7 @@ pub fn save_settings(
         let report = match switched {
             Ok(report) => report,
             Err(error) => {
-                return Err(match syncdash::store::settings::save(&previous) {
+                return Err(match update.rollback() {
                     Ok(_) => format!(
                         "The new log directory became unusable; settings were restored, but migrated history may remain in the selected directory: {error}"
                     ),
@@ -109,13 +136,141 @@ pub fn save_settings(
                 });
             }
         };
-        let dropped = syncdash::obs::runlog::prune(settings.keep_days, settings.max_total_mb);
+        let dropped = syncdash::obs::runlog::prune(settings.keep_days, settings.max_total_mb)
+            .map_err(|error| format!("Log cleanup failed: {error}"))?;
         if dropped > 0 {
             syncdash::log_info!(
                 "settings",
                 "Log cleanup: removed the records of {dropped} runs"
             );
         }
-        Ok(report)
+        Ok(SettingsSaveDto {
+            snapshot: saved_snapshot.into(),
+            migration: report,
+        })
     })
+}
+
+#[tauri::command]
+pub async fn pick_log_directory(
+    window: tauri::WebviewWindow,
+    expected_revision: String,
+    settings_authority: tauri::State<'_, Arc<SettingsAuthority>>,
+) -> Result<Option<LogDirectorySelectionDto>, String> {
+    require_window_role(&window, WindowRole::Main)?;
+    let snapshot = syncdash::store::settings::load_snapshot();
+    if snapshot.revision != expected_revision {
+        return Err(format!(
+            "Settings changed on disk (expected revision {expected_revision}, found {}) — reload before choosing a log directory",
+            snapshot.revision
+        ));
+    }
+
+    let (sender, mut receiver) = tauri::async_runtime::channel(1);
+    window
+        .dialog()
+        .file()
+        .set_title("Select a log directory")
+        .set_directory(snapshot.settings.wanted_log_dir())
+        .pick_folder(move |selection| {
+            let _ = sender.try_send(selection);
+        });
+    let selected = receiver.recv().await.ok_or_else(|| {
+        "The native directory picker closed without reporting a result".to_string()
+    })?;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let directory = selected
+        .into_path()
+        .map_err(|error| format!("The selected log location is not a filesystem path: {error}"))?;
+    let latest = syncdash::store::settings::load_snapshot();
+    if latest.revision != expected_revision {
+        return Err(format!(
+            "Settings changed while the directory picker was open (expected revision {expected_revision}, found {}) — reload before choosing it again",
+            latest.revision
+        ));
+    }
+    let is_default = directory == syncdash::store::settings::default_log_dir();
+    let directory_text = if is_default {
+        String::new()
+    } else {
+        directory
+            .to_str()
+            .ok_or_else(|| {
+                "The selected log directory cannot be represented in the settings file".to_string()
+            })?
+            .to_string()
+    };
+    let grant_id = if is_default || directory == latest.settings.wanted_log_dir() {
+        None
+    } else {
+        Some(settings_authority.issue_log_directory_grant(&expected_revision, directory)?)
+    };
+    Ok(Some(LogDirectorySelectionDto {
+        directory: directory_text,
+        grant_id,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings_at(directory: &str) -> syncdash::store::settings::AppSettings {
+        syncdash::store::settings::AppSettings {
+            log_dir: directory.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unchanged_and_default_log_locations_need_no_renderer_grant() {
+        let authority = SettingsAuthority::default();
+        let custom = settings_at("/selected/logs");
+        assert!(
+            authorize_log_directory_change(&custom, &custom, "revision", None, &authority,).is_ok()
+        );
+        assert!(authorize_log_directory_change(
+            &custom,
+            &syncdash::store::settings::AppSettings::default(),
+            "revision",
+            None,
+            &authority,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_changed_custom_log_location_consumes_an_exact_picker_grant() {
+        let authority = SettingsAuthority::default();
+        let previous = settings_at("/old/logs");
+        let next = settings_at("/selected/logs");
+        assert!(
+            authorize_log_directory_change(&previous, &next, "revision", None, &authority,)
+                .unwrap_err()
+                .contains("native picker")
+        );
+
+        let directory = next.wanted_log_dir();
+        let grant = authority
+            .issue_log_directory_grant("revision", directory)
+            .unwrap();
+        assert!(authorize_log_directory_change(
+            &previous,
+            &next,
+            "revision",
+            Some(&grant),
+            &authority,
+        )
+        .is_ok());
+        assert!(authorize_log_directory_change(
+            &previous,
+            &next,
+            "revision",
+            Some(&grant),
+            &authority,
+        )
+        .is_err());
+    }
 }

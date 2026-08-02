@@ -14,6 +14,30 @@ use tauri::Emitter;
 use syncdash::model::event::{Phase, ProgressEvent};
 use syncdash::obs::progress::{ProgressSink, RunCtl, RunCtx};
 
+use crate::window_role::{MAIN_WINDOW_LABEL, PROGRESS_WINDOW_LABEL};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunEventAudience {
+    Compare,
+    Apply,
+}
+
+impl RunEventAudience {
+    const fn purpose(self) -> &'static str {
+        match self {
+            Self::Compare => "compare",
+            Self::Apply => "apply",
+        }
+    }
+
+    const fn window_label(self) -> &'static str {
+        match self {
+            Self::Compare => MAIN_WINDOW_LABEL,
+            Self::Apply => PROGRESS_WINDOW_LABEL,
+        }
+    }
+}
+
 /// The run-progress payload sent to the frontend: run_id lets the frontend drop late events from a cancelled run;
 /// purpose separates compare from apply — the sub-window only accepts apply (otherwise the automatic re-check compare
 /// after a sync would hijack the open result window into a forever-spinning "comparing"), the main panel only accepts compare.
@@ -179,7 +203,7 @@ pub(crate) struct TauriSink {
     app: tauri::AppHandle,
     events: Arc<RunEventRepository>,
     run_id: u64,
-    purpose: &'static str,
+    audience: RunEventAudience,
     throttle: ProgressThrottle,
 }
 
@@ -190,8 +214,10 @@ impl ProgressSink for TauriSink {
                 return;
             }
         }
-        let event = self.events.record(self.run_id, self.purpose, ev);
-        let _ = self.app.emit("run-progress", event);
+        let event = self.events.record(self.run_id, self.audience.purpose(), ev);
+        let _ = self
+            .app
+            .emit_to(self.audience.window_label(), "run-progress", event);
     }
 }
 
@@ -200,7 +226,7 @@ pub(crate) fn make_ctx(
     events: Arc<RunEventRepository>,
     run_id: u64,
     ctl: Arc<RunCtl>,
-    purpose: &'static str,
+    audience: RunEventAudience,
 ) -> RunCtx {
     RunCtx::new(
         ctl,
@@ -208,7 +234,7 @@ pub(crate) fn make_ctx(
             app: app.clone(),
             events,
             run_id,
-            purpose,
+            audience,
             throttle: ProgressThrottle::default(),
         }),
     )

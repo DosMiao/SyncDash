@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::autoscan::{AutoApplyTicket, AutoScanComparePermit};
 use crate::compare_results::CompareScope;
-use crate::dto::{CompareIdentity, SelectedRowDto};
+use crate::dto::{CompareIdentity, ReviewedRowDecisionDto};
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(10 * 60);
 const AUTHORIZATION_TTL: Duration = Duration::from_secs(2 * 60);
@@ -125,29 +125,29 @@ impl CompareAuthorization {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ExactSelection {
-    selected_rows: Vec<SelectedRowDto>,
-    selection_digest: String,
+pub(crate) struct ExactReviewedDecisions {
+    reviewed_row_decisions: Vec<ReviewedRowDecisionDto>,
+    decisions_digest: String,
 }
 
-impl ExactSelection {
-    pub(crate) fn new(selected_rows: Vec<SelectedRowDto>) -> Result<Self, String> {
-        if selected_rows.is_empty() {
-            return Err("An Apply authorization must bind at least one selected operation".into());
+impl ExactReviewedDecisions {
+    pub(crate) fn new(reviewed_row_decisions: Vec<ReviewedRowDecisionDto>) -> Result<Self, String> {
+        if reviewed_row_decisions.is_empty() {
+            return Err("An Apply authorization must bind at least one included difference".into());
         }
-        let selection_digest = selection_digest(&selected_rows)?;
+        let decisions_digest = reviewed_row_decisions_digest(&reviewed_row_decisions)?;
         Ok(Self {
-            selected_rows,
-            selection_digest,
+            reviewed_row_decisions,
+            decisions_digest,
         })
     }
 
-    pub(crate) fn rows(&self) -> &[SelectedRowDto] {
-        &self.selected_rows
+    pub(crate) fn decisions(&self) -> &[ReviewedRowDecisionDto] {
+        &self.reviewed_row_decisions
     }
 
     pub(crate) fn digest(&self) -> &str {
-        &self.selection_digest
+        &self.decisions_digest
     }
 }
 
@@ -155,7 +155,7 @@ impl ExactSelection {
 pub(crate) struct ApplyReview {
     compare_identity: CompareIdentity,
     plan_digest: String,
-    selection: ExactSelection,
+    reviewed_decisions: ExactReviewedDecisions,
     health_review_digest: String,
     capability_review_digest: String,
 }
@@ -164,7 +164,7 @@ impl ApplyReview {
     pub(crate) fn new(
         compare_identity: CompareIdentity,
         plan_digest: String,
-        selected_rows: Vec<SelectedRowDto>,
+        reviewed_row_decisions: Vec<ReviewedRowDecisionDto>,
         health_review_digest: String,
         capability_review_digest: String,
     ) -> Result<Self, String> {
@@ -179,7 +179,7 @@ impl ApplyReview {
         Ok(Self {
             compare_identity,
             plan_digest,
-            selection: ExactSelection::new(selected_rows)?,
+            reviewed_decisions: ExactReviewedDecisions::new(reviewed_row_decisions)?,
             health_review_digest,
             capability_review_digest,
         })
@@ -193,8 +193,8 @@ impl ApplyReview {
         &self.compare_identity
     }
 
-    pub(crate) fn selected_rows(&self) -> &[SelectedRowDto] {
-        self.selection.rows()
+    pub(crate) fn reviewed_row_decisions(&self) -> &[ReviewedRowDecisionDto] {
+        self.reviewed_decisions.decisions()
     }
 
     pub(crate) fn capability_review_digest(&self) -> &str {
@@ -208,10 +208,8 @@ impl ApplyReview {
         if self.plan_digest != current.plan_digest {
             return Err("The authorized plan changed — review Apply again".into());
         }
-        if self.selection.digest() != current.selection.digest() {
-            return Err(
-                "The authorized selected operation set changed — review Apply again".into(),
-            );
+        if self.reviewed_decisions.digest() != current.reviewed_decisions.digest() {
+            return Err("The authorized reviewed decisions changed — review Apply again".into());
         }
         if self.health_review_digest != current.health_review_digest {
             return Err("The plan health report changed — review Apply again".into());
@@ -795,36 +793,29 @@ fn touch_grant(grants: &mut VecDeque<GrantRecord>, index: usize) {
 }
 
 fn random_token() -> Result<String, String> {
-    let mut bytes = [0_u8; 32];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| format!("Cannot create an operation authorization: {error}"))?;
-    let mut token = String::with_capacity(bytes.len() * 2);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
-        token.push(HEX[(byte >> 4) as usize] as char);
-        token.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    Ok(token)
+    crate::authority_token::random_hex::<32>("Cannot create an operation authorization")
 }
 
 fn wall_expiry_ms(ttl: Duration) -> u64 {
     syncdash::foundation::time::now_ms().saturating_add(ttl.as_millis() as u64)
 }
 
-pub(crate) fn selection_digest(selected: &[SelectedRowDto]) -> Result<String, String> {
-    let mut normalized: Vec<(usize, bool)> = selected
+pub(crate) fn reviewed_row_decisions_digest(
+    reviewed_row_decisions: &[ReviewedRowDecisionDto],
+) -> Result<String, String> {
+    let mut normalized: Vec<(usize, bool)> = reviewed_row_decisions
         .iter()
-        .map(|decision| (decision.index, decision.flipped))
+        .map(|decision| (decision.index, decision.direction_reversed))
         .collect();
     normalized.sort_unstable();
     if normalized.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-        return Err("The selected action set contains a duplicate row".into());
+        return Err("The reviewed row decisions contain a duplicate index".into());
     }
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"syncdash-selected-decisions-v1\0");
-    for (index, flipped) in normalized {
+    hasher.update(b"syncdash-reviewed-row-decisions-v1\0");
+    for (index, direction_reversed) in normalized {
         hasher.update(&(index as u64).to_le_bytes());
-        hasher.update(&[u8::from(flipped)]);
+        hasher.update(&[u8::from(direction_reversed)]);
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -870,6 +861,7 @@ mod tests {
 
     fn identity() -> CompareIdentity {
         CompareIdentity {
+            result_id: "33333333333333333333333333333333".into(),
             compare_run_id: 9,
             job_id: "job-a".into(),
             config_revision: "revision-a".into(),
@@ -881,9 +873,9 @@ mod tests {
         ApplyReview::new(
             identity(),
             "plan-a".into(),
-            vec![SelectedRowDto {
+            vec![ReviewedRowDecisionDto {
                 index: 3,
-                flipped: true,
+                direction_reversed: true,
             }],
             "health-a".into(),
             "caps-a".into(),
@@ -892,38 +884,38 @@ mod tests {
     }
 
     #[test]
-    fn selection_and_digest_are_created_atomically() {
-        assert!(ExactSelection::new(Vec::new()).is_err());
-        assert!(ExactSelection::new(vec![
-            SelectedRowDto {
+    fn reviewed_decisions_and_digest_are_created_atomically() {
+        assert!(ExactReviewedDecisions::new(Vec::new()).is_err());
+        assert!(ExactReviewedDecisions::new(vec![
+            ReviewedRowDecisionDto {
                 index: 2,
-                flipped: false,
+                direction_reversed: false,
             },
-            SelectedRowDto {
+            ReviewedRowDecisionDto {
                 index: 2,
-                flipped: true,
+                direction_reversed: true,
             },
         ])
         .is_err());
-        let a = selection_digest(&[
-            SelectedRowDto {
+        let a = reviewed_row_decisions_digest(&[
+            ReviewedRowDecisionDto {
                 index: 2,
-                flipped: false,
+                direction_reversed: false,
             },
-            SelectedRowDto {
+            ReviewedRowDecisionDto {
                 index: 1,
-                flipped: true,
+                direction_reversed: true,
             },
         ])
         .unwrap();
-        let b = selection_digest(&[
-            SelectedRowDto {
+        let b = reviewed_row_decisions_digest(&[
+            ReviewedRowDecisionDto {
                 index: 1,
-                flipped: true,
+                direction_reversed: true,
             },
-            SelectedRowDto {
+            ReviewedRowDecisionDto {
                 index: 2,
-                flipped: false,
+                direction_reversed: false,
             },
         ])
         .unwrap();
@@ -936,7 +928,7 @@ mod tests {
         let current = ApplyReview::new(
             identity(),
             "plan-a".into(),
-            expected.selected_rows().to_vec(),
+            expected.reviewed_row_decisions().to_vec(),
             "health-a".into(),
             "caps-a".into(),
         )
@@ -1213,7 +1205,7 @@ mod tests {
         let changed = ApplyReview::new(
             changed_identity,
             "plan-a".into(),
-            expected.selected_rows().to_vec(),
+            expected.reviewed_row_decisions().to_vec(),
             "health-a".into(),
             "caps-a".into(),
         )

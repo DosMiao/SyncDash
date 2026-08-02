@@ -1,5 +1,6 @@
 //! Process-wide lifecycle for run commands, progress launches, and the one active engine run.
 
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
 use syncdash::obs::progress::RunCtl;
@@ -14,12 +15,26 @@ struct ActiveRun {
 #[derive(Default)]
 struct LifecycleState {
     active_run: Option<ActiveRun>,
-    pending_progress_launch_id: Option<u64>,
+    pending_progress_launch: Option<PendingProgressLaunch>,
     progress_window_closing: bool,
     commands_in_flight: u64,
     registry_mutation_in_progress: bool,
+    post_run_power_action_grant: Option<u64>,
     next_run_id: u64,
     next_progress_launch_id: u64,
+}
+
+struct PendingProgressLaunch {
+    id: u64,
+    phase: ProgressLaunchPhase,
+}
+
+enum ProgressLaunchPhase {
+    Reserved,
+    AwaitingWindowMount(SyncSender<()>),
+    WindowMounted,
+    AwaitingLaunchAcknowledgement(SyncSender<()>),
+    Ready,
 }
 
 #[derive(Default)]
@@ -75,6 +90,15 @@ impl ActiveRunLease {
 pub(crate) enum RunPurpose {
     Compare,
     Apply,
+}
+
+impl RunPurpose {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Compare => "Compare",
+            Self::Apply => "Apply",
+        }
+    }
 }
 
 struct RegistryMutationLease<'a> {
@@ -141,11 +165,22 @@ impl RunLifecycle {
             );
         }
         match progress_launch_id {
-            Some(launch_id) if state.pending_progress_launch_id == Some(launch_id) => {
-                state.pending_progress_launch_id = None;
+            Some(launch_id) => {
+                let Some(pending) = state.pending_progress_launch.as_ref() else {
+                    return Err("This synchronization launch is no longer active".into());
+                };
+                if pending.id != launch_id {
+                    return Err("This synchronization launch is no longer active".into());
+                }
+                if !matches!(pending.phase, ProgressLaunchPhase::Ready) {
+                    return Err(
+                        "The progress window has not acknowledged this synchronization launch"
+                            .into(),
+                    );
+                }
+                state.pending_progress_launch = None;
             }
-            Some(_) => return Err("This synchronization launch is no longer active".into()),
-            None if state.pending_progress_launch_id.is_some() => {
+            None if state.pending_progress_launch.is_some() => {
                 return Err("A synchronization is already preparing to start".into())
             }
             None => {}
@@ -153,6 +188,7 @@ impl RunLifecycle {
         state.next_run_id = state.next_run_id.checked_add(1).ok_or_else(|| {
             "The run identifier space is exhausted — restart SyncDash".to_string()
         })?;
+        state.post_run_power_action_grant = None;
         let run_id = state.next_run_id;
         let control = RunCtl::new();
         state.active_run = Some(ActiveRun {
@@ -183,7 +219,7 @@ impl RunLifecycle {
                 "Another run is already in progress — cancel it or wait for it to finish".into(),
             );
         }
-        if state.pending_progress_launch_id.is_some() {
+        if state.pending_progress_launch.is_some() {
             return Err("A synchronization is already preparing to start".into());
         }
         state.next_progress_launch_id =
@@ -194,24 +230,91 @@ impl RunLifecycle {
                     "The progress launch identifier space is exhausted — restart SyncDash"
                         .to_string()
                 })?;
+        state.post_run_power_action_grant = None;
         let launch_id = state.next_progress_launch_id;
-        state.pending_progress_launch_id = Some(launch_id);
+        state.pending_progress_launch = Some(PendingProgressLaunch {
+            id: launch_id,
+            phase: ProgressLaunchPhase::Reserved,
+        });
         Ok(launch_id)
+    }
+
+    pub(crate) fn prepare_progress_window_mount(
+        &self,
+        launch_id: u64,
+    ) -> Result<Receiver<()>, String> {
+        let mut state = self.state.lock().unwrap();
+        let pending = pending_progress_launch_mut(&mut state, launch_id)?;
+        if !matches!(pending.phase, ProgressLaunchPhase::Reserved) {
+            return Err("The progress window mount handshake is out of sequence".into());
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        pending.phase = ProgressLaunchPhase::AwaitingWindowMount(sender);
+        Ok(receiver)
+    }
+
+    pub(crate) fn report_progress_window_mounted(&self, launch_id: u64) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        let pending = pending_progress_launch_mut(&mut state, launch_id)?;
+        let ProgressLaunchPhase::AwaitingWindowMount(sender) = &pending.phase else {
+            return Err("The progress window mount handshake is out of sequence".into());
+        };
+        sender
+            .try_send(())
+            .map_err(|_| "The progress window mount handshake is no longer active".to_string())?;
+        pending.phase = ProgressLaunchPhase::WindowMounted;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_progress_launch_acknowledgement(
+        &self,
+        launch_id: u64,
+    ) -> Result<Receiver<()>, String> {
+        let mut state = self.state.lock().unwrap();
+        let pending = pending_progress_launch_mut(&mut state, launch_id)?;
+        if !matches!(
+            pending.phase,
+            ProgressLaunchPhase::Reserved | ProgressLaunchPhase::WindowMounted
+        ) {
+            return Err("The progress launch acknowledgement is out of sequence".into());
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        pending.phase = ProgressLaunchPhase::AwaitingLaunchAcknowledgement(sender);
+        Ok(receiver)
+    }
+
+    pub(crate) fn acknowledge_progress_launch(&self, launch_id: u64) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        let pending = pending_progress_launch_mut(&mut state, launch_id)?;
+        let ProgressLaunchPhase::AwaitingLaunchAcknowledgement(sender) = &pending.phase else {
+            return Err("The progress launch acknowledgement is out of sequence".into());
+        };
+        sender
+            .try_send(())
+            .map_err(|_| "The progress launch acknowledgement is no longer active".to_string())?;
+        pending.phase = ProgressLaunchPhase::Ready;
+        Ok(())
     }
 
     pub(crate) fn cancel_progress_launch(&self, launch_id: u64) -> bool {
         let mut state = self.state.lock().unwrap();
-        if state.pending_progress_launch_id != Some(launch_id) {
+        if state
+            .pending_progress_launch
+            .as_ref()
+            .map(|launch| launch.id)
+            != Some(launch_id)
+        {
             return false;
         }
-        state.pending_progress_launch_id = None;
+        state.pending_progress_launch = None;
         true
     }
 
     pub(crate) fn begin_progress_window_close(&self) -> ProgressWindowCloseDecisionDto {
         let mut state = self.state.lock().unwrap();
         state.progress_window_closing = true;
-        if state.pending_progress_launch_id.take().is_some() {
+        state.post_run_power_action_grant = None;
+        if state.pending_progress_launch.take().is_some() {
             return ProgressWindowCloseDecisionDto::PendingLaunchCancelled;
         }
         if let Some(active) = state
@@ -228,13 +331,15 @@ impl RunLifecycle {
     }
 
     pub(crate) fn finish_progress_window_close(&self) {
-        self.state.lock().unwrap().progress_window_closing = false;
+        let mut state = self.state.lock().unwrap();
+        state.progress_window_closing = false;
+        state.post_run_power_action_grant = None;
     }
 
     pub(crate) fn has_activity(&self) -> bool {
         let state = self.state.lock().unwrap();
         state.active_run.is_some()
-            || state.pending_progress_launch_id.is_some()
+            || state.pending_progress_launch.is_some()
             || state.commands_in_flight > 0
             || state.registry_mutation_in_progress
     }
@@ -246,7 +351,7 @@ impl RunLifecycle {
     ) -> Result<T, String> {
         let mut state = self.state.lock().unwrap();
         if state.active_run.is_some()
-            || state.pending_progress_launch_id.is_some()
+            || state.pending_progress_launch.is_some()
             || state.commands_in_flight > 0
             || state.registry_mutation_in_progress
         {
@@ -262,7 +367,11 @@ impl RunLifecycle {
         result
     }
 
-    pub(crate) fn request_cancel(&self, run_id: u64) -> Result<bool, String> {
+    pub(crate) fn request_cancel(
+        &self,
+        run_id: u64,
+        expected_purpose: RunPurpose,
+    ) -> Result<bool, String> {
         let state = self.state.lock().unwrap();
         let Some(active) = state.active_run.as_ref() else {
             return Ok(false);
@@ -271,13 +380,25 @@ impl RunLifecycle {
             return Err(format!(
                 "Run {run_id} is no longer active; run {} is active now",
                 active.run_id
+            ));
+        }
+        if active.purpose != expected_purpose {
+            return Err(format!(
+                "Run {run_id} is an {} run and cannot be controlled as {}",
+                active.purpose.name(),
+                expected_purpose.name()
             ));
         }
         active.control.request_cancel();
         Ok(true)
     }
 
-    pub(crate) fn set_paused(&self, run_id: u64, paused: bool) -> Result<bool, String> {
+    pub(crate) fn set_paused(
+        &self,
+        run_id: u64,
+        expected_purpose: RunPurpose,
+        paused: bool,
+    ) -> Result<bool, String> {
         let state = self.state.lock().unwrap();
         let Some(active) = state.active_run.as_ref() else {
             return Ok(false);
@@ -288,9 +409,64 @@ impl RunLifecycle {
                 active.run_id
             ));
         }
+        if active.purpose != expected_purpose {
+            return Err(format!(
+                "Run {run_id} is an {} run and cannot be controlled as {}",
+                active.purpose.name(),
+                expected_purpose.name()
+            ));
+        }
         active.control.set_paused(paused);
         Ok(true)
     }
+
+    pub(crate) fn issue_post_run_power_action_grant(&self, run_id: u64) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        let Some(active) = state.active_run.as_ref() else {
+            return Err("The completed Apply run is no longer active".into());
+        };
+        if active.run_id != run_id || active.purpose != RunPurpose::Apply {
+            return Err("Only the exact active Apply run can authorize a power action".into());
+        }
+        state.post_run_power_action_grant = Some(run_id);
+        Ok(())
+    }
+
+    pub(crate) fn consume_post_run_power_action_grant_with<T>(
+        &self,
+        run_id: u64,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut state = self.state.lock().unwrap();
+        if state.post_run_power_action_grant != Some(run_id) {
+            return Err(
+                "This run has no unused successful-Apply power-action authorization".into(),
+            );
+        }
+        let result = action()?;
+        state.post_run_power_action_grant = None;
+        Ok(result)
+    }
+
+    pub(crate) fn revoke_post_run_power_action_grant(&self, run_id: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.post_run_power_action_grant == Some(run_id) {
+            state.post_run_power_action_grant = None;
+        }
+    }
+}
+
+fn pending_progress_launch_mut(
+    state: &mut LifecycleState,
+    launch_id: u64,
+) -> Result<&mut PendingProgressLaunch, String> {
+    let Some(pending) = state.pending_progress_launch.as_mut() else {
+        return Err("This synchronization launch is no longer active".into());
+    };
+    if pending.id != launch_id {
+        return Err("This synchronization launch is no longer active".into());
+    }
+    Ok(pending)
 }
 
 #[cfg(test)]
@@ -307,6 +483,13 @@ mod tests {
         assert!(command
             .start_apply_from_progress_launch(launch_id + 1)
             .is_err());
+        assert!(command.start_apply_from_progress_launch(launch_id).is_err());
+
+        let ready = lifecycle
+            .prepare_progress_launch_acknowledgement(launch_id)
+            .unwrap();
+        lifecycle.acknowledge_progress_launch(launch_id).unwrap();
+        ready.recv().unwrap();
 
         let run = command.start_apply_from_progress_launch(launch_id).unwrap();
         assert_eq!(run.run_id(), 1);
@@ -367,11 +550,46 @@ mod tests {
         let second = command.start_run(RunPurpose::Apply).unwrap();
         let second_id = second.run_id();
 
-        assert!(lifecycle.request_cancel(first_id).is_err());
-        assert!(lifecycle.set_paused(first_id, true).is_err());
-        assert!(lifecycle.set_paused(second_id, true).unwrap());
-        assert!(lifecycle.request_cancel(second_id).unwrap());
+        assert!(lifecycle
+            .request_cancel(first_id, RunPurpose::Compare)
+            .is_err());
+        assert!(lifecycle
+            .set_paused(first_id, RunPurpose::Apply, true)
+            .is_err());
+        assert!(lifecycle
+            .request_cancel(second_id, RunPurpose::Compare)
+            .is_err());
+        assert!(lifecycle
+            .set_paused(second_id, RunPurpose::Apply, true)
+            .unwrap());
+        assert!(lifecycle
+            .request_cancel(second_id, RunPurpose::Apply)
+            .unwrap());
         assert!(second.control().cancelled());
+    }
+
+    #[test]
+    fn progress_handshake_binds_mount_and_readiness_to_one_launch() {
+        let lifecycle = RunLifecycle::default();
+        let launch_id = lifecycle.reserve_progress_launch().unwrap();
+        assert!(lifecycle.report_progress_window_mounted(launch_id).is_err());
+
+        let mounted = lifecycle.prepare_progress_window_mount(launch_id).unwrap();
+        assert!(lifecycle
+            .report_progress_window_mounted(launch_id + 1)
+            .is_err());
+        lifecycle.report_progress_window_mounted(launch_id).unwrap();
+        mounted.recv().unwrap();
+
+        let ready = lifecycle
+            .prepare_progress_launch_acknowledgement(launch_id)
+            .unwrap();
+        assert!(lifecycle
+            .acknowledge_progress_launch(launch_id + 1)
+            .is_err());
+        lifecycle.acknowledge_progress_launch(launch_id).unwrap();
+        ready.recv().unwrap();
+        assert!(lifecycle.acknowledge_progress_launch(launch_id).is_err());
     }
 
     #[test]
@@ -422,5 +640,54 @@ mod tests {
         assert!(lifecycle.reserve_progress_launch().is_err());
         drop(command);
         assert!(lifecycle.reserve_progress_launch().is_ok());
+    }
+
+    #[test]
+    fn successful_apply_grant_is_exact_retryable_and_one_use() {
+        let lifecycle = Arc::new(RunLifecycle::default());
+        let command = lifecycle.command_lease().unwrap();
+        let run = command.start_run(RunPurpose::Apply).unwrap();
+        let run_id = run.run_id();
+        lifecycle.issue_post_run_power_action_grant(run_id).unwrap();
+        drop(run);
+        drop(command);
+
+        assert!(lifecycle
+            .consume_post_run_power_action_grant_with(run_id + 1, || Ok(()))
+            .is_err());
+        assert!(lifecycle
+            .consume_post_run_power_action_grant_with::<()>(run_id, || {
+                Err("system command unavailable".into())
+            })
+            .is_err());
+        assert!(lifecycle
+            .consume_post_run_power_action_grant_with(run_id, || Ok(()))
+            .is_ok());
+        assert!(lifecycle
+            .consume_post_run_power_action_grant_with(run_id, || Ok(()))
+            .is_err());
+    }
+
+    #[test]
+    fn compare_and_a_new_launch_cannot_reuse_a_power_action_grant() {
+        let lifecycle = Arc::new(RunLifecycle::default());
+        let command = lifecycle.command_lease().unwrap();
+        let compare = command.start_run(RunPurpose::Compare).unwrap();
+        assert!(lifecycle
+            .issue_post_run_power_action_grant(compare.run_id())
+            .is_err());
+        drop(compare);
+        let apply = command.start_run(RunPurpose::Apply).unwrap();
+        let apply_id = apply.run_id();
+        lifecycle
+            .issue_post_run_power_action_grant(apply_id)
+            .unwrap();
+        drop(apply);
+        drop(command);
+
+        lifecycle.reserve_progress_launch().unwrap();
+        assert!(lifecycle
+            .consume_post_run_power_action_grant_with(apply_id, || Ok(()))
+            .is_err());
     }
 }
