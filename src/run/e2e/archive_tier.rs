@@ -1,6 +1,6 @@
 //! The archive and the comparison have to agree on how the evidence was gathered.
 //!
-//! A sampled digest is `~`-prefixed so it can never equal a full hash. An archive written in one
+//! A sampled digest and a full digest occupy different observation variants. An archive written in one
 //! tier and read in another therefore calls every file over the sampling floor "changed" — and a
 //! file the far side merely deleted lands as `deleted-on-target-but-changed-on-source`, the one
 //! conflict kind no `on_conflict` policy resolves. It never clears.
@@ -15,9 +15,8 @@ use std::sync::Arc;
 use super::*;
 use crate::fs::vfs::memory::MemVfs;
 use crate::fs::vfs::{Support, Vfs};
-use crate::model::table::Snapshot;
 
-/// 6 MiB, so it is over the 4 MiB sampling floor and actually gets a `~` digest.
+/// 6 MiB, so it is over the 4 MiB sampling floor and actually gets sampled evidence.
 const BIG: Seed = Seed {
     path: "big/handbook.bin",
     seed: 20,
@@ -62,13 +61,18 @@ fn the_archive_and_the_comparison_must_agree_on_evidence_tier() {
         p1.ops
     );
 
-    let archived = Snapshot::load(&arch).expect("archive written");
+    let archived = crate::run::archive::load_archive(&arch)
+        .expect("archive readable")
+        .expect("archive written");
     let row = archived
         .entries
         .iter()
-        .find(|e| e.path == BIG.path)
+        .find(|entry| entry.path().as_str() == BIG.path)
         .expect("the big file is in the archive");
-    let archived_hash = row.hash.clone().expect("archived with a hash");
+    let archived_hash = row
+        .as_file()
+        .and_then(|file| file.identity.digest())
+        .expect("archived with a digest");
 
     // Round two. The target drops the file. With a usable archive that reads as "they deleted it",
     // and the delete propagates back to the source.
@@ -112,12 +116,14 @@ fn an_archive_from_a_different_rigor_is_refused_not_misread() {
 
     let arch = scratch_archive("x1b");
 
-    // Both roots sample happily, so `standard` writes a `~` archive.
+    // Both roots sample happily, so `standard` writes a sampled archive.
     cycle(&archive_job("standard", &arch), &sv, &tv);
-    let a = Snapshot::load(&arch).expect("archive written");
+    let a = crate::run::archive::load_archive(&arch)
+        .expect("archive readable")
+        .expect("archive written");
     assert_eq!(
-        a.header.vfs.as_ref().map(|v| v.evidence_effective.as_str()),
-        Some("sampled"),
+        a.header.evidence,
+        crate::model::table::TableEvidence::Sampled,
         "the archive has to record the tier it was gathered in, or the reader has nothing to check"
     );
 

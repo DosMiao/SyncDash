@@ -173,7 +173,7 @@ fn reconcile_bound_file(
     file: &Path,
     binding: &[u8],
     fixes: &HashMap<String, (i64, i64)>,
-    entries: &[crate::model::table::Entry],
+    entries: &[crate::model::table::ObservedEntry],
     coverage: super::ScanCoverage,
     matched: &std::collections::HashSet<String>,
     retain_absent: &std::collections::HashSet<String>,
@@ -181,11 +181,11 @@ fn reconcile_bound_file(
     let needs_rebuild = super::scan_state_needs_rebuild(file, STATE_KIND, binding);
     let needs_materialize = !file.exists() && !fixes.is_empty();
     let observed: std::collections::HashSet<&str> =
-        entries.iter().map(|entry| entry.path.as_str()).collect();
+        entries.iter().map(|entry| entry.path().as_str()).collect();
     let live_files: std::collections::HashSet<&str> = entries
         .iter()
-        .filter(|entry| entry.kind == crate::model::table::EntryKind::File)
-        .map(|entry| entry.path.as_str())
+        .filter(|entry| entry.as_file().is_some())
+        .map(|entry| entry.path().as_str())
         .collect();
     let keep = |path: &str| {
         if observed.contains(path) {
@@ -206,7 +206,7 @@ fn reconcile_bound_file(
 pub fn reconcile_by_key(
     key: &str,
     fixes: &HashMap<String, (i64, i64)>,
-    entries: &[crate::model::table::Entry],
+    entries: &[crate::model::table::ObservedEntry],
     coverage: super::ScanCoverage,
     matched: &std::collections::HashSet<String>,
     retain_absent: &std::collections::HashSet<String>,
@@ -230,7 +230,7 @@ pub fn reconcile_by_key(
 pub(crate) fn reconcile_local(
     identity: &super::localid::LocalScanStateIdentity,
     fixes: &HashMap<String, (i64, i64)>,
-    entries: &[crate::model::table::Entry],
+    entries: &[crate::model::table::ObservedEntry],
     coverage: super::ScanCoverage,
     matched: &std::collections::HashSet<String>,
     retain_absent: &std::collections::HashSet<String>,
@@ -270,19 +270,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
-    fn entry(path: &str) -> crate::model::table::Entry {
-        crate::model::table::Entry {
-            path: path.into(),
-            kind: crate::model::table::EntryKind::File,
+    fn entry(path: &str) -> crate::model::table::ObservedEntry {
+        crate::model::table::ObservedEntry::File(crate::model::table::ObservedFile {
+            path: crate::foundation::path::RootRelativePath::try_from(path).unwrap(),
             size: 1,
             mtime_ms: 1_500,
-            hash: None,
-            hash_failed: false,
-            file_id: None,
+            identity: crate::model::table::FileIdentityObservation::SizeAndMtime,
+            file_system_id: None,
             mode: None,
-            link: None,
-            prev: None,
-        }
+            previous_identities: Vec::new(),
+        })
     }
 
     fn record_file(file: &Path, key: &str, fixes: &[(String, i64, i64)]) {

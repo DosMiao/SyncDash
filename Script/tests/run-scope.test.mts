@@ -20,11 +20,13 @@ import {
 import type { PlanDto, PlanOperation, ResultType } from '../../typescript/core/plan.ts';
 import {
   deriveApplyAvailability,
-  identicalResultRequestKey,
-  readRunScopePanelCollapsed,
-  writeRunScopePanelCollapsed,
-} from '../../typescript/ui/state/result-workspace.ts';
-import type { CompareOwner } from '../../typescript/core/types/generated/CompareOwner.ts';
+} from '../../typescript/ui/state/applyAvailability.ts';
+import {
+  loadCompareWorkspacePreferences,
+  saveCompareWorkspacePreferences,
+} from '../../typescript/ui/state/compareWorkspacePreferences.ts';
+import { createCompareWorkspace } from '../../typescript/ui/state/compareWorkspaceModel.ts';
+import { deriveWorkspaceExecutionAccess } from '../../typescript/ui/state/compareWorkspaceExecution.ts';
 
 function operation(path: string, action: PlanOperation['action'] = 'copy'): PlanOperation {
   return { side: 'target', action, path, reason: 'fixture' };
@@ -44,7 +46,7 @@ function plan(operations: PlanOperation[]): PlanDto {
 function inScope(result: PlanDto, folderScope: string | null): number[] {
   return computeInScopeIndices({
     plan: result,
-    flipped: [],
+    reversedRows: [],
     selectedResultTypes: new Set(),
     searchQuery: '',
     folderScope,
@@ -118,7 +120,7 @@ test('mask and result-type criteria narrow the run scope together', () => {
   ]);
   const indices = computeInScopeIndices({
     plan: result,
-    flipped: [],
+    reversedRows: [],
     selectedResultTypes: new Set<ResultType>(['delete', 'note']),
     searchQuery: '.txt',
     folderScope: null,
@@ -135,35 +137,43 @@ test('scope masks normalize one shared draft format', () => {
   assert.equal(isMaskMatchResult([true, 'false'], 2), false);
 });
 
-test('run-scope panel preference migrates once and writes only the current key', () => {
+test('compare workspace preferences migrate once and write one coherent preference set', () => {
   const values = new Map<string, string>([['sd.ov', 'open']]);
   const storage = {
     getItem: (key: string) => values.get(key) ?? null,
     setItem: (key: string, value: string) => { values.set(key, value); },
     removeItem: (key: string) => { values.delete(key); },
   };
-  assert.equal(readRunScopePanelCollapsed(storage), false);
-  assert.equal(values.get('sd.scope'), 'open');
+  const loaded = loadCompareWorkspacePreferences(storage);
+  const preferences = loaded.preferences;
+  assert.equal(loaded.warning, null);
+  assert.equal(preferences.scopePanelCollapsed, false);
+  assert.deepEqual(JSON.parse(values.get('sd.compare-workspace-preferences.v1')!), preferences);
+  assert.equal(values.has('sd.scope'), false);
   assert.equal(values.has('sd.ov'), false);
-  writeRunScopePanelCollapsed(storage, true);
-  assert.equal(values.get('sd.scope'), 'closed');
+  assert.equal(saveCompareWorkspacePreferences(storage, {
+    ...preferences,
+    scopePanelCollapsed: true,
+    grouped: false,
+    pathMode: 'full',
+  }), null);
+  assert.deepEqual(JSON.parse(values.get('sd.compare-workspace-preferences.v1')!), {
+    scopePanelCollapsed: true,
+    grouped: false,
+    pathMode: 'full',
+  });
 });
 
-test('identical request identity fences every provenance dimension, query, and page', () => {
-  const owner: CompareOwner = {
-    compare_id: 7,
-    job_id: 'job-id',
-    job_name: 'Display Name',
-    target_index: 2,
-    config_revision: 'revision',
+test('compare workspace preference storage failures return defaults and diagnostics', () => {
+  const storage = {
+    getItem: () => { throw new Error('storage denied'); },
+    setItem: () => { throw new Error('storage denied'); },
+    removeItem: () => { throw new Error('storage denied'); },
   };
-  const baseline = identicalResultRequestKey(owner, 'docs', 300);
-  assert.notEqual(identicalResultRequestKey({ ...owner, compare_id: 8 }, 'docs', 300), baseline);
-  assert.notEqual(identicalResultRequestKey({ ...owner, job_id: 'other' }, 'docs', 300), baseline);
-  assert.notEqual(identicalResultRequestKey({ ...owner, target_index: 3 }, 'docs', 300), baseline);
-  assert.notEqual(identicalResultRequestKey({ ...owner, config_revision: 'new' }, 'docs', 300), baseline);
-  assert.notEqual(identicalResultRequestKey(owner, 'src', 300), baseline);
-  assert.notEqual(identicalResultRequestKey(owner, 'docs', 600), baseline);
+  const loaded = loadCompareWorkspacePreferences(storage);
+  assert.equal(loaded.preferences.pathMode, 'relative');
+  assert.match(loaded.warning ?? '', /storage denied/);
+  assert.match(saveCompareWorkspacePreferences(storage, loaded.preferences) ?? '', /storage denied/);
 });
 
 test('size and modified-time criteria use immutable compare evidence', () => {
@@ -182,7 +192,7 @@ test('size and modified-time criteria use immutable compare evidence', () => {
 
   assert.deepEqual(computeInScopeIndices({
     plan: result,
-    flipped: [],
+    reversedRows: [],
     selectedResultTypes: new Set(),
     searchQuery: '',
     folderScope: null,
@@ -234,46 +244,90 @@ test('reversed updates count bytes from their new origin side', () => {
 });
 
 test('apply availability is one fail-closed guard for the active result workspace', () => {
+  const resultPlan = plan([operation('run.txt')]);
+  resultPlan.owner = {
+    identity: {
+      result_id: '44444444444444444444444444444444',
+      compare_run_id: 9,
+      job_id: 'job-id',
+      target_index: 0,
+      config_revision: 'revision',
+    },
+    job_name: 'Job',
+  };
+  const workspace = createCompareWorkspace(resultPlan);
+  const executable = deriveWorkspaceExecutionAccess(workspace, {
+    status: 'fresh',
+    scope: { job_id: 'job-id', target_index: 0, config_revision: 'revision' },
+    attempt: { verification_epoch: 4, compare_run_id: 9 },
+    owner: resultPlan.owner,
+  });
   assert.match(deriveApplyAvailability({
-    hasPlan: false,
-    resultView: 'differences',
+    workspace: null,
+    workspaceExecutionAccess: null,
+    compareActivity: null,
     scopeCalculationPending: false,
     scopeCalculationFailed: false,
     executableCount: 0,
   }).blockedMessage ?? '', /Compare first/);
+  assert.match(deriveApplyAvailability({
+    workspace,
+    workspaceExecutionAccess: deriveWorkspaceExecutionAccess(workspace, null),
+    compareActivity: null,
+    scopeCalculationPending: false,
+    scopeCalculationFailed: false,
+    executableCount: 1,
+  }).blockedMessage ?? '', /execution authority/);
   assert.equal(deriveApplyAvailability({
-    hasPlan: true,
-    resultView: 'identical',
+    workspace: { ...workspace, selectedView: 'identical' },
+    workspaceExecutionAccess: executable,
+    compareActivity: null,
     scopeCalculationPending: false,
     scopeCalculationFailed: false,
     executableCount: 3,
   }).available, false);
   assert.match(deriveApplyAvailability({
-    hasPlan: true,
-    resultView: 'differences',
+    workspace,
+    workspaceExecutionAccess: executable,
+    compareActivity: null,
     scopeCalculationPending: false,
     scopeCalculationFailed: true,
     executableCount: 3,
   }).blockedMessage ?? '', /could not be calculated safely/);
   assert.match(deriveApplyAvailability({
-    hasPlan: true,
-    resultView: 'differences',
+    workspace,
+    workspaceExecutionAccess: executable,
+    compareActivity: null,
     scopeCalculationPending: true,
     scopeCalculationFailed: false,
     executableCount: 3,
   }).blockedMessage ?? '', /still being calculated/);
   assert.match(deriveApplyAvailability({
-    hasPlan: true,
-    resultView: 'differences',
+    workspace,
+    workspaceExecutionAccess: executable,
+    compareActivity: null,
     scopeCalculationPending: false,
     scopeCalculationFailed: false,
     executableCount: 0,
-  }).blockedMessage ?? '', /No checked differences/);
+  }).blockedMessage ?? '', /No included differences/);
   assert.equal(deriveApplyAvailability({
-    hasPlan: true,
-    resultView: 'differences',
+    workspace,
+    workspaceExecutionAccess: executable,
+    compareActivity: null,
     scopeCalculationPending: false,
     scopeCalculationFailed: false,
     executableCount: 3,
   }).available, true);
+  assert.match(deriveApplyAvailability({
+    workspace,
+    workspaceExecutionAccess: executable,
+    compareActivity: {
+      status: 'comparing',
+      requestId: 1,
+      origin: { kind: 'auto_scan', generation: 2, ticketId: 3 },
+    },
+    scopeCalculationPending: false,
+    scopeCalculationFailed: false,
+    executableCount: 3,
+  }).blockedMessage ?? '', /newer Compare attempt/);
 });

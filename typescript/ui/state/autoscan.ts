@@ -1,7 +1,7 @@
-import type { AutoScanStatusDto } from '../../core/ipc';
+import type { AutoScanStatusDto } from '../../core/types/generated/AutoScanStatusDto';
 import type { CompareOwner } from '../../core/types/generated/CompareOwner';
 
-export const AUTOSCAN_TICKET_LEDGER_CAPACITY = 64;
+export const autoScanTicketLedgerCapacity = 64;
 
 export interface AutoScanTicket {
   generation: number;
@@ -13,7 +13,7 @@ export interface AutoScanTicket {
   autoApply: boolean;
 }
 
-export type AutoScanStatusSource = 'event' | 'snapshot' | 'start' | 'completion' | 'stop';
+export type AutoScanStatusSource = 'event' | 'snapshot' | 'start' | 'decline' | 'stop';
 
 function sameBinding(left: AutoScanStatusDto, right: AutoScanStatusDto): boolean {
   if (left.job_id === null || right.job_id === null) return !left.active && !right.active;
@@ -24,52 +24,65 @@ function sameBinding(left: AutoScanStatusDto, right: AutoScanStatusDto): boolean
 
 function statusRank(status: AutoScanStatusDto): number {
   if (!status.active) return 4;
-  if (status.pending_trigger || status.active_ticket !== null) return 2;
+  if (status.pending_trigger !== null || status.active_ticket !== null) return 2;
   if (status.latest_ticket_id > 0) return 3;
   return status.mode === 'starting' ? 0 : 1;
 }
 
+function statusMatchesTicket(status: AutoScanStatusDto, ticket: AutoScanTicket): boolean {
+  return status.active
+    && status.generation === ticket.generation
+    && status.job_id === ticket.jobId
+    && status.config_revision === ticket.configRevision
+    && status.target_index === ticket.targetIndex
+    && status.latest_ticket_id === ticket.ticketId;
+}
+
+function localTicketMatches(active: AutoScanTicket | null, ticket: AutoScanTicket): boolean {
+  return active !== null
+    && active.generation === ticket.generation
+    && active.ticketId === ticket.ticketId
+    && active.jobId === ticket.jobId
+    && active.configRevision === ticket.configRevision
+    && active.targetIndex === ticket.targetIndex;
+}
+
 /**
  * Reconcile snapshots, events, and command responses without allowing an older worker generation
- * (or its initial `starting` snapshot) to resurrect or regress the monitor shown in the toolbar.
- * The never-armed DTO uses generation zero; stopped monitors retain their generation/cursor. The
- * zero-generation normalization is a defensive fallback, and a stale status read cannot invoke it.
+ * or ticket cursor to resurrect or regress the monitor shown in the toolbar.
  */
 export function reconcileAutoScanStatus(
   current: AutoScanStatusDto | null,
   incoming: AutoScanStatusDto,
   source: AutoScanStatusSource,
-  completedTicketId?: number,
+  declinedTicket?: AutoScanTicket,
 ): AutoScanStatusDto | null {
+  if (source === 'decline') {
+    const exactDecline = declinedTicket !== undefined
+      && incoming.generation === declinedTicket.generation
+      && incoming.job_id === declinedTicket.jobId
+      && incoming.config_revision === declinedTicket.configRevision
+      && incoming.target_index === declinedTicket.targetIndex
+      && incoming.latest_ticket_id === declinedTicket.ticketId
+      && incoming.active_ticket === null
+      && incoming.pending_trigger === null;
+    if (!exactDecline) return current;
+  }
   if (!current) return incoming;
 
-  let candidate = incoming;
-  if (!incoming.active && incoming.generation === 0 && current.active) {
-    if (source === 'snapshot' || source === 'start') return current;
-    candidate = {
-      ...incoming,
-      generation: current.generation,
-      latest_ticket_id: Math.max(current.latest_ticket_id, incoming.latest_ticket_id),
-      job_id: current.job_id,
-      job_name: current.job_name,
-      config_revision: current.config_revision,
-      target_index: current.target_index,
-    };
+  if (incoming.generation < current.generation) return current;
+  if (incoming.generation > current.generation) return incoming;
+  if (!sameBinding(current, incoming)) return current;
+  if (!current.active && incoming.active) return current;
+  if (incoming.latest_ticket_id < current.latest_ticket_id) return current;
+  if (source === 'decline' && current.latest_ticket_id > (declinedTicket?.ticketId ?? -1)) return current;
+  if (incoming.latest_ticket_id > current.latest_ticket_id) return incoming;
+  if (source === 'decline') {
+    const currentTicketId = current.pending_trigger?.ticket_id ?? current.active_ticket;
+    if (currentTicketId !== null && currentTicketId !== declinedTicket?.ticketId) return current;
   }
-
-  if (candidate.generation < current.generation) return current;
-  if (candidate.generation > current.generation) return candidate;
-  if (!sameBinding(current, candidate)) return current;
-  // A terminal tombstone for this generation cannot be resurrected by a delayed worker event.
-  if (!current.active && candidate.active) return current;
-  if (candidate.latest_ticket_id < current.latest_ticket_id) return current;
-  if (candidate.latest_ticket_id > current.latest_ticket_id) return candidate;
-  if (source === 'completion' && completedTicketId !== undefined) {
-    const currentPending = current.pending_trigger?.ticket_id ?? current.active_ticket;
-    if (currentPending !== null && currentPending !== completedTicketId) return current;
-  }
-  if (statusRank(candidate) < statusRank(current)) return current;
-  return candidate;
+  if (statusRank(incoming) < statusRank(current)) return current;
+  return incoming;
 }
 
 export function monitorOwnsAutoScanResult(
@@ -78,10 +91,21 @@ export function monitorOwnsAutoScanResult(
   ticket: AutoScanTicket,
   owner: CompareOwner,
 ): boolean {
-  return monitorOwnsAutoScanTicket(status, active, ticket)
-    && owner.job_id === ticket.jobId
-    && owner.config_revision === ticket.configRevision
-    && owner.target_index === ticket.targetIndex;
+  return statusCompletesAutoScanTicket(status, ticket)
+    && localTicketMatches(active, ticket)
+    && owner.identity.job_id === ticket.jobId
+    && owner.identity.config_revision === ticket.configRevision
+    && owner.identity.target_index === ticket.targetIndex;
+}
+
+export function statusCompletesAutoScanTicket(
+  status: AutoScanStatusDto | null,
+  ticket: AutoScanTicket,
+): boolean {
+  return status !== null
+    && statusMatchesTicket(status, ticket)
+    && status.active_ticket === null
+    && status.pending_trigger === null;
 }
 
 export function monitorOwnsAutoScanTicket(
@@ -89,27 +113,22 @@ export function monitorOwnsAutoScanTicket(
   active: AutoScanTicket | null,
   ticket: AutoScanTicket,
 ): boolean {
-  return statusCanOwnAutoScanTrigger(status, ticket)
-    && active !== null
-    && active.generation === ticket.generation
-    && active.ticketId === ticket.ticketId
-    && active.jobId === ticket.jobId
-    && active.configRevision === ticket.configRevision
-    && active.targetIndex === ticket.targetIndex;
+  return statusCanOwnAutoScanTrigger(status, ticket) && localTicketMatches(active, ticket);
 }
 
 export function statusCanOwnAutoScanTrigger(
   status: AutoScanStatusDto | null,
   ticket: AutoScanTicket,
 ): boolean {
-  return status?.active === true
-    && status.generation === ticket.generation
-    && status.job_id === ticket.jobId
-    && status.config_revision === ticket.configRevision
-    && status.target_index === ticket.targetIndex
-    && status.latest_ticket_id <= ticket.ticketId
-    && (status.active_ticket === null || status.active_ticket === ticket.ticketId)
-    && (status.pending_trigger === null || status.pending_trigger.ticket_id === ticket.ticketId);
+  if (status === null || !statusMatchesTicket(status, ticket)) return false;
+  const pending = status.pending_trigger;
+  return status.active_ticket === ticket.ticketId
+    && pending !== null
+    && pending.generation === ticket.generation
+    && pending.ticket_id === ticket.ticketId
+    && pending.job_id === ticket.jobId
+    && pending.config_revision === ticket.configRevision
+    && pending.target_index === ticket.targetIndex;
 }
 
 export type AutoScanToggleAction = 'start' | 'stop' | 'unavailable';
@@ -127,68 +146,66 @@ export function autoScanButtonLabel(status: AutoScanStatusDto | null, pending: '
   return status.job_name ? `AutoScan · ${status.job_name}${target}` : `AutoScan · active${target}`;
 }
 
-type LedgerRecord<T> =
+type LedgerRecord =
   | { stage: 'processing' }
-  | { stage: 'completing'; outcome: T }
-  | { stage: 'ready'; outcome: T }
+  | { stage: 'decline_recovery' }
   | { stage: 'completed' };
 
-export type AutoScanTicketClaim<T> =
+export type AutoScanTicketClaim =
   | { kind: 'process' }
-  | { kind: 'retry_completion'; outcome: T }
+  | { kind: 'decline_recovery' }
   | { kind: 'duplicate' }
   | { kind: 'capacity' };
 
-function ticketKey(ticket: Pick<AutoScanTicket, 'generation' | 'ticketId'>): string {
-  return `${ticket.generation}:${ticket.ticketId}`;
-}
-
 /**
- * Bounded, generation/ticket keyed at-most-once processing. A failed completion acknowledgement can
- * be retried from a recovered `pending_trigger` without rerunning Compare. Completed records are the
- * only records evicted; in-flight evidence is never silently forgotten.
+ * Bounded, generation/ticket keyed at-most-once processing. Only an authoritative recovered
+ * pending trigger can re-enter a claimed ticket, and it can re-enter solely to decline it.
  */
-export class AutoScanTicketLedger<T> {
+export class AutoScanTicketLedger {
   readonly #capacity: number;
-  readonly #records = new Map<string, LedgerRecord<T>>();
+  readonly #records = new Map<number, LedgerRecord>();
+  #generation: number | null = null;
+  #completedThroughTicketId = 0;
 
-  constructor(capacity = AUTOSCAN_TICKET_LEDGER_CAPACITY) {
+  constructor(capacity = autoScanTicketLedgerCapacity) {
     if (!Number.isInteger(capacity) || capacity < 1) throw new Error('AutoScan ledger capacity must be positive');
     this.#capacity = capacity;
   }
 
   get size(): number { return this.#records.size; }
 
-  claim(ticket: Pick<AutoScanTicket, 'generation' | 'ticketId'>): AutoScanTicketClaim<T> {
-    const key = ticketKey(ticket);
-    const existing = this.#records.get(key);
-    if (existing?.stage === 'ready') {
-      this.#records.set(key, { stage: 'completing', outcome: existing.outcome });
-      return { kind: 'retry_completion', outcome: existing.outcome };
+  claim(ticket: Pick<AutoScanTicket, 'generation' | 'ticketId'>): AutoScanTicketClaim {
+    if (this.#generation !== null && ticket.generation < this.#generation) return { kind: 'duplicate' };
+    if (this.#generation === null || ticket.generation > this.#generation) {
+      this.#generation = ticket.generation;
+      this.#completedThroughTicketId = 0;
+      this.#records.clear();
     }
-    if (existing) return { kind: 'duplicate' };
+
+    const existing = this.#records.get(ticket.ticketId);
+    if (existing?.stage === 'decline_recovery') {
+      this.#records.set(ticket.ticketId, { stage: 'processing' });
+      return { kind: 'decline_recovery' };
+    }
+    if (existing || ticket.ticketId <= this.#completedThroughTicketId) return { kind: 'duplicate' };
     this.#trimCompleted();
     if (this.#records.size >= this.#capacity) return { kind: 'capacity' };
-    this.#records.set(key, { stage: 'processing' });
+    this.#records.set(ticket.ticketId, { stage: 'processing' });
     return { kind: 'process' };
   }
 
-  prepareCompletion(ticket: Pick<AutoScanTicket, 'generation' | 'ticketId'>, outcome: T): boolean {
-    const key = ticketKey(ticket);
-    if (this.#records.get(key)?.stage !== 'processing') return false;
-    this.#records.set(key, { stage: 'completing', outcome });
+  markDeclineRecovery(ticket: Pick<AutoScanTicket, 'generation' | 'ticketId'>): boolean {
+    if (ticket.generation !== this.#generation) return false;
+    if (this.#records.get(ticket.ticketId)?.stage !== 'processing') return false;
+    this.#records.set(ticket.ticketId, { stage: 'decline_recovery' });
     return true;
   }
 
-  completionFailed(ticket: Pick<AutoScanTicket, 'generation' | 'ticketId'>): void {
-    const key = ticketKey(ticket);
-    const record = this.#records.get(key);
-    if (record?.stage === 'completing') this.#records.set(key, { stage: 'ready', outcome: record.outcome });
-  }
-
-  completed(ticket: Pick<AutoScanTicket, 'generation' | 'ticketId'>): void {
-    const key = ticketKey(ticket);
-    if (this.#records.has(key)) this.#records.set(key, { stage: 'completed' });
+  markCompleted(ticket: Pick<AutoScanTicket, 'generation' | 'ticketId'>): boolean {
+    if (ticket.generation !== this.#generation || !this.#records.has(ticket.ticketId)) return false;
+    this.#records.set(ticket.ticketId, { stage: 'completed' });
+    this.#completedThroughTicketId = Math.max(this.#completedThroughTicketId, ticket.ticketId);
+    return true;
   }
 
   #trimCompleted(): void {

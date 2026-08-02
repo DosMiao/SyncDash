@@ -12,24 +12,32 @@ use syncdash::pipeline::guard::Verdict;
 use syncdash::{job, run};
 use tauri::Emitter;
 
-use crate::auth::{
-    health_digest, AuthorizationPurpose, AuthorizationRecord, AuthorizationStore, ChallengeSpec,
-    OperationBinding,
+use crate::autoscan::{
+    AutoApplyTicket, AutoScanComparePermit, AutoScanComparePublication, AutoScanController,
+    AutoScanVerificationTerminal,
 };
-use crate::autoscan::{AutoApplyTicket, AutoScanController};
-use crate::bridge::{make_ctx, RunEvent, RunEventRepository};
+use crate::bridge::{make_ctx, RunEvent, RunEventAudience, RunEventRepository};
+use crate::compare_results::{
+    validate_retained_compare, CompareResultRepository, CompareScope,
+    CompareVerificationTerminalOutcome, SuccessfulCompareResult,
+};
 use crate::dto::{
-    ApplyDto, AuthorizationDto, CapabilityIssueDto, CompareOwner, OperationReviewDto, PlanDto,
-    ReviewStatus, SelectedRowDto,
+    ApplyDto, ApplySessionGrantDecisionDto, AuthorizationDto, AutoScanCompareRequestDto,
+    CapabilityIssueDto, CompareIdentity, CompareOwner, CompareWorkspaceSnapshotDto,
+    OperationApprovalDto, OperationReviewDto, PlanDto, PostRunPowerActionReadyDto,
+    ReviewedRowDecisionDto,
 };
-use crate::state::{
-    begin_run, begin_run_command, begin_run_for_launch, end_run, finish_run_command,
-    release_progress_launch, request_cancel, resolve_selected_ops, resolve_target, set_paused,
-    user_err, validate_cached_compare, CachedCompare, CompareProvenance, ResultKey,
-    ResultRepository, RunState,
+use crate::job_target::resolve_target;
+use crate::operation_authorization::{
+    health_review_digest, ApplyAuthorization, ApplyAuthorizationKind, ApplyReview,
+    ApplySessionGrantDecision, CompareAuthorization, CompareOrigin, IssuedAuthorization,
+    JobTargetRevision, OperationAuthorizationStore, ReviewApproval, ReviewChallenge,
 };
-
-use super::require_main_window;
+use crate::operation_decisions::resolve_reviewed_operations;
+use crate::run_lifecycle::{ActiveRunLease, RunCommandLease, RunLifecycle, RunPurpose};
+use crate::window_role::{
+    require_window_role, WindowRole, MAIN_WINDOW_LABEL, PROGRESS_WINDOW_LABEL,
+};
 
 #[derive(Clone, serde::Serialize)]
 struct RunRejected {
@@ -37,23 +45,80 @@ struct RunRejected {
     message: String,
 }
 
-struct ActiveRunGuard {
-    state: Arc<RunState>,
-    run_id: u64,
+struct AutoScanCompareTerminalGuard {
+    controller: Arc<AutoScanController>,
+    permit: Option<AutoScanComparePermit>,
 }
 
-struct RunCommandGuard(Arc<RunState>);
+impl AutoScanCompareTerminalGuard {
+    fn new(controller: Arc<AutoScanController>, permit: Option<AutoScanComparePermit>) -> Self {
+        Self { controller, permit }
+    }
+
+    fn disarm(&mut self) {
+        self.permit = None;
+    }
+}
+
+impl Drop for AutoScanCompareTerminalGuard {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            let _ = self.controller.terminalize_permitted_verification(
+                &permit,
+                AutoScanVerificationTerminal::Failed(
+                    "The Compare task ended without publishing or reporting a terminal outcome"
+                        .into(),
+                ),
+            );
+        }
+    }
+}
+
+fn format_run_io_error(error: std::io::Error) -> String {
+    if syncdash::obs::progress::is_cancelled(&error) {
+        "cancelled".into()
+    } else {
+        error.to_string()
+    }
+}
+
+fn verification_terminal_from_io(error: &std::io::Error) -> AutoScanVerificationTerminal {
+    if syncdash::obs::progress::is_cancelled(error) {
+        AutoScanVerificationTerminal::Cancelled
+    } else {
+        AutoScanVerificationTerminal::Failed(error.to_string())
+    }
+}
+
+fn emit_compare_execution_status(
+    app: &tauri::AppHandle,
+    results: &CompareResultRepository,
+    scope: &CompareScope,
+) {
+    let _ = app.emit_to(
+        MAIN_WINDOW_LABEL,
+        "compare-execution-status",
+        results.execution_status(scope),
+    );
+}
 
 struct AppliedResultGuard {
-    results: Arc<ResultRepository>,
+    app: tauri::AppHandle,
+    results: Arc<CompareResultRepository>,
     job_id: String,
     config_revision: String,
     invalidate_on_drop: bool,
 }
 
 impl AppliedResultGuard {
-    fn new(results: Arc<ResultRepository>, job_id: &str, config_revision: &str) -> Self {
+    fn new(
+        app: tauri::AppHandle,
+        results: Arc<CompareResultRepository>,
+        job_id: &str,
+        config_revision: &str,
+    ) -> Self {
         Self {
+            app,
             results,
             job_id: job_id.to_string(),
             config_revision: config_revision.to_string(),
@@ -69,81 +134,89 @@ impl AppliedResultGuard {
 impl Drop for AppliedResultGuard {
     fn drop(&mut self) {
         if self.invalidate_on_drop {
-            self.results
-                .0
-                .lock()
-                .unwrap()
-                .invalidate_revision(&self.job_id, &self.config_revision);
+            for status in self.results.expire_revision(
+                &self.job_id,
+                &self.config_revision,
+                crate::dto::CompareExecutionExpiryReasonDto::WriteStarted,
+            ) {
+                let _ = self
+                    .app
+                    .emit_to(MAIN_WINDOW_LABEL, "compare-execution-status", status);
+            }
         }
     }
 }
 
-impl RunCommandGuard {
-    fn begin(state: Arc<RunState>) -> Self {
-        begin_run_command(&state);
-        Self(state)
-    }
-}
-
-impl Drop for RunCommandGuard {
-    fn drop(&mut self) {
-        finish_run_command(&self.0);
-    }
-}
-
-impl Drop for ActiveRunGuard {
-    fn drop(&mut self) {
-        end_run(&self.state, self.run_id);
-    }
-}
-
-/// Request cooperative cancellation of the active run. Returns whether an active run existed.
 #[tauri::command]
-pub fn cancel_run(state: tauri::State<'_, Arc<RunState>>, run_id: u64) -> Result<bool, String> {
-    request_cancel(state.inner(), run_id)
+pub fn cancel_compare_run(
+    window: tauri::WebviewWindow,
+    lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
+    run_id: u64,
+) -> Result<bool, String> {
+    require_window_role(&window, WindowRole::Main)?;
+    lifecycle.request_cancel(run_id, RunPurpose::Compare)
 }
 
-/// Pause/resume the active run (elapsed stops growing while paused, the RootLock heartbeat keeps beating)
 #[tauri::command]
-pub fn pause_run(
-    state: tauri::State<'_, Arc<RunState>>,
+pub fn cancel_apply_run(
+    window: tauri::WebviewWindow,
+    lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
+    run_id: u64,
+) -> Result<bool, String> {
+    require_window_role(&window, WindowRole::Progress)?;
+    lifecycle.request_cancel(run_id, RunPurpose::Apply)
+}
+
+#[tauri::command]
+pub fn set_apply_paused(
+    window: tauri::WebviewWindow,
+    lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
     run_id: u64,
     paused: bool,
 ) -> Result<bool, String> {
-    set_paused(state.inner(), run_id, paused)
+    require_window_role(&window, WindowRole::Progress)?;
+    lifecycle.set_paused(run_id, RunPurpose::Apply, paused)
 }
 
 #[tauri::command]
-pub fn replay_run_events(
+pub fn replay_compare_events(
+    window: tauri::WebviewWindow,
     events: tauri::State<'_, Arc<RunEventRepository>>,
-    purpose: String,
     after_sequence: Option<u64>,
 ) -> Result<Vec<RunEvent>, String> {
-    if !matches!(purpose.as_str(), "compare" | "apply") {
-        return Err(format!("Unknown run purpose: {purpose}"));
-    }
-    Ok(events.replay(&purpose, after_sequence.unwrap_or(0)))
+    require_window_role(&window, WindowRole::Main)?;
+    Ok(events.replay("compare", after_sequence.unwrap_or(0)))
 }
 
-struct LoadedTarget {
+#[tauri::command]
+pub fn replay_apply_events(
+    window: tauri::WebviewWindow,
+    events: tauri::State<'_, Arc<RunEventRepository>>,
+    after_sequence: Option<u64>,
+) -> Result<Vec<RunEvent>, String> {
+    require_window_role(&window, WindowRole::Progress)?;
+    Ok(events.replay("apply", after_sequence.unwrap_or(0)))
+}
+
+struct ResolvedJobTarget {
     job_name: String,
-    full_job: syncdash::job::Job,
+    registered_job: syncdash::job::Job,
     target_index: usize,
-    job: syncdash::job::Job,
+    target_job: syncdash::job::SingleTargetJob,
     config_revision: String,
 }
 
 struct PreparedApply {
-    loaded: LoadedTarget,
+    target: ResolvedJobTarget,
     owner: CompareOwner,
     plan: Plan,
     plan_digest: String,
-    selected: Vec<SelectedRowDto>,
-    ops: Vec<Op>,
+    reviewed_row_decisions: Vec<ReviewedRowDecisionDto>,
+    reviewed_operations: Vec<Op>,
 }
 
-struct CachedApplyPlan {
-    loaded: LoadedTarget,
+struct RetainedApplyPlan {
+    target: ResolvedJobTarget,
     owner: CompareOwner,
     plan: Plan,
     plan_digest: String,
@@ -158,49 +231,49 @@ struct ApplyFacts {
 fn load_review_target(
     expected_job_id: &str,
     target_index: Option<usize>,
-) -> Result<LoadedTarget, String> {
-    let (job_name, full_job) = job::load_by_id(expected_job_id).map_err(|error| {
+) -> Result<ResolvedJobTarget, String> {
+    let (job_name, registered_job) = job::load_by_id(expected_job_id).map_err(|error| {
         format!("The selected job was deleted or replaced — refresh it and review Compare again: {error}")
     })?;
-    load_target(job_name, full_job, target_index)
+    resolve_job_target(job_name, registered_job, target_index)
 }
 
-fn load_bound_target(binding: &OperationBinding) -> Result<LoadedTarget, String> {
-    let (job_name, full_job) = job::load_by_id(&binding.job_id).map_err(|error| {
+fn load_bound_target(target: &JobTargetRevision) -> Result<ResolvedJobTarget, String> {
+    let (job_name, registered_job) = job::load_by_id(target.job_id()).map_err(|error| {
         format!("The authorized job was deleted or replaced — review the operation again: {error}")
     })?;
-    let loaded = load_target(job_name, full_job, Some(binding.target_index))?;
-    if loaded.config_revision != binding.config_revision {
+    let resolved = resolve_job_target(job_name, registered_job, Some(target.target_index()))?;
+    if resolved.config_revision != target.config_revision() {
         return Err(format!(
             "Job '{}' changed after authorization — review the operation again",
-            loaded.job_name
+            resolved.job_name
         ));
     }
-    Ok(loaded)
+    Ok(resolved)
 }
 
-fn load_target(
+fn resolve_job_target(
     job_name: String,
-    full_job: syncdash::job::Job,
+    registered_job: syncdash::job::Job,
     target_index: Option<usize>,
-) -> Result<LoadedTarget, String> {
-    let config_revision =
-        job::config_revision(&full_job).map_err(|error| format!("Job '{job_name}': {error}"))?;
-    let (target_index, job) = resolve_target(&full_job, target_index)?;
-    Ok(LoadedTarget {
+) -> Result<ResolvedJobTarget, String> {
+    let config_revision = job::config_revision(&registered_job)
+        .map_err(|error| format!("Job '{job_name}': {error}"))?;
+    let (target_index, target_job) = resolve_target(&registered_job, target_index)?;
+    Ok(ResolvedJobTarget {
         job_name,
-        full_job,
+        registered_job,
         target_index,
-        job,
+        target_job,
         config_revision,
     })
 }
 
-fn validate_loaded_target_unchanged(
-    reviewed: &LoadedTarget,
-    current: &LoadedTarget,
+fn validate_resolved_target_unchanged(
+    reviewed: &ResolvedJobTarget,
+    current: &ResolvedJobTarget,
 ) -> Result<(), String> {
-    if reviewed.full_job.job_id != current.full_job.job_id {
+    if reviewed.registered_job.job_id != current.registered_job.job_id {
         return Err("The reviewed job identity changed — review the operation again".into());
     }
     if reviewed.config_revision != current.config_revision {
@@ -212,44 +285,36 @@ fn validate_loaded_target_unchanged(
     Ok(())
 }
 
-fn reload_prepared_target(reviewed: &LoadedTarget) -> Result<LoadedTarget, String> {
-    let (job_name, full_job) = job::load_by_id(&reviewed.full_job.job_id).map_err(|error| {
-        format!("The reviewed job was deleted or replaced — review again: {error}")
-    })?;
-    let current = load_target(job_name, full_job, Some(reviewed.target_index))?;
-    validate_loaded_target_unchanged(reviewed, &current)?;
+fn reload_prepared_target(reviewed: &ResolvedJobTarget) -> Result<ResolvedJobTarget, String> {
+    let (job_name, registered_job) =
+        job::load_by_id(&reviewed.registered_job.job_id).map_err(|error| {
+            format!("The reviewed job was deleted or replaced — review again: {error}")
+        })?;
+    let current = resolve_job_target(job_name, registered_job, Some(reviewed.target_index))?;
+    validate_resolved_target_unchanged(reviewed, &current)?;
     Ok(current)
 }
 
-fn empty_verdict() -> Verdict {
-    Verdict {
-        blockers: Vec::new(),
-        warnings: Vec::new(),
-    }
+fn build_compare_authorization(
+    target: &ResolvedJobTarget,
+    capabilities: &CapReport,
+    origin: CompareOrigin,
+) -> Result<CompareAuthorization, String> {
+    CompareAuthorization::new(
+        JobTargetRevision::new(
+            target.registered_job.job_id.clone(),
+            target.config_revision.clone(),
+            target.target_index,
+        )?,
+        capabilities.consent_digest(CapabilityScope::CompareRead),
+        origin,
+    )
 }
 
-fn compare_binding(loaded: &LoadedTarget, capabilities: &CapReport) -> OperationBinding {
-    let empty = empty_verdict();
-    OperationBinding {
-        scope: CapabilityScope::CompareRead,
-        purpose: AuthorizationPurpose::CompareInteractive,
-        job_id: loaded.full_job.job_id.clone(),
-        job_name: loaded.job_name.clone(),
-        config_revision: loaded.config_revision.clone(),
-        target_index: loaded.target_index,
-        owner: None,
-        plan_digest: None,
-        decision_digest: None,
-        health_digest: health_digest(&empty, &empty),
-        capability_digest: capabilities.consent_digest(CapabilityScope::CompareRead),
-        auto_apply_ticket: None,
-    }
-}
-
-fn authorization_dto(record: AuthorizationRecord, expires_at_ms: u64) -> AuthorizationDto {
+fn authorization_dto(issued: IssuedAuthorization) -> AuthorizationDto {
     AuthorizationDto {
-        authorization_token: record.token,
-        expires_at_ms,
+        authorization_token: issued.authorization_token,
+        expires_at_ms: issued.expires_at_ms,
     }
 }
 
@@ -270,223 +335,324 @@ fn blocked_review(
     warnings: Vec<String>,
     capabilities: &CapReport,
 ) -> OperationReviewDto {
-    OperationReviewDto {
-        status: ReviewStatus::Blocked,
-        authorization: None,
-        challenge_id: None,
-        expires_at_ms: None,
+    OperationReviewDto::Blocked {
         blockers,
         warnings,
         capabilities: capability_dtos(capabilities),
-        requires_health_ack: false,
-        requires_capability_ack: false,
-        can_remember_for_session: false,
-        can_allow_unattended: false,
-    }
-}
-
-fn validate_exact_binding(
-    authorized: &OperationBinding,
-    current: &OperationBinding,
-) -> Result<(), String> {
-    if authorized.scope != current.scope || authorized.purpose != current.purpose {
-        return Err("The authorization belongs to a different operation".into());
-    }
-    if authorized.job_id != current.job_id {
-        return Err("The authorized job identity changed — review again".into());
-    }
-    if authorized.config_revision != current.config_revision {
-        return Err("The authorized job configuration changed — review again".into());
-    }
-    if authorized.target_index != current.target_index {
-        return Err("The authorized target changed — review again".into());
-    }
-    if !same_compare_identity(authorized.owner.as_ref(), current.owner.as_ref()) {
-        return Err("The authorized Compare result changed — review Apply again".into());
-    }
-    if authorized.plan_digest != current.plan_digest {
-        return Err("The authorized plan changed — review Apply again".into());
-    }
-    if authorized.decision_digest != current.decision_digest {
-        return Err("The authorized selected operation set changed — review Apply again".into());
-    }
-    if authorized.health_digest != current.health_digest {
-        return Err("The plan health report changed — review the operation again".into());
-    }
-    if authorized.capability_digest != current.capability_digest {
-        return Err("The backend capability report changed — review the operation again".into());
-    }
-    if !same_auto_apply_authority(
-        authorized.auto_apply_ticket.as_ref(),
-        current.auto_apply_ticket.as_ref(),
-    ) {
-        return Err("The AutoScan ticket authority changed — wait for a fresh trigger".into());
-    }
-    Ok(())
-}
-
-fn same_compare_identity(left: Option<&CompareOwner>, right: Option<&CompareOwner>) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => {
-            left.compare_id == right.compare_id
-                && left.job_id == right.job_id
-                && left.target_index == right.target_index
-                && left.config_revision == right.config_revision
-        }
-        _ => false,
-    }
-}
-
-fn with_current_job_name(mut owner: CompareOwner, job_name: &str) -> CompareOwner {
-    owner.job_name = job_name.to_string();
-    owner
-}
-
-fn same_auto_apply_authority(
-    left: Option<&AutoApplyTicket>,
-    right: Option<&AutoApplyTicket>,
-) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => left.same_authority(right),
-        _ => false,
     }
 }
 
 #[tauri::command]
 pub async fn review_compare(
     window: tauri::WebviewWindow,
-    state: tauri::State<'_, Arc<RunState>>,
-    authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
+    lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
+    authorizations: tauri::State<'_, Arc<OperationAuthorizationStore>>,
+    autoscan: tauri::State<'_, Arc<AutoScanController>>,
     expected_job_id: String,
     target_index: Option<usize>,
+    auto_scan_request: Option<AutoScanCompareRequestDto>,
 ) -> Result<OperationReviewDto, String> {
-    require_main_window(&window)?;
-    let st = state.inner().clone();
-    let _command = RunCommandGuard::begin(st);
+    require_window_role(&window, WindowRole::Main)?;
     let authorizations = authorizations.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let loaded = load_review_target(&expected_job_id, target_index)?;
-        let capabilities = match run::compare_capabilities(&loaded.job) {
-            Ok(capabilities) => capabilities,
-            Err(error) => {
-                return Ok(blocked_review(
-                    vec![user_err(error)],
-                    Vec::new(),
-                    &CapReport::default(),
-                ))
+    let autoscan = autoscan.inner().clone();
+    let _command = match lifecycle.inner().command_lease() {
+        Ok(command) => command,
+        Err(error) => {
+            if let Some(request) = auto_scan_request {
+                let _ = autoscan.terminalize_verification_request(
+                    request.generation,
+                    request.ticket_id,
+                    AutoScanVerificationTerminal::Failed(format!(
+                        "AutoScan Compare could not enter review: {error}"
+                    )),
+                );
             }
-        };
-        let blockers = capability_blockers(&capabilities);
-        if !blockers.is_empty() {
-            return Ok(blocked_review(blockers, Vec::new(), &capabilities));
+            return Err(error);
         }
-        let binding = compare_binding(&loaded, &capabilities);
-        let requires_capability_ack = !capabilities.needs_ack().is_empty();
-        if !requires_capability_ack || authorizations.grant_allows(&binding, false) {
-            let (authorization, expires_at_ms) =
-                authorizations.authorize_direct(binding, Vec::new(), false)?;
-            return Ok(OperationReviewDto {
-                status: ReviewStatus::DirectAuthorized,
-                authorization: Some(authorization_dto(authorization, expires_at_ms)),
-                challenge_id: None,
-                expires_at_ms: None,
-                blockers: Vec::new(),
-                warnings: Vec::new(),
+    };
+    let join_request = auto_scan_request;
+    let join_autoscan = autoscan.clone();
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| {
+            let target = load_review_target(&expected_job_id, target_index)?;
+            let capabilities = match run::compare_capabilities(&target.target_job) {
+                Ok(capabilities) => capabilities,
+                Err(error) => {
+                    if let Some(request) = auto_scan_request {
+                        let terminal = verification_terminal_from_io(&error);
+                        let _ = autoscan.terminalize_verification_request(
+                            request.generation,
+                            request.ticket_id,
+                            terminal,
+                        );
+                    }
+                    return Ok(blocked_review(
+                        vec![format_run_io_error(error)],
+                        Vec::new(),
+                        &CapReport::default(),
+                    ));
+                }
+            };
+            let blockers = capability_blockers(&capabilities);
+            if !blockers.is_empty() {
+                return Ok(blocked_review(blockers, Vec::new(), &capabilities));
+            }
+            let origin = match auto_scan_request {
+                Some(request) => CompareOrigin::AutoScan(
+                    autoscan.issue_compare_permit(request.generation, request.ticket_id)?,
+                ),
+                None => CompareOrigin::Interactive,
+            };
+            let authorization = build_compare_authorization(&target, &capabilities, origin)?;
+            let requires_capability_ack = !capabilities.needs_ack().is_empty();
+            if !requires_capability_ack
+                || authorizations.has_compare_capability_grant(&authorization)
+            {
+                let issued = authorizations.issue_compare_authorization(authorization)?;
+                return Ok(OperationReviewDto::DirectAuthorized {
+                    authorization: authorization_dto(issued),
+                    capabilities: capability_dtos(&capabilities),
+                });
+            }
+            if auto_scan_request.is_some() {
+                return Ok(blocked_review(
+                    vec![
+                        "AutoScan Compare requires an interactive capability approval for this exact job revision and target"
+                            .into(),
+                    ],
+                    Vec::new(),
+                    &capabilities,
+                ));
+            }
+            let challenge = authorizations.create_review_challenge(ReviewChallenge::Compare {
+                authorization,
+                requires_capability_ack: true,
+            })?;
+            Ok(OperationReviewDto::CompareConfirmationRequired {
+                challenge_id: challenge.challenge_id,
+                expires_at_ms: challenge.expires_at_ms,
                 capabilities: capability_dtos(&capabilities),
-                requires_health_ack: false,
-                requires_capability_ack: false,
-                can_remember_for_session: false,
-                can_allow_unattended: false,
-            });
+                can_remember_for_session: true,
+            })
+        })();
+        if let Some(request) = auto_scan_request {
+            let terminal = match &result {
+                Err(error) => Some(AutoScanVerificationTerminal::Failed(format!(
+                    "AutoScan Compare review failed: {error}"
+                ))),
+                Ok(OperationReviewDto::Blocked { blockers, .. }) => {
+                    Some(AutoScanVerificationTerminal::Failed(format!(
+                        "AutoScan Compare review was blocked: {}",
+                        blockers.join("; ")
+                    )))
+                }
+                Ok(OperationReviewDto::CompareConfirmationRequired { .. })
+                | Ok(OperationReviewDto::InteractiveApplyConfirmationRequired { .. }) => {
+                    Some(AutoScanVerificationTerminal::Failed(
+                        "AutoScan Compare unexpectedly required an interactive approval".into(),
+                    ))
+                }
+                Ok(OperationReviewDto::DirectAuthorized { .. }) => None,
+            };
+            if let Some(terminal) = terminal {
+                let _ = autoscan.terminalize_verification_request(
+                    request.generation,
+                    request.ticket_id,
+                    terminal,
+                );
+            }
         }
-        let (challenge_id, expires_at_ms) = authorizations.challenge(ChallengeSpec {
-            binding,
-            selected: Vec::new(),
-            requires_health_ack: false,
-            requires_capability_ack: true,
-        })?;
-        Ok(OperationReviewDto {
-            status: ReviewStatus::ConfirmationRequired,
-            authorization: None,
-            challenge_id: Some(challenge_id),
-            expires_at_ms: Some(expires_at_ms),
-            blockers: Vec::new(),
-            warnings: Vec::new(),
-            capabilities: capability_dtos(&capabilities),
-            requires_health_ack: false,
-            requires_capability_ack: true,
-            can_remember_for_session: true,
-            can_allow_unattended: false,
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())?
+        result
+    });
+    match task.await {
+        Ok(result) => result,
+        Err(error) => {
+            let message = error.to_string();
+            if let Some(request) = join_request {
+                let _ = join_autoscan.terminalize_verification_request(
+                    request.generation,
+                    request.ticket_id,
+                    AutoScanVerificationTerminal::Failed(format!(
+                        "AutoScan Compare review task failed: {message}"
+                    )),
+                );
+            }
+            Err(message)
+        }
+    }
 }
 
 #[tauri::command]
 pub fn approve_operation(
     window: tauri::WebviewWindow,
-    authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
+    lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
+    authorizations: tauri::State<'_, Arc<OperationAuthorizationStore>>,
     challenge_id: String,
-    acknowledge_health: bool,
-    accept_capabilities: bool,
-    remember_for_session: bool,
-    allow_unattended: bool,
+    approval: OperationApprovalDto,
 ) -> Result<AuthorizationDto, String> {
-    require_main_window(&window)?;
-    let (authorization, expires_at_ms) = authorizations.approve(
-        &challenge_id,
-        acknowledge_health,
-        accept_capabilities,
-        remember_for_session,
-        allow_unattended,
-    )?;
-    Ok(authorization_dto(authorization, expires_at_ms))
+    require_window_role(&window, WindowRole::Main)?;
+    let _command = lifecycle.inner().command_lease()?;
+    let approval = match approval {
+        OperationApprovalDto::Compare {
+            accept_capabilities,
+            remember_for_session,
+        } => ReviewApproval::Compare {
+            accept_capabilities,
+            remember_for_session,
+        },
+        OperationApprovalDto::InteractiveApply {
+            acknowledge_health,
+            accept_capabilities,
+            session_grant,
+        } => ReviewApproval::InteractiveApply {
+            acknowledge_health,
+            accept_capabilities,
+            session_grant: match session_grant {
+                ApplySessionGrantDecisionDto::None => ApplySessionGrantDecision::None,
+                ApplySessionGrantDecisionDto::RememberCapabilities => {
+                    ApplySessionGrantDecision::RememberCapabilities
+                }
+                ApplySessionGrantDecisionDto::AllowAutoApply => {
+                    ApplySessionGrantDecision::AllowAutoApply
+                }
+            },
+        },
+    };
+    let issued = authorizations.approve_review_challenge(&challenge_id, approval)?;
+    Ok(authorization_dto(issued))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // Tauri injects state and exposes the rest as flat IPC fields.
 #[tauri::command]
 pub async fn compare_job(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
-    state: tauri::State<'_, Arc<RunState>>,
-    results: tauri::State<'_, Arc<ResultRepository>>,
+    lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
     events: tauri::State<'_, Arc<RunEventRepository>>,
-    authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
+    authorizations: tauri::State<'_, Arc<OperationAuthorizationStore>>,
     autoscan: tauri::State<'_, Arc<AutoScanController>>,
     authorization_token: String,
-) -> Result<PlanDto, String> {
-    require_main_window(&window)?;
-    let st = state.inner().clone();
-    let _command = RunCommandGuard::begin(st.clone());
+) -> Result<CompareWorkspaceSnapshotDto, String> {
+    require_window_role(&window, WindowRole::Main)?;
+    let lifecycle = lifecycle.inner().clone();
     let results = results.inner().clone();
     let events = events.inner().clone();
     let authorizations = authorizations.inner().clone();
     let autoscan = autoscan.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let authorization = authorizations.consume(
-            &authorization_token,
-            AuthorizationPurpose::CompareInteractive,
-        )?;
-        let loaded = load_bound_target(&authorization.binding)?;
-        let capabilities = run::compare_capabilities(&loaded.job).map_err(user_err)?;
+        let authorization = authorizations.consume_compare_authorization(&authorization_token)?;
+        let auto_scan_permit = authorization.auto_scan_permit().cloned();
+        let mut auto_scan_terminal =
+            AutoScanCompareTerminalGuard::new(autoscan.clone(), auto_scan_permit.clone());
+        let terminalize_auto_scan = |terminal: AutoScanVerificationTerminal| {
+            if let Some(permit) = auto_scan_permit.as_ref() {
+                let _ = autoscan.terminalize_permitted_verification(permit, terminal);
+            }
+        };
+        let command = match lifecycle.command_lease() {
+            Ok(command) => command,
+            Err(message) => {
+                terminalize_auto_scan(AutoScanVerificationTerminal::Failed(message.clone()));
+                return Err(message);
+            }
+        };
+        let target = match load_bound_target(authorization.target()) {
+            Ok(target) => target,
+            Err(message) => {
+                terminalize_auto_scan(AutoScanVerificationTerminal::Failed(message.clone()));
+                return Err(message);
+            }
+        };
+        let capabilities = match run::compare_capabilities(&target.target_job) {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                let terminal = verification_terminal_from_io(&error);
+                let message = format_run_io_error(error);
+                terminalize_auto_scan(terminal);
+                return Err(message);
+            }
+        };
         let blockers = capability_blockers(&capabilities);
         if !blockers.is_empty() {
-            return Err(blockers.join("\n"));
+            let message = blockers.join("\n");
+            terminalize_auto_scan(AutoScanVerificationTerminal::Failed(message.clone()));
+            return Err(message);
         }
-        let loaded = reload_prepared_target(&loaded)?;
-        let current_binding = compare_binding(&loaded, &capabilities);
-        validate_exact_binding(&authorization.binding, &current_binding)?;
-        let consent = CapabilityConsent::ExactDigest(current_binding.capability_digest.clone());
-
-        let (run_id, ctl) = begin_run(&st)?;
-        let _active_run = ActiveRunGuard {
-            state: st.clone(),
-            run_id,
+        let target = match reload_prepared_target(&target) {
+            Ok(target) => target,
+            Err(message) => {
+                terminalize_auto_scan(AutoScanVerificationTerminal::Failed(message.clone()));
+                return Err(message);
+            }
         };
-        let ctx = make_ctx(&app, events, run_id, ctl, "compare");
+        let current = match build_compare_authorization(
+            &target,
+            &capabilities,
+            authorization.origin().clone(),
+        ) {
+            Ok(current) => current,
+            Err(message) => {
+                terminalize_auto_scan(AutoScanVerificationTerminal::Failed(message.clone()));
+                return Err(message);
+            }
+        };
+        if let Err(message) = authorization.verify_current(&current) {
+            terminalize_auto_scan(AutoScanVerificationTerminal::Failed(message.clone()));
+            return Err(message);
+        }
+        let consent =
+            CapabilityConsent::ExactDigest(current.capability_review_digest().to_string());
+
+        let active_run = match command.start_run(RunPurpose::Compare) {
+            Ok(active_run) => active_run,
+            Err(message) => {
+                terminalize_auto_scan(AutoScanVerificationTerminal::Failed(message.clone()));
+                return Err(message);
+            }
+        };
+        let run_id = active_run.run_id();
+        let execution_scope = CompareScope::new(
+            &target.registered_job.job_id,
+            target.target_index,
+            &target.config_revision,
+        );
+        authorizations.revoke_apply_authority(&execution_scope);
+        let verification = match auto_scan_permit.as_ref() {
+            Some(permit) => {
+                if let Err(message) = autoscan.mark_compare_launched(permit, run_id) {
+                    terminalize_auto_scan(AutoScanVerificationTerminal::Failed(message.clone()));
+                    return Err(message);
+                }
+                permit.verification().clone()
+            }
+            None => results
+                .begin_verification(execution_scope.clone(), Some(run_id))
+                .map_err(|error| error.to_string())?,
+        };
+        emit_compare_execution_status(&app, &results, &execution_scope);
+        let terminalize_failure = |terminal: AutoScanVerificationTerminal,
+                                   repository_message: &str| {
+            if auto_scan_permit.is_some() {
+                terminalize_auto_scan(terminal);
+            } else {
+                let outcome = match terminal {
+                    AutoScanVerificationTerminal::Failed(_) => {
+                        CompareVerificationTerminalOutcome::Failed {
+                            message: repository_message.to_string(),
+                        }
+                    }
+                    AutoScanVerificationTerminal::Cancelled => {
+                        CompareVerificationTerminalOutcome::Cancelled
+                    }
+                };
+                if results.complete_verification_terminal(&verification, outcome) {
+                    emit_compare_execution_status(&app, &results, &execution_scope);
+                }
+            }
+        };
+        let ctl = active_run.control();
+        let ctx = make_ctx(&app, events, run_id, ctl, RunEventAudience::Compare);
         let outlet: Arc<dyn syncdash::obs::progress::ProgressSink> =
             match syncdash::obs::progress::current() {
                 Some(previous) => Arc::new(syncdash::obs::logging::MultiSink::new(vec![
@@ -498,11 +664,19 @@ pub async fn compare_job(
         let _log_guard = syncdash::obs::progress::install(outlet);
         let t0 = std::time::Instant::now();
         let ts_ms = syncdash::foundation::time::now_ms() as i64;
-        let result =
-            run::compare_with_capability_consent(&loaded.job_name, &loaded.job, &ctx, &consent);
+        let result = run::compare_with_capability_consent(
+            &target.job_name,
+            &target.target_job,
+            &ctx,
+            &consent,
+        );
         syncdash::obs::runlog::compare_summary(
-            &loaded.job_name,
-            &run::run_kind(&loaded.job, "compare"),
+            syncdash::obs::runlog::RunSubject::registered(
+                &target.job_name,
+                &target.registered_job.job_id,
+                target.target_index,
+            ),
+            run::compare_run_kind(&target.target_job),
             ts_ms,
             result
                 .as_ref()
@@ -515,14 +689,34 @@ pub async fn compare_job(
                 .map(syncdash::obs::progress::is_cancelled)
                 .unwrap_or(false),
         );
-        let outcome = result.map_err(user_err)?;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let terminal = verification_terminal_from_io(&error);
+                let message = format_run_io_error(error);
+                terminalize_failure(terminal, &message);
+                return Err(message);
+            }
+        };
         let plan_digest = outcome.plan.digest();
+        let result_id = crate::authority_token::random_hex::<16>(
+            "Cannot allocate the successful Compare result identity",
+        )
+        .inspect_err(|message| {
+            terminalize_failure(
+                AutoScanVerificationTerminal::Failed(message.clone()),
+                message,
+            );
+        })?;
         let mut owner = CompareOwner {
-            compare_id: run_id,
-            job_id: loaded.full_job.job_id.clone(),
-            job_name: loaded.job_name.clone(),
-            target_index: loaded.target_index,
-            config_revision: loaded.config_revision.clone(),
+            identity: CompareIdentity {
+                result_id,
+                compare_run_id: run_id,
+                job_id: target.registered_job.job_id.clone(),
+                target_index: target.target_index,
+                config_revision: target.config_revision.clone(),
+            },
+            job_name: target.job_name.clone(),
         };
         let evidence = compare::evidence::evidence(
             &outcome.source,
@@ -551,169 +745,219 @@ pub async fn compare_job(
             identical_bytes: evidence.identical_bytes,
         };
 
-        let mut repository = results.0.lock().unwrap();
-        let (current_name, current_job) = job::load_by_id(&owner.job_id).map_err(|error| {
-            format!(
-                "Job '{}' was deleted or replaced while Compare was running: {error}",
-                owner.job_name
-            )
+        let (current_name, current_job) =
+            job::load_by_id(&owner.identity.job_id).map_err(|error| {
+                let message = format!(
+                    "Job '{}' was deleted or replaced while Compare was running: {error}",
+                    owner.job_name
+                );
+                terminalize_failure(
+                    AutoScanVerificationTerminal::Failed(message.clone()),
+                    &message,
+                );
+                message
+            })?;
+        let current_revision = job::config_revision(&current_job).map_err(|error| {
+            let message = format!("Job '{}': {error}", owner.job_name);
+            terminalize_failure(
+                AutoScanVerificationTerminal::Failed(message.clone()),
+                &message,
+            );
+            message
         })?;
-        let current_revision = job::config_revision(&current_job)
-            .map_err(|error| format!("Job '{}': {error}", owner.job_name))?;
-        if current_revision != owner.config_revision {
-            return Err(format!(
+        if current_revision != owner.identity.config_revision {
+            let message = format!(
                 "Job '{}' changed while Compare was running — run Compare again",
                 owner.job_name
-            ));
+            );
+            terminalize_failure(
+                AutoScanVerificationTerminal::Failed(message.clone()),
+                &message,
+            );
+            return Err(message);
         }
         owner.job_name = current_name;
         dto.owner = owner.clone();
-        repository.insert(CachedCompare {
-            provenance: CompareProvenance {
-                owner: owner.clone(),
-                plan_digest,
-            },
-            plan: dto.clone(),
-            source: outcome.source,
-            target: outcome.target,
-            compare_options: outcome.compare_options,
-        });
-        drop(repository);
-        // Registration is opportunistic: a stop/rearm may have made this an ordinary interactive
-        // Compare while it ran. Keep returning and caching the successful result; only a later
-        // AutoScan completion needs the exact pending-ticket association.
-        let _ = autoscan.record_successful_compare(&owner);
-        Ok(dto)
+        let retained_result = SuccessfulCompareResult::from_plan(
+            plan_digest,
+            dto.clone(),
+            outcome.source,
+            outcome.target,
+            outcome.compare_options,
+        );
+        let publication = if let Some(permit) = auto_scan_permit.as_ref() {
+            match autoscan.publish_successful_compare(permit, retained_result) {
+                Ok(AutoScanComparePublication {
+                    publication,
+                    autoscan_status,
+                }) => {
+                    auto_scan_terminal.disarm();
+                    debug_assert!(autoscan_status.pending_trigger.is_none());
+                    publication
+                }
+                Err(message) => {
+                    terminalize_failure(
+                        AutoScanVerificationTerminal::Failed(message.clone()),
+                        &message,
+                    );
+                    return Err(message);
+                }
+            }
+        } else {
+            match results.publish_successful_version(&verification, retained_result) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    let message = error.to_string();
+                    terminalize_failure(
+                        AutoScanVerificationTerminal::Failed(message.clone()),
+                        &message,
+                    );
+                    return Err(message);
+                }
+            }
+        };
+        let _ = app.emit_to(
+            MAIN_WINDOW_LABEL,
+            "compare-execution-status",
+            publication.workspace.execution_status.clone(),
+        );
+        Ok(publication.workspace)
     })
     .await
     .map_err(|error| error.to_string())?
 }
 
 fn prepare_apply(
-    results: &ResultRepository,
-    requested_owner: &CompareOwner,
-    selected: Vec<SelectedRowDto>,
+    results: &CompareResultRepository,
+    compare_identity: &CompareIdentity,
+    reviewed_row_decisions: Vec<ReviewedRowDecisionDto>,
 ) -> Result<PreparedApply, String> {
-    prepare_cached_apply(load_cached_apply(results, requested_owner)?, selected)
+    prepare_retained_apply(
+        load_retained_apply(results, compare_identity)?,
+        reviewed_row_decisions,
+    )
 }
 
-fn load_cached_apply(
-    results: &ResultRepository,
-    requested_owner: &CompareOwner,
-) -> Result<CachedApplyPlan, String> {
-    let (job_name, full_job) = job::load_by_id(&requested_owner.job_id).map_err(|error| {
-        format!("The Compare result's job was deleted or replaced — run Compare again: {error}")
-    })?;
-    let loaded = load_target(job_name, full_job, Some(requested_owner.target_index))?;
-    if loaded.config_revision != requested_owner.config_revision {
+fn load_retained_apply(
+    results: &CompareResultRepository,
+    compare_identity: &CompareIdentity,
+) -> Result<RetainedApplyPlan, String> {
+    let (job_name, registered_job) =
+        job::load_by_id(&compare_identity.job_id).map_err(|error| {
+            format!("The Compare result's job was deleted or replaced — run Compare again: {error}")
+        })?;
+    let target = resolve_job_target(
+        job_name,
+        registered_job,
+        Some(compare_identity.target_index),
+    )?;
+    if target.config_revision != compare_identity.config_revision {
         return Err(format!(
             "Job '{}' changed since this Compare — run Compare again",
-            loaded.job_name
+            target.job_name
         ));
     }
-    let (mut owner, header, plan_ops, plan_digest) = {
-        let mut repository = results.0.lock().unwrap();
-        let key = ResultKey::new(
-            &loaded.full_job.job_id,
-            loaded.target_index,
-            &loaded.config_revision,
-        );
-        let cached = repository.get(&key);
-        validate_cached_compare(
-            cached.map(|result| &result.provenance),
-            requested_owner,
-            &loaded.full_job.job_id,
-            &loaded.job_name,
-            loaded.target_index,
-            &loaded.config_revision,
-            None,
-        )?;
-        let cached = cached.expect("validated cached compare must exist");
-        (
-            cached.provenance.owner.clone(),
-            cached.plan.header.clone(),
-            cached.plan.ops.clone(),
-            cached.provenance.plan_digest.clone(),
-        )
+    results
+        .rebind_job_name(&target.registered_job.job_id, &target.job_name)
+        .map_err(|error| error.to_string())?;
+    let retained = results
+        .get_fresh_exact(compare_identity)
+        .map_err(|error| error.to_string())?;
+    let requested_owner = CompareOwner {
+        identity: compare_identity.clone(),
+        job_name: target.job_name.clone(),
     };
-    // Names are presentation, not provenance. Normalize the cloned owner to the registry's current
-    // label so a pure rename still forms a valid binding while every authority-bearing field stays
-    // pinned to the cached compare identity.
-    owner = with_current_job_name(owner, &loaded.job_name);
+    validate_retained_compare(
+        Some(&retained),
+        &requested_owner,
+        &target.registered_job.job_id,
+        &target.job_name,
+        target.target_index,
+        &target.config_revision,
+        None,
+    )?;
+    let owner = retained.owner().clone();
     let plan = Plan {
-        header,
-        ops: plan_ops,
+        header: retained.plan_header().clone(),
+        ops: retained.plan_operations().to_vec(),
     };
+    let plan_digest = retained.plan_digest().to_string();
     if plan.digest() != plan_digest {
-        return Err("The cached Compare plan changed — run Compare again".into());
+        return Err("The retained Compare plan changed — run Compare again".into());
     }
-    Ok(CachedApplyPlan {
-        loaded,
+    Ok(RetainedApplyPlan {
+        target,
         owner,
         plan,
         plan_digest,
     })
 }
 
-fn prepare_cached_apply(
-    cached: CachedApplyPlan,
-    selected: Vec<SelectedRowDto>,
+fn prepare_retained_apply(
+    retained_plan: RetainedApplyPlan,
+    reviewed_row_decisions: Vec<ReviewedRowDecisionDto>,
 ) -> Result<PreparedApply, String> {
-    let ops = resolve_selected_ops(&cached.plan.ops, &selected)?;
+    let reviewed_operations =
+        resolve_reviewed_operations(&retained_plan.plan.ops, &reviewed_row_decisions)?;
     Ok(PreparedApply {
-        loaded: cached.loaded,
-        owner: cached.owner,
-        plan: cached.plan,
-        plan_digest: cached.plan_digest,
-        selected,
-        ops,
+        target: retained_plan.target,
+        owner: retained_plan.owner,
+        plan: retained_plan.plan,
+        plan_digest: retained_plan.plan_digest,
+        reviewed_row_decisions,
+        reviewed_operations,
     })
 }
 
-fn server_owned_selection(ops: &[Op]) -> Result<Vec<SelectedRowDto>, String> {
-    let selected: Vec<SelectedRowDto> = ops
+fn server_owned_reviewed_row_decisions(ops: &[Op]) -> Result<Vec<ReviewedRowDecisionDto>, String> {
+    let reviewed_row_decisions: Vec<ReviewedRowDecisionDto> = ops
         .iter()
         .enumerate()
         .filter(|(_, op)| !matches!(op.action, Action::Conflict | Action::Note))
-        .map(|(index, _)| SelectedRowDto {
+        .map(|(index, _)| ReviewedRowDecisionDto {
             index,
-            flipped: false,
+            direction_reversed: false,
         })
         .collect();
-    if selected.is_empty() {
+    if reviewed_row_decisions.is_empty() {
         return Err(
             "AutoScan found no executable operations; unattended Apply will not run a no-op plan"
                 .into(),
         );
     }
-    Ok(selected)
+    Ok(reviewed_row_decisions)
 }
 
 fn prepare_autoscan_apply(
-    results: &ResultRepository,
+    results: &CompareResultRepository,
     ticket: &AutoApplyTicket,
 ) -> Result<PreparedApply, String> {
-    let cached = load_cached_apply(results, &ticket.owner)?;
-    if cached.loaded.full_job.job_id != ticket.job_id
-        || cached.loaded.config_revision != ticket.config_revision
-        || cached.loaded.target_index != ticket.target_index
-        || !same_compare_identity(Some(&cached.owner), Some(&ticket.owner))
-    {
+    let retained_plan = load_retained_apply(results, ticket.compare_identity())?;
+    if retained_plan.owner.identity != *ticket.compare_identity() {
         return Err("The completed AutoScan ticket no longer owns this Compare result".into());
     }
-    let selected = server_owned_selection(&cached.plan.ops)?;
-    prepare_cached_apply(cached, selected)
+    let reviewed_row_decisions = server_owned_reviewed_row_decisions(&retained_plan.plan.ops)?;
+    prepare_retained_apply(retained_plan, reviewed_row_decisions)
 }
 
 fn apply_facts(prepared: &PreparedApply) -> Result<ApplyFacts, String> {
-    let requirements =
-        run::apply_requirements(&prepared.loaded.job, &prepared.plan, &prepared.ops, false)
-            .map_err(user_err)?;
+    let requirements = run::apply_requirements(
+        &prepared.target.target_job,
+        &prepared.plan,
+        &prepared.reviewed_operations,
+        false,
+    )
+    .map_err(format_run_io_error)?;
     let acknowledged = if requirements.verdict.ok() {
         requirements.verdict.clone()
     } else {
-        run::preflight(&prepared.loaded.job, &prepared.plan, &prepared.ops, true)
-            .map_err(user_err)?
+        run::preflight(
+            &prepared.target.target_job,
+            &prepared.plan,
+            &prepared.reviewed_operations,
+            true,
+        )
+        .map_err(format_run_io_error)?
     };
     Ok(ApplyFacts {
         unacknowledged: requirements.verdict,
@@ -722,51 +966,16 @@ fn apply_facts(prepared: &PreparedApply) -> Result<ApplyFacts, String> {
     })
 }
 
-fn apply_binding(
-    prepared: &PreparedApply,
-    facts: &ApplyFacts,
-    purpose: AuthorizationPurpose,
-    auto_apply_ticket: Option<&AutoApplyTicket>,
-) -> Result<OperationBinding, String> {
-    let auto_apply_ticket = auto_apply_ticket
-        .map(|ticket| {
-            if ticket.job_id != prepared.loaded.full_job.job_id
-                || ticket.config_revision != prepared.loaded.config_revision
-                || ticket.target_index != prepared.loaded.target_index
-                || !same_compare_identity(Some(&ticket.owner), Some(&prepared.owner))
-            {
-                return Err(
-                    "The AutoScan ticket no longer matches its authenticated Compare result"
-                        .to_string(),
-                );
-            }
-            Ok(AutoApplyTicket {
-                generation: ticket.generation,
-                ticket_id: ticket.ticket_id,
-                job_id: prepared.loaded.full_job.job_id.clone(),
-                job_name: prepared.loaded.job_name.clone(),
-                config_revision: prepared.loaded.config_revision.clone(),
-                target_index: prepared.loaded.target_index,
-                owner: prepared.owner.clone(),
-            })
-        })
-        .transpose()?;
-    Ok(OperationBinding {
-        scope: CapabilityScope::ApplyWrite,
-        purpose,
-        job_id: prepared.loaded.full_job.job_id.clone(),
-        job_name: prepared.loaded.job_name.clone(),
-        config_revision: prepared.loaded.config_revision.clone(),
-        target_index: prepared.loaded.target_index,
-        owner: Some(prepared.owner.clone()),
-        plan_digest: Some(prepared.plan_digest.clone()),
-        decision_digest: Some(crate::auth::decision_digest(&prepared.selected)?),
-        health_digest: health_digest(&facts.unacknowledged, &facts.acknowledged),
-        capability_digest: facts
+fn build_apply_review(prepared: &PreparedApply, facts: &ApplyFacts) -> Result<ApplyReview, String> {
+    ApplyReview::new(
+        prepared.owner.identity.clone(),
+        prepared.plan_digest.clone(),
+        prepared.reviewed_row_decisions.clone(),
+        health_review_digest(&facts.unacknowledged, &facts.acknowledged),
+        facts
             .capabilities
             .consent_digest(CapabilityScope::ApplyWrite),
-        auto_apply_ticket,
-    })
+    )
 }
 
 fn apply_review_messages(facts: &ApplyFacts) -> (Vec<String>, Vec<String>, bool) {
@@ -795,19 +1004,18 @@ fn autoscan_health_refusals(facts: &ApplyFacts) -> Vec<String> {
 #[tauri::command]
 pub async fn review_apply(
     window: tauri::WebviewWindow,
-    state: tauri::State<'_, Arc<RunState>>,
-    results: tauri::State<'_, Arc<ResultRepository>>,
-    authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
-    owner: CompareOwner,
-    selected: Vec<SelectedRowDto>,
+    lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
+    authorizations: tauri::State<'_, Arc<OperationAuthorizationStore>>,
+    compare_identity: CompareIdentity,
+    reviewed_row_decisions: Vec<ReviewedRowDecisionDto>,
 ) -> Result<OperationReviewDto, String> {
-    require_main_window(&window)?;
-    let st = state.inner().clone();
-    let _command = RunCommandGuard::begin(st);
+    require_window_role(&window, WindowRole::Main)?;
+    let _command = lifecycle.inner().command_lease()?;
     let results = results.inner().clone();
     let authorizations = authorizations.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let prepared = prepare_apply(&results, &owner, selected)?;
+        let prepared = prepare_apply(&results, &compare_identity, reviewed_row_decisions)?;
         let facts = match apply_facts(&prepared) {
             Ok(facts) => facts,
             Err(error) => {
@@ -822,25 +1030,20 @@ pub async fn review_apply(
         if !blockers.is_empty() {
             return Ok(blocked_review(blockers, warnings, &facts.capabilities));
         }
-        let requires_capability_ack = !facts.capabilities.needs_ack().is_empty();
-        let binding = apply_binding(
-            &prepared,
-            &facts,
-            AuthorizationPurpose::ApplyInteractive,
-            None,
-        )?;
-        let (challenge_id, expires_at_ms) = authorizations.challenge(ChallengeSpec {
-            binding,
-            selected: prepared.selected,
-            requires_health_ack,
-            requires_capability_ack,
+        let review = build_apply_review(&prepared, &facts)?;
+        let requires_capability_ack = !facts.capabilities.needs_ack().is_empty()
+            && !authorizations.has_interactive_apply_capability_grant(&review);
+        let compare_identity = review.compare_identity().clone();
+        let challenge = results.with_fresh_execution_eligibility(&compare_identity, || {
+            authorizations.create_review_challenge(ReviewChallenge::InteractiveApply {
+                review,
+                requires_health_ack,
+                requires_capability_ack,
+            })
         })?;
-        Ok(OperationReviewDto {
-            status: ReviewStatus::ConfirmationRequired,
-            authorization: None,
-            challenge_id: Some(challenge_id),
-            expires_at_ms: Some(expires_at_ms),
-            blockers: Vec::new(),
+        Ok(OperationReviewDto::InteractiveApplyConfirmationRequired {
+            challenge_id: challenge.challenge_id,
+            expires_at_ms: challenge.expires_at_ms,
             warnings,
             capabilities: capability_dtos(&facts.capabilities),
             requires_health_ack,
@@ -856,16 +1059,15 @@ pub async fn review_apply(
 #[tauri::command]
 pub async fn authorize_autoscan_apply(
     window: tauri::WebviewWindow,
-    state: tauri::State<'_, Arc<RunState>>,
-    results: tauri::State<'_, Arc<ResultRepository>>,
-    authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
+    lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
+    authorizations: tauri::State<'_, Arc<OperationAuthorizationStore>>,
     autoscan: tauri::State<'_, Arc<AutoScanController>>,
     generation: u64,
     ticket_id: u64,
 ) -> Result<AuthorizationDto, String> {
-    require_main_window(&window)?;
-    let st = state.inner().clone();
-    let _command = RunCommandGuard::begin(st);
+    require_window_role(&window, WindowRole::Main)?;
+    let _command = lifecycle.inner().command_lease()?;
     let results = results.inner().clone();
     let authorizations = authorizations.inner().clone();
     let autoscan = autoscan.inner().clone();
@@ -884,105 +1086,131 @@ pub async fn authorize_autoscan_apply(
         if !blockers.is_empty() {
             return Err(blockers.join("\n"));
         }
-        reload_prepared_target(&prepared.loaded)?;
-        let binding = apply_binding(
-            &prepared,
-            &facts,
-            AuthorizationPurpose::ApplyAutoScan,
-            Some(&ticket),
-        )?;
-        let selected = prepared.selected;
-        let (authorization, expires_at_ms) = autoscan.authorize_claim(&ticket, || {
-            authorizations.authorize_autoscan(binding, selected)
+        reload_prepared_target(&prepared.target)?;
+        let review = build_apply_review(&prepared, &facts)?;
+        let compare_identity = review.compare_identity().clone();
+        let issued = autoscan.authorize_claim(&ticket, || {
+            results.with_fresh_execution_eligibility(&compare_identity, || {
+                authorizations.issue_auto_apply_authorization(review, ticket.clone())
+            })
         })?;
-        Ok(authorization_dto(authorization, expires_at_ms))
+        Ok(authorization_dto(issued))
     })
     .await
     .map_err(|error| error.to_string())?
 }
 
-fn revalidate_cached_before_apply(
-    results: &ResultRepository,
+fn revalidate_retained_before_apply(
+    results: &CompareResultRepository,
     prepared: &PreparedApply,
-    state: &RunState,
-    launch_id: Option<u64>,
-) -> Result<(u64, Arc<syncdash::obs::progress::RunCtl>), String> {
+    command: &RunCommandLease,
+    launch: ApplyLaunch,
+) -> Result<ActiveRunLease, String> {
     // Root/capability probes above can be slow. Re-read the registry after them, without holding
     // any result/auth/run lock, so an external TOML edit cannot ride an old in-memory Job into the
     // reservation. The core reopens roots once more after reservation and enforces exact consent.
-    let _current = reload_prepared_target(&prepared.loaded)?;
-    let mut repository = results.0.lock().unwrap();
-    let key = ResultKey::new(
-        &prepared.loaded.full_job.job_id,
-        prepared.loaded.target_index,
-        &prepared.loaded.config_revision,
-    );
-    let cached = repository.get(&key);
-    validate_cached_compare(
-        cached.map(|result| &result.provenance),
+    let _current = reload_prepared_target(&prepared.target)?;
+    let retained = results
+        .get_exact(&prepared.owner.identity)
+        .map_err(|error| error.to_string())?;
+    validate_retained_compare(
+        retained.as_ref(),
         &prepared.owner,
-        &prepared.loaded.full_job.job_id,
-        &prepared.loaded.job_name,
-        prepared.loaded.target_index,
-        &prepared.loaded.config_revision,
+        &prepared.target.registered_job.job_id,
+        &prepared.target.job_name,
+        prepared.target.target_index,
+        &prepared.target.config_revision,
         Some(&prepared.plan_digest),
     )?;
-    begin_run_for_launch(state, launch_id)
+    results.with_fresh_execution_eligibility(&prepared.owner.identity, || match launch {
+        ApplyLaunch::Interactive { progress_launch_id } => {
+            command.start_apply_from_progress_launch(progress_launch_id)
+        }
+        ApplyLaunch::AutoScan => command.start_run(RunPurpose::Apply),
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplyLaunch {
+    Interactive { progress_launch_id: u64 },
+    AutoScan,
+}
+
+impl ApplyLaunch {
+    fn bind(
+        authorization_kind: ApplyAuthorizationKind,
+        progress_launch_id: Option<u64>,
+    ) -> Result<Self, String> {
+        match (authorization_kind, progress_launch_id) {
+            (ApplyAuthorizationKind::Interactive, Some(progress_launch_id)) => {
+                Ok(Self::Interactive { progress_launch_id })
+            }
+            (ApplyAuthorizationKind::AutoScan, None) => Ok(Self::AutoScan),
+            (ApplyAuthorizationKind::Interactive, None) => Err(
+                "Interactive Apply requires its reserved progress window — review Apply again"
+                    .into(),
+            ),
+            (ApplyAuthorizationKind::AutoScan, Some(_)) => {
+                Err("AutoScan Apply cannot use an interactive progress-window launch".into())
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Tauri injects state and exposes the rest as flat IPC fields.
 #[tauri::command]
 pub async fn apply_job(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
-    state: tauri::State<'_, Arc<RunState>>,
-    results: tauri::State<'_, Arc<ResultRepository>>,
+    lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
+    results: tauri::State<'_, Arc<CompareResultRepository>>,
     events: tauri::State<'_, Arc<RunEventRepository>>,
-    authorizations: tauri::State<'_, Arc<AuthorizationStore>>,
+    authorizations: tauri::State<'_, Arc<OperationAuthorizationStore>>,
     autoscan: tauri::State<'_, Arc<AutoScanController>>,
     authorization_token: String,
     launch_id: Option<u64>,
 ) -> Result<ApplyDto, String> {
-    require_main_window(&window)?;
-    let st = state.inner().clone();
-    let _command = RunCommandGuard::begin(st.clone());
+    require_window_role(&window, WindowRole::Main)?;
+    let lifecycle = lifecycle.inner().clone();
+    let command = lifecycle.command_lease()?;
     let results = results.inner().clone();
     let events = events.inner().clone();
     let authorizations = authorizations.inner().clone();
     let autoscan = autoscan.inner().clone();
-    let reject_state = state.inner().clone();
+    let rejection_lifecycle = lifecycle.clone();
+    let power_action_lifecycle = lifecycle.clone();
     let requested_launch = launch_id;
     let run_app = app.clone();
     let joined =
         tauri::async_runtime::spawn_blocking(move || -> Result<ApplyDto, (String, bool)> {
             let authorization = authorizations
-                .consume_apply(&authorization_token)
+                .consume_apply_authorization(&authorization_token)
                 .map_err(|error| (error, false))?;
-            let purpose = authorization.binding.purpose;
-            let auto_apply_ticket = authorization.binding.auto_apply_ticket.clone();
-            let owner =
-                authorization.binding.owner.clone().ok_or_else(|| {
-                    ("The Apply authorization has no Compare owner".into(), false)
-                })?;
-            let prepared = prepare_apply(&results, &owner, authorization.selected)
+            let apply_launch = ApplyLaunch::bind(authorization.kind(), launch_id)
                 .map_err(|error| (error, false))?;
+            let reviewed = authorization.review().clone();
+            let health_warning_acknowledged = authorization.health_warning_acknowledged();
+            let auto_apply_ticket = match &authorization {
+                ApplyAuthorization::Interactive(_) => None,
+                ApplyAuthorization::AutoScan(authorization) => Some(authorization.ticket().clone()),
+            };
+            let prepared = prepare_apply(
+                &results,
+                reviewed.compare_identity(),
+                reviewed.reviewed_row_decisions().to_vec(),
+            )
+            .map_err(|error| (error, false))?;
             let facts = apply_facts(&prepared).map_err(|error| (error, false))?;
-            let current_binding =
-                apply_binding(&prepared, &facts, purpose, auto_apply_ticket.as_ref())
-                    .map_err(|error| (error, false))?;
-            validate_exact_binding(&authorization.binding, &current_binding)
+            let current_review =
+                build_apply_review(&prepared, &facts).map_err(|error| (error, false))?;
+            reviewed
+                .verify_current(&current_review)
                 .map_err(|error| (error, false))?;
             let blockers = capability_blockers(&facts.capabilities);
             if !blockers.is_empty() {
                 return Err((blockers.join("\n"), false));
             }
-            if purpose == AuthorizationPurpose::ApplyAutoScan && authorization.acknowledged_health {
-                return Err((
-                    "An AutoScan Apply cannot acknowledge plan-health warnings".into(),
-                    false,
-                ));
-            }
-            if purpose == AuthorizationPurpose::ApplyAutoScan {
+            if matches!(authorization, ApplyAuthorization::AutoScan(_)) {
                 let health_refusals = autoscan_health_refusals(&facts);
                 if !health_refusals.is_empty() {
                     return Err((
@@ -994,7 +1222,7 @@ pub async fn apply_job(
                     ));
                 }
             }
-            let verdict = if authorization.acknowledged_health {
+            let verdict = if health_warning_acknowledged {
                 &facts.acknowledged
             } else {
                 &facts.unacknowledged
@@ -1002,51 +1230,84 @@ pub async fn apply_job(
             if !verdict.ok() {
                 return Err((verdict.blockers.join("\n"), false));
             }
-            let consent = CapabilityConsent::ExactDigest(current_binding.capability_digest.clone());
-            let reserve = || revalidate_cached_before_apply(&results, &prepared, &st, launch_id);
-            let (run_id, ctl) = match auto_apply_ticket.as_ref() {
+            let consent = CapabilityConsent::ExactDigest(
+                current_review.capability_review_digest().to_string(),
+            );
+            let reserve =
+                || revalidate_retained_before_apply(&results, &prepared, &command, apply_launch);
+            let active_run = match auto_apply_ticket.as_ref() {
                 Some(ticket) => autoscan.consume_authorized_with(ticket, reserve),
                 None => reserve(),
             }
             .map_err(|error| (error, false))?;
+            let run_id = active_run.run_id();
+            let ctl = active_run.control();
             let mut applied_result = AppliedResultGuard::new(
+                run_app.clone(),
                 results.clone(),
-                &prepared.loaded.full_job.job_id,
-                &prepared.loaded.config_revision,
+                &prepared.target.registered_job.job_id,
+                &prepared.target.config_revision,
             );
-            let _active_run = ActiveRunGuard {
-                state: st.clone(),
-                run_id,
-            };
-            let ctx = make_ctx(&run_app, events, run_id, ctl, "apply");
+            let ctx = make_ctx(&run_app, events, run_id, ctl, RunEventAudience::Apply);
             let t0 = std::time::Instant::now();
             let recorder = syncdash::obs::runlog::Recorder::start(
-                &prepared.loaded.job_name,
-                &run::run_kind(&prepared.loaded.job, "apply"),
+                syncdash::obs::runlog::RunSubject::registered(
+                    &prepared.target.job_name,
+                    &prepared.target.registered_job.job_id,
+                    prepared.target.target_index,
+                ),
+                run::apply_run_kind(&prepared.target.target_job),
                 &ctx,
-                &prepared.ops,
+                &prepared.reviewed_operations,
             );
             let execution = run::apply_with_capability_consent_classified(
-                &prepared.loaded.job_name,
-                &prepared.loaded.job,
+                &prepared.target.job_name,
+                &prepared.target.target_job,
                 &prepared.plan,
-                &prepared.ops,
+                &prepared.reviewed_operations,
                 None,
                 false,
-                authorization.acknowledged_health,
+                health_warning_acknowledged,
                 &consent,
                 &recorder.ctx,
             );
-            if !execution.writes_started() {
+            let writes_started = execution.writes_started();
+            if !writes_started {
                 applied_result.retain_for_safe_rejection();
             }
             let outcome = match execution.into_result() {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    return Err((user_err(error), true));
+                    return Err((format_run_io_error(error), true));
                 }
             };
-            recorder.finish(&outcome, t0.elapsed().as_millis() as u64);
+            let _ = recorder.finish(&outcome, t0.elapsed().as_millis() as u64);
+            if matches!(apply_launch, ApplyLaunch::Interactive { .. })
+                && writes_started
+                && !outcome.cancelled
+                && outcome.errors == 0
+            {
+                match power_action_lifecycle.issue_post_run_power_action_grant(run_id) {
+                    Ok(()) => match run_app.emit_to(
+                        PROGRESS_WINDOW_LABEL,
+                        "post-run-power-action-ready",
+                        PostRunPowerActionReadyDto { run_id },
+                    ) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            power_action_lifecycle.revoke_post_run_power_action_grant(run_id);
+                            syncdash::log_warn!(
+                                "desktop",
+                                "Apply run {run_id} finished safely, but its power-action availability could not be delivered: {error}"
+                            );
+                        }
+                    },
+                    Err(error) => syncdash::log_error!(
+                        "desktop",
+                        "Apply run {run_id} finished safely, but its power-action grant could not be issued: {error}"
+                    ),
+                }
+            }
             Ok(ApplyDto {
                 done: outcome.done,
                 skipped: outcome.skipped,
@@ -1061,8 +1322,9 @@ pub async fn apply_job(
         Err(error) => {
             let message = error.to_string();
             if let Some(launch_id) = requested_launch {
-                release_progress_launch(&reject_state, launch_id);
-                let _ = app.emit(
+                rejection_lifecycle.cancel_progress_launch(launch_id);
+                let _ = app.emit_to(
+                    PROGRESS_WINDOW_LABEL,
                     "run-rejected",
                     RunRejected {
                         launch_id,
@@ -1078,8 +1340,9 @@ pub async fn apply_job(
         Err((message, began)) => {
             if !began {
                 if let Some(launch_id) = requested_launch {
-                    if release_progress_launch(&reject_state, launch_id) {
-                        let _ = app.emit(
+                    if rejection_lifecycle.cancel_progress_launch(launch_id) {
+                        let _ = app.emit_to(
+                            PROGRESS_WINDOW_LABEL,
                             "run-rejected",
                             RunRejected {
                                 launch_id,
@@ -1098,33 +1361,6 @@ pub async fn apply_job(
 mod tests {
     use super::*;
 
-    fn owner() -> CompareOwner {
-        CompareOwner {
-            compare_id: 7,
-            job_id: "job-a".into(),
-            job_name: "photos".into(),
-            target_index: 1,
-            config_revision: "revision-a".into(),
-        }
-    }
-
-    fn binding() -> OperationBinding {
-        OperationBinding {
-            scope: CapabilityScope::ApplyWrite,
-            purpose: AuthorizationPurpose::ApplyInteractive,
-            job_id: "job-a".into(),
-            job_name: "photos".into(),
-            config_revision: "revision-a".into(),
-            target_index: 1,
-            owner: Some(owner()),
-            plan_digest: Some("plan-a".into()),
-            decision_digest: Some("selection-a".into()),
-            health_digest: "health-a".into(),
-            capability_digest: "caps-a".into(),
-            auto_apply_ticket: None,
-        }
-    }
-
     fn op(action: Action, path: &str) -> Op {
         Op {
             side: syncdash::model::plan::Side::Target,
@@ -1140,139 +1376,66 @@ mod tests {
         }
     }
 
-    fn loaded(name: &str, revision: &str, target_index: usize) -> LoadedTarget {
-        let full_job = syncdash::job::Job {
+    fn resolved_target(name: &str, revision: &str, target_index: usize) -> ResolvedJobTarget {
+        let registered_job = syncdash::job::Job {
             job_id: "job-a".into(),
+            source: "/source".into(),
+            targets: (0..=target_index)
+                .map(|index| format!("/target-{index}"))
+                .collect(),
             ..Default::default()
         };
-        LoadedTarget {
+        let target_job = registered_job
+            .select_target(target_index)
+            .expect("fixture target should resolve");
+        ResolvedJobTarget {
             job_name: name.into(),
-            job: full_job.clone(),
-            full_job,
+            target_job,
+            registered_job,
             target_index,
             config_revision: revision.into(),
         }
     }
 
     #[test]
-    fn active_run_guard_releases_state_during_unwind() {
-        let state = Arc::new(RunState::default());
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
-            let state = state.clone();
-            move || {
-                let (run_id, _) = begin_run(&state).unwrap();
-                let _active_run = ActiveRunGuard {
-                    state: state.clone(),
-                    run_id,
-                };
-                panic!("worker panic");
-            }
-        }));
-
-        assert!(result.is_err());
-        assert!(begin_run(&state).is_ok());
-    }
-
-    #[test]
-    fn every_execution_fingerprint_is_exact() {
-        let expected = binding();
-        assert!(validate_exact_binding(&expected, &expected).is_ok());
-
-        let rebound_owner = with_current_job_name(owner(), "archive");
-        assert_eq!(rebound_owner.job_name, "archive");
-        assert!(same_compare_identity(Some(&owner()), Some(&rebound_owner)));
-
-        let mut renamed = expected.clone();
-        renamed.job_name = "archive".into();
-        renamed.owner.as_mut().unwrap().job_name = "archive".into();
-        assert!(validate_exact_binding(&expected, &renamed).is_ok());
-
-        let mut changed = expected.clone();
-        changed.job_id = "job-b".into();
-        assert!(validate_exact_binding(&expected, &changed).is_err());
-        changed = expected.clone();
-        changed.config_revision = "revision-b".into();
-        assert!(validate_exact_binding(&expected, &changed).is_err());
-        changed = expected.clone();
-        changed.target_index = 0;
-        assert!(validate_exact_binding(&expected, &changed).is_err());
-        changed = expected.clone();
-        changed.capability_digest = "caps-b".into();
-        assert!(validate_exact_binding(&expected, &changed).is_err());
-        changed = expected.clone();
-        changed.plan_digest = Some("plan-b".into());
-        assert!(validate_exact_binding(&expected, &changed).is_err());
-        changed = expected.clone();
-        changed.decision_digest = Some("selection-b".into());
-        assert!(validate_exact_binding(&expected, &changed).is_err());
-        changed = expected.clone();
-        changed.health_digest = "health-b".into();
-        assert!(validate_exact_binding(&expected, &changed).is_err());
-        changed = expected.clone();
-        changed.owner.as_mut().unwrap().compare_id += 1;
-        assert!(validate_exact_binding(&expected, &changed).is_err());
-
-        let mut autoscan = expected.clone();
-        autoscan.purpose = AuthorizationPurpose::ApplyAutoScan;
-        autoscan.auto_apply_ticket = Some(AutoApplyTicket {
-            generation: 5,
-            ticket_id: 9,
-            job_id: "job-a".into(),
-            job_name: "photos".into(),
-            config_revision: "revision-a".into(),
-            target_index: 1,
-            owner: owner(),
-        });
-        assert!(validate_exact_binding(&autoscan, &autoscan).is_ok());
-        let mut renamed = autoscan.clone();
-        let ticket = renamed.auto_apply_ticket.as_mut().unwrap();
-        ticket.job_name = "archive".into();
-        ticket.owner.job_name = "archive".into();
-        assert!(validate_exact_binding(&autoscan, &renamed).is_ok());
-        let mut changed = autoscan.clone();
-        changed.auto_apply_ticket.as_mut().unwrap().ticket_id += 1;
-        assert!(validate_exact_binding(&autoscan, &changed).is_err());
-    }
-
-    #[test]
     fn registry_identity_is_rechecked_after_slow_probes_before_reservation() {
-        let reviewed = loaded("photos", "revision-a", 1);
-        assert!(validate_loaded_target_unchanged(&reviewed, &reviewed).is_ok());
+        let reviewed = resolved_target("photos", "revision-a", 1);
+        assert!(validate_resolved_target_unchanged(&reviewed, &reviewed).is_ok());
 
-        let renamed = loaded("archive", "revision-a", 1);
-        assert!(validate_loaded_target_unchanged(&reviewed, &renamed).is_ok());
-        let revised = loaded("photos", "revision-b", 1);
-        assert!(validate_loaded_target_unchanged(&reviewed, &revised).is_err());
-        let retargeted = loaded("photos", "revision-a", 0);
-        assert!(validate_loaded_target_unchanged(&reviewed, &retargeted).is_err());
-        let mut replaced = loaded("photos", "revision-a", 1);
-        replaced.full_job.job_id = "job-b".into();
-        assert!(validate_loaded_target_unchanged(&reviewed, &replaced).is_err());
+        let renamed = resolved_target("archive", "revision-a", 1);
+        assert!(validate_resolved_target_unchanged(&reviewed, &renamed).is_ok());
+        let revised = resolved_target("photos", "revision-b", 1);
+        assert!(validate_resolved_target_unchanged(&reviewed, &revised).is_err());
+        let retargeted = resolved_target("photos", "revision-a", 0);
+        assert!(validate_resolved_target_unchanged(&reviewed, &retargeted).is_err());
+        let mut replaced = resolved_target("photos", "revision-a", 1);
+        replaced.registered_job.job_id = "job-b".into();
+        assert!(validate_resolved_target_unchanged(&reviewed, &replaced).is_err());
     }
 
     #[test]
-    fn autoscan_selection_is_server_owned_complete_ordered_and_never_flipped() {
+    fn autoscan_review_decisions_are_server_owned_complete_ordered_and_not_reversed() {
         let ops = vec![
             op(Action::Copy, "copy"),
             op(Action::Conflict, "conflict"),
             op(Action::Note, "note"),
             op(Action::Delete, "delete"),
         ];
-        let selected = server_owned_selection(&ops).unwrap();
+        let reviewed_row_decisions = server_owned_reviewed_row_decisions(&ops).unwrap();
         assert_eq!(
-            selected,
+            reviewed_row_decisions,
             vec![
-                SelectedRowDto {
+                ReviewedRowDecisionDto {
                     index: 0,
-                    flipped: false,
+                    direction_reversed: false,
                 },
-                SelectedRowDto {
+                ReviewedRowDecisionDto {
                     index: 3,
-                    flipped: false,
+                    direction_reversed: false,
                 },
             ]
         );
-        assert!(server_owned_selection(&ops[1..3]).is_err());
+        assert!(server_owned_reviewed_row_decisions(&ops[1..3]).is_err());
     }
 
     #[test]
@@ -1282,12 +1445,31 @@ mod tests {
                 blockers: Vec::new(),
                 warnings: vec!["z warning".into(), "a warning".into(), "a warning".into()],
             },
-            acknowledged: empty_verdict(),
+            acknowledged: Verdict {
+                blockers: Vec::new(),
+                warnings: Vec::new(),
+            },
             capabilities: CapReport::default(),
         };
         assert_eq!(
             autoscan_health_refusals(&facts),
             vec!["a warning".to_string(), "z warning".to_string()]
         );
+    }
+
+    #[test]
+    fn apply_authorization_kind_requires_the_matching_launch_channel() {
+        assert_eq!(
+            ApplyLaunch::bind(ApplyAuthorizationKind::Interactive, Some(17)).unwrap(),
+            ApplyLaunch::Interactive {
+                progress_launch_id: 17
+            }
+        );
+        assert_eq!(
+            ApplyLaunch::bind(ApplyAuthorizationKind::AutoScan, None).unwrap(),
+            ApplyLaunch::AutoScan
+        );
+        assert!(ApplyLaunch::bind(ApplyAuthorizationKind::Interactive, None).is_err());
+        assert!(ApplyLaunch::bind(ApplyAuthorizationKind::AutoScan, Some(17)).is_err());
     }
 }

@@ -1,106 +1,136 @@
 import { useEffect, useRef } from 'react';
-import { activeNow, windowRate } from './runstate';
+import { activeElapsedMs, calculateWindowRate } from './runstate';
 import type { RunState } from './runstate';
 import type { RefObject } from 'react';
 
-interface Props {
+type GraphMetric = 'bytesDone' | 'itemsDone';
+
+interface GraphProps {
   caption: string;
-  field: 'b' | 'i';
-  /// The live run state, read on each redraw. The canvas repaints on its own 100 ms timer so the curve
-  /// stays smooth without dragging the numeric readouts (throttled to 500 ms) along with it.
+  metric: GraphMetric;
   runRef: RefObject<RunState>;
-  rateText: (s: RunState) => string;
+  rateText: (state: RunState) => string;
 }
 
-function draw(cv: HTMLCanvasElement, s: RunState, key: 'b' | 'i', total: number) {
-  const ctx = cv.getContext('2d');
-  if (!ctx) return;
-  const dpr = window.devicePixelRatio || 1;
-  const w = cv.clientWidth, h = cv.clientHeight;
-  if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, w, h);
-
-  // Colors are read from the stylesheet on every frame so the graph tracks the token layer — and,
-  // since the tokens flip with prefers-color-scheme, follows a light/dark switch without a reload.
-  // The fallbacks are the light-theme values (light is the default) and only ever apply if the
-  // stylesheet has not loaded.
-  const css = getComputedStyle(document.documentElement);
-  const cAccent = css.getPropertyValue('--accent').trim() || '#3b82f6';
-  const cDim = css.getPropertyValue('--text-2').trim() || '#5c5c63';
-  const cBorder = css.getPropertyValue('--border').trim() || '#e0e0e3';
-
-  const now = activeNow(s);
-  const lastV = s.samples.length ? s.samples[s.samples.length - 1][key] : 0;
-  // the ETA endpoint takes part in the x axis: the completion estimate sits at the right edge
-  // (a simplified FFS wedge: a dashed marker)
-  const r = windowRate(s, 60000);
-  const rate = key === 'b' ? r?.bps ?? 0 : r?.ips ?? 0;
-  const remain = Math.max(0, total - lastV);
-  const etaMs = rate > 1e-6 && total > 0 ? remain / rate * 1000 : 0;
-  const xMax = Math.max(now + etaMs, now, 1000);
-  const yMax = Math.max(total, lastV, 1);
-  const X = (t: number) => t / xMax * (w - 8) + 4;
-  const Y = (v: number) => h - 6 - v / yMax * (h - 16);
-
-  // grid
-  ctx.strokeStyle = cBorder; ctx.lineWidth = 1;
-  for (let g = 1; g <= 3; g++) {
-    const y = 6 + (h - 12) * g / 4;
-    ctx.beginPath(); ctx.moveTo(2, y); ctx.lineTo(w - 2, y); ctx.stroke();
+function drawGraph(
+  canvas: HTMLCanvasElement,
+  state: RunState,
+  metric: GraphMetric,
+  total: number,
+) {
+  const context = canvas.getContext('2d');
+  if (!context) return;
+  const pixelRatio = window.devicePixelRatio || 1;
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+  if (canvas.width !== width * pixelRatio || canvas.height !== height * pixelRatio) {
+    canvas.width = width * pixelRatio;
+    canvas.height = height * pixelRatio;
   }
-  // dashed line for the total
+  context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+  context.clearRect(0, 0, width, height);
+
+  const documentStyle = getComputedStyle(document.documentElement);
+  const accentColor = documentStyle.getPropertyValue('--accent').trim() || '#3b82f6';
+  const mutedColor = documentStyle.getPropertyValue('--text-2').trim() || '#5c5c63';
+  const borderColor = documentStyle.getPropertyValue('--border').trim() || '#e0e0e3';
+
+  const activeTimeMs = activeElapsedMs(state);
+  const latestValue = state.samples.length ? state.samples[state.samples.length - 1][metric] : 0;
+  const rate = calculateWindowRate(state, 60_000);
+  const unitsPerSecond = metric === 'bytesDone'
+    ? rate?.bytesPerSecond ?? 0
+    : rate?.itemsPerSecond ?? 0;
+  const remaining = Math.max(0, total - latestValue);
+  const estimatedRemainingMs = unitsPerSecond > 1e-6 && total > 0
+    ? remaining / unitsPerSecond * 1000
+    : 0;
+  const maximumTimeMs = Math.max(activeTimeMs + estimatedRemainingMs, activeTimeMs, 1000);
+  const maximumValue = Math.max(total, latestValue, 1);
+  const xCoordinate = (timeMs: number) => timeMs / maximumTimeMs * (width - 8) + 4;
+  const yCoordinate = (value: number) => height - 6 - value / maximumValue * (height - 16);
+
+  context.strokeStyle = borderColor;
+  context.lineWidth = 1;
+  for (let gridLine = 1; gridLine <= 3; gridLine++) {
+    const y = 6 + (height - 12) * gridLine / 4;
+    context.beginPath();
+    context.moveTo(2, y);
+    context.lineTo(width - 2, y);
+    context.stroke();
+  }
+
   if (total > 0) {
-    ctx.setLineDash([4, 3]); ctx.strokeStyle = cDim;
-    ctx.beginPath(); ctx.moveTo(2, Y(total)); ctx.lineTo(w - 2, Y(total)); ctx.stroke();
-    ctx.setLineDash([]);
+    context.setLineDash([4, 3]);
+    context.strokeStyle = mutedColor;
+    context.beginPath();
+    context.moveTo(2, yCoordinate(total));
+    context.lineTo(width - 2, yCoordinate(total));
+    context.stroke();
+    context.setLineDash([]);
   }
-  // cumulative curve + fill (decimated by a step once there are >300 samples)
-  if (s.samples.length > 1) {
-    const step = Math.max(1, Math.floor(s.samples.length / 300));
-    ctx.beginPath(); ctx.moveTo(X(0), Y(0));
-    for (let k = 0; k < s.samples.length; k += step) ctx.lineTo(X(s.samples[k].t), Y(s.samples[k][key]));
-    ctx.lineTo(X(s.samples[s.samples.length - 1].t), Y(lastV));
-    ctx.strokeStyle = cAccent; ctx.lineWidth = 1.5; ctx.stroke();
-    ctx.lineTo(X(s.samples[s.samples.length - 1].t), Y(0)); ctx.closePath();
-    // globalAlpha rather than appending '33' to the color string: that assumed --accent is always
-    // a 6-digit hex, which a token written as rgb() or color-mix() would silently break
-    ctx.fillStyle = cAccent;
-    ctx.globalAlpha = 0.2;
-    ctx.fill();
-    ctx.globalAlpha = 1;
+
+  if (state.samples.length > 1) {
+    const sampleStep = Math.max(1, Math.floor(state.samples.length / 300));
+    context.beginPath();
+    context.moveTo(xCoordinate(0), yCoordinate(0));
+    for (let index = 0; index < state.samples.length; index += sampleStep) {
+      const sample = state.samples[index];
+      context.lineTo(xCoordinate(sample.activeElapsedMs), yCoordinate(sample[metric]));
+    }
+    const latestSample = state.samples[state.samples.length - 1];
+    context.lineTo(xCoordinate(latestSample.activeElapsedMs), yCoordinate(latestValue));
+    context.strokeStyle = accentColor;
+    context.lineWidth = 1.5;
+    context.stroke();
+    context.lineTo(xCoordinate(latestSample.activeElapsedMs), yCoordinate(0));
+    context.closePath();
+    context.fillStyle = accentColor;
+    context.globalAlpha = 0.2;
+    context.fill();
+    context.globalAlpha = 1;
   }
-  // "now" vertical line + estimated-completion dashed line
-  ctx.strokeStyle = cDim;
-  ctx.beginPath(); ctx.moveTo(X(now), 4); ctx.lineTo(X(now), h - 4); ctx.stroke();
-  if (etaMs > 0) {
-    ctx.setLineDash([3, 3]);
-    ctx.beginPath(); ctx.moveTo(X(now + etaMs), 4); ctx.lineTo(X(now + etaMs), h - 4); ctx.stroke();
-    ctx.setLineDash([]);
+
+  context.strokeStyle = mutedColor;
+  context.beginPath();
+  context.moveTo(xCoordinate(activeTimeMs), 4);
+  context.lineTo(xCoordinate(activeTimeMs), height - 4);
+  context.stroke();
+  if (estimatedRemainingMs > 0) {
+    context.setLineDash([3, 3]);
+    context.beginPath();
+    context.moveTo(xCoordinate(activeTimeMs + estimatedRemainingMs), 4);
+    context.lineTo(xCoordinate(activeTimeMs + estimatedRemainingMs), height - 4);
+    context.stroke();
+    context.setLineDash([]);
   }
 }
 
-export function Graph({ caption, field, runRef, rateText }: Props) {
-  const cvRef = useRef<HTMLCanvasElement>(null);
+export function Graph({ caption, metric, runRef, rateText }: GraphProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const rateRef = useRef<HTMLSpanElement>(null);
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      const s = runRef.current;
-      const cv = cvRef.current;
-      if (!s || !cv || !s.applying) return;
-      draw(cv, s, field, field === 'b' ? s.totals.bytes : s.totals.items);
-      // Written straight to the node: this ticks at 10 Hz and has no business re-rendering the tree
-      if (rateRef.current) rateRef.current.textContent = rateText(s);
+    const intervalId = window.setInterval(() => {
+      const state = runRef.current;
+      const canvas = canvasRef.current;
+      if (!state || !canvas || !state.applying) return;
+      drawGraph(
+        canvas,
+        state,
+        metric,
+        metric === 'bytesDone' ? state.totals.bytes : state.totals.items,
+      );
+      if (rateRef.current) rateRef.current.textContent = rateText(state);
     }, 100);
-    return () => window.clearInterval(id);
-  }, [field, runRef, rateText]);
+    return () => window.clearInterval(intervalId);
+  }, [metric, runRef, rateText]);
 
   return (
     <div className="gwrap">
       <span className="gcap">{caption}</span>
       <span className="grate" ref={rateRef} />
-      <canvas ref={cvRef} />
+      <canvas ref={canvasRef} aria-hidden="true" />
     </div>
   );
 }

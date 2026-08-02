@@ -12,16 +12,16 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use super::error::{VfsError, VfsErrorKind, VfsResult};
-use super::spec::{default_port, RemoteSpec};
+use super::spec::{default_port, EndpointSpec};
 use super::{CredentialProvider, Credentials};
 
 const SERVICE: &str = "syncdash";
 
-/// The keyring account for a remote spec: `{scheme}://{user}@{host}:{port}` with the
+/// The keyring account for an endpoint spec: `{scheme}://{user}@{host}:{port}` with the
 /// host folded to lowercase and the port always explicit — same canonicalization as
-/// `RemoteSpec::identity`, so one server is one entry no matter how the phrase spells it.
+/// `EndpointSpec::identity`, so one server is one entry no matter how the phrase spells it.
 /// None when the phrase names no user: nothing to look up, and never a guessed account.
-pub fn account_for(spec: &RemoteSpec) -> Option<String> {
+pub fn account_for(spec: &EndpointSpec) -> Option<String> {
     let user = spec.user.as_deref()?;
     Some(format!(
         "{}://{}@{}:{}",
@@ -143,7 +143,7 @@ fn index_remove(account: &str) {
 pub struct KeyringProvider;
 
 impl CredentialProvider for KeyringProvider {
-    fn credentials_for(&self, spec: &RemoteSpec) -> VfsResult<Credentials> {
+    fn credentials_for(&self, spec: &EndpointSpec) -> VfsResult<Credentials> {
         let keyfile = spec.opt("key").map(expand_tilde);
         let password = match account_for(spec) {
             Some(acc) => get_secret(&acc)?,
@@ -182,9 +182,9 @@ mod tests {
     use super::*;
     use crate::fs::vfs::spec::{parse, RootSpec};
 
-    fn spec(s: &str) -> RemoteSpec {
+    fn spec(s: &str) -> EndpointSpec {
         match parse(s) {
-            RootSpec::Remote(r) => r,
+            RootSpec::Endpoint(r) => r,
             other => panic!("{other:?}"),
         }
     }

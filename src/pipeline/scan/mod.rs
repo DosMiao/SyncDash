@@ -1,9 +1,8 @@
 //! scan: walk a root and produce a snapshot table — the first of the three stages.
 //!
-//! Two lanes behind one entry point. `scan_root` asks the backend for `as_local()`: a real
-//! directory takes `local`, the platform metadata walker + rayon fast path; anything else takes `vfs`,
-//! the generic lane driven entirely through the `Vfs` trait. The split is which primitives are
-//! available, not how far away the bytes are — an SMB root the OS has mounted takes `local`.
+//! Two lanes sit behind one entry point. A backend with a retained `LocalRoot` takes the platform
+//! metadata walker and rayon fast path; anything else takes the generic VFS lane. The split is
+//! which primitives are available, not how far away the bytes are: an OS-mounted SMB root is local.
 //!
 //! Both speak the same filter contract and the same exclusion accounting, and both emit the same
 //! events; the difference is only how bytes are reached.
@@ -20,22 +19,41 @@ pub mod vfs;
 
 use std::path::Path;
 
-use crate::model::table::Snapshot;
+use crate::model::table::TableArtifact;
 
-use local::scan_impl;
+use local::scan_local_root_impl;
 use vfs::scan_vfs;
 
-fn local_parallelism(root: &Path) -> usize {
+fn scan_local_path(
+    root_path: &Path,
+    options: &ScanOptions,
+    progress: Option<ProgressFn<'_>>,
+    context: Option<(&crate::obs::progress::RunCtx, crate::model::event::Phase)>,
+) -> std::io::Result<TableArtifact> {
     use crate::fs::vfs::Vfs;
-    crate::fs::vfs::local::LocalVfs::new(root.to_path_buf())
-        .caps()
-        .max_parallel_streams
+    let local = crate::fs::vfs::local::LocalVfs::open(root_path.to_path_buf()).map_err(|error| {
+        let error = std::io::Error::from(error);
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "scan of '{}' could not read the root itself: {error} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
+                root_path.display()
+            ),
+        )
+    })?;
+    scan_local_root_impl(
+        local.local_root(),
+        options,
+        progress,
+        context,
+        local.caps().max_parallel_streams,
+    )
 }
 
 pub struct ScanOptions {
     pub hash: bool,
-    /// Sampled evidence: files ≥4MB are not read whole but get a sampled digest (size + blake3 of 256KB at head/middle/tail,
-    /// the value `~`-prefixed to keep it strictly apart from a full hash); <4MB is hashed in full. Cloud placeholders hydrate
+    /// Sampled evidence: files ≥4MB are not read whole but get a sampled digest (size + blake3 of 256KB at head/middle/tail);
+    /// its typed observation keeps it strictly apart from a full hash. Files <4MB are hashed in full. Cloud placeholders hydrate
     /// only those three windows. Not a byte-for-byte equality proof —— the escalation rule (same digest, different mtime → full rehash) backstops it.
     pub sampled: bool,
     /// Whether to trust the (path,size,mtime) cache. **The ladder's decisive axis**:
@@ -102,16 +120,16 @@ impl ScanMetrics {
     }
 }
 
-pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<Snapshot> {
-    scan_impl(root, opt, None, None, local_parallelism(root))
+pub fn scan(root: &Path, opt: &ScanOptions) -> std::io::Result<TableArtifact> {
+    scan_local_path(root, opt, None, None)
 }
 
 pub fn scan_with_progress(
     root: &Path,
     opt: &ScanOptions,
     progress: Option<ProgressFn<'_>>,
-) -> std::io::Result<Snapshot> {
-    scan_impl(root, opt, progress, None, local_parallelism(root))
+) -> std::io::Result<TableArtifact> {
+    scan_local_path(root, opt, progress, None)
 }
 
 /// v0.9 M1 unified-foundation entry point: cancel/pause/ProgressEvent event stream (see progress.rs).
@@ -121,8 +139,8 @@ pub fn scan_ctx(
     opt: &ScanOptions,
     ctx: &crate::obs::progress::RunCtx,
     phase: crate::model::event::Phase,
-) -> std::io::Result<Snapshot> {
-    scan_impl(root, opt, None, Some((ctx, phase)), local_parallelism(root))
+) -> std::io::Result<TableArtifact> {
+    scan_local_path(root, opt, None, Some((ctx, phase)))
 }
 
 /// Route a root to the right scan lane: a local (or locally-translated) root keeps the
@@ -134,10 +152,10 @@ pub fn scan_root(
     opt: &ScanOptions,
     ctx: &crate::obs::progress::RunCtx,
     phase: crate::model::event::Phase,
-) -> std::io::Result<Snapshot> {
-    match vfs.as_local() {
+) -> std::io::Result<TableArtifact> {
+    match vfs.local_root() {
         Some(root) => {
-            let mut snap = scan_impl(
+            let mut snap = scan_local_root_impl(
                 root,
                 opt,
                 None,
@@ -147,7 +165,7 @@ pub fn scan_root(
             // The local lane used to leave this empty, which meant a table could not say whether
             // its root was a disk on this machine or a share on another — the very fact that
             // decides where its deletions were preserved.
-            snap.header.vfs = Some(vfs_note(vfs.as_ref(), opt, opt.sampled));
+            snap.header.vfs = Some(vfs_note(vfs.as_ref()));
             Ok(snap)
         }
         None => scan_vfs(vfs, opt, ctx, phase),
@@ -159,25 +177,27 @@ pub fn scan_root(
 /// `sampled` is passed rather than read off `opt` because the generic lane may have been forced
 /// down a tier by a backend that cannot do ranged reads; the note has to record what ran, not
 /// what was asked for.
-pub(crate) fn vfs_note(
-    vfs: &dyn crate::fs::vfs::Vfs,
-    opt: &ScanOptions,
-    sampled: bool,
-) -> crate::model::table::VfsNote {
+pub(crate) fn vfs_note(vfs: &dyn crate::fs::vfs::Vfs) -> crate::model::table::VfsNote {
     let caps = vfs.caps();
     crate::model::table::VfsNote {
         protocol: caps.protocol.to_string(),
         display_root: vfs.display(),
         mtime_precision_ms: caps.mtime_precision_ms,
-        medium: caps.medium.as_str().to_string(),
-        evidence_effective: if !opt.hash {
-            "none".into()
-        } else if sampled {
-            "sampled".into()
-        } else {
-            "full".into()
+        medium: match caps.medium {
+            crate::fs::vfs::Medium::FixedDisk => crate::model::table::ObservedMedium::FixedDisk,
+            crate::fs::vfs::Medium::RemovableDisk => {
+                crate::model::table::ObservedMedium::RemovableDisk
+            }
+            crate::fs::vfs::Medium::NetworkShare => {
+                crate::model::table::ObservedMedium::NetworkShare
+            }
+            crate::fs::vfs::Medium::Unknown => crate::model::table::ObservedMedium::Unknown,
         },
-        name_rules: caps.name_rules.as_str().into(),
+        name_rules: match caps.name_rules {
+            crate::fs::vfs::NameRules::Windows => crate::model::table::ObservedNameRules::Windows,
+            crate::fs::vfs::NameRules::Posix => crate::model::table::ObservedNameRules::Posix,
+            crate::fs::vfs::NameRules::Unknown => crate::model::table::ObservedNameRules::Unknown,
+        },
         degraded: Vec::new(),
     }
 }
@@ -187,7 +207,6 @@ mod tests {
     use super::*;
     use crate::fs::vfs::{memory::MemVfs, Vfs};
     use crate::model::event::{Phase, ProgressEvent};
-    use crate::model::table::EntryKind;
     use crate::obs::progress::{is_cancelled, RunCtl, RunCtx};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
@@ -243,7 +262,7 @@ mod tests {
         assert_eq!(
             snap.entries
                 .iter()
-                .filter(|e| e.kind == EntryKind::File)
+                .filter(|entry| entry.as_file().is_some())
                 .count(),
             20
         );
@@ -339,7 +358,11 @@ mod tests {
         );
 
         let snapshot = scan_ctx(&root, &opts(), &ctx, Phase::ScanSource).unwrap();
-        assert!(snapshot.entries.iter().any(|entry| entry.hash_failed));
+        assert!(snapshot.entries.iter().any(|entry| {
+            entry
+                .as_file()
+                .is_some_and(|file| file.identity.is_unreadable())
+        }));
         assert!(matches!(
             events.lock().unwrap().last(),
             Some(ProgressEvent::PhaseEnd {
@@ -397,7 +420,11 @@ mod tests {
         );
 
         let snapshot = scan_root(&vfs, &opts(), &ctx, Phase::ScanSource).unwrap();
-        assert!(snapshot.entries.iter().any(|entry| entry.hash_failed));
+        assert!(snapshot.entries.iter().any(|entry| {
+            entry
+                .as_file()
+                .is_some_and(|file| file.identity.is_unreadable())
+        }));
         assert!(matches!(
             events.lock().unwrap().last(),
             Some(ProgressEvent::PhaseEnd {
@@ -422,8 +449,9 @@ mod tests {
         let old_hash = first
             .entries
             .iter()
-            .find(|entry| entry.path == "included.bin")
-            .and_then(|entry| entry.hash.clone())
+            .find(|entry| entry.path().as_str() == "included.bin")
+            .and_then(|entry| entry.as_file())
+            .and_then(|file| file.identity.digest().cloned())
             .unwrap();
 
         memory.seed_bytes("included.bin", b"new!", 1_700_000_000_000);
@@ -433,10 +461,11 @@ mod tests {
         let new_hash = second
             .entries
             .iter()
-            .find(|entry| entry.path == "included.bin")
-            .and_then(|entry| entry.hash.as_deref())
+            .find(|entry| entry.path().as_str() == "included.bin")
+            .and_then(|entry| entry.as_file())
+            .and_then(|file| file.identity.digest())
             .unwrap();
-        assert_ne!(new_hash, old_hash);
+        assert_ne!(new_hash, &old_hash);
 
         let cache = crate::store::hashcache::load_by_key(&vfs.identity());
         assert!(cache.contains_key("excluded/keep.bin"));

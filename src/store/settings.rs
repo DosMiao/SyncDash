@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 
+pub const MAX_KEEP_DAYS: u64 = 36_500;
+pub const MAX_TOTAL_MB: u64 = 1_048_576;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct AppSettings {
@@ -127,6 +130,12 @@ impl AppSettings {
         if self.log_dir.contains('\0') {
             return Err("log_dir contains a NUL byte".into());
         }
+        if self.keep_days > MAX_KEEP_DAYS {
+            return Err(format!("keep_days must be {MAX_KEEP_DAYS} or less"));
+        }
+        if self.max_total_mb > MAX_TOTAL_MB {
+            return Err(format!("max_total_mb must be {MAX_TOTAL_MB} or less"));
+        }
         self.max_total_mb
             .checked_mul(1024 * 1024)
             .ok_or_else(|| "max_total_mb is too large".to_string())?;
@@ -137,64 +146,232 @@ impl AppSettings {
     }
 }
 
+/// Revision token for compare-and-swap settings updates. Valid files are identified by their
+/// effective settings rather than TOML formatting; invalid files include their raw bytes so a
+/// renderer that saw a fallback snapshot cannot overwrite a later repair.
+pub fn revision(settings: &AppSettings, invalid_file: Option<&[u8]>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"syncdash-settings-v1\0");
+    match invalid_file {
+        Some(bytes) => {
+            hasher.update(b"invalid\0");
+            hasher.update(bytes);
+        }
+        None => {
+            hasher.update(b"effective\0");
+            let encoded = serde_json::to_vec(settings)
+                .expect("AppSettings contains only infallibly serializable fields");
+            hasher.update(&encoded);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+#[derive(Clone, Debug)]
+pub struct AppSettingsSnapshot {
+    pub settings: AppSettings,
+    pub revision: String,
+    pub diagnostic: Option<String>,
+}
+
+enum PreviousSettingsFile {
+    Missing,
+    Bytes(Vec<u8>),
+}
+
+pub struct AppSettingsUpdate {
+    pub snapshot: AppSettingsSnapshot,
+    path: PathBuf,
+    previous_file: PreviousSettingsFile,
+    changed: bool,
+}
+
+impl AppSettingsUpdate {
+    pub fn rollback(self) -> std::io::Result<AppSettingsSnapshot> {
+        if !self.changed {
+            return Ok(self.snapshot);
+        }
+        let dir = self.path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "settings path has no parent directory",
+            )
+        })?;
+        let lock = open_mutation_lock(dir)?;
+        lock.lock()?;
+        let current = load_snapshot_at(&self.path);
+        if current.revision != self.snapshot.revision {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "settings changed again after saving revision {} — refusing to overwrite revision {} during rollback",
+                    self.snapshot.revision, current.revision
+                ),
+            ));
+        }
+        match self.previous_file {
+            PreviousSettingsFile::Missing => match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            },
+            PreviousSettingsFile::Bytes(bytes) => write_settings_bytes(&self.path, &bytes)?,
+        }
+        Ok(load_snapshot_at(&self.path))
+    }
+}
+
+fn load_snapshot_at(path: &std::path::Path) -> AppSettingsSnapshot {
+    match std::fs::read(&path) {
+        Ok(bytes) => match std::str::from_utf8(&bytes)
+            .map_err(|error| error.to_string())
+            .and_then(|text| toml::from_str::<AppSettings>(text).map_err(|error| error.to_string()))
+            .and_then(|settings| settings.validate().map(|()| settings))
+        {
+            Ok(settings) => AppSettingsSnapshot {
+                revision: revision(&settings, None),
+                settings,
+                diagnostic: None,
+            },
+            Err(error) => {
+                let settings = AppSettings::default();
+                AppSettingsSnapshot {
+                    revision: revision(&settings, Some(&bytes)),
+                    settings,
+                    diagnostic: Some(format!(
+                        "settings: {} is invalid, using defaults: {error}",
+                        path.display()
+                    )),
+                }
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let settings = AppSettings::default();
+            AppSettingsSnapshot {
+                revision: revision(&settings, None),
+                settings,
+                diagnostic: None,
+            }
+        }
+        Err(error) => {
+            let settings = AppSettings::default();
+            let diagnostic = format!(
+                "settings: {} could not be read, using defaults: {error}",
+                path.display()
+            );
+            AppSettingsSnapshot {
+                revision: revision(&settings, Some(diagnostic.as_bytes())),
+                settings,
+                diagnostic: Some(diagnostic),
+            }
+        }
+    }
+}
+
+pub fn load_snapshot() -> AppSettingsSnapshot {
+    load_snapshot_at(&settings_path())
+}
+
 /// Read settings and preserve any fallback reason so startup can publish it after installing the
 /// application log sink. A missing file is the normal first-run state and has no diagnostic.
 pub fn load_with_diagnostic() -> (AppSettings, Option<String>) {
-    let p = settings_path();
-    match std::fs::read_to_string(&p) {
-        Ok(text) => match toml::from_str::<AppSettings>(&text) {
-            Ok(settings) => match settings.validate() {
-                Ok(()) => (settings, None),
-                Err(error) => (
-                    AppSettings::default(),
-                    Some(format!(
-                        "settings: {} is invalid, using defaults: {error}",
-                        p.display()
-                    )),
-                ),
-            },
-            Err(error) => (
-                AppSettings::default(),
-                Some(format!(
-                    "settings: {} failed to parse, using defaults: {error}",
-                    p.display()
-                )),
-            ),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            (AppSettings::default(), None)
-        }
-        Err(error) => (
-            AppSettings::default(),
-            Some(format!(
-                "settings: {} could not be read, using defaults: {error}",
-                p.display()
-            )),
-        ),
-    }
+    let snapshot = load_snapshot();
+    (snapshot.settings, snapshot.diagnostic)
 }
 
 pub fn load() -> AppSettings {
     load_with_diagnostic().0
 }
 
-pub fn save(s: &AppSettings) -> std::io::Result<PathBuf> {
-    s.validate()
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir)?;
-    let text = toml::to_string_pretty(s).map_err(|e| {
+fn write_settings_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut staged = crate::fs::staged::Staged::create(path)?;
+    staged.write_all(bytes)?;
+    staged.seal(true)?;
+    staged.commit()
+}
+
+fn write_settings(path: &std::path::Path, settings: &AppSettings) -> std::io::Result<()> {
+    let text = toml::to_string_pretty(settings).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("toml serialize: {e}"),
+            format!("toml serialize: {error}"),
         )
     })?;
-    let p = settings_path();
-    let mut staged = crate::fs::staged::Staged::create(&p)?;
-    staged.write_all(text.as_bytes())?;
-    staged.seal(true)?;
-    staged.commit()?;
-    Ok(p)
+    write_settings_bytes(path, text.as_bytes())
+}
+
+fn open_mutation_lock(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(dir.join(".syncdash-settings.lock"))
+}
+
+fn save_if_revision_at(
+    path: &std::path::Path,
+    settings: &AppSettings,
+    expected_revision: &str,
+) -> std::io::Result<AppSettingsUpdate> {
+    settings
+        .validate()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "settings path has no parent directory",
+        )
+    })?;
+    let lock = open_mutation_lock(dir)?;
+    lock.lock()?;
+
+    let current = load_snapshot_at(path);
+    if current.revision != expected_revision {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "settings changed on disk (expected revision {expected_revision}, found {}) — reload before saving",
+                current.revision
+            ),
+        ));
+    }
+    if current.diagnostic.is_none() && current.revision == revision(settings, None) {
+        return Ok(AppSettingsUpdate {
+            snapshot: current,
+            path: path.to_path_buf(),
+            previous_file: PreviousSettingsFile::Missing,
+            changed: false,
+        });
+    }
+
+    let previous_file = match std::fs::read(path) {
+        Ok(bytes) => PreviousSettingsFile::Bytes(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PreviousSettingsFile::Missing,
+        Err(error) => {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot preserve {} for a safe settings rollback: {error}",
+                    path.display()
+                ),
+            ))
+        }
+    };
+    write_settings(path, settings)?;
+    Ok(AppSettingsUpdate {
+        snapshot: load_snapshot_at(path),
+        path: path.to_path_buf(),
+        previous_file,
+        changed: true,
+    })
+}
+
+pub fn save_if_revision(
+    settings: &AppSettings,
+    expected_revision: &str,
+) -> std::io::Result<AppSettingsUpdate> {
+    save_if_revision_at(&settings_path(), settings, expected_revision)
 }
 
 #[cfg(test)]
@@ -238,6 +415,81 @@ mod tests {
         settings.log_compare = "summary".into();
         settings.log_dir = "bad\0path".into();
         assert!(settings.validate().unwrap_err().contains("NUL"));
+
+        settings.log_dir.clear();
+        settings.keep_days = MAX_KEEP_DAYS + 1;
+        assert!(settings.validate().unwrap_err().contains("keep_days"));
+
+        settings.keep_days = default_keep_days();
+        settings.max_total_mb = MAX_TOTAL_MB + 1;
+        assert!(settings.validate().unwrap_err().contains("max_total_mb"));
+    }
+
+    #[test]
+    fn settings_revision_ignores_formatting_but_fences_invalid_file_changes() {
+        let settings = AppSettings::default();
+        assert_eq!(revision(&settings, None), revision(&settings.clone(), None));
+        assert_ne!(
+            revision(&settings, Some(b"not = [valid")),
+            revision(&settings, Some(b"still = [invalid"))
+        );
+        assert_ne!(
+            revision(&settings, None),
+            revision(&settings, Some(b"not = [valid"))
+        );
+    }
+
+    #[test]
+    fn settings_save_refuses_a_stale_revision_and_preserves_the_newer_file() {
+        let root = tmp("cas");
+        let path = root.join("settings.toml");
+        let initial = AppSettings::default();
+        write_settings(&path, &initial).unwrap();
+        let loaded = load_snapshot_at(&path);
+
+        let mut newer = initial.clone();
+        newer.keep_days = 14;
+        let saved = save_if_revision_at(&path, &newer, &loaded.revision).unwrap();
+        assert_eq!(saved.snapshot.settings.keep_days, 14);
+
+        let mut stale = initial;
+        stale.keep_days = 90;
+        let error = match save_if_revision_at(&path, &stale, &loaded.revision) {
+            Ok(_) => panic!("a stale settings revision must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(load_snapshot_at(&path).settings.keep_days, 14);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saving_the_fallback_snapshot_repairs_the_same_invalid_revision() {
+        let root = tmp("repair");
+        let path = root.join("settings.toml");
+        std::fs::write(&path, "not = [valid").unwrap();
+        let invalid = load_snapshot_at(&path);
+        assert!(invalid.diagnostic.is_some());
+
+        let repaired = save_if_revision_at(&path, &invalid.settings, &invalid.revision).unwrap();
+        assert!(repaired.snapshot.diagnostic.is_none());
+        assert_eq!(repaired.snapshot.settings, AppSettings::default());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_restores_the_exact_invalid_file() {
+        let root = tmp("rollback");
+        let path = root.join("settings.toml");
+        let invalid_bytes = b"not = [valid";
+        std::fs::write(&path, invalid_bytes).unwrap();
+        let invalid = load_snapshot_at(&path);
+
+        let update = save_if_revision_at(&path, &invalid.settings, &invalid.revision).unwrap();
+        let restored = update.rollback().unwrap();
+        assert!(restored.diagnostic.is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), invalid_bytes);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

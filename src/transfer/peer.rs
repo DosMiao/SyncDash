@@ -7,14 +7,15 @@
 //!
 //! **Being in-process removes the child process, not the shell.** SSH's exec request (RFC 4254
 //! §6.5) carries a single command string that sshd hands to the user's login shell, so the far
-//! side still parses what we send. `RemoteShell` and the quoting below therefore stay: OpenSSH on
+//! side still parses what we send. `PeerShell` and the quoting below therefore stay: OpenSSH on
 //! Windows defaults to PowerShell, whose quoting rules differ from POSIX, and the `chcp 65001`
 //! prelude is what keeps non-ASCII paths off the OEM code page.
 
 use std::io::{Error, ErrorKind, Read};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+
+type UploadStream<'a> = (std::fs::File, &'a mut dyn FnMut(u64) -> std::io::Result<()>);
 
 use russh::ChannelMsg;
 
@@ -27,37 +28,37 @@ fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Remote shell dialect: OpenSSH on Windows defaults to PowerShell
+/// Peer shell dialect: OpenSSH on Windows defaults to PowerShell.
 #[derive(Clone, Copy, PartialEq)]
-pub enum RemoteShell {
+pub enum PeerShell {
     Posix,
     PowerShell,
 }
 
-impl RemoteShell {
-    pub fn from_os(os: &str) -> RemoteShell {
+impl PeerShell {
+    pub fn from_os(os: &str) -> PeerShell {
         if os == "windows" {
-            RemoteShell::PowerShell
+            PeerShell::PowerShell
         } else {
-            RemoteShell::Posix
+            PeerShell::Posix
         }
     }
 }
 
-/// Quote for the remote dialect (inside PowerShell single quotes, an embedded single quote is written '')
-fn shq_for(shell: RemoteShell, s: &str) -> String {
+/// Quote for the peer dialect (inside PowerShell single quotes, an embedded single quote is written '').
+fn shq_for(shell: PeerShell, s: &str) -> String {
     match shell {
-        RemoteShell::Posix => shq(s),
-        RemoteShell::PowerShell => format!("'{}'", s.replace('\'', "''")),
+        PeerShell::Posix => shq(s),
+        PeerShell::PowerShell => format!("'{}'", s.replace('\'', "''")),
     }
 }
 
-/// Assemble the remote syncdash invocation:
+/// Assemble the peer syncdash invocation:
 /// - posix: exe left bare (so `~` expands), every argument through shq
 /// - powershell: `chcp 65001 >$null; & '<exe>' args...` (switch to UTF-8 first, or non-ASCII paths get mangled by the OEM code page)
-pub fn remote_cmd(shell: RemoteShell, exe: &str, args: &[String]) -> String {
+pub fn peer_command(shell: PeerShell, exe: &str, args: &[String]) -> String {
     match shell {
-        RemoteShell::Posix => {
+        PeerShell::Posix => {
             let mut c = exe.to_string();
             for a in args {
                 c.push(' ');
@@ -65,7 +66,7 @@ pub fn remote_cmd(shell: RemoteShell, exe: &str, args: &[String]) -> String {
             }
             c
         }
-        RemoteShell::PowerShell => {
+        PeerShell::PowerShell => {
             let mut c = format!("chcp 65001 >$null; & {}", shq_for(shell, exe));
             for a in args {
                 c.push(' ');
@@ -97,7 +98,7 @@ pub struct PeerAddr {
 /// `peer://[user@]host[:port]/…` → the address to dial. The user defaults to this machine's
 /// login name, matching what `ssh host` would have done.
 pub fn addr_of(phrase: &str) -> std::io::Result<PeerAddr> {
-    let RootSpec::Remote(r) = parse(phrase) else {
+    let RootSpec::Endpoint(r) = parse(phrase) else {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             format!("'{phrase}' is not a peer:// root"),
@@ -128,8 +129,8 @@ impl PeerSession {
             .build()?;
         let creds = default_provider()
             .credentials_for(&match parse(phrase) {
-                RootSpec::Remote(r) => r,
-                _ => unreachable!("addr_of already rejected a non-remote phrase"),
+                RootSpec::Endpoint(r) => r,
+                _ => unreachable!("addr_of already rejected a non-peer phrase"),
             })
             .map_err(std::io::Error::from)?;
         let session = rt
@@ -163,7 +164,7 @@ impl PeerSession {
         Ok(self.run(cmd, None)?.1 == 0)
     }
 
-    /// Run one command with a local file streamed to its stdin.
+    /// Run one command with an already-open local file streamed to its stdin.
     ///
     /// `on_chunk` is called with each block's size as it leaves, and its `Err` stops the transfer
     /// — which is the other half of being in-process. The old transport handed the file to a child
@@ -172,11 +173,10 @@ impl PeerSession {
     pub fn send_file(
         &self,
         cmd: &str,
-        file: &Path,
+        file: std::fs::File,
         on_chunk: &mut dyn FnMut(u64) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
-        let f = std::fs::File::open(file)?;
-        let (_, code) = self.run(cmd, Some((f, on_chunk)))?;
+        let (_, code) = self.run(cmd, Some((file, on_chunk)))?;
         if code != 0 {
             return Err(Error::other(format!(
                 "stdin-ship to {} failed (exit {code}): {cmd}",
@@ -190,7 +190,7 @@ impl PeerSession {
     fn run(
         &self,
         cmd: &str,
-        mut stdin: Option<(std::fs::File, &mut dyn FnMut(u64) -> std::io::Result<()>)>,
+        mut upload: Option<UploadStream<'_>>,
     ) -> std::io::Result<(Vec<u8>, u32)> {
         self.rt.block_on(async {
             let mut ch = self.handle.channel_open_session().await.map_err(|e| {
@@ -200,7 +200,7 @@ impl PeerSession {
                 .await
                 .map_err(|e| Error::other(format!("exec refused by {}: {e}", self.host)))?;
 
-            if let Some((mut f, on_chunk)) = stdin.take() {
+            if let Some((mut f, on_chunk)) = upload.take() {
                 // 256 KiB: large enough that the per-chunk window update is not the bottleneck,
                 // small enough that a cancel between chunks is felt quickly.
                 let mut buf = vec![0u8; 256 * 1024];
@@ -262,20 +262,20 @@ mod tests {
     /// string to the far side's login shell, so both dialects still have to be quoted for.
     #[test]
     fn posix_quoting_survives_an_embedded_quote() {
-        let c = remote_cmd(
-            RemoteShell::Posix,
+        let c = peer_command(
+            PeerShell::Posix,
             "syncdash",
             &["scan".into(), "/it's/here".into()],
         );
         assert_eq!(c, r#"syncdash 'scan' '/it'\''s/here'"#);
-        // The exe stays bare so the remote shell still expands a leading ~
-        assert!(remote_cmd(RemoteShell::Posix, "~/bin/syncdash", &[]).starts_with("~/bin/syncdash"));
+        // The executable stays bare so the peer shell still expands a leading `~`.
+        assert!(peer_command(PeerShell::Posix, "~/bin/syncdash", &[]).starts_with("~/bin/syncdash"));
     }
 
     #[test]
     fn powershell_doubles_quotes_and_switches_the_code_page_first() {
-        let c = remote_cmd(
-            RemoteShell::PowerShell,
+        let c = peer_command(
+            PeerShell::PowerShell,
             "sd.exe",
             &["scan".into(), "C:\\it's".into()],
         );
@@ -286,10 +286,10 @@ mod tests {
 
     #[test]
     fn the_dialect_follows_the_probed_os() {
-        assert!(RemoteShell::from_os("windows") == RemoteShell::PowerShell);
-        assert!(RemoteShell::from_os("macos") == RemoteShell::Posix);
+        assert!(PeerShell::from_os("windows") == PeerShell::PowerShell);
+        assert!(PeerShell::from_os("macos") == PeerShell::Posix);
         assert!(
-            RemoteShell::from_os("") == RemoteShell::Posix,
+            PeerShell::from_os("") == PeerShell::Posix,
             "unknown means posix, not a panic"
         );
     }

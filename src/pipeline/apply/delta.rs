@@ -1,64 +1,69 @@
-//! In-place patching for large updates: reuse the blocks the target already has and write only
-//! what changed, instead of re-sending a file because a few bytes moved.
+//! Descriptor-relative in-place patching for large local updates.
 
-use std::path::Path;
+use crate::foundation::path::RootRelativePath;
+use crate::fs::local_root::{LocalRoot, LocalStagedFile};
 
 use super::DELTA_MEM_CAP;
 
-/// Delta update (P1-1 step B, opt-in).
-///
-/// How it works: first copy dst into a temp file in the same directory (`fs::copy` uses server-side copychunk
-/// on SMB2+, and is near-free on local filesystems with reflink support), then write only the **FastCDC chunks
-/// whose content differs** into that temp file, and rename at the end. Same atomic path, no loss of interruption safety.
-///
-/// The trade-off, stated plainly: this path reads dst one extra time (a remote read) to avoid writing a lot of bytes (remote writes).
-/// It is a net win where writes cost far more than reads (SMB / WAN uplinks) and a wash on symmetric links — hence off by default, enabled explicitly per job.
-/// The remote pack pipeline (already present in v0.7) is where the delta payoff is most certain.
-pub(super) fn update_with_delta(
-    src: &Path,
-    dst: &Path,
-    staged: &mut crate::fs::staged::Staged,
-) -> std::io::Result<Option<(u64, u64, String)>> {
-    let (Ok(smd), Ok(dmd)) = (std::fs::metadata(src), std::fs::metadata(dst)) else {
-        return Ok(None);
+pub(super) struct StagedDeltaUpdate {
+    pub(super) written_bytes: u64,
+    pub(super) output_size: u64,
+    pub(super) output_hash: String,
+}
+
+pub(super) fn stage_delta_update(
+    source_root: &LocalRoot,
+    target_root: &LocalRoot,
+    relative: &RootRelativePath,
+    staged: &mut LocalStagedFile,
+    mut checkpoint: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<Option<StagedDeltaUpdate>> {
+    let source_metadata = match source_root.metadata_path(relative) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
     };
-    if smd.len() < crate::model::chunk::DELTA_MIN_SIZE
-        || smd.len() > DELTA_MEM_CAP
-        || dmd.len() > DELTA_MEM_CAP
+    let target_metadata = match target_root.metadata_path(relative) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if source_metadata.len() < crate::model::chunk::DELTA_MIN_SIZE
+        || source_metadata.len() > DELTA_MEM_CAP
+        || target_metadata.len() > DELTA_MEM_CAP
     {
         return Ok(None);
     }
-    let old = std::fs::read(dst)?;
-    let new = std::fs::read(src)?;
-    // Lay the whole old content into the temp file first (the opening for server-side copy / reflink)
-    staged.write_at(0, &old)?;
-    let old_chunks = crate::model::chunk::chunk_bytes(&old);
-    let new_chunks = crate::model::chunk::chunk_bytes(&new);
-    let have: std::collections::HashMap<&str, (u64, u32)> = old_chunks
+
+    let existing_bytes = target_root.read(relative)?;
+    let replacement_bytes = source_root.read(relative)?;
+    checkpoint()?;
+    staged.write_at(0, &existing_bytes)?;
+    let existing_chunks = crate::fs::chunk::chunk_bytes(&existing_bytes);
+    let replacement_chunks = crate::fs::chunk::chunk_bytes(&replacement_bytes);
+    let existing_chunks_by_hash: std::collections::HashMap<&str, (u64, u32)> = existing_chunks
         .iter()
-        .map(|c| (c.hash.as_str(), (c.off, c.len)))
+        .map(|chunk| (chunk.hash.as_str(), (chunk.off, chunk.len)))
         .collect();
-    let mut written = 0u64;
-    for c in &new_chunks {
-        let start = c.off as usize;
-        let end = start + c.len as usize;
-        // Only when the chunk content matches **and it sits at the same offset** can this write be skipped
-        if let Some(&(off, len)) = have.get(c.hash.as_str()) {
-            if off == c.off && len == c.len {
-                continue;
-            }
+    let mut written_bytes = 0u64;
+    for chunk in &replacement_chunks {
+        checkpoint()?;
+        let start = chunk.off as usize;
+        let end = start + chunk.len as usize;
+        if existing_chunks_by_hash.get(chunk.hash.as_str()) == Some(&(chunk.off, chunk.len)) {
+            continue;
         }
-        staged.write_at(c.off, &new[start..end])?;
-        written += c.len as u64;
+        staged.write_at(chunk.off, &replacement_bytes[start..end])?;
+        written_bytes += chunk.len as u64;
     }
-    // A shorter new file needs its tail truncated
-    if (new.len() as u64) < old.len() as u64 {
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(staged.path())?;
-        f.set_len(new.len() as u64)?;
+    if replacement_bytes.len() < existing_bytes.len() {
+        checkpoint()?;
+        staged.set_len(replacement_bytes.len() as u64)?;
     }
-    // The new content is right there in memory — hash it in full while we're at it, for post-copy verification against the readback from disk
-    let h = blake3::hash(&new).to_hex().to_string();
-    Ok(Some((written, new.len() as u64, h)))
+
+    Ok(Some(StagedDeltaUpdate {
+        written_bytes,
+        output_size: replacement_bytes.len() as u64,
+        output_hash: blake3::hash(&replacement_bytes).to_hex().to_string(),
+    }))
 }

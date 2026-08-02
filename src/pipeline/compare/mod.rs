@@ -7,33 +7,39 @@
 //! Around the decision itself:
 //! - `keys` — how two entries are judged equal, and how a path is keyed across platforms
 //! - `moves` — pairing a delete with a copy of identical content into one move
-//! - `winnames` — Windows naming legality, checked at plan time rather than at write time
+//! - `name_rules` — resolves the naming semantics recorded by each table
 //! - `evidence` — the read-only layer the UI reads; `compare` itself is unaffected by it
 
 pub mod evidence;
 pub mod keys;
 pub mod moves;
-pub mod winnames;
+mod name_rules;
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::foundation::names::CONFLICT_INFIX;
+use serde::{Deserialize, Serialize};
+
+use crate::foundation::names::{windows_name_fault, CONFLICT_INFIX};
 use crate::foundation::path::{base_name, split_ext, split_parent};
 use crate::foundation::text::norm_key;
 use crate::foundation::text::{fold, safe_host};
 use crate::foundation::time::now_ms;
 use crate::foundation::time::stamp_compact;
 use crate::model::plan::{Action, Op, Plan, PlanHeader, Side, MTIME_SLACK_MS};
-use crate::model::table::{Entry, EntryKind, Snapshot};
+use crate::model::table::{
+    FileIdentityObservation, ObservedEntry, ObservedEntryKind, ObservedFile, ObservedSymlink,
+    TableArtifact,
+};
 
 use crate::fs::vfs::NameRules;
 use keys::{evidence_missing, files_equal, generation_of, map_of};
 use moves::{detect_moves, move_reason};
-use winnames::{name_rules_of, win_name_fault, WinNameFault};
+use name_rules::name_rules_of;
 
 /// Conflict handling policy. Default is Report (report only, never arbitrate automatically) — this is
 /// what SyncDash stands on; aligning with syncthing does not change the default.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConflictPolicy {
     /// Report only; a human handles it
     Report,
@@ -44,7 +50,8 @@ pub enum ConflictPolicy {
     Newer,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompareOptions {
     /// Default true: NTFS and APFS are both case-insensitive by default
     pub case_insensitive: bool,
@@ -55,7 +62,7 @@ pub struct CompareOptions {
     /// How many conflict copies to keep per file at most (-1 = unlimited). Only effective for ConflictPolicy::Copy
     pub max_conflicts: i32,
     /// The no-hash equality window on mtime, in ms. Defaults to MTIME_SLACK_MS (FAT/SMB granularity);
-    /// a remote backend with coarser timestamps (FTP LIST = minutes) widens it to its declared precision.
+    /// a protocol-backed root with coarser timestamps (FTP LIST = minutes) widens it to its declared precision.
     /// Only the *hashless* judgment uses it — content evidence always wins over timestamps.
     pub mtime_window_ms: i64,
 }
@@ -88,36 +95,52 @@ pub fn is_conflict_copy(path: &str) -> bool {
     base_name(path).contains(CONFLICT_INFIX)
 }
 
-fn push_copy(ops: &mut Vec<Op>, side: Side, e: &Entry, reason: &str) {
+fn push_copy(ops: &mut Vec<Op>, side: Side, e: &ObservedEntry, reason: &str) {
+    let file = observed_file(e);
     ops.push(Op {
         side,
         action: Action::Copy,
-        path: e.path.clone(),
+        path: file.path.as_str().to_owned(),
         from: None,
-        size: Some(e.size),
-        mtime_ms: Some(e.mtime_ms),
-        hash: e.hash.clone(),
+        size: Some(file.size),
+        mtime_ms: Some(file.mtime_ms),
+        hash: file.identity.plan_hash(),
         link: None,
         mode: None,
         reason: reason.into(),
     });
 }
 
+fn observed_file(entry: &ObservedEntry) -> &ObservedFile {
+    entry
+        .as_file()
+        .expect("the file observation map contains only files")
+}
+
+fn observed_symlink(entry: &ObservedEntry) -> &ObservedSymlink {
+    entry
+        .as_symlink()
+        .expect("the symlink observation map contains only symlinks")
+}
+
+fn observed_path(entry: &ObservedEntry) -> String {
+    entry.path().as_str().to_owned()
+}
+
 pub fn compare(
-    source: &Snapshot,
-    target: &Snapshot,
+    source: &TableArtifact,
+    target: &TableArtifact,
     mode: &str,
-    archive: Option<&Snapshot>,
+    archive: Option<&TableArtifact>,
     resolve_newer: bool,
     copts: &CompareOptions,
 ) -> Plan {
     let ci = copts.case_insensitive;
     let win = copts.mtime_window_ms;
-    let (s_files, s_dups) = map_of(source, EntryKind::File, ci);
-    let (t_files, t_dups) = map_of(target, EntryKind::File, ci);
-    let (s_dirs, _) = map_of(source, EntryKind::Dir, ci);
-    let (t_dirs, _) = map_of(target, EntryKind::Dir, ci);
-    let both_hashed = source.header.hashed && target.header.hashed;
+    let (s_files, s_dups) = map_of(source, ObservedEntryKind::File, ci);
+    let (t_files, t_dups) = map_of(target, ObservedEntryKind::File, ci);
+    let (s_dirs, _) = map_of(source, ObservedEntryKind::Directory, ci);
+    let (t_dirs, _) = map_of(target, ObservedEntryKind::Directory, ci);
     let mut ops: Vec<Op> = Vec::new();
 
     for d in s_dups {
@@ -151,8 +174,8 @@ pub fn compare(
 
     match mode {
         "mirror" | "enrich" => {
-            let mut adds: Vec<&Entry> = Vec::new();
-            let mut dels: Vec<&Entry> = Vec::new();
+            let mut adds: Vec<&ObservedEntry> = Vec::new();
+            let mut dels: Vec<&ObservedEntry> = Vec::new();
             for (p, se) in &s_files {
                 let se = *se;
                 match t_files.get(p) {
@@ -167,7 +190,7 @@ pub fn compare(
                             ops.push(Op {
                                 side: Side::Target,
                                 action: Action::Conflict,
-                                path: te.path.clone(),
+                                path: observed_path(te),
                                 from: None,
                                 size: None,
                                 mtime_ms: None,
@@ -178,7 +201,8 @@ pub fn compare(
                                     .into(),
                             });
                         } else if !files_equal(se, te, win)
-                            && (mode == "mirror" || se.mtime_ms > te.mtime_ms + win)
+                            && (mode == "mirror"
+                                || observed_file(se).mtime_ms > observed_file(te).mtime_ms + win)
                         {
                             let reason = if mode == "mirror" {
                                 "differs-master-wins"
@@ -189,11 +213,11 @@ pub fn compare(
                             ops.push(Op {
                                 side: Side::Target,
                                 action: Action::Update,
-                                path: te.path.clone(),
+                                path: observed_path(te),
                                 from: None,
-                                size: Some(se.size),
-                                mtime_ms: Some(se.mtime_ms),
-                                hash: se.hash.clone(),
+                                size: Some(observed_file(se).size),
+                                mtime_ms: Some(observed_file(se).mtime_ms),
+                                hash: observed_file(se).identity.plan_hash(),
                                 link: None,
                                 mode: None,
                                 reason: reason.into(),
@@ -208,11 +232,7 @@ pub fn compare(
                         dels.push(*te);
                     }
                 }
-                let (moves, rest_adds, rest_dels) = if both_hashed {
-                    detect_moves(adds, dels)
-                } else {
-                    (Vec::new(), adds, dels)
-                };
+                let (moves, rest_adds, rest_dels) = detect_moves(adds, dels);
                 for m in moves {
                     let base = if m.rename_in_place {
                         "rename-detected-by-hash"
@@ -240,9 +260,9 @@ pub fn compare(
                     ops.push(Op {
                         side: Side::Target,
                         action: Action::Delete,
-                        path: d.path.clone(),
+                        path: observed_path(d),
                         from: None,
-                        size: Some(d.size),
+                        size: Some(observed_file(d).size),
                         mtime_ms: None,
                         hash: None,
                         link: None,
@@ -255,7 +275,7 @@ pub fn compare(
                         ops.push(Op {
                             side: Side::Target,
                             action: Action::DeleteDir,
-                            path: te.path.clone(),
+                            path: observed_path(te),
                             from: None,
                             size: None,
                             mtime_ms: None,
@@ -274,13 +294,13 @@ pub fn compare(
         }
         "sync" => {
             let (arch_files, _) = archive
-                .map(|a| map_of(a, EntryKind::File, ci))
+                .map(|a| map_of(a, ObservedEntryKind::File, ci))
                 .unwrap_or_default();
             let has_archive = archive.is_some();
-            let mut s_adds: Vec<&Entry> = Vec::new();
-            let mut t_adds: Vec<&Entry> = Vec::new();
-            let mut del_on_target: Vec<&Entry> = Vec::new();
-            let mut del_on_source: Vec<&Entry> = Vec::new();
+            let mut s_adds: Vec<&ObservedEntry> = Vec::new();
+            let mut t_adds: Vec<&ObservedEntry> = Vec::new();
+            let mut del_on_target: Vec<&ObservedEntry> = Vec::new();
+            let mut del_on_source: Vec<&ObservedEntry> = Vec::new();
 
             for (p, se) in &s_files {
                 let se = *se;
@@ -293,7 +313,7 @@ pub fn compare(
                             ops.push(Op {
                                 side: Side::Target,
                                 action: Action::Conflict,
-                                path: se.path.clone(),
+                                path: observed_path(se),
                                 from: None,
                                 size: None,
                                 mtime_ms: None,
@@ -321,11 +341,11 @@ pub fn compare(
                                 ops.push(Op {
                                     side: Side::Source,
                                     action: Action::Update,
-                                    path: se.path.clone(),
+                                    path: observed_path(se),
                                     from: None,
-                                    size: Some(te.size),
-                                    mtime_ms: Some(te.mtime_ms),
-                                    hash: te.hash.clone(),
+                                    size: Some(observed_file(te).size),
+                                    mtime_ms: Some(observed_file(te).mtime_ms),
+                                    hash: observed_file(te).identity.plan_hash(),
                                     link: None,
                                     mode: None,
                                     reason: why.into(),
@@ -335,11 +355,11 @@ pub fn compare(
                                 ops.push(Op {
                                     side: Side::Target,
                                     action: Action::Update,
-                                    path: te.path.clone(),
+                                    path: observed_path(te),
                                     from: None,
-                                    size: Some(se.size),
-                                    mtime_ms: Some(se.mtime_ms),
-                                    hash: se.hash.clone(),
+                                    size: Some(observed_file(se).size),
+                                    mtime_ms: Some(observed_file(se).mtime_ms),
+                                    hash: observed_file(se).identity.plan_hash(),
                                     link: None,
                                     mode: None,
                                     reason: why.into(),
@@ -360,7 +380,7 @@ pub fn compare(
                                 _ => ops.push(Op {
                                     side: Side::Target,
                                     action: Action::Conflict,
-                                    path: se.path.clone(),
+                                    path: observed_path(se),
                                     from: None,
                                     size: None,
                                     mtime_ms: None,
@@ -371,15 +391,15 @@ pub fn compare(
                                 }),
                             }
                         } else if resolve_newer {
-                            if se.mtime_ms >= te.mtime_ms {
+                            if observed_file(se).mtime_ms >= observed_file(te).mtime_ms {
                                 ops.push(Op {
                                     side: Side::Target,
                                     action: Action::Update,
-                                    path: te.path.clone(),
+                                    path: observed_path(te),
                                     from: None,
-                                    size: Some(se.size),
-                                    mtime_ms: Some(se.mtime_ms),
-                                    hash: se.hash.clone(),
+                                    size: Some(observed_file(se).size),
+                                    mtime_ms: Some(observed_file(se).mtime_ms),
+                                    hash: observed_file(se).identity.plan_hash(),
                                     link: None,
                                     mode: None,
                                     reason: "differs-newer-wins".into(),
@@ -388,11 +408,11 @@ pub fn compare(
                                 ops.push(Op {
                                     side: Side::Source,
                                     action: Action::Update,
-                                    path: se.path.clone(),
+                                    path: observed_path(se),
                                     from: None,
-                                    size: Some(te.size),
-                                    mtime_ms: Some(te.mtime_ms),
-                                    hash: te.hash.clone(),
+                                    size: Some(observed_file(te).size),
+                                    mtime_ms: Some(observed_file(te).mtime_ms),
+                                    hash: observed_file(te).identity.plan_hash(),
                                     link: None,
                                     mode: None,
                                     reason: "differs-newer-wins".into(),
@@ -402,7 +422,7 @@ pub fn compare(
                             ops.push(Op {
                                 side: Side::Target,
                                 action: Action::Conflict,
-                                path: se.path.clone(),
+                                path: observed_path(se),
                                 from: None,
                                 size: None,
                                 mtime_ms: None,
@@ -422,7 +442,7 @@ pub fn compare(
                                     ops.push(Op {
                                         side: Side::Target,
                                         action: Action::Conflict,
-                                        path: se.path.clone(),
+                                        path: observed_path(se),
                                         from: None,
                                         size: None,
                                         mtime_ms: None,
@@ -452,7 +472,7 @@ pub fn compare(
                             ops.push(Op {
                                 side: Side::Target,
                                 action: Action::Conflict,
-                                path: te.path.clone(),
+                                path: observed_path(te),
                                 from: None,
                                 size: None,
                                 mtime_ms: None,
@@ -468,7 +488,7 @@ pub fn compare(
                 t_adds.push(te);
             }
 
-            if has_archive && both_hashed {
+            if has_archive {
                 let (mv_on_target, rest_s_adds, rest_del_t) = detect_moves(s_adds, del_on_target);
                 for m in mv_on_target {
                     let base = if m.rename_in_place {
@@ -521,9 +541,9 @@ pub fn compare(
                     ops.push(Op {
                         side: Side::Target,
                         action: Action::Delete,
-                        path: d.path.clone(),
+                        path: observed_path(d),
                         from: None,
-                        size: Some(d.size),
+                        size: Some(observed_file(d).size),
                         mtime_ms: None,
                         hash: None,
                         link: None,
@@ -535,9 +555,9 @@ pub fn compare(
                     ops.push(Op {
                         side: Side::Source,
                         action: Action::Delete,
-                        path: d.path.clone(),
+                        path: observed_path(d),
                         from: None,
-                        size: Some(d.size),
+                        size: Some(observed_file(d).size),
                         mtime_ms: None,
                         hash: None,
                         link: None,
@@ -546,27 +566,36 @@ pub fn compare(
                     });
                 }
             } else {
-                if both_hashed {
-                    let t_only: HashMap<&str, &str> = t_adds
-                        .iter()
-                        .filter_map(|e| e.hash.as_deref().map(|h| (h, e.path.as_str())))
-                        .collect();
-                    for a in &s_adds {
-                        if let Some(h) = a.hash.as_deref() {
-                            if let Some(&other) = t_only.get(h) {
-                                ops.push(Op {
-                                    side: Side::Target,
-                                    action: Action::Note,
-                                    path: a.path.clone(),
-                                    from: Some(other.to_string()),
-                                    size: Some(a.size),
-                                    mtime_ms: None,
-                                    hash: None,
-                                    link: None,
-                                    mode: None,
-                                    reason: "possible-move-needs-archive".into(),
-                                });
+                let t_only: HashMap<&str, &str> = t_adds
+                    .iter()
+                    .filter_map(|entry| {
+                        let file = observed_file(entry);
+                        match &file.identity {
+                            FileIdentityObservation::FullBlake3 { digest } => {
+                                Some((digest.as_str(), file.path.as_str()))
                             }
+                            FileIdentityObservation::SizeAndMtime
+                            | FileIdentityObservation::SampledBlake3 { .. }
+                            | FileIdentityObservation::Unreadable => None,
+                        }
+                    })
+                    .collect();
+                for a in &s_adds {
+                    let file = observed_file(a);
+                    if let FileIdentityObservation::FullBlake3 { digest } = &file.identity {
+                        if let Some(&other) = t_only.get(digest.as_str()) {
+                            ops.push(Op {
+                                side: Side::Target,
+                                action: Action::Note,
+                                path: file.path.as_str().to_owned(),
+                                from: Some(other.to_string()),
+                                size: Some(file.size),
+                                mtime_ms: None,
+                                hash: None,
+                                link: None,
+                                mode: None,
+                                reason: "possible-move-needs-archive".into(),
+                            });
                         }
                     }
                 }
@@ -580,9 +609,9 @@ pub fn compare(
                     ops.push(Op {
                         side: Side::Target,
                         action: Action::Delete,
-                        path: d.path.clone(),
+                        path: observed_path(d),
                         from: None,
-                        size: Some(d.size),
+                        size: Some(observed_file(d).size),
                         mtime_ms: None,
                         hash: None,
                         link: None,
@@ -594,9 +623,9 @@ pub fn compare(
                     ops.push(Op {
                         side: Side::Source,
                         action: Action::Delete,
-                        path: d.path.clone(),
+                        path: observed_path(d),
                         from: None,
-                        size: Some(d.size),
+                        size: Some(observed_file(d).size),
                         mtime_ms: None,
                         hash: None,
                         link: None,
@@ -612,19 +641,22 @@ pub fn compare(
     // symlinks (Symlink entries only exist in both tables when symlinks="direct")
     // Compared by equality of the "link target string"; mirror falls in line with master, enrich only fills gaps, sync fills gaps + reports differences as conflicts
     {
-        let (s_links, _) = map_of(source, EntryKind::Symlink, ci);
-        let (t_links, _) = map_of(target, EntryKind::Symlink, ci);
-        let link_op = |side: Side, action: Action, e: &Entry, reason: &str| Op {
-            side,
-            action,
-            path: e.path.clone(),
-            from: None,
-            size: None,
-            mtime_ms: None,
-            hash: None,
-            link: e.link.clone(),
-            mode: None,
-            reason: reason.into(),
+        let (s_links, _) = map_of(source, ObservedEntryKind::Symlink, ci);
+        let (t_links, _) = map_of(target, ObservedEntryKind::Symlink, ci);
+        let link_op = |side: Side, action: Action, e: &ObservedEntry, reason: &str| {
+            let symlink = observed_symlink(e);
+            Op {
+                side,
+                action,
+                path: symlink.path.as_str().to_owned(),
+                from: None,
+                size: None,
+                mtime_ms: None,
+                hash: None,
+                link: Some(symlink.target.clone()),
+                mode: None,
+                reason: reason.into(),
+            }
         };
         for (p, se) in &s_links {
             let se = *se;
@@ -640,7 +672,7 @@ pub fn compare(
                     }
                 }
                 Some(&te) => {
-                    if se.link != te.link {
+                    if observed_symlink(se).target != observed_symlink(te).target {
                         match mode {
                             "mirror" => ops.push(link_op(
                                 Side::Target,
@@ -703,7 +735,7 @@ pub fn compare(
                     Side::Source => t_files.get(&key),
                 };
                 if let Some(e) = from_entry {
-                    op.mode = e.mode;
+                    op.mode = observed_file(e).mode;
                 }
             }
         }
@@ -715,21 +747,26 @@ pub fn compare(
             for (p, se) in &s_files {
                 let se = *se;
                 if let Some(&te) = t_files.get(p) {
-                    if files_equal(se, te, win) && se.mode.is_some() && se.mode != te.mode {
+                    let source_file = observed_file(se);
+                    let target_file = observed_file(te);
+                    if files_equal(se, te, win)
+                        && source_file.mode.is_some()
+                        && source_file.mode != target_file.mode
+                    {
                         ops.push(Op {
                             side: Side::Target,
                             action: Action::Chmod,
-                            path: te.path.clone(),
+                            path: target_file.path.as_str().to_owned(),
                             from: None,
                             size: None,
                             mtime_ms: None,
                             hash: None,
                             link: None,
-                            mode: se.mode,
+                            mode: source_file.mode,
                             reason: format!(
                                 "mode-differs-master-wins ({:04o} -> {:04o})",
-                                te.mode.unwrap_or(0),
-                                se.mode.unwrap_or(0)
+                                target_file.mode.unwrap_or(0),
+                                source_file.mode.unwrap_or(0)
                             ),
                         });
                     }
@@ -747,10 +784,11 @@ pub fn compare(
         let mut folded: HashMap<(bool, String), Vec<&str>> = HashMap::new();
         for (is_target, snap) in [(false, source), (true, target)] {
             for e in &snap.entries {
+                let path = e.path().as_str();
                 folded
-                    .entry((is_target, fold(&e.path)))
+                    .entry((is_target, fold(path)))
                     .or_default()
-                    .push(&e.path);
+                    .push(path);
             }
         }
         for op in &mut ops {
@@ -800,27 +838,39 @@ pub fn compare(
             };
             // Newer mtime wins; on an exact tie the host name's lexicographic order is a stable tie-break
             // (syncthing uses the device id from the version vector; we have none, so host is the equivalent)
-            let source_wins = match se.mtime_ms.cmp(&te.mtime_ms) {
+            let source_file = observed_file(se);
+            let target_file = observed_file(te);
+            let source_wins = match source_file.mtime_ms.cmp(&target_file.mtime_ms) {
                 std::cmp::Ordering::Greater => true,
                 std::cmp::Ordering::Less => false,
                 std::cmp::Ordering::Equal => source.header.host <= target.header.host,
             };
             let (winner, loser, loser_side, loser_host) = if source_wins {
-                (se, te, Side::Target, target.header.host.as_str())
+                (
+                    source_file,
+                    target_file,
+                    Side::Target,
+                    target.header.host.as_str(),
+                )
             } else {
-                (te, se, Side::Source, source.header.host.as_str())
+                (
+                    target_file,
+                    source_file,
+                    Side::Source,
+                    source.header.host.as_str(),
+                )
             };
             if copts.conflict == ConflictPolicy::Copy {
-                let kept = conflict_name(&loser.path, loser_host, now);
+                let kept = conflict_name(loser.path.as_str(), loser_host, now);
                 extra.push(Op {
                     side: loser_side.clone(),
                     action: Action::Move,
                     path: kept.clone(),
-                    from: Some(loser.path.clone()),
+                    from: Some(loser.path.as_str().to_owned()),
                     size: Some(loser.size),
                     mtime_ms: Some(loser.mtime_ms),
-                    hash: loser.hash.clone(),
-                    link: loser.link.clone(),
+                    hash: loser.identity.plan_hash(),
+                    link: None,
                     mode: loser.mode,
                     reason: format!("conflict-loser-kept-as-copy ({})", op.reason),
                 });
@@ -829,12 +879,12 @@ pub fn compare(
             extra.push(Op {
                 side: loser_side,
                 action: Action::Update,
-                path: loser.path.clone(),
+                path: loser.path.as_str().to_owned(),
                 from: None,
                 size: Some(winner.size),
                 mtime_ms: Some(winner.mtime_ms),
-                hash: winner.hash.clone(),
-                link: winner.link.clone(),
+                hash: winner.identity.plan_hash(),
+                link: None,
                 mode: None,
                 reason: format!(
                     "conflict-resolved-newer-wins ({})",
@@ -858,12 +908,17 @@ pub fn compare(
             let limit = copts.max_conflicts as usize;
             for (is_target, snap) in [(false, source), (true, target)] {
                 let mut groups: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-                for e in snap.entries.iter().filter(|e| e.kind == EntryKind::File) {
-                    if is_conflict_copy(&e.path) {
+                for e in snap
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.kind() == ObservedEntryKind::File)
+                {
+                    let path = e.path().as_str();
+                    if is_conflict_copy(path) {
                         // Group under the original file name: strip off the `.sync-conflict-…` part
-                        if let Some(i) = e.path.find(CONFLICT_INFIX) {
-                            let stem = &e.path[..i];
-                            groups.entry(stem.to_string()).or_default().push(&e.path);
+                        if let Some(i) = path.find(CONFLICT_INFIX) {
+                            let stem = &path[..i];
+                            groups.entry(stem.to_string()).or_default().push(path);
                         }
                     }
                 }
@@ -920,14 +975,14 @@ pub fn compare(
         let candidates = [Some(op.path.as_str()), op.from.as_deref()];
         let mut verdict: Option<(bool, String)> = None; // (refuse, reason)
         for path in candidates.into_iter().flatten() {
-            let Some((fault, r)) = win_name_fault(path) else {
+            let Some((fault, r)) = windows_name_fault(path) else {
                 continue;
             };
             // Which roots does this fault actually endanger for this op?
             let exec_hit =
-                exec_rules == NameRules::Windows && (fault == WinNameFault::Mangled || creates);
+                exec_rules == NameRules::Windows && (fault.changes_addressed_path() || creates);
             let read_hit =
-                reads_other && other_rules == NameRules::Windows && fault == WinNameFault::Mangled;
+                reads_other && other_rules == NameRules::Windows && fault.changes_addressed_path();
             if exec_hit || read_hit {
                 let where_ = if read_hit && !exec_hit {
                     "reading side"
@@ -940,9 +995,9 @@ pub fn compare(
             // Unknown-OS roots: never refuse (the name may be perfectly legal there), never
             // stay quiet either.
             let exec_unknown =
-                exec_rules == NameRules::Unknown && (fault == WinNameFault::Mangled || creates);
+                exec_rules == NameRules::Unknown && (fault.changes_addressed_path() || creates);
             let read_unknown =
-                reads_other && other_rules == NameRules::Unknown && fault == WinNameFault::Mangled;
+                reads_other && other_rules == NameRules::Unknown && fault.changes_addressed_path();
             if (exec_unknown || read_unknown) && verdict.is_none() {
                 verdict = Some((false, r));
             }
@@ -1027,20 +1082,42 @@ pub fn compare(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::table::{Header, SCHEMA};
+    use crate::foundation::path::RootRelativePath;
+    use crate::model::table::{
+        Blake3Digest, ObservedFile, ObservedMedium, ObservedNameRules, TableEvidence, TableHeader,
+        TableKind, VfsNote, TABLE_SCHEMA,
+    };
 
-    fn snap(os: &str, entries: Vec<Entry>) -> Snapshot {
-        Snapshot {
-            header: Header {
-                schema: SCHEMA,
-                kind: "snapshot".into(),
+    fn digest(label: &str) -> Blake3Digest {
+        Blake3Digest::hash_bytes(label.as_bytes())
+    }
+
+    fn assert_plan_hash(operation: &Op, label: &str) {
+        let expected = digest(label);
+        assert_eq!(operation.hash.as_deref(), Some(expected.as_str()));
+    }
+
+    fn snap(os: &str, entries: Vec<ObservedEntry>) -> TableArtifact {
+        let evidence = if entries.iter().all(|entry| {
+            entry
+                .as_file()
+                .is_none_or(|file| matches!(file.identity, FileIdentityObservation::SizeAndMtime))
+        }) {
+            TableEvidence::None
+        } else {
+            TableEvidence::Full
+        };
+        TableArtifact {
+            header: TableHeader {
+                schema: TABLE_SCHEMA,
+                kind: TableKind::Snapshot,
                 root: "/r".into(),
                 host: "h".into(),
                 os: os.into(),
                 scanned_at_ms: 0,
                 duration_ms: 0,
                 entry_count: entries.len() as u64,
-                hashed: true,
+                evidence,
                 excluded_dirs: 0,
                 excluded_files: 0,
                 walk_errors: 0,
@@ -1054,27 +1131,24 @@ mod tests {
             entries,
         }
     }
-    fn file(path: &str, hash: &str) -> Entry {
-        Entry {
-            path: path.into(),
-            kind: EntryKind::File,
+    fn file(path: &str, hash: &str) -> ObservedEntry {
+        ObservedEntry::File(ObservedFile {
+            path: RootRelativePath::try_from(path).unwrap(),
             size: 1,
             mtime_ms: 0,
-            hash: Some(hash.into()),
-            hash_failed: false,
-            file_id: None,
+            identity: FileIdentityObservation::FullBlake3 {
+                digest: digest(hash),
+            },
+            file_system_id: None,
             mode: None,
-            link: None,
-            prev: None,
-        }
+            previous_identities: Vec::new(),
+        })
     }
     /// A file whose content could not be read: same size and mtime as its twin, no hash.
-    fn unreadable(path: &str) -> Entry {
-        Entry {
-            hash: None,
-            hash_failed: true,
-            ..file(path, "")
-        }
+    fn unreadable(path: &str) -> ObservedEntry {
+        let mut entry = file(path, "unreadable");
+        entry.as_file_mut().unwrap().identity = FileIdentityObservation::Unreadable;
+        entry
     }
 
     /// The exact shape that used to pass silently: identical size and mtime, no hash on one side
@@ -1104,10 +1178,10 @@ mod tests {
     /// fire on every hashless comparison, only on a failed one.
     #[test]
     fn a_hashless_comparison_is_still_judged_on_size_and_mtime() {
-        let bare = |p: &str| Entry {
-            hash: None,
-            hash_failed: false,
-            ..file(p, "")
+        let bare = |path: &str| {
+            let mut entry = file(path, "hashing-disabled");
+            entry.as_file_mut().unwrap().identity = FileIdentityObservation::SizeAndMtime;
+            entry
         };
         let s = snap("linux", vec![bare("a.bin")]);
         let t = snap("linux", vec![bare("a.bin")]);
@@ -1119,45 +1193,46 @@ mod tests {
         );
     }
     /// A file with an mtime (conflict arbitration goes by mtime)
-    fn file_at(path: &str, hash: &str, mtime_ms: i64) -> Entry {
-        Entry {
-            mtime_ms,
-            ..file(path, hash)
-        }
+    fn file_at(path: &str, hash: &str, mtime_ms: i64) -> ObservedEntry {
+        let mut entry = file(path, hash);
+        entry.as_file_mut().unwrap().mtime_ms = mtime_ms;
+        entry
     }
-    fn sized(path: &str, hash: &str, size: u64) -> Entry {
-        Entry {
-            size,
-            ..file(path, hash)
-        }
+    fn sized(path: &str, hash: &str, size: u64) -> ObservedEntry {
+        let mut entry = file(path, hash);
+        entry.as_file_mut().unwrap().size = size;
+        entry
     }
     /// An archive entry: current hash + historic generations
-    fn arch(path: &str, hash: &str, prev: &[&str]) -> Entry {
-        Entry {
-            prev: if prev.is_empty() {
-                None
-            } else {
-                Some(prev.iter().map(|s| s.to_string()).collect())
-            },
-            ..file(path, hash)
-        }
+    fn arch(path: &str, hash: &str, previous: &[&str]) -> ObservedEntry {
+        let mut entry = file(path, hash);
+        entry.as_file_mut().unwrap().previous_identities = previous
+            .iter()
+            .map(|label| FileIdentityObservation::FullBlake3 {
+                digest: digest(label),
+            })
+            .collect();
+        entry
     }
-    fn snap_named(os: &str, host: &str, entries: Vec<Entry>) -> Snapshot {
+    fn snap_named(os: &str, host: &str, entries: Vec<ObservedEntry>) -> TableArtifact {
         let mut s = snap(os, entries);
         s.header.host = host.into();
         s
     }
     /// A snapshot of a VFS root: `header.os` carries the *protocol*, and the naming rules
     /// live in the VfsNote — exactly the shape `scan_vfs` writes.
-    fn snap_vfs(protocol: &str, name_rules: &str, entries: Vec<Entry>) -> Snapshot {
+    fn snap_vfs(
+        protocol: &str,
+        name_rules: ObservedNameRules,
+        entries: Vec<ObservedEntry>,
+    ) -> TableArtifact {
         let mut s = snap(protocol, entries);
-        s.header.vfs = Some(crate::model::table::VfsNote {
+        s.header.vfs = Some(VfsNote {
             protocol: protocol.into(),
             display_root: "/r".into(),
             mtime_precision_ms: 1,
-            medium: crate::fs::vfs::Medium::NetworkShare.as_str().into(),
-            evidence_effective: "full".into(),
-            name_rules: name_rules.into(),
+            medium: ObservedMedium::NetworkShare,
+            name_rules,
             degraded: Vec::new(),
         });
         s
@@ -1260,6 +1335,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn full_file_identities_enable_moves_inside_a_sampled_table() {
+        let mut source = snap("windows", vec![sized("moved/one.bin", "h", 10)]);
+        let mut target = snap("windows", vec![sized("one.bin", "h", 10)]);
+        source.header.evidence = TableEvidence::Sampled;
+        target.header.evidence = TableEvidence::Sampled;
+
+        let plan = compare(
+            &source,
+            &target,
+            "mirror",
+            None,
+            false,
+            &CompareOptions::default(),
+        );
+
+        assert_eq!(
+            plan.ops
+                .iter()
+                .filter(|operation| operation.action == Action::Move)
+                .count(),
+            1,
+            "the candidate files carry full evidence even though larger files in the table may be sampled"
+        );
+    }
+
     // P1-3: multi-generation archive attribution
 
     #[test]
@@ -1282,7 +1383,7 @@ mod tests {
             .find(|o| o.action == Action::Update)
             .expect("should propagate");
         assert_eq!(up.side, Side::Target);
-        assert_eq!(up.hash.as_deref(), Some("H3"));
+        assert_plan_hash(up, "H3");
     }
 
     #[test]
@@ -1318,15 +1419,17 @@ mod tests {
         let old = vec![arch("f.txt", "H1", &["H0"])];
         let mut fresh = vec![file("f.txt", "H2")];
         roll_generations(&mut fresh, &old);
-        assert_eq!(
-            fresh[0].prev.as_ref().unwrap(),
-            &vec!["H1".to_string(), "H0".to_string()]
-        );
+        let fresh_history = &fresh[0].as_file().unwrap().previous_identities;
+        assert_eq!(fresh_history.len(), 2);
+        assert_eq!(fresh_history[0].digest(), Some(&digest("H1")));
+        assert_eq!(fresh_history[1].digest(), Some(&digest("H0")));
 
         // When the content hasn't changed, the same hash must not be poured into the history
         let mut same = vec![file("f.txt", "H1")];
         roll_generations(&mut same, &old);
-        assert_eq!(same[0].prev.as_ref().unwrap(), &vec!["H0".to_string()]);
+        let same_history = &same[0].as_file().unwrap().previous_identities;
+        assert_eq!(same_history.len(), 1);
+        assert_eq!(same_history[0].digest(), Some(&digest("H0")));
     }
 
     // P1-2: conflict copies
@@ -1385,7 +1488,7 @@ mod tests {
             .iter()
             .find(|o| o.action == Action::Update && o.path == "doc/report.pdf")
             .unwrap();
-        assert_eq!(up.hash.as_deref(), Some("NEW"));
+        assert_plan_hash(up, "NEW");
         // The original conflict row is downgraded to an auditable note and no longer counts as a conflict
         assert_eq!(plan.header.conflict_count, 0);
         assert!(plan
@@ -1413,7 +1516,7 @@ mod tests {
             .find(|o| o.action == Action::Update)
             .unwrap();
         assert_eq!(up.side, Side::Target);
-        assert_eq!(up.hash.as_deref(), Some("NEW"));
+        assert_plan_hash(up, "NEW");
     }
 
     #[test]
@@ -1434,7 +1537,7 @@ mod tests {
             .find(|o| o.action == Action::Update && o.path == "f.txt")
             .unwrap();
         assert_eq!(up.side, Side::Source);
-        assert_eq!(up.hash.as_deref(), Some("NEW"));
+        assert_plan_hash(up, "NEW");
     }
 
     #[test]
@@ -1511,9 +1614,9 @@ mod tests {
     #[test]
     fn mode_only_difference_produces_a_chmod_not_a_recopy() {
         let mut se = file("run.sh", "SAME");
-        se.mode = Some(0o755);
+        se.as_file_mut().unwrap().mode = Some(0o755);
         let mut te = file("run.sh", "SAME");
-        te.mode = Some(0o644);
+        te.as_file_mut().unwrap().mode = Some(0o644);
         let s = snap("macos", vec![se]);
         let t = snap("linux", vec![te]);
         let opts = CompareOptions {
@@ -1532,9 +1635,9 @@ mod tests {
     #[test]
     fn mode_is_ignored_unless_enabled_and_both_sides_are_unix() {
         let mut se = file("run.sh", "SAME");
-        se.mode = Some(0o755);
+        se.as_file_mut().unwrap().mode = Some(0o755);
         let mut te = file("run.sh", "SAME");
-        te.mode = Some(0o644);
+        te.as_file_mut().unwrap().mode = Some(0o644);
         // Off by default
         let plan = compare(
             &snap("macos", vec![se.clone()]),
@@ -1564,7 +1667,7 @@ mod tests {
     #[test]
     fn copies_carry_the_source_mode_when_enabled() {
         let mut se = file("new.sh", "H");
-        se.mode = Some(0o755);
+        se.as_file_mut().unwrap().mode = Some(0o755);
         let s = snap("macos", vec![se]);
         let t = snap("linux", Vec::new());
         let opts = CompareOptions {
@@ -1602,11 +1705,9 @@ mod tests {
         assert!(c.reason.contains("case-collision"), "{}", c.reason);
     }
 
-    /// The gap that shipped: a VFS root records `header.os` as the *protocol*, so the
-    /// `os == "windows"` gate skipped every one of them. The recorded `name_rules` is what
-    /// decides now — and a root can still carry `windows` while `os` says `smb`, because that
-    /// is exactly what the tables written by the old OS-delegating SMB backend look like, and
-    /// those tables are still on disk being compared against.
+    /// A VFS observation records its protocol in `header.os`, while `vfs.name_rules` records the
+    /// destination's actual naming semantics. Planning must use the latter or an SMB-backed Windows
+    /// root would bypass the name-safety gate.
     #[test]
     fn windows_name_check_fires_on_an_smb_root_not_just_a_local_windows_one() {
         let bad = vec![
@@ -1616,7 +1717,7 @@ mod tests {
             file("a?b.txt", "h4"),
         ];
         let s = snap("macos", bad.clone());
-        let t = snap_vfs("smb", "windows", vec![]);
+        let t = snap_vfs("smb", ObservedNameRules::Windows, vec![]);
         let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
         let refused: Vec<_> = plan
             .ops
@@ -1731,7 +1832,7 @@ mod tests {
     #[test]
     fn unknown_server_rules_warn_instead_of_refusing() {
         let s = snap("macos", vec![file("report:2024.pdf", "h1")]);
-        let t = snap_vfs("sftp", "unknown", vec![]);
+        let t = snap_vfs("sftp", ObservedNameRules::Unknown, vec![]);
         let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
         assert!(plan
             .ops
@@ -1864,7 +1965,11 @@ mod tests {
     // sync-with-archive classification matrix
     // State notation: E = present with content x, ∅ = absent. archive = the consensus state at the last sync.
 
-    fn plan_sync(s: Vec<Entry>, t: Vec<Entry>, a: Option<Vec<Entry>>) -> Plan {
+    fn plan_sync(
+        s: Vec<ObservedEntry>,
+        t: Vec<ObservedEntry>,
+        a: Option<Vec<ObservedEntry>>,
+    ) -> Plan {
         let s = snap("windows", s);
         let t = snap("macos", t);
         let a = a.map(|e| snap("windows", e));
@@ -2008,11 +2113,11 @@ mod tests {
     fn matrix_enrich_never_deletes_or_downgrades() {
         let s = snap("windows", vec![file("only-src", "h1")]);
         let mut old = file("shared", "h-old");
-        old.mtime_ms = 0;
+        old.as_file_mut().unwrap().mtime_ms = 0;
         let mut newer_on_target = file("shared", "h-new");
-        newer_on_target.mtime_ms = 999_999;
+        newer_on_target.as_file_mut().unwrap().mtime_ms = 999_999;
         let t = snap("macos", vec![newer_on_target, file("only-tgt", "hx")]);
-        let s = Snapshot {
+        let s = TableArtifact {
             header: s.header,
             entries: vec![s.entries[0].clone(), old],
         };

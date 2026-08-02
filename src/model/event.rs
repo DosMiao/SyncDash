@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// Log level. Division of labor with the `Error` event: `Error` is a structured **single-op failure**
 /// (carrying path/action/side, naturally a line in the error detail), `Log` is pipeline narration
-/// (remote probe results, delta downgrades, lock takeover…) — the sink for those in-library `eprintln!`s.
+/// (endpoint probe results, delta downgrades, lock contention…) — the sink for those in-library `eprintln!`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "lowercase")]

@@ -92,7 +92,7 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             let info = serde_json::json!({
                 "app": "syncdash",
                 "version": env!("CARGO_PKG_VERSION"),
-                "schema": table::SCHEMA,
+                "schema": table::TABLE_SCHEMA,
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,
                 "host": table::host_name(),
@@ -112,7 +112,13 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 );
             } else {
                 for (name, j) in jobs {
-                    println!("{:<24} {:<7} {}  ->  {}", name, j.mode, j.source, j.target);
+                    println!(
+                        "{:<24} {:<7} {}  ->  {}",
+                        name,
+                        j.mode,
+                        j.source,
+                        j.targets.join(", ")
+                    );
                 }
             }
             Ok(0)
@@ -148,13 +154,17 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             // RootLock stops both ends acting at once.
             if watch {
                 let iv = interval
-                    .or_else(|| list.iter().filter_map(|(_, j)| j.watch_interval_secs).min())
+                    .or_else(|| {
+                        list.iter()
+                            .filter_map(|(_, job)| job.autoscan_interval_secs)
+                            .min()
+                    })
                     .unwrap_or(30)
                     .max(1);
                 eprintln!("watch: {} job(s), every {iv}s — Ctrl-C to stop", list.len());
                 loop {
                     for (name, j) in &list {
-                        let auto = auto_apply || j.watch_auto_apply;
+                        let auto = auto_apply || j.autoscan_auto_apply;
                         let res = run::run_job(name, j, auto, verbose, i_know, accept_caps);
                         match res {
                             Ok((d, _s, e, c)) if d + e + c > 0 => {
@@ -288,7 +298,7 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     Some("off") => Some(false),
                     _ => None,
                 })
-                .with_no_hash(no_hash);
+                .with_hash_disabled(no_hash);
             if fast {
                 r.sampled = true;
                 r.use_cache = true;
@@ -358,10 +368,17 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             case_sensitive,
             out,
         } => {
-            let s = table::Snapshot::load(&source)?;
-            let t = table::Snapshot::load(&target)?;
+            let s = table::TableArtifact::load_snapshot(&source)?;
+            let t = table::TableArtifact::load_snapshot(&target)?;
             let a = match &archive {
-                Some(p) => Some(table::Snapshot::load(p)?),
+                Some(path) => {
+                    Some(syncdash::run::archive::load_archive(path)?.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("archive does not exist: {}", path.display()),
+                        )
+                    })?)
+                }
                 None => None,
             };
             let mode_str = match mode {
@@ -407,16 +424,16 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             target_root,
             mode,
             rigor,
-            remote_host,
-            remote_root_base,
-            remote_exe,
+            peer_host,
+            peer_root_base,
+            peer_exe,
             junk,
             force,
         } => {
-            let remote = remote_host.map(|h| territory::RemoteGen {
+            let peer_generation = peer_host.map(|h| territory::PeerJobGeneration {
                 host: h,
-                root_base: remote_root_base.unwrap_or_default(),
-                exe: remote_exe,
+                root_base: peer_root_base.unwrap_or_default(),
+                exe: peer_exe,
             });
             // An unknown preset id is refused rather than dropped: a job seeded with fewer rules than
             // asked for is a filter that isn't what it says it is, and it would only surface as a surprise
@@ -441,7 +458,7 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 force,
                 ..Default::default()
             };
-            let outs = territory::gen_jobs(&root, &target_root, &opts, remote.as_ref())?;
+            let outs = territory::gen_jobs(&root, &target_root, &opts, peer_generation.as_ref())?;
             for o in &outs {
                 println!(
                     "{:<44} <- {}{}",
@@ -488,22 +505,30 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             if let Some(p) = path.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            let mut f = std::fs::File::create(&path)?;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
             let n = std::io::copy(&mut std::io::stdin().lock(), &mut f)?;
             eprintln!("received {n} bytes -> {}", path.display());
             Ok(0)
         }
         Cmd::Chunks { root, files } => {
+            let root = syncdash::fs::local_root::LocalRoot::open(root)?;
+            let files: Vec<syncdash::foundation::path::RootRelativePath> = files
+                .into_iter()
+                .map(|rel| {
+                    syncdash::foundation::path::RootRelativePath::try_from(rel).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                    })
+                })
+                .collect::<Result<_, _>>()?;
             let stdout = std::io::stdout();
             let mut w = std::io::BufWriter::new(stdout.lock());
             for rel in &files {
-                match syncdash::model::chunk::chunk_file(&root, rel) {
-                    Ok(fc) => {
-                        use std::io::Write;
-                        writeln!(w, "{}", serde_json::to_string(&fc)?)?;
-                    }
-                    Err(e) => eprintln!("warning: chunking {rel} failed: {e}"),
-                }
+                let fc = syncdash::fs::chunk::chunk_file(&root, rel)?;
+                use std::io::Write;
+                writeln!(w, "{}", serde_json::to_string(&fc)?)?;
             }
             Ok(0)
         }
@@ -600,9 +625,9 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             use syncdash::fs::vfs::spec::{parse, RootSpec};
             match cmd {
                 CredCmd::Set { phrase, stdin } => {
-                    let RootSpec::Remote(r) = parse(&phrase) else {
+                    let RootSpec::Endpoint(r) = parse(&phrase) else {
                         eprintln!(
-                            "not a remote phrase: {phrase} (expected scheme://user@host/...)"
+                            "not a network endpoint phrase: {phrase} (expected scheme://user@host/...)"
                         );
                         return Ok(2);
                     };
@@ -628,8 +653,8 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                     Ok(0)
                 }
                 CredCmd::Rm { phrase } => {
-                    let RootSpec::Remote(r) = parse(&phrase) else {
-                        eprintln!("not a remote phrase: {phrase}");
+                    let RootSpec::Endpoint(r) = parse(&phrase) else {
+                        eprintln!("not a network endpoint phrase: {phrase}");
                         return Ok(2);
                     };
                     let Some(acc) = cred::account_for(&r) else {
@@ -685,10 +710,10 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
         } => {
             if let Some(days) = prune_days {
                 // 0 = don't stack the total-size gate: the meaning of `--prune-days N` is exactly "by days only"
-                let n = syncdash::obs::runlog::prune(days, 0);
+                let n = syncdash::obs::runlog::prune(days, 0)?;
                 println!("pruned {n} run(s) older than {days} day(s)");
             }
-            let rows = syncdash::obs::runlog::history(job.as_deref(), limit);
+            let rows = syncdash::obs::runlog::history(job.as_deref(), limit)?;
             if rows.is_empty() {
                 println!("no runs recorded yet (runs are logged when a job actually applies)");
                 return Ok(0);
@@ -706,7 +731,7 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
                 println!(
                     "{:>9}  {:<20} {:<12} {:>5} done {:>4} skip {:>3} err  {:>10}  {:>7.1}s{}",
                     age,
-                    r.job,
+                    r.subject.job_name,
                     r.kind,
                     r.done,
                     r.skipped,
@@ -816,7 +841,7 @@ pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
             let tr = target_root.unwrap_or_else(|| PathBuf::from(&p.header.target_root));
             for (name, r) in [("source", &sr), ("target", &tr)] {
                 if !r.is_dir() {
-                    eprintln!("error: {name} root not accessible locally: {} (remote package mode lands in v0.4)", r.display());
+                    eprintln!("error: {name} root is not locally accessible: {} (use `syncdash run` for VFS or peer roots)", r.display());
                     return Ok(2);
                 }
             }

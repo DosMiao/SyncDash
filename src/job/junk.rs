@@ -7,7 +7,7 @@
 //!
 //! A preset is a **macro over `exclude`**, not a parallel rule set. Ticking one writes its patterns
 //! into the list, where they appear verbatim, can be edited or deleted line by line, and survive
-//! into `--exclude` on the wire to a remote scan. Unticking takes exactly those lines back out.
+//! into `--exclude` on the wire to a peer scan. Unticking takes exactly those lines back out.
 //! The old shape — a job saying `os_excludes = "auto"` while the exclude box said nothing — could
 //! not answer "what is actually excluded here", which is the same class of lie as folding `.git`
 //! in silently.

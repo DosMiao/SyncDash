@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-// A table of contents that follows the page, for a rail beside one long scrolling pane.
-//
-// The pane arrives as an element rather than a ref for the reason spelled out on useVirtualRows.
+// The element is passed directly because a ref object's stable identity cannot signal replacement.
 
 /// Height of the sticky section heading. The activation line sits just under it, so a section
 /// becomes current when its *heading* reaches the top of the pane, not when its first row does.
@@ -12,87 +10,109 @@ const STICKY_H = 30;
 /// Ceiling on how long the rail stays pinned to a clicked section during the smooth scroll, for the
 /// case where the pane never reaches the exact target (a short last section cannot scroll far
 /// enough). Released as soon as it does land, so this is not a delay in the normal case.
-const GLIDE_MS = 600;
+const SMOOTH_SCROLL_HOLD_MS = 600;
 
 export interface ScrollSpy {
-  /// The section in view, or the clicked one while a glide is still running
+  /// The section in view, or the target while smooth scrolling is in progress.
   active: string;
-  /// Callback ref for a section element. Stable per id: an inline `(el) => …` would be a new
+  /// Callback ref for a section element. Stable per ID: an inline callback would be a new
   /// function every render, and React responds to a changed ref identity by detaching with null
   /// and reattaching — so every render would rebuild the map this hook reads on every scroll frame.
-  register: (id: string) => (el: HTMLElement | null) => void;
-  scrollTo: (id: string, smooth?: boolean) => void;
+  register: (sectionId: string) => (element: HTMLElement | null) => void;
+  scrollTo: (sectionId: string, smooth?: boolean) => void;
 }
 
-/// `ids` must be referentially stable — a fresh array each render re-subscribes the scroll listener.
-export function useScrollSpy(pane: HTMLElement | null, ids: string[]): ScrollSpy {
-  const [active, setActive] = useState(ids[0] ?? '');
-  const els = useRef(new Map<string, HTMLElement>());
-  const refs = useRef(new Map<string, (el: HTMLElement | null) => void>());
-  const glide = useRef<{ id: string; until: number } | null>(null);
+/// `sectionIds` must be referentially stable; a fresh array re-subscribes the scroll listener.
+export function useScrollSpy(scrollPane: HTMLElement | null, sectionIds: string[]): ScrollSpy {
+  const [activeSectionId, setActiveSectionId] = useState(sectionIds[0] ?? '');
+  const sectionElementsRef = useRef(new Map<string, HTMLElement>());
+  const registrationCallbacksRef = useRef(
+    new Map<string, (element: HTMLElement | null) => void>(),
+  );
+  const activeSectionHoldRef = useRef<{ sectionId: string; expiresAt: number } | null>(null);
 
-  const register = useCallback((id: string) => {
-    let cb = refs.current.get(id);
-    if (!cb) {
-      cb = (el: HTMLElement | null) => {
-        if (el) els.current.set(id, el);
-        else els.current.delete(id);
+  const register = useCallback((sectionId: string) => {
+    let registrationCallback = registrationCallbacksRef.current.get(sectionId);
+    if (!registrationCallback) {
+      registrationCallback = (element: HTMLElement | null) => {
+        if (element) sectionElementsRef.current.set(sectionId, element);
+        else sectionElementsRef.current.delete(sectionId);
       };
-      refs.current.set(id, cb);
+      registrationCallbacksRef.current.set(sectionId, registrationCallback);
     }
-    return cb;
+    return registrationCallback;
   }, []);
 
-  const measure = useCallback(() => {
-    if (!pane || ids.length === 0) return;
+  const measureActiveSection = useCallback(() => {
+    if (!scrollPane || sectionIds.length === 0) return;
 
-    const held = glide.current;
-    if (held) {
-      const target = els.current.get(held.id);
-      const landed = target && Math.abs(pane.scrollTop - Math.max(0, target.offsetTop - STICKY_H)) < 2;
-      if (landed || performance.now() > held.until) glide.current = null;
-      else { setActive(held.id); return; }
+    const activeSectionHold = activeSectionHoldRef.current;
+    if (activeSectionHold) {
+      const targetSection = sectionElementsRef.current.get(activeSectionHold.sectionId);
+      const targetScrollTop = targetSection
+        ? Math.max(0, targetSection.offsetTop - STICKY_H)
+        : null;
+      const targetReached = targetScrollTop !== null
+        && Math.abs(scrollPane.scrollTop - targetScrollTop) < 2;
+      if (targetReached || performance.now() > activeSectionHold.expiresAt) {
+        activeSectionHoldRef.current = null;
+      } else {
+        setActiveSectionId(activeSectionHold.sectionId);
+        return;
+      }
     }
 
     // The last section is the shortest and its top can never reach the activation line, so without
     // this it would never highlight however far you scrolled.
-    if (pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 2) {
-      setActive(ids[ids.length - 1]);
+    if (scrollPane.scrollTop + scrollPane.clientHeight >= scrollPane.scrollHeight - 2) {
+      setActiveSectionId(sectionIds[sectionIds.length - 1]);
       return;
     }
 
     // offsetTop is pane-relative only because .ed-pane is positioned — see styles.css
-    const line = pane.scrollTop + STICKY_H + 8;
-    let hit = ids[0];
-    for (const id of ids) {
-      const el = els.current.get(id);
-      if (el && el.offsetTop <= line) hit = id;
+    const activationLine = scrollPane.scrollTop + STICKY_H + 8;
+    let measuredActiveSectionId = sectionIds[0];
+    for (const sectionId of sectionIds) {
+      const sectionElement = sectionElementsRef.current.get(sectionId);
+      if (sectionElement && sectionElement.offsetTop <= activationLine) {
+        measuredActiveSectionId = sectionId;
+      }
     }
-    setActive(hit);
-  }, [pane, ids]);
+    setActiveSectionId(measuredActiveSectionId);
+  }, [scrollPane, sectionIds]);
 
   useEffect(() => {
-    if (!pane) return;
-    let pending = false;
-    const onScroll = () => {
-      if (pending) return;
-      pending = true;
-      requestAnimationFrame(() => { pending = false; measure(); });
+    if (!scrollPane) return;
+    let pendingAnimationFrameId: number | null = null;
+    const handleScroll = () => {
+      if (pendingAnimationFrameId !== null) return;
+      pendingAnimationFrameId = requestAnimationFrame(() => {
+        pendingAnimationFrameId = null;
+        measureActiveSection();
+      });
     };
-    pane.addEventListener('scroll', onScroll, { passive: true });
-    measure();
-    return () => pane.removeEventListener('scroll', onScroll);
-  }, [pane, measure]);
+    scrollPane.addEventListener('scroll', handleScroll, { passive: true });
+    measureActiveSection();
+    return () => {
+      scrollPane.removeEventListener('scroll', handleScroll);
+      if (pendingAnimationFrameId !== null) cancelAnimationFrame(pendingAnimationFrameId);
+    };
+  }, [measureActiveSection, scrollPane]);
 
-  // Pinning `active` for the duration is what stops the rail strobing through every section the
-  // glide passes over.
-  const scrollTo = useCallback((id: string, smooth = true) => {
-    const el = els.current.get(id);
-    if (!pane || !el) return;
-    glide.current = { id, until: performance.now() + GLIDE_MS };
-    setActive(id);
-    pane.scrollTo({ top: Math.max(0, el.offsetTop - STICKY_H), behavior: smooth ? 'smooth' : 'auto' });
-  }, [pane]);
+  // Pinning `active` stops the rail strobing through intermediate sections during smooth scrolling.
+  const scrollTo = useCallback((sectionId: string, smooth = true) => {
+    const sectionElement = sectionElementsRef.current.get(sectionId);
+    if (!scrollPane || !sectionElement) return;
+    activeSectionHoldRef.current = {
+      sectionId,
+      expiresAt: performance.now() + SMOOTH_SCROLL_HOLD_MS,
+    };
+    setActiveSectionId(sectionId);
+    scrollPane.scrollTo({
+      top: Math.max(0, sectionElement.offsetTop - STICKY_H),
+      behavior: smooth ? 'smooth' : 'auto',
+    });
+  }, [scrollPane]);
 
-  return { active, register, scrollTo };
+  return { active: activeSectionId, register, scrollTo };
 }

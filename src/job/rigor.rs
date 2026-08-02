@@ -78,9 +78,9 @@ impl RigorResolved {
         self
     }
 
-    /// Applied last, and one-way: `--no-hash` can turn hashing off but nothing turns it back on.
-    pub fn with_no_hash(mut self, no_hash: bool) -> RigorResolved {
-        if no_hash {
+    /// Apply the CLI's explicit `--no-hash` override after preset and detail resolution.
+    pub fn with_hash_disabled(mut self, disabled: bool) -> RigorResolved {
+        if disabled {
             self.hash = false;
         }
         self
@@ -137,18 +137,16 @@ mod tests {
         assert!(r.use_cache);
     }
 
-    /// `--no-hash` is applied after everything else and is one-directional, so no combination of
-    /// preset and evidence flag can put hashing back on behind the user's back.
     #[test]
-    fn no_hash_is_applied_last_and_only_turns_things_off() {
+    fn cli_hash_disable_override_is_applied_last_and_is_one_way() {
         let r = RigorResolved::from_preset("paranoid")
             .with_evidence(Some("full"))
-            .with_no_hash(true);
+            .with_hash_disabled(true);
         assert!(!r.hash);
-        let r = RigorResolved::from_preset("quick").with_no_hash(false);
+        let r = RigorResolved::from_preset("quick").with_hash_disabled(false);
         assert!(
             !r.hash,
-            "no_hash=false does not enable hashing that the preset left off"
+            "a disabled override does not enable hashing that the preset left off"
         );
     }
 }

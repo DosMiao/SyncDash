@@ -11,8 +11,8 @@
 //!   thinks in minutes and pretends UTC (60000 ms, FileZilla's stance) — declared in
 //!   caps, so the compare window widens out loud;
 //! - MFMT is FEAT-gated. Without it mtimes cannot be set — the P1-4 correction table
-//!   absorbs that for compare, but the root-lock heartbeat also rides set_mtime, so
-//!   the write side refuses without MFMT (a Block naming the reason);
+//!   absorbs that for compare. FTP remains read-only for apply independently of MFMT because the
+//!   protocol has no exclusive staged-file publication primitive for a root-lock claim;
 //! - one control connection, operations serialized (`max_parallel_streams = 1`) — and the apply
 //!   lane clamps to that, because a second concurrent transfer here does not queue, it fails;
 //! - **no ranged reads, whatever FEAT says about REST.** Nothing in FTP ends a partial transfer
@@ -29,12 +29,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::error::{VfsError, VfsErrorKind, VfsResult};
-use super::spec::RemoteSpec;
+use super::spec::EndpointSpec;
+use super::VfsEntryKind;
 use super::{
     CaseSense, CredentialProvider, ReadStream, Support, VDirEntry, VMeta, Vfs, VfsCaps, WriteHint,
     WriteStaged,
 };
-use crate::model::table::EntryKind;
 
 use suppaftp::list::File as FtpFile;
 use suppaftp::types::FileType;
@@ -233,7 +233,7 @@ pub(super) struct FtpConn {
 
 pub(super) type ConnSlot = Arc<Mutex<Option<FtpConn>>>;
 pub struct FtpBackend {
-    spec: RemoteSpec,
+    spec: EndpointSpec,
     creds: Arc<dyn CredentialProvider>,
     timeout: Duration,
     conn: ConnSlot,
@@ -260,7 +260,7 @@ pub(super) fn map_ftp_err(what: &str, e: FtpError) -> VfsError {
 }
 
 impl FtpBackend {
-    pub fn new(spec: RemoteSpec, creds: Arc<dyn CredentialProvider>) -> FtpBackend {
+    pub fn new(spec: EndpointSpec, creds: Arc<dyn CredentialProvider>) -> FtpBackend {
         let timeout = spec
             .opt("timeout")
             .and_then(|t| t.parse::<u64>().ok())
@@ -354,11 +354,11 @@ impl FtpBackend {
 
 fn meta_of(f: &FtpFile) -> VMeta {
     let kind = if f.is_directory() {
-        EntryKind::Dir
+        VfsEntryKind::Directory
     } else if f.is_symlink() {
-        EntryKind::Symlink
+        VfsEntryKind::Symlink
     } else {
-        EntryKind::File
+        VfsEntryKind::File
     };
     VMeta {
         kind,
@@ -388,6 +388,10 @@ impl Vfs for FtpBackend {
             fsync: Support::No,
             rename: Support::Yes,
             rename_overwrite: Support::Unknown, // varies by server; the engine clears targets anyway
+            exclusive_staged_file_publish: Support::No,
+            exclusive_entry_rename: Support::Unknown,
+            exclusive_symlink_publish: Support::No,
+            durable_namespace: Support::No,
             // REST positions a transfer, but nothing in FTP *ends* one early and cleanly: the
             // client has to stop a RETR it no longer wants, and servers disagree about the reply.
             // Verified against pyftpdlib: both ABOR and closing the data socket leave a response
@@ -556,7 +560,7 @@ impl Vfs for FtpBackend {
             let abs = self.abs("");
             self.with_conn("stat root", |c| c.stream.cwd(&abs))?;
             return Ok(Some(VMeta {
-                kind: EntryKind::Dir,
+                kind: VfsEntryKind::Directory,
                 size: 0,
                 mtime_ms: 0,
                 mode: None,
@@ -577,14 +581,20 @@ impl Vfs for FtpBackend {
     }
 
     fn read_dir(&self, rel: &str) -> VfsResult<Vec<VDirEntry>> {
-        Ok(self
-            .list_dir(rel)?
-            .iter()
-            .map(|f| VDirEntry {
-                name: f.name().to_string(),
-                meta: meta_of(f),
-            })
-            .collect())
+        let mut out = Vec::new();
+        for entry in self.list_dir(rel)? {
+            let name = crate::foundation::path::EntryName::try_from(entry.name()).map_err(|e| {
+                VfsError::new(
+                    VfsErrorKind::Protocol,
+                    format!("FTP server returned an invalid directory entry: {e}"),
+                )
+            })?;
+            out.push(VDirEntry {
+                name,
+                meta: meta_of(&entry),
+            });
+        }
+        Ok(out)
     }
 
     fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>> {
@@ -654,15 +664,13 @@ impl Vfs for FtpBackend {
 
     fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
         let (parent, base) = crate::foundation::path::split_parent(rel);
+        let token = super::random_name_token()?;
         let tmp_rel = format!(
-            "{parent}{}{base}.{}",
+            "{parent}{}{base}.{token}",
             crate::foundation::names::TEMP_PREFIX,
-            std::process::id()
         );
         let tmp_abs = self.abs(&tmp_rel);
         let dst_abs = self.abs(rel);
-        // Stale debris from a previous crash under the same name
-        let _ = self.with_conn("clear stale temp", |c| c.stream.rm(&tmp_abs));
         let data = self.with_conn("open staged", |c| c.stream.put_with_stream(&tmp_abs))?;
         Ok(Box::new(FtpStaged {
             conn: self.conn.clone(),
@@ -738,7 +746,7 @@ mod tests {
     use crate::fs::vfs::spec::{parse, RootSpec};
 
     fn backend(s: &str) -> FtpBackend {
-        let RootSpec::Remote(r) = parse(s) else {
+        let RootSpec::Endpoint(r) = parse(s) else {
             panic!()
         };
         FtpBackend::new(r, crate::fs::vfs::cred::default_provider())

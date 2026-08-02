@@ -5,6 +5,7 @@ members = [".", "src-tauri"]
 name = "syncdash"
 version = "0.9.0"
 edition = "2021"
+rust-version = "1.89"
 description = "Table-driven multi-node file sync: scan -> compare -> plan -> apply, with real move detection"
 
 [dependencies]
@@ -20,6 +21,8 @@ getrandom = "0.3"
 walkdir = "2"
 clap = { version = "4", features = ["derive"] }
 filetime = "0.2"
+cap-primitives = "4.0.2"
+cap-fs-ext = { version = "4.0.2", default-features = false }
 hostname = "0.4"
 toml = "0.8"
 unicode-normalization = "0.1"
@@ -52,6 +55,9 @@ rustls = { version = "0.23.42", default-features = false, features = ["ring"] }
 # statvfs (disk-space preflight). Windows goes through kernel32's GetDiskFreeSpaceExW, no extra crate needed.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }

@@ -1,15 +1,17 @@
-import { useEffect, useRef, useState } from 'react';
 import { ArrowLeftRight, FolderOpen } from 'lucide-react';
 import { summarizePresets } from '../../core/junk';
 import { pathState, usePathVerdict } from '../hooks/usePathVerdict';
 import { rootEditKeyAction } from '../state/execution-safety';
-import { useJunkPresets } from './JunkPresets';
+import { rootDraftIsDirty } from '../state/rootEditor';
+import { useJunkPresetCatalog } from './JunkPresets';
 import { PathVerdictBox } from './PathVerdictBox';
 import type { JobDto } from '../../core/types/generated/JobDto';
 import type { JobFull, JunkPresetDto } from '../../core/ipc';
+import type { RootEditorWorkspace, RootField } from '../state/rootEditor';
 
 interface PathLineProps {
   job: JobDto | null;
+  rootEditor: RootEditorWorkspace | null;
   /// Full config behind the selected job, for the pill row (JobDto carries only what the list needs)
   jobConfiguration: JobFull | null;
   busy: boolean;
@@ -22,8 +24,11 @@ interface PathLineProps {
   dropTargetKey: 'source' | 'target' | null;
   /// Registers this row as a drop region: the drag handler hit-tests the inputs inside it
   scopeRef: (element: HTMLElement | null) => void;
-  onCommit: (which: 'source' | 'target', value: string) => void;
-  onBrowse: (which: 'source' | 'target') => void;
+  onDraftChange: (field: RootField, value: string) => void;
+  onSave: (field: RootField) => void;
+  onRevert: (field: RootField) => void;
+  onAcceptConflict: (field: RootField) => void;
+  onBrowse: (field: RootField) => void;
   onSwap: () => void;
   onSelectTarget: (index: number) => void;
   onEditGroup: (group: string) => void;
@@ -83,10 +88,10 @@ function configPills(job: JobFull, presets: JunkPresetDto[]): Pill[] {
     },
     {
       key: 'AutoScan',
-      value: job.watch_interval_secs ? `${job.watch_interval_secs}s${job.watch_auto_apply ? ' · auto' : ''}` : 'off',
+      value: job.autoscan_interval_secs ? `${job.autoscan_interval_secs}s${job.autoscan_auto_apply ? ' · auto' : ''}` : 'off',
       group: 'AutoScan',
-      title: job.watch_interval_secs
-        ? `Compares every ${job.watch_interval_secs}s${job.watch_auto_apply ? ' and runs the result automatically' : ' and waits for you to review'}.`
+      title: job.autoscan_interval_secs
+        ? `Compares every ${job.autoscan_interval_secs}s${job.autoscan_auto_apply ? ' and runs the result automatically' : ' and waits for you to review'}.`
         : 'No scheduled comparison.',
     },
   ];
@@ -103,12 +108,13 @@ function configPills(job: JobFull, presets: JunkPresetDto[]): Pill[] {
   // The link used to live in three job fields; it is in the target phrase now, which the box above
   // already shows in full. So the pill reports only what the phrase does not make obvious: that
   // this job pushes to a peer, and whether it declared a mount to pull back through.
-  if (job.target?.startsWith('peer://')) {
-    const mounted = /\|mount=/.test(job.target);
+  const peerTarget = job.targets.find((target) => target.startsWith('peer://'));
+  if (peerTarget) {
+    const mounted = /\|mount=/.test(peerTarget);
     pills.push({
       key: 'Peer',
       value: mounted ? 'push + pull' : 'push only',
-      group: 'Remote',
+      group: 'Basics',
       title: mounted
         ? 'The far side runs its own syncdash and applies what this side packs. Source-side (pull) ops write through the declared |mount= path.'
         : 'The far side runs its own syncdash and applies what this side packs. No |mount= is declared, so source-side (pull) ops are skipped — add |mount=<path serving the same tree> to enable them.',
@@ -117,33 +123,79 @@ function configPills(job: JobFull, presets: JunkPresetDto[]): Pill[] {
   return pills;
 }
 
-/// The two roots on the main screen are **editable** (same as FFS): Enter or blur writes them back to the
-/// job TOML. No "just tweak it in memory" — once the two roots in the plan header disagree with what the
-/// job file says, run logs and archive refresh both point in the wrong direction.
 export function PathLine(props: PathLineProps) {
-  const { job, jobConfiguration, busy, reviewing, selectedTargetIndex, pathHistory, dropTargetKey, scopeRef, onCommit, onBrowse, onSwap, onSelectTarget, onEditGroup } = props;
-  const mutationBusy = busy || reviewing;
+  const {
+    job, rootEditor, jobConfiguration, busy, reviewing, selectedTargetIndex, pathHistory,
+    dropTargetKey, scopeRef, onDraftChange, onSave, onRevert, onAcceptConflict, onBrowse,
+    onSwap, onSelectTarget, onEditGroup,
+  } = props;
+  const saving = rootEditor?.save.status === 'saving';
+  const mutationBusy = busy || reviewing || saving;
 
-  const targets = job ? (job.targets && job.targets.length ? job.targets : [job.target]) : [];
+  const targets = job?.targets ?? [];
   const targetValue = targets[selectedTargetIndex] ?? '';
-  const [sourceDraft, setSourceDraft] = useState(job?.source ?? '');
-  const [targetDraft, setTargetDraft] = useState(targetValue);
-  const suppressSourceBlur = useRef(false);
-  const suppressTargetBlur = useRef(false);
+  const sourceDraft = rootEditor?.draft.source ?? '';
+  const targetDraft = rootEditor?.draft.target ?? '';
+  const pathInspection = usePathVerdict(sourceDraft, targetDraft, !!job && !!rootEditor);
+  const presetCatalog = useJunkPresetCatalog();
+  const sourceDirty = rootEditor ? rootDraftIsDirty(rootEditor, 'source') : false;
+  const targetDirty = rootEditor ? rootDraftIsDirty(rootEditor, 'target') : false;
+  const hasDraft = sourceDirty || targetDirty;
 
-  // Re-seed whenever the job (or the selected target of a 1:N job) changes underneath the box
-  useEffect(() => { setSourceDraft(job?.source ?? ''); }, [job?.name, job?.source]);
-  useEffect(() => { setTargetDraft(targetValue); }, [job?.name, targetValue]);
-
-  const verdict = usePathVerdict(sourceDraft, targetDraft, !!job);
-  const presets = useJunkPresets();
-
-  const inputClassName = (which: 'source' | 'target') => {
+  const inputClassName = (which: RootField) => {
     const base = pathState(
-      which === 'source' ? verdict?.source : verdict?.target,
+      pathInspection,
+      which,
       which === 'source' ? sourceDraft : targetDraft,
     );
-    return ['mono', base, dropTargetKey === which ? 'dropon' : ''].filter(Boolean).join(' ');
+    return [
+      'mono',
+      base,
+      dropTargetKey === which ? 'dropon' : '',
+      rootEditor?.conflicts[which] ? 'root-conflicted' : '',
+    ].filter(Boolean).join(' ');
+  };
+
+  const fieldActions = (field: RootField) => {
+    const dirty = field === 'source' ? sourceDirty : targetDirty;
+    if (!dirty || !rootEditor) return null;
+    const conflict = rootEditor.conflicts[field];
+    return (
+      <span className="root-edit-actions">
+        {conflict ? (
+          <button
+            type="button"
+            className="pbtn root-action"
+            disabled={mutationBusy}
+            title={`The saved value changed from ${conflict.previousCommittedValue} to ${conflict.currentCommittedValue}. Keep this draft and allow a new save.`}
+            onClick={() => onAcceptConflict(field)}
+          >Keep draft</button>
+        ) : (
+          <button
+            type="button"
+            className="pbtn root-action save"
+            disabled={mutationBusy || !(field === 'source' ? sourceDraft : targetDraft).trim()}
+            title={`Save the ${field} root (Enter)`}
+            onClick={() => onSave(field)}
+          >Save</button>
+        )}
+        <button
+          type="button"
+          className="pbtn root-action"
+          disabled={mutationBusy}
+          title={`Restore the saved ${field} root (Escape)`}
+          onClick={() => onRevert(field)}
+        >Cancel</button>
+      </span>
+    );
+  };
+
+  const handleRootKey = (event: React.KeyboardEvent<HTMLInputElement>, field: RootField) => {
+    const action = rootEditKeyAction(event.key);
+    if (!action) return;
+    event.preventDefault();
+    if (action === 'revert') onRevert(field);
+    else onSave(field);
   };
 
   return (
@@ -161,30 +213,19 @@ export function PathLine(props: PathLineProps) {
           disabled={!job || mutationBusy}
           title={sourceDraft}
           value={sourceDraft}
-          onChange={(event) => setSourceDraft(event.target.value)}
-          // change fires only on Enter or blur — nothing is written to disk while typing
-          onBlur={() => {
-            if (suppressSourceBlur.current) { suppressSourceBlur.current = false; return; }
-            onCommit('source', sourceDraft);
-          }}
-          onKeyDown={(event) => {
-            const action = rootEditKeyAction(event.key);
-            if (!action) return;
-            event.preventDefault();
-            if (action === 'revert') {
-              suppressSourceBlur.current = true;
-              setSourceDraft(job?.source ?? '');
-            }
-            (event.target as HTMLInputElement).blur();
-          }}
+          onChange={(event) => onDraftChange('source', event.target.value)}
+          onKeyDown={(event) => handleRootKey(event, 'source')}
         />
-        <button className="pbtn" title="Browse…" disabled={!job || mutationBusy} onClick={() => onBrowse('source')}>
+        <button type="button" className="pbtn" title="Browse…" disabled={!job || mutationBusy} onClick={() => onBrowse('source')}>
           <FolderOpen size={13} />
         </button>
         <button
+          type="button"
           className="pbtn"
-          title={job ? `Swap: ${job.source} ⇄ ${targetValue} (written back to the job file)` : 'Swap source / target'}
-          disabled={!job || mutationBusy}
+          title={hasDraft
+            ? 'Save or cancel both root drafts before swapping'
+            : job ? `Swap: ${job.source} ⇄ ${targetValue} (written back to the job file)` : 'Swap source / target'}
+          disabled={!job || mutationBusy || hasDraft}
           onClick={onSwap}
         ><ArrowLeftRight size={13} /></button>
         <span className="plabel">target</span>
@@ -198,23 +239,10 @@ export function PathLine(props: PathLineProps) {
           disabled={!job || mutationBusy}
           title={targetDraft}
           value={targetDraft}
-          onChange={(event) => setTargetDraft(event.target.value)}
-          onBlur={() => {
-            if (suppressTargetBlur.current) { suppressTargetBlur.current = false; return; }
-            onCommit('target', targetDraft);
-          }}
-          onKeyDown={(event) => {
-            const action = rootEditKeyAction(event.key);
-            if (!action) return;
-            event.preventDefault();
-            if (action === 'revert') {
-              suppressTargetBlur.current = true;
-              setTargetDraft(targetValue);
-            }
-            (event.target as HTMLInputElement).blur();
-          }}
+          onChange={(event) => onDraftChange('target', event.target.value)}
+          onKeyDown={(event) => handleRootKey(event, 'target')}
         />
-        <button className="pbtn" title="Browse…" disabled={!job || mutationBusy} onClick={() => onBrowse('target')}>
+        <button type="button" className="pbtn" title="Browse…" disabled={!job || mutationBusy} onClick={() => onBrowse('target')}>
           <FolderOpen size={13} />
         </button>
         {targets.length > 1 && (
@@ -232,26 +260,49 @@ export function PathLine(props: PathLineProps) {
         )}
       </div>
 
+      {hasDraft && (
+        <div className="root-draft-row">
+          <span>Unsaved root draft</span>
+          {sourceDirty && <><strong>source</strong>{fieldActions('source')}</>}
+          {targetDirty && <><strong>target</strong>{fieldActions('target')}</>}
+        </div>
+      )}
+
       {/* Path history is a native datalist (keyboard-friendly, no custom popup layer); it lives here so
           both root boxes and the editor's path fields can reference it by id. */}
       <datalist id="sd-paths">
         {pathHistory.map((path) => <option key={path} value={path} />)}
       </datalist>
 
-      <PathVerdictBox verdict={job ? verdict : null} className="pwarn" />
+      <PathVerdictBox inspection={pathInspection} className="pwarn" />
+      {rootEditor?.save.status === 'failed' && (
+        <div className="root-save-error" role="alert">
+          Could not save {rootEditor.save.field}: {rootEditor.save.error}. Your draft is still here.
+        </div>
+      )}
 
       <div className="cfgline">
-        {jobConfiguration && configPills(jobConfiguration, presets).map((pill) => (
+        {jobConfiguration && configPills(jobConfiguration, presetCatalog.presets).map((pill) => (
           <button
             key={pill.key}
+            type="button"
             className="cfgpill"
             title={`${pill.title}\n\nClick to edit — opens ${pill.group}.`}
-            disabled={mutationBusy}
+            disabled={mutationBusy || hasDraft}
             onClick={() => onEditGroup(pill.group)}
           >
             <span className="ck">{pill.key}</span><span className="cv">{pill.value}</span>
           </button>
         ))}
+        {presetCatalog.status === 'failed' && (
+          <span
+            className="cfgpill"
+            role="status"
+            title={`Junk-preset metadata could not be loaded: ${presetCatalog.error}. Filter counts still come from the saved job.`}
+          >
+            <span className="ck">Filters</span><span className="cv">preset metadata unavailable</span>
+          </span>
+        )}
       </div>
     </div>
   );

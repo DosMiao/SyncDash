@@ -127,8 +127,8 @@ impl Default for GenOpts {
     }
 }
 
-/// Remote pipeline generation parameters (enabled by --remote-host)
-pub struct RemoteGen {
+/// Peer-job generation parameters supplied by `--peer-*` CLI flags.
+pub struct PeerJobGeneration {
     pub host: String,
     pub root_base: String,
     pub exe: Option<String>,
@@ -140,7 +140,7 @@ pub fn gen_jobs(
     source_root: &Path,
     target_root: &Path,
     opts: &GenOpts,
-    remote: Option<&RemoteGen>,
+    peer: Option<&PeerJobGeneration>,
 ) -> std::io::Result<Vec<GenOutcome>> {
     let terrs = find_territories(source_root);
     std::fs::create_dir_all(&opts.dest)?;
@@ -174,7 +174,7 @@ pub fn gen_jobs(
         };
         // With a peer, the mount is no longer the target — it is the path the *pull* direction
         // writes through, and it rides on the phrase where the rest of the link already lives.
-        let target = match remote {
+        let target = match peer {
             Some(r) => {
                 let mut p = format!(
                     "peer://{}/{}/{}",
@@ -193,7 +193,7 @@ pub fn gen_jobs(
         let job = Job {
             mode: opts.mode.clone(),
             source: source_root.join(&native).to_string_lossy().into_owned(),
-            target,
+            targets: vec![target],
             archive: if opts.mode == "sync" {
                 Some(opts.archives.join(format!("{name}.jsonl")))
             } else {
@@ -204,7 +204,6 @@ pub fn gen_jobs(
             // there is no companion flag that adds more behind it, and no re-run that puts back a line
             // its owner deleted.
             exclude: junk.clone(),
-            no_hash: false,
             rigor: opts.rigor.clone(),
             case_sensitive: false,
             symlinks: "exclude".into(),

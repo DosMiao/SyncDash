@@ -9,7 +9,7 @@
 //! ```text
 //! L4  shells         src/main.rs (CLI) · src-tauri (desktop)
 //! L3  orchestration  run · job · boot (process startup)
-//! L2  domain         pipeline (scan/compare/apply/filter/guard) · transfer (remote/pack)
+//! L2  domain         pipeline (scan/compare/apply/filter/guard) · transfer (peer/pack)
 //! L1  services       obs (progress/logging/runlog) · store (settings/trash/version)
 //! L0  foundation     foundation · model (plan/event/table/chunk) · fs (staged/lock)
 //! ```
@@ -55,7 +55,7 @@
 //! **SIGBUS**. That is a signal, not an `io::Error`: the surrounding `?` and `Err` arms are
 //! unreachable and the process is killed outright. On macOS a mounted SMB/AFP share under
 //! `/Volumes` is an ordinary local path, so a Wi-Fi roam was enough to trigger it. In `apply` the
-//! consequence is not a lost hash — the process dies mid-write holding both root heartbeat locks,
+//! consequence is not a lost hash — the process dies mid-write holding both root lease ledgers,
 //! `fs::lock::RootLock::drop` never runs, and the locks are left on disk for a human to clear. The
 //! answer is not a SIGBUS handler in a process that writes user files; it is to not map the file,
 //! so a vanishing file arrives as the ordinary `Err` each site already handles.

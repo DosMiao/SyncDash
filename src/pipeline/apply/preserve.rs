@@ -1,142 +1,233 @@
-//! Where the previous content goes before it is overwritten or deleted.
-//!
-//! A root uses the central trash only when it can rename into that store. Mounted shares, protocol
-//! roots, and external local volumes preserve by rename inside themselves. Versioning, when
-//! enabled, layers on top of both.
+//! Transactional preservation of content before overwrite or deletion.
 
-use crate::foundation::path::join_native;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Seek};
+use std::path::PathBuf;
 
-use super::schedule::Shared;
+use crate::foundation::path::{RootRelativeDir, RootRelativePath};
+use crate::fs::local_root::LocalRoot;
 use crate::model::plan::{Op, Side};
 use crate::obs::progress::PhaseProgress;
+
+use super::schedule::Shared;
 
 pub(super) fn default_trash() -> PathBuf {
     crate::store::trash::trash_root().join(crate::foundation::time::now_ms().to_string())
 }
 
-pub(super) fn move_to_trash(
-    file: &Path,
-    rel: &str,
-    trash: &Path,
+pub(super) fn move_to_trash<F>(
+    source_root: &LocalRoot,
+    source: &RootRelativePath,
+    retained_relative: &str,
+    trash_root: &LocalRoot,
     fsync: bool,
-    pp: &PhaseProgress,
-) -> std::io::Result<()> {
-    let dest = join_native(trash, rel);
-    if let Some(p) = dest.parent() {
-        std::fs::create_dir_all(p)?;
-    }
-    refuse_existing(&dest, rel)?;
-    match crate::fs::rename_force(file, &dest) {
-        Ok(_) => Ok(()),
-        // Cross-volume: stage a cancellable copy beside the trash destination, then remove the
-        // original only after the complete copy lands.
-        Err(_) => copy_to_trash(file, &dest, rel, fsync, pp),
+    progress: &PhaseProgress,
+    mut checkpoint: F,
+) -> std::io::Result<()>
+where
+    F: FnMut() -> std::io::Result<()>,
+{
+    let destination = relative_path(retained_relative)?;
+    trash_root.create_directory_all(&parent_directory(&destination))?;
+    refuse_existing(trash_root, &destination)?;
+    checkpoint()?;
+    match source_root.rename_to_noreplace(source, trash_root, &destination) {
+        Ok(()) => {
+            if fsync {
+                trash_root.sync_parent(&destination)?;
+                source_root.sync_parent(source)?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => copy_to_trash(
+            source_root,
+            source,
+            trash_root,
+            &destination,
+            fsync,
+            progress,
+            checkpoint,
+        ),
+        Err(error) => Err(error),
     }
 }
 
-fn refuse_existing(dest: &Path, rel: &str) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(dest) {
+fn refuse_existing(root: &LocalRoot, destination: &RootRelativePath) -> std::io::Result<()> {
+    match root.metadata_path(destination) {
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            format!("refusing to overwrite an existing retained original: {rel}"),
+            format!(
+                "refusing to overwrite an existing retained original: {}",
+                destination.as_str()
+            ),
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
 }
 
-fn copy_to_trash(
-    file: &Path,
-    dest: &Path,
-    rel: &str,
+fn copy_to_trash<F>(
+    source_root: &LocalRoot,
+    source: &RootRelativePath,
+    trash_root: &LocalRoot,
+    destination: &RootRelativePath,
     fsync: bool,
-    pp: &PhaseProgress,
-) -> std::io::Result<()> {
-    refuse_existing(dest, rel)?;
-    let metadata = std::fs::metadata(file)?;
-    pp.add_total_bytes(metadata.len());
-    pp.checkpoint()?;
-    let mut staged = crate::fs::staged::Staged::create(dest)?;
-    let copied = staged.copy_from(file, &mut |chunk| {
-        pp.checkpoint()?;
-        pp.add_bytes(chunk.len() as u64, rel);
-        Ok(())
-    })?;
+    progress: &PhaseProgress,
+    mut checkpoint: F,
+) -> std::io::Result<()>
+where
+    F: FnMut() -> std::io::Result<()>,
+{
+    let destination_label = destination.as_str();
+    trash_root.create_directory_all(&parent_directory(destination))?;
+    refuse_existing(trash_root, destination)?;
+    let mut source_file = source_root.open_read(source)?;
+    let metadata = source_file.metadata()?;
+    progress.add_total_bytes(metadata.len());
+    checkpoint()?;
+    let mut staged = trash_root.create_staged(destination)?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut copied = 0u64;
+    let mut copied_hash = blake3::Hasher::new();
+    loop {
+        checkpoint()?;
+        let count = source_file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut staged, &buffer[..count])?;
+        copied = copied.checked_add(count as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("trash copy byte count overflowed for '{destination_label}'"),
+            )
+        })?;
+        copied_hash.update(&buffer[..count]);
+        progress.add_bytes(count as u64, destination_label);
+    }
     if copied != metadata.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("trash copy changed length while preserving '{rel}': expected {} bytes, copied {copied}", metadata.len()),
+            format!(
+                "trash copy changed length while preserving '{destination_label}': expected {} bytes, copied {copied}",
+                metadata.len()
+            ),
         ));
     }
+    source_file.seek(std::io::SeekFrom::Start(0))?;
+    let mut current_hash = blake3::Hasher::new();
+    let mut verified = 0u64;
+    loop {
+        checkpoint()?;
+        let count = source_file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        verified = verified.checked_add(count as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("trash verification byte count overflowed for '{destination_label}'"),
+            )
+        })?;
+        current_hash.update(&buffer[..count]);
+    }
+    if verified != copied || current_hash.finalize() != copied_hash.finalize() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("source changed while preserving '{destination_label}'"),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        staged.set_mode(metadata.mode() & 0o7777)?;
+    }
+    staged.set_mtime(crate::foundation::time::systime_ms(metadata.modified()?))?;
     staged.seal(fsync)?;
-    std::fs::set_permissions(staged.path(), metadata.permissions())?;
-    staged.resync_metadata_if_requested()?;
-    refuse_existing(dest, rel)?;
-    staged.commit()?;
-    crate::fs::remove_file_force(file)
+    refuse_existing(trash_root, destination)?;
+    checkpoint()?;
+    staged.commit_noreplace()?;
+    checkpoint()?;
+    source_root.remove_open_file(source, &source_file)?;
+    if fsync {
+        source_root.sync_parent(source)?;
+    }
+    Ok(())
 }
 
-/// Archive the original before it is overwritten/deleted (trash or .version_syncDash).
-///
-/// Three routes, chosen by two independent questions:
-///
-/// - **Is there a real path?** (`local_of`) — the rdelta version store needs one. It writes into
-///   `<root>/.version_syncDash/`, so it stays a move *within* the root and is safe anywhere a
-///   path exists, share or not.
-/// - **Can the configured trash path take it?** A local root and that actual path must be on the
-///   same device. A move into it from a share or another local volume is cross-volume, and
-///   `move_to_trash` answers a failed rename by copying every byte before removal. Those roots take
-///   the in-root retention area instead, which is the same rename a genuinely remote root gets.
 pub(super) fn preserve(
-    sh: &Shared,
-    op: &Op,
-    exec: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
-    why: &str,
-    newer: Option<&Path>,
-    pp: &PhaseProgress,
+    shared: &Shared,
+    operation: &Op,
+    destination_vfs: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+    reason: &str,
+    newer: Option<(&LocalRoot, &RootRelativePath)>,
+    progress: &PhaseProgress,
 ) -> std::io::Result<()> {
-    if let Some(root) = sh.local_of(&op.side) {
-        let dst = join_native(root, &op.path);
-        if sh.opt.versioning {
-            let slot = if op.side == Side::Source {
-                &sh.ver_source
+    if let Some(root) = shared.local_root_of(&operation.side) {
+        let relative = relative_path(&operation.path)?;
+        if shared.opt.versioning {
+            shared.check_before_mutation()?;
+            let slot = if operation.side == Side::Source {
+                &shared.ver_source
             } else {
-                &sh.ver_target
+                &shared.ver_target
             };
-            let mut w = slot.lock().unwrap();
-            if w.is_none() {
-                *w = Some(crate::store::version::VersionWriter::begin(root)?);
+            let mut writer = slot.lock().unwrap();
+            if writer.is_none() {
+                *writer = Some(crate::store::version::VersionWriter::begin(root, || {
+                    shared.checkpoint(progress)
+                })?);
             }
-            return w.as_mut().unwrap().preserve(&op.path, &dst, newer, why);
+            return writer.as_mut().unwrap().preserve(
+                &relative,
+                newer,
+                reason,
+                shared.opt.fsync,
+                || shared.checkpoint(progress),
+            );
         }
-        if sh.trash_reaches(&op.side) {
-            let side = if op.side == Side::Source {
+        if shared.trash_reaches(&operation.side) {
+            let side = if operation.side == Side::Source {
                 "source"
             } else {
                 "target"
             };
-            let retained_rel = format!("{side}/{}", op.path);
-            move_to_trash(&dst, &retained_rel, &sh.trash, sh.opt.fsync, pp)?;
-            sh.note_central_preservation();
+            let retained_relative = format!("{side}/{}", operation.path);
+            let trash_root = shared
+                .central_trash_root
+                .as_ref()
+                .expect("central trash reachability opens a central trash capability");
+            move_to_trash(
+                root,
+                &relative,
+                &retained_relative,
+                trash_root,
+                shared.opt.fsync,
+                progress,
+                || shared.checkpoint(progress),
+            )?;
+            shared.note_central_preservation();
             return Ok(());
         }
     }
-    // A root the central store cannot reach — external local volume, mounted share, or protocol
-    // backend — keeps the original under itself, so preservation remains a same-root rename.
-    let keep_rel = format!("{}/{}", sh.in_root_keep_rel, op.path);
-    if exec.stat(&keep_rel)?.is_some() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("refusing to overwrite an existing retained original: {keep_rel}"),
-        ));
+
+    let retained_relative = format!("{}/{}", shared.in_root_keep_rel, operation.path);
+    if let Some(parent) = crate::foundation::path::parent(&retained_relative) {
+        shared.ensure_dir(&operation.side, destination_vfs, parent)?;
     }
-    if let Some(parent) = crate::foundation::path::parent(&keep_rel) {
-        sh.ensure_dir(&op.side, exec, parent)?;
-    }
-    exec.rename(&op.path, &keep_rel)?;
-    sh.note_in_root_preservation(&op.side);
+    shared.check_before_mutation()?;
+    destination_vfs.rename_noreplace(&operation.path, &retained_relative)?;
+    shared.note_in_root_preservation(&operation.side);
     Ok(())
+}
+
+fn relative_path(value: &str) -> std::io::Result<RootRelativePath> {
+    RootRelativePath::try_from(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn parent_directory(path: &RootRelativePath) -> RootRelativeDir {
+    RootRelativeDir::try_from(crate::foundation::path::parent(path.as_str()).unwrap_or(""))
+        .expect("a validated relative path has a valid parent")
 }
 
 #[cfg(test)]
@@ -146,91 +237,160 @@ mod tests {
     use crate::obs::progress::{PhaseProgress, RunCtl, RunCtx};
     use std::sync::{Arc, Mutex};
 
-    fn root(tag: &str) -> PathBuf {
-        let dir =
+    fn roots(tag: &str) -> (PathBuf, LocalRoot, LocalRoot) {
+        let base =
             std::env::temp_dir().join(format!("syncdash-preserve-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        let _ = std::fs::remove_dir_all(&base);
+        let source_path = base.join("source");
+        let trash_path = base.join("trash");
+        let source = LocalRoot::create(source_path).unwrap();
+        let trash = LocalRoot::create(trash_path).unwrap();
+        (base, source, trash)
     }
 
     #[test]
-    fn fallback_copy_reports_bytes_and_lands_atomically() {
-        let dir = root("progress");
-        let src = dir.join("old.bin");
-        let dest = dir.join("trash/old.bin");
-        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    fn preservation_reports_bytes_and_lands_atomically() {
+        let (base, source, trash) = roots("progress");
+        let relative = RootRelativePath::try_from("old.bin").unwrap();
         let content = vec![7u8; 2 * 1024 * 1024 + 17];
-        std::fs::write(&src, &content).unwrap();
+        let mut staged = source.create_staged(&relative).unwrap();
+        std::io::Write::write_all(&mut staged, &content).unwrap();
+        staged.commit().unwrap();
         let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let copy = events.clone();
-        let ctx = RunCtx::new(
+        let context = RunCtx::new(
             RunCtl::new(),
-            Arc::new(move |ev| copy.lock().unwrap().push(ev)),
+            Arc::new(move |event| copy.lock().unwrap().push(event)),
         );
-        let pp = PhaseProgress::begin(&ctx, Phase::Apply, None, 1, 0);
+        let progress = PhaseProgress::begin(&context, Phase::Apply, None, 1, 0);
 
-        copy_to_trash(&src, &dest, "old.bin", false, &pp).unwrap();
-        pp.item_done("old.bin");
-        pp.finish().unwrap();
+        copy_to_trash(
+            &source,
+            &relative,
+            &trash,
+            &RootRelativePath::try_from("target/old.bin").unwrap(),
+            false,
+            &progress,
+            || progress.checkpoint(),
+        )
+        .unwrap();
+        progress.item_done("old.bin");
+        progress.finish().unwrap();
 
-        assert!(!src.exists());
-        assert_eq!(std::fs::read(&dest).unwrap(), content);
+        assert!(source.metadata_path(&relative).is_err());
+        assert_eq!(
+            trash
+                .read(&RootRelativePath::try_from("target/old.bin").unwrap())
+                .unwrap(),
+            content
+        );
         let events = events.lock().unwrap();
-        assert!(events.iter().any(|ev| matches!(ev, ProgressEvent::Totals {
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::Totals {
             reset: false,
             bytes_total,
             ..
         } if *bytes_total == content.len() as u64)));
-        assert!(matches!(events.last(), Some(ProgressEvent::PhaseEnd {
-            status: crate::model::event::PhaseStatus::Completed,
-            bytes_done,
-            bytes_total,
-            ..
-        }) if *bytes_done == content.len() as u64 && *bytes_total == content.len() as u64));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
-    fn cancelled_fallback_keeps_the_original_and_no_partial_trash() {
-        let dir = root("cancel");
-        let src = dir.join("old.bin");
-        let dest = dir.join("trash/old.bin");
-        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        std::fs::write(&src, vec![9u8; 2 * 1024 * 1024]).unwrap();
-        let ctl = RunCtl::new();
-        ctl.request_cancel();
-        let ctx = RunCtx::new(ctl, Arc::new(|_| {}));
-        let pp = PhaseProgress::begin(&ctx, Phase::Apply, None, 1, 0);
+    fn cancellation_keeps_the_original_and_no_partial_trash() {
+        let (base, source, trash) = roots("cancel");
+        let relative = RootRelativePath::try_from("old.bin").unwrap();
+        let mut staged = source.create_staged(&relative).unwrap();
+        std::io::Write::write_all(&mut staged, &vec![9u8; 2 * 1024 * 1024]).unwrap();
+        staged.commit().unwrap();
+        let control = RunCtl::new();
+        control.request_cancel();
+        let context = RunCtx::new(control, Arc::new(|_| {}));
+        let progress = PhaseProgress::begin(&context, Phase::Apply, None, 1, 0);
+        let destination = RootRelativePath::try_from("target/old.bin").unwrap();
 
-        let err = copy_to_trash(&src, &dest, "old.bin", false, &pp).unwrap_err();
-        assert!(crate::obs::progress::is_cancelled(&err));
-        assert!(src.exists());
-        assert!(!dest.exists());
-        assert!(std::fs::read_dir(dest.parent().unwrap())
-            .unwrap()
-            .next()
-            .is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        let error = copy_to_trash(
+            &source,
+            &relative,
+            &trash,
+            &destination,
+            false,
+            &progress,
+            || progress.checkpoint(),
+        )
+        .unwrap_err();
+        assert!(crate::obs::progress::is_cancelled(&error));
+        assert!(source.metadata_path(&relative).is_ok());
+        assert!(trash.metadata_path(&destination).is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_source_change_during_cross_volume_preservation_is_not_removed() {
+        let (base, source, trash) = roots("source-change");
+        let relative = RootRelativePath::try_from("old.bin").unwrap();
+        let destination = RootRelativePath::try_from("target/old.bin").unwrap();
+        std::fs::write(source.display_path().join("old.bin"), b"original").unwrap();
+        let context = RunCtx::new(RunCtl::new(), Arc::new(|_| {}));
+        let progress = PhaseProgress::begin(&context, Phase::Apply, None, 1, 0);
+        let source_path = source.display_path().join("old.bin");
+        let mut checkpoints = 0;
+
+        let error = copy_to_trash(
+            &source,
+            &relative,
+            &trash,
+            &destination,
+            false,
+            &progress,
+            || {
+                checkpoints += 1;
+                if checkpoints == 4 {
+                    std::fs::write(&source_path, b"modified").unwrap();
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(source.read(&relative).unwrap(), b"modified");
+        assert!(trash.metadata_path(&destination).is_err());
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
     fn an_existing_retained_original_is_never_replaced() {
-        let dir = root("collision");
-        let src = dir.join("old.bin");
-        let trash = dir.join("trash");
-        let dest = trash.join("target/old.bin");
-        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        std::fs::write(&src, b"second original").unwrap();
-        std::fs::write(&dest, b"first original").unwrap();
-        let ctx = RunCtx::new(RunCtl::new(), Arc::new(|_| {}));
-        let pp = PhaseProgress::begin(&ctx, Phase::Apply, None, 1, 0);
+        let (base, source, trash) = roots("collision");
+        let relative = RootRelativePath::try_from("old.bin").unwrap();
+        let destination = RootRelativePath::try_from("target/old.bin").unwrap();
+        trash
+            .create_directory_all(&RootRelativeDir::try_from("target").unwrap())
+            .unwrap();
+        for (root, path, bytes) in [
+            (&source, &relative, b"second original".as_slice()),
+            (&trash, &destination, b"first original".as_slice()),
+        ] {
+            let mut staged = root.create_staged(path).unwrap();
+            std::io::Write::write_all(&mut staged, bytes).unwrap();
+            staged.commit().unwrap();
+        }
+        let context = RunCtx::new(RunCtl::new(), Arc::new(|_| {}));
+        let progress = PhaseProgress::begin(&context, Phase::Apply, None, 1, 0);
 
-        let error = move_to_trash(&src, "target/old.bin", &trash, false, &pp).unwrap_err();
+        let error = move_to_trash(
+            &source,
+            &relative,
+            "target/old.bin",
+            &trash,
+            false,
+            &progress,
+            || progress.checkpoint(),
+        )
+        .unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read(&src).unwrap(), b"second original");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"first original");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(source.read(&relative).unwrap(), b"second original");
+        assert_eq!(trash.read(&destination).unwrap(), b"first original");
+        let _ = std::fs::remove_dir_all(base);
     }
 }

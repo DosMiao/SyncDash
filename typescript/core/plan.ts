@@ -1,7 +1,7 @@
 import type { Op } from './types/generated/Op';
 import type { PlanDto as GeneratedPlanDto } from './types/generated/PlanDto';
 import type { RowMeta } from './types/generated/RowMeta';
-import type { SelectedRowDto } from './types/generated/SelectedRowDto';
+import type { ReviewedRowDecisionDto } from './types/generated/ReviewedRowDecisionDto';
 
 export type PlanOperation = Op;
 export type PlanDto = GeneratedPlanDto;
@@ -46,13 +46,13 @@ export const MTIME_SLACK_MS = 2000;
 // A 250k-row comparison used to ship a second complete Op for every reversible row. Besides
 // duplicating paths and reasons across the Tauri JSON boundary, WebKit had to retain both object
 // graphs and peaked above 1 GB before the table first painted. Reversal is needed only for rows the
-// user explicitly flips, so derive and cache those few objects lazily from the original operation.
+// user explicitly reverses, so derive and cache those few objects lazily from the original operation.
 const reverseCache = new WeakMap<PlanOperation, PlanOperation | null>();
 
 function reverseOperation(operation: PlanOperation): PlanOperation | null {
   if (reverseCache.has(operation)) return reverseCache.get(operation) ?? null;
   const side = operation.side === 'source' ? 'target' : 'source';
-  const reason = `flipped(${operation.reason})`;
+  const reason = `reversed(${operation.reason})`;
   let reversedOperation: PlanOperation | null;
   switch (operation.action) {
     case 'copy':
@@ -79,15 +79,21 @@ function reverseOperation(operation: PlanOperation): PlanOperation | null {
 }
 
 /// Returns the original or user-reversed operation currently represented by a row.
-export function effectiveOperation(plan: PlanDto, flipped: boolean[], index: number): PlanOperation {
+export function effectiveOperation(plan: PlanDto, rowReversed: boolean[], index: number): PlanOperation {
   const operation = plan.ops[index];
-  return flipped[index] ? (reverseOperation(operation) ?? operation) : operation;
+  return rowReversed[index] ? (reverseOperation(operation) ?? operation) : operation;
 }
 
 /// The apply boundary carries decisions, not operations. Rust reconstructs each row from the
 /// authenticated plan and owns the executable reversal semantics.
-export function selectedRows(indices: number[], flipped: boolean[]): SelectedRowDto[] {
-  return indices.map((index) => ({ index, flipped: flipped[index] === true }));
+export function buildReviewedRowDecisions(
+  indices: number[],
+  rowReversed: boolean[],
+): ReviewedRowDecisionDto[] {
+  return indices.map((index) => ({
+    index,
+    direction_reversed: rowReversed[index] === true,
+  }));
 }
 
 export function rowMetadata(plan: PlanDto, index: number): RowMeta {
@@ -219,8 +225,8 @@ export function keySpec(key: SortKey): KeySpec {
 /// direction) so "things that aren't there" don't steal attention. Numeric keys compare as numbers — the
 /// old code zero-padded size/mtime to 20-char strings, two allocations per comparator call, i.e. hundreds
 /// of thousands of them for one pass over a few thousand rows
-export function sortValue(plan: PlanDto, flipped: boolean[], index: number, key: SortKey): [number, number, string] {
-  const operation = effectiveOperation(plan, flipped, index);
+export function sortValue(plan: PlanDto, rowReversed: boolean[], index: number, key: SortKey): [number, number, string] {
+  const operation = effectiveOperation(plan, rowReversed, index);
   const metadata = rowMetadata(plan, index);
   switch (key) {
     // Per-side paths, not operation.path: the column shows what sidePaths() put in it, and for a move that
@@ -243,10 +249,10 @@ export function sortValue(plan: PlanDto, flipped: boolean[], index: number, key:
 }
 
 /// Largest size represented by either side of the compare row.
-export function rowSize(plan: PlanDto, flipped: boolean[], index: number): number {
+export function rowSize(plan: PlanDto, rowReversed: boolean[], index: number): number {
   const metadata = rowMetadata(plan, index);
   return Math.max(
-    effectiveOperation(plan, flipped, index).size ?? 0,
+    effectiveOperation(plan, rowReversed, index).size ?? 0,
     metadata.src?.size ?? 0,
     metadata.dst?.size ?? 0,
   );
@@ -255,8 +261,8 @@ export function rowSize(plan: PlanDto, flipped: boolean[], index: number): numbe
 /// Bytes that actually cross from the winning side for a copy/update. A reversed update deliberately
 /// clears Op.size because its original evidence belongs to the other direction, so consult the
 /// immutable per-side compare metadata according to the effective destination instead.
-export function rowTransferBytes(plan: PlanDto, flipped: boolean[], index: number): number {
-  const operation = effectiveOperation(plan, flipped, index);
+export function rowTransferBytes(plan: PlanDto, rowReversed: boolean[], index: number): number {
+  const operation = effectiveOperation(plan, rowReversed, index);
   if (operation.action !== 'copy' && operation.action !== 'update') return 0;
   const metadata = rowMetadata(plan, index);
   const origin = operation.side === 'target' ? metadata.src : metadata.dst;

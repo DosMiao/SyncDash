@@ -4,13 +4,12 @@
 //! has the wrong thing" matters to the plan, not to the write. Both stage, verify if asked, and
 //! land by rename.
 
-use super::delta::update_with_delta;
+use super::delta::stage_delta_update;
 use super::dir::{try_delete_dir_vfs, DirOutcome};
-use super::platform::{exists_no_follow, read_mtime_ms, set_mode, set_mtime};
 use super::preserve::preserve;
 use super::schedule::Shared;
 use crate::foundation::names::TEMP_PREFIX;
-use crate::foundation::path::join_native;
+use crate::foundation::path::RootRelativePath;
 use crate::fs::vfs::error::VfsErrorKind;
 use crate::fs::vfs::{VMeta, Vfs};
 use crate::model::plan::{Action, Op, Side};
@@ -38,22 +37,12 @@ fn next_move_hold(from: &str) -> String {
     }
 }
 
-fn local_parent(exec: &dyn Vfs, rel: &str) -> Option<std::path::PathBuf> {
-    let root = exec.as_local()?;
-    let parent = crate::foundation::path::parent(rel).unwrap_or("");
-    Some(if parent.is_empty() {
-        root.to_path_buf()
-    } else {
-        join_native(root, parent)
-    })
-}
-
 fn sync_local_parent(exec: &dyn Vfs, rel: &str, fsync: bool) -> std::io::Result<()> {
     if !fsync {
         return Ok(());
     }
-    if let Some(parent) = local_parent(exec, rel) {
-        crate::fs::staged::sync_directory(&parent)?;
+    if let Some(root) = exec.local_root() {
+        root.sync_parent(&relative_path(rel)?)?;
     }
     Ok(())
 }
@@ -67,24 +56,73 @@ fn sync_local_rename_parents(
     if !fsync {
         return Ok(());
     }
-    let source_parent = local_parent(exec, from);
-    let destination_parent = local_parent(exec, to);
-    if let Some(destination_parent) = destination_parent.as_deref() {
-        crate::fs::staged::sync_directory(destination_parent)?;
-    }
-    if source_parent != destination_parent {
-        if let Some(source_parent) = source_parent.as_deref() {
-            crate::fs::staged::sync_directory(source_parent)?;
+    if let Some(root) = exec.local_root() {
+        root.sync_parent(&relative_path(to)?)?;
+        if crate::foundation::path::parent(from) != crate::foundation::path::parent(to) {
+            root.sync_parent(&relative_path(from)?)?;
         }
     }
     Ok(())
 }
 
-fn claim_move_source(exec: &dyn Vfs, from: &str, fsync: bool) -> std::io::Result<String> {
-    // The counter makes collisions exceptional; retrying AlreadyExists is safe because the source
-    // has not moved in that case. Every other failure is final and occurs before destination work.
+fn relative_path(relative: &str) -> std::io::Result<RootRelativePath> {
+    RootRelativePath::try_from(relative)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn apply_commit_report(
+    sh: &Shared<'_>,
+    op: &Op,
+    intended_mtime_ms: Option<i64>,
+    report: crate::fs::vfs::CommitReport,
+    pp: &PhaseProgress<'_>,
+) -> std::io::Result<()> {
+    let side = if op.side == Side::Target {
+        "target"
+    } else {
+        "source"
+    };
+    if let Some(want) = intended_mtime_ms {
+        if let Some(got) = report.mtime_ondisk_ms {
+            if got != want {
+                sh.mtime_fixes.lock().unwrap().push((
+                    op.side == Side::Source,
+                    op.path.clone(),
+                    got,
+                    want,
+                ));
+            }
+        }
+        if let Some(error) = report.mtime_error {
+            pp.error(
+                &op.path,
+                "set_mtime",
+                side,
+                &format!(
+                    "mtime could not be set ({error}); comparison will lean on size/content for this file"
+                ),
+            );
+        }
+    }
+    if let Some(error) = report.mode_error {
+        return Err(std::io::Error::other(format!(
+            "file content was published, but requested permissions could not be set ({error})"
+        )));
+    }
+    Ok(())
+}
+
+fn claim_move_source(
+    sh: &Shared<'_>,
+    exec: &dyn Vfs,
+    from: &str,
+    fsync: bool,
+) -> std::io::Result<String> {
+    // Retrying AlreadyExists is safe because the source has not moved in that case. Every other
+    // failure is final and occurs before destination work.
     for _ in 0..1024 {
         let hold = next_move_hold(from);
+        sh.check_before_mutation()?;
         match exec.rename_noreplace(from, &hold) {
             Ok(()) => {
                 if let Err(error) = sync_local_rename_parents(exec, from, &hold, fsync) {
@@ -141,6 +179,7 @@ fn rollback_claim(
 }
 
 fn stream_hash(
+    sh: &Shared<'_>,
     stream: &mut dyn crate::fs::vfs::ReadStream,
     pp: &PhaseProgress<'_>,
 ) -> std::io::Result<(u64, String)> {
@@ -148,7 +187,7 @@ fn stream_hash(
     let mut total = 0u64;
     let mut buf = vec![0u8; stream.block_size().clamp(64 * 1024, READ_CHUNK as usize)];
     loop {
-        pp.checkpoint()?;
+        sh.checkpoint(pp)?;
         let n = std::io::Read::read(stream, &mut buf)?;
         if n == 0 {
             break;
@@ -160,6 +199,7 @@ fn stream_hash(
 }
 
 fn move_evidence_hash(
+    sh: &Shared<'_>,
     exec: &dyn Vfs,
     rel: &str,
     size: u64,
@@ -170,7 +210,7 @@ fn move_evidence_hash(
         let mut hasher = blake3::Hasher::new();
         hasher.update(&size.to_le_bytes());
         for off in [0u64, size / 2, size.saturating_sub(SAMPLE_CHUNK)] {
-            pp.checkpoint()?;
+            sh.checkpoint(pp)?;
             let bytes = exec.read_range(rel, off, SAMPLE_CHUNK as u32)?;
             let expected = size.saturating_sub(off).min(SAMPLE_CHUNK) as usize;
             if bytes.len() != expected {
@@ -187,7 +227,7 @@ fn move_evidence_hash(
         Ok(format!("~{}", hasher.finalize().to_hex()))
     } else {
         let mut stream = exec.open_read(rel)?;
-        let (read, hash) = stream_hash(&mut *stream, pp)?;
+        let (read, hash) = stream_hash(sh, &mut *stream, pp)?;
         if read != size {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -199,6 +239,7 @@ fn move_evidence_hash(
 }
 
 fn verify_move_evidence(
+    sh: &Shared<'_>,
     exec: &dyn Vfs,
     hold: &str,
     op: &Op,
@@ -226,9 +267,9 @@ fn verify_move_evidence(
         )
     })?;
     let expected_kind = if op.link.is_some() {
-        crate::model::table::EntryKind::Symlink
+        crate::fs::vfs::VfsEntryKind::Symlink
     } else {
-        crate::model::table::EntryKind::File
+        crate::fs::vfs::VfsEntryKind::File
     };
     if before.kind != expected_kind {
         return Err(std::io::Error::new(
@@ -239,7 +280,7 @@ fn verify_move_evidence(
             ),
         ));
     }
-    if expected_kind == crate::model::table::EntryKind::File && before.size != expected_size {
+    if expected_kind == crate::fs::vfs::VfsEntryKind::File && before.size != expected_size {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -248,7 +289,7 @@ fn verify_move_evidence(
             ),
         ));
     }
-    if expected_kind == crate::model::table::EntryKind::File {
+    if expected_kind == crate::fs::vfs::VfsEntryKind::File {
         if let Some(expected_mode) = op.mode {
             if before.mode.is_some_and(|mode| mode != expected_mode) {
                 return Err(std::io::Error::new(
@@ -268,6 +309,7 @@ fn verify_move_evidence(
         }
     } else if let Some(expected_hash) = &op.hash {
         let got = move_evidence_hash(
+            sh,
             exec,
             hold,
             expected_size,
@@ -292,11 +334,16 @@ fn verify_move_evidence(
             format!("claimed move source disappeared during verification: {hold}"),
         )
     })?;
+    let symlink_target_changed = if let Some(expected_target) = op.link.as_deref() {
+        exec.read_link(hold)? != expected_target
+    } else {
+        false
+    };
     if after.kind != before.kind
         || after.size != before.size
         || after.mtime_ms != before.mtime_ms
         || after.mode != before.mode
-        || (op.link.is_some() && exec.read_link(hold).ok().as_deref() != op.link.as_deref())
+        || symlink_target_changed
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -322,13 +369,14 @@ fn copy_claimed_move(
         mtime_ms: op.mtime_ms.or(Some(moving.mtime_ms)),
         mode: op.mode.or(moving.mode),
     };
+    sh.check_before_mutation()?;
     let mut writer = exec.open_write(&op.path, &hint)?;
     let mut source = exec.open_read(hold)?;
     let mut copy_hash = blake3::Hasher::new();
     let mut copied = 0u64;
     let mut buf = vec![0u8; source.block_size().clamp(64 * 1024, READ_CHUNK as usize)];
     loop {
-        pp.checkpoint()?;
+        sh.checkpoint(pp)?;
         let n = std::io::Read::read(&mut source, &mut buf)?;
         if n == 0 {
             break;
@@ -366,9 +414,10 @@ fn copy_claimed_move(
         ));
     }
 
+    sh.checkpoint(pp)?;
     writer.seal(sh.opt.fsync)?;
     let mut staged = writer.open_staged_read()?;
-    let (read_back_len, read_back_hash) = stream_hash(&mut *staged, pp)?;
+    let (read_back_len, read_back_hash) = stream_hash(sh, &mut *staged, pp)?;
     if read_back_len != copied || read_back_hash != copy_hash {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -380,16 +429,18 @@ fn copy_claimed_move(
     drop(staged);
 
     // Detect a source that changed through an already-open external handle while it was copied.
-    let _ = verify_move_evidence(exec, hold, op, pp)?;
-    writer.commit_noreplace()?;
-    Ok(())
+    verify_move_evidence(sh, exec, hold, op, pp)?;
+    sh.check_before_mutation()?;
+    let report = writer.commit_noreplace()?;
+    apply_commit_report(sh, op, hint.mtime_ms, report, pp)
 }
 
 /// Execute a single op through the VFS pair. Cancel/pause are honored at chunk
-/// boundaries via `pp.checkpoint()`; a cancel returns Interrupted, and the staged
+/// boundaries via `Shared::checkpoint`; a cancel or lost lease returns Interrupted, and the staged
 /// write's Drop contract guarantees no debris at the destination on either backend.
 pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Result<()> {
     use crate::fs::vfs::WriteHint;
+    sh.checkpoint(pp)?;
     let (exec, other) = sh.exec_other(&op.side);
     match op.action {
         Action::Copy | Action::Update => {
@@ -401,12 +452,13 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                 if exec.stat(&op.path)?.is_some() {
                     preserve(sh, op, exec, "overwritten", None, pp)?;
                 }
+                sh.check_before_mutation()?;
                 return Ok(exec.make_symlink(&op.path, target)?);
             }
 
             // Plan sizes are exact for ordinary copy/update rows. Only pay for another stat when a
             // legacy/package op omitted size or mtime; the final streamed count still reconciles
-            // a source that changed after compare without adding one round-trip per remote file.
+            // a source that changed after Compare without adding one round-trip per network file.
             let live_meta = if op.size.is_none() || op.mtime_ms.is_none() {
                 other.stat(&op.path)?
             } else {
@@ -428,75 +480,134 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
             };
             pp.revise_total_bytes(op.size.unwrap_or(0), planned_size);
 
-            // Delta stays a both-local affair — it reads old and new into memory and
-            // patches with write_at. Preflight already disabled it otherwise; this gate
-            // is the belt to that braces.
-            let exec_local = sh.local_of(&op.side);
-            let other_local = sh.local_of(match op.side {
+            let exec_local = sh.local_root_of(&op.side);
+            let other_local = sh.local_root_of(match op.side {
                 Side::Target => &Side::Source,
                 Side::Source => &Side::Target,
             });
             if sh.opt.delta && op.action == Action::Update {
                 if let (Some(eroot), Some(oroot)) = (exec_local, other_local) {
-                    let dst = join_native(eroot, &op.path);
-                    let src = join_native(oroot, &op.path);
-                    if exists_no_follow(&dst) {
-                        let mut staged = crate::fs::staged::Staged::create(&dst)?;
-                        if let Some((written, total, h)) =
-                            update_with_delta(&src, &dst, &mut staged)?
+                    let relative = relative_path(&op.path)?;
+                    let destination_exists = match eroot.metadata_path(&relative) {
+                        Ok(_) => true,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(error) => return Err(error),
+                    };
+                    if destination_exists {
+                        sh.check_before_mutation()?;
+                        let mut staged = eroot.create_staged(&relative)?;
+                        if let Some(delta) =
+                            stage_delta_update(oroot, eroot, &relative, &mut staged, || {
+                                sh.checkpoint(pp)
+                            })?
                         {
-                            pp.revise_total_bytes(planned_size, total);
-                            sh.delta_saved
-                                .fetch_add(total.saturating_sub(written), Ordering::Relaxed);
-                            pp.add_bytes(total, &op.path);
+                            pp.revise_total_bytes(planned_size, delta.output_size);
+                            if op.size.is_some() && delta.output_size != planned_size {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!(
+                                        "copy source changed size after compare: expected {planned_size}, read {}",
+                                        delta.output_size
+                                    ),
+                                ));
+                            }
+                            if op.hash.as_ref().is_some_and(|expected| {
+                                !expected.starts_with('~') && expected != &delta.output_hash
+                            }) {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!(
+                                        "copy source content changed after compare: {}",
+                                        op.path
+                                    ),
+                                ));
+                            }
+                            sh.delta_saved.fetch_add(
+                                delta.output_size.saturating_sub(delta.written_bytes),
+                                Ordering::Relaxed,
+                            );
+                            pp.add_bytes(delta.output_size, &op.path);
+                            sh.checkpoint(pp)?;
                             staged.seal(sh.opt.fsync)?;
                             if sh.opt.verify {
                                 let mut hasher = blake3::Hasher::new();
-                                let mut f = std::fs::File::open(staged.path())?;
-                                let mut buf = vec![0u8; total.clamp(1, READ_CHUNK) as usize];
+                                let mut file = staged.try_clone_file()?;
+                                let mut buf =
+                                    vec![0u8; delta.output_size.clamp(1, READ_CHUNK) as usize];
                                 loop {
-                                    pp.checkpoint()?;
-                                    let n = std::io::Read::read(&mut f, &mut buf)?;
+                                    sh.checkpoint(pp)?;
+                                    let n = std::io::Read::read(&mut file, &mut buf)?;
                                     if n == 0 {
                                         break;
                                     }
                                     hasher.update(&buf[..n]);
                                 }
                                 let got = hasher.finalize().to_hex().to_string();
-                                if got != h {
+                                if got != delta.output_hash {
                                     return Err(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
-                                        format!("write verify failed: staged readback {got} != copy stream {h}"),
+                                        format!(
+                                            "write verify failed: staged readback {got} != copy stream {}",
+                                            delta.output_hash
+                                        ),
                                     ));
                                 }
                             }
-                            let intended = match op.mtime_ms {
-                                Some(mt) => {
-                                    set_mtime(staged.path(), mt);
-                                    Some(mt)
-                                }
-                                None => {
-                                    read_mtime_ms(&src).inspect(|mt| set_mtime(staged.path(), *mt))
-                                }
-                            };
+                            sh.checkpoint(pp)?;
+                            let intended = op
+                                .mtime_ms
+                                .or_else(|| live_meta.as_ref().map(|metadata| metadata.mtime_ms));
+                            let mtime_error =
+                                intended.and_then(|mtime| staged.set_mtime(mtime).err());
                             if let Some(m) = op.mode {
-                                set_mode(staged.path(), m)?;
+                                #[cfg(unix)]
+                                staged.set_mode(m)?;
                             }
-                            staged.resync_metadata_if_requested()?;
-                            if exists_no_follow(&dst) {
-                                preserve(sh, op, exec, "overwritten", Some(&src), pp)?;
+                            if sh.opt.fsync {
+                                staged.sync_file()?;
                             }
-                            staged.commit()?;
+                            match eroot.metadata_path(&relative) {
+                                Ok(_) => {
+                                    preserve(
+                                        sh,
+                                        op,
+                                        exec,
+                                        "overwritten",
+                                        Some((oroot, &relative)),
+                                        pp,
+                                    )?;
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error),
+                            }
+                            sh.check_before_mutation()?;
+                            staged.commit_noreplace()?;
                             if let Some(want) = intended {
-                                if let Some(got) = read_mtime_ms(&dst) {
-                                    if got != want {
-                                        sh.mtime_fixes.lock().unwrap().push((
-                                            op.side == Side::Source,
-                                            op.path.clone(),
-                                            got,
-                                            want,
-                                        ));
-                                    }
+                                let metadata = eroot.metadata_path(&relative)?;
+                                let got = crate::foundation::time::systime_ms(
+                                    metadata.modified()?.into_std(),
+                                );
+                                if got != want {
+                                    sh.mtime_fixes.lock().unwrap().push((
+                                        op.side == Side::Source,
+                                        op.path.clone(),
+                                        got,
+                                        want,
+                                    ));
+                                }
+                                if let Some(error) = mtime_error {
+                                    pp.error(
+                                        &op.path,
+                                        "set_mtime",
+                                        if op.side == Side::Target {
+                                            "target"
+                                        } else {
+                                            "source"
+                                        },
+                                        &format!(
+                                            "mtime could not be set ({error}); comparison will lean on size/content for this file"
+                                        ),
+                                    );
                                 }
                             }
                             return Ok(());
@@ -518,6 +629,7 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                 mtime_ms: intended,
                 mode: op.mode,
             };
+            sh.check_before_mutation()?;
             let mut w = exec.open_write(&op.path, &hint)?;
             let mut src_stream = other.open_read(&op.path)?;
             let block = src_stream
@@ -525,14 +637,18 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                 .max(w.block_size())
                 .clamp(64 * 1024, 8 * 1024 * 1024);
             let mut buf = vec![0u8; block];
-            let mut hasher = if sh.opt.verify {
+            let expected_full_hash = op
+                .hash
+                .as_deref()
+                .filter(|expected| !expected.starts_with('~'));
+            let mut hasher = if sh.opt.verify || expected_full_hash.is_some() {
                 Some(blake3::Hasher::new())
             } else {
                 None
             };
             let mut copied = 0u64;
             loop {
-                pp.checkpoint()?;
+                sh.checkpoint(pp)?;
                 let n = std::io::Read::read(&mut src_stream, &mut buf)?;
                 if n == 0 {
                     break;
@@ -544,7 +660,25 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                 copied += n as u64;
                 pp.add_bytes(n as u64, &op.path);
             }
+            if op.size.is_some() && copied != planned_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "copy source changed size after compare: expected {planned_size}, read {copied}"
+                    ),
+                ));
+            }
             pp.revise_total_bytes(planned_size, copied);
+            let copied_hash = hasher.map(|hasher| hasher.finalize().to_hex().to_string());
+            if let Some(expected) = expected_full_hash {
+                if copied_hash.as_deref() != Some(expected) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("copy source content changed after compare: {}", op.path),
+                    ));
+                }
+            }
+            sh.checkpoint(pp)?;
             w.seal(sh.opt.fsync)?;
 
             // Length reconciliation (FFS's finalize check — it has caught corrupt
@@ -560,13 +694,15 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
             }
 
             // Verification runs on the staged file: readback vs the copy stream — a failure never becomes the final file
-            if let Some(h) = hasher {
-                let expect = h.finalize().to_hex().to_string();
+            if sh.opt.verify {
+                let expect = copied_hash
+                    .as_deref()
+                    .expect("verify=true initializes the copy-stream hasher");
                 let mut rs = w.open_staged_read()?;
                 let mut hh = blake3::Hasher::new();
                 let mut b2 = vec![0u8; block];
                 loop {
-                    pp.checkpoint()?;
+                    sh.checkpoint(pp)?;
                     let n = std::io::Read::read(&mut rs, &mut b2)?;
                     if n == 0 {
                         break;
@@ -586,42 +722,14 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
 
             // Archive the old file at the last moment before commit, so the window is a single rename
             if exec.stat(&op.path)?.is_some() {
-                let newer = other_local.map(|r| join_native(r, &op.path));
-                preserve(sh, op, exec, "overwritten", newer.as_deref(), pp)?;
+                let relative = relative_path(&op.path)?;
+                let newer = other_local.map(|root| (root, &relative));
+                preserve(sh, op, exec, "overwritten", newer, pp)?;
             }
-            let report = w.commit()?;
+            sh.check_before_mutation()?;
+            let report = w.commit_noreplace()?;
 
-            // mtime bookkeeping (P1-4): the backend reports what actually landed
-            if let Some(want) = intended {
-                if let Some(got) = report.mtime_ondisk_ms {
-                    if got != want {
-                        sh.mtime_fixes.lock().unwrap().push((
-                            op.side == Side::Source,
-                            op.path.clone(),
-                            got,
-                            want,
-                        ));
-                    }
-                }
-                if let Some(e) = report.mtime_error {
-                    // Not a copy failure (FFS's errorModTime lesson) — but never silent either
-                    pp.error(&op.path, "set_mtime", if op.side == Side::Target { "target" } else { "source" },
-                        &format!("mtime could not be set ({e}); comparison will lean on size/content for this file"));
-                }
-            }
-            if let Some(e) = report.mode_error {
-                pp.error(
-                    &op.path,
-                    "chmod",
-                    if op.side == Side::Target {
-                        "target"
-                    } else {
-                        "source"
-                    },
-                    &format!("permissions could not be set ({e})"),
-                );
-            }
-            Ok(())
+            apply_commit_report(sh, op, intended, report, pp)
         }
         Action::Chmod => {
             let m = op.mode.ok_or_else(|| {
@@ -632,6 +740,7 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
             if exec.caps().unix_mode != crate::fs::vfs::Support::Yes {
                 return Ok(());
             }
+            sh.check_before_mutation()?;
             Ok(exec.set_mode(&op.path, m)?)
         }
         Action::Move => {
@@ -645,9 +754,9 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
             // Claim the exact source pathname before creating a destination directory or staging
             // bytes. Later cleanup addresses only this hold, never `from`, so a new writer at the
             // original name cannot be deleted by this operation.
-            let hold = claim_move_source(exec.as_ref(), from, sh.opt.fsync)?;
+            let hold = claim_move_source(sh, exec.as_ref(), from, sh.opt.fsync)?;
             let publish = (|| -> std::io::Result<bool> {
-                let moving = verify_move_evidence(exec.as_ref(), &hold, op, pp)?;
+                let moving = verify_move_evidence(sh, exec.as_ref(), &hold, op, pp)?;
                 if exec.stat(&op.path)?.is_some() {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::AlreadyExists,
@@ -661,6 +770,7 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                     sh.ensure_dir(&op.side, exec, parent)?;
                 }
 
+                sh.check_before_mutation()?;
                 match exec.rename_noreplace(&hold, &op.path) {
                     Ok(()) => Ok(false), // the hold itself became the destination
                     Err(error) if error.kind == VfsErrorKind::CrossDevice => {
@@ -682,7 +792,15 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                     // An already-open writer follows the claimed inode across rename. Recheck at
                     // its published name and put it back if it changed in the verification-to-
                     // rename window; never bless unverified bytes merely because no copy occurred.
-                    if let Err(error) = verify_move_evidence(exec.as_ref(), &op.path, op, pp) {
+                    if let Err(error) = verify_move_evidence(sh, exec.as_ref(), &op.path, op, pp) {
+                        if sh.lease_lost() {
+                            return Err(std::io::Error::other(
+                                format!(
+                                    "{error}; root-lock ownership was lost, so the published move was left at recoverable path '{}' instead of racing a rollback",
+                                    op.path
+                                ),
+                            ));
+                        }
                         return Err(rollback_claim(
                             exec.as_ref(),
                             &op.path,
@@ -707,26 +825,33 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
                         )
                     })
                 }
-                Ok(true) => match exec.remove_file(&hold) {
-                    Ok(()) => sync_local_parent(exec.as_ref(), &hold, sh.opt.fsync).map_err(
-                        |error| {
-                            std::io::Error::new(
-                                error.kind(),
-                                format!(
-                                    "move destination '{}' was published and the claimed source removed, but the source directory could not be synced ({error})",
-                                    op.path
-                                ),
-                            )
-                        },
-                    ),
-                    Err(error) => Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "move destination '{}' was published, but the claimed source could not be removed ({error}); recoverable duplicate retained at '{hold}'",
-                            op.path
+                Ok(true) => {
+                    sh.check_before_mutation()?;
+                    match exec.remove_file(&hold) {
+                        Ok(()) => sync_local_parent(exec.as_ref(), &hold, sh.opt.fsync).map_err(
+                            |error| {
+                                std::io::Error::new(
+                                    error.kind(),
+                                    format!(
+                                        "move destination '{}' was published and the claimed source removed, but the source directory could not be synced ({error})",
+                                        op.path
+                                    ),
+                                )
+                            },
                         ),
-                    )),
-                },
+                        Err(error) => Err(std::io::Error::other(
+                            format!(
+                                "move destination '{}' was published, but the claimed source could not be removed ({error}); recoverable duplicate retained at '{hold}'",
+                                op.path
+                            ),
+                        )),
+                    }
+                }
+                Err(error) if sh.lease_lost() => Err(std::io::Error::other(
+                    format!(
+                        "{error}; root-lock ownership was lost, so the claimed original was left at recoverable path '{hold}' instead of racing a rollback"
+                    ),
+                )),
                 Err(error) => Err(rollback_claim(
                     exec.as_ref(),
                     &hold,
@@ -745,7 +870,9 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
         }
         Action::DeleteDir => {
             // P0-4: report by classification, no longer swallowed silently
-            match try_delete_dir_vfs(exec, &op.path, sh.opt.filter.as_ref()) {
+            match try_delete_dir_vfs(exec, &op.path, sh.opt.filter.as_ref(), || {
+                sh.check_before_mutation()
+            }) {
                 DirOutcome::Removed | DirOutcome::Absent => Ok(()),
                 DirOutcome::NotEmpty { sample } => Err(std::io::Error::new(
                     std::io::ErrorKind::DirectoryNotEmpty,

@@ -8,7 +8,7 @@
 //!   per phase every 100ms. Terminal and total events remain exact and unthrottled.
 //! - Cancel rides `io::ErrorKind::Interrupted` — it reuses the io::Result already threaded end to end, zero new error types.
 //! - Pause = a 100ms nap spin: **the stack frame stays alive ⇒ the RootLock heartbeat thread keeps
-//!   beating**, so the far machine never judges our lock abandoned (lock.rs 12s criterion). That is
+//!   beating**, so the owner remains observable while the run is paused. That is
 //!   the hard reason for not "returning suspended".
 //! - Relation to the parallel line P2-6 (scan_with_progress/ScanProgress): this module is a superset;
 //!   the blanket closure impl lets `Fn(ProgressEvent)` serve as a sink directly, and the scan side bridges the old callback shape.
@@ -57,8 +57,8 @@ fn slot() -> &'static Slot {
 /// Install the "current run" sink; when the guard lands the sink is removed and the previous one restored.
 ///
 /// **Must be RAII**: leaking the guard cross-contaminates the next run's log directory.
-/// The desktop has `RunState.active` single-run mutual exclusion and the CLI runs `run --all`
-/// sequentially, so a process-wide single slot is safe in itself.
+/// The desktop's `RunLifecycle` permits one active-run lease and the CLI runs `run --all`
+/// sequentially, so a process-wide single slot is safe.
 #[must_use = "the sink is removed the moment the guard lands — bind it to the run's lifetime"]
 pub struct SinkGuard {
     prev: Option<Arc<dyn ProgressSink>>,
@@ -158,7 +158,7 @@ impl RunCtx {
     }
 
     /// Cooperation point: cancel → Err(Interrupted); pause → a 100ms nap loop (Paused/Resumed emitted once each, CAS-deduped).
-    /// PhaseProgress::checkpoint delegates here; the remote pipeline's between-stage cooperation points (no counter context) use it directly.
+    /// PhaseProgress::checkpoint delegates here; the peer pipeline's between-stage cooperation points (no counter context) use it directly.
     pub fn checkpoint(&self) -> std::io::Result<()> {
         let ctl = &self.ctl;
         if ctl.cancel.load(Ordering::Relaxed) {

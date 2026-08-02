@@ -1,0 +1,13 @@
+[[set]]
+identifier = "progress-commands"
+description = "Commands callable only from the Apply progress window."
+permissions = [
+    "allow-report-progress-window-mounted",
+    "allow-acknowledge-progress-launch",
+    "allow-execute-post-run-power-action",
+    "allow-begin-progress-window-close",
+    "allow-destroy-progress-window",
+    "allow-replay-apply-events",
+    "allow-cancel-apply-run",
+    "allow-set-apply-paused",
+]

@@ -20,10 +20,10 @@ pub mod peer;
 pub mod roots;
 pub mod watch;
 
-use crate::job::Job;
+use crate::job::{Job, SingleTargetJob};
 
 use crate::model::plan::{Op, Plan};
-use crate::model::table::Snapshot;
+use crate::model::table::TableArtifact;
 
 use crate::pipeline::{compare::CompareOptions, scan};
 use local::{
@@ -44,7 +44,7 @@ pub struct ApplyRequirements {
 /// Desktop keeps a reviewed Compare result after a refusal only when the engine proves it stopped
 /// at `BeforeWrite`. Counters and error messages cannot provide that proof: a first write can fail
 /// with the same zero-done outcome as a capability gate, and peer transport errors can happen on
-/// either side of the remote `apply-pack` invocation.
+/// either side of the peer `apply-pack` invocation.
 #[derive(Debug)]
 pub enum ApplyExecution {
     BeforeWrite(ApplyCompletion),
@@ -135,7 +135,7 @@ pub fn effective_scan_opts(
 
 /// The `none` | `sampled` | `full` vocabulary, from the options that produced a scan.
 ///
-/// One mapping, three readers: the snapshot header stamps it (`Header.vfs.evidence_effective`), the
+/// One mapping, three readers: the snapshot header stamps it (`TableHeader.evidence`), the
 /// archive is checked against it on the way back in, and the peer lane sends it to the far side as
 /// `--evidence`. Spelled out separately, those drift into disagreeing about what a tier is called.
 pub fn evidence_label(opt: &scan::ScanOptions) -> &'static str {
@@ -148,38 +148,78 @@ pub fn evidence_label(opt: &scan::ScanOptions) -> &'static str {
     }
 }
 
+fn load_comparison_archive(
+    job: &Job,
+    options: &scan::ScanOptions,
+    ctx: &crate::obs::progress::RunCtx,
+) -> std::io::Result<Option<TableArtifact>> {
+    if job.mode != "sync" {
+        return Ok(None);
+    }
+    let Some(path) = &job.archive else {
+        return Ok(None);
+    };
+    let Some(archive) = archive::load_archive(path)? else {
+        return Ok(None);
+    };
+
+    let expected = evidence_label(options);
+    let actual = archive.header.evidence.as_str();
+    if actual != expected {
+        ctx.log(
+            crate::model::event::LogLevel::Warn,
+            "compare",
+            format!(
+                "archive was written with {actual} evidence but this run compares at {expected} — \
+                 the two cannot be matched, so it is being ignored for this run. Sync falls back \
+                 to safe mode (fills both ways, reports differences, deletes nothing). The next \
+                 successful run rewrites it at {expected}."
+            ),
+        );
+        return Ok(None);
+    }
+    Ok(Some(archive))
+}
+
 /// Whether this job executes on a peer over ssh rather than here.
 ///
 /// The distinction is the *transport*, not the protocol: a job whose target is `sftp://` still
 /// runs here — this process does the reading and writing. A `peer://` target ships a package to
 /// another machine and has it apply the plan against its own disk.
 ///
-/// It reads the target phrase because that is where a root says where it lives. It used to read a
-/// `remote_host` field instead, which meant the same question had two answers and a validation
-/// rule whose only job was to stop them disagreeing.
+/// It reads the canonical target phrases because that is where each root says where it lives. A
+/// valid peer job has exactly one target; using `any` here still reports the transport honestly for
+/// an invalid hand-edited job before validation explains why it cannot run.
 pub fn is_peer_job(job: &Job) -> bool {
-    crate::fs::vfs::spec::is_peer(&job.target)
+    job.targets
+        .iter()
+        .any(|target| crate::fs::vfs::spec::is_peer(target))
 }
 
-/// The run-log `kind` for this job's compare or apply, so the history reads back correctly.
-///
-/// Says `remote-` where the rest of the code says peer, and deliberately: these strings are
-/// **stored** in `runs.jsonl` and read back by `syncdash logs` and the desktop history. Renaming
-/// the producer without migrating every record already on disk would split one history into two
-/// vocabularies. The single producer is here, so the day that migration is written, this is the
-/// only line that changes.
-pub fn run_kind(job: &Job, verb: &str) -> String {
-    if is_peer_job(job) {
-        format!("remote-{verb}")
+fn is_peer_target(job: &SingleTargetJob) -> bool {
+    crate::fs::vfs::spec::is_peer(job.target())
+}
+
+pub fn compare_run_kind(job: &SingleTargetJob) -> crate::obs::runlog::RunKind {
+    if is_peer_target(job) {
+        crate::obs::runlog::RunKind::PeerCompare
     } else {
-        verb.to_string()
+        crate::obs::runlog::RunKind::Compare
+    }
+}
+
+pub fn apply_run_kind(job: &SingleTargetJob) -> crate::obs::runlog::RunKind {
+    if is_peer_target(job) {
+        crate::obs::runlog::RunKind::PeerApply
+    } else {
+        crate::obs::runlog::RunKind::Apply
     }
 }
 
 /// Compare, whichever side does the scanning.
 pub fn compare(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     ctx: &crate::obs::progress::RunCtx,
     accept_caps: bool,
 ) -> std::io::Result<CompareOutcome> {
@@ -193,12 +233,11 @@ pub fn compare(
 
 pub fn compare_with_capability_consent(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     ctx: &crate::obs::progress::RunCtx,
     consent: &crate::pipeline::guard::caps::CapabilityConsent,
 ) -> std::io::Result<CompareOutcome> {
-    validate_job(job)?;
-    if is_peer_job(job) {
+    if is_peer_target(job) {
         // The peer scans its own disk and sends back a table; capability consent is a property of
         // the roots this process opens, so it has nothing to apply to.
         compare_peer_job_detailed(name, job, ctx)
@@ -207,9 +246,10 @@ pub fn compare_with_capability_consent(
     }
 }
 
-pub fn compare_capabilities(job: &Job) -> std::io::Result<crate::pipeline::guard::caps::CapReport> {
-    validate_job(job)?;
-    if is_peer_job(job) {
+pub fn compare_capabilities(
+    job: &SingleTargetJob,
+) -> std::io::Result<crate::pipeline::guard::caps::CapReport> {
+    if is_peer_target(job) {
         Ok(crate::pipeline::guard::caps::CapReport::default())
     } else {
         local::compare_capabilities(job)
@@ -218,13 +258,12 @@ pub fn compare_capabilities(job: &Job) -> std::io::Result<crate::pipeline::guard
 
 /// Gate a plan before applying it.
 pub fn preflight(
-    job: &Job,
+    job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
     acknowledged: bool,
 ) -> std::io::Result<crate::pipeline::guard::Verdict> {
-    validate_job(job)?;
-    if is_peer_job(job) {
+    if is_peer_target(job) {
         Ok(preflight_peer_job(job, plan, ops, acknowledged))
     } else {
         preflight_job(job, plan, ops, acknowledged)
@@ -232,13 +271,12 @@ pub fn preflight(
 }
 
 pub fn apply_requirements(
-    job: &Job,
+    job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
     acknowledged: bool,
 ) -> std::io::Result<ApplyRequirements> {
-    validate_job(job)?;
-    if is_peer_job(job) {
+    if is_peer_target(job) {
         Ok(ApplyRequirements {
             verdict: preflight_peer_job(job, plan, ops, acknowledged),
             capabilities: peer::apply_capabilities(job, ops),
@@ -252,7 +290,7 @@ pub fn apply_requirements(
 #[allow(clippy::too_many_arguments)] // every one is a distinct decision the caller has already made
 pub fn apply(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
     trash: Option<std::path::PathBuf>,
@@ -274,10 +312,10 @@ pub fn apply(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // each argument is an independently reviewed apply decision
 pub fn apply_with_capability_consent(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
     trash: Option<std::path::PathBuf>,
@@ -302,10 +340,10 @@ pub fn apply_with_capability_consent(
 
 /// Apply with an explicit mutation boundary. New interactive callers should use this form so a
 /// refused run can preserve its reviewed Compare result without guessing from text or counters.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // each argument is an independently reviewed apply decision
 pub fn apply_with_capability_consent_classified(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
     trash: Option<std::path::PathBuf>,
@@ -314,10 +352,7 @@ pub fn apply_with_capability_consent_classified(
     consent: &crate::pipeline::guard::caps::CapabilityConsent,
     ctx: &crate::obs::progress::RunCtx,
 ) -> ApplyExecution {
-    if let Err(error) = validate_job(job) {
-        return ApplyExecution::failed_before_write(error);
-    }
-    if is_peer_job(job) {
+    if is_peer_target(job) {
         let capabilities = peer::apply_capabilities(job, ops);
         let blockers = capabilities.blockers();
         if !blockers.is_empty() {
@@ -365,7 +400,10 @@ pub fn run_job(
 ) -> std::io::Result<(u64, u64, u64, u64)> {
     validate_job(job)?;
     if is_peer_job(job) {
-        run_peer_job(name, job, do_apply, verbose, acknowledged)
+        let target = job
+            .select_target(0)
+            .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))?;
+        run_peer_job(name, &target, do_apply, verbose, acknowledged)
     } else {
         run_local_job(name, job, do_apply, verbose, acknowledged, accept_caps)
     }
@@ -376,7 +414,7 @@ fn validate_job(job: &Job) -> std::io::Result<()> {
         .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))
 }
 
-pub fn compare_job(job: &Job) -> std::io::Result<Plan> {
+pub fn compare_job(job: &SingleTargetJob) -> std::io::Result<Plan> {
     compare_job_with(job, &crate::obs::progress::RunCtx::null())
 }
 
@@ -395,8 +433,8 @@ pub fn describe_root(phrase: &str) -> std::io::Result<String> {
     let _ = writeln!(
         out,
         "local lane: {}",
-        if v.as_local().is_some() {
-            "yes (fast path)"
+        if v.local_root().is_some() {
+            "yes (retained root descriptor)"
         } else {
             "no (generic VFS lane)"
         }
@@ -437,6 +475,14 @@ pub fn describe_root(phrase: &str) -> std::io::Result<String> {
     );
     let _ = writeln!(
         out,
+        "exclusive_staged_file_publish {}  exclusive_entry_rename {}  exclusive_symlink_publish {}  durable_namespace {}",
+        cap(c.exclusive_staged_file_publish),
+        cap(c.exclusive_entry_rename),
+        cap(c.exclusive_symlink_publish),
+        cap(c.durable_namespace)
+    );
+    let _ = writeln!(
+        out,
         "unix_mode {}  symlink {}  file_id {}  free_space {}  read_back {}",
         cap(c.unix_mode),
         cap(c.symlink),
@@ -453,20 +499,21 @@ pub fn describe_root(phrase: &str) -> std::io::Result<String> {
 /// them later would lose capability-driven adjustments such as a protocol's timestamp precision.
 pub struct CompareOutcome {
     pub plan: Plan,
-    pub source: Snapshot,
-    pub target: Snapshot,
+    pub source: TableArtifact,
+    pub target: TableArtifact,
     pub compare_options: CompareOptions,
 }
 
-/// v0.9 M1: the end-to-end comparison with an event stream and cancellation. This function replaces the second
-/// pipeline src-tauri had inlined just to emit events (undoing the two-copy drift).
-pub fn compare_job_with(job: &Job, ctx: &crate::obs::progress::RunCtx) -> std::io::Result<Plan> {
+pub fn compare_job_with(
+    job: &SingleTargetJob,
+    ctx: &crate::obs::progress::RunCtx,
+) -> std::io::Result<Plan> {
     compare_job_detailed(job, ctx, false).map(|o| o.plan)
 }
 
 /// Execute the selected ops; on complete success in sync mode, refresh the archive (conflicted paths are dropped from it, so the conflict is reported again next time).
 pub fn apply_job(
-    job: &Job,
+    job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
     trash: Option<std::path::PathBuf>,
@@ -478,7 +525,7 @@ pub fn apply_job(
 /// `acknowledged` = the user passed --i-know explicitly; it only allows the "plan health check" gates through.
 /// A missing marker and insufficient disk space always block (those are environment problems, not judgment calls).
 pub fn apply_job_guarded(
-    job: &Job,
+    job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
     trash: Option<std::path::PathBuf>,
@@ -499,11 +546,10 @@ pub fn apply_job_guarded(
     .into_tuple()
 }
 
-/// v0.9 M3: the **compare stage** of a remote job — the desktop's `compare_job` routes remote jobs straight here
-/// instead of silently dropping into the local pipeline (which would pull the data over UNC and rehash it: an order of magnitude slower, and semantically wrong).
+/// Scan the target on its peer instead of treating the phrase as a locally mounted root.
 pub fn compare_peer_job_with(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<Plan> {
     compare_peer_job_detailed(name, job, ctx).map(|o| o.plan)

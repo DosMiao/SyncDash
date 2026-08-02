@@ -214,7 +214,7 @@ fn parse_phrase(phrase: &str, set: &mut MaskSet) {
 /// `job::junk` is what used to be that hidden tier, and the difference is the whole point: a preset
 /// is now a **macro over `exclude`**, not a parallel rule set. Ticking one writes its patterns into the job's
 /// exclude list, where they show up verbatim, can be edited or deleted line by line, and survive into
-/// `--exclude` on the wire to a remote scan. Untick and they come back out. The old shape — a job saying
+/// `--exclude` on the wire to a peer scan. Untick and they come back out. The old shape — a job saying
 /// `os_excludes = "auto"` and an exclude box saying nothing — could not answer "what is actually excluded here",
 /// which is the same class of lie as folding `.git` in silently.
 ///

@@ -6,6 +6,52 @@ use serde::{Deserialize, Serialize};
 use syncdash::model::plan::{Op, PlanHeader};
 use syncdash::pipeline::compare;
 
+#[derive(Serialize, Clone, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct SettingsNumericLimitsDto {
+    #[ts(type = "number")]
+    pub(crate) maximum_keep_days: u64,
+    #[ts(type = "number")]
+    pub(crate) maximum_total_mb: u64,
+}
+
+#[derive(Serialize, Clone, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct SettingsSnapshotDto {
+    pub(crate) settings: syncdash::store::settings::AppSettings,
+    pub(crate) revision: String,
+    pub(crate) diagnostic: Option<String>,
+    pub(crate) numeric_limits: SettingsNumericLimitsDto,
+}
+
+impl From<syncdash::store::settings::AppSettingsSnapshot> for SettingsSnapshotDto {
+    fn from(snapshot: syncdash::store::settings::AppSettingsSnapshot) -> Self {
+        Self {
+            settings: snapshot.settings,
+            revision: snapshot.revision,
+            diagnostic: snapshot.diagnostic,
+            numeric_limits: SettingsNumericLimitsDto {
+                maximum_keep_days: syncdash::store::settings::MAX_KEEP_DAYS,
+                maximum_total_mb: syncdash::store::settings::MAX_TOTAL_MB,
+            },
+        }
+    }
+}
+
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct LogDirectorySelectionDto {
+    pub(crate) directory: String,
+    pub(crate) grant_id: Option<String>,
+}
+
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct SettingsSaveDto {
+    pub(crate) snapshot: SettingsSnapshotDto,
+    pub(crate) migration: syncdash::store::migrate::MigrateReport,
+}
+
 #[derive(Serialize, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JobDto {
@@ -14,12 +60,9 @@ pub(crate) struct JobDto {
     pub(crate) mode: String,
     pub(crate) rigor: String,
     pub(crate) source: String,
-    pub(crate) target: String,
     pub(crate) has_archive: bool,
-    // v0.9 M3: fill in the fields the frontend needs to see (remote badge / versioning marker / filter hints).
-    // The host is not among them: it lives in `target` now (`peer://<host>/…`), and shipping a second
-    // copy is how the frontend ends up rendering a stale one.
-    pub(crate) remote: bool,
+    /// Derived from the root phrase; no separate host field may duplicate that authority.
+    pub(crate) is_peer_job: bool,
     pub(crate) versioning: bool,
     pub(crate) delta: bool,
     #[ts(type = "number | null")]
@@ -27,9 +70,9 @@ pub(crate) struct JobDto {
     pub(crate) include: Vec<String>,
     pub(crate) exclude: Vec<String>,
     #[ts(type = "number | null")]
-    pub(crate) watch_interval_secs: Option<u64>,
-    pub(crate) watch_auto_apply: bool,
-    /// 1:N: the effective target list (a single-target job = one entry). When >1 the frontend shows the target selector
+    pub(crate) autoscan_interval_secs: Option<u64>,
+    pub(crate) autoscan_auto_apply: bool,
+    /// The canonical target roots; a single-target job has exactly one entry.
     pub(crate) targets: Vec<String>,
     pub(crate) config_revision: String,
 }
@@ -51,6 +94,15 @@ pub(crate) struct JobSaveDto {
     pub(crate) config_revision: String,
     pub(crate) effect: syncdash::job::JobMutationEffect,
     pub(crate) previous_name: Option<String>,
+    pub(crate) status_delivery_warnings: Vec<String>,
+}
+
+#[derive(Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct JobRootMutationDto {
+    pub(crate) mutation: JobSaveDto,
+    pub(crate) source: String,
+    pub(crate) targets: Vec<String>,
 }
 
 #[derive(Serialize, ts_rs::TS)]
@@ -60,24 +112,139 @@ pub(crate) struct JobDeleteDto {
     pub(crate) name: String,
     pub(crate) config_revision: String,
     pub(crate) effect: syncdash::job::JobMutationEffect,
+    pub(crate) status_delivery_warnings: Vec<String>,
 }
 
-/// Immutable provenance for one successful comparison.
-///
-/// The frontend carries this value with the plan. Commands that read cached evidence or can write
-/// files require an exact match, so changing selection cannot silently reinterpret an old plan.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+/// Immutable identity for one successful Compare result.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
-pub(crate) struct CompareOwner {
+pub(crate) struct CompareIdentity {
+    pub(crate) result_id: String,
     #[ts(type = "number")]
-    pub(crate) compare_id: u64,
-    /// Stable registry identity. `job_name` is only the current display/lookup label and may change
-    /// while this comparison remains valid.
+    pub(crate) compare_run_id: u64,
     pub(crate) job_id: String,
-    pub(crate) job_name: String,
     #[ts(type = "number")]
     pub(crate) target_index: usize,
     pub(crate) config_revision: String,
+}
+
+/// An immutable Compare identity paired with its current display label.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct CompareOwner {
+    pub(crate) identity: CompareIdentity,
+    pub(crate) job_name: String,
+}
+
+/// The exact job-target revision used to look up retained results and execution status.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, Hash, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct CompareScopeDto {
+    pub(crate) job_id: String,
+    #[ts(type = "number")]
+    pub(crate) target_index: usize,
+    pub(crate) config_revision: String,
+}
+
+/// One monotonic verification epoch and the Compare run currently associated with it, if launched.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct CompareVerificationAttemptDto {
+    #[ts(type = "number")]
+    pub(crate) verification_epoch: u64,
+    #[ts(type = "number | null")]
+    pub(crate) compare_run_id: Option<u64>,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum CompareExecutionExpiryReasonDto {
+    ApplicationRestarted,
+    JobChanged,
+    JobDeleted,
+    WriteStarted,
+    VerificationExhausted,
+}
+
+/// Authoritative execution authority for one Compare scope. Retained plans remain viewable even
+/// when this status says that their filesystem evidence is no longer eligible for Apply.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum CompareScopeExecutionStatusDto {
+    Unavailable {
+        scope: CompareScopeDto,
+    },
+    AwaitingCompare {
+        scope: CompareScopeDto,
+        attempt: CompareVerificationAttemptDto,
+    },
+    Comparing {
+        scope: CompareScopeDto,
+        attempt: CompareVerificationAttemptDto,
+    },
+    Fresh {
+        scope: CompareScopeDto,
+        attempt: CompareVerificationAttemptDto,
+        owner: CompareOwner,
+    },
+    Failed {
+        scope: CompareScopeDto,
+        attempt: CompareVerificationAttemptDto,
+        message: String,
+    },
+    Cancelled {
+        scope: CompareScopeDto,
+        attempt: CompareVerificationAttemptDto,
+    },
+    Expired {
+        scope: CompareScopeDto,
+        attempt: CompareVerificationAttemptDto,
+        reason: CompareExecutionExpiryReasonDto,
+    },
+}
+
+/// An atomic restored Compare workspace: immutable plan evidence and its independently evolving
+/// execution status are read under the same repository lock.
+#[derive(Serialize, Clone, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct CompareWorkspaceSnapshotDto {
+    pub(crate) plan: PlanDto,
+    pub(crate) execution_status: CompareScopeExecutionStatusDto,
+}
+
+/// An exact retained-workspace lookup never encodes absence as null. Missing evidence and its
+/// authoritative scope status are read under the same repository lock.
+#[derive(Serialize, Clone, ts_rs::TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum CompareWorkspaceLookupDto {
+    Found {
+        workspace: Box<CompareWorkspaceSnapshotDto>,
+    },
+    Missing {
+        execution_status: CompareScopeExecutionStatusDto,
+    },
+}
+
+#[derive(Serialize, Clone, ts_rs::TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum CompareResultForgetDto {
+    Forgotten { cleanup_warning: Option<String> },
+    AlreadyForgotten,
+}
+
+/// Identifies the backend AutoScan trigger for which Compare is being reviewed. The backend turns
+/// this public cursor into a private, one-use permit; it is not itself execution authority.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct AutoScanCompareRequestDto {
+    #[ts(type = "number")]
+    pub(crate) generation: u64,
+    #[ts(type = "number")]
+    pub(crate) ticket_id: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, ts_rs::TS)]
@@ -102,22 +269,58 @@ pub(crate) struct PlanDto {
 }
 
 /// One reviewed plan row submitted for preflight/apply. The backend reconstructs the operation from
-/// the cached plan; the frontend never gets to submit an independent write instruction.
+/// the exact retained plan; the frontend never gets to submit an independent write instruction.
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
-pub(crate) struct SelectedRowDto {
+pub(crate) struct ReviewedRowDecisionDto {
     #[ts(type = "number")]
     pub(crate) index: usize,
-    pub(crate) flipped: bool,
+    pub(crate) direction_reversed: bool,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) struct CsvRowPresentationDto {
+    #[ts(type = "number")]
+    pub(crate) index: usize,
+    pub(crate) included: bool,
+    pub(crate) direction_reversed: bool,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum CsvExportDto {
+    Cancelled,
+    Exported {
+        #[ts(type = "number")]
+        row_count: usize,
+        display_path: String,
+        receipt_id: String,
+    },
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum CompareFileSideDto {
+    Source,
+    Target,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum PostRunPowerActionDto {
+    Sleep,
+    Shutdown,
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
-#[serde(rename_all = "snake_case")]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
-pub(crate) enum ReviewStatus {
-    DirectAuthorized,
-    ConfirmationRequired,
-    Blocked,
+pub(crate) struct PostRunPowerActionReadyDto {
+    #[ts(type = "number")]
+    pub(crate) run_id: u64,
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
@@ -172,20 +375,60 @@ pub(crate) struct AuthorizationDto {
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
-pub(crate) struct OperationReviewDto {
-    pub(crate) status: ReviewStatus,
-    pub(crate) authorization: Option<AuthorizationDto>,
-    pub(crate) challenge_id: Option<String>,
-    #[ts(type = "number | null")]
-    pub(crate) expires_at_ms: Option<u64>,
-    pub(crate) blockers: Vec<String>,
-    pub(crate) warnings: Vec<String>,
-    pub(crate) capabilities: Vec<CapabilityIssueDto>,
-    pub(crate) requires_health_ack: bool,
-    pub(crate) requires_capability_ack: bool,
-    pub(crate) can_remember_for_session: bool,
-    pub(crate) can_allow_unattended: bool,
+pub(crate) enum OperationReviewDto {
+    Blocked {
+        blockers: Vec<String>,
+        warnings: Vec<String>,
+        capabilities: Vec<CapabilityIssueDto>,
+    },
+    DirectAuthorized {
+        authorization: AuthorizationDto,
+        capabilities: Vec<CapabilityIssueDto>,
+    },
+    CompareConfirmationRequired {
+        challenge_id: String,
+        #[ts(type = "number")]
+        expires_at_ms: u64,
+        capabilities: Vec<CapabilityIssueDto>,
+        can_remember_for_session: bool,
+    },
+    InteractiveApplyConfirmationRequired {
+        challenge_id: String,
+        #[ts(type = "number")]
+        expires_at_ms: u64,
+        warnings: Vec<String>,
+        capabilities: Vec<CapabilityIssueDto>,
+        requires_health_ack: bool,
+        requires_capability_ack: bool,
+        can_remember_for_session: bool,
+        can_allow_unattended: bool,
+    },
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum OperationApprovalDto {
+    Compare {
+        accept_capabilities: bool,
+        remember_for_session: bool,
+    },
+    InteractiveApply {
+        acknowledge_health: bool,
+        accept_capabilities: bool,
+        session_grant: ApplySessionGrantDecisionDto,
+    },
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub(crate) enum ApplySessionGrantDecisionDto {
+    None,
+    RememberCapabilities,
+    AllowAutoApply,
 }
 
 #[derive(Serialize, ts_rs::TS)]

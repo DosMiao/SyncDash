@@ -1,4 +1,4 @@
-// Run-scope membership is an execution boundary: a checked row outside this module's result does
+// Run-scope membership is an execution boundary: an included row outside this module's result does
 // not run. Display sorting, grouping, folding, and path formatting must never enter this data flow.
 
 import { owningFolderOf, ROOT_FOLDER_PATH, ROOT_LEVEL_LABEL } from './folders.ts';
@@ -39,7 +39,7 @@ export function isMaskMatchResult(value: unknown, rowCount: number): value is bo
 
 export interface RunScopeInput {
   plan: PlanDto;
-  flipped: boolean[];
+  reversedRows: boolean[];
   selectedResultTypes: ReadonlySet<ResultType>;
   searchQuery: string;
   folderScope: string | null;
@@ -73,7 +73,7 @@ export function matchesFolderScope(operation: PlanOperation, folderScope: string
 export function computeInScopeIndices(input: RunScopeInput): number[] {
   const {
     plan,
-    flipped,
+    reversedRows,
     selectedResultTypes,
     folderScope,
     advancedFilter,
@@ -89,12 +89,12 @@ export function computeInScopeIndices(input: RunScopeInput): number[] {
   const indices: number[] = [];
   for (let index = 0; index < plan.ops.length; index++) {
     if (excludedByMask[index] === true) continue;
-    const operation = effectiveOperation(plan, flipped, index);
+    const operation = effectiveOperation(plan, reversedRows, index);
     if (selectedResultTypes.size > 0 && !selectedResultTypes.has(resultTypeOf(operation))) continue;
     if (!matchesSearch(operation, query)) continue;
     if (!matchesFolderScope(operation, folderScope)) continue;
     if (hasSizeConstraint) {
-      const size = rowSize(plan, flipped, index);
+      const size = rowSize(plan, reversedRows, index);
       if (advancedFilter.minimumMiB !== null && size < advancedFilter.minimumMiB * mebibyte) continue;
       if (advancedFilter.maximumMiB !== null && size > advancedFilter.maximumMiB * mebibyte) continue;
     }
@@ -109,12 +109,12 @@ export function computeInScopeIndices(input: RunScopeInput): number[] {
 
 export function computeExecutableIndices(
   plan: PlanDto,
-  flipped: boolean[],
+  reversedRows: boolean[],
   inScopeIndices: readonly number[],
-  checked: readonly boolean[],
+  includedRows: readonly boolean[],
 ): number[] {
   return inScopeIndices.filter((index) => (
-    checked[index] === true && isExecutableOperation(effectiveOperation(plan, flipped, index))
+    includedRows[index] === true && isExecutableOperation(effectiveOperation(plan, reversedRows, index))
   ));
 }
 
@@ -147,7 +147,7 @@ function byteMetricKind(operation: PlanOperation): 'transfer' | 'deletion' | nul
   return null;
 }
 
-export function buildRunScopeModel(plan: PlanDto, flipped: boolean[]): RunScopeModel {
+export function buildRunScopeModel(plan: PlanDto, reversedRows: boolean[]): RunScopeModel {
   const folders: RunScopeFolderNode[] = [];
   const nodes: RunScopeFolderNode[] = [];
   const nodeByPath = new Map<string, RunScopeFolderNode>();
@@ -196,14 +196,14 @@ export function buildRunScopeModel(plan: PlanDto, flipped: boolean[]): RunScopeM
   };
 
   for (let index = 0; index < plan.ops.length; index++) {
-    const operation = effectiveOperation(plan, flipped, index);
+    const operation = effectiveOperation(plan, reversedRows, index);
     const resultType = resultTypeOf(operation);
     countByResultType[resultType] += 1;
 
     const owner = ensureFolder(owningFolderOf(operation), index);
     owner.directCount += 1;
     const metricKind = byteMetricKind(operation);
-    if (metricKind === 'transfer') owner.directTransferBytes += rowTransferBytes(plan, flipped, index);
+    if (metricKind === 'transfer') owner.directTransferBytes += rowTransferBytes(plan, reversedRows, index);
     if (metricKind === 'deletion') owner.directDeletionBytes += Math.max(0, operation.size ?? 0);
   }
 

@@ -1,12 +1,9 @@
-//! Metadata records shared by the platform directory walkers.
-//!
-//! The scanner consumes one shape regardless of how a directory was enumerated. macOS fills it
-//! from `getattrlistbulk`; every other platform, and the macOS differential tests, fill it from
-//! WalkDir. Keeping the policy-free record here leaves filtering, hashing, cache use, and snapshot
-//! construction in `local` instead of growing a second scanner beside it.
+//! Descriptor-relative metadata traversal for the local scanner.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use crate::foundation::path::{RootRelativeDir, RootRelativePath};
+use crate::fs::local_root::LocalRoot;
 use crate::pipeline::filter::PathFilter;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -18,8 +15,7 @@ pub(super) enum WalkKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WalkEntry {
-    pub abs: PathBuf,
-    pub rel: String,
+    pub relative: RootRelativePath,
     pub kind: WalkKind,
     pub size: u64,
     pub mtime_ms: i64,
@@ -30,20 +26,19 @@ pub(super) struct WalkEntry {
 
 impl WalkEntry {
     pub(super) fn from_metadata(
-        abs: PathBuf,
-        rel: String,
-        kind: WalkKind,
-        md: &std::fs::Metadata,
+        relative: RootRelativePath,
+        metadata: &cap_primitives::fs::Metadata,
+        dataless: bool,
     ) -> Self {
+        let kind = kind_from_metadata(metadata);
         Self {
-            abs,
-            rel,
+            relative,
             kind,
-            size: md.len(),
-            mtime_ms: metadata_mtime_ms(md),
-            file_id: metadata_file_id(md),
-            mode: metadata_mode(md),
-            dataless: metadata_is_dataless(md),
+            size: metadata.len(),
+            mtime_ms: metadata_mtime_ms(metadata),
+            file_id: metadata_file_id(metadata),
+            mode: metadata_mode(metadata),
+            dataless,
         }
     }
 }
@@ -64,58 +59,57 @@ impl WalkStats {
         }
     }
 
-    pub(super) fn note_invalid_name(&mut self, rel: &Path) {
+    pub(super) fn note_invalid_name(&mut self, relative: &Path) {
         self.note_error(format!(
             "{}: name is not valid Unicode on this platform — skipped rather than recorded under a substituted spelling",
-            rel.to_string_lossy()
+            relative.to_string_lossy()
         ));
     }
 }
 
 #[cfg(unix)]
-fn metadata_file_id(md: &std::fs::Metadata) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    Some(format!("{}:{}", md.dev(), md.ino()))
+fn metadata_file_id(metadata: &cap_primitives::fs::Metadata) -> Option<String> {
+    use cap_primitives::fs::MetadataExt;
+    Some(format!("{}:{}", metadata.dev(), metadata.ino()))
 }
 
 #[cfg(not(unix))]
-fn metadata_file_id(_md: &std::fs::Metadata) -> Option<String> {
+fn metadata_file_id(_metadata: &cap_primitives::fs::Metadata) -> Option<String> {
     None
 }
 
 #[cfg(unix)]
-fn metadata_mode(md: &std::fs::Metadata) -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-    Some(md.mode() & 0o7777)
+fn metadata_mode(metadata: &cap_primitives::fs::Metadata) -> Option<u32> {
+    use cap_primitives::fs::MetadataExt;
+    Some(metadata.mode() & 0o7777)
 }
 
 #[cfg(not(unix))]
-fn metadata_mode(_md: &std::fs::Metadata) -> Option<u32> {
+fn metadata_mode(_metadata: &cap_primitives::fs::Metadata) -> Option<u32> {
     None
 }
 
-#[cfg(target_os = "macos")]
-fn metadata_is_dataless(md: &std::fs::Metadata) -> bool {
-    use std::os::macos::fs::MetadataExt;
-    const SF_DATALESS: u32 = 0x4000_0000;
-    md.st_flags() & SF_DATALESS != 0
-}
-
-#[cfg(not(target_os = "macos"))]
-fn metadata_is_dataless(_md: &std::fs::Metadata) -> bool {
-    false
-}
-
-fn metadata_mtime_ms(md: &std::fs::Metadata) -> i64 {
-    md.modified()
+fn metadata_mtime_ms(metadata: &cap_primitives::fs::Metadata) -> i64 {
+    metadata
+        .modified()
         .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|time| time.into_std().duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
 }
 
+pub(super) fn kind_from_metadata(metadata: &cap_primitives::fs::Metadata) -> WalkKind {
+    if metadata.is_dir() {
+        WalkKind::Dir
+    } else if metadata.is_symlink() {
+        WalkKind::Symlink
+    } else {
+        WalkKind::File
+    }
+}
+
 pub(super) fn walk<C, V>(
-    root: &Path,
+    root: &LocalRoot,
     filter: &PathFilter,
     mut checkpoint: C,
     mut visit: V,
@@ -124,105 +118,100 @@ where
     C: FnMut() -> std::io::Result<()>,
     V: FnMut(WalkEntry),
 {
-    let excluded_dirs = std::cell::Cell::new(0u64);
-    let excluded_files = std::cell::Cell::new(0u64);
-    let walker = walkdir::WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            if entry.depth() == 0 {
-                return true;
-            }
-            let rel = entry
-                .path()
-                .strip_prefix(root)
-                .unwrap_or(entry.path())
-                .to_string_lossy()
-                .replace('\\', "/");
-            if entry.file_type().is_dir() {
-                let (pass, child_might_match) = filter.pass_dir(&rel);
-                let keep = pass || child_might_match;
-                if !keep {
-                    excluded_dirs.set(excluded_dirs.get() + 1);
-                }
-                keep
-            } else {
-                let keep = filter.pass_file(&rel);
-                if !keep {
-                    excluded_files.set(excluded_files.get() + 1);
-                }
-                keep
-            }
-        });
-
     let mut stats = WalkStats::default();
-    for item in walker {
-        checkpoint()?;
-        let item = match item {
-            Ok(item) => item,
-            Err(error) if error.depth() == 0 => {
-                return Err(std::io::Error::other(format!(
-                    "scan of '{}' could not read the root itself: {error} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
-                    root.display()
-                )));
-            }
-            Err(error) => {
-                let kind = error.io_error().map(std::io::Error::kind);
-                if kind != Some(std::io::ErrorKind::NotFound) {
-                    return Err(std::io::Error::new(
-                        kind.unwrap_or(std::io::ErrorKind::Other),
-                        format!(
-                            "scan of '{}' aborted at '{}': {error} — refusing to emit a half table (its missing subtrees would read as deletions)",
-                            root.display(),
-                            error
-                                .path()
-                                .map(|path| path.display().to_string())
-                                .unwrap_or_else(|| "<path unavailable>".into()),
-                        ),
-                    ));
-                }
-                stats.note_error(format!(
-                    "{}: {error}",
-                    error
-                        .path()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "<path unavailable>".into())
-                ));
-                continue;
-            }
-        };
-        if item.depth() == 0 {
-            continue;
-        }
+    let mut directories = vec![RootRelativeDir::new("").expect("the root directory is valid")];
 
-        let raw_rel = item.path().strip_prefix(root).unwrap_or(item.path());
-        let Some(rel) = raw_rel.to_str() else {
-            stats.note_invalid_name(raw_rel);
-            continue;
-        };
-        let rel = rel.replace('\\', "/");
-        let md = match item.metadata() {
-            Ok(md) => md,
-            Err(error) => {
-                stats.note_error(format!("{rel}: {error}"));
+    while let Some(directory) = directories.pop() {
+        checkpoint()?;
+        let mut children = match root.read_directory(&directory) {
+            Ok(children) => children,
+            Err(error) if directory.as_str().is_empty() => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "scan of '{}' could not read the root itself: {error} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
+                        root.display_path().display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                stats.note_error(format!("{}: {error}", directory.as_str()));
                 continue;
             }
+            Err(error) => {
+                return Err(subtree_error(root, directory.as_str(), error));
+            }
         };
-        let kind = if item.file_type().is_dir() {
-            WalkKind::Dir
-        } else if item.file_type().is_symlink() {
-            WalkKind::Symlink
-        } else {
-            WalkKind::File
-        };
-        visit(WalkEntry::from_metadata(
-            item.path().to_path_buf(),
-            rel,
-            kind,
-            &md,
-        ));
+        children.sort_by(|left, right| left.name.cmp(&right.name));
+
+        for child in children {
+            checkpoint()?;
+            let relative = child_path(&directory, child.name.as_str());
+            let relative_text = relative.as_str();
+            let kind = kind_from_metadata(&child.metadata);
+            let keep = match kind {
+                WalkKind::Dir => {
+                    let (pass, child_might_match) = filter.pass_dir(relative_text);
+                    let keep = pass || child_might_match;
+                    if !keep {
+                        stats.excluded_dirs += 1;
+                    }
+                    keep
+                }
+                WalkKind::File | WalkKind::Symlink => {
+                    let keep = filter.pass_file(relative_text);
+                    if !keep {
+                        stats.excluded_files += 1;
+                    }
+                    keep
+                }
+            };
+            if !keep {
+                continue;
+            }
+
+            #[cfg(target_os = "macos")]
+            let dataless = if kind == WalkKind::File {
+                root.is_dataless_file(&relative)
+                    .map_err(|error| subtree_error(root, relative.as_str(), error))?
+            } else {
+                false
+            };
+            #[cfg(not(target_os = "macos"))]
+            let dataless = false;
+
+            visit(WalkEntry::from_metadata(
+                relative.clone(),
+                &child.metadata,
+                dataless,
+            ));
+            if kind == WalkKind::Dir {
+                directories.push(
+                    RootRelativeDir::new(relative.into_string())
+                        .expect("a validated child path is a valid directory path"),
+                );
+            }
+        }
     }
-    stats.excluded_dirs = excluded_dirs.get();
-    stats.excluded_files = excluded_files.get();
+
     Ok(stats)
+}
+
+fn child_path(directory: &RootRelativeDir, name: &str) -> RootRelativePath {
+    let relative = if directory.as_str().is_empty() {
+        name.to_owned()
+    } else {
+        format!("{}/{name}", directory.as_str())
+    };
+    RootRelativePath::new(relative).expect("validated directory and entry names form a valid path")
+}
+
+fn subtree_error(root: &LocalRoot, relative: &str, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!(
+            "scan of '{}' aborted at '{relative}': {error} — refusing to emit a half table (its missing subtrees would read as deletions)",
+            root.display_path().display()
+        ),
+    )
 }

@@ -1,555 +1,1190 @@
-// SyncDash progress sub-window (FFS-equivalent behavior parameters):
-// - rate = 4s sliding window, ETA = 60s sliding window, readouts refresh every 500ms, redraw every 100ms
-// - percentage = (bytesDone + itemsDone) / (bytesTotal + itemsTotal) (same formula as FFS)
-// - paused time is excluded from elapsed; Stop = cooperative cancel (stops after the current chunk, so
-//   the end state never leaves a half-written file)
-// - errors accumulate without interrupting; Auto-close and When-finished (sleep/shut down, 10s cancellable countdown)
-// Data source: the `run-progress` event broadcast by the Rust TauriSink (throttled to ≥100ms apiece, carries run_id).
-//
-// The run state lives in a ref, not in useState: events arrive up to ten times a second and the sample
-// series runs to thousands of entries. Rendering is driven by the same 100 ms tick the original used, so
-// the throttle stays exactly where FFS put it instead of being whatever React decides to coalesce.
-
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { Check, Pause, Play, RefreshCw, Square, TriangleAlert } from 'lucide-react';
-import { emit, listen } from '@tauri-apps/api/event';
+import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow, ProgressBarStatus } from '@tauri-apps/api/window';
 import {
-  cancelRun,
-  closeProgressLaunch,
+  acknowledgeProgressLaunch,
+  beginProgressWindowClose,
+  cancelApplyRun,
   destroyProgressWindow,
-  pauseRun,
-  postSyncAction,
-  replayRunEvents,
+  executePostRunPowerAction,
+  replayApplyEvents,
+  reportProgressWindowMounted,
+  setApplyPaused,
 } from '../core/ipc';
 import { humanDuration, humanSize } from '../core/format';
 import { mergeRunEventReplay } from '../core/runEvents';
-import { applyZoom, readZoom } from '../core/zoom';
+import { applyZoom, loadZoomPreference } from '../core/zoom';
+import type { PostRunPowerActionReadyDto } from '../core/types/generated/PostRunPowerActionReadyDto';
 import { Graph } from './Graph';
-import type { RunEv, RunState, Sample } from './runstate';
-import { PHASE_LABEL, activeNow, endStage, newRunState, percent, startStage, windowRate } from './runstate';
+import {
+  isWhenFinishedAction,
+  loadProgressPreferences,
+  saveAutoClosePreference,
+  saveWhenFinishedPreference,
+} from './preferences';
+import type { WhenFinishedAction } from './preferences';
+import { deriveAutoCloseRequest, derivePowerActionCountdown } from './postRunActions';
+import type { AutoCloseRequest, PowerAction, PowerActionCountdown } from './postRunActions';
+import type { ProgressRateSample, RunProgressEvent, RunState } from './runstate';
+import {
+  PHASE_LABELS,
+  activeElapsedMs,
+  calculateWindowRate,
+  completionPercent,
+  endStage,
+  newRunState,
+  startStage,
+} from './runstate';
 
-const win = getCurrentWindow();
+const progressWindow = getCurrentWindow();
+const initialProgressLaunchId = (() => {
+  const launchIdParameter = new URLSearchParams(window.location.search).get('launch_id');
+  if (launchIdParameter === null) return null;
+  const launchId = Number(launchIdParameter);
+  return Number.isSafeInteger(launchId) && launchId > 0 ? launchId : null;
+})();
 
-interface PendingLaunch { id: number; afterRunId: number }
-interface RunRejected { launch_id: number; message: string }
+interface PendingLaunch { launchId: number; afterRunId: number }
+interface RunRejectionEvent { launch_id: number; message: string }
+interface PauseRequest { runId: number; pause: boolean }
+interface StopRequest { runId: number }
+interface PowerActionRequest { runId: number; action: PowerAction }
+
+function formatStageProgress(event: RunProgressEvent): string {
+  const itemTotal = event.items_total ?? 0;
+  const byteTotal = event.bytes_total ?? 0;
+  const completedItems = event.items_done ?? 0;
+  const completedBytes = humanSize(event.bytes_done ?? 0);
+  const itemProgress = itemTotal ? `${completedItems} / ${itemTotal}` : `${completedItems}`;
+  const byteProgress = byteTotal ? `${completedBytes} / ${humanSize(byteTotal)}` : completedBytes;
+  return `${itemProgress} items · ${byteProgress}`;
+}
+
+function formatCompletedRunStatus(summary: NonNullable<RunState['summary']>): string {
+  if (summary.cancelled) {
+    return `Cancelled — ${summary.done} applied, ${summary.skipped} skipped`;
+  }
+  return [
+    `Done — ${summary.done} applied, ${summary.skipped} skipped, ${summary.errors} errors`,
+    humanSize(summary.bytes_done ?? 0),
+    humanDuration(summary.elapsed_ms ?? 0),
+  ].join(' · ');
+}
 
 export function ProgressApp() {
-  const run = useRef<RunState>(newRunState());
-  const pendingLaunch = useRef<PendingLaunch | null>(null);
-  // Bumping this is the only thing that re-renders; the tick below decides how often that happens
-  const [, forceRender] = useState(0);
-  const rerender = useCallback(() => forceRender((n) => n + 1), []);
+  const runStateRef = useRef<RunState>(newRunState());
+  const pendingLaunchRef = useRef<PendingLaunch | null>(null);
+  const reportedWindowChromeFailuresRef = useRef(new Set<string>());
+  const [, setRenderRevision] = useState(0);
+  const requestRender = useCallback(() => setRenderRevision((revision) => revision + 1), []);
 
-  const [autoclose, setAutoclose] = useState(() => localStorage.getItem('sd.autoclose') === '1');
-  const [whenFin, setWhenFin] = useState(() => localStorage.getItem('sd.whenfin') ?? 'none');
-  const [countdown, setCountdown] = useState<{ kind: string; left: number } | null>(null);
-  const [errorsOpen, setErrorsOpen] = useState(false);
-  const [rejected, setRejected] = useState<string | null>(null);
-  /// Where the Stop button is in its own little lifecycle. A state rather than the button's caption:
-  /// the enabled test used to be `label !== '■ Stop'`, which quietly turns into "always disabled" the
-  /// day anyone edits the wording.
-  const [stop, setStop] = useState<'idle' | 'stopping' | 'finished'>('idle');
+  const [storedProgressPreferences] = useState(() => loadProgressPreferences(localStorage));
+  const [zoomPreference] = useState(() => loadZoomPreference(localStorage));
+  const [autoCloseEnabled, setAutoCloseEnabled] = useState(storedProgressPreferences.autoCloseEnabled);
+  const [whenFinishedAction, setWhenFinishedAction] = useState<WhenFinishedAction>(
+    storedProgressPreferences.whenFinishedAction,
+  );
+  const [powerActionCountdown, setPowerActionCountdown] = useState<PowerActionCountdown | null>(null);
+  const [scheduledAutoClose, setScheduledAutoClose] = useState<AutoCloseRequest | null>(null);
+  const [powerActionFailure, setPowerActionFailure] = useState<{
+    action: PowerAction;
+    runId: number;
+    error: string;
+  } | null>(null);
+  const powerActionRequestRef = useRef<PowerActionRequest | null>(null);
+  const [powerActionPending, setPowerActionPending] = useState<PowerAction | null>(null);
+  const powerActionReadyRunIdRef = useRef<number | null>(null);
+  const [errorDetailsOpen, setErrorDetailsOpen] = useState(false);
+  const [runRejectionMessage, setRunRejectionMessage] = useState<string | null>(null);
+  const countdownProgressFillRef = useRef<HTMLDivElement>(null);
+  const countdownCancelButtonRef = useRef<HTMLButtonElement>(null);
+  const countdownTitleId = useId();
+  const countdownDescriptionId = useId();
+  const pauseRequestRef = useRef<PauseRequest | null>(null);
+  const [pausePending, setPausePending] = useState<'pause' | 'resume' | null>(null);
+  const stopRequestRef = useRef<StopRequest | null>(null);
+  const closeRequestPendingRef = useRef(false);
+  const windowDestructionPendingRef = useRef(false);
+  const [stopState, setStopState] = useState<'idle' | 'stopping' | 'finished'>('idle');
+  const autoCloseEnabledRef = useRef(autoCloseEnabled);
+  autoCloseEnabledRef.current = autoCloseEnabled;
+  const whenFinishedActionRef = useRef(whenFinishedAction);
+  whenFinishedActionRef.current = whenFinishedAction;
 
   const reportControlError = useCallback((action: string, error: unknown) => {
-    run.current.errors.push({
+    runStateRef.current.errors.push({
       path: '', action: 'control', side: '', message: `${action}: ${String(error)}`, warning: false,
     });
-    setErrorsOpen(true);
-    setStop('idle');
-    rerender();
-  }, [rerender]);
+    setErrorDetailsOpen(true);
+    requestRender();
+  }, [requestRender]);
 
-  const autocloseRef = useRef(autoclose);
-  autocloseRef.current = autoclose;
-  const whenFinRef = useRef(whenFin);
-  whenFinRef.current = whenFin;
-
-  const armLaunch = useCallback((id: number) => {
-    const afterRunId = run.current.runId;
-    pendingLaunch.current = { id, afterRunId };
-    const reset = newRunState();
-    reset.runId = afterRunId;
-    run.current = reset;
-    setRejected(null);
-    setStop('idle');
-    setCountdown(null);
-    rerender();
-    void emit(`progress-window-ready-${id}`);
-  }, [rerender]);
+  const reportWindowChromeFailure = useCallback((action: string, error: unknown) => {
+    if (reportedWindowChromeFailuresRef.current.has(action)) return;
+    reportedWindowChromeFailuresRef.current.add(action);
+    runStateRef.current.errors.push({
+      path: '', action: 'window', side: '', message: `${action}: ${String(error)}`, warning: true,
+    });
+    requestRender();
+  }, [requestRender]);
 
   useEffect(() => {
-    // This window opens fresh each run, so it has to re-assert the scale the main window is using
-    void applyZoom(readZoom());
+    for (const failure of storedProgressPreferences.failures) {
+      reportControlError('Could not restore progress preferences', failure);
+    }
+  }, [reportControlError, storedProgressPreferences]);
+
+  const requestWindowDestruction = useCallback(async () => {
+    if (windowDestructionPendingRef.current) return;
+    setScheduledAutoClose(null);
+    setPowerActionCountdown(null);
+    windowDestructionPendingRef.current = true;
+    try {
+      await destroyProgressWindow();
+    } catch (error) {
+      windowDestructionPendingRef.current = false;
+      reportControlError('Could not close the progress window', error);
+    }
+  }, [reportControlError]);
+
+  const executePowerAction = useCallback(async (runId: number, action: PowerAction) => {
+    const currentRunState = runStateRef.current;
+    if (powerActionRequestRef.current !== null
+      || currentRunState.runId !== runId
+      || currentRunState.running
+      || !currentRunState.summary
+      || powerActionReadyRunIdRef.current !== runId
+      || autoCloseEnabledRef.current
+      || whenFinishedActionRef.current !== action
+    ) return;
+    const request: PowerActionRequest = { runId, action };
+    powerActionRequestRef.current = request;
+    setPowerActionPending(action);
+    setPowerActionFailure(null);
+    try {
+      await executePostRunPowerAction(runId, action);
+    } catch (error) {
+      if (powerActionRequestRef.current === request
+        && runStateRef.current.runId === runId
+        && powerActionReadyRunIdRef.current === runId
+        && !autoCloseEnabledRef.current
+        && whenFinishedActionRef.current === action
+      ) {
+        setPowerActionFailure({ action, runId, error: String(error) });
+        const actionDescription = action === 'sleep'
+          ? 'put the computer to sleep'
+          : 'shut down the computer';
+        reportControlError(`Could not ${actionDescription}`, error);
+      }
+    } finally {
+      if (powerActionRequestRef.current === request) {
+        powerActionRequestRef.current = null;
+        setPowerActionPending(null);
+      }
+    }
+  }, [reportControlError]);
+
+  const reconcilePowerActionCountdown = useCallback((
+    nextWhenFinishedAction: WhenFinishedAction,
+    nextAutoCloseEnabled: boolean,
+  ) => {
+    const currentRunState = runStateRef.current;
+    setPowerActionCountdown(derivePowerActionCountdown({
+      readyRunId: powerActionReadyRunIdRef.current,
+      currentRunId: currentRunState.runId,
+      summary: currentRunState.summary,
+      applying: currentRunState.applying,
+      autoCloseEnabled: nextAutoCloseEnabled,
+      whenFinishedAction: nextWhenFinishedAction,
+    }));
   }, []);
 
-  // The instantaneous rate labels use the 4 s window; they are painted inside <Graph> at 10 Hz
-  const rateBytes = useCallback((st: RunState) => {
-    const r = windowRate(st, 4000);
-    return r ? `${(r.bps / (1 << 20)).toFixed(2)} MiB/s` : '';
-  }, []);
-  const rateItems = useCallback((st: RunState) => {
-    const r = windowRate(st, 4000);
-    return r ? `${r.ips.toFixed(0)} items/s` : '';
+  const resetRunControlRequests = useCallback(() => {
+    pauseRequestRef.current = null;
+    stopRequestRef.current = null;
+    setPausePending(null);
+    setStopState('idle');
   }, []);
 
-  // Countdown before sleep / shut down — 10 s, cancellable
+  const armLaunch = useCallback((launchId: number) => {
+    const afterRunId = runStateRef.current.runId;
+    pendingLaunchRef.current = { launchId, afterRunId };
+    const resetRunState = newRunState();
+    resetRunState.runId = afterRunId;
+    runStateRef.current = resetRunState;
+    setRunRejectionMessage(null);
+    resetRunControlRequests();
+    setScheduledAutoClose(null);
+    setPowerActionCountdown(null);
+    setPowerActionFailure(null);
+    powerActionReadyRunIdRef.current = null;
+    requestRender();
+    void acknowledgeProgressLaunch(launchId).catch((error) => {
+      reportControlError('Could not acknowledge the pending Apply launch', error);
+    });
+  }, [reportControlError, requestRender, resetRunControlRequests]);
+
   useEffect(() => {
-    if (!countdown) return;
-    if (countdown.left <= 0) {
-      setCountdown(null);
-      postSyncAction(countdown.kind).catch(() => {});
+    if (zoomPreference.warning) {
+      reportWindowChromeFailure('Could not restore the progress-window zoom preference', zoomPreference.warning);
+    }
+    void applyZoom(zoomPreference.factor).catch((error) => {
+      reportWindowChromeFailure('Could not restore the progress-window zoom', error);
+    });
+  }, [reportWindowChromeFailure, zoomPreference]);
+
+  const formatByteRate = useCallback((runState: RunState) => {
+    const rate = calculateWindowRate(runState, 4000);
+    return rate ? `${(rate.bytesPerSecond / (1 << 20)).toFixed(2)} MiB/s` : '';
+  }, []);
+  const formatItemRate = useCallback((runState: RunState) => {
+    const rate = calculateWindowRate(runState, 4000);
+    return rate ? `${rate.itemsPerSecond.toFixed(0)} items/s` : '';
+  }, []);
+
+  const cancelPowerActionCountdown = useCallback(() => setPowerActionCountdown(null), []);
+  const powerActionCountdownIdentity = powerActionCountdown
+    ? `${powerActionCountdown.runId}:${powerActionCountdown.action}`
+    : null;
+
+  useEffect(() => {
+    if (!powerActionCountdown) return;
+    if (powerActionCountdown.secondsRemaining <= 0) {
+      setPowerActionCountdown(null);
+      void executePowerAction(powerActionCountdown.runId, powerActionCountdown.action);
       return;
     }
-    const t = setTimeout(() => setCountdown((c) => (c ? { ...c, left: c.left - 1 } : c)), 1000);
-    return () => clearTimeout(t);
-  }, [countdown]);
+    const countdownTimerId = window.setTimeout(() => {
+      setPowerActionCountdown((currentCountdown) => (
+        currentCountdown
+        && currentCountdown.runId === powerActionCountdown.runId
+        && currentCountdown.action === powerActionCountdown.action
+          ? { ...currentCountdown, secondsRemaining: currentCountdown.secondsRemaining - 1 }
+          : currentCountdown
+      ));
+    }, 1000);
+    return () => window.clearTimeout(countdownTimerId);
+  }, [executePowerAction, powerActionCountdown]);
 
-  const onEvent = useCallback((ev: RunEv) => {
-    const s = run.current;
-    if (ev.purpose === 'compare') return;   // compare belongs to the main-window panel; this window only shows apply
-    const pending = pendingLaunch.current;
-    if (pending && ev.run_id <= pending.afterRunId) return;
-    if (ev.run_id < s.runId) return;        // late event from an already-cancelled run
-    if (ev.run_id > s.runId) {
-      const closeAfterStop = s.closeAfterStop;
-      run.current = newRunState(ev.run_id, ev.ts_ms);
-      run.current.closeAfterStop = closeAfterStop;
-      setRejected(null);
-      setStop('idle');
-      setCountdown(null);
+  useLayoutEffect(() => {
+    if (powerActionCountdownIdentity === null) return;
+    countdownCancelButtonRef.current?.focus();
+  }, [powerActionCountdownIdentity]);
+
+  useEffect(() => {
+    if (powerActionCountdownIdentity === null) return;
+    const handleCountdownKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      cancelPowerActionCountdown();
+    };
+    window.addEventListener('keydown', handleCountdownKeyDown);
+    return () => window.removeEventListener('keydown', handleCountdownKeyDown);
+  }, [cancelPowerActionCountdown, powerActionCountdownIdentity]);
+
+  useLayoutEffect(() => {
+    const progressFill = countdownProgressFillRef.current;
+    if (!progressFill || !powerActionCountdown) return;
+    progressFill.style.setProperty(
+      '--countdown-progress-width',
+      `${powerActionCountdown.secondsRemaining * 10}%`,
+    );
+    return () => { progressFill.style.removeProperty('--countdown-progress-width'); };
+  }, [powerActionCountdown]);
+
+  useEffect(() => {
+    if (!scheduledAutoClose) return;
+    const autoCloseTimerId = window.setTimeout(() => {
+      const currentRunState = runStateRef.current;
+      const validatedAutoCloseRequest = deriveAutoCloseRequest({
+        completedRunId: scheduledAutoClose.runId,
+        currentRunId: currentRunState.runId,
+        summary: currentRunState.summary,
+        applying: currentRunState.applying,
+        autoCloseEnabled: autoCloseEnabledRef.current,
+        closeAfterStop: currentRunState.closeAfterStop,
+      });
+      if (!validatedAutoCloseRequest) {
+        setScheduledAutoClose((request) => (request === scheduledAutoClose ? null : request));
+        return;
+      }
+      setScheduledAutoClose((request) => (request === scheduledAutoClose ? null : request));
+      void requestWindowDestruction();
+    }, 1200);
+    return () => window.clearTimeout(autoCloseTimerId);
+  }, [requestWindowDestruction, scheduledAutoClose]);
+
+  const handleRunProgressEvent = useCallback((event: RunProgressEvent) => {
+    const previousRunState = runStateRef.current;
+    if (event.purpose === 'compare') return;
+    const pendingLaunch = pendingLaunchRef.current;
+    if (pendingLaunch && event.run_id <= pendingLaunch.afterRunId) return;
+    if (event.run_id < previousRunState.runId) return;
+    if (event.run_id > previousRunState.runId) {
+      const closeAfterStop = previousRunState.closeAfterStop;
+      runStateRef.current = newRunState(event.run_id, event.ts_ms);
+      runStateRef.current.closeAfterStop = closeAfterStop;
+      if (powerActionReadyRunIdRef.current !== null
+        && powerActionReadyRunIdRef.current < event.run_id) {
+        powerActionReadyRunIdRef.current = null;
+      }
+      setRunRejectionMessage(null);
+      resetRunControlRequests();
+      setScheduledAutoClose(null);
+      setPowerActionCountdown(null);
+      setPowerActionFailure(null);
     }
-    const st = run.current;
+    const currentRunState = runStateRef.current;
 
-    switch (ev.kind) {
+    switch (event.kind) {
       case 'phase_start': {
-        const p = ev.phase!;
-        st.phase = p;
-        let row = st.stages.find((x) => x.phase === p);
-        if (!row) { row = { phase: p, detail: '', active: true, done: false }; st.stages.push(row); }
-        startStage(row);
-        if (ev.label) row.detail = ev.label;
-        st.applying = true;
-        // The headline meter and graphs describe one coherent active phase. Reusing apply's done
-        // counters with refresh/ship totals produced arbitrary percentages and negative rates.
-        st.totals = { items: ev.items_total ?? 0, bytes: ev.bytes_total ?? 0 };
-        st.dones = { items: 0, bytes: 0 };
-        st.samples = [{ t: activeNow(st), b: 0, i: 0 }];
-        st.currentPath = '';
+        const phase = event.phase!;
+        currentRunState.phase = phase;
+        let stage = currentRunState.stages.find((candidate) => candidate.phase === phase);
+        if (!stage) {
+          stage = { phase, detail: '', active: true, done: false };
+          currentRunState.stages.push(stage);
+        }
+        startStage(stage);
+        if (event.label) stage.detail = event.label;
+        currentRunState.applying = true;
+        // Each Apply phase owns a counter epoch; refresh and ship totals cannot share its meter.
+        currentRunState.totals = { items: event.items_total ?? 0, bytes: event.bytes_total ?? 0 };
+        currentRunState.completed = { items: 0, bytes: 0 };
+        currentRunState.samples = [{
+          activeElapsedMs: activeElapsedMs(currentRunState),
+          bytesDone: 0,
+          itemsDone: 0,
+        }];
+        currentRunState.currentPath = '';
         break;
       }
       case 'totals':
-        if (ev.phase === st.phase) {
-          st.totals = { items: ev.items_total ?? 0, bytes: ev.bytes_total ?? 0 };
-          st.dones = ev.reset
-            ? { items: ev.items_done ?? 0, bytes: ev.bytes_done ?? 0 }
+        if (event.phase === currentRunState.phase) {
+          currentRunState.totals = {
+            items: event.items_total ?? 0,
+            bytes: event.bytes_total ?? 0,
+          };
+          currentRunState.completed = event.reset
+            ? { items: event.items_done ?? 0, bytes: event.bytes_done ?? 0 }
             : {
-                items: Math.max(st.dones.items, ev.items_done ?? 0),
-                bytes: Math.max(st.dones.bytes, ev.bytes_done ?? 0),
+                items: Math.max(currentRunState.completed.items, event.items_done ?? 0),
+                bytes: Math.max(currentRunState.completed.bytes, event.bytes_done ?? 0),
               };
-          const sample = { t: activeNow(st), b: st.dones.bytes, i: st.dones.items };
-          if (ev.reset) st.samples = [sample];
-          else st.samples.push(sample);
+          const sample: ProgressRateSample = {
+            activeElapsedMs: activeElapsedMs(currentRunState),
+            bytesDone: currentRunState.completed.bytes,
+            itemsDone: currentRunState.completed.items,
+          };
+          if (event.reset) currentRunState.samples = [sample];
+          else currentRunState.samples.push(sample);
         }
         break;
       case 'progress': {
-        let row = st.stages.find((x) => x.phase === ev.phase);
-        if (!row) { row = { phase: ev.phase!, detail: '', active: true, done: false }; st.stages.push(row); }
-        const it = ev.items_total ?? 0, bt = ev.bytes_total ?? 0;
-        row.detail = `${ev.items_done ?? 0}${it ? ` / ${it}` : ''} items · ${humanSize(ev.bytes_done ?? 0)}${bt ? ` / ${humanSize(bt)}` : ''}`;
-        if (ev.phase === st.phase) {
+        let stage = currentRunState.stages.find((candidate) => candidate.phase === event.phase);
+        if (!stage) {
+          stage = { phase: event.phase!, detail: '', active: true, done: false };
+          currentRunState.stages.push(stage);
+        }
+        stage.detail = formatStageProgress(event);
+        if (event.phase === currentRunState.phase) {
           // Worker events can reach the webview in a different order. Totals is the explicit epoch
           // reset (walk → hash); inside an epoch, counters never regress.
-          st.dones = {
-            items: Math.max(st.dones.items, ev.items_done ?? 0),
-            bytes: Math.max(st.dones.bytes, ev.bytes_done ?? 0),
+          currentRunState.completed = {
+            items: Math.max(currentRunState.completed.items, event.items_done ?? 0),
+            bytes: Math.max(currentRunState.completed.bytes, event.bytes_done ?? 0),
           };
-          st.totals = { items: ev.items_total ?? st.totals.items, bytes: ev.bytes_total ?? st.totals.bytes };
-          st.currentPath = ev.current_path ?? st.currentPath;
-          st.samples.push({ t: activeNow(st), b: st.dones.bytes, i: st.dones.items } as Sample);
-          if (st.samples.length > 4000) st.samples.splice(0, 1000);
+          currentRunState.totals = {
+            items: event.items_total ?? currentRunState.totals.items,
+            bytes: event.bytes_total ?? currentRunState.totals.bytes,
+          };
+          currentRunState.currentPath = event.current_path ?? currentRunState.currentPath;
+          currentRunState.samples.push({
+            activeElapsedMs: activeElapsedMs(currentRunState),
+            bytesDone: currentRunState.completed.bytes,
+            itemsDone: currentRunState.completed.items,
+          });
+          if (currentRunState.samples.length > 4000) currentRunState.samples.splice(0, 1000);
         }
         break;
       }
       case 'phase_end': {
-        const row = st.stages.find((x) => x.phase === ev.phase);
-        if (row) {
-          endStage(row, ev.status);
-          const it = ev.items_total ?? 0, bt = ev.bytes_total ?? 0;
-          row.detail = `${ev.items_done ?? 0}${it ? ` / ${it}` : ''} items · ${humanSize(ev.bytes_done ?? 0)}${bt ? ` / ${humanSize(bt)}` : ''}`;
+        const stage = currentRunState.stages.find((candidate) => candidate.phase === event.phase);
+        if (stage) {
+          endStage(stage, event.status);
+          stage.detail = formatStageProgress(event);
         }
-        if (ev.phase === st.phase) {
-          st.dones = { items: ev.items_done ?? st.dones.items, bytes: ev.bytes_done ?? st.dones.bytes };
-          st.totals = { items: ev.items_total ?? st.totals.items, bytes: ev.bytes_total ?? st.totals.bytes };
-          st.samples.push({ t: activeNow(st), b: st.dones.bytes, i: st.dones.items });
+        if (event.phase === currentRunState.phase) {
+          currentRunState.completed = {
+            items: event.items_done ?? currentRunState.completed.items,
+            bytes: event.bytes_done ?? currentRunState.completed.bytes,
+          };
+          currentRunState.totals = {
+            items: event.items_total ?? currentRunState.totals.items,
+            bytes: event.bytes_total ?? currentRunState.totals.bytes,
+          };
+          currentRunState.samples.push({
+            activeElapsedMs: activeElapsedMs(currentRunState),
+            bytesDone: currentRunState.completed.bytes,
+            itemsDone: currentRunState.completed.items,
+          });
         }
         break;
       }
       case 'error':
-        st.errors.push({
-          path: ev.path ?? '', action: ev.action ?? '', side: ev.side ?? '',
-          message: ev.message ?? '', warning: ev.action === 'warning',
+        currentRunState.errors.push({
+          path: event.path ?? '', action: event.action ?? '', side: event.side ?? '',
+          message: event.message ?? '', warning: event.action === 'warning',
         });
-        rerender();
+        requestRender();
         break;
-      // v0.10: pipeline narrative. info stays out of this panel (it would drown the real problems), only
-      // warn/error get in — they used to go to stderr only, which in a windowed build means never said at all.
       case 'log':
-        if (ev.level === 'warn' || ev.level === 'error') {
-          st.errors.push({
-            path: '', action: ev.scope ?? 'log', side: '',
-            message: ev.message ?? '', warning: ev.level === 'warn',
+        if (event.level === 'warn' || event.level === 'error') {
+          currentRunState.errors.push({
+            path: '', action: event.scope ?? 'log', side: '',
+            message: event.message ?? '', warning: event.level === 'warn',
           });
-          rerender();
+          requestRender();
         }
         break;
       case 'paused':
-        st.pausedSince = Date.now();
-        rerender();
+        currentRunState.pausedSince = Date.now();
+        requestRender();
         break;
       case 'resumed':
-        st.pausedSince = 0;
-        st.pausedMs = ev.paused_ms ?? st.pausedMs;
-        rerender();
+        currentRunState.pausedSince = 0;
+        currentRunState.pausedMs = event.paused_ms ?? currentRunState.pausedMs;
+        requestRender();
         break;
       case 'summary': {
-        pendingLaunch.current = null;
-        st.summary = ev;
-        st.running = false;
-        st.pausedSince = 0;
-        st.pausedMs = ev.paused_ms ?? st.pausedMs;
-        // push dones to completion in the final state (throttling can swallow the last Progress event)
-        if (!ev.cancelled && (ev.errors ?? 0) === 0 && st.totals.bytes + st.totals.items > 0) {
-          st.dones = { items: st.totals.items, bytes: st.totals.bytes };
-          st.samples.push({ t: activeNow(st), b: st.dones.bytes, i: st.dones.items });
+        pendingLaunchRef.current = null;
+        pauseRequestRef.current = null;
+        stopRequestRef.current = null;
+        setPausePending(null);
+        setStopState('finished');
+        setScheduledAutoClose(null);
+        currentRunState.summary = event;
+        currentRunState.running = false;
+        currentRunState.pausedSince = 0;
+        currentRunState.pausedMs = event.paused_ms ?? currentRunState.pausedMs;
+        // Throttling can omit the final progress event before a successful summary arrives.
+        if (!event.cancelled
+          && (event.errors ?? 0) === 0
+          && currentRunState.totals.bytes + currentRunState.totals.items > 0
+        ) {
+          currentRunState.completed = {
+            items: currentRunState.totals.items,
+            bytes: currentRunState.totals.bytes,
+          };
+          currentRunState.samples.push({
+            activeElapsedMs: activeElapsedMs(currentRunState),
+            bytesDone: currentRunState.completed.bytes,
+            itemsDone: currentRunState.completed.items,
+          });
         }
-        for (const row of st.stages) row.active = false;
-        const cur = st.stages.find((x) => x.phase === st.phase);
-        if (cur && !cur.done && !cur.failed && !cur.cancelled) {
-          cur.cancelled = !!ev.cancelled;
-          cur.failed = !ev.cancelled;
+        for (const stage of currentRunState.stages) stage.active = false;
+        const finalStage = currentRunState.stages.find(
+          (candidate) => candidate.phase === currentRunState.phase,
+        );
+        if (finalStage && !finalStage.done && !finalStage.failed && !finalStage.cancelled) {
+          finalStage.cancelled = !!event.cancelled;
+          finalStage.failed = !event.cancelled;
         }
-        rerender();
-        if (st.closeAfterStop) { win.close().catch(() => {}); break; }
-        if (ev.cancelled) break;
-        if ((ev.errors ?? 0) === 0 && autocloseRef.current && st.applying) {
-          setTimeout(() => { if (run.current.summary) win.close().catch(() => {}); }, 1200);
+        requestRender();
+        if (currentRunState.closeAfterStop) {
+          void requestWindowDestruction();
           break;
         }
-        if ((ev.errors ?? 0) === 0 && whenFinRef.current !== 'none' && st.applying) {
-          setCountdown({ kind: whenFinRef.current, left: 10 });
+        if (event.cancelled) break;
+
+        const autoCloseRequest = deriveAutoCloseRequest({
+          completedRunId: event.run_id,
+          currentRunId: currentRunState.runId,
+          summary: event,
+          applying: currentRunState.applying,
+          autoCloseEnabled: autoCloseEnabledRef.current,
+          closeAfterStop: currentRunState.closeAfterStop,
+        });
+        if (autoCloseRequest) {
+          setScheduledAutoClose(autoCloseRequest);
+          break;
         }
+
+        const nextPowerActionCountdown = derivePowerActionCountdown({
+          readyRunId: powerActionReadyRunIdRef.current,
+          currentRunId: currentRunState.runId,
+          summary: event,
+          applying: currentRunState.applying,
+          autoCloseEnabled: autoCloseEnabledRef.current,
+          whenFinishedAction: whenFinishedActionRef.current,
+        });
+        if (nextPowerActionCountdown) setPowerActionCountdown(nextPowerActionCountdown);
         break;
       }
     }
-  }, [rerender]);
+  }, [requestRender, requestWindowDestruction, resetRunControlRequests]);
 
   useEffect(() => {
     let disposed = false;
-    let unlisten: (() => void) | undefined;
-    let ready = false;
+    let stopListening: (() => void) | undefined;
+    let replayMerged = false;
     let lastSequence = 0;
-    const queued: RunEv[] = [];
-    const publish = (event: RunEv) => {
-      if (!ready) {
-        queued.push(event);
+    const queuedEvents: RunProgressEvent[] = [];
+    const publishOrderedEvent = (event: RunProgressEvent) => {
+      if (!replayMerged) {
+        queuedEvents.push(event);
         return;
       }
       if (event.sequence <= lastSequence) return;
       lastSequence = event.sequence;
-      onEvent(event);
+      handleRunProgressEvent(event);
     };
-    void Promise.all([
-      listen<RunEv>('run-progress', (e) => publish(e.payload)),
-      listen<RunRejected>('run-rejected', (e) => {
-        const pending = pendingLaunch.current;
-        if (!pending || e.payload.launch_id !== pending.id) return;
-        pendingLaunch.current = null;
-        const closeAfterStop = run.current.closeAfterStop;
-        const reset = newRunState();
-        reset.runId = pending.afterRunId;
-        run.current = reset;
-        setRejected(e.payload.message);
-        setStop('finished');
-        rerender();
-        if (closeAfterStop) destroyProgressWindow().catch(() => {});
+    void Promise.allSettled([
+      listen<RunProgressEvent>('run-progress', (event) => publishOrderedEvent(event.payload)),
+      listen<RunRejectionEvent>('run-rejected', (event) => {
+        const pendingLaunch = pendingLaunchRef.current;
+        if (!pendingLaunch || event.payload.launch_id !== pendingLaunch.launchId) return;
+        pendingLaunchRef.current = null;
+        powerActionReadyRunIdRef.current = null;
+        setScheduledAutoClose(null);
+        const closeAfterStop = runStateRef.current.closeAfterStop;
+        const resetRunState = newRunState();
+        resetRunState.runId = pendingLaunch.afterRunId;
+        runStateRef.current = resetRunState;
+        setRunRejectionMessage(event.payload.message);
+        resetRunControlRequests();
+        setStopState('finished');
+        requestRender();
+        if (closeAfterStop) void requestWindowDestruction();
       }),
-      listen<number>('progress-window-arm', (e) => armLaunch(e.payload)),
-    ]).then(async (stops) => {
-      if (disposed) {
-        for (const stopListening of stops) stopListening();
+      listen<number>('progress-window-arm', (event) => armLaunch(event.payload)),
+      listen<PostRunPowerActionReadyDto>('post-run-power-action-ready', (event) => {
+        const runId = event.payload.run_id;
+        const currentRunState = runStateRef.current;
+        if (runId < currentRunState.runId) return;
+        powerActionReadyRunIdRef.current = runId;
+        const nextPowerActionCountdown = derivePowerActionCountdown({
+          readyRunId: runId,
+          currentRunId: currentRunState.runId,
+          summary: currentRunState.summary,
+          applying: currentRunState.applying,
+          autoCloseEnabled: autoCloseEnabledRef.current,
+          whenFinishedAction: whenFinishedActionRef.current,
+        });
+        if (nextPowerActionCountdown) setPowerActionCountdown(nextPowerActionCountdown);
+      }),
+    ]).then(async (listenerResults) => {
+      const stopListeningCallbacks = listenerResults.flatMap((result) => (
+        result.status === 'fulfilled' ? [result.value] : []
+      ));
+      const listenerFailures = listenerResults.flatMap((result) => (
+        result.status === 'rejected' ? [String(result.reason)] : []
+      ));
+      if (listenerFailures.length > 0) {
+        for (const stopListener of stopListeningCallbacks) stopListener();
+        if (!disposed) {
+          reportControlError('Could not attach all progress event listeners', listenerFailures.join(' · '));
+        }
         return;
       }
-      unlisten = () => { for (const stopListening of stops) stopListening(); };
+      if (disposed) {
+        for (const stopListener of stopListeningCallbacks) stopListener();
+        return;
+      }
+      stopListening = () => {
+        for (const stopListener of stopListeningCallbacks) stopListener();
+      };
       try {
-        const replay = await replayRunEvents('apply');
+        const replayedEvents = await replayApplyEvents();
         if (!disposed) {
-          const pending = mergeRunEventReplay(replay, queued);
-          queued.length = 0;
-          ready = true;
-          for (const event of pending) publish(event);
+          const pendingEvents = mergeRunEventReplay(replayedEvents, queuedEvents);
+          queuedEvents.length = 0;
+          replayMerged = true;
+          for (const event of pendingEvents) publishOrderedEvent(event);
         }
       } catch (error) {
         if (disposed) return;
-        ready = true;
-        for (const event of queued.splice(0)) publish(event);
+        replayMerged = true;
+        for (const event of queuedEvents.splice(0)) publishOrderedEvent(event);
         reportControlError('Could not restore progress after reconnect', error);
       }
       if (disposed) return;
-      await emit('progress-window-mounted');
+      if (initialProgressLaunchId === null) {
+        reportControlError('Could not announce the mounted progress window', 'missing or invalid launch identity');
+        return;
+      }
+      try { await reportProgressWindowMounted(initialProgressLaunchId); }
+      catch (error) {
+        if (!disposed) reportControlError('Could not announce the mounted progress window', error);
+      }
+    }).catch((error) => {
+      if (!disposed) reportControlError('Progress event setup failed', error);
     });
     return () => {
       disposed = true;
-      unlisten?.();
+      stopListening?.();
     };
-  }, [armLaunch, onEvent, reportControlError, rerender]);
+  }, [
+    armLaunch,
+    handleRunProgressEvent,
+    reportControlError,
+    requestRender,
+    requestWindowDestruction,
+    resetRunControlRequests,
+  ]);
 
-  // The numeric readouts step every 500ms (same divider as FFS — figures that flip ten times a second
-  // are unreadable). The graphs keep their own 100ms repaint inside <Graph>, off the React tree.
+  // Numeric readouts update less often than graphs so rapidly changing figures remain readable.
   useEffect(() => {
-    const id = window.setInterval(() => { if (run.current.runId >= 0) rerender(); }, 500);
-    return () => window.clearInterval(id);
-  }, [rerender]);
+    const renderIntervalId = window.setInterval(() => {
+      if (runStateRef.current.runId >= 0) requestRender();
+    }, 500);
+    return () => window.clearInterval(renderIntervalId);
+  }, [requestRender]);
 
-  // Window title + taskbar (fails silently: macOS has no taskbar progress)
-  const s = run.current;
-  const pct = percent(s);
-  const paused = s.pausedSince > 0;
-  useEffect(() => {
-    const title = s.summary
-      ? (s.summary.cancelled ? 'Stopped — SyncDash' : 'Done — SyncDash')
-      : rejected ? 'Could not start — SyncDash'
-      : s.applying ? `${Math.round(pct)}% — SyncDash` : `${s.phase ? PHASE_LABEL[s.phase] : 'Running'} — SyncDash`;
-    win.setTitle(title).catch(() => {});
-    if (s.summary) win.setProgressBar({ status: ProgressBarStatus.None }).catch(() => {});
-    else if (s.applying) {
-      win.setProgressBar({
-        status: paused ? ProgressBarStatus.Paused : ProgressBarStatus.Normal,
-        progress: Math.round(pct),
-      }).catch(() => {});
+  const togglePause = useCallback(async () => {
+    const currentRunState = runStateRef.current;
+    if (pauseRequestRef.current !== null
+      || stopRequestRef.current !== null
+      || stopState !== 'idle'
+      || !currentRunState.running
+      || currentRunState.summary
+      || currentRunState.runId < 0
+    ) return;
+
+    const request: PauseRequest = {
+      runId: currentRunState.runId,
+      pause: currentRunState.pausedSince === 0,
+    };
+    const previousPausedSince = currentRunState.pausedSince;
+    pauseRequestRef.current = request;
+    setPausePending(request.pause ? 'pause' : 'resume');
+    currentRunState.pausedSince = request.pause ? Date.now() : 0;
+    requestRender();
+
+    try {
+      const accepted = await setApplyPaused(request.runId, request.pause);
+      if (!accepted) throw new Error('the run already finished');
+    } catch (error) {
+      if (pauseRequestRef.current === request && runStateRef.current.runId === request.runId) {
+        runStateRef.current.pausedSince = previousPausedSince;
+        reportControlError(request.pause ? 'Could not pause this run' : 'Could not resume this run', error);
+        requestRender();
+      }
+    } finally {
+      if (pauseRequestRef.current === request) {
+        pauseRequestRef.current = null;
+        setPausePending(null);
+      }
     }
-  }, [paused, pct, rejected, s.applying, s.phase, s.summary]);
+  }, [reportControlError, requestRender, stopState]);
 
-  // Close button = FFS semantics: while running, cooperatively cancel first and leave once Summary arrives
-  useEffect(() => {
-    const un = win.onCloseRequested(async (e) => {
-      e.preventDefault();
-      // React's view may still describe the previous run while a new launch is being armed. Ask
-      // the backend first: clearing a pending reservation or cancelling the matching interactive
-      // run is atomic with begin_run_for_launch, so a close can never start a headless sync.
-      run.current.closeAfterStop = true;
-      let launchState: Awaited<ReturnType<typeof closeProgressLaunch>>;
-      try { launchState = await closeProgressLaunch(); }
-      catch (error) { reportControlError('Could not inspect the active launch before closing', error); return; }
-      let current = run.current;
-      current.closeAfterStop = true;
-      if (launchState === 'pending') {
-        pendingLaunch.current = null;
-        destroyProgressWindow().catch(() => {});
-        return;
-      }
-      if (launchState === 'active') {
-        if (current.summary) destroyProgressWindow().catch(() => {});
-        else setStop('stopping');
-        return;
-      }
+  const stopRun = useCallback(async () => {
+    const currentRunState = runStateRef.current;
+    if (stopRequestRef.current !== null
+      || !currentRunState.running
+      || currentRunState.summary
+      || currentRunState.runId < 0
+    ) return;
 
-      // No interactive launch is pending/active. The window can still be showing an unattended
-      // apply; retain the prior cooperative-cancel behavior for that case.
-      if (current.running && !current.summary) {
-        setStop('stopping');
-        if (current.runId < 0) return;
-        if (current.pausedSince) {
-          current.pausedSince = 0;
-          try { await pauseRun(current.runId, false); }
-          catch (error) { reportControlError('Could not resume before stopping', error); return; }
-        }
-        let had: boolean;
-        try { had = await cancelRun(current.runId); }
-        catch (error) { reportControlError('Could not stop this run', error); return; }
-        if (!had) {
-          // Catch a launch reserved while cancelRun was in flight before destroying the window.
-          let racedLaunch: Awaited<ReturnType<typeof closeProgressLaunch>>;
-          try { racedLaunch = await closeProgressLaunch(); }
-          catch (error) { reportControlError('Could not inspect a raced launch before closing', error); return; }
-          current = run.current;
-          current.closeAfterStop = true;
-          if (racedLaunch === 'active') {
-            setStop('stopping');
-            return;
-          }
-          if (racedLaunch === 'pending') pendingLaunch.current = null;
-        } else {
+    const request: StopRequest = { runId: currentRunState.runId };
+    const previousPausedSince = currentRunState.pausedSince;
+    stopRequestRef.current = request;
+    pauseRequestRef.current = null;
+    setPausePending(null);
+    setStopState('stopping');
+    let resumeAccepted = previousPausedSince === 0;
+    let failureAction = 'Could not stop this run';
+
+    try {
+      if (previousPausedSince !== 0) {
+        failureAction = 'Could not resume before stopping';
+        currentRunState.pausedSince = 0;
+        requestRender();
+        const resumed = await setApplyPaused(request.runId, false);
+        if (stopRequestRef.current !== request || runStateRef.current.runId !== request.runId) return;
+        if (!resumed) {
+          setStopState('finished');
           return;
         }
+        resumeAccepted = true;
       }
-      destroyProgressWindow().catch(() => {});
+
+      failureAction = 'Could not stop this run';
+      const cancellationRequested = await cancelApplyRun(request.runId);
+      if (stopRequestRef.current !== request || runStateRef.current.runId !== request.runId) return;
+      if (!cancellationRequested) setStopState('finished');
+    } catch (error) {
+      if (stopRequestRef.current === request && runStateRef.current.runId === request.runId) {
+        if (!resumeAccepted && previousPausedSince !== 0) {
+          runStateRef.current.pausedSince = previousPausedSince;
+        }
+        setStopState('idle');
+        reportControlError(failureAction, error);
+        requestRender();
+      }
+    } finally {
+      if (stopRequestRef.current === request) stopRequestRef.current = null;
+    }
+  }, [reportControlError, requestRender]);
+
+  const currentRunState = runStateRef.current;
+  const completionPercentage = completionPercent(currentRunState);
+  const runPaused = currentRunState.pausedSince > 0;
+  useEffect(() => {
+    const title = currentRunState.summary
+      ? (currentRunState.summary.cancelled ? 'Stopped — SyncDash' : 'Done — SyncDash')
+      : runRejectionMessage ? 'Could not start — SyncDash'
+      : currentRunState.applying
+        ? `${Math.round(completionPercentage)}% — SyncDash`
+        : `${currentRunState.phase ? PHASE_LABELS[currentRunState.phase] : 'Running'} — SyncDash`;
+    void progressWindow.setTitle(title).catch((error) => {
+      reportWindowChromeFailure('Could not update the progress window title', error);
     });
-    return () => { un.then((f) => f()); };
-  }, [reportControlError]);
+    if (currentRunState.summary) {
+      void progressWindow.setProgressBar({ status: ProgressBarStatus.None }).catch((error) => {
+        reportWindowChromeFailure('Could not clear operating-system progress', error);
+      });
+    } else if (currentRunState.applying) {
+      void progressWindow.setProgressBar({
+        status: runPaused ? ProgressBarStatus.Paused : ProgressBarStatus.Normal,
+        progress: Math.round(completionPercentage),
+      }).catch((error) => {
+        reportWindowChromeFailure('Could not update operating-system progress', error);
+      });
+    }
+  }, [
+    completionPercentage,
+    currentRunState.applying,
+    currentRunState.phase,
+    currentRunState.summary,
+    reportWindowChromeFailure,
+    runPaused,
+    runRejectionMessage,
+  ]);
 
-  const r60 = windowRate(s, 60000);
-  const nErr = s.errors.filter((e) => !e.warning).length;
-  const nWarn = s.errors.length - nErr;
+  useEffect(() => {
+    let disposed = false;
+    let removeCloseListener: (() => void) | null = null;
+    void progressWindow.onCloseRequested(async (event) => {
+      event.preventDefault();
+      if (closeRequestPendingRef.current || windowDestructionPendingRef.current) return;
+      closeRequestPendingRef.current = true;
+      setScheduledAutoClose(null);
+      setPowerActionCountdown(null);
+      pauseRequestRef.current = null;
+      stopRequestRef.current = null;
+      setPausePending(null);
+      try {
+        // React may still describe the previous run while a launch is being armed. The backend owns
+        // the atomic reservation-to-Apply transition, so closing cannot start a headless sync.
+        runStateRef.current.closeAfterStop = true;
+        let closeDecision: Awaited<ReturnType<typeof beginProgressWindowClose>>;
+        try { closeDecision = await beginProgressWindowClose(); }
+        catch (error) { reportControlError('Could not inspect the active launch before closing', error); return; }
+        let latestRunState = runStateRef.current;
+        latestRunState.closeAfterStop = true;
+        if (closeDecision.decision === 'pending_launch_cancelled') {
+          pendingLaunchRef.current = null;
+          void requestWindowDestruction();
+          return;
+        }
+        if (closeDecision.decision === 'active_run_cancellation_requested') {
+          if (latestRunState.runId === closeDecision.run_id && latestRunState.summary) {
+            void requestWindowDestruction();
+          } else {
+            setStopState('stopping');
+          }
+          return;
+        }
 
-  const countersExhausted = s.totals.items + s.totals.bytes > 0
-    && (s.totals.items === 0 || s.dones.items >= s.totals.items)
-    && (s.totals.bytes === 0 || s.dones.bytes >= s.totals.bytes);
+        // An unattended Apply still needs cooperative cancellation before window destruction.
+        if (latestRunState.running && !latestRunState.summary) {
+          const runId = latestRunState.runId;
+          setStopState('stopping');
+          if (runId < 0) {
+            setStopState('idle');
+            return;
+          }
+          if (latestRunState.pausedSince) {
+            const previousPausedSince = latestRunState.pausedSince;
+            latestRunState.pausedSince = 0;
+            requestRender();
+            try { await setApplyPaused(runId, false); }
+            catch (error) {
+              if (runStateRef.current.runId === runId) {
+                runStateRef.current.pausedSince = previousPausedSince;
+              }
+              setStopState('idle');
+              reportControlError('Could not resume before stopping', error);
+              return;
+            }
+          }
+          let cancellationRequested: boolean;
+          try { cancellationRequested = await cancelApplyRun(runId); }
+          catch (error) {
+            setStopState('idle');
+            reportControlError('Could not stop this run', error);
+            return;
+          }
+          if (!cancellationRequested) {
+            // Catch a launch reserved while cancelApplyRun was in flight before destroying the window.
+            let racedDecision: Awaited<ReturnType<typeof beginProgressWindowClose>>;
+            try { racedDecision = await beginProgressWindowClose(); }
+            catch (error) {
+              setStopState('idle');
+              reportControlError('Could not inspect a raced launch before closing', error);
+              return;
+            }
+            latestRunState = runStateRef.current;
+            latestRunState.closeAfterStop = true;
+            if (racedDecision.decision === 'active_run_cancellation_requested') {
+              if (latestRunState.runId === racedDecision.run_id && latestRunState.summary) {
+                void requestWindowDestruction();
+              } else {
+                setStopState('stopping');
+              }
+              return;
+            }
+            if (racedDecision.decision === 'pending_launch_cancelled') {
+              pendingLaunchRef.current = null;
+            }
+          } else {
+            return;
+          }
+        }
+        void requestWindowDestruction();
+      } finally {
+        closeRequestPendingRef.current = false;
+      }
+    }).then(
+      (stopListening) => {
+        if (disposed) stopListening();
+        else removeCloseListener = stopListening;
+      },
+      (error: unknown) => {
+        if (!disposed) reportWindowChromeFailure('Could not attach the progress-window close handler', error);
+      },
+    );
+    return () => {
+      disposed = true;
+      removeCloseListener?.();
+    };
+  }, [reportControlError, reportWindowChromeFailure, requestRender, requestWindowDestruction]);
+
+  const oneMinuteRate = calculateWindowRate(currentRunState, 60000);
+  const errorCount = currentRunState.errors.filter((entry) => !entry.warning).length;
+  const warningCount = currentRunState.errors.length - errorCount;
+
+  const countersExhausted = currentRunState.totals.items + currentRunState.totals.bytes > 0
+    && (currentRunState.totals.items === 0
+      || currentRunState.completed.items >= currentRunState.totals.items)
+    && (currentRunState.totals.bytes === 0
+      || currentRunState.completed.bytes >= currentRunState.totals.bytes);
   // The copy loop reports its final byte before seal/fsync/verify/preserve/commit completes the
   // item. On an external mirror, preservation may itself be a long cross-volume copy.
   const finalizing = countersExhausted
-    || (s.totals.bytes > 0 && s.dones.bytes >= s.totals.bytes);
-  const eta = (() => {
-    if (s.summary) return '—';
+    || (currentRunState.totals.bytes > 0
+      && currentRunState.completed.bytes >= currentRunState.totals.bytes);
+  const estimatedTimeRemaining = (() => {
+    if (currentRunState.summary) return '—';
     if (finalizing) return 'Finalizing…';
-    if (r60 && s.totals.bytes > 0 && r60.bps > 1) return humanDuration(Math.max(0, s.totals.bytes - s.dones.bytes) / r60.bps * 1000) + ' remaining';
-    if (r60 && s.totals.items > 0 && r60.ips > 0.01) return humanDuration(Math.max(0, s.totals.items - s.dones.items) / r60.ips * 1000) + ' remaining';
+    if (oneMinuteRate
+      && currentRunState.totals.bytes > 0
+      && oneMinuteRate.bytesPerSecond > 1
+    ) {
+      return humanDuration(
+        Math.max(0, currentRunState.totals.bytes - currentRunState.completed.bytes)
+          / oneMinuteRate.bytesPerSecond * 1000,
+      ) + ' remaining';
+    }
+    if (oneMinuteRate
+      && currentRunState.totals.items > 0
+      && oneMinuteRate.itemsPerSecond > 0.01
+    ) {
+      return humanDuration(
+        Math.max(0, currentRunState.totals.items - currentRunState.completed.items)
+          / oneMinuteRate.itemsPerSecond * 1000,
+      ) + ' remaining';
+    }
     return 'Estimating…';
   })();
+  const roundedCompletionPercentage = Math.round(completionPercentage);
+  const progressValueText = currentRunState.summary
+    ? (currentRunState.summary.cancelled
+      ? `Stopped at ${roundedCompletionPercentage}%`
+      : `${roundedCompletionPercentage}% complete`)
+    : runRejectionMessage
+      ? 'Run failed to start'
+      : currentRunState.running
+        ? (currentRunState.applying ? `${roundedCompletionPercentage}% complete` : 'Preparing Apply')
+        : 'Waiting for a run';
+  const summaryStatusText = currentRunState.summary
+    ? formatCompletedRunStatus(currentRunState.summary)
+    : null;
 
   return (
-    <div className={'pwin' + (s.applying ? ' applying' : '')}>
+    <div className={'pwin' + (currentRunState.applying ? ' applying' : '')}>
       <div className="phead">
         <span className="pjob">SyncDash</span>
-        <span className="pphase">
-          {s.summary
-            ? (s.summary.cancelled
-              ? `Cancelled — ${s.summary.done} applied, ${s.summary.skipped} skipped`
-              : `Done — ${s.summary.done} applied, ${s.summary.skipped} skipped, ${s.summary.errors} errors · ${humanSize(s.summary.bytes_done ?? 0)} · ${humanDuration(s.summary.elapsed_ms ?? 0)}`)
-            : rejected ? `Could not start — ${rejected}`
-            : s.running
-              ? <>{paused && <><Pause size={12} /> Paused — </>}{s.phase ? PHASE_LABEL[s.phase] : ''}{finalizing ? ' — Finalizing' : ''}</>
+        <span className="pphase" role="status" aria-live="polite" aria-atomic="true">
+          {summaryStatusText !== null
+            ? summaryStatusText
+            : runRejectionMessage ? `Could not start — ${runRejectionMessage}`
+            : currentRunState.running
+              ? <>
+                  {runPaused && <><Pause size={12} /> Paused — </>}
+                  {currentRunState.phase ? PHASE_LABELS[currentRunState.phase] : ''}
+                  {finalizing ? ' — Finalizing' : ''}
+                </>
               : 'Waiting for a run…'}
         </span>
         <span
-          className={'ppct ' + (s.summary ? (s.summary.cancelled || s.summary.errors ? 'err' : 'ok') : paused ? 'paused' : '')}
+          className={'ppct ' + (currentRunState.summary
+            ? (currentRunState.summary.cancelled || currentRunState.summary.errors ? 'err' : 'ok')
+            : runPaused ? 'paused' : '')}
+          role="progressbar"
+          aria-label="Apply progress"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={currentRunState.applying || currentRunState.summary
+            ? roundedCompletionPercentage
+            : undefined}
+          aria-valuetext={progressValueText}
         >
-          {s.summary
-            ? (s.summary.cancelled ? 'Stopped' : `${Math.round(pct)}%`)
-            : rejected ? 'Failed'
-            : s.running ? (s.applying ? `${Math.round(pct)}%` : '…') : '—'}
+          {currentRunState.summary
+            ? (currentRunState.summary.cancelled ? 'Stopped' : `${roundedCompletionPercentage}%`)
+            : runRejectionMessage ? 'Failed'
+            : currentRunState.running
+              ? (currentRunState.applying ? `${roundedCompletionPercentage}%` : '…')
+              : '—'}
         </span>
       </div>
 
       <div className="stagerows">
-        {s.stages.map((row) => (
-          <div key={row.phase} className={'stagerow' + (row.active ? ' active' : '') + (row.done ? ' done' : '')}>
+        {currentRunState.stages.map((stage) => (
+          <div
+            key={stage.phase}
+            className={'stagerow' + (stage.active ? ' active' : '') + (stage.done ? ' done' : '')}
+          >
             <span className="st-ico">
-              {row.active ? <RefreshCw size={13} className="spin" />
-                : row.failed ? <TriangleAlert size={13} className="icon-err" />
-                  : row.cancelled ? <Square size={12} />
-                    : row.done ? <Check size={13} />
+              {stage.active ? <RefreshCw size={13} className="spin" />
+                : stage.failed ? <TriangleAlert size={13} className="icon-err" />
+                  : stage.cancelled ? <Square size={12} />
+                    : stage.done ? <Check size={13} />
                       : <RefreshCw size={13} />}
             </span>
-            <span className="st-name">{PHASE_LABEL[row.phase]}</span>
-            <span className="st-detail">{row.detail}</span>
+            <span className="st-name">{PHASE_LABELS[stage.phase]}</span>
+            <span className="st-detail">{stage.detail}</span>
           </div>
         ))}
       </div>
 
       <div className="graphs">
-        <Graph caption="Data (cumulative bytes)" field="b" runRef={run} rateText={rateBytes} />
-        <Graph caption="Items (cumulative count)" field="i" runRef={run} rateText={rateItems} />
+        <Graph
+          caption="Data (cumulative bytes)"
+          metric="bytesDone"
+          runRef={runStateRef}
+          rateText={formatByteRate}
+        />
+        <Graph
+          caption="Items (cumulative count)"
+          metric="itemsDone"
+          runRef={runStateRef}
+          rateText={formatItemRate}
+        />
         <div className="readouts">
           <div className="rh" /><div className="rh">Processed</div><div className="rh">Remaining</div>
           <div className="rh">Items</div>
-          <div>{s.dones.items} / {s.totals.items}</div>
-          <div>{Math.max(0, s.totals.items - s.dones.items)}</div>
+          <div>{currentRunState.completed.items} / {currentRunState.totals.items}</div>
+          <div>{Math.max(0, currentRunState.totals.items - currentRunState.completed.items)}</div>
           <div className="rh">Bytes</div>
-          <div>{humanSize(s.dones.bytes)} / {humanSize(s.totals.bytes)}</div>
-          <div>{humanSize(Math.max(0, s.totals.bytes - s.dones.bytes))}</div>
+          <div>{humanSize(currentRunState.completed.bytes)} / {humanSize(currentRunState.totals.bytes)}</div>
+          <div>{humanSize(Math.max(0, currentRunState.totals.bytes - currentRunState.completed.bytes))}</div>
           <div className="rh">Time</div>
-          <div>{humanDuration(s.summary ? s.summary.elapsed_ms ?? 0 : activeNow(s))}</div>
-          <div>{eta}</div>
+          <div>{humanDuration(currentRunState.summary
+            ? currentRunState.summary.elapsed_ms ?? 0
+            : activeElapsedMs(currentRunState))}</div>
+          <div>{estimatedTimeRemaining}</div>
         </div>
-        <div className="curfile" title={s.currentPath}>{s.currentPath ? `‎${s.currentPath}` : ''}</div>
+        <div className="curfile" title={currentRunState.currentPath}>
+          {currentRunState.currentPath ? `‎${currentRunState.currentPath}` : ''}
+        </div>
       </div>
 
-      <div className={'errsec' + (s.errors.length ? ' show' : '') + (errorsOpen ? ' open' : '')}>
-        <div className="errhead" onClick={() => setErrorsOpen((v) => !v)}>
-          <TriangleAlert size={14} className={nErr ? 'icon-err' : 'icon-warn'} />
-          <span className="cnt-err">{nErr ? `${nErr} errors` : ''}</span>
-          <span className="cnt-warn">{nWarn ? `${nWarn} warnings` : ''}</span>
-          <span className="dim errtip">Click to expand</span>
-        </div>
-        <div className="errlist">
-          {s.errors.map((e, k) => (
-            <div key={k} className={'erow' + (e.warning ? ' warn' : '')}>
-              <span className="epath mono">{e.path}</span>{' '}
-              {/* narrative entries (kind=log) have no path/side — don't render an empty slot like "[scope/] msg" */}
-              <span className="emsg">{e.side ? `[${e.action}/${e.side}] ` : `[${e.action}] `}{e.message}</span>
+      <div className={'errsec'
+        + (currentRunState.errors.length ? ' show' : '')
+        + (errorDetailsOpen ? ' open' : '')}>
+        <button
+          type="button"
+          className="errhead"
+          aria-expanded={errorDetailsOpen}
+          aria-controls="progress-errors"
+          onClick={() => setErrorDetailsOpen((open) => !open)}
+        >
+          <TriangleAlert size={14} className={errorCount ? 'icon-err' : 'icon-warn'} />
+          <span className="cnt-err">
+            {errorCount ? `${errorCount} ${errorCount === 1 ? 'error' : 'errors'}` : ''}
+          </span>
+          <span className="cnt-warn">
+            {warningCount ? `${warningCount} ${warningCount === 1 ? 'warning' : 'warnings'}` : ''}
+          </span>
+          <span className="dim errtip">{errorDetailsOpen ? 'Collapse details' : 'Expand details'}</span>
+        </button>
+        <div id="progress-errors" className="errlist">
+          {currentRunState.errors.map((entry, index) => (
+            <div key={index} className={'erow' + (entry.warning ? ' warn' : '')}>
+              <span className="epath mono">{entry.path}</span>{' '}
+              <span className="emsg">
+                {entry.side ? `[${entry.action}/${entry.side}] ` : `[${entry.action}] `}{entry.message}
+              </span>
             </div>
           ))}
         </div>
       </div>
 
-      {countdown && (
-        <div className="countdown show">
-          <span className="cdtext">{countdown.kind === 'sleep' ? 'Sleep' : 'Shut down'} in {countdown.left}s</span>
-          <div className="cdbar"><div className="cdfill" style={{ width: `${countdown.left * 10}%` }} /></div>
-          <button className="btn" onClick={() => setCountdown(null)}>Cancel</button>
+      {powerActionCountdown && (
+        <div
+          className="countdown show"
+          role="alertdialog"
+          aria-labelledby={countdownTitleId}
+          aria-describedby={countdownDescriptionId}
+        >
+          <span id={countdownTitleId} className="cdtext">
+            <span aria-hidden="true">
+              {powerActionCountdown.action === 'sleep' ? 'Sleep' : 'Shut down'} in{' '}
+              {powerActionCountdown.secondsRemaining}s
+            </span>
+            <span className="sr-only">
+              {powerActionCountdown.action === 'sleep' ? 'Computer sleep scheduled' : 'Computer shutdown scheduled'}
+            </span>
+          </span>
+          <span id={countdownDescriptionId} className="sr-only">
+            Press Escape or activate Cancel to keep the computer running.
+          </span>
+          <span className="sr-only" role="alert" aria-live="assertive" aria-atomic="true">
+            {powerActionCountdown.action === 'sleep'
+              ? 'SyncDash will put the computer to sleep in 10 seconds.'
+              : 'SyncDash will shut down the computer in 10 seconds.'}
+          </span>
+          <div className="cdbar" aria-hidden="true">
+            <div ref={countdownProgressFillRef} className="cdfill" />
+          </div>
+          <button
+            ref={countdownCancelButtonRef}
+            type="button"
+            className="btn"
+            autoFocus
+            onClick={cancelPowerActionCountdown}
+          >Cancel</button>
+        </div>
+      )}
+
+      {powerActionFailure && (
+        <div className="countdown show" role="alert">
+          <span className="cdtext">{powerActionFailure.error}</span>
+          <button
+            type="button"
+            className="btn"
+            disabled={powerActionPending !== null
+              || powerActionFailure.runId !== currentRunState.runId
+              || currentRunState.running
+              || !currentRunState.summary}
+            onClick={() => void executePowerAction(
+              powerActionFailure.runId,
+              powerActionFailure.action,
+            )}
+          >{powerActionPending ? 'Retrying…' : 'Retry'}</button>
+          <button type="button" className="btn" onClick={() => setPowerActionFailure(null)}>
+            Dismiss
+          </button>
         </div>
       )}
 
       <div className="controls">
         <button
+          type="button"
           className="btn"
-          disabled={!s.running || !!s.summary}
-          onClick={async () => {
-            const wantPause = run.current.pausedSince === 0;
-            const previousPausedSince = run.current.pausedSince;
-            // optimistic toggle, corrected once the event arrives
-            run.current.pausedSince = wantPause ? Date.now() : 0;
-            rerender();
-            try {
-              const accepted = await pauseRun(run.current.runId, wantPause);
-              if (!accepted) throw new Error('the run already finished');
-            }
-            catch (error) {
-              run.current.pausedSince = previousPausedSince;
-              reportControlError(wantPause ? 'Could not pause this run' : 'Could not resume this run', error);
-            }
-          }}
-        >{paused ? <><Play size={12} /> Continue</> : <><Pause size={12} /> Pause</>}</button>
+          disabled={!currentRunState.running
+            || !!currentRunState.summary
+            || pausePending !== null
+            || stopState !== 'idle'}
+          onClick={() => void togglePause()}
+        >{pausePending === 'pause'
+            ? 'Pausing…'
+            : pausePending === 'resume'
+              ? 'Resuming…'
+              : runPaused
+                ? <><Play size={12} /> Continue</>
+                : <><Pause size={12} /> Pause</>}</button>
         <button
+          type="button"
           className="btn btn-stop"
-          disabled={!s.running || !!s.summary || stop !== 'idle'}
-          onClick={async () => {
-            setStop('stopping');
-            const st = run.current;
-            // Stop pressed while paused: resume first, otherwise the cancel never reaches a checkpoint
-            if (st.pausedSince) {
-              st.pausedSince = 0;
-              try { await pauseRun(st.runId, false); }
-              catch (error) { reportControlError('Could not resume before stopping', error); return; }
-            }
-            let had: boolean;
-            try { had = await cancelRun(st.runId); }
-            catch (error) { reportControlError('Could not stop this run', error); return; }
-            // no active run (it already finished on its own) — don't leave the button stuck on "Stopping…"
-            if (!had) setStop('finished');
-          }}
+          disabled={!currentRunState.running || !!currentRunState.summary || stopState !== 'idle'}
+          onClick={() => void stopRun()}
         >
-          {stop === 'idle' ? <><Square size={12} /> Stop</> : stop === 'stopping' ? 'Stopping…' : 'Finished'}
+          {stopState === 'idle'
+            ? <><Square size={12} /> Stop</>
+            : stopState === 'stopping' ? 'Stopping…' : 'Finished'}
         </button>
         <label className="dim chkline">
           <input
             type="checkbox"
-            checked={autoclose}
-            onChange={(e) => { setAutoclose(e.target.checked); localStorage.setItem('sd.autoclose', e.target.checked ? '1' : '0'); }}
+            checked={autoCloseEnabled}
+            disabled={powerActionPending !== null}
+            onChange={(event) => {
+              const nextAutoCloseEnabled = event.target.checked;
+              const error = saveAutoClosePreference(localStorage, nextAutoCloseEnabled);
+              if (error) {
+                reportControlError('Could not save the Auto-close preference', error);
+                return;
+              }
+              setScheduledAutoClose(null);
+              setPowerActionFailure(null);
+              autoCloseEnabledRef.current = nextAutoCloseEnabled;
+              setAutoCloseEnabled(nextAutoCloseEnabled);
+              reconcilePowerActionCountdown(
+                whenFinishedActionRef.current,
+                nextAutoCloseEnabled,
+              );
+            }}
           /> Auto-close when finished
         </label>
-        <span className="wfin">
+        <label className="wfin">
           When finished
           <select
-            value={whenFin}
-            onChange={(e) => { setWhenFin(e.target.value); localStorage.setItem('sd.whenfin', e.target.value); }}
+            value={whenFinishedAction}
+            disabled={autoCloseEnabled || powerActionPending !== null}
+            title={autoCloseEnabled
+              ? 'Auto-close takes precedence over a post-run power action'
+              : undefined}
+            onChange={(event) => {
+              const nextWhenFinishedAction = event.target.value;
+              if (!isWhenFinishedAction(nextWhenFinishedAction)) {
+                reportControlError(
+                  'Could not save the When-finished preference',
+                  `unknown action: ${nextWhenFinishedAction}`,
+                );
+                return;
+              }
+              const error = saveWhenFinishedPreference(localStorage, nextWhenFinishedAction);
+              if (error) {
+                reportControlError('Could not save the When-finished preference', error);
+                return;
+              }
+              setScheduledAutoClose(null);
+              setPowerActionFailure(null);
+              whenFinishedActionRef.current = nextWhenFinishedAction;
+              setWhenFinishedAction(nextWhenFinishedAction);
+              reconcilePowerActionCountdown(nextWhenFinishedAction, autoCloseEnabledRef.current);
+            }}
           >
             <option value="none">Do nothing</option>
             <option value="sleep">Sleep</option>
             <option value="shutdown">Shut down</option>
           </select>
-        </span>
+        </label>
       </div>
     </div>
   );

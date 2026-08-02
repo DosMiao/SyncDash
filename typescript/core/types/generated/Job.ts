@@ -2,9 +2,8 @@
 
 export type Job = {
 /**
- * Job-file schema version. A file written before the junk presets became part of `exclude`
- * carries no `schema` key, deserializes as 1, and is migrated on load — see `migrate_v1_junk_presets`.
- * `save_job` always stamps the current version, because a file we just wrote is by definition current.
+ * Job-file schema version. A missing key means v1; load runs each one-way migration in order,
+ * while every current save stamps `SCHEMA` and serializes only current fields.
  */
 schema: number,
 /**
@@ -22,11 +21,11 @@ mode: string,
  * Plain strings so a phrase survives serde untouched; `vfs::spec::parse` routes it.
  * Serialized form is identical to the old PathBuf fields — existing job files load as-is.
  */
-source: string, target: string,
+source: string,
 /**
- * One source → **many targets** (the original 1:N requirement). Non-empty overrides the single target above:
- * each target gets its own comparison, its own plan, its own execution (source is scanned once).
- * mirror/enrich only — sync's N-way merge is version-vector territory, express it as paired jobs; ssh-peer jobs don't support multiple targets either.
+ * One source → one or more targets. Each target owns its own comparison, plan, and execution.
+ * The persisted current schema requires at least one entry; schema v1–v3 scalar `target`
+ * storage is converted once by `migrate_v3_current_schema` during load.
  */
 targets: Array<string>,
 /**
@@ -48,7 +47,7 @@ include: Array<string>,
  * Do not put a mask's star-slash sequence on this line: ts-rs copies this doc verbatim into the
  * generated JSDoc, and those two characters would end the comment block early, yielding invalid .ts.
  */
-exclude: Array<string>, no_hash: boolean,
+exclude: Array<string>,
 /**
  * Rigor-level **shortcut preset**: quick | fast | balanced | standard | paranoid | custom.
  * A preset is just a macro over the four detail knobs below; a detail field with a value **overrides** the preset's matching axis (the UI writes all four explicitly on save).
@@ -127,10 +126,10 @@ delta: boolean,
  */
 parallel: number | null,
 /**
- * M6 scheduled scan: compare automatically every N seconds (None = off). Second-level intervals = "near real-time"; use ≥30 for UNC targets
+ * AutoScan's maximum full-verification interval in seconds (None = off).
  */
-watch_interval_secs: number | null,
+autoscan_interval_secs: number | null,
 /**
- * Apply automatically when watch finds differences (default false = notify only, touch nothing)
+ * Apply an AutoScan result automatically when exact unattended authorization allows it.
  */
-watch_auto_apply: boolean, };
+autoscan_auto_apply: boolean, };

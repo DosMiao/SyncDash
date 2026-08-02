@@ -8,32 +8,38 @@ import {
   EMPTY_APPROVAL_CHOICES,
   INITIAL_OPERATION_REVIEW,
   normalizeApprovalChoices,
-  normalizedSelectedDecisions,
+  operationApprovalFromChoices,
+  normalizedReviewedRowDecisions,
   operationReviewCanSubmit,
   operationReviewReducer,
-  ownsOperationReviewTicket,
+  ownsOperationReviewRequest,
   reviewAllowsApproval,
   type ApprovalChoices,
-  type OperationReviewTicket,
-} from '../../typescript/ui/state/operation-review.ts';
+  type ReviewRequestFence,
+} from '../../typescript/ui/state/operationReview.ts';
+import type { CompareIdentity } from '../../typescript/core/types/generated/CompareIdentity.ts';
 import type { OperationReviewDto } from '../../typescript/core/types/generated/OperationReviewDto.ts';
-import type { CompareOwner } from '../../typescript/core/types/generated/CompareOwner.ts';
+import { buildReviewedRowDecisions } from '../../typescript/core/plan.ts';
 
-const owner: CompareOwner = {
-  compare_id: 71,
+const compareIdentity: CompareIdentity = {
+  result_id: '33333333333333333333333333333333',
+  compare_run_id: 71,
   job_id: 'job-id',
-  job_name: 'before-rename',
   config_revision: 'revision-3',
   target_index: 1,
 };
 
-function review(overrides: Partial<OperationReviewDto> = {}): OperationReviewDto {
+type ApplyConfirmationReview = Extract<OperationReviewDto, {
+  status: 'interactive_apply_confirmation_required';
+}>;
+
+function applyConfirmation(
+  overrides: Partial<ApplyConfirmationReview> = {},
+): ApplyConfirmationReview {
   return {
-    status: 'confirmation_required',
-    authorization: null,
+    status: 'interactive_apply_confirmation_required',
     challenge_id: 'challenge-1',
     expires_at_ms: 10_000,
-    blockers: [],
     warnings: ['deletion ratio is high'],
     capabilities: [],
     requires_health_ack: true,
@@ -44,72 +50,143 @@ function review(overrides: Partial<OperationReviewDto> = {}): OperationReviewDto
   };
 }
 
-test('reducer ignores every response that does not own the current key and generation', () => {
-  const first: OperationReviewTicket = { key: compareReviewKey('job-id', 'revision-3', 1), generation: 1 };
-  const second: OperationReviewTicket = { key: compareReviewKey('job-id', 'revision-4', 1), generation: 2 };
-  let state = operationReviewReducer(INITIAL_OPERATION_REVIEW, { type: 'begin', ticket: first });
-  state = operationReviewReducer(state, { type: 'begin', ticket: second });
-  const stale = operationReviewReducer(state, { type: 'resolved', ticket: first, review: review() });
+function compareConfirmation(): Extract<OperationReviewDto, {
+  status: 'compare_confirmation_required';
+}> {
+  return {
+    status: 'compare_confirmation_required',
+    challenge_id: 'compare-challenge',
+    expires_at_ms: 10_000,
+    capabilities: [],
+    can_remember_for_session: true,
+  };
+}
+
+test('reducer accepts only explicit transitions owned by the current request fence', () => {
+  const first: ReviewRequestFence = {
+    key: compareReviewKey('job-id', 'revision-3', 1),
+    requestId: 1,
+  };
+  const second: ReviewRequestFence = {
+    key: compareReviewKey('job-id', 'revision-4', 1),
+    requestId: 2,
+  };
+  let state = operationReviewReducer(INITIAL_OPERATION_REVIEW, { type: 'begin', request: first });
+  state = operationReviewReducer(state, { type: 'begin', request: second });
+  const stale = operationReviewReducer(state, {
+    type: 'resolved',
+    request: first,
+    review: applyConfirmation(),
+  });
   assert.equal(stale, state);
   assert.equal(stale.phase, 'reviewing');
 
-  state = operationReviewReducer(state, { type: 'resolved', ticket: second, review: review() });
+  state = operationReviewReducer(state, {
+    type: 'resolved',
+    request: second,
+    review: applyConfirmation(),
+  });
   assert.equal(state.phase, 'ready');
   assert.equal(state.review?.challenge_id, 'challenge-1');
+  const invalidTransition = operationReviewReducer(state, {
+    type: 'authorized',
+    request: second,
+    authorization: { authorization_token: 'premature', expires_at_ms: 20_000 },
+  });
+  assert.equal(invalidTransition, state);
   const staleAuthorization = operationReviewReducer(state, {
     type: 'authorized',
-    ticket: first,
+    request: first,
     authorization: { authorization_token: 'stale-token', expires_at_ms: 20_000 },
   });
   assert.equal(staleAuthorization, state);
 });
 
-test('external async fencing requires ticket, generation, and current semantic identity', () => {
-  const ticket = { key: compareReviewKey('job-id', 'revision-3', 1), generation: 9 };
-  assert.equal(ownsOperationReviewTicket(ticket, ticket, ticket.key), true);
-  assert.equal(ownsOperationReviewTicket({ ...ticket, generation: 10 }, ticket, ticket.key), false);
-  assert.equal(ownsOperationReviewTicket(ticket, ticket, compareReviewKey('job-id', 'revision-4', 1)), false);
-  assert.equal(ownsOperationReviewTicket(null, ticket, ticket.key), false);
+test('external async fencing requires request id and current semantic identity', () => {
+  const request = { key: compareReviewKey('job-id', 'revision-3', 1), requestId: 9 };
+  assert.equal(ownsOperationReviewRequest(request, request, request.key), true);
+  assert.equal(ownsOperationReviewRequest({ ...request, requestId: 10 }, request, request.key), false);
+  assert.equal(
+    ownsOperationReviewRequest(request, request, compareReviewKey('job-id', 'revision-4', 1)),
+    false,
+  );
+  assert.equal(ownsOperationReviewRequest(null, request, request.key), false);
 });
 
-test('approval is gated by each exact acknowledgement and blocked reviews can never submit', () => {
-  const requested = review();
+test('approval is gated by each exact acknowledgement and blocked reviews never submit', () => {
+  const requested = applyConfirmation();
   const healthOnly: ApprovalChoices = { ...EMPTY_APPROVAL_CHOICES, acknowledgeHealth: true };
   const allRequired: ApprovalChoices = { ...healthOnly, acceptCapabilities: true };
   assert.equal(reviewAllowsApproval(requested, EMPTY_APPROVAL_CHOICES), false);
   assert.equal(reviewAllowsApproval(requested, healthOnly), false);
   assert.equal(reviewAllowsApproval(requested, allRequired), true);
-  assert.equal(reviewAllowsApproval(review({ status: 'blocked', challenge_id: null }), allRequired), false);
-  assert.equal(reviewAllowsApproval(review({ challenge_id: null }), allRequired), false);
-  assert.equal(reviewAllowsApproval(review({ blockers: ['contradictory blocker'] }), allRequired), false);
-  assert.equal(reviewAllowsApproval(review({
-    authorization: { authorization_token: 'wrong-shape', expires_at_ms: 20_000 },
-  }), allRequired), false);
-  assert.equal(reviewAllowsApproval({ ...requested, status: 'unexpected' } as unknown as OperationReviewDto, allRequired), false);
+  assert.equal(reviewAllowsApproval({
+    status: 'blocked',
+    blockers: ['offline'],
+    warnings: [],
+    capabilities: [],
+  }, allRequired), false);
+  assert.equal(
+    reviewAllowsApproval({ ...requested, status: 'unexpected' } as unknown as OperationReviewDto, allRequired),
+    false,
+  );
 
-  const ticket = { key: 'apply', generation: 1 };
-  let state = operationReviewReducer(INITIAL_OPERATION_REVIEW, { type: 'begin', ticket });
-  state = operationReviewReducer(state, { type: 'resolved', ticket, review: requested });
-  assert.equal(operationReviewCanSubmit(state, allRequired), true);
-  state = operationReviewReducer(state, { type: 'begin_approval', ticket });
-  assert.equal(operationReviewCanSubmit(state, allRequired), false);
-  state = operationReviewReducer(state, { type: 'approval_failed', ticket, error: 'expired' });
-  assert.equal(state.phase, 'error');
-  assert.equal(operationReviewCanSubmit(state, allRequired), false);
+  const request = { key: 'apply', requestId: 1 };
+  let state = operationReviewReducer(INITIAL_OPERATION_REVIEW, { type: 'begin', request });
+  state = operationReviewReducer(state, { type: 'resolved', request, review: requested });
+  assert.equal(operationReviewCanSubmit(state, allRequired, 0), true);
+  state = operationReviewReducer(state, { type: 'begin_approval', request });
+  assert.equal(operationReviewCanSubmit(state, allRequired, 0), false);
+  state = operationReviewReducer(state, { type: 'approval_failed', request, error: 'expired' });
+  assert.equal(state.phase, 'approval_failed');
+  assert.equal(operationReviewCanSubmit(state, allRequired, 0), false);
 });
 
-test('direct authorization fails closed when the structured review contradicts its status', () => {
-  const authorized = review({
+test('challenge and authorization deadlines are executable state, not display text', () => {
+  const request = { key: 'apply', requestId: 4 };
+  const choices: ApprovalChoices = {
+    ...EMPTY_APPROVAL_CHOICES,
+    acknowledgeHealth: true,
+    acceptCapabilities: true,
+  };
+  let state = operationReviewReducer(INITIAL_OPERATION_REVIEW, { type: 'begin', request });
+  state = operationReviewReducer(state, {
+    type: 'resolved', request, review: applyConfirmation({ expires_at_ms: 10_000 }),
+  });
+  assert.equal(operationReviewCanSubmit(state, choices, 8_999), true);
+  assert.equal(operationReviewCanSubmit(state, choices, 9_000), false);
+  state = operationReviewReducer(state, {
+    type: 'expired', request, error: 'review again',
+  });
+  assert.equal(state.phase, 'expired');
+  assert.equal(operationReviewCanSubmit(state, choices, 0), false);
+
+  const stale = operationReviewReducer(state, {
+    type: 'expired', request: { ...request, requestId: 5 }, error: 'stale',
+  });
+  assert.equal(stale, state);
+
+  let authorized = operationReviewReducer(INITIAL_OPERATION_REVIEW, { type: 'begin', request });
+  authorized = operationReviewReducer(authorized, {
+    type: 'resolved', request, review: applyConfirmation(),
+  });
+  authorized = operationReviewReducer(authorized, { type: 'begin_approval', request });
+  authorized = operationReviewReducer(authorized, {
+    type: 'authorized',
+    request,
+    authorization: { authorization_token: 'token', expires_at_ms: 20_000 },
+  });
+  assert.equal(operationReviewCanSubmit(authorized, choices, 18_999), true);
+  assert.equal(operationReviewCanSubmit(authorized, choices, 19_000), false);
+});
+
+test('direct authorization accepts only its tagged variant and rejects capability blockers', () => {
+  const authorized: OperationReviewDto = {
     status: 'direct_authorized',
     authorization: { authorization_token: 'token', expires_at_ms: 20_000 },
-    challenge_id: null,
-    requires_health_ack: false,
-    requires_capability_ack: false,
-  });
+    capabilities: [],
+  };
   assert.equal(directAuthorization(authorized)?.authorization_token, 'token');
-  assert.equal(directAuthorization({ ...authorized, blockers: ['offline'] }), null);
-  assert.equal(directAuthorization({ ...authorized, challenge_id: 'contradictory-challenge' }), null);
-  assert.equal(directAuthorization({ ...authorized, requires_capability_ack: true }), null);
   assert.equal(directAuthorization({
     ...authorized,
     capabilities: [{
@@ -123,8 +200,8 @@ test('direct authorization fails closed when the structured review contradicts i
   }), null);
 });
 
-test('unattended approval is normalized off unless Remember is both supported and selected', () => {
-  const requested = review();
+test('approval payload variants cannot contain fields from another operation', () => {
+  const requested = applyConfirmation();
   const askUnattended: ApprovalChoices = {
     acknowledgeHealth: true,
     acceptCapabilities: true,
@@ -140,30 +217,67 @@ test('unattended approval is normalized off unless Remember is both supported an
   assert.equal(reviewAllowsApproval(requested, askUnattended), false);
   const remembered = { ...askUnattended, rememberForSession: true };
   assert.equal(normalizeApprovalChoices(requested, remembered).allowUnattended, true);
+  assert.deepEqual(operationApprovalFromChoices(requested, remembered), {
+    operation: 'interactive_apply',
+    acknowledge_health: true,
+    accept_capabilities: true,
+    session_grant: 'allow_auto_apply',
+  });
+  assert.deepEqual(operationApprovalFromChoices(compareConfirmation(), remembered), {
+    operation: 'compare',
+    accept_capabilities: true,
+    remember_for_session: true,
+  });
 });
 
-test('keys fence semantic mutation and selected-set changes while preserving a pure rename', () => {
-  const selected = [{ index: 8, flipped: true }, { index: 2, flipped: false }];
-  const base = applyReviewKey(owner, 'job-id', 'revision-3', 1, selected);
-  assert.equal(base, applyReviewKey({ ...owner, job_name: 'after-rename' }, 'job-id', 'revision-3', 1, selected));
-  assert.equal(base, applyReviewKey(owner, 'job-id', 'revision-3', 1, [...selected].reverse()));
-  assert.notEqual(base, applyReviewKey({ ...owner, compare_id: 72 }, 'job-id', 'revision-3', 1, selected));
-  assert.notEqual(base, applyReviewKey(owner, 'replacement-id', 'revision-3', 1, selected));
-  assert.notEqual(base, applyReviewKey(owner, 'job-id', 'revision-4', 1, selected));
-  assert.notEqual(base, applyReviewKey(owner, 'job-id', 'revision-3', 0, selected));
-  assert.notEqual(base, applyReviewKey(owner, 'job-id', 'revision-3', 1, [{ index: 8, flipped: true }, { index: 2, flipped: true }]));
+test('keys fence result identity, job revision, target, and reviewed row decisions', () => {
+  const reviewedRowDecisions = [
+    { index: 8, direction_reversed: true },
+    { index: 2, direction_reversed: false },
+  ];
+  const base = applyReviewKey(compareIdentity, 'job-id', 'revision-3', 1, 8, reviewedRowDecisions);
+  assert.equal(base, applyReviewKey(compareIdentity, 'job-id', 'revision-3', 1, 8, [...reviewedRowDecisions].reverse()));
+  assert.notEqual(base, applyReviewKey({ ...compareIdentity, result_id: '55555555555555555555555555555555' }, 'job-id', 'revision-3', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey({ ...compareIdentity, compare_run_id: 72 }, 'job-id', 'revision-3', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey({ ...compareIdentity, job_id: 'replacement-id' }, 'job-id', 'revision-3', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey({ ...compareIdentity, config_revision: 'revision-4' }, 'job-id', 'revision-3', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey({ ...compareIdentity, target_index: 0 }, 'job-id', 'revision-3', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey(compareIdentity, 'replacement-id', 'revision-3', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey(compareIdentity, 'job-id', 'revision-4', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey(compareIdentity, 'job-id', 'revision-3', 0, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey(compareIdentity, 'job-id', 'revision-3', 1, 9, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey(compareIdentity, 'job-id', 'revision-3', 1, 8, [
+    { index: 8, direction_reversed: true },
+    { index: 2, direction_reversed: true },
+  ]));
 
   const compare = compareReviewKey('job-id', 'revision-3', 1);
   assert.equal(compare, compareReviewKey('job-id', 'revision-3', 1));
   assert.notEqual(compare, compareReviewKey('job-id', 'revision-4', 1));
 });
 
-test('selected-decision normalization is non-mutating and rejects ambiguous duplicate indices', () => {
-  const selected = [{ index: 9, flipped: true }, { index: 1, flipped: false }];
-  assert.deepEqual(normalizedSelectedDecisions(selected), [[1, false], [9, true]]);
-  assert.deepEqual(selected, [{ index: 9, flipped: true }, { index: 1, flipped: false }]);
+test('reviewed-row-decision normalization is non-mutating and rejects duplicate indices', () => {
+  const reviewedRowDecisions = [
+    { index: 9, direction_reversed: true },
+    { index: 1, direction_reversed: false },
+  ];
+  assert.deepEqual(normalizedReviewedRowDecisions(reviewedRowDecisions), [[1, false], [9, true]]);
+  assert.deepEqual(reviewedRowDecisions, [
+    { index: 9, direction_reversed: true },
+    { index: 1, direction_reversed: false },
+  ]);
   assert.throws(
-    () => normalizedSelectedDecisions([{ index: 4, flipped: false }, { index: 4, flipped: true }]),
-    /duplicate selected row index 4/,
+    () => normalizedReviewedRowDecisions([
+      { index: 4, direction_reversed: false },
+      { index: 4, direction_reversed: true },
+    ]),
+    /duplicate reviewed row index 4/,
   );
+});
+
+test('reviewed row decisions carry only plan identity and effective direction', () => {
+  assert.deepEqual(buildReviewedRowDecisions([3, 1], [false, true, false, true]), [
+    { index: 3, direction_reversed: true },
+    { index: 1, direction_reversed: true },
+  ]);
 });

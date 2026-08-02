@@ -1,204 +1,572 @@
-//! Table format: JSONL —— the first line is a Header, every line after it is one Entry.
-//! Why JSONL: it streams both ways (pipe it straight over ssh), appends incrementally, and one bad line does not ruin the whole table.
+//! Strict JSONL observations exchanged by scan, compare, peer, and archive flows.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
+use std::fmt;
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-pub const SCHEMA: u32 = 1;
+use crate::foundation::path::RootRelativePath;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Header {
+pub(crate) mod migrate;
+
+pub const TABLE_SCHEMA: u32 = 2;
+pub const ARCHIVE_GENERATIONS: usize = 3;
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TableKind {
+    Snapshot,
+    Archive,
+}
+
+impl TableKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Snapshot => "snapshot",
+            Self::Archive => "archive",
+        }
+    }
+}
+
+impl fmt::Display for TableKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TableEvidence {
+    None,
+    Sampled,
+    Full,
+}
+
+impl TableEvidence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Sampled => "sampled",
+            Self::Full => "full",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedMedium {
+    FixedDisk,
+    RemovableDisk,
+    NetworkShare,
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedNameRules {
+    Windows,
+    Posix,
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VfsNote {
+    pub protocol: String,
+    pub display_root: String,
+    pub mtime_precision_ms: u32,
+    pub medium: ObservedMedium,
+    pub name_rules: ObservedNameRules,
+    pub degraded: Vec<String>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TableHeader {
     pub schema: u32,
-    pub kind: String, // "snapshot" | "plan" | "archive"
+    pub kind: TableKind,
     pub root: String,
     pub host: String,
     pub os: String,
     pub scanned_at_ms: u64,
     pub duration_ms: u64,
     pub entry_count: u64,
-    pub hashed: bool,
-    /// Directories excluded by the filter (their whole subtree never entered the table) — exclusions must be visible, never silent
-    #[serde(default)]
+    pub evidence: TableEvidence,
     pub excluded_dirs: u64,
-    /// Files excluded by the filter
-    #[serde(default)]
     pub excluded_files: u64,
-    /// Entries the walk could not read and skipped. Distinct from `excluded_*`: an exclusion is a
-    /// choice the user made, this is a tree the scan could not see. Both are equally invisible to
-    /// compare — a skipped entry reads as "absent on this side", which under mirror is a delete —
-    /// so the count has to cross the module boundary and reach the guards, not just a log line.
-    /// Only races survive to here; anything structural aborts the scan (see `scan::local`).
-    #[serde(default)]
     pub walk_errors: u64,
-    /// Up to five sampled walk failures, so the guard's refusal can name what it could not read
-    /// instead of just counting.
-    #[serde(default)]
     pub walk_err_samples: Vec<String>,
-    /// `.<name>.icloud` placeholders: the file's contents are not on this disk and its real name is
-    /// not in this table. Syncing one copies a few hundred bytes of plist over the real file on the
-    /// other side, so this blocks rather than warns.
-    #[serde(default)]
     pub icloud_stubs: u64,
-    #[serde(default)]
     pub icloud_stub_samples: Vec<String>,
-    /// Symlinks the scan saw and did not record, because `symlinks = "exclude"` (the default).
-    /// Counted for the same reason `excluded_*` is: an exclusion has to be visible. A macOS tree is
-    /// made of links — every `.app`, every framework, every Homebrew prefix — so "0 differences"
-    /// over a tree full of them is a claim the snapshot was not entitled to make.
-    #[serde(default)]
     pub skipped_symlinks: u64,
-    /// Files evicted in place (macOS `SF_DATALESS`). Unlike a stub these still carry the true name,
-    /// size and mtime, so nothing is lost — but reading one downloads it, which is worth saying
-    /// before a full-rigor scan hydrates an entire library.
-    #[serde(default)]
     pub dataless_files: u64,
-    /// A VFS root's self-description (None for plain local roots): protocol, display
-    /// root, mtime precision, the evidence tier this scan *actually* ran, and any
-    /// declared degradations — the snapshot must say for itself how its evidence was
-    /// gathered (the no-silent rule, landed on the table).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub vfs: Option<VfsNote>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct VfsNote {
-    pub protocol: String,
-    pub display_root: String,
-    pub mtime_precision_ms: u32,
-    /// "fixed disk" | "removable disk" | "network share" | "unknown" — what the root sits on.
-    /// It decides where preserved originals go, so a table that omits it cannot account for its
-    /// own run. Empty on snapshots written before the volume probe existed.
-    #[serde(default)]
-    pub medium: String,
-    /// "none" | "sampled" | "full" — what the scan really did (post-preflight)
-    pub evidence_effective: String,
-    /// "windows" | "posix" | "unknown" — the naming rules writes to this root must satisfy.
-    /// `Header.os` cannot answer this for a VFS root: it carries the protocol name there, and
-    /// even when it carries an OS it is the *scanning* machine's, not the root's.
-    #[serde(default)]
-    pub name_rules: String,
-    /// Capabilities explicitly degraded for this run (human-readable lines from the preflight report)
-    #[serde(default)]
-    pub degraded: Vec<String>,
-}
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(transparent)]
+pub struct Blake3Digest(String);
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum EntryKind {
-    File,
-    Dir,
-    Symlink,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Entry {
-    /// Path relative to root, always '/'-separated (comparable across platforms)
-    pub path: String,
-    pub kind: EntryKind,
-    pub size: u64,
-    pub mtime_ms: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hash: Option<String>,
-    /// Content evidence was asked for on this entry and could not be obtained — the file exists but
-    /// could not be read (an ACL, a TCC denial on the file rather than its directory, a share that
-    /// dropped mid-scan).
-    ///
-    /// It cannot be inferred from `hash: None`, which also means "hashing was never requested", and
-    /// the two must not be confused: the first is a degraded judgment, the second is the intended
-    /// one. The header's `hashed` flag records what was *asked for*, so it says `true` for both.
-    /// Without this field a file whose content changed but whose size and mtime were preserved — a
-    /// restore, `touch -r`, an SMB mtime round-trip — was silently declared identical and never
-    /// synced again.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub hash_failed: bool,
-    /// unix: dev:inode; empty on windows for now. Only corroborates same-machine moves; across machines we rely on hash.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file_id: Option<String>,
-    /// unix permission bits (octal mode). SMB cannot carry the exec bit, so record it here and restore it in the v0.4 pack mode.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub mode: Option<u32>,
-    /// symlink target (recorded when symlinks="direct"; comparison is string equality on the target)
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub link: Option<String>,
-    /// **archive tables only**: content hashes of this path's earlier generations, newest first (P1-3).
-    /// Why: if one side's current content is merely "parked on an older generation" it was not modified
-    /// concurrently and must not be reported as both-changed. The archive model's cheap approximation
-    /// of a vector clock (syncthing achieves the same with `PreviousBlocksHash`,
-    ///  `lib/protocol/bep_fileinfo.go:200-207`).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub prev: Option<Vec<String>>,
-}
-
-/// How many generations of history the archive keeps. 3 covers the common "edited but never
-/// refreshed the archive" case and costs only a few dozen extra bytes per entry.
-pub const ARCHIVE_GENERATIONS: usize = 3;
-
-/// Roll a new archive generation: push the old archive's hash for the same path onto the `prev` chain.
-/// `fresh` is the freshly scanned snapshot (rewritten in place); `old` is the previous archive.
-pub fn roll_generations(fresh: &mut [Entry], old: &[Entry]) {
-    use std::collections::HashMap;
-    let prior: HashMap<&str, &Entry> = old.iter().map(|e| (e.path.as_str(), e)).collect();
-    for e in fresh.iter_mut() {
-        let Some(o) = prior.get(e.path.as_str()) else {
-            continue;
-        };
-        // Unchanged content needs no new generation — keeps the history from filling up with one repeated hash
-        if o.hash.is_some() && o.hash == e.hash {
-            e.prev = o.prev.clone();
-            continue;
+impl Blake3Digest {
+    pub fn parse(value: impl Into<String>) -> Result<Self, DigestError> {
+        let value = value.into();
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(DigestError(value));
         }
-        let mut chain = Vec::with_capacity(ARCHIVE_GENERATIONS);
-        if let Some(h) = &o.hash {
-            chain.push(h.clone());
-        }
-        if let Some(p) = &o.prev {
-            chain.extend(p.iter().cloned());
-        }
-        chain.truncate(ARCHIVE_GENERATIONS);
-        e.prev = if chain.is_empty() { None } else { Some(chain) };
+        Ok(Self(value))
+    }
+
+    pub fn hash_bytes(bytes: &[u8]) -> Self {
+        Self(blake3::hash(bytes).to_hex().to_string())
+    }
+
+    pub fn from_hash(hash: blake3::Hash) -> Self {
+        Self(hash.to_hex().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
     }
 }
 
-pub struct Snapshot {
-    pub header: Header,
-    pub entries: Vec<Entry>,
+impl fmt::Display for Blake3Digest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
-impl Snapshot {
-    pub fn write_to(&self, w: &mut dyn Write) -> std::io::Result<()> {
-        writeln!(w, "{}", serde_json::to_string(&self.header)?)?;
-        for e in &self.entries {
-            writeln!(w, "{}", serde_json::to_string(e)?)?;
+impl<'de> Deserialize<'de> for Blake3Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl TryFrom<String> for Blake3Digest {
+    type Error = DigestError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl TryFrom<&str> for Blake3Digest {
+    type Error = DigestError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DigestError(String);
+
+impl fmt::Display for DigestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid BLAKE3 digest {:?}: expected exactly 64 lowercase hexadecimal characters",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for DigestError {}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FileIdentityObservation {
+    SizeAndMtime,
+    SampledBlake3 { digest: Blake3Digest },
+    FullBlake3 { digest: Blake3Digest },
+    Unreadable,
+}
+
+impl FileIdentityObservation {
+    pub fn digest(&self) -> Option<&Blake3Digest> {
+        match self {
+            Self::SampledBlake3 { digest } | Self::FullBlake3 { digest } => Some(digest),
+            Self::SizeAndMtime | Self::Unreadable => None,
+        }
+    }
+
+    pub fn is_unreadable(&self) -> bool {
+        matches!(self, Self::Unreadable)
+    }
+
+    pub fn plan_hash(&self) -> Option<String> {
+        match self {
+            Self::SampledBlake3 { digest } => Some(format!("~{digest}")),
+            Self::FullBlake3 { digest } => Some(digest.as_str().to_owned()),
+            Self::SizeAndMtime | Self::Unreadable => None,
+        }
+    }
+
+    fn is_digest(&self) -> bool {
+        matches!(self, Self::SampledBlake3 { .. } | Self::FullBlake3 { .. })
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedFile {
+    pub path: RootRelativePath,
+    pub size: u64,
+    pub mtime_ms: i64,
+    pub identity: FileIdentityObservation,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub file_system_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub mode: Option<u32>,
+    pub previous_identities: Vec<FileIdentityObservation>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedDirectory {
+    pub path: RootRelativePath,
+    pub mtime_ms: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedSymlink {
+    pub path: RootRelativePath,
+    pub mtime_ms: i64,
+    pub target: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    content = "observation",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ObservedEntry {
+    File(ObservedFile),
+    Directory(ObservedDirectory),
+    Symlink(ObservedSymlink),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservedEntryKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+impl ObservedEntry {
+    pub fn path(&self) -> &RootRelativePath {
+        match self {
+            Self::File(file) => &file.path,
+            Self::Directory(directory) => &directory.path,
+            Self::Symlink(symlink) => &symlink.path,
+        }
+    }
+
+    pub fn kind(&self) -> ObservedEntryKind {
+        match self {
+            Self::File(_) => ObservedEntryKind::File,
+            Self::Directory(_) => ObservedEntryKind::Directory,
+            Self::Symlink(_) => ObservedEntryKind::Symlink,
+        }
+    }
+
+    pub fn mtime_ms(&self) -> i64 {
+        match self {
+            Self::File(file) => file.mtime_ms,
+            Self::Directory(directory) => directory.mtime_ms,
+            Self::Symlink(symlink) => symlink.mtime_ms,
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        match self {
+            Self::File(file) => file.size,
+            Self::Directory(_) | Self::Symlink(_) => 0,
+        }
+    }
+
+    pub fn as_file(&self) -> Option<&ObservedFile> {
+        match self {
+            Self::File(file) => Some(file),
+            Self::Directory(_) | Self::Symlink(_) => None,
+        }
+    }
+
+    pub fn as_file_mut(&mut self) -> Option<&mut ObservedFile> {
+        match self {
+            Self::File(file) => Some(file),
+            Self::Directory(_) | Self::Symlink(_) => None,
+        }
+    }
+
+    pub fn as_symlink(&self) -> Option<&ObservedSymlink> {
+        match self {
+            Self::Symlink(symlink) => Some(symlink),
+            Self::File(_) | Self::Directory(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TableArtifact {
+    pub header: TableHeader,
+    pub entries: Vec<ObservedEntry>,
+}
+
+impl TableArtifact {
+    pub fn new(header: TableHeader, entries: Vec<ObservedEntry>) -> std::io::Result<Self> {
+        let table = Self { header, entries };
+        table.validate()?;
+        Ok(table)
+    }
+
+    pub fn write_to(&self, writer: &mut dyn Write) -> std::io::Result<()> {
+        self.validate()?;
+        serde_json::to_writer(&mut *writer, &self.header).map_err(std::io::Error::other)?;
+        writer.write_all(b"\n")?;
+        for entry in &self.entries {
+            serde_json::to_writer(&mut *writer, entry).map_err(std::io::Error::other)?;
+            writer.write_all(b"\n")?;
         }
         Ok(())
     }
 
-    pub fn load(path: &Path) -> std::io::Result<Snapshot> {
-        let f = std::fs::File::open(path)?;
-        Self::from_reader(std::io::BufReader::new(f))
+    pub fn read_snapshot(reader: impl BufRead) -> std::io::Result<Self> {
+        Self::read_exact(reader, TableKind::Snapshot)
     }
 
-    /// Parse from any stream (feed the stdout of a remote ssh scan straight in)
-    pub fn from_reader(r: impl BufRead) -> std::io::Result<Snapshot> {
-        let mut lines = r.lines();
-        let head_line = lines
-            .next()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty table"))??;
-        let header: Header = serde_json::from_str(&head_line).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad header: {e}"))
-        })?;
+    pub fn read_archive(reader: impl BufRead) -> std::io::Result<Self> {
+        Self::read_exact(reader, TableKind::Archive)
+    }
+
+    pub fn load_snapshot(path: &Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        Self::read_snapshot(std::io::BufReader::new(file))
+    }
+
+    fn read_exact(reader: impl BufRead, expected_kind: TableKind) -> std::io::Result<Self> {
+        let mut lines = reader.lines();
+        let header_line = lines.next().ok_or_else(|| table_error("empty table"))??;
+        if header_line.trim().is_empty() {
+            return Err(table_error("the table header line is empty"));
+        }
+        let marker: serde_json::Value = serde_json::from_str(&header_line)
+            .map_err(|error| table_error(format!("invalid table header JSON: {error}")))?;
+        let observed_schema = marker.get("schema").and_then(serde_json::Value::as_u64);
+        if observed_schema != Some(TABLE_SCHEMA as u64) {
+            let found = observed_schema
+                .map(|schema| schema.to_string())
+                .unwrap_or_else(|| "missing or non-integer".to_string());
+            let remedy = if expected_kind == TableKind::Snapshot {
+                "rebuild it with a fresh scan"
+            } else {
+                "run the archive migration"
+            };
+            return Err(table_error(format!(
+                "{} table schema {found} is unsupported; {remedy} (expected {TABLE_SCHEMA})",
+                expected_kind.as_str()
+            )));
+        }
+        let header: TableHeader = serde_json::from_str(&header_line)
+            .map_err(|error| table_error(format!("invalid table header: {error}")))?;
+        if header.kind != expected_kind {
+            return Err(table_error(format!(
+                "expected a {} table, found {}",
+                expected_kind, header.kind
+            )));
+        }
         let mut entries = Vec::new();
-        for line in lines {
+        for (index, line) in lines.enumerate() {
             let line = line?;
             if line.trim().is_empty() {
-                continue;
+                return Err(table_error(format!(
+                    "table entry line {} is empty",
+                    index + 2
+                )));
             }
-            let e: Entry = serde_json::from_str(&line).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad entry: {e}"))
+            let entry = serde_json::from_str::<ObservedEntry>(&line).map_err(|error| {
+                table_error(format!(
+                    "invalid table entry on line {}: {error}",
+                    index + 2
+                ))
             })?;
-            entries.push(e);
+            entries.push(entry);
         }
-        Ok(Snapshot { header, entries })
+        Self::new(header, entries)
+    }
+
+    pub fn validate(&self) -> std::io::Result<()> {
+        if self.header.schema != TABLE_SCHEMA {
+            return Err(table_error(format!(
+                "{} table schema {} is unsupported (expected {TABLE_SCHEMA})",
+                self.header.kind, self.header.schema
+            )));
+        }
+        if self.header.entry_count != self.entries.len() as u64 {
+            return Err(table_error(format!(
+                "table header declares {} entries but contains {}",
+                self.header.entry_count,
+                self.entries.len()
+            )));
+        }
+        validate_samples(
+            "walk error",
+            self.header.walk_errors,
+            &self.header.walk_err_samples,
+        )?;
+        validate_samples(
+            "iCloud stub",
+            self.header.icloud_stubs,
+            &self.header.icloud_stub_samples,
+        )?;
+        if let Some(vfs) = &self.header.vfs {
+            if vfs.protocol.is_empty() || vfs.display_root.is_empty() {
+                return Err(table_error(
+                    "a VFS observation requires non-empty protocol and display_root",
+                ));
+            }
+        }
+        for pair in self.entries.windows(2) {
+            if pair[0].path().as_str() >= pair[1].path().as_str() {
+                return Err(table_error(format!(
+                    "table paths must be unique and strictly sorted: {:?} then {:?}",
+                    pair[0].path().as_str(),
+                    pair[1].path().as_str()
+                )));
+            }
+        }
+        for entry in &self.entries {
+            let Some(file) = entry.as_file() else {
+                if let Some(symlink) = entry.as_symlink() {
+                    if symlink.target.is_empty() || symlink.target.contains('\0') {
+                        return Err(table_error(format!(
+                            "symlink {:?} has an invalid empty or NUL target",
+                            symlink.path.as_str()
+                        )));
+                    }
+                }
+                continue;
+            };
+            validate_current_identity(self.header.evidence, file)?;
+            if file.previous_identities.len() > ARCHIVE_GENERATIONS {
+                return Err(table_error(format!(
+                    "file {:?} carries {} historic identities; the maximum is {ARCHIVE_GENERATIONS}",
+                    file.path.as_str(),
+                    file.previous_identities.len()
+                )));
+            }
+            if self.header.kind == TableKind::Snapshot && !file.previous_identities.is_empty() {
+                return Err(table_error(format!(
+                    "snapshot entry {:?} contains archive history",
+                    file.path.as_str()
+                )));
+            }
+            if file
+                .previous_identities
+                .iter()
+                .any(|identity| !identity.is_digest())
+            {
+                return Err(table_error(format!(
+                    "archive history for {:?} contains a non-digest observation",
+                    file.path.as_str()
+                )));
+            }
+            if file.mode.is_some_and(|mode| mode > 0o7777) {
+                return Err(table_error(format!(
+                    "file {:?} carries invalid permission bits {:#o}",
+                    file.path.as_str(),
+                    file.mode.unwrap_or_default()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_samples(label: &str, count: u64, samples: &[String]) -> std::io::Result<()> {
+    if samples.len() > 5 || samples.len() as u64 > count {
+        return Err(table_error(format!(
+            "{label} samples are inconsistent with their count"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_current_identity(evidence: TableEvidence, file: &ObservedFile) -> std::io::Result<()> {
+    let valid = match evidence {
+        TableEvidence::None => matches!(file.identity, FileIdentityObservation::SizeAndMtime),
+        TableEvidence::Sampled => matches!(
+            file.identity,
+            FileIdentityObservation::SampledBlake3 { .. }
+                | FileIdentityObservation::FullBlake3 { .. }
+                | FileIdentityObservation::Unreadable
+        ),
+        TableEvidence::Full => matches!(
+            file.identity,
+            FileIdentityObservation::FullBlake3 { .. } | FileIdentityObservation::Unreadable
+        ),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(table_error(format!(
+            "file {:?} has identity {:?}, which is invalid for {} evidence",
+            file.path.as_str(),
+            file.identity,
+            evidence.as_str()
+        )))
+    }
+}
+
+fn table_error(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+pub fn roll_generations(fresh: &mut [ObservedEntry], old: &[ObservedEntry]) {
+    let previous: HashMap<&str, &ObservedFile> = old
+        .iter()
+        .filter_map(ObservedEntry::as_file)
+        .map(|file| (file.path.as_str(), file))
+        .collect();
+    for fresh_file in fresh.iter_mut().filter_map(ObservedEntry::as_file_mut) {
+        let Some(old_file) = previous.get(fresh_file.path.as_str()) else {
+            continue;
+        };
+        if old_file.identity.is_digest() && old_file.identity == fresh_file.identity {
+            fresh_file.previous_identities = old_file.previous_identities.clone();
+            continue;
+        }
+        let mut history = Vec::with_capacity(ARCHIVE_GENERATIONS);
+        if old_file.identity.is_digest() {
+            history.push(old_file.identity.clone());
+        }
+        history.extend(old_file.previous_identities.iter().cloned());
+        history.truncate(ARCHIVE_GENERATIONS);
+        fresh_file.previous_identities = history;
     }
 }
 
@@ -208,7 +576,7 @@ pub fn os_name() -> String {
 
 pub fn host_name() -> String {
     hostname::get()
-        .map(|h| h.to_string_lossy().into_owned())
+        .map(|host| host.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "unknown".into())
 }
 
@@ -216,125 +584,138 @@ pub fn host_name() -> String {
 mod tests {
     use super::*;
 
-    fn entry(path: &str, size: u64, hash: Option<&str>) -> Entry {
-        Entry {
-            path: path.into(),
-            kind: EntryKind::File,
-            size,
-            mtime_ms: 1_700_000_000_000,
-            hash: hash.map(String::from),
-            hash_failed: false,
-            file_id: None,
-            mode: None,
-            link: None,
-            prev: None,
-        }
+    fn digest(label: &str) -> Blake3Digest {
+        Blake3Digest::hash_bytes(label.as_bytes())
     }
 
-    fn header() -> Header {
-        Header {
-            schema: 1,
-            kind: "snapshot".into(),
-            root: r"D:\data".into(),
-            host: "win01".into(),
-            os: "windows".into(),
+    fn file(path: &str, identity: FileIdentityObservation) -> ObservedEntry {
+        ObservedEntry::File(ObservedFile {
+            path: RootRelativePath::try_from(path).unwrap(),
+            size: 10,
+            mtime_ms: 1_700_000_000_000,
+            identity,
+            file_system_id: None,
+            mode: None,
+            previous_identities: Vec::new(),
+        })
+    }
+
+    fn header(kind: TableKind, entries: usize) -> TableHeader {
+        TableHeader {
+            schema: TABLE_SCHEMA,
+            kind,
+            root: "/data".into(),
+            host: "host".into(),
+            os: "linux".into(),
             scanned_at_ms: 1_700_000_000_000,
             duration_ms: 12,
-            entry_count: 0,
-            hashed: true,
-            excluded_dirs: 3,
-            excluded_files: 4,
+            entry_count: entries as u64,
+            evidence: TableEvidence::Full,
+            excluded_dirs: 0,
+            excluded_files: 0,
             walk_errors: 0,
             walk_err_samples: Vec::new(),
             icloud_stubs: 0,
             icloud_stub_samples: Vec::new(),
-            dataless_files: 0,
             skipped_symlinks: 0,
+            dataless_files: 0,
             vfs: None,
         }
     }
 
-    /// The snapshot is the format every stage hands to the next and the one an archive is read
-    /// back from months later. A field that silently stops surviving the trip is a whole class
-    /// of wrong answers, so pin the round-trip rather than the struct.
     #[test]
-    fn a_snapshot_survives_write_then_read() {
-        let snap = Snapshot {
-            header: header(),
-            entries: vec![
-                entry("a/one.txt", 10, Some("abc")),
-                entry("b/two.bin", 2048, None),
+    fn current_table_round_trip_is_exact() {
+        let table = TableArtifact::new(
+            header(TableKind::Snapshot, 2),
+            vec![
+                file(
+                    "a.txt",
+                    FileIdentityObservation::FullBlake3 {
+                        digest: digest("a"),
+                    },
+                ),
+                file(
+                    "b.txt",
+                    FileIdentityObservation::FullBlake3 {
+                        digest: digest("b"),
+                    },
+                ),
             ],
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        snap.write_to(&mut buf).unwrap();
-        let back = Snapshot::from_reader(std::io::BufReader::new(&buf[..])).unwrap();
-
-        assert_eq!(back.header.root, snap.header.root);
-        assert_eq!(back.header.hashed, snap.header.hashed);
-        assert_eq!(
-            back.header.excluded_dirs, 3,
-            "exclusion counts must survive — the UI reports them"
-        );
-        assert_eq!(back.header.excluded_files, 4);
-        assert_eq!(back.entries.len(), 2);
-        assert_eq!(back.entries[0].path, "a/one.txt");
-        assert_eq!(back.entries[0].hash.as_deref(), Some("abc"));
-        assert_eq!(
-            back.entries[1].hash, None,
-            "an absent hash must stay absent, not become empty string"
-        );
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        table.write_to(&mut bytes).unwrap();
+        let decoded = TableArtifact::read_snapshot(std::io::BufReader::new(bytes.as_slice()))
+            .expect("strict v2 table");
+        assert_eq!(decoded.header, table.header);
+        assert_eq!(decoded.entries, table.entries);
     }
 
-    /// One JSON object per line is what lets an ssh pipe, an archive and an audit share a format.
     #[test]
-    fn the_table_is_one_json_object_per_line() {
-        let snap = Snapshot {
-            header: header(),
-            entries: vec![entry("x", 1, None), entry("y", 2, None)],
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        snap.write_to(&mut buf).unwrap();
-        let text = String::from_utf8(buf).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "one header line plus one line per entry");
-        for l in &lines {
-            serde_json::from_str::<serde_json::Value>(l).expect("every line parses on its own");
-        }
+    fn unknown_or_missing_fields_are_rejected() {
+        let header = serde_json::to_value(header(TableKind::Snapshot, 0)).unwrap();
+        let mut unknown = header.clone();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("surprise".into(), serde_json::json!(true));
+        let error = TableArtifact::read_snapshot(std::io::BufReader::new(
+            format!("{}\n", serde_json::to_string(&unknown).unwrap()).as_bytes(),
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
+
+        let mut missing = header;
+        missing.as_object_mut().unwrap().remove("vfs");
+        let error = TableArtifact::read_snapshot(std::io::BufReader::new(
+            format!("{}\n", serde_json::to_string(&missing).unwrap()).as_bytes(),
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("missing field `vfs`"));
     }
 
-    /// Generations are the archive's cheap stand-in for a causal clock: the newest hash is the
-    /// current one and older ones ride along, newest first, capped.
     #[test]
-    fn roll_generations_chains_history_newest_first_and_caps() {
-        let mut fresh = vec![entry("f", 1, Some("v4"))];
-        let old = vec![Entry {
-            prev: Some(vec!["v2".into(), "v1".into()]),
-            ..entry("f", 1, Some("v3"))
-        }];
-        roll_generations(&mut fresh, &old);
-        let prev = fresh[0].prev.clone().expect("history must attach");
-        assert_eq!(
-            prev.first().map(String::as_str),
-            Some("v3"),
-            "the previous current hash leads"
-        );
-        assert!(
-            prev.len() <= ARCHIVE_GENERATIONS,
-            "history is capped at {ARCHIVE_GENERATIONS}"
-        );
+    fn noncurrent_snapshot_requires_a_rebuild() {
+        let bytes = b"{\"schema\":1,\"kind\":\"snapshot\"}\n";
+        let error =
+            TableArtifact::read_snapshot(std::io::BufReader::new(bytes.as_slice())).unwrap_err();
+        assert!(error.to_string().contains("rebuild it with a fresh scan"));
     }
 
-    /// An unchanged file must not accumulate a generation per scan.
     #[test]
-    fn roll_generations_does_not_grow_when_content_is_unchanged() {
-        let mut fresh = vec![entry("f", 1, Some("same"))];
-        let old = vec![entry("f", 1, Some("same"))];
-        roll_generations(&mut fresh, &old);
-        let prev = fresh[0].prev.clone().unwrap_or_default();
-        assert!(
-            !prev.contains(&"same".to_string()),
-            "the current hash must not also sit in its own history"
+    fn digest_accepts_only_canonical_blake3_text() {
+        let canonical = digest("canonical").into_string();
+        assert!(Blake3Digest::try_from(canonical.as_str()).is_ok());
+        assert!(Blake3Digest::try_from(canonical.to_uppercase().as_str()).is_err());
+        assert!(Blake3Digest::try_from("abc").is_err());
+        assert!(Blake3Digest::try_from(format!("~{canonical}")).is_err());
+    }
+
+    #[test]
+    fn generation_history_is_typed_and_bounded() {
+        let mut fresh = vec![file(
+            "file.bin",
+            FileIdentityObservation::FullBlake3 {
+                digest: digest("v4"),
+            },
+        )];
+        let mut old = file(
+            "file.bin",
+            FileIdentityObservation::FullBlake3 {
+                digest: digest("v3"),
+            },
         );
+        old.as_file_mut().unwrap().previous_identities = vec![
+            FileIdentityObservation::FullBlake3 {
+                digest: digest("v2"),
+            },
+            FileIdentityObservation::FullBlake3 {
+                digest: digest("v1"),
+            },
+        ];
+        roll_generations(&mut fresh, &[old]);
+        let history = &fresh[0].as_file().unwrap().previous_identities;
+        assert_eq!(history.len(), ARCHIVE_GENERATIONS);
+        assert_eq!(history[0].digest(), Some(&digest("v3")));
     }
 }

@@ -8,47 +8,24 @@ use syncdash::fs::vfs::spec::{parse, RootSpec};
 use crate::autoscan::{
     configured_interval, AutoScanBinding, AutoScanController, AutoScanStatusDto,
 };
-use crate::dto::CompareOwner;
-use crate::state::{begin_run_command, finish_run_command, RunState};
-
-struct AutoScanCommandGuard(Arc<RunState>);
-
-impl AutoScanCommandGuard {
-    fn begin(state: Arc<RunState>) -> Self {
-        begin_run_command(&state);
-        Self(state)
-    }
-}
-
-impl Drop for AutoScanCommandGuard {
-    fn drop(&mut self) {
-        finish_run_command(&self.0);
-    }
-}
-
-fn require_main(window: &tauri::WebviewWindow) -> Result<(), String> {
-    if window.label() == "main" {
-        Ok(())
-    } else {
-        Err("AutoScan can only be controlled from the main window".into())
-    }
-}
+use crate::run_lifecycle::RunLifecycle;
+use crate::window_role::{require_window_role, WindowRole};
 
 #[tauri::command]
 pub fn start_autoscan(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     controller: tauri::State<'_, Arc<AutoScanController>>,
-    run_state: tauri::State<'_, Arc<RunState>>,
+    run_lifecycle: tauri::State<'_, Arc<RunLifecycle>>,
     expected_job_id: String,
     expected_revision: String,
     target_index: usize,
 ) -> Result<AutoScanStatusDto, String> {
-    require_main(&window)?;
+    require_window_role(&window, WindowRole::Main)?;
     // Cross the same short gate as Compare/Apply before reading the registry. A concurrent save
     // either finishes first or sees this command in flight, so it cannot leave a freshly armed
     // generation bound to the revision that existed just before its mutation.
-    let _command = AutoScanCommandGuard::begin(run_state.inner().clone());
+    let _command = run_lifecycle.inner().command_lease()?;
     let (job_name, full_job) = syncdash::job::load_by_id(&expected_job_id).map_err(|error| {
         format!(
             "The selected job was deleted or replaced before AutoScan started — refresh it and try again: {error}"
@@ -61,31 +38,24 @@ pub fn start_autoscan(
             "Job '{job_name}' changed before AutoScan started — refresh it and try again"
         ));
     }
-    let target = full_job
-        .target_list()
-        .get(target_index)
-        .cloned()
-        .ok_or_else(|| format!("Job '{job_name}' has no target {}", target_index + 1))?;
-    let job = full_job.for_target(&target);
-    job.validate()?;
-    let local_roots = match (parse(&job.source), parse(&job.target)) {
+    let selected_target = full_job.select_target(target_index)?;
+    let local_roots = match (parse(&full_job.source), parse(selected_target.target())) {
         (RootSpec::Local(source), RootSpec::Local(target)) => Some((source, target)),
         _ => None,
     };
-    Ok(controller.start(
+    controller.start(
         app,
-        run_state.inner().clone(),
         AutoScanBinding {
             job_id: full_job.job_id.clone(),
             job_name,
             config_revision: revision,
             target_index,
-            interval_secs: configured_interval(&job),
-            auto_apply: job.watch_auto_apply,
-            rigor: job.rigor.clone(),
+            interval_secs: configured_interval(&full_job),
+            auto_apply: full_job.autoscan_auto_apply,
+            rigor: full_job.rigor.clone(),
         },
         local_roots,
-    ))
+    )
 }
 
 #[tauri::command]
@@ -93,7 +63,7 @@ pub fn stop_autoscan(
     window: tauri::WebviewWindow,
     controller: tauri::State<'_, Arc<AutoScanController>>,
 ) -> Result<AutoScanStatusDto, String> {
-    require_main(&window)?;
+    require_window_role(&window, WindowRole::Main)?;
     Ok(controller.stop())
 }
 
@@ -102,19 +72,17 @@ pub fn autoscan_status(
     window: tauri::WebviewWindow,
     controller: tauri::State<'_, Arc<AutoScanController>>,
 ) -> Result<AutoScanStatusDto, String> {
-    require_main(&window)?;
+    require_window_role(&window, WindowRole::Main)?;
     Ok(controller.status())
 }
 
 #[tauri::command]
-pub fn complete_autoscan(
+pub fn decline_autoscan_trigger(
     window: tauri::WebviewWindow,
     controller: tauri::State<'_, Arc<AutoScanController>>,
     generation: u64,
     ticket_id: u64,
-    succeeded: bool,
-    owner: Option<CompareOwner>,
 ) -> Result<AutoScanStatusDto, String> {
-    require_main(&window)?;
-    controller.complete(generation, ticket_id, succeeded, owner.as_ref())
+    require_window_role(&window, WindowRole::Main)?;
+    controller.decline_trigger(generation, ticket_id)
 }

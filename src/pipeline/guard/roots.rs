@@ -2,18 +2,41 @@
 
 use std::path::Path;
 
-use super::marker::has_marker;
+use super::marker::{inspect_marker_in, Marker};
 use super::Verdict;
 use crate::foundation::names::MARKER_NAME;
+use crate::foundation::path::RootRelativeDir;
+use crate::fs::local_root::LocalRoot;
 
 /// Root availability + marker check. `label` is only used in messages ("source"/"target").
 pub fn check_root(label: &str, root: &Path, require_marker: bool, v: &mut Verdict) {
-    if !root.is_dir() {
-        v.blockers
-            .push(format!("{label} root not accessible: {}", root.display()));
-        return;
-    }
-    if require_marker && !has_marker(root) {
+    let local_root = match LocalRoot::open(root.to_path_buf()) {
+        Ok(root) => root,
+        Err(error) => {
+            v.blockers.push(format!(
+                "{label} root not accessible: {} ({error})",
+                root.display()
+            ));
+            return;
+        }
+    };
+    let marker = match inspect_marker_in(&local_root) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) => {
+            let message = format!(
+                "{label} root has an invalid {MARKER_NAME} marker: {} ({error})",
+                root.display()
+            );
+            if require_marker {
+                v.blockers.push(message);
+                return;
+            }
+            v.warnings.push(message);
+            false
+        }
+    };
+    if require_marker && !marker {
         v.blockers.push(format!(
             "{label} root has no {MARKER_NAME} marker: {} \
              — the share may not be mounted. Run `syncdash mark <root>` once on the real data, \
@@ -23,9 +46,10 @@ pub fn check_root(label: &str, root: &Path, require_marker: bool, v: &mut Verdic
         return;
     }
     // Even without a required marker, an empty directory plus planned deletions is worth a warning (decided in check_plan)
-    if !require_marker && !has_marker(root) {
-        let empty = std::fs::read_dir(root)
-            .map(|mut d| d.next().is_none())
+    if !require_marker && !marker {
+        let empty = local_root
+            .read_directory(&RootRelativeDir::new("").expect("empty path names the root"))
+            .map(|entries| entries.is_empty())
             .unwrap_or(false);
         if empty {
             v.warnings.push(format!(
@@ -47,10 +71,10 @@ pub fn check_root_vfs(
     require_marker: bool,
     v: &mut Verdict,
 ) {
-    use crate::model::table::EntryKind;
+    use crate::fs::vfs::VfsEntryKind;
     let disp = vfs.display();
     match vfs.stat("") {
-        Ok(Some(m)) if m.kind == EntryKind::Dir => {}
+        Ok(Some(m)) if m.kind == VfsEntryKind::Directory => {}
         Ok(Some(_)) => {
             v.blockers
                 .push(format!("{label} root is not a directory: {disp}"));
@@ -67,7 +91,20 @@ pub fn check_root_vfs(
             return;
         }
     }
-    let marker = matches!(vfs.stat(MARKER_NAME), Ok(Some(_)));
+    let marker = match inspect_marker_vfs(vfs) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) => {
+            let message =
+                format!("{label} root has an invalid {MARKER_NAME} marker: {disp} ({error})");
+            if require_marker {
+                v.blockers.push(message);
+                return;
+            }
+            v.warnings.push(message);
+            false
+        }
+    };
     if require_marker && !marker {
         v.blockers.push(format!(
             "{label} root has no {MARKER_NAME} marker: {disp} \
@@ -88,6 +125,33 @@ pub fn check_root_vfs(
             ));
         }
     }
+}
+
+fn inspect_marker_vfs(
+    vfs: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+) -> std::io::Result<Option<Marker>> {
+    use crate::fs::vfs::VfsEntryKind;
+    use std::io::Read as _;
+
+    match vfs.stat(MARKER_NAME).map_err(std::io::Error::from)? {
+        None => return Ok(None),
+        Some(metadata) if metadata.kind == VfsEntryKind::File => {}
+        Some(metadata) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("marker is a {:?}, not a regular file", metadata.kind),
+            ))
+        }
+    }
+    let mut stream = vfs.open_read(MARKER_NAME).map_err(std::io::Error::from)?;
+    let mut text = String::new();
+    stream.read_to_string(&mut text)?;
+    serde_json::from_str(&text).map(Some).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("marker JSON is invalid: {error}"),
+        )
+    })
 }
 
 // ---- the capability report: the no-silent rule, mechanized ----
@@ -116,6 +180,25 @@ mod tests {
         };
         check_root("target", &d, true, &mut v2);
         assert!(v2.ok(), "marker present -> pass");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn malformed_marker_does_not_satisfy_the_mount_guard() {
+        let d =
+            std::env::temp_dir().join(format!("syncdash-pf-invalid-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(MARKER_NAME), b"not-json").unwrap();
+        let mut verdict = Verdict {
+            blockers: vec![],
+            warnings: vec![],
+        };
+
+        check_root("target", &d, true, &mut verdict);
+
+        assert_eq!(verdict.blockers.len(), 1);
+        assert!(verdict.blockers[0].contains("invalid .syncdash-root marker"));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

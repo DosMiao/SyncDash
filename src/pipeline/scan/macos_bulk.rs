@@ -4,11 +4,12 @@
 //! `readdir` + `lstat` syscall pair per item that dominates trees containing hundreds of thousands
 //! of small files, while preserving the local scanner's strict path and error contracts.
 
-use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
+use crate::foundation::path::{EntryName, RootRelativeDir, RootRelativePath};
+use crate::fs::local_root::LocalRoot;
 use crate::pipeline::filter::PathFilter;
 
 use super::local_walk::{WalkEntry, WalkKind, WalkStats};
@@ -58,8 +59,8 @@ struct ParsedEntry<'a> {
 impl ParsedEntry<'_> {
     fn complete(&self) -> bool {
         // Bulk metadata describes the covered directory/firmlink object, not the mounted/firmlink
-        // root that path-based traversal sees. Force the uncommon path through symlink_metadata so
-        // its snapshot fields stay identical to WalkDir without imposing a syscall on every item.
+        // root exposed through its descriptor. Force uncommon entries through descriptor-relative
+        // metadata so mounted and firmlink roots keep their visible identity.
         self.entry_error.unwrap_or(0) == 0
             && self.dev.is_some()
             && self.kind.is_some()
@@ -80,12 +81,11 @@ impl ParsedEntry<'_> {
             }
     }
 
-    fn into_walk_entry(self, abs: PathBuf, rel: String) -> WalkEntry {
+    fn into_walk_entry(self, relative: RootRelativePath) -> WalkEntry {
         let dev = self.dev.expect("complete bulk entry has a device id");
         let file_id = self.file_id.expect("complete bulk entry has a file id");
         WalkEntry {
-            abs,
-            rel,
+            relative,
             kind: self.kind.expect("complete bulk entry has a kind"),
             size: self.size.expect("complete bulk entry has a size"),
             mtime_ms: self.mtime_ms.expect("complete bulk entry has an mtime"),
@@ -146,7 +146,7 @@ fn system_bulk_read(fd: RawFd, buffer: &mut [u8]) -> std::io::Result<usize> {
 }
 
 pub(super) fn walk<C, V>(
-    root: &Path,
+    root: &LocalRoot,
     filter: &PathFilter,
     checkpoint: C,
     visit: V,
@@ -159,7 +159,7 @@ where
 }
 
 fn walk_with_bulk<C, V, B>(
-    root: &Path,
+    root: &LocalRoot,
     filter: &PathFilter,
     mut checkpoint: C,
     mut visit: V,
@@ -193,7 +193,7 @@ where
 }
 
 fn walk_bulk<C, V, B>(
-    root: &Path,
+    root: &LocalRoot,
     filter: &PathFilter,
     checkpoint: &mut C,
     visit: &mut V,
@@ -205,36 +205,36 @@ where
     B: FnMut(RawFd, &mut [u8]) -> std::io::Result<usize>,
 {
     let mut stats = WalkStats::default();
-    let mut directories = vec![PathBuf::new()];
+    let mut directories = vec![RootRelativeDir::new("").expect("the root directory is valid")];
     let mut buffer = vec![0u8; BUFFER_SIZE];
 
-    while let Some(dir_rel) = directories.pop() {
+    while let Some(directory_relative) = directories.pop() {
         checkpoint()?;
-        let dir_abs = root.join(&dir_rel);
-        let dir = match open_directory(&dir_abs, dir_rel.as_os_str().is_empty()) {
-            Ok(dir) => dir,
-            Err(error) if dir_rel.as_os_str().is_empty() => {
+        let directory = match root.open_directory(&directory_relative) {
+            Ok(directory) => directory,
+            Err(error) if directory_relative.as_str().is_empty() => {
                 return Err(std::io::Error::new(
                     error.kind(),
                     format!(
                         "scan of '{}' could not read the root itself: {error} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
-                        root.display()
+                        root.display_path().display()
                     ),
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                stats.note_error(format!("{}: {error}", dir_abs.display()));
+                stats.note_error(format!("{}: {error}", directory_relative.as_str()));
                 continue;
             }
-            Err(error) => return Err(subtree_error(root, &dir_abs, error)),
+            Err(error) => return Err(subtree_error(root, directory_relative.as_str(), error)),
         };
+        let directory_handle = directory.try_clone_handle()?;
 
         loop {
             checkpoint()?;
-            let count = match bulk_read(dir.as_raw_fd(), &mut buffer) {
+            let count = match bulk_read(directory_handle.as_raw_fd(), &mut buffer) {
                 Ok(count) => count,
                 Err(error)
-                    if dir_rel.as_os_str().is_empty()
+                    if directory_relative.as_str().is_empty()
                         && matches!(
                             error.raw_os_error(),
                             Some(libc::ENOTSUP) | Some(libc::EINVAL)
@@ -243,26 +243,26 @@ where
                     return Err(std::io::Error::new(
                         error.kind(),
                         RootBulkCompatibilityError {
-                            root: root.to_path_buf(),
+                            root: root.display_path().to_path_buf(),
                             source: error,
                         },
                     ));
                 }
                 Err(error) => {
-                    if dir_rel.as_os_str().is_empty() {
+                    if directory_relative.as_str().is_empty() {
                         return Err(std::io::Error::new(
                         error.kind(),
                         format!(
                             "scan of '{}' could not read the root itself: {error} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
-                            root.display()
+                            root.display_path().display()
                         ),
                     ));
                     }
                     if error.kind() == std::io::ErrorKind::NotFound {
-                        stats.note_error(format!("{}: {error}", dir_abs.display()));
+                        stats.note_error(format!("{}: {error}", directory_relative.as_str()));
                         break;
                     }
-                    return Err(subtree_error(root, &dir_abs, error));
+                    return Err(subtree_error(root, directory_relative.as_str(), error));
                 }
             };
             if count == 0 {
@@ -277,8 +277,8 @@ where
                         std::io::ErrorKind::InvalidData,
                         format!(
                             "scan of '{}' received malformed directory metadata at '{}': {error} — refusing to emit a half table",
-                            root.display(),
-                            dir_abs.display()
+                            root.display_path().display(),
+                            directory_relative.as_str()
                         ),
                     )
                 })?;
@@ -290,8 +290,8 @@ where
                         std::io::ErrorKind::InvalidData,
                         format!(
                             "scan of '{}' received malformed directory metadata at '{}': {error} — refusing to emit a half table",
-                            root.display(),
-                            dir_abs.display()
+                            root.display_path().display(),
+                            directory_relative.as_str()
                         ),
                     )
                 })?;
@@ -300,35 +300,38 @@ where
                 }
 
                 let name = std::ffi::OsString::from_vec(parsed.name.to_vec());
-                let raw_rel = dir_rel.join(&name);
-                let abs = root.join(&raw_rel);
-                let mut metadata_entry = None;
+                let Some(name_text) = name.to_str() else {
+                    stats.note_invalid_name(Path::new(&name));
+                    continue;
+                };
+                let name = match EntryName::new(name_text) {
+                    Ok(name) => name,
+                    Err(error) => {
+                        stats.note_error(error.to_string());
+                        continue;
+                    }
+                };
+                let relative = child_path(&directory_relative, &name);
+                let mut fallback_metadata = None;
                 let kind = match parsed.kind {
                     Some(kind) => kind,
-                    None => match std::fs::symlink_metadata(&abs) {
-                        Ok(md) => {
-                            let fallback = WalkEntry::from_metadata(
-                                abs.clone(),
-                                String::new(),
-                                kind_from_metadata(&md),
-                                &md,
-                            );
-                            let kind = fallback.kind;
-                            metadata_entry = Some(fallback);
+                    None => match root.metadata_path(&relative) {
+                        Ok(metadata) => {
+                            let kind = super::local_walk::kind_from_metadata(&metadata);
+                            fallback_metadata = Some(metadata);
                             kind
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            stats.note_error(format!("{}: {error}", raw_rel.to_string_lossy()));
+                            stats.note_error(format!("{}: {error}", relative.as_str()));
                             continue;
                         }
-                        Err(error) => return Err(subtree_error(root, &abs, error)),
+                        Err(error) => return Err(subtree_error(root, relative.as_str(), error)),
                     },
                 };
 
-                let filter_rel = raw_rel.to_string_lossy().replace('\\', "/");
                 let keep = match kind {
                     WalkKind::Dir => {
-                        let (pass, child_might_match) = filter.pass_dir(&filter_rel);
+                        let (pass, child_might_match) = filter.pass_dir(relative.as_str());
                         let keep = pass || child_might_match;
                         if !keep {
                             stats.excluded_dirs += 1;
@@ -336,7 +339,7 @@ where
                         keep
                     }
                     WalkKind::File | WalkKind::Symlink => {
-                        let keep = filter.pass_file(&filter_rel);
+                        let keep = filter.pass_file(relative.as_str());
                         if !keep {
                             stats.excluded_files += 1;
                         }
@@ -347,38 +350,40 @@ where
                     continue;
                 }
 
-                let valid_rel = raw_rel.to_str().map(|rel| rel.replace('\\', "/"));
-                if valid_rel.is_none() {
-                    stats.note_invalid_name(&raw_rel);
+                let entry = if parsed.complete() {
+                    parsed.into_walk_entry(relative.clone())
                 } else {
-                    let rel = valid_rel.expect("checked above");
-                    let entry = match metadata_entry {
-                        Some(mut entry) => {
-                            entry.rel = rel;
-                            entry
-                        }
-                        None if parsed.complete() => parsed.into_walk_entry(abs.clone(), rel),
-                        None => match std::fs::symlink_metadata(&abs) {
-                            Ok(md) => WalkEntry::from_metadata(abs.clone(), rel, kind, &md),
+                    let metadata = match fallback_metadata {
+                        Some(metadata) => metadata,
+                        None => match root.metadata_path(&relative) {
+                            Ok(metadata) => metadata,
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                                stats.note_error(format!("{}: {error}", raw_rel.to_string_lossy()));
+                                stats.note_error(format!("{}: {error}", relative.as_str()));
                                 if kind == WalkKind::Dir {
-                                    directories.push(raw_rel);
+                                    directories.push(as_directory(relative.clone()));
                                 }
                                 continue;
                             }
                             Err(error) if kind != WalkKind::Dir => {
-                                stats.note_error(format!("{}: {error}", raw_rel.to_string_lossy()));
+                                stats.note_error(format!("{}: {error}", relative.as_str()));
                                 continue;
                             }
-                            Err(error) => return Err(subtree_error(root, &abs, error)),
+                            Err(error) => {
+                                return Err(subtree_error(root, relative.as_str(), error));
+                            }
                         },
                     };
-                    visit(entry);
-                }
+                    let dataless = if kind == WalkKind::File {
+                        root.is_dataless_file(&relative)?
+                    } else {
+                        false
+                    };
+                    WalkEntry::from_metadata(relative.clone(), &metadata, dataless)
+                };
+                visit(entry);
 
                 if kind == WalkKind::Dir {
-                    directories.push(raw_rel);
+                    directories.push(as_directory(relative));
                 }
             }
         }
@@ -387,51 +392,28 @@ where
     Ok(stats)
 }
 
-fn open_directory(path: &Path, follow: bool) -> std::io::Result<OwnedFd> {
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "path contains a null byte",
-        )
-    })?;
-    let mut flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    if !follow {
-        flags |= libc::O_NOFOLLOW;
-    }
-    let fd = unsafe {
-        // SAFETY: `path` is a live, null-terminated C string and flags require no mode argument.
-        libc::open(path.as_ptr(), flags)
-    };
-    if fd < 0 {
-        Err(std::io::Error::last_os_error())
+fn child_path(directory: &RootRelativeDir, name: &EntryName) -> RootRelativePath {
+    let relative = if directory.as_str().is_empty() {
+        name.as_str().to_owned()
     } else {
-        Ok(unsafe {
-            // SAFETY: `open` returned a new descriptor, transferring unique ownership here.
-            OwnedFd::from_raw_fd(fd)
-        })
-    }
+        format!("{}/{}", directory.as_str(), name.as_str())
+    };
+    RootRelativePath::new(relative).expect("validated directory and entry names form a valid path")
 }
 
-fn subtree_error(root: &Path, path: &Path, error: std::io::Error) -> std::io::Error {
+fn as_directory(relative: RootRelativePath) -> RootRelativeDir {
+    RootRelativeDir::new(relative.into_string())
+        .expect("a validated child path is a valid directory path")
+}
+
+fn subtree_error(root: &LocalRoot, relative: &str, error: std::io::Error) -> std::io::Error {
     std::io::Error::new(
         error.kind(),
         format!(
-            "scan of '{}' aborted at '{}': {error} — refusing to emit a half table (its missing subtrees would read as deletions)",
-            root.display(),
-            path.display()
+            "scan of '{}' aborted at '{relative}': {error} — refusing to emit a half table (its missing subtrees would read as deletions)",
+            root.display_path().display()
         ),
     )
-}
-
-fn kind_from_metadata(md: &std::fs::Metadata) -> WalkKind {
-    let file_type = md.file_type();
-    if file_type.is_dir() {
-        WalkKind::Dir
-    } else if file_type.is_symlink() {
-        WalkKind::Symlink
-    } else {
-        WalkKind::File
-    }
 }
 
 fn record_at(buffer: &[u8], offset: usize) -> Result<&[u8], &'static str> {
@@ -621,18 +603,24 @@ mod tests {
     }
 
     fn collect_bulk(root: &Path, filter: &PathFilter) -> (Vec<WalkEntry>, WalkStats) {
+        let local_root = LocalRoot::open(root.to_path_buf()).unwrap();
         let mut entries = Vec::new();
-        let stats = walk(root, filter, || Ok(()), |entry| entries.push(entry)).unwrap();
-        entries.sort_by(|left, right| left.rel.cmp(&right.rel));
+        let stats = walk(&local_root, filter, || Ok(()), |entry| entries.push(entry)).unwrap();
+        entries.sort_by(|left, right| left.relative.cmp(&right.relative));
         (entries, stats)
     }
 
     fn collect_reference(root: &Path, filter: &PathFilter) -> (Vec<WalkEntry>, WalkStats) {
+        let local_root = LocalRoot::open(root.to_path_buf()).unwrap();
         let mut entries = Vec::new();
-        let stats =
-            super::super::local_walk::walk(root, filter, || Ok(()), |entry| entries.push(entry))
-                .unwrap();
-        entries.sort_by(|left, right| left.rel.cmp(&right.rel));
+        let stats = super::super::local_walk::walk(
+            &local_root,
+            filter,
+            || Ok(()),
+            |entry| entries.push(entry),
+        )
+        .unwrap();
+        entries.sort_by(|left, right| left.relative.cmp(&right.relative));
         (entries, stats)
     }
 
@@ -683,10 +671,11 @@ mod tests {
         let (reference_entries, reference_stats) = collect_reference(&root, &filter);
 
         for errno in [libc::ENOTSUP, libc::EINVAL] {
+            let local_root = LocalRoot::open(root.clone()).unwrap();
             let calls = std::cell::Cell::new(0usize);
             let mut entries = Vec::new();
             let stats = walk_with_bulk(
-                &root,
+                &local_root,
                 &filter,
                 || Ok(()),
                 |entry| entries.push(entry),
@@ -696,7 +685,7 @@ mod tests {
                 },
             )
             .unwrap();
-            entries.sort_by(|left, right| left.rel.cmp(&right.rel));
+            entries.sort_by(|left, right| left.relative.cmp(&right.relative));
 
             assert_eq!(
                 calls.get(),
@@ -719,9 +708,10 @@ mod tests {
         let filter = PathFilter::build(&[], &[]);
         let calls = std::cell::Cell::new(0usize);
         let mut entries = Vec::new();
+        let local_root = LocalRoot::open(root.clone()).unwrap();
 
         let error = walk_with_bulk(
-            &root,
+            &local_root,
             &filter,
             || Ok(()),
             |entry| entries.push(entry),

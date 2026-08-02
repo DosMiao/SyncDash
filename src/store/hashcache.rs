@@ -13,10 +13,19 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::model::table::Entry;
+use crate::foundation::path::RootRelativePath;
+use crate::model::table::{FileIdentityObservation, ObservedEntry};
 
-const STATE_KIND: &str = "hashcache";
-pub type HashCache = HashMap<String, (u64, i64, String)>;
+const STATE_KIND: &str = "hashcache-v2";
+
+#[derive(Clone)]
+pub struct CachedFileIdentity {
+    pub size: u64,
+    pub mtime_ms: i64,
+    pub identity: FileIdentityObservation,
+}
+
+pub type HashCache = HashMap<RootRelativePath, CachedFileIdentity>;
 
 fn logical_file_for_key(key: &str) -> PathBuf {
     super::logical_scan_state_file(key, "jsonl")
@@ -31,19 +40,20 @@ fn local_file_for_key(key: &str) -> PathBuf {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CacheLine {
-    path: String,
+    path: RootRelativePath,
     size: u64,
     mtime_ms: i64,
-    hash: String,
+    identity: FileIdentityObservation,
 }
 
 #[derive(serde::Serialize)]
 struct CacheLineRef<'a> {
-    path: &'a str,
+    path: &'a RootRelativePath,
     size: u64,
     mtime_ms: i64,
-    hash: &'a str,
+    identity: &'a FileIdentityObservation,
 }
 
 fn read_bound_from_file(
@@ -52,7 +62,16 @@ fn read_bound_from_file(
 ) -> std::io::Result<(HashCache, super::ScanStateRead)> {
     let mut map = HashMap::new();
     let status = super::read_scan_state(file, STATE_KIND, binding, |c: CacheLine| {
-        map.insert(c.path, (c.size, c.mtime_ms, c.hash));
+        if c.identity.digest().is_some() {
+            map.insert(
+                c.path,
+                CachedFileIdentity {
+                    size: c.size,
+                    mtime_ms: c.mtime_ms,
+                    identity: c.identity,
+                },
+            );
+        }
     })?;
     if status != super::ScanStateRead::Accepted {
         map.clear();
@@ -105,12 +124,12 @@ fn rewrite_map(file: &Path, binding: &[u8], map: &HashCache) -> std::io::Result<
     let mut rows: Vec<_> = map.iter().collect();
     rows.sort_unstable_by(|left, right| left.0.cmp(right.0));
     super::rewrite_scan_state(file, STATE_KIND, binding, |writer| {
-        for (path, (size, mtime_ms, hash)) in rows {
+        for (path, cached) in rows {
             let row = CacheLineRef {
                 path,
-                size: *size,
-                mtime_ms: *mtime_ms,
-                hash,
+                size: cached.size,
+                mtime_ms: cached.mtime_ms,
+                identity: &cached.identity,
             };
             serde_json::to_writer(&mut *writer, &row).map_err(std::io::Error::other)?;
             writer.write_all(b"\n")?;
@@ -119,15 +138,22 @@ fn rewrite_map(file: &Path, binding: &[u8], map: &HashCache) -> std::io::Result<
     })
 }
 
-fn merge_entries(map: &mut HashCache, entries: &[Entry]) {
+fn merge_entries(map: &mut HashCache, entries: &[ObservedEntry]) {
     for entry in entries {
-        if let Some(hash) = &entry.hash {
+        let Some(file) = entry.as_file() else {
+            continue;
+        };
+        if file.identity.digest().is_some() {
             map.insert(
-                entry.path.clone(),
-                (entry.size, entry.mtime_ms, hash.clone()),
+                file.path.clone(),
+                CachedFileIdentity {
+                    size: file.size,
+                    mtime_ms: file.mtime_ms,
+                    identity: file.identity.clone(),
+                },
             );
         } else {
-            map.remove(&entry.path);
+            map.remove(&file.path);
         }
     }
 }
@@ -136,7 +162,7 @@ fn reconcile_bound_to_file(
     file: &Path,
     binding: &[u8],
     prior: Option<HashCache>,
-    entries: &[Entry],
+    entries: &[ObservedEntry],
     coverage: super::ScanCoverage,
     retain_absent: &std::collections::HashSet<String>,
 ) -> std::io::Result<bool> {
@@ -146,7 +172,7 @@ fn reconcile_bound_to_file(
         prior
             .unwrap_or_default()
             .into_iter()
-            .filter(|(path, _)| retain_absent.contains(path))
+            .filter(|(path, _)| retain_absent.contains(path.as_str()))
             .collect()
     };
     merge_entries(&mut map, entries);
@@ -155,7 +181,7 @@ fn reconcile_bound_to_file(
 
 pub fn save_by_key(
     key: &str,
-    entries: &[Entry],
+    entries: &[ObservedEntry],
     coverage: super::ScanCoverage,
     retain_absent: &std::collections::HashSet<String>,
 ) -> super::StateWriteStatus {
@@ -182,7 +208,7 @@ pub fn save_by_key(
 
 pub(crate) fn save_local(
     identity: &super::localid::LocalScanStateIdentity,
-    entries: &[Entry],
+    entries: &[ObservedEntry],
     coverage: super::ScanCoverage,
     retain_absent: &std::collections::HashSet<String>,
 ) -> super::StateWriteStatus {
@@ -212,7 +238,7 @@ pub(crate) fn save_local(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::table::EntryKind;
+    use crate::model::table::{Blake3Digest, ObservedFile};
 
     fn temp_file(tag: &str) -> PathBuf {
         let directory =
@@ -226,22 +252,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(file.parent().unwrap());
     }
 
-    fn entry(path: &str, hash: Option<&str>) -> Entry {
-        Entry {
-            path: path.into(),
-            kind: EntryKind::File,
+    fn entry(path: &str, hash: Option<&str>) -> ObservedEntry {
+        ObservedEntry::File(ObservedFile {
+            path: RootRelativePath::try_from(path).unwrap(),
             size: 42,
             mtime_ms: 1_700_000_000_000,
-            hash: hash.map(String::from),
-            hash_failed: false,
-            file_id: None,
+            identity: hash.map_or(FileIdentityObservation::SizeAndMtime, |label| {
+                FileIdentityObservation::FullBlake3 {
+                    digest: Blake3Digest::hash_bytes(label.as_bytes()),
+                }
+            }),
+            file_system_id: None,
             mode: None,
-            link: None,
-            prev: None,
-        }
+            previous_identities: Vec::new(),
+        })
     }
 
-    fn write_complete(file: &Path, binding: &[u8], entries: &[Entry]) {
+    fn write_complete(file: &Path, binding: &[u8], entries: &[ObservedEntry]) {
         reconcile_bound_to_file(
             file,
             binding,
@@ -251,6 +278,17 @@ mod tests {
             &std::collections::HashSet::new(),
         )
         .unwrap();
+    }
+
+    fn cached_digest<'a>(cache: &'a HashCache, path: &str) -> Option<&'a str> {
+        cache
+            .get(path)
+            .and_then(|row| row.identity.digest())
+            .map(Blake3Digest::as_str)
+    }
+
+    fn digest(label: &str) -> Blake3Digest {
+        Blake3Digest::hash_bytes(label.as_bytes())
     }
 
     #[test]
@@ -264,7 +302,7 @@ mod tests {
             &[entry("a.txt", Some("aaa")), entry("b.txt", None)],
         );
         let back = load_bound_from_file(&file, &binding);
-        assert_eq!(back.get("a.txt").map(|v| v.2.as_str()), Some("aaa"));
+        assert_eq!(cached_digest(&back, "a.txt"), Some(digest("aaa").as_str()));
         assert!(
             !back.contains_key("b.txt"),
             "an unhashed entry has nothing worth caching"
@@ -312,7 +350,10 @@ mod tests {
 
         write_complete(&file, &second, &[entry("b.txt", Some("bbb"))]);
         let rebuilt = load_bound_from_file(&file, &second);
-        assert_eq!(rebuilt.get("b.txt").map(|row| row.2.as_str()), Some("bbb"));
+        assert_eq!(
+            cached_digest(&rebuilt, "b.txt"),
+            Some(digest("bbb").as_str())
+        );
         cleanup(&file);
     }
 
@@ -320,7 +361,7 @@ mod tests {
     fn logical_identity_folds_only_scheme_and_host() {
         fn identity(phrase: &str) -> String {
             match crate::fs::vfs::spec::parse(phrase) {
-                crate::fs::vfs::spec::RootSpec::Remote(spec) => spec.identity(),
+                crate::fs::vfs::spec::RootSpec::Endpoint(spec) => spec.identity(),
                 other => panic!("expected VFS phrase, got {other:?}"),
             }
         }
@@ -357,8 +398,8 @@ mod tests {
         write_complete(&legacy, &exact, &[entry("a.txt", Some("exact"))]);
         let migrated = load_logical_from_files(&primary, &legacy, key).unwrap();
         assert_eq!(
-            migrated.get("a.txt").map(|row| row.2.as_str()),
-            Some("exact")
+            cached_digest(&migrated, "a.txt"),
+            Some(digest("exact").as_str())
         );
 
         let folded = key.to_lowercase().into_bytes();
@@ -409,12 +450,12 @@ mod tests {
         .unwrap();
         let partial = load_bound_from_file(&file, binding);
         assert_eq!(
-            partial.get("visible.txt").map(|row| row.2.as_str()),
-            Some("new")
+            cached_digest(&partial, "visible.txt"),
+            Some(digest("new").as_str())
         );
         assert_eq!(
-            partial.get("excluded.txt").map(|row| row.2.as_str()),
-            Some("keep")
+            cached_digest(&partial, "excluded.txt"),
+            Some(digest("keep").as_str())
         );
 
         reconcile_bound_to_file(
@@ -498,10 +539,8 @@ mod tests {
         write_complete(&file, first.binding(), &[entry("a.txt", Some("aaa"))]);
         assert!(load_bound_from_file(&file, second.binding()).is_empty());
         assert_eq!(
-            load_bound_from_file(&file, first.binding())
-                .get("a.txt")
-                .map(|row| row.2.as_str()),
-            Some("aaa")
+            cached_digest(&load_bound_from_file(&file, first.binding()), "a.txt"),
+            Some(digest("aaa").as_str())
         );
         cleanup(&file);
     }
@@ -543,10 +582,8 @@ mod tests {
             crate::store::StateWriteStatus::Unchanged
         );
         assert_eq!(
-            load_local(&durable)
-                .get("old.txt")
-                .map(|row| row.2.as_str()),
-            Some("old-hash")
+            cached_digest(&load_local(&durable), "old.txt"),
+            Some(digest("old-hash").as_str())
         );
         assert!(!load_local(&durable).contains_key("new.txt"));
         let _ = std::fs::remove_file(file);
@@ -574,8 +611,8 @@ mod tests {
         let rebuilt = load_bound_from_file(&file, identity.binding());
         assert!(!rebuilt.contains_key("stale.txt"));
         assert_eq!(
-            rebuilt.get("fresh.txt").map(|row| row.2.as_str()),
-            Some("fresh")
+            cached_digest(&rebuilt, "fresh.txt"),
+            Some(digest("fresh").as_str())
         );
         let text = std::fs::read_to_string(&file).unwrap();
         assert_eq!(

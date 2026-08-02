@@ -4,7 +4,7 @@
 // builds a directory trie, sorts rows and sibling folders, and flattens the result for the virtual
 // table. Apply deliberately ignores this order because directory deletion must follow its children.
 
-import { baseOf } from './format.ts';
+import { relativePathBaseName } from './format.ts';
 import { owningFolderOf, ROOT_FOLDER_PATH } from './folders.ts';
 import { effectiveOperation, keySpec, isExecutableOperation, sortValue } from './plan.ts';
 import type { PlanDto, Sort } from './plan.ts';
@@ -59,7 +59,7 @@ export interface PlanLayout {
 
 export interface LayoutInput {
   plan: PlanDto;
-  flipped: boolean[];
+  reversedRows: boolean[];
   /// From computeInScopeIndices(): membership, in plan order.
   inScopeIndices: number[];
   grouped: boolean;
@@ -102,7 +102,7 @@ function textRank(
 /// are sorted among their siblings using a fold over each complete subtree. Without a sort, first
 /// appearance in plan order remains the ordering contract.
 export function buildLayout(input: LayoutInput): PlanLayout {
-  const { plan, flipped, inScopeIndices, grouped, sort } = input;
+  const { plan, reversedRows, inScopeIndices, grouped, sort } = input;
   const operationCount = plan.ops.length;
 
   const isText = !!sort && keySpec(sort.key).kind === 'text';
@@ -111,7 +111,7 @@ export function buildLayout(input: LayoutInput): PlanLayout {
   const rowText: string[] = new Array(sort && isText ? operationCount : 0);
   if (sort) {
     for (const index of inScopeIndices) {
-      const [missing, numericValue, textValue] = sortValue(plan, flipped, index, sort.key);
+      const [missing, numericValue, textValue] = sortValue(plan, reversedRows, index, sort.key);
       rowMissing[index] = missing;
       if (isText) rowText[index] = textValue; else rowNumber[index] = numericValue;
     }
@@ -175,7 +175,7 @@ export function buildLayout(input: LayoutInput): PlanLayout {
   };
 
   for (const index of inScopeIndices) {
-    const owner = ensureFolder(owningFolderOf(effectiveOperation(plan, flipped, index)), index);
+    const owner = ensureFolder(owningFolderOf(effectiveOperation(plan, reversedRows, index)), index);
     owner.directIndices.push(index);
   }
 
@@ -212,7 +212,7 @@ export function buildLayout(input: LayoutInput): PlanLayout {
     let executableCount = 0;
     let bytes = 0;
     for (const index of node.directIndices) {
-      const operation = effectiveOperation(plan, flipped, index);
+      const operation = effectiveOperation(plan, reversedRows, index);
       if (isExecutableOperation(operation)) executableCount++;
       bytes += operation.size ?? 0;
     }
@@ -232,7 +232,7 @@ export function buildLayout(input: LayoutInput): PlanLayout {
         // Siblings share the same parent prefix, so their segment is the meaningful tree key.
         folderText[node.id] = node.path === ROOT_FOLDER_PATH
           ? ROOT_FOLDER_PATH
-          : baseOf(node.path).toLowerCase();
+          : relativePathBaseName(node.path).toLowerCase();
       } else {
         let missing = 1;
         let num = fold === 'sum' ? 0 : fold === 'min' ? Infinity : -Infinity;

@@ -1,3 +1,60 @@
+const APP_COMMANDS: &[&str] = &[
+    "list_jobs",
+    "jobs_dir",
+    "get_job",
+    "default_job",
+    "job_file_schema",
+    "save_job",
+    "update_job_root",
+    "swap_job_roots",
+    "delete_job",
+    "start_autoscan",
+    "stop_autoscan",
+    "autoscan_status",
+    "decline_autoscan_trigger",
+    "inspect_paths",
+    "mask_match",
+    "junk_presets",
+    "reconcile_compare_workspace",
+    "restore_compare",
+    "forget_compare_result",
+    "list_identical",
+    "export_compare_csv",
+    "reveal_compare_row",
+    "reveal_csv_export",
+    "latest_run_records",
+    "log_runs",
+    "log_artifact",
+    "reveal_log_location",
+    "get_settings",
+    "pick_log_directory",
+    "save_settings",
+    "open_progress_window",
+    "cancel_progress_launch",
+    "report_progress_window_mounted",
+    "acknowledge_progress_launch",
+    "execute_post_run_power_action",
+    "begin_progress_window_close",
+    "destroy_progress_window",
+    "review_compare",
+    "approve_operation",
+    "compare_job",
+    "review_apply",
+    "authorize_autoscan_apply",
+    "apply_job",
+    "replay_compare_events",
+    "replay_apply_events",
+    "cancel_compare_run",
+    "cancel_apply_run",
+    "set_apply_paused",
+];
+
 fn main() {
-    tauri_build::build()
+    // Tauri exposes registered application commands to every webview unless the app manifest
+    // enumerates them: https://v2.tauri.app/security/capabilities/#application-manifest
+    tauri_build::try_build(
+        tauri_build::Attributes::new()
+            .app_manifest(tauri_build::AppManifest::new().commands(APP_COMMANDS)),
+    )
+    .expect("failed to build the Tauri application manifest");
 }

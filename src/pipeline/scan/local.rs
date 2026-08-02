@@ -1,18 +1,24 @@
 //! The local lane: platform metadata traversal + rayon hashing over a real directory.
 //!
-//! macOS batches directory metadata with `getattrlistbulk`; other platforms use WalkDir. Both
-//! feed the same records into this scanner, so filtering, cache use, hashing, progress, and error
-//! policy remain one implementation. Hash parallelism is per *file*, not within one: reads use an
-//! explicit loop rather than mapping because a vanished mapping kills the process with SIGBUS.
+//! macOS batches directory metadata with `getattrlistbulk`; other platforms enumerate through
+//! retained directory handles. Both feed the same records into this scanner, so filtering, cache
+//! use, hashing, progress, and error policy remain one implementation. Hash parallelism is per
+//! file, not within one: reads use an explicit loop because a vanished mapping raises SIGBUS.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::foundation::path::RootRelativePath;
 use crate::foundation::time::now_ms;
-use crate::model::table::{os_name, Entry, EntryKind, Header, Snapshot, SCHEMA};
+use crate::fs::local_root::LocalRoot;
+use crate::model::table::{
+    os_name, Blake3Digest, FileIdentityObservation, ObservedDirectory, ObservedEntry, ObservedFile,
+    ObservedSymlink, TableArtifact, TableEvidence, TableHeader, TableKind, TABLE_SCHEMA,
+};
 
-use super::digest::{effective_read, sampled_digest_with_buffer, SAMPLE_MIN};
+use super::digest::{effective_read, sampled_digest_stream, SAMPLE_MIN};
 use super::local_walk::WalkKind;
 use super::{ProgressFn, ScanMetrics, ScanOptions, ScanProgress};
 
@@ -47,19 +53,22 @@ fn walk_progress_sample_due(
 }
 
 fn full_hash_with_buffer<C, P>(
-    path: &Path,
+    root: &LocalRoot,
+    relative: &RootRelativePath,
     size: u64,
+    raw_mtime_ms: i64,
+    expected_file_id: Option<&str>,
     buf: &mut Vec<u8>,
     mut checkpoint: C,
     mut on_read: P,
-) -> std::io::Result<String>
+) -> std::io::Result<Blake3Digest>
 where
     C: FnMut() -> std::io::Result<()>,
     P: FnMut(u64),
 {
     use std::io::Read;
 
-    let mut f = std::fs::File::open(path)?;
+    let mut file = root.open_read(relative)?;
     // Grow once to the largest file this worker has seen. Smaller files reuse the allocation and
     // read through only the prefix they need; a tree of tiny files no longer allocates per entry.
     let len = size.clamp(1, READ_CHUNK) as usize;
@@ -71,7 +80,7 @@ where
     while remaining > 0 {
         checkpoint()?;
         let width = remaining.min(len as u64) as usize;
-        let n = f.read(&mut buf[..width])?;
+        let n = file.read(&mut buf[..width])?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -85,7 +94,110 @@ where
         on_read(n as u64);
         remaining -= n as u64;
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    verify_opened_file(&file, size, raw_mtime_ms, expected_file_id)?;
+    verify_current_file(root, relative, size, raw_mtime_ms, expected_file_id)?;
+    Ok(Blake3Digest::from_hash(hasher.finalize()))
+}
+
+fn sampled_hash_with_buffer<P>(
+    root: &LocalRoot,
+    relative: &RootRelativePath,
+    size: u64,
+    raw_mtime_ms: i64,
+    expected_file_id: Option<&str>,
+    buffer: &mut Vec<u8>,
+    on_read: P,
+) -> std::io::Result<Blake3Digest>
+where
+    P: FnMut(u64),
+{
+    let mut file = root.open_read(relative)?;
+    let digest = sampled_digest_stream(&mut file, size, buffer, on_read)?;
+    verify_opened_file(&file, size, raw_mtime_ms, expected_file_id)?;
+    verify_current_file(root, relative, size, raw_mtime_ms, expected_file_id)?;
+    Ok(digest)
+}
+
+fn verify_opened_file(
+    file: &std::fs::File,
+    size: u64,
+    raw_mtime_ms: i64,
+    expected_file_id: Option<&str>,
+) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.len() != size
+        || std_metadata_mtime_ms(&metadata) != raw_mtime_ms
+        || expected_file_id
+            .is_some_and(|expected| std_metadata_file_id(&metadata).as_deref() != Some(expected))
+    {
+        return Err(std::io::Error::other(
+            "file changed while content evidence was being read",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_current_file(
+    root: &LocalRoot,
+    relative: &RootRelativePath,
+    size: u64,
+    raw_mtime_ms: i64,
+    expected_file_id: Option<&str>,
+) -> std::io::Result<()> {
+    let metadata = root.metadata_path(relative)?;
+    if !metadata.is_file()
+        || metadata.len() != size
+        || capability_metadata_mtime_ms(&metadata) != raw_mtime_ms
+        || expected_file_id.is_some_and(|expected| {
+            capability_metadata_file_id(&metadata).as_deref() != Some(expected)
+        })
+    {
+        return Err(std::io::Error::other(
+            "file changed while content evidence was being read",
+        ));
+    }
+    Ok(())
+}
+
+fn std_metadata_mtime_ms(metadata: &std::fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn capability_metadata_mtime_ms(metadata: &cap_primitives::fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.into_std().duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn std_metadata_file_id(metadata: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    Some(format!("{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn std_metadata_file_id(_metadata: &std::fs::Metadata) -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn capability_metadata_file_id(metadata: &cap_primitives::fs::Metadata) -> Option<String> {
+    use cap_primitives::fs::MetadataExt;
+    Some(format!("{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn capability_metadata_file_id(_metadata: &cap_primitives::fs::Metadata) -> Option<String> {
+    None
 }
 
 /// The *other* iCloud eviction shape, and the dangerous one. When a file is evicted the real name
@@ -101,18 +213,18 @@ fn is_icloud_stub(name: &str) -> bool {
     name.starts_with('.') && name.ends_with(".icloud") && name.len() > ".icloud".len() + 1
 }
 
-pub(super) fn scan_impl(
-    root: &Path,
+pub(crate) fn scan_local_root_impl(
+    root: &LocalRoot,
     opt: &ScanOptions,
     progress: Option<ProgressFn<'_>>,
     ctxp: Option<(&crate::obs::progress::RunCtx, crate::model::event::Phase)>,
     max_parallel_streams: usize,
-) -> std::io::Result<Snapshot> {
+) -> std::io::Result<TableArtifact> {
     let pp = ctxp.map(|(ctx, phase)| {
         crate::obs::progress::PhaseProgress::begin(
             ctx,
             phase,
-            Some(root.to_string_lossy().into_owned()),
+            Some(root.display_path().to_string_lossy().into_owned()),
             0,
             0,
         )
@@ -124,7 +236,7 @@ pub(super) fn scan_impl(
     let started = now_ms();
     let t0 = std::time::Instant::now();
     let mut metrics = ScanMetrics::default();
-    let local_state = crate::store::localid::LocalScanStateIdentity::for_root(root);
+    let local_state = crate::store::localid::LocalScanStateIdentity::for_root(root.display_path());
     let measured = std::time::Instant::now();
     // No-cache rigor tiers still need the previous table to preserve rows outside this scan's
     // filter domain. `use_cache` controls reuse below; loading here does not turn old hashes into
@@ -139,29 +251,8 @@ pub(super) fn scan_impl(
     let mtime_fixes = crate::store::mtimefix::load_local(&local_state);
     let mut matched_mtime_fixes = HashSet::new();
     metrics.mtime_load_ms = measured.elapsed().as_millis() as u64;
-    let mut entries: Vec<Entry> = Vec::new();
+    let mut entries: Vec<ObservedEntry> = Vec::new();
     let mut hash_errors = 0u64;
-
-    // Windows long paths: walk from a \\?\-prefixed root so every descendant path is immune to the 260-char MAX_PATH
-    // (the OneDrive root prefix alone is 47 chars; deep course directories were measured hitting the limit, and a directory
-    // that hits it vanishes silently along with its whole tree — in mirror mode that reads as "the other side got mass-deleted".
-    // \\?\ is exactly what keeps FFS alive). The cache key and snapshot header keep the original root; the prefix lives only in the walk and in file I/O.
-    //
-    // **The prefix must not be pasted on by hand.** `\\?\` turns off Win32 path parsing, which means
-    // '/' stops being a separator and '.' / '..' stop resolving — so the string that names a healthy
-    // directory stops naming anything. Measured with the release binary on one 5-file tree: spelled
-    // with backslashes it scanned 5 entries; spelled with forward slashes, or with a `..` in it, the
-    // very same directory scanned **0**, because the root read failed and the loop simply counted a
-    // walk error. A 0-entry source snapshot is not a degraded result — under mirror it means delete
-    // everything on the far side. `canonicalize` returns an already-verbatim path (and the
-    // `\\?\UNC\server\share` form for shares, which the hand-rolled version could not produce), so it
-    // gives the same MAX_PATH immunity without inventing an unreadable spelling. If it fails we walk
-    // the root as given: std applies the long-path prefix internally anyway.
-    #[cfg(windows)]
-    let walk_root: std::path::PathBuf =
-        std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    #[cfg(not(windows))]
-    let walk_root: std::path::PathBuf = root.to_path_buf();
 
     // iCloud eviction, counted separately from walk errors because the remedy is different:
     // `brctl download` or an exclusion, not a permission.
@@ -173,25 +264,26 @@ pub(super) fn scan_impl(
     // Phase 1: serial walk to collect entries (metadata is fast); phase 2: parallel hashing with rayon (the lesson from FFS
     // parallel_scan: with many small files the bottleneck is serial I/O). Every file is read through the same chunked loop, so the parallelism is across files and the buffer is sized to the file.
     struct PendingFile {
-        rel: String,
-        abs: std::path::PathBuf,
+        relative: RootRelativePath,
         size: u64,
         raw_mt: i64,
         mt: i64,
-        hash: Option<String>, // cache hit
+        hash: Option<Blake3Digest>,
         /// Set when hashing was attempted and failed: distinct from `hash: None`, which also covers
         /// "hashing was never requested". Only the first is a degraded judgment.
         hash_failed: bool,
+        observed_file_id: Option<String>,
         file_id: Option<String>,
         mode: Option<u32>,
     }
     let mut pending: Vec<PendingFile> = Vec::new();
+    let mut symlink_read_error = None;
     let legacy_walk_started = std::time::Instant::now();
     let mut legacy_walk_last_sample = None;
 
     let measured = std::time::Instant::now();
     let walk_stats = walk_local(
-        &walk_root,
+        root,
         &opt.filter,
         || match &pp {
             Some(pp) => pp.checkpoint(),
@@ -199,20 +291,11 @@ pub(super) fn scan_impl(
         },
         |item| match item.kind {
             WalkKind::Dir => {
-                let rel = item.rel;
-                if opt.filter.pass_dir(&rel).0 {
-                    entries.push(Entry {
-                        path: rel,
-                        kind: EntryKind::Dir,
-                        size: 0,
+                if opt.filter.pass_dir(item.relative.as_str()).0 {
+                    entries.push(ObservedEntry::Directory(ObservedDirectory {
+                        path: item.relative,
                         mtime_ms: item.mtime_ms,
-                        hash: None,
-                        hash_failed: false,
-                        file_id: None,
-                        mode: None,
-                        link: None,
-                        prev: None,
-                    });
+                    }));
                 }
             }
             WalkKind::Symlink => {
@@ -220,33 +303,29 @@ pub(super) fn scan_impl(
                     skipped_symlinks += 1;
                 }
                 if opt.symlinks_direct {
-                    let target = std::fs::read_link(&item.abs)
-                        .ok()
-                        .map(|t| t.to_string_lossy().into_owned());
-                    entries.push(Entry {
-                        path: item.rel,
-                        kind: EntryKind::Symlink,
-                        size: 0,
-                        mtime_ms: item.mtime_ms,
-                        hash: None,
-                        hash_failed: false,
-                        file_id: None,
-                        mode: None,
-                        link: target,
-                        prev: None,
-                    });
+                    match root.read_link(&item.relative) {
+                        Ok(target) => entries.push(ObservedEntry::Symlink(ObservedSymlink {
+                            path: item.relative,
+                            mtime_ms: item.mtime_ms,
+                            target: target.to_string_lossy().into_owned(),
+                        })),
+                        Err(error) if symlink_read_error.is_none() => {
+                            symlink_read_error = Some((item.relative, error));
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
             WalkKind::File => {
-                let rel = item.rel;
+                let relative_text = item.relative.as_str().to_owned();
                 // Both iCloud eviction shapes, judged before the entry is recorded. Neither is an
                 // exclusion and neither can be fixed by one: the stub's danger comes from the *absence*
                 // of the real name, and excluding the stub only removes the visible hint while leaving
                 // the delete in place.
-                if is_icloud_stub(crate::foundation::path::base_name(&rel)) {
+                if is_icloud_stub(crate::foundation::path::base_name(&relative_text)) {
                     icloud_stubs += 1;
                     if icloud_stub_samples.len() < 5 {
-                        icloud_stub_samples.push(rel.clone());
+                        icloud_stub_samples.push(relative_text.clone());
                     }
                 } else if item.dataless {
                     dataless_files += 1;
@@ -255,9 +334,9 @@ pub(super) fn scan_impl(
                 // P1-4: the filesystem once stored a different value than the mtime we asked for (FAT's 2-second granularity
                 // / SMB truncation); convert it back to what we meant so compare need not lean on a tolerance
                 let raw_mt = item.mtime_ms;
-                let mt = match mtime_fixes.get(&rel) {
+                let mt = match mtime_fixes.get(&relative_text) {
                     Some((ondisk, intended)) if *ondisk == raw_mt => {
-                        matched_mtime_fixes.insert(rel.clone());
+                        matched_mtime_fixes.insert(relative_text.clone());
                         *intended
                     }
                     _ => raw_mt,
@@ -265,23 +344,30 @@ pub(super) fn scan_impl(
                 let mut hash = None;
                 // A correction has no stable object token in the legacy table. Re-read content
                 // instead of letting a same-size replacement inherit the previous object's hash.
-                if opt.hash && opt.use_cache && !matched_mtime_fixes.contains(&rel) {
-                    if let Some((cs, cm, ch)) = cache.get(&rel) {
-                        // Cached values are isolated per mode: a `~` prefix means sampled digest, which must never stand in for a full hash (or the reverse)
+                if opt.hash && opt.use_cache && !matched_mtime_fixes.contains(&relative_text) {
+                    if let Some(cached) = cache.get(relative_text.as_str()) {
                         let want_sampled = opt.sampled && size >= SAMPLE_MIN;
-                        if *cs == size && *cm == mt && ch.starts_with('~') == want_sampled {
-                            hash = Some(ch.clone());
+                        let cached_is_sampled = matches!(
+                            cached.identity,
+                            FileIdentityObservation::SampledBlake3 { .. }
+                        );
+                        if cached.size == size
+                            && cached.mtime_ms == mt
+                            && cached_is_sampled == want_sampled
+                        {
+                            hash = cached.identity.digest().cloned();
                         }
                     }
                 }
+                let observed_file_id = item.file_id.clone();
                 pending.push(PendingFile {
-                    rel,
-                    abs: item.abs,
+                    relative: item.relative,
                     size,
                     raw_mt,
                     mt,
                     hash,
                     hash_failed: false,
+                    observed_file_id,
                     // FAT/exFAT synthesize object IDs from allocation state. On the real exFAT
                     // corpus, 1,532 zero-byte files changed IDs between two untouched scans, so
                     // persisting those values creates thousands of imaginary moves.
@@ -293,7 +379,7 @@ pub(super) fn scan_impl(
                     mode: item.mode,
                 });
                 if let Some(pp) = &pp {
-                    pp.item_done(&pending.last().unwrap().rel);
+                    pp.item_done(pending.last().unwrap().relative.as_str());
                 }
                 if let Some(cb) = progress {
                     if walk_progress_sample_due(
@@ -314,6 +400,15 @@ pub(super) fn scan_impl(
             }
         },
     )?;
+    if let Some((relative, error)) = symlink_read_error {
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "could not read symlink target for {:?}: {error}",
+                relative.as_str()
+            ),
+        ));
+    }
     let walk_errors = walk_stats.walk_errors;
     let walk_err_samples = walk_stats.walk_err_samples;
     let excl_dirs = walk_stats.excluded_dirs;
@@ -326,9 +421,10 @@ pub(super) fn scan_impl(
     let retain_absent: HashSet<String> = if coverage == crate::store::ScanCoverage::Complete {
         cache
             .keys()
-            .chain(mtime_fixes.keys())
+            .map(RootRelativePath::as_str)
+            .chain(mtime_fixes.keys().map(String::as_str))
             .filter(|path| !opt.filter.pass_file(path))
-            .cloned()
+            .map(str::to_owned)
             .collect()
     } else {
         HashSet::new()
@@ -338,7 +434,7 @@ pub(super) fn scan_impl(
     metrics.cache_hits = pending.iter().filter(|file| file.hash.is_some()).count() as u64;
 
     if walk_errors > 0 {
-        crate::log_warn!("scan", "warning: {walk_errors} entr(ies) under {} skipped by walk errors — they will look ABSENT on this side! samples: {}", root.display(), walk_err_samples.join(" | "));
+        crate::log_warn!("scan", "warning: {walk_errors} entr(ies) under {} skipped by walk errors — they will look ABSENT on this side! samples: {}", root.display_path().display(), walk_err_samples.join(" | "));
         if let Some(pp) = &pp {
             pp.error("", "walk", side, &format!("{walk_errors} entr(ies) skipped by walk errors (they will be treated as ABSENT on this side!) samples: {}", walk_err_samples.join(" | ")));
         }
@@ -462,48 +558,42 @@ pub(super) fn scan_impl(
                     if p.hash.is_none() {
                         // fast rigor tier: large files only read the three sample windows (a cloud placeholder hydrates only those three too)
                         if opt.sampled && p.size >= SAMPLE_MIN {
-                            let result = sampled_digest_with_buffer(&p.abs, p.size, buf, |n| {
-                                bytes_done.fetch_add(n, Ordering::Relaxed);
-                                if let Some(pp) = &pp {
-                                    pp.add_bytes(n, &p.rel);
-                                }
-                            })
-                            .and_then(|hash| {
-                                let metadata = std::fs::symlink_metadata(&p.abs)?;
-                                let current_mt = metadata
-                                    .modified()
-                                    .ok()
-                                    .and_then(|time| {
-                                        time.duration_since(std::time::UNIX_EPOCH).ok()
-                                    })
-                                    .map(|duration| duration.as_millis() as i64)
-                                    .unwrap_or(0);
-                                if metadata.len() != p.size || current_mt != p.raw_mt {
-                                    return Err(std::io::Error::other(
-                                        "file changed while content evidence was being read",
-                                    ));
-                                }
-                                Ok(hash)
-                            });
+                            let result = sampled_hash_with_buffer(
+                                root,
+                                &p.relative,
+                                p.size,
+                                p.raw_mt,
+                                p.observed_file_id.as_deref(),
+                                buf,
+                                |n| {
+                                    bytes_done.fetch_add(n, Ordering::Relaxed);
+                                    if let Some(pp) = &pp {
+                                        pp.add_bytes(n, p.relative.as_str());
+                                    }
+                                },
+                            );
                             match result {
                                 Ok(d) => p.hash = Some(d),
                                 Err(e) => {
                                     p.hash_failed = true;
                                     hash_err_count.fetch_add(1, Ordering::Relaxed);
                                     if let Some(pp) = &pp {
-                                        pp.error(&p.rel, "hash", side, &e.to_string());
+                                        pp.error(p.relative.as_str(), "hash", side, &e.to_string());
                                     }
                                 }
                             }
                             if let Some(pp) = &pp {
-                                pp.item_done(&p.rel);
+                                pp.item_done(p.relative.as_str());
                             }
                             files_done.fetch_add(1, Ordering::Relaxed);
                             return;
                         }
                         let res = full_hash_with_buffer(
-                            &p.abs,
+                            root,
+                            &p.relative,
                             p.size,
+                            p.raw_mt,
+                            p.observed_file_id.as_deref(),
                             buf,
                             || match &pp {
                                 Some(pp) => pp.checkpoint(),
@@ -512,38 +602,24 @@ pub(super) fn scan_impl(
                             |n| {
                                 bytes_done.fetch_add(n, Ordering::Relaxed);
                                 if let Some(pp) = &pp {
-                                    pp.add_bytes(n, &p.rel);
+                                    pp.add_bytes(n, p.relative.as_str());
                                 }
                             },
                         );
-                        match res.and_then(|hash| {
-                            let metadata = std::fs::symlink_metadata(&p.abs)?;
-                            let current_mt = metadata
-                                .modified()
-                                .ok()
-                                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|duration| duration.as_millis() as i64)
-                                .unwrap_or(0);
-                            if metadata.len() != p.size || current_mt != p.raw_mt {
-                                return Err(std::io::Error::other(
-                                    "file changed while content evidence was being read",
-                                ));
-                            }
-                            Ok(hash)
-                        }) {
+                        match res {
                             Ok(hash) => p.hash = Some(hash),
                             Err(e) if crate::obs::progress::is_cancelled(&e) => return, // cancellation is not a hash error
                             Err(e) => {
                                 p.hash_failed = true;
                                 hash_err_count.fetch_add(1, Ordering::Relaxed);
                                 if let Some(pp) = &pp {
-                                    pp.error(&p.rel, "hash", side, &e.to_string());
+                                    pp.error(p.relative.as_str(), "hash", side, &e.to_string());
                                 }
                             }
                         }
                     }
                     if let Some(pp) = &pp {
-                        pp.item_done(&p.rel); // item count during hashing = files processed (a cache hit bumps it immediately)
+                        pp.item_done(p.relative.as_str()); // item count during hashing = files processed (a cache hit bumps it immediately)
                     }
                     files_done.fetch_add(1, Ordering::Relaxed);
                 })
@@ -565,21 +641,29 @@ pub(super) fn scan_impl(
     metrics.read_bytes = bytes_done.load(Ordering::Relaxed);
     let measured = std::time::Instant::now();
     for p in pending {
-        entries.push(Entry {
-            path: p.rel,
-            kind: EntryKind::File,
+        let identity = if p.hash_failed {
+            FileIdentityObservation::Unreadable
+        } else if let Some(digest) = p.hash {
+            if opt.sampled && p.size >= SAMPLE_MIN {
+                FileIdentityObservation::SampledBlake3 { digest }
+            } else {
+                FileIdentityObservation::FullBlake3 { digest }
+            }
+        } else {
+            FileIdentityObservation::SizeAndMtime
+        };
+        entries.push(ObservedEntry::File(ObservedFile {
+            path: p.relative,
             size: p.size,
             mtime_ms: p.mt,
-            hash: p.hash,
-            hash_failed: p.hash_failed,
-            file_id: p.file_id,
+            identity,
+            file_system_id: p.file_id,
             mode: p.mode,
-            link: None,
-            prev: None,
-        });
+            previous_identities: Vec::new(),
+        }));
     }
 
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries.sort_by(|left, right| left.path().cmp(right.path()));
     metrics.finalize_ms = measured.elapsed().as_millis() as u64;
     let measured = std::time::Instant::now();
     if opt.hash {
@@ -609,17 +693,23 @@ pub(super) fn scan_impl(
         );
     }
 
-    let snapshot = Snapshot {
-        header: Header {
-            schema: SCHEMA,
-            kind: "snapshot".into(),
-            root: root.to_string_lossy().into_owned(),
+    let snapshot = TableArtifact::new(
+        TableHeader {
+            schema: TABLE_SCHEMA,
+            kind: TableKind::Snapshot,
+            root: root.display_path().to_string_lossy().into_owned(),
             host: crate::model::table::host_name(),
             os: os_name(),
             scanned_at_ms: started,
             duration_ms: t0.elapsed().as_millis() as u64,
             entry_count: entries.len() as u64,
-            hashed: opt.hash,
+            evidence: if !opt.hash {
+                TableEvidence::None
+            } else if opt.sampled {
+                TableEvidence::Sampled
+            } else {
+                TableEvidence::Full
+            },
             excluded_dirs: excl_dirs,
             excluded_files: excl_files,
             walk_errors,
@@ -631,7 +721,7 @@ pub(super) fn scan_impl(
             vfs: None,
         },
         entries,
-    };
+    )?;
     if let Some((ctx, _)) = ctxp {
         metrics.emit(ctx, side, "local");
     }
@@ -681,18 +771,37 @@ mod tests {
         let small_path = root.join("small.bin");
         std::fs::write(&large_path, &large).unwrap();
         std::fs::write(&small_path, &small).unwrap();
+        let local_root = LocalRoot::open(root.clone()).unwrap();
+        let large_relative = RootRelativePath::new("large.bin").unwrap();
+        let small_relative = RootRelativePath::new("small.bin").unwrap();
 
         let mut buf = Vec::new();
-        let first =
-            full_hash_with_buffer(&large_path, large.len() as u64, &mut buf, || Ok(()), |_| {})
-                .unwrap();
-        assert_eq!(first, blake3::hash(&large).to_hex().to_string());
+        let first = full_hash_with_buffer(
+            &local_root,
+            &large_relative,
+            large.len() as u64,
+            std_metadata_mtime_ms(&std::fs::metadata(&large_path).unwrap()),
+            None,
+            &mut buf,
+            || Ok(()),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(first, Blake3Digest::from_hash(blake3::hash(&large)));
         let capacity = buf.capacity();
 
-        let second =
-            full_hash_with_buffer(&small_path, small.len() as u64, &mut buf, || Ok(()), |_| {})
-                .unwrap();
-        assert_eq!(second, blake3::hash(&small).to_hex().to_string());
+        let second = full_hash_with_buffer(
+            &local_root,
+            &small_relative,
+            small.len() as u64,
+            std_metadata_mtime_ms(&std::fs::metadata(&small_path).unwrap()),
+            None,
+            &mut buf,
+            || Ok(()),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(second, Blake3Digest::from_hash(blake3::hash(&small)));
         assert_eq!(
             buf.capacity(),
             capacity,
@@ -827,17 +936,23 @@ mod tests {
         let mut options = opts();
         options.use_cache = true;
         let first = scan(&root, &options).unwrap();
-        let first_hash = first.entries[0].hash.clone().unwrap();
-        assert_eq!(first.entries[0].mtime_ms, intended_ms);
+        let first_hash = first.entries[0]
+            .as_file()
+            .and_then(|file| file.identity.digest())
+            .cloned()
+            .unwrap();
+        assert_eq!(first.entries[0].mtime_ms(), intended_ms);
 
         std::fs::remove_file(&file).unwrap();
         std::fs::write(&file, b"new!").unwrap();
         filetime::set_file_mtime(&file, stamp).unwrap();
         let second = scan(&root, &options).unwrap();
-        assert_eq!(second.entries[0].mtime_ms, intended_ms);
+        assert_eq!(second.entries[0].mtime_ms(), intended_ms);
         assert_ne!(
-            second.entries[0].hash.as_deref(),
-            Some(first_hash.as_str()),
+            second.entries[0]
+                .as_file()
+                .and_then(|file| file.identity.digest()),
+            Some(&first_hash),
             "a same-size replacement with the same coarse raw mtime must be re-read",
         );
 
@@ -862,8 +977,9 @@ mod tests {
         let old_hash = first
             .entries
             .iter()
-            .find(|entry| entry.path == "included.bin")
-            .and_then(|entry| entry.hash.clone())
+            .find(|entry| entry.path().as_str() == "included.bin")
+            .and_then(|entry| entry.as_file())
+            .and_then(|file| file.identity.digest().cloned())
             .unwrap();
 
         // Same size and mtime would be a cache hit if loading state accidentally weakened the
@@ -876,10 +992,11 @@ mod tests {
         let new_hash = second
             .entries
             .iter()
-            .find(|entry| entry.path == "included.bin")
-            .and_then(|entry| entry.hash.as_deref())
+            .find(|entry| entry.path().as_str() == "included.bin")
+            .and_then(|entry| entry.as_file())
+            .and_then(|file| file.identity.digest())
             .unwrap();
-        assert_ne!(new_hash, old_hash);
+        assert_ne!(new_hash, &old_hash);
 
         let state = crate::store::localid::LocalScanStateIdentity::for_root(&root);
         let cache = crate::store::hashcache::load_local(&state);
@@ -921,7 +1038,11 @@ mod tests {
             },
         )
         .unwrap();
-        let paths: Vec<&str> = snap.entries.iter().map(|e| e.path.as_str()).collect();
+        let paths: Vec<&str> = snap
+            .entries
+            .iter()
+            .map(|entry| entry.path().as_str())
+            .collect();
         assert_eq!(
             paths,
             vec!["good.txt"],

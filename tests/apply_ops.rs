@@ -853,16 +853,27 @@ fn parallel_and_sequential_agree() {
     let (b1, t1, r1) = run("seq", 1);
     let (b2, t2, r2) = run("par", 4);
     assert_eq!(r1, r2, "counts must match");
-    // The result trees agree file by file
-    for e in std::fs::read_dir(&t1).unwrap().flatten() {
-        let name = e.file_name();
-        let a = std::fs::read(e.path()).unwrap();
-        let b = std::fs::read(t2.join(&name)).unwrap();
-        assert_eq!(a, b, "file {:?} differs between seq and par runs", name);
-    }
+    let user_files = |root: &std::path::Path| {
+        std::fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(syncdash::foundation::names::LOCK_NAME)
+            })
+            .map(|entry| {
+                let name = entry.file_name();
+                let bytes = std::fs::read(entry.path()).unwrap();
+                (name, bytes)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
     assert_eq!(
-        std::fs::read_dir(&t1).unwrap().count(),
-        std::fs::read_dir(&t2).unwrap().count()
+        user_files(&t1),
+        user_files(&t2),
+        "parallel and sequential runs must produce the same user-visible files"
     );
     let _ = std::fs::remove_dir_all(&b1);
     let _ = std::fs::remove_dir_all(&b2);
@@ -964,9 +975,9 @@ fn delete_dirs_deepest_first_regardless_of_input_order() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// A route fixture backed by real files. It can hide its local path to model a protocol root, or
-/// expose the path while denying `local_trash` to model a local root that cannot reach the default
-/// store. That distinction pins the configured-path behavior without depending on mounted media.
+/// A route fixture backed by real files. It can hide its local capability to model a protocol
+/// root, or expose it while denying `local_trash` to model a local root that cannot reach the
+/// default store. That distinction pins routing without depending on mounted media.
 struct RouteFixture(syncdash::fs::vfs::local::LocalVfs, Medium, bool);
 
 impl syncdash::fs::vfs::Vfs for RouteFixture {
@@ -983,9 +994,9 @@ impl syncdash::fs::vfs::Vfs for RouteFixture {
     fn identity(&self) -> String {
         self.0.identity()
     }
-    fn as_local(&self) -> Option<&std::path::Path> {
+    fn local_root(&self) -> Option<&syncdash::fs::local_root::LocalRoot> {
         if self.2 {
-            self.0.as_local()
+            Some(self.0.local_root())
         } else {
             None
         }
@@ -1052,8 +1063,8 @@ impl syncdash::fs::vfs::Vfs for RenameDrift {
     fn identity(&self) -> String {
         self.0.identity()
     }
-    fn as_local(&self) -> Option<&std::path::Path> {
-        self.0.as_local()
+    fn local_root(&self) -> Option<&syncdash::fs::local_root::LocalRoot> {
+        self.0.local_root()
     }
     fn connect(&self) -> VfsResult<()> {
         self.0.connect()
@@ -1081,7 +1092,10 @@ impl syncdash::fs::vfs::Vfs for RenameDrift {
     }
     fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
         if from_rel == "old.txt" && to_rel == "new.txt" {
-            std::fs::write(self.as_local().unwrap().join(to_rel), b"raced occupant")?;
+            std::fs::write(
+                self.local_root().unwrap().display_path().join(to_rel),
+                b"raced occupant",
+            )?;
             return Err(VfsError::new(
                 VfsErrorKind::Io,
                 "forced rename fallback after destination drift",
@@ -1091,7 +1105,10 @@ impl syncdash::fs::vfs::Vfs for RenameDrift {
     }
     fn rename_noreplace(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
         if syncdash::fs::staged::is_temp_rel(from_rel) && to_rel == "new.txt" {
-            std::fs::write(self.as_local().unwrap().join(to_rel), b"raced occupant")?;
+            std::fs::write(
+                self.local_root().unwrap().display_path().join(to_rel),
+                b"raced occupant",
+            )?;
         }
         self.0.rename_noreplace(from_rel, to_rel)
     }
@@ -1136,7 +1153,7 @@ impl FaultMoveVfs {
     fn new(root: PathBuf, fault: MoveFault) -> FaultMoveVfs {
         FaultMoveVfs {
             inner: RouteFixture(
-                syncdash::fs::vfs::local::LocalVfs::new(root.clone()),
+                syncdash::fs::vfs::local::LocalVfs::open(root.clone()).unwrap(),
                 Medium::FixedDisk,
                 true,
             ),
@@ -1192,8 +1209,8 @@ impl syncdash::fs::vfs::Vfs for FaultMoveVfs {
     fn identity(&self) -> String {
         self.inner.identity()
     }
-    fn as_local(&self) -> Option<&std::path::Path> {
-        self.inner.as_local()
+    fn local_root(&self) -> Option<&syncdash::fs::local_root::LocalRoot> {
+        self.inner.local_root()
     }
     fn connect(&self) -> VfsResult<()> {
         self.inner.connect()
@@ -1309,9 +1326,9 @@ fn move_fallback_rechecks_destination_before_staging_a_copy() {
     std::fs::create_dir_all(&t).unwrap();
     std::fs::write(t.join("old.txt"), b"planned source").unwrap();
     let source: Arc<dyn syncdash::fs::vfs::Vfs> =
-        Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s));
+        Arc::new(syncdash::fs::vfs::local::LocalVfs::open(s).unwrap());
     let target: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(RenameDrift(RouteFixture(
-        syncdash::fs::vfs::local::LocalVfs::new(t.clone()),
+        syncdash::fs::vfs::local::LocalVfs::open(t.clone()).unwrap(),
         Medium::FixedDisk,
         true,
     )));
@@ -1349,7 +1366,7 @@ fn run_fault_move(
     std::fs::create_dir_all(&s).unwrap();
     std::fs::create_dir_all(&t).unwrap();
     let source: Arc<dyn syncdash::fs::vfs::Vfs> =
-        Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s));
+        Arc::new(syncdash::fs::vfs::local::LocalVfs::open(s).unwrap());
     let target: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(FaultMoveVfs::new(t, fault));
     apply::apply_vfs(
         &[moving],
@@ -1498,7 +1515,7 @@ fn cross_volume_move_fallback_preserves_executable_mode() {
     let _ = std::fs::remove_dir_all(base);
 }
 
-/// The bug: preserving an original chose its route from `as_local()`, so a share took the central
+/// The bug: preserving an original chose its route from local capability presence, so a share took the central
 /// trash store, the same-volume rename into it failed, and `move_to_trash` fell back to
 /// `fs::copy` — **downloading every deleted file** before removing it. A mirror clearing 50 GB
 /// off a NAS pulled 50 GB onto the local disk, and the space gate had checked the share.
@@ -1512,9 +1529,9 @@ fn an_off_machine_root_preserves_in_place_instead_of_downloading() {
     std::fs::write(t.join("f.txt"), b"old").unwrap();
 
     let sv: Arc<dyn syncdash::fs::vfs::Vfs> =
-        Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s.clone()));
+        Arc::new(syncdash::fs::vfs::local::LocalVfs::open(s.clone()).unwrap());
     let tv: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(RouteFixture(
-        syncdash::fs::vfs::local::LocalVfs::new(t.clone()),
+        syncdash::fs::vfs::local::LocalVfs::open(t.clone()).unwrap(),
         Medium::NetworkShare,
         false,
     ));
@@ -1562,9 +1579,10 @@ fn a_protocol_root_reports_the_in_root_preservation_path() {
     std::fs::write(s.join("f.txt"), b"new").unwrap();
     std::fs::write(t.join("f.txt"), b"old").unwrap();
 
-    let sv: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s));
+    let sv: Arc<dyn syncdash::fs::vfs::Vfs> =
+        Arc::new(syncdash::fs::vfs::local::LocalVfs::open(s).unwrap());
     let tv: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(RouteFixture(
-        syncdash::fs::vfs::local::LocalVfs::new(t.clone()),
+        syncdash::fs::vfs::local::LocalVfs::open(t.clone()).unwrap(),
         Medium::RemovableDisk,
         false,
     ));
@@ -1678,9 +1696,10 @@ fn a_custom_same_volume_trash_is_not_blocked_by_the_default_store_capability() {
     std::fs::write(s.join("f.txt"), b"new").unwrap();
     std::fs::write(t.join("f.txt"), b"old").unwrap();
 
-    let sv: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(syncdash::fs::vfs::local::LocalVfs::new(s));
+    let sv: Arc<dyn syncdash::fs::vfs::Vfs> =
+        Arc::new(syncdash::fs::vfs::local::LocalVfs::open(s).unwrap());
     let tv: Arc<dyn syncdash::fs::vfs::Vfs> = Arc::new(RouteFixture(
-        syncdash::fs::vfs::local::LocalVfs::new(t.clone()),
+        syncdash::fs::vfs::local::LocalVfs::open(t.clone()).unwrap(),
         Medium::RemovableDisk,
         true,
     ));
@@ -1707,6 +1726,41 @@ fn a_custom_same_volume_trash_is_not_blocked_by_the_default_store_capability() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[test]
+fn copy_refuses_source_content_that_no_longer_matches_the_plan() {
+    let base = tmproot("copy-source-content-drift");
+    let (source, target) = (base.join("source"), base.join("target"));
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(source.join("file.bin"), b"newer-content").unwrap();
+
+    let mut planned = op(Action::Copy, "file.bin");
+    planned.size = Some(b"older-content".len() as u64);
+    planned.hash = Some(blake3::hash(b"older-content").to_hex().to_string());
+    let (done, _, errors) = apply::apply(&[planned], &source, &target, &opts(base.join("trash")));
+
+    assert_eq!((done, errors), (0, 1));
+    assert!(!target.join("file.bin").exists());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn copy_refuses_source_length_that_no_longer_matches_the_plan() {
+    let base = tmproot("copy-source-length-drift");
+    let (source, target) = (base.join("source"), base.join("target"));
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(source.join("file.bin"), b"changed length").unwrap();
+
+    let mut planned = op(Action::Copy, "file.bin");
+    planned.size = Some(3);
+    let (done, _, errors) = apply::apply(&[planned], &source, &target, &opts(base.join("trash")));
+
+    assert_eq!((done, errors), (0, 1));
+    assert!(!target.join("file.bin").exists());
+    let _ = std::fs::remove_dir_all(base);
+}
+
 /// The copy lane's width is a negotiation, not a preference.
 ///
 /// A backend that declares `max_parallel_streams: 1` means it: FTP carries one control connection,
@@ -1719,7 +1773,9 @@ fn the_copy_lane_never_exceeds_what_a_backend_declares() {
 
     // Borrow a real backend's sheet and vary only the one field under test, so the case cannot
     // drift out of shape when `VfsCaps` gains a member.
-    let base = syncdash::fs::vfs::local::LocalVfs::new(std::env::temp_dir()).caps();
+    let base = syncdash::fs::vfs::local::LocalVfs::open(std::env::temp_dir())
+        .unwrap()
+        .caps();
     let caps = |n: usize| VfsCaps {
         max_parallel_streams: n,
         ..base.clone()

@@ -5,13 +5,12 @@
 //! `apply` is not trusted to have come from `compare` — a plan can arrive from a package built
 //! by another machine, so the ordering is re-derived here.
 
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use super::ledger::record;
 use super::ops::exec_op;
-use super::ApplyOptions;
+use super::{ApplyLeaseGuard, ApplyOptions};
 use crate::model::plan::Op;
 use crate::model::plan::Side;
 use crate::obs::progress::{PhaseProgress, RunCtx};
@@ -20,20 +19,18 @@ use crate::obs::progress::{PhaseProgress, RunCtx};
 pub(super) struct Shared<'a> {
     pub(super) opt: &'a ApplyOptions,
     pub(super) ctx: &'a RunCtx,
+    pub(super) lease: &'a ApplyLeaseGuard,
     pub(super) source: &'a std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     pub(super) target: &'a std::sync::Arc<dyn crate::fs::vfs::Vfs>,
-    /// The local escape hatches, precomputed: Some = this side is a real directory and
-    /// the path-based machinery (delta, VersionWriter, walkdir) applies.
-    pub(super) source_local: Option<PathBuf>,
-    pub(super) target_local: Option<PathBuf>,
+    pub(super) source_local_root: Option<crate::fs::local_root::LocalRoot>,
+    pub(super) target_local_root: Option<crate::fs::local_root::LocalRoot>,
     /// Whether the central trash store may take each side's deletions.
     ///
-    /// A separate question from `local_of`, and the reason this field exists: a mounted share or
-    /// external disk is a real local path, so the delta lane applies, but a move into a store on
-    /// another volume would copy every deleted file first.
+    /// Separate from local-capability presence: a mounted share or external disk supports the
+    /// descriptor-local delta lane, but a move into another volume would copy every deleted file.
     pub(super) source_trash_ok: bool,
     pub(super) target_trash_ok: bool,
-    pub(super) trash: PathBuf,
+    pub(super) central_trash_root: Option<crate::fs::local_root::LocalRoot>,
     /// The in-root retention area for every side that cannot rename into the central store:
     /// `.syncdash/trash/<run_ms>` under that root. This includes protocol roots, mounted shares,
     /// and external local volumes.
@@ -43,7 +40,7 @@ pub(super) struct Shared<'a> {
     pub(super) target_in_root_preserved: AtomicBool,
     pub(super) ver_source: Mutex<Option<crate::store::version::VersionWriter>>,
     pub(super) ver_target: Mutex<Option<crate::store::version::VersionWriter>>,
-    /// Directories already ensured on each side this run (spares one round-trip per file on remote roots)
+    /// Directories already ensured on each side this run (spares one round-trip per network root)
     pub(super) mkdir_memo: Mutex<std::collections::HashSet<(bool, String)>>,
     // P1-4: when the mtime the filesystem actually stored differs from the one we wanted (FAT's 2-second
     // granularity, truncation by some SMB servers), record (ondisk, intended) for the next scan to convert with,
@@ -53,6 +50,18 @@ pub(super) struct Shared<'a> {
 }
 
 impl<'a> Shared<'a> {
+    pub(super) fn checkpoint(&self, pp: &PhaseProgress<'_>) -> std::io::Result<()> {
+        self.lease.checkpoint(pp)
+    }
+
+    pub(super) fn check_before_mutation(&self) -> std::io::Result<()> {
+        self.lease.check_before_mutation()
+    }
+
+    pub(super) fn lease_lost(&self) -> bool {
+        self.lease.lost()
+    }
+
     pub(super) fn exec_other(
         &self,
         side: &Side,
@@ -66,10 +75,10 @@ impl<'a> Shared<'a> {
         }
     }
 
-    pub(super) fn local_of(&self, side: &Side) -> Option<&Path> {
+    pub(super) fn local_root_of(&self, side: &Side) -> Option<&crate::fs::local_root::LocalRoot> {
         match side {
-            Side::Target => self.target_local.as_deref(),
-            Side::Source => self.source_local.as_deref(),
+            Side::Target => self.target_local_root.as_ref(),
+            Side::Source => self.source_local_root.as_ref(),
         }
     }
 
@@ -116,6 +125,7 @@ impl<'a> Shared<'a> {
         if self.mkdir_memo.lock().unwrap().contains(&key) {
             return Ok(());
         }
+        self.check_before_mutation()?;
         exec.mkdir_all(rel)?;
         self.mkdir_memo.lock().unwrap().insert(key);
         Ok(())
@@ -127,6 +137,7 @@ pub(super) struct Counters {
     pub(super) done: AtomicU64,
     pub(super) skipped: AtomicU64,
     pub(super) errors: AtomicU64,
+    pub(super) lease_failure_recorded: AtomicBool,
 }
 
 /// Run one class of ops. width==1 runs sequentially on the current thread; otherwise a scoped thread pool
@@ -155,7 +166,7 @@ pub(super) fn run_class(
             }
             let op = class[i];
             // The cooperation point between two adjacent ops (a pause spins here, a cancel exits here)
-            if pp.checkpoint().is_err() {
+            if sh.checkpoint(pp).is_err() {
                 break;
             }
             // Per-item timing: "which file slowed this sync down" in the execution ledger can only be measured here
@@ -173,7 +184,7 @@ pub(super) fn run_class(
     } else {
         std::thread::scope(|s| {
             for _ in 0..width {
-                s.spawn(&work);
+                s.spawn(work);
             }
         });
     }

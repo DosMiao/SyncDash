@@ -46,17 +46,16 @@ pub enum Need {
     Symlink,
     UnixMode,
     RangedRead,
-    /// Sampled-divergence escalation only runs when both roots expose a local path, so a case that
-    /// depends on it is meaningless anywhere else.
+    /// Sampled-divergence escalation only runs when both roots expose retained local capabilities.
     BothLocal,
     /// The case's own timestamps must stay distinguishable on this root.
     MtimePrecisionAtMost(u32),
-    /// The target can hold a root lock, and can therefore be written at all.
+    /// Both roots can hold the exclusive leases that apply acquires before writing either side.
     ///
     /// Not declared by any case — it is a precondition of *applying*, which every case does, so the
-    /// driver checks it for all of them. A backend that cannot set mtimes and is not local has no
-    /// way to signal liveness to another machine, and the write side refuses rather than sync
-    /// without one. Such a lane still compares, so it skips loudly instead of failing: "readable,
+    /// driver checks it for all of them. A backend without atomic absent-name publication cannot
+    /// establish a mutually exclusive claim across machines, so the write side refuses before any
+    /// mutation. Such a lane still compares, so it skips loudly instead of failing: "readable,
     /// never writable" is a real and supported shape, and the lane's own test pins the refusal.
     WritableTarget,
 }
@@ -69,13 +68,15 @@ impl Need {
             Need::Symlink => sc.symlink.yes() && tc.symlink.yes(),
             Need::UnixMode => sc.unix_mode.yes() && tc.unix_mode.yes(),
             Need::RangedRead => sc.ranged_read.yes() && tc.ranged_read.yes(),
-            Need::BothLocal => s.as_local().is_some() && t.as_local().is_some(),
+            Need::BothLocal => s.local_root().is_some() && t.local_root().is_some(),
             Need::MtimePrecisionAtMost(ms) => {
                 sc.mtime_precision_ms <= ms && tc.mtime_precision_ms <= ms
             }
-            // Mirrors the root-lock gate in `guard::caps`: a local root locks by other means, a
-            // remote one needs `set_mtime` for the heartbeat.
-            Need::WritableTarget => tc.set_mtime.yes() || t.as_local().is_some(),
+            // Mirrors the root-lock gate in `guard::caps`: apply locks both roots even when this
+            // plan's visible mutations happen on only one side.
+            Need::WritableTarget => {
+                sc.exclusive_staged_file_publish.yes() && tc.exclusive_staged_file_publish.yes()
+            }
         }
     }
 }
@@ -205,16 +206,15 @@ pub fn watched() -> (Transcript, RunCtx) {
 /// about the fixture.
 ///
 /// Roots stay blank because everything below `compare_resolved` works on open backends and never
-/// reads the phrases. `targets` stays empty deliberately: `compare_resolved` sits *below* the
-/// multi-target check, so a stray entry here would silently test a shape production refuses.
+/// reads the phrases. The one empty target keeps the current `Job` shape canonical while remaining
+/// irrelevant below the phrase-resolution boundary.
 ///
 pub fn bare_job() -> Job {
     Job {
         mode: "mirror".into(),
         rigor: "standard".into(),
         source: String::new(),
-        target: String::new(),
-        targets: Vec::new(),
+        targets: vec![String::new()],
         archive: None,
         include: Vec::new(),
         exclude: Vec::new(),
@@ -454,11 +454,11 @@ fn collect_vfs(v: &Arc<dyn Vfs>, abs: &str, rel: &str, out: &mut Vec<String>) {
     for e in entries {
         let child_abs = format!("{abs}/{}", e.name);
         let child_rel = if rel.is_empty() {
-            e.name.clone()
+            e.name.as_str().to_owned()
         } else {
             format!("{rel}/{}", e.name)
         };
-        if e.meta.kind == crate::model::table::EntryKind::Dir {
+        if e.meta.kind == crate::fs::vfs::VfsEntryKind::Directory {
             collect_vfs(v, &child_abs, &child_rel, out);
         } else {
             out.push(child_rel);
