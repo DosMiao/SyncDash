@@ -141,16 +141,6 @@ pub fn gen_jobs(
     let mut out = Vec::new();
     for rel in terrs {
         let name = format!("cs-{}", slug(&rel));
-        let path = opts.dest.join(format!("{name}.toml"));
-        if path.exists() && !opts.force {
-            out.push(GenOutcome {
-                name,
-                territory: rel,
-                path,
-                written: false,
-            });
-            continue;
-        }
         let native = crate::foundation::path::to_native(&rel);
         // target_root may be UNC or posix — join each side with its own separator
         let mount = if target_root.to_string_lossy().contains('/')
@@ -221,12 +211,20 @@ pub fn gen_jobs(
              # (use --force to discard your edits and reseed).\n",
             junk.len(),
         );
-        std::fs::write(&path, format!("{header}{toml_text}"))?;
+        // The registry owns job-file writes: one advisory lock for the directory, one staged
+        // write per file, and a no-replace commit so an existing job is left alone by the
+        // filesystem rather than by a check that raced it.
+        let (path, outcome) = crate::job::persistence::seed_job_file(
+            &opts.dest,
+            &name,
+            &format!("{header}{toml_text}"),
+            opts.force,
+        )?;
         out.push(GenOutcome {
             name,
             territory: rel,
             path,
-            written: true,
+            written: outcome == crate::job::persistence::SeedOutcome::Written,
         });
     }
     Ok(out)
@@ -367,6 +365,35 @@ mod tests {
     }
 
     /// `--junk none` really means none: the generator has no floor it silently applies underneath.
+    /// The keep decision has to be enforced by the commit, not by an `exists()` check that ran
+    /// before it. A job created between the check and the write — a second generator, or a desktop
+    /// save — used to be discarded silently; a no-replace commit refuses instead.
+    #[test]
+    fn a_job_that_appears_mid_generation_is_never_discarded() {
+        use crate::job::persistence::{seed_job_file, SeedOutcome};
+
+        let root = tmp("noreplace");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let (path, first) = seed_job_file(&root, "cs-x", "# first\n", false).unwrap();
+        assert_eq!(first, SeedOutcome::Written);
+
+        let (same, second) = seed_job_file(&root, "cs-x", "# second\n", false).unwrap();
+        assert_eq!(second, SeedOutcome::Kept);
+        assert_eq!(same, path);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# first\n",
+            "a kept job must keep its own bytes"
+        );
+
+        let (_, forced) = seed_job_file(&root, "cs-x", "# forced\n", true).unwrap();
+        assert_eq!(forced, SeedOutcome::Written);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# forced\n");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn seeding_nothing_seeds_nothing() {
         let root = tmp("none");
