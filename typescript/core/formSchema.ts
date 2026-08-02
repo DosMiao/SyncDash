@@ -1,52 +1,38 @@
-// Form schemas. The job editor and the log settings sheet are both generated from these lists, so a new
-// knob is one line here rather than a hand-written label/input/collect triple in three places.
-
 import type { AppSettings } from './types/generated/AppSettings';
 import type { Job as JobFull } from './types/generated/Job';
+import type { SettingsNumericLimitsDto } from './types/generated/SettingsNumericLimitsDto';
 
-/// What a rendered form holds. Deliberately not the domain shape: while you are typing a `lines` field,
-/// "a\n" is not yet the array ["a"], and re-joining a split array on every keystroke eats the newline
-/// under the cursor. Numbers stay strings for the same reason — an empty box is not 0.
+/// Draft values preserve incomplete text and numbers exactly as typed; domain conversion happens
+/// only at the save boundary.
 export type FormValues = Record<string, string | boolean>;
 
-/// 'custom' is a slot the caller fills (the junk-preset checkbox block); it carries no form value
-export type FKind = 'text' | 'num' | 'bool' | 'select' | 'lines' | 'dir' | 'file' | 'custom';
+export type FormFieldKind = 'text' | 'num' | 'bool' | 'select' | 'lines' | 'dir' | 'file' | 'custom';
 
 /**
  * One row of a settings form.
  *
- * `label` / `desc` / `help` are three distinct jobs and used to be one field, which is how a
- * label ended up reading "Multiple targets (one root per line; overrides the single target above
- * when non-empty)". The renderer gives each its own typography, so the split is what makes the
- * hierarchy visible at all:
- *
- *   label  what this setting is          13px semibold  — always on screen
- *   desc   one short line, no more       11px muted     — always on screen
- *   help   the paragraph                 popover        — behind an info icon
- *
- * If a `desc` will not fit on one line, it belongs in `help`.
+ * `label` names the setting, `desc` must fit on one line, and longer guidance belongs in `help`.
  */
-export interface FSpec {
+export interface FormFieldSpec {
   key: string;
   label: string;
-  kind: FKind;
+  kind: FormFieldKind;
   opts?: string[];
   desc?: string;
   help?: string;
-  /// Key of the setting this one qualifies; rendered indented beneath it behind a rule
+  /// Key of the setting this field qualifies.
   parent?: string;
-  /// Starts a new section; the section rail and the config pills on the main screen both key off this
+  /// Starts a section that continues until the next field with a group.
   group?: string;
 }
 
-export const ED_FIELDS: FSpec[] = [
+export const JOB_FORM_FIELDS: FormFieldSpec[] = [
   { key: '__name', label: 'Job name', kind: 'text', group: 'Basics', desc: 'Also the name of the TOML file on disk.' },
   { key: 'mode', label: 'Mode', kind: 'select', opts: ['mirror', 'sync', 'enrich'], desc: 'mirror = source wins · sync = two-way · enrich = add only, never delete' },
   { key: 'source', label: 'Source root', kind: 'dir' },
-  { key: 'target', label: 'Target root', kind: 'dir' },
   {
-    key: 'targets', label: 'Multiple targets', kind: 'lines',
-    desc: 'One root per line. Overrides the single target above when non-empty.',
+    key: 'targets', label: 'Target roots', kind: 'lines',
+    desc: 'One root per line. At least one is required.',
     help: '1:N — one source mirrored or enriched into several targets in turn, each with its own plan and its own logs. Not supported in sync mode; use paired jobs there.',
   },
   { key: 'archive', label: 'Archive file', kind: 'file', desc: 'Sync mode only. Empty = none.', help: 'Suggested location: the archive/ directory beside your jobs/ one, as <name>.jsonl. syncdash gen-jobs fills this in for you.' },
@@ -83,10 +69,6 @@ export const ED_FIELDS: FSpec[] = [
     help: 'Ticking a preset writes its patterns in verbatim; unticking takes exactly those lines back out. A tick adds nothing you cannot see, and nothing puts a line back once you have deleted it. Whatever the filter removes is counted in the status bar — never silently.',
   },
   { key: 'include', label: 'Include', kind: 'lines', desc: 'One pattern per line. Empty = everything.' },
-  // Naming the one remaining unconditional rule rather than letting the description imply there is
-  // none. It is four names, it is why the mount-point gate works (a synced .syncdash-root would grow
-  // on an unmounted empty directory and defeat it), and a filter you cannot see is exactly what this
-  // screen was rebuilt to stop having.
   {
     key: 'exclude', label: 'Exclude', kind: 'lines',
     desc: 'One pattern per line; a leading ! makes an exception.',
@@ -95,17 +77,17 @@ export const ED_FIELDS: FSpec[] = [
   { key: 'deletable', label: 'Deletable', kind: 'lines', desc: 'May be removed along with a deleted parent directory.' },
 
   {
-    key: 'watch_interval_secs', label: 'Maximum verification interval', kind: 'num', group: 'AutoScan',
-    desc: 'Seconds. Local macOS roots also react to FSEvents; remote/unsupported roots poll at this interval while SyncDash is open.',
+    key: 'autoscan_interval_secs', label: 'Maximum verification interval', kind: 'num', group: 'AutoScan',
+    desc: 'Seconds. Local macOS roots also react to FSEvents; VFS and unsupported roots poll at this interval while SyncDash is open.',
   },
   {
-    key: 'watch_auto_apply', label: 'Run automatically when differences are found', kind: 'bool',
+    key: 'autoscan_auto_apply', label: 'Run automatically when differences are found', kind: 'bool',
     help: 'Auto-run never grants permission to degraded capabilities or health warnings. If the exact job revision, target, capability set, and action set lack unattended authorization, AutoScan stops at review required.',
   },
 ];
 
-export const SET_FIELDS: FSpec[] = [
-  { key: 'log_dir', label: 'Log directory', kind: 'dir', group: 'Location', desc: 'Empty = %APPDATA%\\syncdash\\logs.' },
+export const SETTINGS_FORM_FIELDS: FormFieldSpec[] = [
+  { key: 'log_dir', label: 'Log directory', kind: 'dir', group: 'Location', desc: 'Empty = SyncDash\'s default logs folder.' },
   { key: 'level', label: 'Record level', kind: 'select', opts: ['info', 'warn', 'error'], group: 'Content', desc: 'Narration below this level is not written to disk. The error list is unaffected.' },
   {
     key: 'log_compare', label: 'Compare runs', kind: 'select', opts: ['summary', 'off'],
@@ -120,15 +102,14 @@ export const SET_FIELDS: FSpec[] = [
   },
 ];
 
-/// Section titles in rail order, derived from whichever fields open a group
-export function groupsOf(fields: FSpec[]): string[] {
+export function formGroupNames(fields: FormFieldSpec[]): string[] {
   return fields.map((f) => f.group).filter((g): g is string => !!g);
 }
 
 /// The fields of one section. `group` marks where a section *starts*, so a field belongs to the
 /// most recent group above it — the list stays flat and a field only ever names its section when
 /// it opens one.
-export function fieldsInGroup(fields: FSpec[], group: string): FSpec[] {
+export function formFieldsInGroup(fields: FormFieldSpec[], group: string): FormFieldSpec[] {
   let cur = '';
   return fields.filter((f) => {
     if (f.group) cur = f.group;
@@ -136,10 +117,9 @@ export function fieldsInGroup(fields: FSpec[], group: string): FSpec[] {
   });
 }
 
-/// Optional fields where an empty string means "unset" rather than "the empty string" (serde Option)
-export const NULLABLE_TEXT = new Set(['archive']);
+export const NULLABLE_JOB_TEXT_FIELDS = new Set(['archive']);
 
-/// Preset → the four detail knobs (aligned word for word with Rust config::rigor_resolved)
+/// These values must remain identical to `Job::rigor_resolved` in `src/job/mod.rs`.
 export const RIGOR_PRESETS: Record<string, { evidence: string; use_cache: boolean; escalate: boolean; verify_writes: boolean }> = {
   quick: { evidence: 'none', use_cache: false, escalate: false, verify_writes: false },
   fast: { evidence: 'sampled', use_cache: true, escalate: true, verify_writes: false },
@@ -161,16 +141,14 @@ export function applyRigorPresetDefaults(j: JobFull): JobFull {
   };
 }
 
-/// Which preset (if any) a set of four detail values corresponds to; 'custom' when it matches none
 export function detectRigor(evidence: string, useCache: boolean, escalate: boolean, verifyWrites: boolean): string {
   const hit = Object.entries(RIGOR_PRESETS).find(([, p]) =>
     p.evidence === evidence && p.use_cache === useCache && p.escalate === escalate && p.verify_writes === verifyWrites);
   return hit ? hit[0] : 'custom';
 }
 
-/// One-to-one with the preset baselines in job::rigor. Keep this in step when the ladder changes there — the button subtitle is
-/// the only place a user sees what a tier actually does.
-export const RIGOR_HINT: Record<string, string> = {
+/// These labels describe the preset baselines in `src/job/rigor.rs`.
+export const RIGOR_SUMMARIES: Record<string, string> = {
   quick: 'size and time only',
   fast: 'sampled digest · uses cache',
   balanced: 'cached digest · verify after write',
@@ -179,13 +157,11 @@ export const RIGOR_HINT: Record<string, string> = {
   custom: 'per the four detail knobs',
 };
 
-export const MODE_HINT: Record<string, string> = {
+export const MODE_SUMMARIES: Record<string, string> = {
   mirror: 'source wins', sync: 'two-way', enrich: 'add only, never delete',
 };
 
-// Form values ↔ domain objects
-
-function toFormValue(kind: FKind, v: unknown): string | boolean {
+function toFormValue(kind: FormFieldKind, v: unknown): string | boolean {
   if (kind === 'bool') return !!v;
   if (kind === 'lines') return ((v as string[]) ?? []).join('\n');
   return v == null ? '' : String(v);
@@ -194,8 +170,8 @@ function toFormValue(kind: FKind, v: unknown): string | boolean {
 export function jobToForm(j: JobFull, name: string): FormValues {
   const rec = j as unknown as Record<string, unknown>;
   const out: FormValues = {};
-  for (const f of ED_FIELDS) {
-    if (f.kind === 'custom') continue; // a rendered slot, not a value
+  for (const f of JOB_FORM_FIELDS) {
+    if (f.kind === 'custom') continue;
     out[f.key] = toFormValue(f.kind, f.key === '__name' ? name : rec[f.key]);
   }
   return out;
@@ -205,15 +181,14 @@ export function jobToForm(j: JobFull, name: string): FormValues {
 ///
 /// `base` is the job the form was opened on — the loaded job when editing, the engine's own default job
 /// when creating. Fields the schema does not surface are carried through from it rather than reset to a
-/// value invented here: `no_hash` is not in ED_FIELDS and it forces hashing off last in `rigor_resolved`,
-/// so rebuilding the job from a blank default quietly cleared it every time anything else was saved.
+/// value invented here.
 export function formToJob(
   v: FormValues,
   base: JobFull,
-): { name: string; job: JobFull } | { error: string; field: '__name' | 'source' | 'target' } {
+): { name: string; job: JobFull } | { error: string; field: '__name' | 'source' | 'targets' } {
   const j = { ...(base as unknown as Record<string, unknown>) };
   let name = '';
-  for (const f of ED_FIELDS) {
+  for (const f of JOB_FORM_FIELDS) {
     if (f.kind === 'custom') continue;
     const raw = v[f.key];
     let val: unknown;
@@ -222,7 +197,7 @@ export function formToJob(
     else if (f.kind === 'lines') val = String(raw).split('\n').map((s) => s.trim()).filter(Boolean);
     else {
       const s = String(raw).trim();
-      val = s === '' && NULLABLE_TEXT.has(f.key) ? null : s;
+      val = s === '' && NULLABLE_JOB_TEXT_FIELDS.has(f.key) ? null : s;
     }
     if (f.key === '__name') { name = String(val ?? '').trim(); continue; }
     j[f.key] = val;
@@ -230,31 +205,49 @@ export function formToJob(
   if (!name) return { error: 'Job name cannot be empty', field: '__name' };
   const jf = j as unknown as JobFull;
   if (!jf.source.trim()) return { error: 'Source root cannot be empty', field: 'source' };
-  if (!jf.target.trim()) return { error: 'Target root cannot be empty', field: 'target' };
+  if (jf.targets.length === 0) return { error: 'At least one target root is required', field: 'targets' };
   return { name, job: jf };
 }
 
 export function settingsToForm(s: AppSettings): FormValues {
   const rec = s as unknown as Record<string, unknown>;
   const out: FormValues = {};
-  for (const f of SET_FIELDS) out[f.key] = toFormValue(f.kind, rec[f.key]);
+  for (const f of SETTINGS_FORM_FIELDS) out[f.key] = toFormValue(f.kind, rec[f.key]);
   return out;
 }
 
-export function formToSettings(v: FormValues): AppSettings {
+export type SettingsFormResult =
+  | { settings: AppSettings }
+  | { error: string; field: string };
+
+export function formToSettings(
+  v: FormValues,
+  limits: SettingsNumericLimitsDto,
+): SettingsFormResult {
   const out: Record<string, unknown> = {};
-  for (const f of SET_FIELDS) {
+  for (const f of SETTINGS_FORM_FIELDS) {
     if (f.kind === 'bool') out[f.key] = !!v[f.key];
-    else if (f.kind === 'num') out[f.key] = Number(String(v[f.key]).trim() || 0);
+    else if (f.kind === 'num') {
+      const raw = String(v[f.key]).trim();
+      const value = raw === '' ? 0 : Number(raw);
+      let maximum: number;
+      if (f.key === 'keep_days') maximum = limits.maximum_keep_days;
+      else if (f.key === 'max_total_mb') maximum = limits.maximum_total_mb;
+      else return { error: `Numeric settings field '${f.key}' has no backend-owned limit`, field: f.key };
+      if (!Number.isSafeInteger(value) || value < 0 || value > maximum) {
+        return {
+          error: `${f.label} must be a whole number from 0 through ${maximum.toLocaleString('en-US')}`,
+          field: f.key,
+        };
+      }
+      out[f.key] = value;
+    }
     else out[f.key] = String(v[f.key]).trim();
   }
-  return out as unknown as AppSettings;
+  return { settings: out as unknown as AppSettings };
 }
 
-/// Our answer to the FFS "Save as batch job": the CLI already exists; all that was missing was handing
-/// over the command. We do not register the system scheduled task for you — that is a system-settings
-/// action, and a person should press it.
-export function schtasksCmd(job: string): string {
+export function windowsScheduledTaskCommand(job: string): string {
   const exe = 'syncdash.exe';
   return `schtasks /create /tn "SyncDash-${job}" /tr "\\"${exe}\\" run ${job} --yes" /sc daily /st 22:00`;
 }

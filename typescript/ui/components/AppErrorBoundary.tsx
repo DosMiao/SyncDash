@@ -1,16 +1,18 @@
 import { Component } from 'react';
 import type { ErrorInfo, ReactNode } from 'react';
 
-interface Props {
+interface AppErrorBoundaryProps {
   children: ReactNode;
 }
 
-interface State {
+interface AppErrorBoundaryState {
   message: string | null;
+  diagnosticStorage: 'pending' | 'saved' | { error: string };
 }
 
-function remember(kind: string, value: unknown, detail = '') {
+function remember(kind: string, value: unknown, detail = ''): string | null {
   const message = value instanceof Error ? `${value.name}: ${value.message}\n${value.stack ?? ''}` : String(value);
+  let storageFailure: string | null = null;
   try {
     localStorage.setItem('sd.last-ui-error', JSON.stringify({
       at: new Date().toISOString(),
@@ -18,10 +20,12 @@ function remember(kind: string, value: unknown, detail = '') {
       message,
       detail,
     }));
-  } catch {
-    // The visible fallback and console entry still carry the failure if storage is unavailable.
+  } catch (storageError) {
+    storageFailure = String(storageError);
+    console.error('[SyncDash diagnostic storage]', storageError);
   }
   console.error(`[SyncDash ${kind}]`, value, detail);
+  return storageFailure;
 }
 
 export function installGlobalErrorCapture() {
@@ -33,15 +37,19 @@ export function installGlobalErrorCapture() {
   });
 }
 
-export class AppErrorBoundary extends Component<Props, State> {
-  state: State = { message: null };
+export class AppErrorBoundary extends Component<AppErrorBoundaryProps, AppErrorBoundaryState> {
+  state: AppErrorBoundaryState = { message: null, diagnosticStorage: 'pending' };
 
-  static getDerivedStateFromError(error: unknown): State {
-    return { message: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
+  static getDerivedStateFromError(error: unknown): AppErrorBoundaryState {
+    return {
+      message: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      diagnosticStorage: 'pending',
+    };
   }
 
   componentDidCatch(error: unknown, info: ErrorInfo) {
-    remember('render error', error, info.componentStack ?? '');
+    const storageError = remember('render error', error, info.componentStack ?? '');
+    this.setState({ diagnosticStorage: storageError ? { error: storageError } : 'saved' });
   }
 
   render() {
@@ -50,7 +58,11 @@ export class AppErrorBoundary extends Component<Props, State> {
       <main className="fatal-root">
         <h1>SyncDash UI stopped rendering</h1>
         <p>{this.state.message}</p>
-        <p>The error was saved as <code>sd.last-ui-error</code>. Reload the window after recording it.</p>
+        {this.state.diagnosticStorage === 'pending'
+          ? <p>Saving a local diagnostic…</p>
+          : this.state.diagnosticStorage === 'saved'
+            ? <p>The error was saved as <code>sd.last-ui-error</code>. Reload the window after recording it.</p>
+            : <p>The diagnostic could not be saved locally: {this.state.diagnosticStorage.error}. Record this screen before reloading.</p>}
       </main>
     );
   }

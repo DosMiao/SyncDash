@@ -1,5 +1,5 @@
-import { useId, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
 import { ChevronDown, ChevronRight, PanelLeftClose, PanelLeftOpen, X } from 'lucide-react';
 import { humanSize } from '../../core/format';
 import { ROOT_FOLDER_PATH, ROOT_LEVEL_LABEL } from '../../core/folders';
@@ -14,7 +14,7 @@ import { RESULT_TYPE_ICON } from '../icons';
 
 export interface RunScopePanelProps {
   plan: PlanDto;
-  flipped: boolean[];
+  reversedRows: boolean[];
   selectedResultTypes: Set<ResultType>;
   onSelectedResultTypesChange: (next: Set<ResultType>) => void;
   folderScope: string | null;
@@ -63,10 +63,39 @@ function ResultTypeFacet(props: {
   );
 }
 
+function RunScopeFolderLayout(props: {
+  children: ReactNode;
+  depth: number;
+  percent: number;
+  selected: boolean;
+}) {
+  const { children, depth, percent, selected } = props;
+  const folderRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const folder = folderRef.current;
+    if (!folder) return;
+    folder.style.setProperty('--run-scope-depth', String(depth));
+    folder.style.setProperty('--run-scope-share', `${Math.min(100, percent)}%`);
+    return () => {
+      folder.style.removeProperty('--run-scope-depth');
+      folder.style.removeProperty('--run-scope-share');
+    };
+  }, [depth, percent]);
+  return (
+    <div
+      ref={folderRef}
+      className={'run-scope-folder' + (selected ? ' on' : '')}
+      role="none"
+    >
+      {children}
+    </div>
+  );
+}
+
 export function RunScopePanel(props: RunScopePanelProps) {
   const {
     plan,
-    flipped,
+    reversedRows,
     selectedResultTypes,
     onSelectedResultTypesChange,
     folderScope,
@@ -78,13 +107,13 @@ export function RunScopePanel(props: RunScopePanelProps) {
     onClearRunScope,
   } = props;
 
-  const model = useMemo(() => buildRunScopeModel(plan, flipped), [plan, flipped]);
+  const model = useMemo(() => buildRunScopeModel(plan, reversedRows), [plan, reversedRows]);
   const folderRows = useMemo(
     () => flattenExpandedFolders(model.folders, expandedFolders),
     [expandedFolders, model.folders],
   );
   const [focusedFolder, setFocusedFolder] = useState<string | null>(null);
-  const folderRefs = useRef(new Map<string, HTMLButtonElement>());
+  const folderRefs = useRef(new Map<string, HTMLElement>());
   const tabStopFolder = folderRows.some(({ node }) => node.path === focusedFolder)
     ? focusedFolder
     : folderRows.find(({ node }) => node.path === folderScope)?.node.path ?? folderRows[0]?.node.path ?? null;
@@ -115,7 +144,7 @@ export function RunScopePanel(props: RunScopePanelProps) {
   };
 
   const onFolderKeyDown = (
-    event: ReactKeyboardEvent<HTMLButtonElement>,
+    event: ReactKeyboardEvent<HTMLElement>,
     index: number,
     row: RunScopeFolderRow,
   ) => {
@@ -148,6 +177,9 @@ export function RunScopePanel(props: RunScopePanelProps) {
           break;
         }
       }
+    } else if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      onFolderScopeChange(folderScope === node.path ? null : node.path);
     }
   };
 
@@ -236,18 +268,17 @@ export function RunScopePanel(props: RunScopePanelProps) {
                 const metricText = metrics.length > 0 ? metrics.join(' · ') : 'No transfer or deletion bytes';
                 const pathLabel = node.path === ROOT_FOLDER_PATH ? ROOT_LEVEL_LABEL : node.path;
                 return (
-                  <div
+                  <RunScopeFolderLayout
                     key={node.path}
-                    className={'run-scope-folder' + (selected ? ' on' : '')}
-                    role="none"
-                    style={{ '--run-scope-depth': depth } as CSSProperties}
+                    depth={depth}
+                    percent={percent}
+                    selected={selected}
                   >
-                    <button
+                    <div
                       ref={(element) => {
                         if (element) folderRefs.current.set(node.path, element);
                         else folderRefs.current.delete(node.path);
                       }}
-                      type="button"
                       role="treeitem"
                       className="run-scope-folder-select"
                       tabIndex={tabStopFolder === node.path ? 0 : -1}
@@ -259,22 +290,25 @@ export function RunScopePanel(props: RunScopePanelProps) {
                       onKeyDown={(event) => onFolderKeyDown(event, index, row)}
                       onClick={() => onFolderScopeChange(selected ? null : node.path)}
                     >
-                      <span className="run-scope-folder-main">
+                      {node.children.length > 0 && (
                         <span
-                          className={'run-scope-folder-chevron' + (node.children.length > 0 ? ' expandable' : '')}
-                          title={node.children.length > 0
-                            ? (expandedFolders.has(node.path) ? `Collapse ${pathLabel}` : `Expand ${pathLabel}`)
-                            : undefined}
+                          className="run-scope-folder-expand"
+                          title={expandedFolders.has(node.path) ? `Collapse ${pathLabel}` : `Expand ${pathLabel}`}
                           aria-hidden="true"
-                          onClick={node.children.length > 0 ? (event) => {
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={(event) => {
                             event.stopPropagation();
                             onToggleExpandedFolder(node.path);
-                          } : undefined}
+                            folderRefs.current.get(node.path)?.focus();
+                          }}
                         >
-                          {node.children.length > 0 ? (
-                            expandedFolders.has(node.path) ? <ChevronDown size={13} /> : <ChevronRight size={13} />
-                          ) : null}
+                          {expandedFolders.has(node.path)
+                            ? <ChevronDown size={13} aria-hidden="true" />
+                            : <ChevronRight size={13} aria-hidden="true" />}
                         </span>
+                      )}
+                      <span className="run-scope-folder-main">
+                        <span className="run-scope-folder-chevron" aria-hidden="true" />
                         <span className="run-scope-folder-name" title={pathLabel}>{node.label}</span>
                         <span className="run-scope-folder-count">{resultCountLabel(node.resultCount)}</span>
                       </span>
@@ -283,10 +317,10 @@ export function RunScopePanel(props: RunScopePanelProps) {
                         {metrics.length > 0 && <span className="run-scope-folder-bytes">{metricText}</span>}
                       </span>
                       <span className="run-scope-folder-bar" aria-hidden="true">
-                        <span style={{ width: `${Math.min(100, percent)}%` }} />
+                        <span />
                       </span>
-                    </button>
-                  </div>
+                    </div>
+                  </RunScopeFolderLayout>
                 );
               })}
             </div>

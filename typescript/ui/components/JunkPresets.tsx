@@ -3,51 +3,64 @@ import { junkPresets } from '../../core/ipc';
 import { excludeLines, presetState, togglePreset } from '../../core/junk';
 import type { JunkPresetDto } from '../../core/ipc';
 
-interface Props {
+interface JunkPresetsProps {
   presets: JunkPresetDto[];
-  /// The job's exclude list, one pattern per line — the same textarea value the form holds
   excludeText: string;
   onChange: (next: string) => void;
 }
 
-export function useJunkPresets(): JunkPresetDto[] {
-  const [presets, setPresets] = useState<JunkPresetDto[]>([]);
+export type JunkPresetCatalog =
+  | { status: 'loading'; presets: JunkPresetDto[] }
+  | { status: 'ready'; presets: JunkPresetDto[] }
+  | { status: 'failed'; presets: JunkPresetDto[]; error: string };
+
+export function useJunkPresetCatalog(): JunkPresetCatalog {
+  const [catalog, setCatalog] = useState<JunkPresetCatalog>({ status: 'loading', presets: [] });
   useEffect(() => {
     let live = true;
-    junkPresets().then((p) => { if (live) setPresets(p); }).catch(() => { /* the exclude box still works by hand */ });
+    junkPresets().then(
+      (presets) => {
+        if (live) setCatalog({ status: 'ready', presets });
+      },
+      (error: unknown) => {
+        if (live) setCatalog({ status: 'failed', presets: [], error: String(error) });
+      },
+    );
     return () => { live = false; };
   }, []);
-  return presets;
+  return catalog;
 }
 
-/// A preset is a macro over the exclude list below, never a parallel rule set: what the box says is
-/// therefore exactly what the job excludes. The old shape — a job saying `os_excludes = "auto"` with an
-/// empty exclude box — could not answer "what is actually excluded here".
-export function JunkPresets({ presets, excludeText, onChange }: Props) {
+export function JunkPresets({ presets, excludeText, onChange }: JunkPresetsProps) {
   const lines = excludeLines(excludeText);
 
   if (!presets.length) return null;
   return (
     <div className="junkgrid">
-      {presets.map((p) => {
-        const { present, state } = presetState(p, lines);
+      {presets.map((preset) => {
+        const { present, state } = presetState(preset, lines);
         return (
           <label
-            key={p.id}
+            key={preset.id}
             className="junkbox"
-            title={`${p.hint}\n\n${p.patterns.join('\n')}${
-              state === 'some' ? `\n\n(${present} of ${p.patterns.length} of these lines are currently in the exclude list)` : ''}`}
+            title={`${preset.hint}\n\n${preset.patterns.join('\n')}${
+              state === 'some' ? `\n\n(${present} of ${preset.patterns.length} of these lines are currently in the exclude list)` : ''}`}
           >
             <input
               type="checkbox"
               checked={state === 'on'}
-              // A partly-present preset clicks to "on", completing it — the useful move, and the one
-              // the checked=false/indeterminate=true pair would otherwise make ambiguous
-              ref={(el) => { if (el) el.indeterminate = state === 'some'; }}
-              onChange={(e) => onChange(togglePreset(p, excludeText, e.target.checked || state === 'some'))}
+              // A partial preset resolves to enabled because HTML exposes indeterminate separately from checked.
+              ref={(checkbox) => { if (checkbox) checkbox.indeterminate = state === 'some'; }}
+              onChange={(event) => onChange(togglePreset(
+                preset,
+                excludeText,
+                event.target.checked || state === 'some',
+              ))}
             />
-            <span className="jb-label">{p.label}</span>
-            <span className="jb-count">{state === 'some' ? `${present}/${p.patterns.length}` : p.patterns.length}</span>
+            <span className="jb-label">{preset.label}</span>
+            <span className="jb-count">
+              {state === 'some' ? `${present}/${preset.patterns.length}` : preset.patterns.length}
+            </span>
           </label>
         );
       })}

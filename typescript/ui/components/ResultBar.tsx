@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef } from 'react';
+import { useId, useMemo, useRef } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import {
   ArrowUpDown,
@@ -15,7 +15,8 @@ import {
 import { RESULT_TYPE_DEFINITIONS, RESULT_TYPES, SORT_LABEL } from '../../core/plan';
 import { ROOT_FOLDER_PATH, ROOT_LEVEL_LABEL } from '../../core/folders';
 import type { PlanDto, ResultType, Sort } from '../../core/plan';
-import type { ResultView } from '../state/result-workspace';
+import type { CompareResultView } from '../state/compareWorkspaceModel';
+import { useInteractionLayer } from '../hooks/useInteractionLayer';
 
 /**
  * The three stages of the run decision, plus the constraints that produced them.
@@ -37,8 +38,8 @@ export interface RunScopeSummary {
 export interface ResultBarProps {
   plan: PlanDto;
 
-  resultView: ResultView;
-  onResultViewChange: (next: ResultView) => void;
+  resultView: CompareResultView;
+  onResultViewChange: (next: CompareResultView) => void;
 
   searchDraft: string;
   searchPending: boolean;
@@ -55,12 +56,13 @@ export interface ResultBarProps {
 
   advancedFiltersOpen: boolean;
   onToggleAdvancedFilters: (anchor: DOMRect) => void;
+  exportPending: boolean;
   onExportCsv: () => void;
 
   grouped: boolean;
   sort: Sort | null;
   anyCollapsed: boolean;
-  pathMode: 'rel' | 'full';
+  pathMode: 'relative' | 'full';
   onToggleFold: () => void;
   onToggleGroup: () => void;
   onClearSort: () => void;
@@ -93,6 +95,7 @@ export function ResultBar(props: ResultBarProps) {
     onClearAdvancedFilters,
     advancedFiltersOpen,
     onToggleAdvancedFilters,
+    exportPending,
     onExportCsv,
     grouped,
     sort,
@@ -113,20 +116,12 @@ export function ResultBar(props: ResultBarProps) {
   const tabLabelId = useId();
   const layoutLabelId = useId();
   const pathLabelId = useId();
-
-  // Differences and Identical have independent queries. Each view owns Ctrl/Cmd+F only while its
-  // search input is present, so switching tabs cannot focus a hidden control or overwrite a query.
-  useEffect(() => {
-    if (resultView !== 'differences') return undefined;
-    const onKey = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
-        event.preventDefault();
-        searchRef.current?.focus();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [resultView]);
+  useInteractionLayer({
+    kind: 'workspace',
+    handlers: {
+      find: resultView === 'differences' ? () => searchRef.current?.focus() : undefined,
+    },
+  });
 
   const activeResultTypeLabels = useMemo(() => {
     const active = new Set(scope.selectedResultTypes);
@@ -141,12 +136,12 @@ export function ResultBar(props: ResultBarProps) {
   const hasAdvancedFilters = scope.advancedFilterCount > 0;
   const hasScopedResult = hasSearch || hasFolder || hasResultTypes || hasAdvancedFilters;
 
-  const selectResultView = (next: ResultView) => {
+  const selectResultView = (next: CompareResultView) => {
     if (next !== resultView) onResultViewChange(next);
   };
 
   const onTabKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
-    let next: ResultView | null = null;
+    let next: CompareResultView | null = null;
     if (event.key === 'Home') next = 'differences';
     if (event.key === 'End') next = 'identical';
     if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
@@ -210,14 +205,16 @@ export function ResultBar(props: ResultBarProps) {
                 ? 'The run scope could not be calculated safely'
                 : scopeCalculationPending
                   ? 'Wait for the run scope to finish calculating before exporting'
-                : scope.inScopeCount === 0
+                  : exportPending
+                    ? 'A CSV export is already in progress'
+                  : scope.inScopeCount === 0
                   ? 'There are no in-scope differences to export'
                   : 'Export the current scoped and sorted differences as CSV'}
-              disabled={scopeCalculationPending || scopeCalculationFailed || scope.inScopeCount === 0}
+              disabled={exportPending || scopeCalculationPending || scopeCalculationFailed || scope.inScopeCount === 0}
               onClick={onExportCsv}
             >
               <Download size={13} aria-hidden="true" />
-              Export CSV
+              {exportPending ? 'Exporting…' : 'Export CSV'}
             </button>
           </div>
         )}
@@ -325,9 +322,9 @@ export function ResultBar(props: ResultBarProps) {
               </span>
               <button
                 type="button"
-                className={'segmented-option' + (pathMode === 'rel' ? ' is-active' : '')}
-                aria-pressed={pathMode === 'rel'}
-                onClick={() => { if (pathMode !== 'rel') onTogglePathMode(); }}
+                className={'segmented-option' + (pathMode === 'relative' ? ' is-active' : '')}
+                aria-pressed={pathMode === 'relative'}
+                onClick={() => { if (pathMode !== 'relative') onTogglePathMode(); }}
               >
                 Relative
               </button>

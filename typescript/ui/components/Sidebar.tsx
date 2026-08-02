@@ -1,14 +1,13 @@
 import { useRef } from 'react';
 import { Circle, Pencil, Plus } from 'lucide-react';
-import { relTime } from '../../core/format';
+import { formatRelativeTimestamp } from '../../core/format';
 import type { JobDto } from '../../core/types/generated/JobDto';
 import type { RunRecord } from '../../core/types/generated/RunRecord';
 
 interface SidebarProps {
   jobs: JobDto[];
   currentJobId: string | null;
-  /// job name → most recent run, for the second line on each card
-  lastSyncByJobName: Record<string, RunRecord>;
+  latestRunByJobId: Record<string, RunRecord>;
   busy: boolean;
   /// A safety review may be abandoned by selecting another job, but editing job identity/config
   /// underneath it is disabled until the response is fenced or dismissed.
@@ -33,13 +32,24 @@ function LastRunSummary({ record }: { record: RunRecord }) {
       {/* Filled rather than outlined: at 7px an outlined ring reads as a smudge, and this dot is
           carrying the whole outcome of the last run */}
       <span className={'dot ' + outcomeClass} aria-hidden="true"><Circle size={7} fill="currentColor" strokeWidth={0} /></span>
-      {relTime(record.ts_ms)} · {record.done} items{outcomeSuffix}
+      {formatRelativeTimestamp(record.ts_ms)} · {record.done} items{outcomeSuffix}
     </span>
   );
 }
 
 export function Sidebar(props: SidebarProps) {
-  const { jobs, currentJobId, lastSyncByJobName, busy, reviewing, appVersion, jobsDir, onSelect, onEdit, onNew } = props;
+  const {
+    jobs,
+    currentJobId,
+    latestRunByJobId,
+    busy,
+    reviewing,
+    appVersion,
+    jobsDir,
+    onSelect,
+    onEdit,
+    onNew,
+  } = props;
   const jobButtons = useRef<Array<HTMLButtonElement | null>>([]);
 
   const moveFocus = (from: number, direction: -1 | 1 | 'first' | 'last') => {
@@ -60,7 +70,7 @@ export function Sidebar(props: SidebarProps) {
           <div
             key={job.job_id}
             className={'job' + (active ? ' active' : '')}
-            title={`${job.source}\n→ ${job.target}` + (job.remote ? '\n(applied by a peer syncdash over ssh)' : '')}
+            title={`${job.source}\n→ ${job.targets[0] ?? '(missing target)'}` + (job.is_peer_job ? '\n(applied by a peer SyncDash over SSH)' : '')}
           >
             <button
               ref={(element) => { jobButtons.current[index] = element; }}
@@ -85,12 +95,12 @@ export function Sidebar(props: SidebarProps) {
             >
               <span className="jrow1">
                 <span className="name">{job.name}</span>
-                {job.remote && <span className="rbadge">ssh</span>}
+                {job.is_peer_job && <span className="rbadge">peer</span>}
                 {job.rigor && job.rigor !== 'standard' && <span className="rigor">{job.rigor}</span>}
                 <span className={'mode ' + job.mode}>{job.mode}</span>
               </span>
-              {lastSyncByJobName[job.name]
-                && <LastRunSummary record={lastSyncByJobName[job.name]} />}
+              {latestRunByJobId[job.job_id]
+                && <LastRunSummary record={latestRunByJobId[job.job_id]} />}
             </button>
             <button
               type="button"
@@ -104,7 +114,7 @@ export function Sidebar(props: SidebarProps) {
           );
         })}
       </nav>
-      <button className="btn newjob" disabled={busy || reviewing} onClick={onNew}><Plus size={13} /> New job</button>
+      <button type="button" className="btn newjob" disabled={busy || reviewing} onClick={onNew}><Plus size={13} /> New job</button>
       <div className="sidefoot">
         <span>{appVersion}</span>
         <span title={jobsDir}>{jobsDir}</span>

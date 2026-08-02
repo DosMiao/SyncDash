@@ -1,6 +1,7 @@
 import { humanSize } from '../../core/format';
 import {
   operationReviewCanSubmit,
+  operationReviewExpired,
   operationReviewFailed,
   type ApprovalChoices,
   type OperationReviewState,
@@ -28,17 +29,20 @@ interface ConfirmSheetProps {
   onChoices: (choices: ApprovalChoices) => void;
   onCancel: () => void;
   onConfirm: () => void;
+  onReviewAgain: () => void;
 }
 
 export function ConfirmSheet(props: ConfirmSheetProps) {
-  const { job, totals, reviewState, choices, onChoices, onCancel, onConfirm } = props;
+  const { job, totals, reviewState, choices, onChoices, onCancel, onConfirm, onReviewAgain } = props;
   const blocked = reviewState.review?.status === 'blocked';
   const canApply = operationReviewCanSubmit(reviewState, choices);
   const actionLabel = reviewState.phase === 'reviewing'
     ? 'Reviewing…'
     : reviewState.phase === 'approving'
       ? 'Authorizing…'
-      : operationReviewFailed(reviewState)
+      : operationReviewExpired(reviewState)
+        ? 'Review Again'
+        : operationReviewFailed(reviewState)
         ? 'Review failed'
         : 'Apply';
 
@@ -52,7 +56,12 @@ export function ConfirmSheet(props: ConfirmSheetProps) {
           <button type="button" className="btn" onClick={onCancel}>
             {blocked || operationReviewFailed(reviewState) ? 'Close' : 'Cancel (Esc)'}
           </button>
-          <button type="button" className="btn accent" disabled={!canApply} onClick={onConfirm}>
+          <button
+            type="button"
+            className="btn accent"
+            disabled={!canApply && !operationReviewExpired(reviewState)}
+            onClick={operationReviewExpired(reviewState) ? onReviewAgain : onConfirm}
+          >
             {actionLabel}
           </button>
         </>
@@ -75,8 +84,8 @@ export function ConfirmSheet(props: ConfirmSheetProps) {
       )}
       {totals.checkedOutsideScope > 0 && (
         <div className="mrow warn">
-          <span>Checked but Outside Run Scope</span><b>{totals.checkedOutsideScope}</b>
-          <span className="dim">Only checked rows in scope are applied</span>
+          <span>Included but Outside Run Scope</span><b>{totals.checkedOutsideScope}</b>
+          <span className="dim">Only included differences in scope are applied</span>
         </div>
       )}
       <OperationReviewDetails state={reviewState} choices={choices} onChoices={onChoices} />

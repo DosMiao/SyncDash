@@ -1,16 +1,3 @@
-// The UI's parts: menus, context menus, confirmations, modal sheets, empty states.
-//
-// Native controls such as menus, confirmation dialogs and tooltips have no equivalent inside a
-// WebView, and this file supplies one of each. The rules:
-//   · Menus close on an outside click or Esc, and clamp themselves back inside the viewport
-//   · A confirmation spells out what pressing the button will do, rather than merely asking
-//     "are you sure" — window.confirm can do neither, and looks nothing like the rest of the app
-//   · One modal shell, three widths. Three hand-rolled overlays was how the old #modal /
-//     #editmodal / #setmodal ended up with three different z-indexes and two different paddings
-//
-// Every export here has a caller. Anything that stops having one gets deleted rather than kept
-// "for symmetry with GitDash" — an unused primitive is a decision nobody made.
-
 import {
   createContext,
   useContext,
@@ -23,14 +10,13 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
-import { Check, ChevronRight } from 'lucide-react';
+import { Check } from 'lucide-react';
+import { InteractionLayerScope, useInteractionLayer } from '../hooks/useInteractionLayer';
 import { menuFocusIndex, type MenuNavigationKey } from './a11y';
 
-// ----------------------------------------------------------------- menus --
+interface MenuContextValue { close: () => void }
 
-interface MenuContext { close: () => void }
-
-const MenuCtx = createContext<MenuContext>({ close: () => {} });
+const MenuContext = createContext<MenuContextValue>({ close: () => {} });
 
 export function MenuItem({ children, onClick, disabled, checked, title, danger }: {
   children: ReactNode;
@@ -40,7 +26,7 @@ export function MenuItem({ children, onClick, disabled, checked, title, danger }
   title?: string;
   danger?: boolean;
 }) {
-  const { close } = useContext(MenuCtx);
+  const { close } = useContext(MenuContext);
   return (
     <button
       type="button"
@@ -62,176 +48,62 @@ export function MenuDivider() {
   return <div className="menu-divider" role="separator" />;
 }
 
-export function MenuSection({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <div className="menu-section-group" role="group" aria-label={title}>
-      <div className="menu-section" aria-hidden="true">{title}</div>
-      {children}
-    </div>
-  );
-}
-
 function directMenuItems(panel: HTMLElement): HTMLElement[] {
   return [...panel.querySelectorAll<HTMLElement>('[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]')]
     .filter((item) => item.closest('[role="menu"]') === panel && !item.matches(':disabled, [aria-disabled="true"]'));
 }
 
-function moveMenuFocus(e: ReactKeyboardEvent<HTMLElement>, panel: HTMLElement): boolean {
-  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return false;
-  const items = directMenuItems(panel);
-  const current = items.indexOf(document.activeElement as HTMLElement);
-  const next = menuFocusIndex(e.key as MenuNavigationKey, current, items.length);
-  if (next === null) return false;
-  e.preventDefault();
-  e.stopPropagation();
-  items[next]?.focus();
+function moveMenuFocus(event: ReactKeyboardEvent<HTMLElement>, panel: HTMLElement): boolean {
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return false;
+  const menuItems = directMenuItems(panel);
+  const currentIndex = menuItems.indexOf(document.activeElement as HTMLElement);
+  const nextIndex = menuFocusIndex(
+    event.key as MenuNavigationKey,
+    currentIndex,
+    menuItems.length,
+  );
+  if (nextIndex === null) return false;
+  event.preventDefault();
+  event.stopPropagation();
+  menuItems[nextIndex]?.focus();
   return true;
 }
 
-/// A submenu. Opens on hover or click, and its contents are a plain layer of MenuItems.
-export function SubMenu({ label, children }: { label: string; children: ReactNode }) {
-  const [open, setOpen] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const trigger = useRef<HTMLButtonElement>(null);
-  const panel = useRef<HTMLDivElement>(null);
-
-  // Asymmetric delays: opening should feel immediate, but closing waits long enough to cross the
-  // diagonal gap between the parent item and the panel without the menu vanishing mid-travel
-  const schedule = (next: boolean) => {
-    if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => setOpen(next), next ? 60 : 160);
-  };
-
-  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
-  useEscape(open, () => { setOpen(false); trigger.current?.focus(); });
-
-  useLayoutEffect(() => {
-    if (!open) return;
-    directMenuItems(panel.current!)[0]?.focus();
-  }, [open]);
-
-  return (
-    <div className="submenu" onMouseEnter={() => schedule(true)} onMouseLeave={() => schedule(false)}>
-      <button
-        ref={trigger}
-        type="button"
-        className="menu-item"
-        role="menuitem"
-        tabIndex={-1}
-        aria-haspopup="menu"
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-        onKeyDown={(e) => {
-          if (e.key !== 'ArrowRight') return;
-          e.preventDefault();
-          e.stopPropagation();
-          setOpen(true);
-        }}
-      >
-        <span className="menu-check" />
-        <span className="menu-label">{label}</span>
-        <ChevronRight size={12} className="menu-arrow" />
-      </button>
-      {open ? (
-        <div
-          ref={panel}
-          className="menu-panel submenu-panel"
-          role="menu"
-          aria-label={label}
-          onKeyDown={(e) => {
-            if (moveMenuFocus(e, e.currentTarget)) return;
-            if (e.key !== 'ArrowLeft') return;
-            e.preventDefault();
-            e.stopPropagation();
-            setOpen(false);
-            trigger.current?.focus();
-          }}
-        >
-          {children}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-/// Clamp a panel of the given size back inside the viewport. 6px so a panel against an edge still
-/// reads as floating rather than welded to the window frame. Exported because every floating layer
-/// needs it and three copies of this arithmetic is how one of them ends up clamping only sideways.
-export function clamp(x: number, y: number, w: number, h: number): { left: number; top: number } {
+/// The 6px inset keeps a clamped floating panel visually separate from the window frame.
+export function clamp(
+  left: number,
+  top: number,
+  width: number,
+  height: number,
+): { left: number; top: number } {
   return {
-    left: Math.max(6, Math.min(x, window.innerWidth - w - 6)),
-    top: Math.max(6, Math.min(y, window.innerHeight - h - 6)),
+    left: Math.max(6, Math.min(left, window.innerWidth - width - 6)),
+    top: Math.max(6, Math.min(top, window.innerHeight - height - 6)),
   };
 }
 
-/**
- * Escape closes the **topmost** dismissible thing and nothing else.
- *
- * Every layer listens on `document`, so without a stack one Escape would close the context menu,
- * the sheet it sits in, and the sheet behind that, all at once — the job editor's delete
- * confirmation is genuinely nested inside the editor, so this is not hypothetical. Registration
- * order is open order, so the last entry is the top layer.
- */
-const escStack: symbol[] = [];
-
-function useEscape(active: boolean, close: () => void) {
-  // Through a ref so the effect's deps stay empty: re-running it on every render would pop and
-  // re-push this layer, and a re-render of the layer *underneath* would then put it on top
-  const latest = useRef(close);
-  latest.current = close;
-
-  useEffect(() => {
-    if (!active) return;
-    const id = Symbol('esc');
-    escStack.push(id);
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape' || escStack[escStack.length - 1] !== id) return;
-      e.stopPropagation();
-      latest.current();
-    };
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('keydown', onKey);
-      const k = escStack.indexOf(id);
-      if (k >= 0) escStack.splice(k, 1);
-    };
-  }, [active]);
-}
-
-/// Close on an outside click or Esc. Shared by Menu and ContextMenu — the two differ only in
-/// what opens them.
-function useDismiss(
+function useOutsidePointerDismissal(
   open: boolean,
   close: () => void,
   inside: React.RefObject<HTMLElement | null>[],
-  escapeClose: () => void = close,
 ) {
-  const latest = useRef(close);
-  latest.current = close;
-
-  useEscape(open, escapeClose);
+  const latestClose = useRef(close);
+  latestClose.current = close;
 
   useEffect(() => {
     if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (inside.some((r) => r.current?.contains(e.target as Node))) return;
-      latest.current();
+    const handleMouseDown = (event: MouseEvent) => {
+      if (inside.some((insideRef) => insideRef.current?.contains(event.target as Node))) return;
+      latestClose.current();
     };
-    document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
+    document.addEventListener('mousedown', handleMouseDown);
+    return () => document.removeEventListener('mousedown', handleMouseDown);
     // `inside` is a fresh array literal each render; the refs inside it are stable, which is what
     // actually matters, so it is deliberately not a dependency
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 }
 
-/**
- * A dropdown menu. `trigger` decides how it looks and `children` are its contents.
- *
- * The panel is fixed-positioned and clamped back inside the viewport after render — a control
- * near the bottom-right of the window that simply expanded down and to the right would end up
- * half off-screen.
- */
 export function Menu({ trigger, children, disabled, title, align = 'start', className }: {
   trigger: ReactNode;
   children: ReactNode;
@@ -241,27 +113,53 @@ export function Menu({ trigger, children, disabled, title, align = 'start', clas
   className?: string;
 }) {
   const [open, setOpen] = useState(false);
-  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   const anchor = useRef<HTMLButtonElement>(null);
   const panel = useRef<HTMLDivElement>(null);
   const panelId = useId();
+  const { layerId } = useInteractionLayer({
+    active: open,
+    kind: 'menu',
+    rootRef: panel,
+    handlers: {
+      dismiss: () => {
+        setOpen(false);
+        requestAnimationFrame(() => anchor.current?.focus());
+      },
+    },
+  });
 
   useLayoutEffect(() => {
-    if (!open || !anchor.current) return;
-    const rect = anchor.current.getBoundingClientRect();
-    const w = panel.current?.offsetWidth ?? 200;
-    const h = panel.current?.offsetHeight ?? 200;
-    setPos(clamp(align === 'end' ? rect.right - w : rect.left, rect.bottom + 4, w, h));
+    const anchorElement = anchor.current;
+    const panelElement = panel.current;
+    if (!open || !anchorElement || !panelElement) return;
+    const updatePosition = () => {
+      const rect = anchorElement.getBoundingClientRect();
+      const width = panelElement.offsetWidth || 200;
+      const height = panelElement.offsetHeight || 200;
+      const position = clamp(
+        align === 'end' ? rect.right - width : rect.left,
+        rect.bottom + 4,
+        width,
+        height,
+      );
+      panelElement.style.setProperty('--floating-panel-top', `${position.top}px`);
+      panelElement.style.setProperty('--floating-panel-left', `${position.left}px`);
+    };
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    document.addEventListener('scroll', updatePosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      document.removeEventListener('scroll', updatePosition, true);
+      panelElement.style.removeProperty('--floating-panel-top');
+      panelElement.style.removeProperty('--floating-panel-left');
+    };
   }, [open, align]);
 
-  useDismiss(
+  useOutsidePointerDismissal(
     open,
     () => setOpen(false),
     [panel, anchor],
-    () => {
-      setOpen(false);
-      requestAnimationFrame(() => anchor.current?.focus());
-    },
   );
 
   useLayoutEffect(() => {
@@ -285,22 +183,23 @@ export function Menu({ trigger, children, disabled, title, align = 'start', clas
         {trigger}
       </button>
       {open ? (
-        <MenuCtx.Provider value={{ close: () => setOpen(false) }}>
-          {/* Off-screen until the first layout has measured the panel — otherwise it paints once
-              at the unclamped position and visibly jumps */}
-          <div
-            id={panelId}
-            ref={panel}
-            className="menu-panel"
-            role="dialog"
-            aria-label={title ?? 'More information'}
-            tabIndex={-1}
-            style={{ top: pos?.top ?? -9999, left: pos?.left ?? -9999 }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            {children}
-          </div>
-        </MenuCtx.Provider>
+        <InteractionLayerScope layerId={layerId}>
+          <MenuContext.Provider value={{ close: () => setOpen(false) }}>
+            {/* Off-screen until the first layout has measured the panel — otherwise it paints once
+                at the unclamped position and visibly jumps */}
+            <div
+              id={panelId}
+              ref={panel}
+              className="menu-panel"
+              role="dialog"
+              aria-label={title ?? 'More information'}
+              tabIndex={-1}
+              onClick={(e) => e.stopPropagation()}
+            >
+              {children}
+            </div>
+          </MenuContext.Provider>
+        </InteractionLayerScope>
       ) : null}
     </>
   );
@@ -308,8 +207,6 @@ export function Menu({ trigger, children, disabled, title, align = 'start', clas
 
 export interface ContextPoint { x: number; y: number }
 
-/// A context menu opened at a point. Its contents are the same layer of MenuItems a Menu takes,
-/// so a row's right-click menu and a toolbar dropdown cannot drift apart in look or behavior.
 export function ContextMenu({ at, onClose, children }: {
   at: ContextPoint;
   onClose: () => void;
@@ -317,15 +214,30 @@ export function ContextMenu({ at, onClose, children }: {
 }) {
   const panel = useRef<HTMLDivElement>(null);
   const previousFocus = useRef(document.activeElement instanceof HTMLElement ? document.activeElement : null);
-  const [pos, setPos] = useState<{ top: number; left: number }>({ left: at.x, top: at.y });
+  const { layerId } = useInteractionLayer({
+    kind: 'menu',
+    rootRef: panel,
+    handlers: { dismiss: onClose },
+  });
 
   useLayoutEffect(() => {
-    const el = panel.current;
-    if (!el) return;
-    setPos(clamp(at.x, at.y, el.offsetWidth, el.offsetHeight));
-  }, [at]);
+    const panelElement = panel.current;
+    if (!panelElement) return;
+    const updatePosition = () => {
+      const position = clamp(at.x, at.y, panelElement.offsetWidth, panelElement.offsetHeight);
+      panelElement.style.setProperty('--floating-panel-top', `${position.top}px`);
+      panelElement.style.setProperty('--floating-panel-left', `${position.left}px`);
+    };
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      panelElement.style.removeProperty('--floating-panel-top');
+      panelElement.style.removeProperty('--floating-panel-left');
+    };
+  }, [at.x, at.y]);
 
-  useDismiss(true, onClose, [panel]);
+  useOutsidePointerDismissal(true, onClose, [panel]);
 
   useLayoutEffect(() => {
     directMenuItems(panel.current!)[0]?.focus();
@@ -342,23 +254,22 @@ export function ContextMenu({ at, onClose, children }: {
   }, [onClose]);
 
   return (
-    <MenuCtx.Provider value={{ close: onClose }}>
-      <div
-        ref={panel}
-        className="menu-panel"
-        role="menu"
-        aria-label="Row actions"
-        style={pos}
-        onClick={(e) => e.stopPropagation()}
-        onKeyDown={(e) => { moveMenuFocus(e, e.currentTarget); }}
-      >
-        {children}
-      </div>
-    </MenuCtx.Provider>
+    <InteractionLayerScope layerId={layerId}>
+      <MenuContext.Provider value={{ close: onClose }}>
+        <div
+          ref={panel}
+          className="menu-panel"
+          role="menu"
+          aria-label="Row actions"
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => { moveMenuFocus(e, e.currentTarget); }}
+        >
+          {children}
+        </div>
+      </MenuContext.Provider>
+    </InteractionLayerScope>
   );
 }
-
-// ---------------------------------------------------------------- sheets --
 
 const FOCUSABLE = [
   'button:not(:disabled)',
@@ -369,31 +280,11 @@ const FOCUSABLE = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
 
-interface SheetLayer { id: symbol; root: HTMLDivElement }
-
-const sheetStack: SheetLayer[] = [];
-
-function syncSheetStack() {
-  const top = sheetStack[sheetStack.length - 1]?.id;
-  for (const layer of sheetStack) {
-    const hidden = layer.id !== top;
-    layer.root.inert = hidden;
-    if (hidden) layer.root.setAttribute('aria-hidden', 'true');
-    else layer.root.removeAttribute('aria-hidden');
-  }
-}
-
 function focusableIn(panel: HTMLElement): HTMLElement[] {
   return [...panel.querySelectorAll<HTMLElement>(FOCUSABLE)]
     .filter((el) => el.getAttribute('aria-hidden') !== 'true');
 }
 
-/**
- * The modal shell: scrim, panel, title, scrolling body, button row.
- *
- * `width` is the only thing the three callers disagree about — a confirmation is a column of
- * numbers, the settings form is two columns, the job editor is two columns of longer fields.
- */
 export function Sheet({ title, width = 'sm', children, footer, onClose }: {
   title: string;
   width?: 'sm' | 'mid' | 'wide' | 'xl';
@@ -402,20 +293,18 @@ export function Sheet({ title, width = 'sm', children, footer, onClose }: {
   onClose: () => void;
 }) {
   const labelId = useId();
-  const layerId = useRef(Symbol('sheet'));
   const scrim = useRef<HTMLDivElement>(null);
   const panel = useRef<HTMLDivElement>(null);
   const previousFocus = useRef(document.activeElement instanceof HTMLElement ? document.activeElement : null);
-  useEscape(true, onClose);
+  const { layerId, isTopLayer } = useInteractionLayer({
+    kind: 'modal',
+    rootRef: scrim,
+    handlers: { dismiss: onClose },
+  });
 
   useLayoutEffect(() => {
-    const root = scrim.current!;
-    const layer = { id: layerId.current, root };
-    sheetStack.push(layer);
-    syncSheetStack();
-
     const frame = requestAnimationFrame(() => {
-      if (sheetStack[sheetStack.length - 1]?.id !== layer.id) return;
+      if (!isTopLayer()) return;
       const target = panel.current?.querySelector<HTMLElement>('[autofocus]')
         ?? (panel.current ? focusableIn(panel.current)[0] : null)
         ?? panel.current;
@@ -424,18 +313,18 @@ export function Sheet({ title, width = 'sm', children, footer, onClose }: {
 
     return () => {
       cancelAnimationFrame(frame);
-      const index = sheetStack.findIndex((entry) => entry.id === layer.id);
-      if (index >= 0) sheetStack.splice(index, 1);
-      syncSheetStack();
       const previous = previousFocus.current;
       if (previous?.isConnected) requestAnimationFrame(() => previous.focus());
     };
-  }, []);
+  }, [isTopLayer]);
 
   const dialog = (
-    // mousedown, not click: a drag that starts inside the sheet and releases on the scrim would
-    // otherwise close it, which is how a text selection in the body used to dismiss the dialog
-    <div ref={scrim} className="scrim" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+    // mousedown preserves a drag that starts inside the sheet and releases on the scrim.
+    <div
+      ref={scrim}
+      className="scrim"
+      onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}
+    >
       <div
         ref={panel}
         className={'sheet' + (width === 'sm' ? '' : ` sheet-${width}`)}
@@ -445,7 +334,7 @@ export function Sheet({ title, width = 'sm', children, footer, onClose }: {
         tabIndex={-1}
         onMouseDown={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
-          if (e.key !== 'Tab' || sheetStack[sheetStack.length - 1]?.id !== layerId.current) return;
+          if (e.key !== 'Tab' || !isTopLayer()) return;
           const focusable = panel.current ? focusableIn(panel.current) : [];
           if (focusable.length === 0) {
             e.preventDefault();
@@ -470,7 +359,10 @@ export function Sheet({ title, width = 'sm', children, footer, onClose }: {
     </div>
   );
 
-  return createPortal(dialog, document.body);
+  return createPortal(
+    <InteractionLayerScope layerId={layerId}>{dialog}</InteractionLayerScope>,
+    document.body,
+  );
 }
 
 export interface ConfirmAction {
@@ -480,36 +372,31 @@ export interface ConfirmAction {
   disabled?: boolean;
 }
 
-/**
- * A confirmation. The title is a question and the body spells out in full what pressing the
- * button will do.
- *
- * The body renders as pre-wrap: these explanations carry path lists, one per line, and squashing
- * them into a paragraph is the same as not writing them.
- */
 export function ConfirmDialog({ title, message, actions, onCancel }: {
   title: string;
   message: string;
   actions: ConfirmAction[];
   onCancel: () => void;
 }) {
+  const dangerConfirmation = actions.some((action) => action.danger && !action.disabled);
+  const firstEnabledAction = actions.findIndex((action) => !action.disabled);
   return (
     <Sheet
       title={title}
       onClose={onCancel}
       footer={
         <>
-          <button type="button" className="btn" onClick={onCancel}>Cancel (Esc)</button>
-          {actions.map((a) => (
+          <button type="button" className="btn" autoFocus={dangerConfirmation} onClick={onCancel}>Cancel (Esc)</button>
+          {actions.map((action, index) => (
             <button
-              key={a.label}
+              key={action.label}
               type="button"
-              className={'btn ' + (a.danger ? 'danger' : 'accent')}
-              disabled={a.disabled}
-              autoFocus={!a.disabled}
-              onClick={() => { onCancel(); a.onConfirm(); }}
+              className={'btn ' + (action.danger ? 'danger' : 'accent')}
+              disabled={action.disabled}
+              autoFocus={!dangerConfirmation && index === firstEnabledAction}
+              onClick={() => { onCancel(); action.onConfirm(); }}
             >
-              {a.label}
+              {action.label}
             </button>
           ))}
         </>
@@ -519,8 +406,6 @@ export function ConfirmDialog({ title, message, actions, onCancel }: {
     </Sheet>
   );
 }
-
-// --------------------------------------------------------- empty states --
 
 export function Placeholder({ icon, title, description }: {
   icon: ReactNode;

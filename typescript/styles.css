@@ -400,7 +400,7 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
 
 /* At one row per file, borders become thousands of competing rectangles. A glyph and semantic
    color preserve the result type while leaving paths dominant. */
-.act {
+.plan-row-action {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -411,21 +411,20 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
   line-height: var(--lh-tight);
   border-radius: var(--r-xs);   /* only so the hover ring has a shape to follow */
 }
-button.act { width: 100%; padding: 0; border: 0; background: none; text-align: left; }
-/* Fixed slots, always present — see the comment at the render site. */
-.act-dir, .act-mark { width: 12px; flex: none; display: inline-flex; justify-content: center; }
+button.plan-row-action { width: 100%; padding: 0; border: 0; background: none; text-align: left; }
+.plan-row-action-direction, .plan-row-action-result { width: 12px; flex: none; display: inline-flex; justify-content: center; }
 /* The label is the only elastic item, and it ellipsizes rather than widening anything: the column
    width comes from <colgroup> and must not depend on which rows happen to be mounted. */
-.act-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.act.flippable { cursor: pointer; }
+.plan-row-action-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plan-row-action.reversible { cursor: pointer; }
 /* The ring, not a background: tr:hover already paints --bg-3 across the whole row, so a background
    cue on the cell would be invisible exactly when you are pointing at it. */
-.act.flippable:hover { box-shadow: var(--ring); }
+.plan-row-action.reversible:hover { box-shadow: var(--ring); }
 /* "This row's direction was reversed", replacing the pill's dashed border — moved onto the thing it
    is actually about, the direction arrow. outline, not border: it paints outside the box, so it
    cannot change the row height the virtual scroller measures. The row tint below is the primary
    signal; this is the confirmation you look for once the tint has caught your eye. */
-tr.flip .act-dir { outline: 1px dashed currentColor; outline-offset: 1px; border-radius: var(--r-xs); }
+.plan-table tr.reversed .plan-row-action-direction { outline: 1px dashed currentColor; outline-offset: 1px; border-radius: var(--r-xs); }
 
 /* A pill stating a mode or tier. Words, never icons — an icon at this size has to be guessed at. */
 .mode, .rigor, .rbadge {
@@ -581,9 +580,24 @@ tr.flip .act-dir { outline: 1px dashed currentColor; outline-offset: 1px; border
 .prow input[type="text"]:focus { border-color: var(--accent); box-shadow: var(--ring); }
 .prow input.good { border-color: var(--c-green); }
 .prow input.bad { border-color: var(--c-red); }
+.prow input.root-conflicted { border-color: var(--c-orange); box-shadow: 0 0 0 1px var(--c-orange); }
 .prow input.dropon { border-color: var(--accent); background: var(--accent-soft); }
 .prow input:disabled { color: var(--text-3); background: var(--bg-2); }
 .prow .pbtn { padding: 0 8px; }
+
+.root-draft-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 8px;
+  color: var(--c-orange);
+  font-size: var(--fs-sm);
+}
+.root-draft-row strong { color: var(--text-1); font-size: var(--fs-micro); text-transform: uppercase; letter-spacing: 0.6px; }
+.root-edit-actions { display: inline-flex; align-items: center; gap: 4px; }
+.root-edit-actions .root-action { min-height: 24px; padding: 0 7px; font-size: var(--fs-micro); }
+.root-edit-actions .root-action.save { border-color: var(--accent); color: var(--accent); }
+.root-save-error { color: var(--c-red); font-size: var(--fs-sm); }
 
 .pwarn { display: flex; flex-direction: column; gap: 2px; font-size: var(--fs-sm); padding-left: 2px; }
 /* The icon sits on the text's line rather than above it — these are one-line remarks, not headings */
@@ -591,6 +605,20 @@ tr.flip .act-dir { outline: 1px dashed currentColor; outline-offset: 1px; border
 .vwarn { color: var(--c-orange); }
 .vnote { color: var(--text-2); }
 .vok { color: var(--c-green); }
+
+.compare-workspace-notice {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px 16px;
+  min-width: 0; padding: 7px 12px; border-bottom: 1px solid var(--border);
+  background: var(--bg-2); color: var(--text-2); font-size: var(--fs-sm);
+}
+.compare-workspace-notice strong { color: var(--text-1); }
+.compare-workspace-notice.candidate { border-bottom-color: var(--c-orange); }
+.compare-workspace-notice.view-only { border-bottom-color: var(--c-orange); color: var(--c-orange); }
+.compare-workspace-notice-actions { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+
+@media (max-width: 760px) {
+  .compare-workspace-notice { align-items: flex-start; flex-direction: column; }
+}
 
 /* Fixed cap, not a %: inside the path grid a percentage would feed back into the track sizing
    and starve the source input; 300px fits "target 2/3: <root>" and long roots clip with the
@@ -734,27 +762,33 @@ tr.flip .act-dir { outline: 1px dashed currentColor; outline-offset: 1px; border
 .run-scope-folder-current.on { background: var(--accent-soft); color: var(--accent); }
 .run-scope-folder-current strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-scope-folder-list { display: flex; flex-direction: column; gap: 2px; }
-.run-scope-folder { border-radius: var(--r-sm); min-width: 0; }
+.run-scope-folder { position: relative; border-radius: var(--r-sm); min-width: 0; }
 .run-scope-folder:hover, .run-scope-folder:focus-within { background: var(--bg-3); }
 .run-scope-folder.on { background: var(--accent-soft); outline: 1px solid var(--accent); }
 .run-scope-folder-select {
   width: 100%; display: flex; flex-direction: column; align-items: stretch; gap: 1px;
   min-width: 0; padding: 4px 5px 5px; border: 0; border-radius: inherit;
-  background: transparent; color: var(--text-1); text-align: left;
+  background: transparent; color: var(--text-1); text-align: left; cursor: pointer;
 }
+.run-scope-folder-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .run-scope-folder-main { display: flex; align-items: center; gap: 5px; min-width: 0; padding-left: calc(var(--run-scope-depth, 0) * 14px); }
 .run-scope-folder-chevron {
   width: 24px; min-height: 24px; color: var(--text-2); flex: none;
   display: inline-flex; align-items: center; justify-content: center; border-radius: var(--r-sm);
 }
-.run-scope-folder-chevron.expandable { cursor: pointer; }
-.run-scope-folder-chevron.expandable:hover { background: var(--bg); color: var(--text-1); }
+.run-scope-folder-expand {
+  position: absolute; z-index: 1; top: 4px; left: calc(5px + var(--run-scope-depth, 0) * 14px);
+  width: 24px; min-height: 24px; padding: 0; border: 0; border-radius: var(--r-sm);
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; color: var(--text-2); cursor: pointer;
+}
+.run-scope-folder-expand:hover { background: var(--bg); color: var(--text-1); }
 .run-scope-folder-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); }
 .run-scope-folder-count { color: var(--text-2); font-size: var(--fs-micro); font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
 .run-scope-folder-share { display: flex; flex-direction: column; gap: 1px; padding-left: calc(29px + var(--run-scope-depth, 0) * 14px); color: var(--text-2); font-size: var(--fs-micro); }
 .run-scope-folder-bytes { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-scope-folder-bar { display: block; height: 3px; margin: 4px 0 0 calc(29px + var(--run-scope-depth, 0) * 14px); overflow: hidden; border-radius: 2px; background: var(--bg-3); }
-.run-scope-folder-bar > span { display: block; height: 100%; background: var(--accent); }
+.run-scope-folder-bar > span { display: block; width: var(--run-scope-share, 0%); height: 100%; background: var(--accent); }
 .run-scope-empty { margin: 4px 0; color: var(--text-2); font-size: var(--fs-sm); }
 
 @media (max-width: 960px) {
@@ -781,18 +815,20 @@ thead th {
 tbody td { padding: 4px 10px; border-bottom: 1px solid var(--border-subtle); line-height: var(--lh-tight); }
 td { user-select: text; }
 
-/* Zebra striping is applied by JS as .alt using the real row index: under virtual scrolling
+/* Zebra striping is applied by JS using the real row index: under virtual scrolling
    :nth-child counts "which row in the window", so the whole pattern flips on every scroll */
-tbody tr.alt { background: var(--bg-2); }
+.plan-table tbody tr.alternating { background: var(--bg-2); }
 tbody tr:hover { background: var(--bg-3); }
 /* An unticked row recedes by color, never by alpha — the reason column still has to be
    readable to explain why you unticked it */
-tbody tr.off td { color: var(--text-2); }
-tbody tr.off td.c-reason, tbody tr.off td.c-size, tbody tr.off td.c-time { color: var(--text-3); }
-tbody tr.flip td { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.plan-table tbody tr.excluded td { color: var(--text-2); }
+.plan-table tbody tr.excluded td.c-reason, .plan-table tbody tr.excluded td.c-size, .plan-table tbody tr.excluded td.c-time { color: var(--text-3); }
+.plan-table tbody tr.reversed td { background: color-mix(in srgb, var(--accent) 10%, transparent); }
 
-.c-chk { width: 38px; }
-.c-act { width: 124px; }
+.plan-table .c-synchronize { width: 58px; text-align: center; }
+.synchronize-selection-header { display: inline-flex; flex-direction: column; align-items: center; gap: 2px; }
+.synchronize-selection-header > span:first-child { font-size: var(--fs-micro); color: var(--text-2); }
+.plan-table .c-action { width: 124px; }
 /* Shared with the Identical panel, which lays out automatically and does rely on this width. The
    diff table overrides it through <colgroup> under fixed layout, so the number here is that panel's. */
 .c-size { width: 92px; text-align: right; }
@@ -812,69 +848,75 @@ td.c-meta { color: var(--text-2); font-size: var(--fs-sm); font-variant-numeric:
 td.c-time.newer, td.c-size.newer, td.c-meta.newer, td.c-path.newer { color: var(--c-green); }
 td.c-path { max-width: 330px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-th .sortable { display: inline-flex; align-items: center; border: 0; padding: 0; background: none; color: inherit; font: inherit; cursor: pointer; user-select: none; }
-th .sortable:hover { color: var(--text-1); text-decoration: underline; }
-th .sortable.on { color: var(--accent); }
-th .sortable .sortmark { display: inline-flex; vertical-align: middle; margin-left: 2px; }
-tbody tr[tabindex]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.plan-table th .sort-button { display: inline-flex; align-items: center; border: 0; padding: 0; background: none; color: inherit; font: inherit; cursor: pointer; user-select: none; }
+.plan-table th .sort-button:hover { color: var(--text-1); text-decoration: underline; }
+.plan-table th .sort-button.on { color: var(--accent); }
+.plan-table th .sort-button .sort-indicator { display: inline-flex; vertical-align: middle; margin-left: 2px; }
+.plan-table tbody tr[tabindex]:focus-visible,
+.plan-table tbody tr[tabindex]:focus-within { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 /* Hierarchical directory tree. Folder and file rows carry a zero-based --tree-depth; the virtual
    scroller still sees one fixed folder height because indentation is horizontal only. */
-tr.grp { background: var(--bg-2); cursor: pointer; user-select: none; }
-tr.grp:hover { background: var(--bg-3); }
-tr.grp td { padding: 5px 10px; border-top: 1px solid var(--border); font-size: var(--fs-sm); }
-tr.grp .gtree {
+.plan-table tr.folder-group { background: var(--bg-2); cursor: pointer; user-select: none; }
+.plan-table tr.folder-group:hover { background: var(--bg-3); }
+.plan-table tr.folder-group td { padding: 5px 10px; border-top: 1px solid var(--border); font-size: var(--fs-sm); }
+.plan-table tr.folder-group .folder-group-toggle {
   display: flex; align-items: center; width: 100%; min-width: 0;
-  padding: 0 0 0 calc(var(--tree-depth, 0) * 18px);
+  padding: 0 0 0 calc(var(--tree-depth) * 18px);
   border: 0; overflow: hidden; background: none; color: inherit; font: inherit; text-align: left; white-space: nowrap; cursor: pointer;
 }
-tr.grp .gtree:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
-tr.grp .gchev { color: var(--text-2); display: inline-flex; width: 14px; vertical-align: middle; }
-tr.grp .gfolder { color: var(--accent); display: inline-flex; width: 17px; flex: none; }
-tr.grp .gdir { color: var(--accent); font-family: var(--mono); }
-tr.grp .gmeta { color: var(--text-2); margin-left: 10px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-micro); font-variant-numeric: tabular-nums; }
+.plan-table tr.folder-group .folder-group-toggle:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
+.plan-table tr.folder-group .folder-group-chevron { color: var(--text-2); display: inline-flex; width: 14px; vertical-align: middle; }
+.plan-table tr.folder-group .folder-group-icon { color: var(--accent); display: inline-flex; width: 17px; flex: none; }
+.plan-table tr.folder-group .folder-group-name { color: var(--accent); font-family: var(--mono); }
+.plan-table tr.folder-group .folder-group-summary { color: var(--text-2); margin-left: 10px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-micro); font-variant-numeric: tabular-nums; }
 /* A direct file is one step beyond its owning folder. Hooked on the source path column by name:
    :first-of-type would mean the checkbox, and the target-side path may describe a move origin in a
    different directory rather than this tree position. */
-tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
+.plan-table tr.in-folder-group td.c-source-path { padding-left: calc(59px + var(--tree-depth) * 18px); }
 
 /* Virtual scrolling: only the screenful of rows in the viewport is mounted. A bounded canvas owns
    the physical scroll range; the hook projects it onto the complete logical row range. The body
    table stays one screen tall and moves only inside that bounded coordinate space.
    That requires equal row heights and column widths independent of "which rows are mounted".
-   Which columns exist and how wide they are lives in PlanTable.tsx (COLS): both change with the
-   container width, so the component owns them — including min-width, which is the current column
-   set's pinned total plus a floor per path column. Below it the table holds its width and scrolls
-   sideways instead of crushing the paths to nothing, and because the floor moves with the set it is
-   a real constraint in every mode rather than only the narrowest one. */
-.plantable { table-layout: fixed; }
-.vtable-canvas { position: relative; width: 100%; }
-.vtable-head {
+   Which columns exist and how wide they are lives in PlanTable.tsx (COLUMN_DEFINITIONS): both change
+   with the container width, so the component owns them — including min-width, which is the current
+   column set's pinned total plus a floor per path column. Below it the table holds its width and
+   scrolls sideways instead of crushing the paths to nothing, and because the floor moves with the
+   set it is a real constraint in every column layout rather than only the narrowest one. */
+.plan-table { table-layout: fixed; }
+.plan-table-column { width: var(--plan-table-column-width); }
+.plan-table-canvas {
+  position: relative;
+  width: 100%;
+  min-width: var(--plan-table-minimum-width);
+  height: var(--plan-table-canvas-height);
+}
+.plan-table-header {
   position: sticky;
   top: 0;
   z-index: 3;
   background: var(--bg-2);
 }
-.vtable-head thead th { position: static; }
-.vtable-body {
+.plan-table-header thead th { position: static; }
+.plan-table-body {
   position: absolute;
   top: 0;
   left: 0;
   contain: layout paint style;
   will-change: transform;
+  transform: translate3d(0, var(--plan-table-body-top), 0);
 }
 
 /* Row height must stay constant — a wrap in any column throws off the precomputed height and
    rows drift out of place. Under fixed layout, overflow is not clipped automatically and smears
    into the neighbouring column, so every column clips itself. */
-.plantable td.c-reason, .plantable tr.grp td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* The time column too: fmtTime carries the year for older files ("2025-07-26 16:51"), which is
+.plan-table td.c-reason, .plan-table tr.folder-group td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Older timestamps include the year ("2025-07-26 16:51"), which is
    wider than the column sized for the yearless form — unclipped it smears into the neighbour (the
    tooltip has it all) */
-.plantable td.c-time, .plantable td.c-size { overflow: hidden; text-overflow: ellipsis; }
-.plantable thead th { overflow: hidden; text-overflow: ellipsis; }
-
-/* Spacer rows only hold height: no borders, padding, zebra stripes, or hover color */
+.plan-table td.c-time, .plan-table td.c-size { overflow: hidden; text-overflow: ellipsis; }
+.plan-table thead th { overflow: hidden; text-overflow: ellipsis; }
 .placeholder {
   display: flex;
   flex-direction: column;
@@ -927,7 +969,7 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 /* Fixed-width grid so a stage that gains a number does not shove the whole row sideways */
 .cmp-rows .stagerow.cmp2 { display: grid; grid-template-columns: 20px 112px 1fr 52px 136px 184px 92px; align-items: center; gap: 9px; }
 .cmp2 .st-bar { height: 6px; background: var(--bg-3); border-radius: 3px; overflow: hidden; }
-.cmp2 .st-bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.25s linear; }
+.cmp2 .st-bar > i { display: block; height: 100%; width: var(--compare-progress-width, 0%); background: var(--accent); transition: width 0.25s linear; }
 .cmp2.done .st-bar > i { background: var(--c-green); }
 .cmp2 .st-pct { text-align: right; font-variant-numeric: tabular-nums; }
 .cmp2 .st-items, .cmp2 .st-bytes, .cmp2 .st-rate { text-align: right; font-variant-numeric: tabular-nums; color: var(--text-2); font-size: var(--fs-sm); white-space: nowrap; overflow: hidden; }
@@ -964,6 +1006,7 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 .lp-pill:focus-visible { background: var(--bg-3); color: var(--text-1); }
 .lp-pill.lv-warn.on { color: var(--c-orange); border-color: var(--c-orange); background: color-mix(in srgb, var(--c-orange) 14%, transparent); }
 .lp-pill.lv-error.on { color: var(--c-red); border-color: var(--c-red); background: color-mix(in srgb, var(--c-red) 14%, transparent); }
+.log-selection-notice { padding: 5px 10px; color: var(--c-orange); border-bottom: 1px solid var(--border); font-size: var(--fs-sm); }
 
 .lp-body { flex: 1; overflow: auto; font-family: var(--mono); font-size: var(--fs-sm); }
 .lp-row { display: grid; grid-template-columns: 92px 44px 72px 1fr; gap: 8px; padding: 2px 10px; align-items: baseline; font-variant-numeric: tabular-nums; }
@@ -1226,7 +1269,7 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 .set-note { color: var(--text-2); padding: 4px 2px 0; }
 
 .pathrow { display: flex; gap: 5px; align-items: stretch; }
-.pathrow input[type="text"] { flex: 1; min-width: 0; }
+.pathrow input[type="text"], .pathrow textarea { flex: 1; min-width: 0; }
 
 /* Load-time migration notice. Amber rather than red: nothing is wrong, but the engine changed
    the filter's representation on the user's behalf and that has to be said before they read the
@@ -1240,6 +1283,11 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 }
 .ed-notice .edn-mark { color: var(--c-orange); flex: none; display: inline-flex; padding-top: 1px; }
 .ed-notice code { font-family: var(--mono); font-size: var(--fs-micro); color: var(--c-orange); }
+.ed-notice.settings-error {
+  border-color: var(--c-red);
+  background: color-mix(in srgb, var(--c-red) 14%, transparent);
+}
+.ed-notice.settings-error .edn-mark { color: var(--c-red); }
 
 /* Junk presets are a macro over the exclude list, so they sit directly above it. The pattern
    count is on the box because "Developer artifacts" alone does not tell you how much it turns off. */
@@ -1260,7 +1308,8 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 
 /* Positioned by JS through the CSSOM — under a CSP nonce a style="" attribute is blocked */
 .advanced-filters-popover {
-  position: fixed; z-index: 115; width: 400px; max-width: calc(100vw - 12px); max-height: calc(100vh - 12px); padding: 12px 14px;
+  position: fixed; top: var(--advanced-filters-top, -9999px); left: var(--advanced-filters-left, -9999px); z-index: 115;
+  width: 400px; max-width: calc(100vw - 12px); max-height: calc(100vh - 12px); padding: 12px 14px;
   background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--r);
   box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 9px; overflow-y: auto; overscroll-behavior: contain;
 }
@@ -1277,10 +1326,14 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 .advanced-filters-pair input { width: 100%; min-width: 0; }
 .advanced-filters-presets { display: flex; gap: 5px; flex-wrap: wrap; }
 .advanced-filters-stat { font-size: var(--fs-sm); min-height: 18px; color: var(--text-2); }
+.advanced-filters-validation { color: var(--c-red); }
+.advanced-filters-row input[aria-invalid="true"] { border-color: var(--c-red); }
 .advanced-filters-buttons { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; padding-top: 4px; }
 
 .menu-panel {
   position: fixed;
+  top: var(--floating-panel-top, -9999px);
+  left: var(--floating-panel-left, -9999px);
   z-index: 120;
   min-width: 200px;
   max-width: 420px;
@@ -1312,21 +1365,27 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 .menu-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .menu-arrow { color: var(--text-3); flex: none; }
 .menu-divider { height: 1px; margin: 4px 2px; background: var(--border); }
-.menu-section { padding: 6px 8px 3px; font-size: var(--fs-micro); color: var(--text-2); white-space: normal; max-width: 300px; }
-.submenu { position: relative; }
-.submenu-panel { position: absolute; top: -4px; left: 100%; margin-left: 2px; }
 
 .status {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 12px;
   background: var(--bg-2);
   border-top: 1px solid var(--border);
   color: var(--text-2);
   font-size: var(--fs-sm);
   min-height: 30px;
 }
+.status-primary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+}
+.status-notices { display: grid; border-bottom: 1px solid var(--border); }
+.status-notice {
+  display: flex; align-items: center; gap: 10px; min-width: 0; padding: 5px 12px;
+  background: color-mix(in srgb, var(--c-red) 9%, var(--bg-2)); color: var(--c-red);
+}
+.status-notice + .status-notice { border-top: 1px solid var(--border); }
+.status-notice > span:first-child { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .status.err { color: var(--c-red); }
 .status.ok { color: var(--c-green); }
 .statusmsg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; min-width: 0; }
@@ -1387,7 +1446,18 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 
 .errsec { border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--bg-2); max-height: 120px; display: none; flex-direction: column; }
 .errsec.show { display: flex; }
-.errhead { padding: 6px 10px; cursor: pointer; display: flex; gap: 8px; align-items: center; }
+.errhead {
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
 .errhead .cnt-err { color: var(--c-red); font-weight: 600; }
 .errhead .cnt-warn { color: var(--c-orange); }
 .icon-err { color: var(--c-red); flex: none; }
@@ -1411,7 +1481,7 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
 .countdown { display: none; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--c-orange); border-radius: var(--r-sm); background: color-mix(in srgb, var(--c-orange) 14%, transparent); }
 .countdown.show { display: flex; }
 .cdbar { flex: 1; height: 6px; background: var(--bg-3); border-radius: 3px; overflow: hidden; }
-.cdfill { height: 100%; background: var(--c-orange); width: 100%; transition: width 1s linear; }
+.cdfill { height: 100%; background: var(--c-orange); width: var(--countdown-progress-width, 0%); transition: width 1s linear; }
 
 @media (max-width: 560px) {
   .app {
@@ -1509,8 +1579,7 @@ tr.ingrp td.c-path-s { padding-left: calc(59px + var(--tree-depth, 0) * 18px); }
   .advanced-filters-pair { flex-wrap: wrap; }
   .identical-results-head .identical-results-count { margin-left: 0; }
   .identical-results-table { min-width: 600px; }
-  .submenu-panel { top: 100%; right: 0; left: auto; margin: 2px 0 0; }
-  .status { flex-wrap: wrap; gap: 4px 8px; padding: 5px 8px; }
+  .status-primary { flex-wrap: wrap; gap: 4px 8px; padding: 5px 8px; }
   .statusmsg { flex: 1 1 220px; }
   .counts { order: 3; flex: 1 1 100%; margin-left: 0; }
   .zoombox { margin-left: auto; }

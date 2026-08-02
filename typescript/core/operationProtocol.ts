@@ -1,7 +1,7 @@
 import type { AutoScanCompareRequestDto } from './types/generated/AutoScanCompareRequestDto';
 import type { CompareIdentity } from './types/generated/CompareIdentity';
 import type { OperationApprovalDto } from './types/generated/OperationApprovalDto';
-import type { SelectedRowDto } from './types/generated/SelectedRowDto';
+import type { ReviewedRowDecisionDto } from './types/generated/ReviewedRowDecisionDto';
 
 export function startAutoScanArgs(expectedJobId: string, expectedRevision: string, targetIndex: number) {
   return { expectedJobId, expectedRevision, targetIndex };
@@ -27,8 +27,11 @@ export function compareAuthorizationArgs(authorizationToken: string) {
   return { authorizationToken };
 }
 
-export function reviewApplyArgs(compareIdentity: CompareIdentity, selected: SelectedRowDto[]) {
-  return { compareIdentity, selected };
+export function reviewApplyArgs(
+  compareIdentity: CompareIdentity,
+  reviewedRowDecisions: ReviewedRowDecisionDto[],
+) {
+  return { compareIdentity, reviewedRowDecisions };
 }
 
 export function autoScanApplyAuthorizationArgs(generation: number, ticketId: number) {

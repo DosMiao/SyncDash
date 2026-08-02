@@ -2,7 +2,7 @@ import type { AuthorizationDto } from '../../core/types/generated/AuthorizationD
 import type { CompareIdentity } from '../../core/types/generated/CompareIdentity';
 import type { OperationApprovalDto } from '../../core/types/generated/OperationApprovalDto';
 import type { OperationReviewDto } from '../../core/types/generated/OperationReviewDto';
-import type { SelectedRowDto } from '../../core/types/generated/SelectedRowDto';
+import type { ReviewedRowDecisionDto } from '../../core/types/generated/ReviewedRowDecisionDto';
 
 export interface ReviewRequestFence {
   key: string;
@@ -14,6 +14,8 @@ export type ConfirmationReview = Extract<OperationReviewDto, {
 }>;
 type ReviewReadyReview = Exclude<OperationReviewDto, { status: 'direct_authorized' }>;
 type AuthorizedReview = Exclude<OperationReviewDto, { status: 'blocked' }>;
+
+export const OPERATION_REVIEW_EXPIRY_SAFETY_MS = 1_000;
 
 export type OperationReviewState =
   | {
@@ -64,6 +66,13 @@ export type OperationReviewState =
     review: ConfirmationReview;
     authorization: null;
     error: string;
+  }
+  | {
+    phase: 'expired';
+    request: ReviewRequestFence;
+    review: OperationReviewDto;
+    authorization: null;
+    error: string;
   };
 
 export const INITIAL_OPERATION_REVIEW: OperationReviewState = {
@@ -81,6 +90,7 @@ export type OperationReviewAction =
   | { type: 'begin_approval'; request: ReviewRequestFence }
   | { type: 'authorized'; request: ReviewRequestFence; authorization: AuthorizationDto }
   | { type: 'approval_failed'; request: ReviewRequestFence; error: string }
+  | { type: 'expired'; request: ReviewRequestFence; error: string }
   | { type: 'reset' };
 
 function stateOwnsRequest(state: OperationReviewState, request: ReviewRequestFence): boolean {
@@ -102,6 +112,16 @@ export function operationReviewReducer(
     };
   }
   if (!stateOwnsRequest(state, action.request)) return state;
+  if (action.type === 'expired') {
+    if (!state.review) return state;
+    return {
+      phase: 'expired',
+      request: action.request,
+      review: state.review,
+      authorization: null,
+      error: action.error,
+    };
+  }
   switch (action.type) {
     case 'resolved': {
       if (state.phase !== 'reviewing') return state;
@@ -266,9 +286,20 @@ export function directAuthorization(review: OperationReviewDto): AuthorizationDt
 export function operationReviewCanSubmit(
   state: OperationReviewState,
   choices: ApprovalChoices,
+  nowMs = Date.now(),
 ): boolean {
+  const expiresAtMs = operationReviewExpiresAtMs(state);
+  if (expiresAtMs !== null && nowMs + OPERATION_REVIEW_EXPIRY_SAFETY_MS >= expiresAtMs) {
+    return false;
+  }
   if (state.phase === 'authorized') return true;
   return state.phase === 'ready' && reviewAllowsApproval(state.review, choices);
+}
+
+export function operationReviewExpiresAtMs(state: OperationReviewState): number | null {
+  if (state.phase === 'authorized') return state.authorization.expires_at_ms;
+  if (!state.review || !isConfirmationReview(state.review)) return null;
+  return state.review.expires_at_ms;
 }
 
 export function operationReviewPending(state: OperationReviewState): boolean {
@@ -277,6 +308,10 @@ export function operationReviewPending(state: OperationReviewState): boolean {
 
 export function operationReviewFailed(state: OperationReviewState): boolean {
   return state.phase === 'review_failed' || state.phase === 'approval_failed';
+}
+
+export function operationReviewExpired(state: OperationReviewState): boolean {
+  return state.phase === 'expired';
 }
 
 export function ownsOperationReviewRequest(
@@ -293,12 +328,16 @@ export function compareReviewKey(jobId: string, configRevision: string, targetIn
   return JSON.stringify(['compare', jobId, configRevision, targetIndex]);
 }
 
-export function normalizedSelectedDecisions(selected: SelectedRowDto[]): Array<[number, boolean]> {
-  const decisions = selected.map((row) => [row.index, row.flipped] as [number, boolean]);
+export function normalizedReviewedRowDecisions(
+  reviewedRowDecisions: ReviewedRowDecisionDto[],
+): Array<[number, boolean]> {
+  const decisions = reviewedRowDecisions.map(
+    (decision) => [decision.index, decision.direction_reversed] as [number, boolean],
+  );
   decisions.sort((left, right) => left[0] - right[0]);
   for (let index = 1; index < decisions.length; index += 1) {
     if (decisions[index - 1]![0] === decisions[index]![0]) {
-      throw new Error(`duplicate selected row index ${decisions[index]![0]}`);
+      throw new Error(`duplicate reviewed row index ${decisions[index]![0]}`);
     }
   }
   return decisions;
@@ -309,10 +348,12 @@ export function applyReviewKey(
   jobId: string,
   configRevision: string,
   targetIndex: number,
-  selected: SelectedRowDto[],
+  verificationEpoch: number,
+  reviewedRowDecisions: ReviewedRowDecisionDto[],
 ): string {
   return JSON.stringify([
     'apply',
+    compareIdentity.result_id,
     compareIdentity.compare_run_id,
     compareIdentity.job_id,
     compareIdentity.config_revision,
@@ -320,6 +361,7 @@ export function applyReviewKey(
     jobId,
     configRevision,
     targetIndex,
-    normalizedSelectedDecisions(selected),
+    verificationEpoch,
+    normalizedReviewedRowDecisions(reviewedRowDecisions),
   ]);
 }

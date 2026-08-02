@@ -1,19 +1,22 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { clamp } from './ui';
-import { parseScopeMasks } from '../../core/runScope';
+import { useInteractionLayer } from '../hooks/useInteractionLayer';
+import {
+  advancedFiltersEqual,
+  createAdvancedFilterDraft,
+  createEmptyAdvancedFilterDraft,
+  validateAdvancedFilterDraft,
+} from '../state/compareWorkspaceFilters';
 import type { AdvancedScopeFilter } from '../../core/runScope';
 
 interface AdvancedFiltersPopoverProps {
   anchor: DOMRect;
-  advancedFilter: AdvancedScopeFilter;
-  maskDraft: string;
+  appliedFilter: AdvancedScopeFilter;
   inScopeCount: number;
   differenceCount: number;
-  onAdvancedFilterChange: (next: AdvancedScopeFilter) => void;
-  onMaskDraftChange: (next: string) => void;
-  onClear: () => void;
-  onWriteMasksToJob: (masks: string[]) => void;
-  onClose: () => void;
+  onApplyFilter: (filter: AdvancedScopeFilter) => void;
+  onWriteValidatedFilterMasksToJobExclude: (filter: AdvancedScopeFilter) => void;
+  onDismiss: () => void;
 }
 
 const MODIFIED_RANGES: [string, number | null][] = [
@@ -26,38 +29,64 @@ const MODIFIED_RANGES: [string, number | null][] = [
 export function AdvancedFiltersPopover(props: AdvancedFiltersPopoverProps) {
   const {
     anchor,
-    advancedFilter,
-    maskDraft,
+    appliedFilter,
     inScopeCount,
     differenceCount,
-    onAdvancedFilterChange,
-    onMaskDraftChange,
-    onClear,
-    onWriteMasksToJob,
-    onClose,
+    onApplyFilter,
+    onWriteValidatedFilterMasksToJobExclude,
+    onDismiss,
   } = props;
   const popoverRef = useRef<HTMLDivElement>(null);
   const previousFocus = useRef(document.activeElement instanceof HTMLElement ? document.activeElement : null);
-  const [position, setPosition] = useState({ left: anchor.left, top: anchor.bottom + 4 });
-  const latestOnClose = useRef(onClose);
-  latestOnClose.current = onClose;
+  const [draft, setDraft] = useState(() => createAdvancedFilterDraft(appliedFilter));
+  const validationMessageId = useId();
+  const appliedScopeStatusId = useId();
+  const latestOnDismiss = useRef(onDismiss);
+  latestOnDismiss.current = onDismiss;
 
-  const close = (restoreFocus: boolean) => {
-    latestOnClose.current();
+  const restorePreviousFocus = useCallback(() => {
     const previous = previousFocus.current;
-    if (restoreFocus && previous?.isConnected) requestAnimationFrame(() => previous.focus());
-  };
+    if (previous?.isConnected) requestAnimationFrame(() => previous.focus());
+  }, []);
+
+  const dismiss = useCallback((restoreFocus: boolean) => {
+    latestOnDismiss.current();
+    if (restoreFocus) restorePreviousFocus();
+  }, [restorePreviousFocus]);
+
+  useInteractionLayer({
+    kind: 'popover',
+    rootRef: popoverRef,
+    handlers: { dismiss: () => dismiss(true) },
+  });
 
   // Both axes are clamped because opening this tall panel near the bottom of a short window would
   // otherwise leave its action buttons unreachable.
   useLayoutEffect(() => {
     const element = popoverRef.current;
-    setPosition(clamp(
-      anchor.left,
-      anchor.bottom + 4,
-      element?.offsetWidth ?? 400,
-      element?.offsetHeight ?? 380,
-    ));
+    if (!element) return;
+    const updatePosition = () => {
+      const position = clamp(
+        anchor.left,
+        anchor.bottom + 4,
+        element.offsetWidth || 400,
+        element.offsetHeight || 380,
+      );
+      element.style.setProperty('--advanced-filters-left', `${position.left}px`);
+      element.style.setProperty('--advanced-filters-top', `${position.top}px`);
+    };
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    document.addEventListener('scroll', updatePosition, true);
+    const resizeObserver = new ResizeObserver(updatePosition);
+    resizeObserver.observe(element);
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener('resize', updatePosition);
+      document.removeEventListener('scroll', updatePosition, true);
+      element.style.removeProperty('--advanced-filters-left');
+      element.style.removeProperty('--advanced-filters-top');
+    };
   }, [anchor]);
 
   useLayoutEffect(() => {
@@ -65,29 +94,21 @@ export function AdvancedFiltersPopover(props: AdvancedFiltersPopoverProps) {
   }, []);
 
   useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      event.stopPropagation();
-      close(true);
-    };
     const onDocumentClick = (event: MouseEvent) => {
       if (popoverRef.current?.contains(event.target as Node)) return;
-      close(false);
+      dismiss(false);
     };
-    document.addEventListener('keydown', onKey);
     document.addEventListener('click', onDocumentClick);
     return () => {
-      document.removeEventListener('keydown', onKey);
       document.removeEventListener('click', onDocumentClick);
     };
-  }, []);
+  }, [dismiss]);
 
-  const parseNonNegativeNumber = (value: string) => {
-    if (value.trim() === '') return null;
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? Math.max(0, parsed) : null;
-  };
+  const validation = validateAdvancedFilterDraft(draft);
+  const validationMessage = validation.status === 'invalid' ? validation.messages.join(' ') : null;
+  const validatedFilter = validation.status === 'valid' ? validation.filter : null;
+  const draftMatchesAppliedFilter = validatedFilter !== null
+    && advancedFiltersEqual(validatedFilter, appliedFilter);
   const outsideScopeCount = differenceCount - inScopeCount;
 
   return (
@@ -96,18 +117,25 @@ export function AdvancedFiltersPopover(props: AdvancedFiltersPopoverProps) {
       ref={popoverRef}
       role="dialog"
       aria-label="Advanced Filters"
-      style={position}
+      aria-describedby={validationMessage
+        ? `${validationMessageId} ${appliedScopeStatusId}`
+        : appliedScopeStatusId}
       onClick={(event) => event.stopPropagation()}
     >
-      <div className="advanced-filters-head">Advanced Filters<span className="hint">No Rescan</span></div>
+      <div className="advanced-filters-head">
+        Advanced Filters<span className="hint">Current Result · No Rescan</span>
+      </div>
       <label className="advanced-filters-row wide">
         <span>Name Masks (FFS Syntax, One per Line)</span>
         <textarea
           className="mono"
           spellCheck={false}
           placeholder={'*/*.log\n/Course/0 Mizzou Courses/.git/'}
-          value={maskDraft}
-          onChange={(event) => onMaskDraftChange(event.target.value)}
+          value={draft.nameMasksText}
+          onChange={(event) => setDraft((current) => ({
+            ...current,
+            nameMasksText: event.target.value,
+          }))}
         />
       </label>
       <label className="advanced-filters-row">
@@ -116,20 +144,28 @@ export function AdvancedFiltersPopover(props: AdvancedFiltersPopoverProps) {
           <input
             type="number" step="any" min="0" placeholder="≥"
             aria-label="Minimum Size in Mebibytes"
-            value={advancedFilter.minimumMiB ?? ''}
-            onChange={(event) => onAdvancedFilterChange({
-              ...advancedFilter,
-              minimumMiB: parseNonNegativeNumber(event.target.value),
-            })}
+            aria-invalid={Boolean(validation.status === 'invalid' && validation.errors.minimumSizeMiBText)}
+            aria-describedby={validation.status === 'invalid' && validation.errors.minimumSizeMiBText
+              ? validationMessageId
+              : undefined}
+            value={draft.minimumSizeMiBText}
+            onChange={(event) => setDraft((current) => ({
+              ...current,
+              minimumSizeMiBText: event.target.value,
+            }))}
           />
           <input
             type="number" step="any" min="0" placeholder="≤"
             aria-label="Maximum Size in Mebibytes"
-            value={advancedFilter.maximumMiB ?? ''}
-            onChange={(event) => onAdvancedFilterChange({
-              ...advancedFilter,
-              maximumMiB: parseNonNegativeNumber(event.target.value),
-            })}
+            aria-invalid={Boolean(validation.status === 'invalid' && validation.errors.maximumSizeMiBText)}
+            aria-describedby={validation.status === 'invalid' && validation.errors.maximumSizeMiBText
+              ? validationMessageId
+              : undefined}
+            value={draft.maximumSizeMiBText}
+            onChange={(event) => setDraft((current) => ({
+              ...current,
+              maximumSizeMiBText: event.target.value,
+            }))}
           />
         </span>
       </label>
@@ -140,33 +176,73 @@ export function AdvancedFiltersPopover(props: AdvancedFiltersPopoverProps) {
             <button
               type="button"
               key={label}
-              className={'chip' + (advancedFilter.modifiedWithinDays === days ? ' on' : '')}
-              aria-pressed={advancedFilter.modifiedWithinDays === days}
-              onClick={() => onAdvancedFilterChange({ ...advancedFilter, modifiedWithinDays: days })}
+              className={'chip' + (draft.modifiedWithinDays === days ? ' on' : '')}
+              aria-pressed={draft.modifiedWithinDays === days}
+              onClick={() => setDraft((current) => ({ ...current, modifiedWithinDays: days }))}
             >{label}</button>
           ))}
         </div>
       </div>
-      <div className="advanced-filters-stat dim" role="status" aria-live="polite">
+      {validationMessage && (
+        <div
+          className="advanced-filters-stat advanced-filters-validation"
+          id={validationMessageId}
+          role="status"
+          aria-live="polite"
+        >
+          Draft not applied: {validationMessage}
+        </div>
+      )}
+      <div
+        className="advanced-filters-stat dim"
+        id={appliedScopeStatusId}
+        role="status"
+        aria-live="polite"
+      >
         {outsideScopeCount > 0
-          ? `${outsideScopeCount} differences outside the run scope — they will not run (${inScopeCount} / ${differenceCount} in scope)`
-          : `All ${differenceCount} differences are in the run scope`}
+          ? `Applied scope: ${inScopeCount} of ${differenceCount}; ${outsideScopeCount} will not run`
+          : `Applied scope: all ${differenceCount} differences`}
+        {draftMatchesAppliedFilter
+          ? '. Draft matches the applied filter.'
+          : '. Draft changes are not active.'}
       </div>
       <div className="advanced-filters-buttons">
-        <button type="button" className="btn" onClick={onClear}>Clear</button>
         <button
           type="button"
           className="btn"
-          title="Write the masks above into the job's exclude — from the next Compare on they prune during the scan"
-          onClick={() => onWriteMasksToJob(parseScopeMasks(maskDraft))}
+          title="Reset this draft. The applied run scope does not change until you apply it."
+          onClick={() => setDraft(createEmptyAdvancedFilterDraft())}
+        >Clear Draft</button>
+        <button
+          type="button"
+          className="btn"
+          title={validationMessage
+            ?? (validatedFilter?.masks.length === 0
+              ? 'Enter at least one valid name mask first.'
+              : "Apply this draft and add its name masks to the job's exclude list.")}
+          disabled={!validatedFilter || validatedFilter.masks.length === 0}
+          onClick={() => {
+            if (!validatedFilter) return;
+            onWriteValidatedFilterMasksToJobExclude(validatedFilter);
+            dismiss(true);
+          }}
         >Write to Job Exclude</button>
         <button
           type="button"
+          className="btn"
+          onClick={() => dismiss(true)}
+        >Cancel</button>
+        <button
+          type="button"
           className="btn accent"
+          title={validationMessage ?? 'Apply this draft to the current result.'}
+          disabled={!validatedFilter}
           onClick={() => {
-            close(true);
+            if (!validatedFilter) return;
+            onApplyFilter(validatedFilter);
+            dismiss(true);
           }}
-        >Done</button>
+        >Apply</button>
       </div>
     </div>
   );

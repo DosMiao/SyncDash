@@ -1,23 +1,39 @@
-import { useEffect, useId, useRef } from 'react';
-import { fmtTime, humanSize } from '../../core/format';
+import { useId, useRef } from 'react';
+import { formatFileTimestamp, humanSize } from '../../core/format';
 import { MTIME_SLACK_MS } from '../../core/plan';
-import type { CompareOwner } from '../../core/types/generated/CompareOwner';
-import { useIdenticalResults } from '../hooks/useIdenticalResults';
+import { useInteractionLayer } from '../hooks/useInteractionLayer';
+import type { IdenticalWorkspace } from '../state/compareWorkspaceModel';
 
-export function IdenticalResultsPanel({ owner }: { owner: CompareOwner }) {
-  const { searchDraft, setSearchDraft, rows, total, error, loading, loadMore } = useIdenticalResults(owner);
+interface IdenticalResultsPanelProps {
+  workspace: IdenticalWorkspace;
+  onSearchDraftChange: (draft: string) => void;
+  onLoadMore: () => void;
+  onRetry: () => void;
+}
+
+export function IdenticalResultsPanel(props: IdenticalResultsPanelProps) {
+  const { workspace, onSearchDraftChange, onLoadMore, onRetry } = props;
+  const pages = workspace.pages;
+  const rows = pages.status === 'ready'
+    || pages.status === 'loading_more'
+    || pages.status === 'load_more_failed'
+    ? pages.rows
+    : [];
+  const total = pages.status === 'ready'
+    || pages.status === 'loading_more'
+    || pages.status === 'load_more_failed'
+    ? pages.total
+    : 0;
+  const loading = pages.status === 'loading_initial' || pages.status === 'loading_more';
+  const error = pages.status === 'initial_failed' || pages.status === 'load_more_failed'
+    ? pages.error
+    : '';
   const searchRef = useRef<HTMLInputElement>(null);
   const titleId = useId();
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
-        event.preventDefault();
-        searchRef.current?.focus();
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  useInteractionLayer({
+    kind: 'workspace',
+    handlers: { find: () => searchRef.current?.focus() },
+  });
 
   return (
     <section className="identical-results-panel" aria-labelledby={titleId} aria-busy={loading}>
@@ -32,8 +48,8 @@ export function IdenticalResultsPanel({ owner }: { owner: CompareOwner }) {
           type="search"
           aria-label="Filter Identical File Paths"
           placeholder="Filter paths…"
-          value={searchDraft}
-          onChange={(event) => setSearchDraft(event.target.value)}
+          value={workspace.searchDraft}
+          onChange={(event) => onSearchDraftChange(event.target.value)}
         />
         <span className="identical-results-count dim" aria-live="polite">
           {error ? '' : `${rows.length} / ${total.toLocaleString()}`}
@@ -55,7 +71,7 @@ export function IdenticalResultsPanel({ owner }: { owner: CompareOwner }) {
           {!loading && !error && rows.length === 0 && (
             <tr>
               <td colSpan={4} className="dim">
-                {searchDraft.trim() ? 'No identical files match this filter.' : 'This comparison found no identical files.'}
+                {workspace.appliedSearch ? 'No identical files match this filter.' : 'This comparison found no identical files.'}
               </td>
             </tr>
           )}
@@ -65,21 +81,24 @@ export function IdenticalResultsPanel({ owner }: { owner: CompareOwner }) {
               <tr key={row.path}>
                 <td className="mono c-path" title={row.path}>{row.path}</td>
                 <td className="c-size mono">{humanSize(row.size)}</td>
-                <td className="c-meta mono">{fmtTime(row.source_mtime_ms)}</td>
+                <td className="c-meta mono">{formatFileTimestamp(row.source_mtime_ms)}</td>
                 <td
                   className={'c-meta mono' + (timestampDrift ? ' drift' : '')}
                   title={timestampDrift ? 'Target timestamp differs from the source by more than 2 seconds' : undefined}
                 >
                   {timestampDrift && <span className="sr-only">Timestamp differs beyond tolerance. </span>}
-                  {fmtTime(row.target_mtime_ms)}
+                  {formatFileTimestamp(row.target_mtime_ms)}
                 </td>
               </tr>
             );
           })}
         </tbody>
       </table>
+      {pages.status === 'initial_failed' && (
+        <button type="button" className="btn identical-results-more" onClick={onRetry}>Retry</button>
+      )}
       {rows.length < total && (
-        <button type="button" className="btn identical-results-more" disabled={loading} onClick={() => void loadMore()}>
+        <button type="button" className="btn identical-results-more" disabled={loading} onClick={onLoadMore}>
           {loading ? 'Loading…' : 'Load More'}
         </button>
       )}

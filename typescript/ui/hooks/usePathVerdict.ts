@@ -1,31 +1,57 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { endpointInputState } from '../../core/endpoint-readiness';
 import { inspectPaths } from '../../core/ipc';
-import type { PathInfo } from '../../core/types/generated/PathInfo';
 import type { PathVerdict } from '../../core/types/generated/PathVerdict';
 
-/// Path health check (debounced): does it exist, is it a directory, are the two roots identical/nested.
-/// Getting a root wrong is too costly to discover only at Compare time. The main path row and the job
-/// editor share this one hook — both verdicts must say the same thing about the same pair of roots.
-export function usePathVerdict(source: string, target: string, enabled = true): PathVerdict | null {
-  const [verdict, setVerdict] = useState<PathVerdict | null>(null);
+export type PathInspectionState =
+  | { status: 'inactive' }
+  | { status: 'debouncing'; requestId: number }
+  | { status: 'checking'; requestId: number }
+  | { status: 'ready'; requestId: number; verdict: PathVerdict }
+  | { status: 'failed'; requestId: number; error: string };
+
+export function usePathVerdict(source: string, target: string, enabled = true): PathInspectionState {
+  const requestSequence = useRef(0);
+  const [inspection, setInspection] = useState<PathInspectionState>({ status: 'inactive' });
 
   useEffect(() => {
-    if (!enabled || (!source && !target)) { setVerdict(null); return; }
-    setVerdict(null);
-    let live = true;
-    const t = setTimeout(() => {
+    if (!enabled || (!source && !target)) {
+      setInspection({ status: 'inactive' });
+      return;
+    }
+    const requestId = requestSequence.current + 1;
+    if (!Number.isSafeInteger(requestId)) {
+      setInspection({ status: 'failed', requestId: requestSequence.current, error: 'Path inspection request IDs are exhausted' });
+      return;
+    }
+    requestSequence.current = requestId;
+    setInspection({ status: 'debouncing', requestId });
+    let active = true;
+    const timer = setTimeout(() => {
+      if (!active || requestSequence.current !== requestId) return;
+      setInspection({ status: 'checking', requestId });
       inspectPaths(source, target)
-        .then((v) => { if (live) setVerdict(v); })
-        .catch(() => { if (live) setVerdict(null); });
+        .then((verdict) => {
+          if (active && requestSequence.current === requestId) {
+            setInspection({ status: 'ready', requestId, verdict });
+          }
+        })
+        .catch((error) => {
+          if (active && requestSequence.current === requestId) {
+            setInspection({ status: 'failed', requestId, error: String(error) });
+          }
+        });
     }, 300);
-    return () => { live = false; clearTimeout(t); };
+    return () => { active = false; clearTimeout(timer); };
   }, [source, target, enabled]);
 
-  return verdict;
+  return inspection;
 }
 
-/// '' | 'good' | 'bad' for a root input, from the verdict for that side
-export function pathState(info: PathInfo | undefined, value: string): string {
-  return endpointInputState(info, value);
+export function pathState(
+  inspection: PathInspectionState,
+  field: 'source' | 'target',
+  value: string,
+): string {
+  return endpointInputState(inspection.status === 'ready' ? inspection.verdict[field] : undefined, value);
 }

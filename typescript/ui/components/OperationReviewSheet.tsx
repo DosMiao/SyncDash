@@ -4,6 +4,7 @@ import {
   directAuthorization,
   isConfirmationReview,
   operationReviewCanSubmit,
+  operationReviewExpired,
   operationReviewFailed,
   type ApprovalChoices,
   type ConfirmationReview,
@@ -45,6 +46,11 @@ export function OperationReviewDetails({
 
   return (
     <>
+      {state.phase === 'expired' && (
+        <div className="review-status danger" role="alert">
+          {state.error}
+        </div>
+      )}
       {review.status === 'direct_authorized' && (
         directAuthorization(review)
           ? <div className="review-status ok" role="status">All required checks passed. This exact operation is authorized.</div>
@@ -56,7 +62,7 @@ export function OperationReviewDetails({
       {isConfirmationReview(review) && (
         <div className="review-expiry">
           Approval request expires at {new Date(review.expires_at_ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.
-          If it expires, close this sheet and review again.
+          The controls disable automatically before that deadline.
         </div>
       )}
       {blockers.length > 0 && (
@@ -105,7 +111,7 @@ export function OperationReviewDetails({
           onChoices={onChoices}
         />
       )}
-      {state.error && (
+      {state.error && state.phase !== 'expired' && (
         <div className="review-status danger" role="alert">
           Authorization failed: {state.error}. Close this sheet and run the safety review again.
         </div>
@@ -185,12 +191,14 @@ export function CompareReviewSheet({
   onChoices,
   onCancel,
   onApprove,
+  onReviewAgain,
 }: {
   state: OperationReviewState;
   choices: ApprovalChoices;
   onChoices: (choices: ApprovalChoices) => void;
   onCancel: () => void;
   onApprove: () => void;
+  onReviewAgain: () => void;
 }) {
   const review = state.review;
   const blocked = review?.status === 'blocked';
@@ -208,7 +216,11 @@ export function CompareReviewSheet({
           <button type="button" className="btn" onClick={onCancel}>
             {blocked || operationReviewFailed(state) ? 'Close' : 'Cancel (Esc)'}
           </button>
-          {!blocked && !operationReviewFailed(state) && (
+          {operationReviewExpired(state) ? (
+            <button type="button" className="btn accent" onClick={onReviewAgain}>
+              Review Again
+            </button>
+          ) : !blocked && !operationReviewFailed(state) && (
             <button
               type="button"
               className="btn accent"

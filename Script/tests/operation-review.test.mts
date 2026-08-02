@@ -9,7 +9,7 @@ import {
   INITIAL_OPERATION_REVIEW,
   normalizeApprovalChoices,
   operationApprovalFromChoices,
-  normalizedSelectedDecisions,
+  normalizedReviewedRowDecisions,
   operationReviewCanSubmit,
   operationReviewReducer,
   ownsOperationReviewRequest,
@@ -19,8 +19,10 @@ import {
 } from '../../typescript/ui/state/operationReview.ts';
 import type { CompareIdentity } from '../../typescript/core/types/generated/CompareIdentity.ts';
 import type { OperationReviewDto } from '../../typescript/core/types/generated/OperationReviewDto.ts';
+import { buildReviewedRowDecisions } from '../../typescript/core/plan.ts';
 
 const compareIdentity: CompareIdentity = {
+  result_id: '33333333333333333333333333333333',
   compare_run_id: 71,
   job_id: 'job-id',
   config_revision: 'revision-3',
@@ -132,12 +134,50 @@ test('approval is gated by each exact acknowledgement and blocked reviews never 
   const request = { key: 'apply', requestId: 1 };
   let state = operationReviewReducer(INITIAL_OPERATION_REVIEW, { type: 'begin', request });
   state = operationReviewReducer(state, { type: 'resolved', request, review: requested });
-  assert.equal(operationReviewCanSubmit(state, allRequired), true);
+  assert.equal(operationReviewCanSubmit(state, allRequired, 0), true);
   state = operationReviewReducer(state, { type: 'begin_approval', request });
-  assert.equal(operationReviewCanSubmit(state, allRequired), false);
+  assert.equal(operationReviewCanSubmit(state, allRequired, 0), false);
   state = operationReviewReducer(state, { type: 'approval_failed', request, error: 'expired' });
   assert.equal(state.phase, 'approval_failed');
-  assert.equal(operationReviewCanSubmit(state, allRequired), false);
+  assert.equal(operationReviewCanSubmit(state, allRequired, 0), false);
+});
+
+test('challenge and authorization deadlines are executable state, not display text', () => {
+  const request = { key: 'apply', requestId: 4 };
+  const choices: ApprovalChoices = {
+    ...EMPTY_APPROVAL_CHOICES,
+    acknowledgeHealth: true,
+    acceptCapabilities: true,
+  };
+  let state = operationReviewReducer(INITIAL_OPERATION_REVIEW, { type: 'begin', request });
+  state = operationReviewReducer(state, {
+    type: 'resolved', request, review: applyConfirmation({ expires_at_ms: 10_000 }),
+  });
+  assert.equal(operationReviewCanSubmit(state, choices, 8_999), true);
+  assert.equal(operationReviewCanSubmit(state, choices, 9_000), false);
+  state = operationReviewReducer(state, {
+    type: 'expired', request, error: 'review again',
+  });
+  assert.equal(state.phase, 'expired');
+  assert.equal(operationReviewCanSubmit(state, choices, 0), false);
+
+  const stale = operationReviewReducer(state, {
+    type: 'expired', request: { ...request, requestId: 5 }, error: 'stale',
+  });
+  assert.equal(stale, state);
+
+  let authorized = operationReviewReducer(INITIAL_OPERATION_REVIEW, { type: 'begin', request });
+  authorized = operationReviewReducer(authorized, {
+    type: 'resolved', request, review: applyConfirmation(),
+  });
+  authorized = operationReviewReducer(authorized, { type: 'begin_approval', request });
+  authorized = operationReviewReducer(authorized, {
+    type: 'authorized',
+    request,
+    authorization: { authorization_token: 'token', expires_at_ms: 20_000 },
+  });
+  assert.equal(operationReviewCanSubmit(authorized, choices, 18_999), true);
+  assert.equal(operationReviewCanSubmit(authorized, choices, 19_000), false);
 });
 
 test('direct authorization accepts only its tagged variant and rejects capability blockers', () => {
@@ -190,20 +230,25 @@ test('approval payload variants cannot contain fields from another operation', (
   });
 });
 
-test('keys fence result identity, job revision, target, and selected decisions', () => {
-  const selected = [{ index: 8, flipped: true }, { index: 2, flipped: false }];
-  const base = applyReviewKey(compareIdentity, 'job-id', 'revision-3', 1, selected);
-  assert.equal(base, applyReviewKey(compareIdentity, 'job-id', 'revision-3', 1, [...selected].reverse()));
-  assert.notEqual(base, applyReviewKey({ ...compareIdentity, compare_run_id: 72 }, 'job-id', 'revision-3', 1, selected));
-  assert.notEqual(base, applyReviewKey({ ...compareIdentity, job_id: 'replacement-id' }, 'job-id', 'revision-3', 1, selected));
-  assert.notEqual(base, applyReviewKey({ ...compareIdentity, config_revision: 'revision-4' }, 'job-id', 'revision-3', 1, selected));
-  assert.notEqual(base, applyReviewKey({ ...compareIdentity, target_index: 0 }, 'job-id', 'revision-3', 1, selected));
-  assert.notEqual(base, applyReviewKey(compareIdentity, 'replacement-id', 'revision-3', 1, selected));
-  assert.notEqual(base, applyReviewKey(compareIdentity, 'job-id', 'revision-4', 1, selected));
-  assert.notEqual(base, applyReviewKey(compareIdentity, 'job-id', 'revision-3', 0, selected));
-  assert.notEqual(base, applyReviewKey(compareIdentity, 'job-id', 'revision-3', 1, [
-    { index: 8, flipped: true },
-    { index: 2, flipped: true },
+test('keys fence result identity, job revision, target, and reviewed row decisions', () => {
+  const reviewedRowDecisions = [
+    { index: 8, direction_reversed: true },
+    { index: 2, direction_reversed: false },
+  ];
+  const base = applyReviewKey(compareIdentity, 'job-id', 'revision-3', 1, 8, reviewedRowDecisions);
+  assert.equal(base, applyReviewKey(compareIdentity, 'job-id', 'revision-3', 1, 8, [...reviewedRowDecisions].reverse()));
+  assert.notEqual(base, applyReviewKey({ ...compareIdentity, result_id: '55555555555555555555555555555555' }, 'job-id', 'revision-3', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey({ ...compareIdentity, compare_run_id: 72 }, 'job-id', 'revision-3', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey({ ...compareIdentity, job_id: 'replacement-id' }, 'job-id', 'revision-3', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey({ ...compareIdentity, config_revision: 'revision-4' }, 'job-id', 'revision-3', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey({ ...compareIdentity, target_index: 0 }, 'job-id', 'revision-3', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey(compareIdentity, 'replacement-id', 'revision-3', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey(compareIdentity, 'job-id', 'revision-4', 1, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey(compareIdentity, 'job-id', 'revision-3', 0, 8, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey(compareIdentity, 'job-id', 'revision-3', 1, 9, reviewedRowDecisions));
+  assert.notEqual(base, applyReviewKey(compareIdentity, 'job-id', 'revision-3', 1, 8, [
+    { index: 8, direction_reversed: true },
+    { index: 2, direction_reversed: true },
   ]));
 
   const compare = compareReviewKey('job-id', 'revision-3', 1);
@@ -211,12 +256,28 @@ test('keys fence result identity, job revision, target, and selected decisions',
   assert.notEqual(compare, compareReviewKey('job-id', 'revision-4', 1));
 });
 
-test('selected-decision normalization is non-mutating and rejects duplicate indices', () => {
-  const selected = [{ index: 9, flipped: true }, { index: 1, flipped: false }];
-  assert.deepEqual(normalizedSelectedDecisions(selected), [[1, false], [9, true]]);
-  assert.deepEqual(selected, [{ index: 9, flipped: true }, { index: 1, flipped: false }]);
+test('reviewed-row-decision normalization is non-mutating and rejects duplicate indices', () => {
+  const reviewedRowDecisions = [
+    { index: 9, direction_reversed: true },
+    { index: 1, direction_reversed: false },
+  ];
+  assert.deepEqual(normalizedReviewedRowDecisions(reviewedRowDecisions), [[1, false], [9, true]]);
+  assert.deepEqual(reviewedRowDecisions, [
+    { index: 9, direction_reversed: true },
+    { index: 1, direction_reversed: false },
+  ]);
   assert.throws(
-    () => normalizedSelectedDecisions([{ index: 4, flipped: false }, { index: 4, flipped: true }]),
-    /duplicate selected row index 4/,
+    () => normalizedReviewedRowDecisions([
+      { index: 4, direction_reversed: false },
+      { index: 4, direction_reversed: true },
+    ]),
+    /duplicate reviewed row index 4/,
   );
+});
+
+test('reviewed row decisions carry only plan identity and effective direction', () => {
+  assert.deepEqual(buildReviewedRowDecisions([3, 1], [false, true, false, true]), [
+    { index: 3, direction_reversed: true },
+    { index: 1, direction_reversed: true },
+  ]);
 });

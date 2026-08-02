@@ -30,10 +30,10 @@ function plan(ops: PlanOperation[]): PlanDto {
   };
 }
 
-function layoutOf(result: PlanDto, flipped: boolean[] = [], sort: Sort | null = null): PlanLayout {
+function layoutOf(result: PlanDto, reversedRows: boolean[] = [], sort: Sort | null = null): PlanLayout {
   return buildLayout({
     plan: result,
-    flipped,
+    reversedRows,
     inScopeIndices: result.ops.map((_, index) => index),
     grouped: true,
     sort,
@@ -248,7 +248,7 @@ test('folder intervals aggregate descendants without copying them into every anc
   );
 });
 
-test('action sorting can reorder flipped subtrees without changing folder membership', () => {
+test('action sorting can reorder reversedRows subtrees without changing folder membership', () => {
   const result = plan([
     operation('alpha/deep/copy.bin', { action: 'copy', size: 10 }),
     operation('beta/deep/delete.bin', { action: 'delete', size: 20 }),

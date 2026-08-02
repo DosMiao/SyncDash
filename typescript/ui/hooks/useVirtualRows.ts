@@ -1,30 +1,28 @@
-import { useEffect, useLayoutEffect, useMemo, useState } from 'react';
-import { projectVirtualGeometry } from './virtualGeometry';
+import { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { projectLogicalScrollTop, projectVirtualGeometry } from './virtualGeometry';
 import type { RefObject } from 'react';
 import type { RowSpec } from '../../core/grouping';
 
-// Virtual scrolling for the diff table body.
-//
-// One diff row = <tr> + up to 9 <td> + checkbox + action cell. Thousands of those in a live <table> cost
-// seconds just to build and to recompute column widths — and a result-type facet, a search keystroke,
-// or folding one directory redoes all of it. So we mount only the viewport's rows inside a bounded
-// scroll canvas: render cost and browser-facing geometry both stay finite.
-//
-// Row heights are measured from the live DOM rather than hard-coded. The measurement runs when a row
-// layout is mounted or replaced, so CSS changes do not silently make the logical offsets drift.
-//
-// core/grouping.ts decides what the lines are; this hook only decides which of them are on screen.
+// Row offsets stay in the logical result space while virtualGeometry projects them onto a bounded
+// browser scroll canvas. Live DOM measurements keep that mapping aligned with the active row layout.
+const OVERSCAN_ROWS = 8;
 
-const OVERSCAN = 8; // extra rows above and below the viewport so fast scrolling never shows blanks
-
-/// Binary search: the last row whose top is ≤ y
-function rowAt(rowTop: Float64Array, n: number, y: number): number {
-  let lo = 0, hi = n - 1;
-  while (lo < hi) {
-    const mid = (lo + hi + 1) >> 1;
-    if (rowTop[mid] <= y) lo = mid; else hi = mid - 1;
+function rowIndexAtOffset(
+  rowOffsets: Float64Array,
+  rowCount: number,
+  logicalOffset: number,
+): number {
+  let lowerBound = 0;
+  let upperBound = rowCount - 1;
+  while (lowerBound < upperBound) {
+    const midpoint = (lowerBound + upperBound + 1) >> 1;
+    if (rowOffsets[midpoint] <= logicalOffset) {
+      lowerBound = midpoint;
+    } else {
+      upperBound = midpoint - 1;
+    }
   }
-  return lo;
+  return lowerBound;
 }
 
 export interface VirtualWindow {
@@ -36,97 +34,198 @@ export interface VirtualWindow {
   canvasHeight: number;
 }
 
-/// `wrap` is the scroll container, which the table does not own — it is handed down from whoever
-/// rendered it. Passed as the element rather than a ref: a ref object's identity never changes, so
-/// an effect depending on it would not re-run when `.current` goes from null to the real node, and
-/// on mount it is always null (a child's effects run before an ancestor host ref attaches).
-export function useVirtualRows(
+export interface ResultViewport {
+  logicalTop: number;
+  scrollLeft: number;
+}
+
+/// The scroll element is passed directly because a ref object's stable identity cannot signal when
+/// its current element is attached or replaced.
+export function useVirtualRows<OwnerKey extends string>(
   rowPlan: RowSpec[],
   wrap: HTMLElement | null,
   theadRef: RefObject<HTMLElement | null>,
   bodyRef: RefObject<HTMLElement | null>,
+  ownerKey: OwnerKey,
+  viewport: ResultViewport,
+  onViewportChange: (ownerKey: OwnerKey, viewport: ResultViewport) => void,
 ): VirtualWindow {
-  const [metrics, setMetrics] = useState({ row: 34, grp: 36, head: 0 });
-  const [view, setView] = useState({ top: 0, height: 600 });
+  const [measuredHeights, setMeasuredHeights] = useState({
+    operationRow: 34,
+    groupRow: 36,
+    header: 0,
+  });
+  const [physicalViewport, setPhysicalViewport] = useState({ scrollTop: 0, height: 600 });
+  const activeOwnerKey = useRef(ownerKey);
+  useLayoutEffect(() => {
+    activeOwnerKey.current = ownerKey;
+  }, [ownerKey]);
 
-  // Prefix sums: rowTop[k] = top offset of row k, rowTop[n] = total height
-  const rowTop = useMemo(() => {
-    const n = rowPlan.length;
-    const arr = new Float64Array(n + 1);
-    let y = 0;
-    for (let k = 0; k < n; k++) {
-      arr[k] = y;
-      y += typeof rowPlan[k] === 'number' ? metrics.row : metrics.grp;
+  const rowOffsets = useMemo(() => {
+    const rowCount = rowPlan.length;
+    const offsets = new Float64Array(rowCount + 1);
+    let nextOffset = 0;
+    for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+      offsets[rowIndex] = nextOffset;
+      nextOffset += typeof rowPlan[rowIndex] === 'number'
+        ? measuredHeights.operationRow
+        : measuredHeights.groupRow;
     }
-    arr[n] = y;
-    return arr;
-  }, [rowPlan, metrics.row, metrics.grp]);
+    offsets[rowCount] = nextOffset;
+    return offsets;
+  }, [measuredHeights.groupRow, measuredHeights.operationRow, rowPlan]);
+  const liveGeometry = useRef({
+    logicalBodyHeight: rowOffsets[rowPlan.length],
+    headHeight: measuredHeights.header,
+  });
+  useLayoutEffect(() => {
+    liveGeometry.current = {
+      logicalBodyHeight: rowOffsets[rowPlan.length],
+      headHeight: measuredHeights.header,
+    };
+  }, [measuredHeights.header, rowOffsets, rowPlan.length]);
 
-  // A ResizeObserver rather than a window resize listener: the table also changes height when the log
-  // panel opens or the compare panel closes, and neither of those is a window resize.
-  useEffect(() => {
-    const el = wrap;
-    if (!el) return;
-    let raf: number | null = null;
+  // Panel layout changes resize the scroll element without resizing the window.
+  useLayoutEffect(() => {
+    const scrollContainer = wrap;
+    if (!scrollContainer) return;
+    let animationFrameId: number | null = null;
+    let pendingViewport: ResultViewport | null = null;
+    let pendingPhysicalViewport: { scrollTop: number; height: number } | null = null;
     const onScroll = () => {
-      if (raf !== null) return;
-      raf = requestAnimationFrame(() => {
-        raf = null;
-        const top = el.scrollTop;
-        setView((v) => (v.top === top ? v : { ...v, top }));
+      if (activeOwnerKey.current !== ownerKey) return;
+      const scrollTop = scrollContainer.scrollTop;
+      const viewportHeight = scrollContainer.clientHeight;
+      pendingPhysicalViewport = { scrollTop, height: viewportHeight };
+      const geometryInput = liveGeometry.current;
+      const projectedGeometry = projectVirtualGeometry({
+        logicalBodyHeight: geometryInput.logicalBodyHeight,
+        headHeight: geometryInput.headHeight,
+        viewportHeight,
+        physicalScrollTop: scrollTop,
+      });
+      pendingViewport = {
+        logicalTop: projectedGeometry.logicalScrollTop,
+        scrollLeft: scrollContainer.scrollLeft,
+      };
+      if (animationFrameId !== null) return;
+      animationFrameId = requestAnimationFrame(() => {
+        animationFrameId = null;
+        if (activeOwnerKey.current !== ownerKey
+          || pendingViewport === null
+          || pendingPhysicalViewport === null) return;
+        const nextPhysicalViewport = pendingPhysicalViewport;
+        setPhysicalViewport((current) => (
+          current.scrollTop === nextPhysicalViewport.scrollTop
+            && current.height === nextPhysicalViewport.height
+            ? current
+            : nextPhysicalViewport
+        ));
+        onViewportChange(ownerKey, pendingViewport);
+        pendingViewport = null;
+        pendingPhysicalViewport = null;
       });
     };
-    const ro = new ResizeObserver(() => {
-      const height = el.clientHeight;
-      setView((v) => (v.height === height ? v : { ...v, height }));
+    const resizeObserver = new ResizeObserver(() => {
+      const height = scrollContainer.clientHeight;
+      setPhysicalViewport((current) => (
+        current.height === height ? current : { ...current, height }
+      ));
     });
-    el.addEventListener('scroll', onScroll, { passive: true });
-    ro.observe(el);
-    setView({ top: el.scrollTop, height: el.clientHeight });
+    scrollContainer.addEventListener('scroll', onScroll, { passive: true });
+    resizeObserver.observe(scrollContainer);
+    setPhysicalViewport({
+      scrollTop: scrollContainer.scrollTop,
+      height: scrollContainer.clientHeight,
+    });
     return () => {
-      el.removeEventListener('scroll', onScroll);
-      ro.disconnect();
-      if (raf !== null) cancelAnimationFrame(raf);
+      scrollContainer.removeEventListener('scroll', onScroll);
+      resizeObserver.disconnect();
+      if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
+      if (pendingViewport !== null) onViewportChange(ownerKey, pendingViewport);
     };
-  }, [wrap]);
+  }, [onViewportChange, ownerKey, wrap]);
 
-  // Measure once for each row layout. This effect deliberately does not run after its own metrics
-  // update: React 19 can keep a layout-effect state update in the current commit lane, so merely
-  // returning the old state from the updater is not enough to prevent a nested-update loop (#185).
-  // Zooming the webview does not change CSS-pixel offsetHeight, while every operation that can change
-  // which row shapes exist replaces rowPlan and triggers a fresh measurement.
+  useLayoutEffect(() => {
+    if (!wrap) return;
+    const viewportHeight = wrap.clientHeight;
+    const projectedScrollTop = projectLogicalScrollTop({
+      logicalBodyHeight: rowOffsets[rowPlan.length],
+      headHeight: measuredHeights.header,
+      viewportHeight,
+      logicalScrollTop: viewport.logicalTop,
+    });
+    if (Math.abs(wrap.scrollTop - projectedScrollTop) > 0.5) wrap.scrollTop = projectedScrollTop;
+    if (Math.abs(wrap.scrollLeft - viewport.scrollLeft) > 0.5) wrap.scrollLeft = viewport.scrollLeft;
+    setPhysicalViewport((current) => (
+      current.scrollTop === projectedScrollTop && current.height === viewportHeight
+        ? current
+        : { scrollTop: projectedScrollTop, height: viewportHeight }
+    ));
+  }, [
+    measuredHeights.header,
+    ownerKey,
+    rowOffsets,
+    rowPlan.length,
+    viewport.logicalTop,
+    viewport.scrollLeft,
+    wrap,
+  ]);
+
+  // Depending on measuredHeights would let this layout-effect state update trigger itself.
   useLayoutEffect(() => {
     const body = bodyRef.current;
     if (!body) return;
-    const r = body.querySelector('tr:not(.vspacer):not(.grp)') as HTMLElement | null;
-    const g = body.querySelector('tr.grp') as HTMLElement | null;
-    const head = theadRef.current?.offsetHeight ?? 0;
-    setMetrics((m) => {
-      const row = r?.offsetHeight || m.row;
-      const grp = g?.offsetHeight || m.grp;
-      if (Math.abs(row - m.row) < 0.5 && Math.abs(grp - m.grp) < 0.5 && Math.abs(head - m.head) < 0.5) return m;
-      return { row, grp, head };
+    const operationRowElement = body.querySelector('tr:not(.vspacer):not(.grp)') as HTMLElement | null;
+    const groupRowElement = body.querySelector('tr.grp') as HTMLElement | null;
+    const headerHeight = theadRef.current?.offsetHeight ?? 0;
+    setMeasuredHeights((current) => {
+      const operationRow = operationRowElement?.offsetHeight || current.operationRow;
+      const groupRow = groupRowElement?.offsetHeight || current.groupRow;
+      if (Math.abs(operationRow - current.operationRow) < 0.5
+        && Math.abs(groupRow - current.groupRow) < 0.5
+        && Math.abs(headerHeight - current.header) < 0.5) return current;
+      return { operationRow, groupRow, header: headerHeight };
     });
   }, [rowPlan]);
 
-  const n = rowPlan.length;
-  if (n === 0) return { from: 0, to: 0, bodyTop: metrics.head, canvasHeight: metrics.head };
+  const rowCount = rowPlan.length;
+  if (rowCount === 0) {
+    return {
+      from: 0,
+      to: 0,
+      bodyTop: measuredHeights.header,
+      canvasHeight: measuredHeights.header,
+    };
+  }
 
   const geometry = projectVirtualGeometry({
-    logicalBodyHeight: rowTop[n],
-    headHeight: metrics.head,
-    viewportHeight: view.height,
-    scrollTop: view.top,
+    logicalBodyHeight: rowOffsets[rowCount],
+    headHeight: measuredHeights.header,
+    viewportHeight: physicalViewport.height,
+    physicalScrollTop: physicalViewport.scrollTop,
   });
-  const top = geometry.logicalBodyTop;
-  const from = Math.max(0, rowAt(rowTop, n, top) - OVERSCAN);
-  const to = Math.min(n, rowAt(rowTop, n, top + view.height) + 1 + OVERSCAN);
+  const logicalViewportTop = geometry.logicalBodyTop;
+  const from = Math.max(
+    0,
+    rowIndexAtOffset(rowOffsets, rowCount, logicalViewportTop) - OVERSCAN_ROWS,
+  );
+  const to = Math.min(
+    rowCount,
+    rowIndexAtOffset(
+      rowOffsets,
+      rowCount,
+      logicalViewportTop + physicalViewport.height,
+    ) + 1 + OVERSCAN_ROWS,
+  );
 
-  // Align the selected logical row with its projected physical viewport position. When the list is
-  // shorter than the cap, physicalScroll === logicalScroll and this reduces to `head + rowTop[from]`.
-  // On a huge list the table still moves only within the bounded canvas.
+  // Align the selected logical row with its projected physical viewport position. Below the canvas
+  // cap this reduces to `header + rowOffsets[from]`; above it, bodyTop stays in physical coordinates.
   const bodyTop = Math.round(
-    geometry.physicalScroll + metrics.head + rowTop[from] - geometry.logicalScroll,
+    geometry.physicalScrollTop
+      + measuredHeights.header
+      + rowOffsets[from]
+      - geometry.logicalScrollTop,
   );
   return { from, to, bodyTop, canvasHeight: geometry.canvasHeight };
 }
