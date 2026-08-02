@@ -1,6 +1,7 @@
 import { useCallback } from 'react';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
-import * as ipc from '#core/infrastructure/tauri/commands/main.ts';
+import * as applyIpc from '#core/infrastructure/tauri/commands/apply.ts';
+import * as operationsIpc from '#core/infrastructure/tauri/commands/operations.ts';
 import type { ApplyAvailability } from '#core/application/apply/applyAvailability.ts';
 import type { CompareWorkspace } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import {
@@ -127,7 +128,7 @@ export function useApplyExecutionController({
     dispatchApplyReview({ type: 'begin', request });
     setConfirmOpen(true);
     try {
-      const review = await ipc.reviewApply(plan.owner.identity, reviewedRowDecisions);
+      const review = await operationsIpc.reviewApply(plan.owner.identity, reviewedRowDecisions);
       if (!ownsOperationReviewRequest(applyReviewRequestRef.current, request, currentReviewKeyRef.current)) return;
       if (review.status === 'compare_confirmation_required') {
         dispatchApplyReview({
@@ -205,7 +206,7 @@ export function useApplyExecutionController({
         dispatchApplyReview({ type: 'begin_approval', request });
         setStatus('Authorizing this exact apply operation…');
         try {
-          authorization = await ipc.approveOperation(
+          authorization = await operationsIpc.approveOperation(
             review.challenge_id,
             operationApprovalFromChoices(review, choices),
           );
@@ -226,10 +227,10 @@ export function useApplyExecutionController({
       setStatus(`Synchronizing '${applyingJob.name}' (${executionDecisions.length} items)...`);
       // The command returns only after the new window has installed its run-progress listener.
       // Starting apply any earlier loses the phase start/totals on a freshly opened window.
-      launchId = await ipc.openProgressWindow();
+      launchId = await applyIpc.openProgressWindow();
       resetSafetyUi();
       executionStarted = true;
-      const applyResult = await ipc.applyJob(authorization.authorization_token, launchId);
+      const applyResult = await applyIpc.applyJob(authorization.authorization_token, launchId);
       setStatus(
         applyResult.cancelled
           ? `Stopped: cancelled after ${applyResult.done} run — re-checking...`
@@ -255,7 +256,7 @@ export function useApplyExecutionController({
       requestResultRestore(applyingJob, selectedTargetIndex, selectedCompareWorkspace, false);
     } finally {
       if (launchId !== null) {
-        void ipc.cancelProgressLaunch(launchId).catch((error) => {
+        void applyIpc.cancelProgressLaunch(launchId).catch((error) => {
           setStatus(`Could not release progress launch ${launchId}: ${error}`, 'err');
         });
       }

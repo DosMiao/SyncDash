@@ -1,6 +1,6 @@
 import { useCallback } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
-import * as ipc from '#core/infrastructure/tauri/commands/main.ts';
+import * as compareIpc from '#core/infrastructure/tauri/commands/compare.ts';
 import type { CompareWorkspace } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import type { CompareWorkspaceAction } from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
 import { owningFolderOf } from '#core/domain/compare/folders.ts';
@@ -131,7 +131,7 @@ export function useResultTableActions({
           label: 'Show in File Manager · Source',
           disabled: !sourceAbsolutePath,
           run: () => {
-            ipc.revealCompareRow(plan.owner.identity, index, 'source', reversedRows[index] === true)
+            compareIpc.revealCompareRow(plan.owner.identity, index, 'source', reversedRows[index] === true)
               .catch((error) => setStatus(`Could not reveal the source item: ${error}`, 'err'));
           },
         },
@@ -139,7 +139,7 @@ export function useResultTableActions({
           label: 'Show in File Manager · Target',
           disabled: !targetAbsolutePath,
           run: () => {
-            ipc.revealCompareRow(plan.owner.identity, index, 'target', reversedRows[index] === true)
+            compareIpc.revealCompareRow(plan.owner.identity, index, 'target', reversedRows[index] === true)
               .catch((error) => setStatus(`Could not reveal the target item: ${error}`, 'err'));
           },
         },

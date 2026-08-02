@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
-import * as ipc from '#core/infrastructure/tauri/commands/main.ts';
+import * as compareIpc from '#core/infrastructure/tauri/commands/compare.ts';
 import type { CompareResultKey, CompareWorkspace } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import type { PlanLayout } from '#core/domain/compare/grouping.ts';
 import type { PlanDto } from '#core/domain/compare/plan.ts';
@@ -60,13 +60,13 @@ export function useCsvExport({
     exportInFlight.current = resultKey;
     setPending(true);
     try {
-      const result = await ipc.exportCompareCsv(compareIdentity, rowPresentation);
+      const result = await compareIpc.exportCompareCsv(compareIdentity, rowPresentation);
       if (result.status === 'cancelled') return;
       const scopeSuffix = selectedWorkspaceKeyRef.current === resultKey ? '' : ` from ${scopeLabel}`;
       offerStatusAction(
         `Exported ${result.row_count} rows${scopeSuffix} to ${result.display_path}`,
         'Open containing folder',
-        () => ipc.revealCsvExport(result.receipt_id),
+        () => compareIpc.revealCsvExport(result.receipt_id),
       );
     } catch (error) {
       setStatus(`Export failed for ${scopeLabel}: ${error}`, 'err');

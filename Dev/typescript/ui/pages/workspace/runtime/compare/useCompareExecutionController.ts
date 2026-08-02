@@ -1,6 +1,8 @@
+import { exactWorkspaceLookupProblem, scopeWorkspaceLookupProblem } from '#core/application/compare-workspace/repository/lookup.ts';
 import { useCallback } from 'react';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
-import * as ipc from '#core/infrastructure/tauri/commands/main.ts';
+import * as compareIpc from '#core/infrastructure/tauri/commands/compare.ts';
+import * as operationsIpc from '#core/infrastructure/tauri/commands/operations.ts';
 import { monitorOwnsAutoScanTicket } from '#core/application/autoscan/autoscan.ts';
 import type { AutoScanTicket } from '#core/application/autoscan/autoscan.ts';
 import {
@@ -10,8 +12,6 @@ import {
 } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import type { CompareWorkspacePreferences } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import {
-  exactWorkspaceLookupProblem,
-  scopeWorkspaceLookupProblem,
 } from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
 import type { CompareWorkspaceAction } from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
 import {
@@ -178,7 +178,7 @@ export function useCompareExecutionController(options: CompareExecutionControlle
     };
     if (!retained) {
       dispatchCompareWorkspace({ type: 'scope_restore_started', scope, requestId });
-      void ipc.restoreCompare(job.job_id, targetIndex, job.config_revision).then((lookup) => {
+      void compareIpc.restoreCompare(job.job_id, targetIndex, job.config_revision).then((lookup) => {
         dispatchCompareWorkspace({
           type: 'scope_restore_completed',
           scopeKey,
@@ -217,7 +217,7 @@ export function useCompareExecutionController(options: CompareExecutionControlle
     }
     dispatchCompareWorkspace({ type: 'scope_touched', scope });
     dispatchCompareWorkspace({ type: 'workspace_lookup_started', workspace: retained, requestId });
-    void ipc.reconcileCompareWorkspace(retained.identity).then((lookup) => {
+    void compareIpc.reconcileCompareWorkspace(retained.identity).then((lookup) => {
       dispatchCompareWorkspace({
         type: 'workspace_lookup_completed',
         resultKey: retained.key,
@@ -291,7 +291,7 @@ export function useCompareExecutionController(options: CompareExecutionControlle
     compareRunReady.current = false;
     if (showProgress) setCompareActive(true);
     try {
-      const snapshot = await ipc.compareJob(authorizationToken);
+      const snapshot = await compareIpc.compareJob(authorizationToken);
       const comparedPlan = snapshot.plan;
       dispatchCompareWorkspace(autoTicket
         ? {
@@ -429,7 +429,7 @@ export function useCompareExecutionController(options: CompareExecutionControlle
       });
       setStatus(`AutoScan is reviewing Compare authorization for '${comparedJob.name}'…`);
       try {
-        const review = await ipc.reviewCompare(comparedJob.jobId, targetIndex, {
+        const review = await operationsIpc.reviewCompare(comparedJob.jobId, targetIndex, {
           generation: autoTicket.generation,
           ticket_id: autoTicket.ticketId,
         });
@@ -480,7 +480,7 @@ export function useCompareExecutionController(options: CompareExecutionControlle
     dispatchCompareReview({ type: 'begin', request });
     setStatus(`Reviewing Compare authorization for '${comparedJob.name}'…`);
     try {
-      const review = await ipc.reviewCompare(comparedJob.jobId, targetIndex);
+      const review = await operationsIpc.reviewCompare(comparedJob.jobId, targetIndex);
       if (!ownsOperationReviewRequest(compareReviewRequest.current, request, currentCompareReviewKeyRef.current)) {
         return null;
       }
@@ -538,7 +538,7 @@ export function useCompareExecutionController(options: CompareExecutionControlle
     dispatchCompareReview({ type: 'begin_approval', request });
     setStatus('Authorizing this exact Compare operation…');
     try {
-      const authorization = await ipc.approveOperation(
+      const authorization = await operationsIpc.approveOperation(
         review.challenge_id,
         operationApprovalFromChoices(review, choices),
       );

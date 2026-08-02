@@ -1,6 +1,8 @@
+import type { JobSaveDto } from '#core/types/generated/JobSaveDto.ts';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Dispatch } from 'react';
-import * as ipc from '#core/infrastructure/tauri/commands/main.ts';
+import * as jobsIpc from '#core/infrastructure/tauri/commands/jobs.ts';
+import * as logsIpc from '#core/infrastructure/tauri/commands/logs.ts';
 import type { CompareWorkspaceAction } from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
 import type { RootEditorAction } from '#core/application/jobs/rootEditor.ts';
 import { RequestFence } from '#core/application/coordination/requestFence.ts';
@@ -64,7 +66,7 @@ export function useWorkspaceJobState({
   }, [dispatchCompare]);
 
   const reconcileSavedWorkspaceJob = useCallback((
-    saved: ipc.JobSaveDto,
+    saved: JobSaveDto,
     previous: JobIdentitySnapshot | null,
   ) => {
     if (!previous || saved.effect === 'created' || saved.effect === 'no_op') return;
@@ -82,7 +84,7 @@ export function useWorkspaceJobState({
 
   const refreshLatestRunSummaries = useCallback(() => {
     const ticket = latestRunSummaryFence.current.start('latest-run-summaries');
-    ipc.latestRunRecords().then(
+    logsIpc.latestRunRecords().then(
       (latestRuns) => {
         if (latestRunSummaryFence.current.owns(ticket)) {
           setLatestRunByJobId(Object.fromEntries(
@@ -121,7 +123,7 @@ export function useWorkspaceJobState({
   useEffect(() => {
     if (!selectedJob) { setJobConfiguration(null); return; }
     let live = true;
-    ipc.getJob(selectedJob.name).then((detail) => {
+    jobsIpc.getJob(selectedJob.name).then((detail) => {
       if (live) setJobConfiguration(detail.job);
     }).catch((error) => {
       if (!live) return;

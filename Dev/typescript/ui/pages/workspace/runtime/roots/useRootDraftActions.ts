@@ -1,6 +1,6 @@
 import { useCallback } from 'react';
 import type { Dispatch, MutableRefObject } from 'react';
-import * as ipc from '#core/infrastructure/tauri/commands/main.ts';
+import * as dialogs from '#core/infrastructure/tauri/dialogs.ts';
 import type {
   RootEditorAction,
   RootEditorWorkspace,
@@ -47,7 +47,7 @@ export function useRootDraftActions({
     const requestId = rootPickerRequestIdRef.current + 1;
     rootPickerRequestIdRef.current = requestId;
     try {
-      const selectedPath = await ipc.pickDirectory({
+      const selectedPath = await dialogs.pickDirectory({
         title: `Select the ${field} directory`,
         defaultPath: workspace.draft[field].trim() || workspace.committed[field],
       });

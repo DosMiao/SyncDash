@@ -1,6 +1,6 @@
 import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from 'react';
 import { listenToMainWindowEvent } from '#core/infrastructure/tauri/mainWindow.ts';
-import { replayCompareEvents } from '#core/infrastructure/tauri/commands/main.ts';
+import { replayCompareEvents } from '#core/infrastructure/tauri/commands/compare.ts';
 import { mergeRunEventReplay } from '#core/domain/runs/runEvents.ts';
 import { reduceCompareStages } from '#core/domain/compare/compareProgress.ts';
 import type { CompareProgressEvent, CompareStage } from '#core/domain/compare/compareProgress.ts';

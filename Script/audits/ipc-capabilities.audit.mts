@@ -106,20 +106,31 @@ test('progress authority is limited to lifecycle and Apply controls', () => {
 });
 
 test('window pages expose only their own capability surface', async () => {
-  const [mainAdapter, mainWindow, workspacePage, progressWindow, progressPage] = await Promise.all([
-    source('Dev/typescript/core/infrastructure/tauri/commands/main.ts'),
-    source('Dev/typescript/ui/windows/main/MainWindow.tsx'),
-    frontendTreeSource('Dev/typescript/ui/pages/workspace'),
-    source('Dev/typescript/ui/windows/progress/ProgressWindow.tsx'),
-    frontendTreeSource('Dev/typescript/ui/pages/progress'),
-  ]);
-  assert.doesNotMatch(mainAdapter, /from\s+['"]\.\/progress\.ts['"]/);
+  // The workspace page used to reach every main-window command family through one barrel, so this
+  // could assert a single import specifier. With the barrel gone it asserts the boundary itself:
+  // each page names the families it uses, and neither page names the other window's.
+  const [mainWindow, workspacePage, progressWindow, progressPage, progressAdapter] =
+    await Promise.all([
+      source('Dev/typescript/ui/windows/main/MainWindow.tsx'),
+      frontendTreeSource('Dev/typescript/ui/pages/workspace'),
+      source('Dev/typescript/ui/windows/progress/ProgressWindow.tsx'),
+      frontendTreeSource('Dev/typescript/ui/pages/progress'),
+      source('Dev/typescript/core/infrastructure/tauri/commands/progress.ts'),
+    ]);
   assert.match(mainWindow, /pages\/workspace\/WorkspacePage\.tsx/);
-  assert.match(workspacePage, /commands\/main\.ts/);
+  assert.match(workspacePage, /commands\/(?:apply|compare|jobs|operations)\.ts/);
   assert.doesNotMatch(workspacePage, /commands\/progress\.ts/);
   assert.match(progressWindow, /pages\/progress\/ProgressPage\.tsx/);
   assert.match(progressPage, /commands\/progress\.ts/);
-  assert.doesNotMatch(progressPage, /commands\/main\.ts/);
+  assert.doesNotMatch(
+    progressPage,
+    /commands\/(?:apply|autoscan|compare|jobs|logs|operations|paths|settings)\.ts/,
+  );
+  assert.doesNotMatch(
+    progressAdapter,
+    /from\s+['"]\.\/(?:apply|autoscan|compare|jobs|logs|operations|paths|settings)\.ts['"]/,
+    'the progress adapter must not re-enter main-window authority',
+  );
 });
 
 test('Tauri features depend on window identity, never the IPC boundary', async () => {
