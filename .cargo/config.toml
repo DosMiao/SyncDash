@@ -1,0 +1,7 @@
+# Applies to every cargo invocation whose working directory is inside this project.
+#
+# The test harness otherwise starts one thread per core (18 on this machine), which leaves nothing
+# for the editor, the language server, or a concurrent build. Four keeps a test run from taking the
+# machine over. Override for a single run with `cargo test -- --test-threads=N`.
+[env]
+RUST_TEST_THREADS = "4"
