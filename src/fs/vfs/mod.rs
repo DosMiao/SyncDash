@@ -1,13 +1,12 @@
 //! The virtual filesystem a sync root lives on.
 //!
 //! One `Vfs` instance = one root. Every path is a table rel: '/'-separated, no
-//! leading or trailing '/', `""` names the root itself, `foundation::path::is_safe_rel`
-//! holds. The engine walks, prunes, counts exclusions and drives the copy loops;
+//! leading or trailing '/', and `""` names the root itself. Ingress parses non-root values as
+//! `RootRelativePath` before the engine walks, prunes, counts exclusions, or drives copy loops;
 //! a backend only answers per-directory and per-file primitives.
 //!
-//! Layering note: this sits in L0 `fs` and reaches sideways into L0 `model` for
-//! `EntryKind` — the table vocabulary is the lingua franca between scanner and
-//! backend, and `model` uses nothing from `fs`, so the graph stays acyclic.
+//! Filesystem entry kinds stay in this layer; table observations translate them into their own
+//! closed artifact schema at the scan boundary.
 //!
 //! Design lineage (from the FreeFileSync AFS layer and syncthing's lib/fs, both
 //! surveyed in-repo under `.libs/`):
@@ -35,18 +34,33 @@ pub mod conformance;
 #[cfg(test)]
 pub mod memory;
 
-use std::path::Path;
 use std::sync::Arc;
 
-use crate::model::table::EntryKind;
+use crate::foundation::path::EntryName;
 use error::{VfsError, VfsErrorKind, VfsResult};
-use spec::{RemoteSpec, RootSpec};
+use spec::{EndpointSpec, RootSpec};
 
-/// A live probe result. `model::table::Entry` is the *table* format; `VMeta` is what
+pub(crate) fn random_name_token() -> VfsResult<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| {
+        VfsError::new(
+            VfsErrorKind::Io,
+            format!("could not generate a staged-name token: {e}"),
+        )
+    })?;
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(token, "{byte:02x}").expect("writing into a String cannot fail");
+    }
+    Ok(token)
+}
+
+/// A live probe result. `model::table::ObservedEntry` is the artifact format; `VMeta` is what
 /// the filesystem said just now.
 #[derive(Clone, Debug)]
 pub struct VMeta {
-    pub kind: EntryKind,
+    pub kind: VfsEntryKind,
     pub size: u64,
     pub mtime_ms: i64,
     /// Unix permission bits. None = the backend genuinely has none (says so, rather
@@ -61,10 +75,16 @@ pub struct VMeta {
     pub link: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VfsEntryKind {
+    File,
+    Directory,
+    Symlink,
+}
+
 #[derive(Clone, Debug)]
 pub struct VDirEntry {
-    /// Single path segment, never containing '/'.
-    pub name: String,
+    pub name: EntryName,
     pub meta: VMeta,
 }
 
@@ -80,6 +100,14 @@ pub enum Support {
 impl Support {
     pub fn yes(self) -> bool {
         self == Support::Yes
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Support::Yes => "yes",
+            Support::No => "no",
+            Support::Unknown => "unknown",
+        }
     }
 }
 
@@ -165,7 +193,7 @@ impl NameRules {
 }
 
 /// What a backend can do. Authoritative only after `connect()` — FTP learns MFMT/MLSD
-/// from FEAT, SFTP learns fsync@openssh.com from the extension list.
+/// from FEAT, while SFTP probes the hard-link extension used for exclusive staged-file publication.
 #[derive(Clone, Debug)]
 pub struct VfsCaps {
     pub protocol: &'static str,
@@ -178,6 +206,18 @@ pub struct VfsCaps {
     /// No = the engine clears the destination first (it does anyway; this simply
     /// records whose job the overwrite is).
     pub rename_overwrite: Support,
+    /// `WriteStaged::commit_noreplace` atomically publishes a regular file only while its final
+    /// name remains absent. Root leases depend on this primitive on both sides of every apply.
+    pub exclusive_staged_file_publish: Support,
+    /// `rename_noreplace` moves an existing entry in one namespace operation only while the final
+    /// name remains absent. `Yes` covers regular files, directories, and symlinks when `symlink`
+    /// is also `Yes`; hard-link-plus-unlink is not this primitive.
+    pub exclusive_entry_rename: Support,
+    /// `make_symlink` atomically creates a link only while its name remains absent.
+    pub exclusive_symlink_publish: Support,
+    /// Namespace mutations requested with `fsync=true` can make their parent-directory changes
+    /// crash-durable. This is distinct from flushing staged file content.
+    pub durable_namespace: Support,
     /// Random-access reads (sampled evidence = 3 windows). No → preflight degrades
     /// the evidence tier, out loud.
     pub ranged_read: Support,
@@ -218,9 +258,9 @@ pub struct WriteHint {
     pub mode: Option<u32>,
 }
 
-/// What actually happened at commit. mtime/mode failures ride here instead of
-/// failing the copy — the engine decides (records a correction, or surfaces per
-/// the preflight agreement). Silence is not an option; error-return is not either.
+/// What actually happened at commit. The engine may tolerate an mtime failure by recording a
+/// correction, but a requested mode is part of the operation's exact result and its failure must
+/// fail that operation even when publication itself already succeeded.
 #[derive(Debug, Default)]
 pub struct CommitReport {
     /// The mtime observed on the final file right after commit, when the backend
@@ -257,10 +297,8 @@ pub trait WriteStaged: Send {
     fn staged_len(&self) -> VfsResult<u64>;
     /// Re-read the staged content (verify_writes). Only when `caps().read_back` says Yes.
     ///
-    /// Every backend verifies through this one stream, local included. There used to be a
-    /// `local_path()` escape hatch that let a real local path be verified by mmap+rayon instead,
-    /// which is ~10x faster on cached bytes and could also kill the process with SIGBUS — see the
-    /// crate header. Losing it costs the paranoid tier a second single-threaded blake3 pass.
+    /// Every backend verifies through this stream, including local roots; no ambient descendant
+    /// path is exposed to a verifier.
     fn open_staged_read(&self) -> VfsResult<Box<dyn ReadStream>>;
     /// Atomically move the staged file onto the destination. The engine has already
     /// cleared/preserved the old file per plan. Consumes self.
@@ -269,7 +307,7 @@ pub trait WriteStaged: Send {
     /// after compare. Backends that cannot guarantee this must fail closed.
     fn commit_noreplace(self: Box<Self>) -> VfsResult<CommitReport> {
         Err(VfsError::unsupported(
-            "atomic no-replace staged commit is unavailable on this backend",
+            "exclusive staged-file publication is unavailable on this backend",
         ))
     }
 }
@@ -285,9 +323,9 @@ pub trait Vfs: Send + Sync {
     /// lock ownership. For a local root this is the root string exactly as spelled
     /// (existing caches must keep hitting).
     fn identity(&self) -> String;
-    /// Local escape hatch: a real directory the engine may touch with std::fs and
-    /// walkdir. `Some` routes the whole fast path.
-    fn as_local(&self) -> Option<&Path> {
+    /// A retained local-root capability. Callers may use its display spelling for diagnostics or
+    /// OS-level volume classification, but descendant I/O must remain descriptor-relative.
+    fn local_root(&self) -> Option<&crate::fs::local_root::LocalRoot> {
         None
     }
     /// One line of server truth for the log ("OpenSSH_9.6, fsync@openssh.com: yes").
@@ -308,7 +346,7 @@ pub trait Vfs: Send + Sync {
     fn read_dir(&self, rel: &str) -> VfsResult<Vec<VDirEntry>>;
     /// Names-only listing for callers that need nothing else (delete-dir residue
     /// sampling). Default delegates; backends with a cheaper primitive override.
-    fn read_dir_names(&self, rel: &str) -> VfsResult<Vec<(String, EntryKind)>> {
+    fn read_dir_names(&self, rel: &str) -> VfsResult<Vec<(EntryName, VfsEntryKind)>> {
         Ok(self
             .read_dir(rel)?
             .into_iter()
@@ -344,6 +382,8 @@ pub trait Vfs: Send + Sync {
     fn remove_dir(&self, rel: &str) -> VfsResult<()>;
     fn set_mtime(&self, rel: &str, mtime_ms: i64) -> VfsResult<()>;
     fn set_mode(&self, rel: &str, mode: u32) -> VfsResult<()>;
+    /// Create a symlink at an absent name. Backends advertising
+    /// `exclusive_symlink_publish=Yes` must refuse an occupied name atomically.
     fn make_symlink(&self, rel: &str, target: &str) -> VfsResult<()>;
 
     // -------- root level --------
@@ -367,36 +407,36 @@ pub struct Credentials {
 /// Where credentials come from. Three impls by shell: CLI = tty prompt, desktop =
 /// dialog round-trip, headless = `NoPrompt` (hard error with the remedy spelled out).
 pub trait CredentialProvider: Send + Sync {
-    fn credentials_for(&self, spec: &RemoteSpec) -> VfsResult<Credentials>;
+    fn credentials_for(&self, spec: &EndpointSpec) -> VfsResult<Credentials>;
 }
 
 /// Route a root phrase to a live backend. Every scheme here is spoken in this process; an
 /// unknown one is refused rather than quietly read as a local path.
 pub fn open(phrase: &str, creds: &Arc<dyn CredentialProvider>) -> VfsResult<Arc<dyn Vfs>> {
     match spec::parse(phrase) {
-        RootSpec::Local(p) => Ok(Arc::new(local::LocalVfs::new(p))),
+        RootSpec::Local(path) => Ok(Arc::new(local::LocalVfs::open(path)?)),
         // Needs a stored credential where `\\host\share` needs none — `smb`'s module doc has
         // the whole trade.
-        RootSpec::Remote(r) if r.scheme == "smb" => {
+        RootSpec::Endpoint(r) if r.scheme == "smb" => {
             Ok(Arc::new(smb::SmbBackend::new(r, creds.clone())?))
         }
-        RootSpec::Remote(r) if r.scheme == "sftp" => {
+        RootSpec::Endpoint(r) if r.scheme == "sftp" => {
             Ok(Arc::new(sftp::SftpBackend::new(r, creds.clone())))
         }
-        RootSpec::Remote(r) if r.scheme == "ftp" || r.scheme == "ftps" => {
+        RootSpec::Endpoint(r) if r.scheme == "ftp" || r.scheme == "ftps" => {
             Ok(Arc::new(ftp::FtpBackend::new(r, creds.clone())))
         }
         // A peer root is not something this process opens: the far side's own syncdash reads and
         // writes it, and `run::peer` drives that over ssh. Reaching here means a caller took a
         // peer job down the in-process lane, which would sync against the wrong filesystem.
-        RootSpec::Remote(r) if spec::is_peer_scheme(&r.scheme) => Err(VfsError::new(
+        RootSpec::Endpoint(r) if spec::is_peer_scheme(&r.scheme) => Err(VfsError::new(
             VfsErrorKind::Unsupported,
             format!(
                 "{} names a peer root — the syncdash on the far side owns it, so there is no backend to open here (run::peer drives it)",
                 r.display()
             ),
         )),
-        RootSpec::Remote(r) => Err(VfsError::new(
+        RootSpec::Endpoint(r) => Err(VfsError::new(
             VfsErrorKind::Unsupported,
             format!("{}:// has no backend (root: {})", r.scheme, r.display()),
         )),

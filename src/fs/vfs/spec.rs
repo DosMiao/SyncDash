@@ -3,7 +3,7 @@
 //! Grammar (FFS path-phrase shape, minus its credential-in-string parts):
 //!
 //! ```text
-//! remote := scheme "://" [user "@"] host [":" port] ["/" path] {"|" opt}
+//! endpoint := scheme "://" [user "@"] host [":" port] ["/" path] {"|" opt}
 //! scheme := "sftp" | "ftp" | "ftps" | "smb" | "peer"   (case-insensitive)
 //! host   := name | ipv4 | "[" ipv6 "]"
 //! opt    := key ["=" value]
@@ -30,7 +30,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RootSpec {
     Local(PathBuf),
-    Remote(RemoteSpec),
+    Endpoint(EndpointSpec),
     /// `scheme://…` where the scheme is not one we know. Never silently local.
     UnknownScheme {
         raw: String,
@@ -39,8 +39,8 @@ pub enum RootSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RemoteSpec {
-    /// Lower-cased: "sftp" | "ftp" | "ftps" | "smb"
+pub struct EndpointSpec {
+    /// Lower-cased: "sftp" | "ftp" | "ftps" | "smb" | "peer"
     pub scheme: String,
     pub user: Option<String>,
     pub host: String,
@@ -70,7 +70,7 @@ pub struct RemoteSpec {
     pub options: Vec<(String, String)>,
 }
 
-impl RemoteSpec {
+impl EndpointSpec {
     /// Display form: credentials-free by construction, options dropped.
     /// Goes into table headers, plan headers, logs and the UI.
     pub fn display(&self) -> String {
@@ -158,11 +158,11 @@ pub fn is_peer_scheme(scheme: &str) -> bool {
 /// It used to be asked of a `remote_host` field on the job instead — a second, unrelated place to
 /// say where a root lives, which `validate_roots` then had to keep from contradicting the phrase.
 pub fn is_peer(phrase: &str) -> bool {
-    matches!(parse(phrase), RootSpec::Remote(r) if is_peer_scheme(&r.scheme))
+    matches!(parse(phrase), RootSpec::Endpoint(r) if is_peer_scheme(&r.scheme))
 }
 
 /// Parse a root phrase. Never fails and never panics: anything unparseable in the
-/// remote grammar still comes back as a representable value, and the error (if it is
+/// endpoint grammar still comes back as a representable value, and the error (if it is
 /// one) is raised where it can carry context — config validation or `open()`.
 pub fn parse(raw: &str) -> RootSpec {
     let s = raw.trim();
@@ -178,7 +178,7 @@ pub fn parse(raw: &str) -> RootSpec {
         let scheme = scheme_raw.to_ascii_lowercase();
         if !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric()) {
             if KNOWN_SCHEMES.contains(&scheme.as_str()) {
-                return RootSpec::Remote(parse_remote(&scheme, &s[idx + 3..]));
+                return RootSpec::Endpoint(parse_endpoint(&scheme, &s[idx + 3..]));
             }
             return RootSpec::UnknownScheme {
                 raw: s.to_string(),
@@ -199,7 +199,7 @@ fn looks_like_drive_path(s: &str) -> bool {
 }
 
 /// `rest` is everything after `scheme://`.
-fn parse_remote(scheme: &str, rest: &str) -> RemoteSpec {
+fn parse_endpoint(scheme: &str, rest: &str) -> EndpointSpec {
     // Options tail: split on '|' first so a '|' can never be mistaken for path content
     let mut parts = rest.split('|');
     let head = parts.next().unwrap_or("");
@@ -226,7 +226,7 @@ fn parse_remote(scheme: &str, rest: &str) -> RemoteSpec {
 
     let (host, port) = parse_hostport(hostport);
 
-    RemoteSpec {
+    EndpointSpec {
         scheme: scheme.to_string(),
         user,
         host,
@@ -280,9 +280,9 @@ fn normalize_root(p: &str) -> String {
 mod tests {
     use super::*;
 
-    fn remote(s: &str) -> RemoteSpec {
+    fn endpoint(s: &str) -> EndpointSpec {
         match parse(s) {
-            RootSpec::Remote(r) => r,
+            RootSpec::Endpoint(r) => r,
             other => panic!("{s} parsed as {other:?}"),
         }
     }
@@ -299,7 +299,8 @@ mod tests {
 
     #[test]
     fn sftp_full_form() {
-        let r = remote("sftp://ben@mac-mini:2222/Users/ben/Code|key=~/.ssh/id_ed25519|timeout=30");
+        let r =
+            endpoint("sftp://ben@mac-mini:2222/Users/ben/Code|key=~/.ssh/id_ed25519|timeout=30");
         assert_eq!(r.scheme, "sftp");
         assert_eq!(r.user.as_deref(), Some("ben"));
         assert_eq!(r.host, "mac-mini");
@@ -312,7 +313,7 @@ mod tests {
 
     #[test]
     fn minimal_and_flag_options() {
-        let r = remote("ftp://nas/pub|active");
+        let r = endpoint("ftp://nas/pub|active");
         assert_eq!(r.user, None);
         assert_eq!(r.host, "nas");
         assert_eq!(r.port, None);
@@ -322,10 +323,10 @@ mod tests {
 
     #[test]
     fn ipv6_forms() {
-        let r = remote("sftp://ben@[fe80::1]:2222/data");
+        let r = endpoint("sftp://ben@[fe80::1]:2222/data");
         assert_eq!(r.host, "fe80::1");
         assert_eq!(r.port, Some(2222));
-        let r2 = remote("sftp://ben@[::1]/data");
+        let r2 = endpoint("sftp://ben@[::1]/data");
         assert_eq!(r2.host, "::1");
         assert_eq!(r2.port, None);
         // display puts brackets back so the output re-parses
@@ -342,30 +343,30 @@ mod tests {
 
     #[test]
     fn identity_folds_host_and_pins_port() {
-        let a = remote("sftp://ben@Mac-Mini/Code");
-        let b = remote("sftp://ben@mac-mini:22/Code/");
+        let a = endpoint("sftp://ben@Mac-Mini/Code");
+        let b = endpoint("sftp://ben@mac-mini:22/Code/");
         assert_eq!(a.identity(), b.identity());
         // but the user stays case-sensitive
-        let c = remote("sftp://Ben@mac-mini/Code");
+        let c = endpoint("sftp://Ben@mac-mini/Code");
         assert_ne!(a.identity(), c.identity());
     }
 
     #[test]
     fn display_omits_options() {
-        let r = remote("smb://ben@server/share/photos|max_conns=2");
+        let r = endpoint("smb://ben@server/share/photos|max_conns=2");
         assert_eq!(r.display(), "smb://ben@server/share/photos");
     }
 
     #[test]
     fn root_normalization() {
-        assert_eq!(remote("smb://s/share\\sub\\dir").root, "share/sub/dir");
-        assert_eq!(remote("sftp://h//a//b/").root, "a/b");
-        assert_eq!(remote("sftp://h").root, "");
+        assert_eq!(endpoint("smb://s/share\\sub\\dir").root, "share/sub/dir");
+        assert_eq!(endpoint("sftp://h//a//b/").root, "a/b");
+        assert_eq!(endpoint("sftp://h").root, "");
     }
 
     #[test]
     fn encoded_user_decodes() {
-        let r = remote("sftp://user%40corp@host/x");
+        let r = endpoint("sftp://user%40corp@host/x");
         assert_eq!(r.user.as_deref(), Some("user@corp"));
     }
 
@@ -385,7 +386,7 @@ mod tests {
 
     #[test]
     fn a_peer_phrase_carries_the_whole_link() {
-        let r = remote(r"peer://mac/Users/ben/Code|exe=~/bin/syncdash|mount=\\mac\share\Code");
+        let r = endpoint(r"peer://mac/Users/ben/Code|exe=~/bin/syncdash|mount=\\mac\share\Code");
         assert_eq!(r.scheme, "peer");
         assert_eq!(r.host, "mac");
         assert_eq!(r.root, "Users/ben/Code");
@@ -406,8 +407,8 @@ mod tests {
         assert!(!is_peer(r"\\mac\share\x"));
         // The default port matters: a spelled-out :22 and an implicit one must share a key
         assert_eq!(
-            remote("peer://mac/x").identity(),
-            remote("peer://mac:22/x/").identity()
+            endpoint("peer://mac/x").identity(),
+            endpoint("peer://mac:22/x/").identity()
         );
     }
 }

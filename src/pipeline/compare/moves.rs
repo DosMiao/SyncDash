@@ -7,7 +7,15 @@
 use std::collections::{HashMap, HashSet};
 
 use super::is_conflict_copy;
-use crate::model::table::Entry;
+use crate::model::table::{Blake3Digest, FileIdentityObservation, ObservedEntry, ObservedFile};
+
+fn full_identity(entry: &ObservedEntry) -> Option<(&ObservedFile, &Blake3Digest)> {
+    let file = entry.as_file()?;
+    let FileIdentityObservation::FullBlake3 { digest } = &file.identity else {
+        return None;
+    };
+    (file.size > 0 && !is_conflict_copy(file.path.as_str())).then_some((file, digest))
+}
 
 /// The result of one move pairing
 pub struct MovePair {
@@ -32,18 +40,21 @@ pub struct MovePair {
 /// The very first thing syncthing does in `findRename` (`lib/model/folder.go:930-932`) is exclude
 /// `Size == 0`; we do the same.
 pub(super) fn detect_moves<'a>(
-    adds: Vec<&'a Entry>,
-    dels: Vec<&'a Entry>,
-) -> (Vec<MovePair>, Vec<&'a Entry>, Vec<&'a Entry>) {
+    adds: Vec<&'a ObservedEntry>,
+    dels: Vec<&'a ObservedEntry>,
+) -> (
+    Vec<MovePair>,
+    Vec<&'a ObservedEntry>,
+    Vec<&'a ObservedEntry>,
+) {
     fn parent(p: &str) -> &str {
         p.rfind('/').map(|i| &p[..i]).unwrap_or("")
     }
-    let eligible = |e: &Entry| e.size > 0 && e.hash.is_some() && !is_conflict_copy(&e.path);
-    let mut by_key: HashMap<(String, u64), Vec<&'a Entry>> = HashMap::new();
+    let mut by_key: HashMap<(String, u64), Vec<&'a ObservedEntry>> = HashMap::new();
     for &d in &dels {
-        if eligible(d) {
+        if let Some((file, digest)) = full_identity(d) {
             by_key
-                .entry((d.hash.clone().unwrap(), d.size))
+                .entry((digest.as_str().to_owned(), file.size))
                 .or_default()
                 .push(d);
         }
@@ -53,30 +64,43 @@ pub(super) fn detect_moves<'a>(
     let mut used: HashSet<String> = HashSet::new();
     for a in adds {
         let mut matched = None;
-        if eligible(a) {
-            if let Some(cands) = by_key.get_mut(&(a.hash.clone().unwrap(), a.size)) {
+        if let Some((added_file, added_digest)) = full_identity(a) {
+            if let Some(cands) =
+                by_key.get_mut(&(added_digest.as_str().to_owned(), added_file.size))
+            {
                 if !cands.is_empty() {
                     let n = cands.len();
                     let pick = cands
                         .iter()
-                        .position(|c| parent(&c.path) == parent(&a.path))
+                        .position(|candidate| {
+                            parent(candidate.path().as_str()) == parent(added_file.path.as_str())
+                        })
                         .or_else(|| {
-                            cands.iter().position(|c| {
-                                std::path::Path::new(&c.path).file_name()
-                                    == std::path::Path::new(&a.path).file_name()
+                            cands.iter().position(|candidate| {
+                                std::path::Path::new(candidate.path().as_str()).file_name()
+                                    == std::path::Path::new(added_file.path.as_str()).file_name()
                             })
                         })
                         .unwrap_or(0);
                     let c = cands.remove(pick);
-                    used.insert(c.path.clone());
+                    let deleted_file = c
+                        .as_file()
+                        .expect("move candidates come from the file observation map");
+                    used.insert(deleted_file.path.as_str().to_owned());
                     matched = Some(MovePair {
-                        rename_in_place: parent(&c.path) == parent(&a.path),
-                        from: c.path.clone(),
-                        to: a.path.clone(),
-                        size: c.size,
-                        mtime_ms: c.mtime_ms,
-                        hash: c.hash.clone().expect("eligible move source has a hash"),
-                        mode: c.mode,
+                        rename_in_place: parent(deleted_file.path.as_str())
+                            == parent(added_file.path.as_str()),
+                        from: deleted_file.path.as_str().to_owned(),
+                        to: added_file.path.as_str().to_owned(),
+                        size: deleted_file.size,
+                        mtime_ms: deleted_file.mtime_ms,
+                        hash: deleted_file
+                            .identity
+                            .digest()
+                            .expect("move candidates carry full BLAKE3 evidence")
+                            .as_str()
+                            .to_owned(),
+                        mode: deleted_file.mode,
                         candidates: n,
                     });
                 }
@@ -89,7 +113,7 @@ pub(super) fn detect_moves<'a>(
     }
     let rest_dels = dels
         .into_iter()
-        .filter(|d| !used.contains(&d.path))
+        .filter(|entry| !used.contains(entry.path().as_str()))
         .collect();
     (moves, rest_adds, rest_dels)
 }

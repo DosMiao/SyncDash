@@ -19,13 +19,13 @@ use std::sync::Arc;
 
 use crate::foundation::names::{APP_DIR, LOCK_NAME, MARKER_NAME, TEMP_PREFIX, VERSION_STORE_DIR};
 use crate::fs::vfs::Vfs;
-use crate::model::table::EntryKind;
+use crate::fs::vfs::VfsEntryKind;
 
 /// One entry as this harness is willing to talk about it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shape {
     pub path: String,
-    pub kind: EntryKind,
+    pub kind: VfsEntryKind,
     pub size: u64,
     /// blake3 of the content, read back through `open_read`. `None` for directories and symlinks.
     pub hash: Option<String>,
@@ -40,7 +40,7 @@ pub struct Shape {
 fn is_self_meta(name: &str) -> bool {
     name == APP_DIR
         || name == VERSION_STORE_DIR
-        || name == LOCK_NAME
+        || name.starts_with(LOCK_NAME)
         || name == MARKER_NAME
         || name.starts_with(TEMP_PREFIX)
 }
@@ -59,19 +59,19 @@ fn walk(v: &Arc<dyn Vfs>, rel: &str, out: &mut Vec<Shape>) {
         .read_dir(rel)
         .unwrap_or_else(|e| panic!("read_dir({rel:?}) on {}: {e}", v.display()));
     for e in entries {
-        if is_self_meta(&e.name) {
+        if is_self_meta(e.name.as_str()) {
             continue;
         }
         let path = if rel.is_empty() {
-            e.name.clone()
+            e.name.as_str().to_owned()
         } else {
             format!("{rel}/{}", e.name)
         };
         match e.meta.kind {
-            EntryKind::Dir => {
+            VfsEntryKind::Directory => {
                 out.push(Shape {
                     path: path.clone(),
-                    kind: EntryKind::Dir,
+                    kind: VfsEntryKind::Directory,
                     size: 0,
                     hash: None,
                     mtime_ms: e.meta.mtime_ms,
@@ -80,13 +80,13 @@ fn walk(v: &Arc<dyn Vfs>, rel: &str, out: &mut Vec<Shape>) {
                 });
                 walk(v, &path, out);
             }
-            EntryKind::Symlink => {
+            VfsEntryKind::Symlink => {
                 let target = v
                     .read_link(&path)
                     .unwrap_or_else(|err| panic!("read_link({path:?}) on {}: {err}", v.display()));
                 out.push(Shape {
                     path,
-                    kind: EntryKind::Symlink,
+                    kind: VfsEntryKind::Symlink,
                     size: e.meta.size,
                     hash: None,
                     mtime_ms: e.meta.mtime_ms,
@@ -94,11 +94,11 @@ fn walk(v: &Arc<dyn Vfs>, rel: &str, out: &mut Vec<Shape>) {
                     link: Some(target),
                 });
             }
-            EntryKind::File => {
+            VfsEntryKind::File => {
                 let hash = hash_of(v, &path);
                 out.push(Shape {
                     path,
-                    kind: EntryKind::File,
+                    kind: VfsEntryKind::File,
                     size: e.meta.size,
                     hash: Some(hash),
                     mtime_ms: e.meta.mtime_ms,
@@ -175,7 +175,7 @@ pub fn assert_same(want: &[Shape], got: &[Shape], tol: &Tolerance, what: &str) {
         if w.kind != g.kind {
             diffs.push(format!("{at}: kind {:?} != {:?}", g.kind, w.kind));
         }
-        if w.kind == EntryKind::File {
+        if w.kind == VfsEntryKind::File {
             if w.size != g.size {
                 diffs.push(format!("{at}: size {} != {}", g.size, w.size));
             }
@@ -192,7 +192,7 @@ pub fn assert_same(want: &[Shape], got: &[Shape], tol: &Tolerance, what: &str) {
         // would assert a guarantee the pipeline does not make. It could not keep it either:
         // stamping a link's own mtime needs `lutimes`, and SFTP's `setstat` follows the link, so a
         // copied link legitimately lands with the time it was created.
-        if tol.mtime_at_all && w.kind == EntryKind::File {
+        if tol.mtime_at_all && w.kind == VfsEntryKind::File {
             let d = (g.mtime_ms - w.mtime_ms).abs();
             if d > tol.mtime_ms {
                 diffs.push(format!(

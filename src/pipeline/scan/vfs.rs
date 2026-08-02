@@ -6,8 +6,13 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::foundation::path::RootRelativePath;
 use crate::foundation::time::now_ms;
-use crate::model::table::{Entry, EntryKind, Header, Snapshot, SCHEMA};
+use crate::fs::vfs::VfsEntryKind;
+use crate::model::table::{
+    Blake3Digest, FileIdentityObservation, ObservedDirectory, ObservedEntry, ObservedFile,
+    ObservedSymlink, TableArtifact, TableEvidence, TableHeader, TableKind, TABLE_SCHEMA,
+};
 
 use super::digest::{effective_read, full_hash_vfs, sampled_digest_vfs, SAMPLE_MIN};
 use super::{ScanMetrics, ScanOptions};
@@ -20,7 +25,7 @@ use super::{ScanMetrics, ScanOptions};
 /// judgment for that file has been silently downgraded to size and mtime.
 enum HashOutcome {
     Skipped,
-    Done(String),
+    Done(Blake3Digest),
     Failed,
 }
 
@@ -36,7 +41,7 @@ pub(super) fn scan_vfs(
     opt: &ScanOptions,
     ctx: &crate::obs::progress::RunCtx,
     phase: crate::model::event::Phase,
-) -> std::io::Result<Snapshot> {
+) -> std::io::Result<TableArtifact> {
     use crate::fs::vfs::error::VfsErrorKind;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -68,13 +73,13 @@ pub(super) fn scan_vfs(
     let mut matched_mtime_fixes = HashSet::new();
     metrics.mtime_load_ms = measured.elapsed().as_millis() as u64;
 
-    let mut entries: Vec<Entry> = Vec::new();
+    let mut entries: Vec<ObservedEntry> = Vec::new();
     struct PendingVfs {
-        rel: String,
+        rel: RootRelativePath,
         size: u64,
         raw_mt: i64,
         mt: i64,
-        hash: Option<String>,
+        hash: Option<Blake3Digest>,
         /// Hashing was attempted and failed — not the same fact as `hash: None`, which also means
         /// "hashing was never requested".
         hash_failed: bool,
@@ -117,26 +122,21 @@ pub(super) fn scan_vfs(
         };
         for de in list {
             let rel = if dir.is_empty() {
-                de.name.clone()
+                de.name.as_str().to_owned()
             } else {
                 format!("{dir}/{}", de.name)
             };
+            let relative = RootRelativePath::try_from(rel.as_str()).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?;
             match de.meta.kind {
-                EntryKind::Dir => {
+                VfsEntryKind::Directory => {
                     let (pass, child_might_match) = opt.filter.pass_dir(&rel);
                     if pass {
-                        entries.push(Entry {
-                            path: rel.clone(),
-                            kind: EntryKind::Dir,
-                            size: 0,
+                        entries.push(ObservedEntry::Directory(ObservedDirectory {
+                            path: relative,
                             mtime_ms: de.meta.mtime_ms,
-                            hash: None,
-                            hash_failed: false,
-                            file_id: None,
-                            mode: None,
-                            link: None,
-                            prev: None,
-                        });
+                        }));
                     }
                     if pass || child_might_match {
                         stack.push(rel);
@@ -144,7 +144,7 @@ pub(super) fn scan_vfs(
                         excl_dirs += 1; // whole subtree pruned — and never even listed
                     }
                 }
-                EntryKind::Symlink => {
+                VfsEntryKind::Symlink => {
                     if !opt.filter.pass_file(&rel) {
                         excl_files += 1;
                         continue;
@@ -153,22 +153,18 @@ pub(super) fn scan_vfs(
                         skipped_symlinks += 1;
                     }
                     if opt.symlinks_direct {
-                        let target = de.meta.link.clone().or_else(|| vfs.read_link(&rel).ok());
-                        entries.push(Entry {
-                            path: rel,
-                            kind: EntryKind::Symlink,
-                            size: 0,
+                        let target = match de.meta.link {
+                            Some(target) => target,
+                            None => vfs.read_link(&rel).map_err(std::io::Error::from)?,
+                        };
+                        entries.push(ObservedEntry::Symlink(ObservedSymlink {
+                            path: relative,
                             mtime_ms: de.meta.mtime_ms,
-                            hash: None,
-                            hash_failed: false,
-                            file_id: None,
-                            mode: None,
-                            link: target,
-                            prev: None,
-                        });
+                            target,
+                        }));
                     }
                 }
-                EntryKind::File => {
+                VfsEntryKind::File => {
                     if !opt.filter.pass_file(&rel) {
                         excl_files += 1;
                         continue;
@@ -184,15 +180,22 @@ pub(super) fn scan_vfs(
                     };
                     let mut hash = None;
                     if opt.hash && opt.use_cache && !matched_mtime_fixes.contains(&rel) {
-                        if let Some((cs, cm, ch)) = cache.get(&rel) {
+                        if let Some(cached) = cache.get(rel.as_str()) {
                             let want_sampled = sampled && size >= SAMPLE_MIN;
-                            if *cs == size && *cm == mt && ch.starts_with('~') == want_sampled {
-                                hash = Some(ch.clone());
+                            let cached_is_sampled = matches!(
+                                cached.identity,
+                                FileIdentityObservation::SampledBlake3 { .. }
+                            );
+                            if cached.size == size
+                                && cached.mtime_ms == mt
+                                && cached_is_sampled == want_sampled
+                            {
+                                hash = cached.identity.digest().cloned();
                             }
                         }
                     }
                     pending.push(PendingVfs {
-                        rel,
+                        rel: relative,
                         size,
                         raw_mt,
                         mt,
@@ -201,7 +204,7 @@ pub(super) fn scan_vfs(
                         file_id: de.meta.file_id,
                         mode: de.meta.mode,
                     });
-                    pp.item_done(&pending.last().unwrap().rel);
+                    pp.item_done(pending.last().unwrap().rel.as_str());
                 }
             }
         }
@@ -217,9 +220,10 @@ pub(super) fn scan_vfs(
     let retain_absent: HashSet<String> = if coverage == crate::store::ScanCoverage::Complete {
         cache
             .keys()
-            .chain(mtime_fixes.keys())
+            .map(RootRelativePath::as_str)
+            .chain(mtime_fixes.keys().map(String::as_str))
             .filter(|path| !opt.filter.pass_file(path))
-            .cloned()
+            .map(str::to_owned)
             .collect()
     } else {
         HashSet::new()
@@ -277,24 +281,24 @@ pub(super) fn scan_vfs(
                         continue; // cancelled: drain the remaining slots empty
                     }
                     if p.hash.is_some() {
-                        pp.item_done(&p.rel); // cache hit: nothing to read
+                        pp.item_done(p.rel.as_str()); // cache hit: nothing to read
                         let _ = hashes[i].set(HashOutcome::Skipped);
                         continue;
                     }
                     let res = if sampled && p.size >= SAMPLE_MIN {
-                        sampled_digest_vfs(vfs.as_ref(), &p.rel, p.size, |n| {
+                        sampled_digest_vfs(vfs.as_ref(), p.rel.as_str(), p.size, |n| {
                             actual_bytes_read.fetch_add(n, Ordering::Relaxed);
-                            pp.add_bytes(n, &p.rel);
+                            pp.add_bytes(n, p.rel.as_str());
                         })
                     } else {
-                        full_hash_vfs(vfs.as_ref(), &p.rel, p.size, &pp, |n| {
+                        full_hash_vfs(vfs.as_ref(), p.rel.as_str(), p.size, &pp, |n| {
                             actual_bytes_read.fetch_add(n, Ordering::Relaxed);
-                            pp.add_bytes(n, &p.rel);
+                            pp.add_bytes(n, p.rel.as_str());
                         })
                     }
-                    .and_then(|hash| match vfs.stat(&p.rel)? {
+                    .and_then(|hash| match vfs.stat(p.rel.as_str())? {
                         Some(meta)
-                            if meta.kind == EntryKind::File
+                            if meta.kind == VfsEntryKind::File
                                 && meta.size == p.size
                                 && meta.mtime_ms == p.raw_mt =>
                         {
@@ -315,11 +319,11 @@ pub(super) fn scan_vfs(
                         }
                         Err(e) => {
                             err_count.fetch_add(1, Ordering::Relaxed);
-                            pp.error(&p.rel, "hash", side, &e.to_string());
+                            pp.error(p.rel.as_str(), "hash", side, &e.to_string());
                             let _ = hashes[i].set(HashOutcome::Failed);
                         }
                     }
-                    pp.item_done(&p.rel);
+                    pp.item_done(p.rel.as_str());
                 });
             }
         });
@@ -341,28 +345,35 @@ pub(super) fn scan_vfs(
 
     let measured = std::time::Instant::now();
     for p in pending {
-        entries.push(Entry {
+        let identity = if p.hash_failed {
+            FileIdentityObservation::Unreadable
+        } else if let Some(digest) = p.hash {
+            if sampled && p.size >= SAMPLE_MIN {
+                FileIdentityObservation::SampledBlake3 { digest }
+            } else {
+                FileIdentityObservation::FullBlake3 { digest }
+            }
+        } else {
+            FileIdentityObservation::SizeAndMtime
+        };
+        entries.push(ObservedEntry::File(ObservedFile {
             path: p.rel,
-            kind: EntryKind::File,
             size: p.size,
             mtime_ms: p.mt,
-            hash: p.hash,
-            hash_failed: p.hash_failed,
-            file_id: p.file_id,
+            identity,
+            file_system_id: p.file_id,
             mode: p.mode,
-            link: None,
-            prev: None,
-        });
+            previous_identities: Vec::new(),
+        }));
     }
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries.sort_by(|left, right| left.path().cmp(right.path()));
     metrics.finalize_ms = measured.elapsed().as_millis() as u64;
     let measured = std::time::Instant::now();
-    if opt.hash {
-        if crate::store::hashcache::save_by_key(&identity, &entries, coverage, &retain_absent)
+    if opt.hash
+        && crate::store::hashcache::save_by_key(&identity, &entries, coverage, &retain_absent)
             == crate::store::StateWriteStatus::Failed
-        {
-            metrics.state_failures += 1;
-        }
+    {
+        metrics.state_failures += 1;
     }
     if crate::store::mtimefix::reconcile_by_key(
         &identity,
@@ -383,17 +394,23 @@ pub(super) fn scan_vfs(
         );
     }
 
-    let snapshot = Snapshot {
-        header: Header {
-            schema: SCHEMA,
-            kind: "snapshot".into(),
+    let snapshot = TableArtifact::new(
+        TableHeader {
+            schema: TABLE_SCHEMA,
+            kind: TableKind::Snapshot,
             root: vfs.display(),
             host: crate::model::table::host_name(),
             os: caps.protocol.to_string(),
             scanned_at_ms: started,
             duration_ms: t0.elapsed().as_millis() as u64,
             entry_count: entries.len() as u64,
-            hashed: opt.hash,
+            evidence: if !opt.hash {
+                TableEvidence::None
+            } else if sampled {
+                TableEvidence::Sampled
+            } else {
+                TableEvidence::Full
+            },
             excluded_dirs: excl_dirs,
             excluded_files: excl_files,
             walk_errors,
@@ -405,10 +422,10 @@ pub(super) fn scan_vfs(
             icloud_stub_samples: Vec::new(),
             dataless_files: 0,
             skipped_symlinks,
-            vfs: Some(super::vfs_note(vfs.as_ref(), opt, sampled)),
+            vfs: Some(super::vfs_note(vfs.as_ref())),
         },
         entries,
-    };
+    )?;
     metrics.emit(ctx, side, "vfs");
     pp.finish()?;
     Ok(snapshot)

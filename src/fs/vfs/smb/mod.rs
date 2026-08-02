@@ -21,18 +21,19 @@
 //!
 //! Admission was earned, not assumed: `smb_backend_conforms` runs the same twelve-check contract
 //! against a live server that the OS route was measured on, `set_mtime` included — the one method
-//! the crate has no high-level call for, and the one `fs::lock`'s heartbeat depends on.
+//! the crate has no high-level call for. Lease ownership itself uses immutable no-replace claims;
+//! mtime only keeps their owner-specific heartbeat record observable.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::error::{VfsError, VfsErrorKind, VfsResult};
-use super::spec::RemoteSpec;
+use super::spec::EndpointSpec;
+use super::VfsEntryKind;
 use super::{
     CaseSense, CredentialProvider, Medium, NameRules, ReadStream, Support, VDirEntry, VMeta, Vfs,
     VfsCaps, WriteHint, WriteStaged,
 };
-use crate::model::table::EntryKind;
 
 use smb2::client::connection::{CompoundOp, Connection};
 use smb2::msg::close::CloseRequest;
@@ -57,7 +58,7 @@ use staged::{SmbRead, SmbStaged};
 const STATUS_DIRECTORY_NOT_EMPTY: u32 = 0xC000_0101;
 
 pub struct SmbBackend {
-    spec: RemoteSpec,
+    spec: EndpointSpec,
     creds: Arc<dyn CredentialProvider>,
     /// Share name (first segment of the phrase root); the tree is connected to this.
     share: String,
@@ -83,7 +84,7 @@ struct Conn {
 }
 
 impl SmbBackend {
-    pub fn new(spec: RemoteSpec, creds: Arc<dyn CredentialProvider>) -> VfsResult<SmbBackend> {
+    pub fn new(spec: EndpointSpec, creds: Arc<dyn CredentialProvider>) -> VfsResult<SmbBackend> {
         let mut segs = spec.root.splitn(2, '/');
         let share = segs.next().unwrap_or("").to_string();
         if share.is_empty() {
@@ -217,7 +218,7 @@ impl SmbBackend {
         let parent = parent.trim_end_matches('/');
         match self.read_dir(parent) {
             Ok(entries) => {
-                if entries.iter().any(|e| e.name == name) {
+                if entries.iter().any(|e| e.name.as_str() == name) {
                     return Err(VfsError::new(
                         VfsErrorKind::Transient,
                         format!(
@@ -278,10 +279,10 @@ fn status_err(what: &str, command: Command, status: NtStatus) -> VfsError {
 /// Set a file's write time and nothing else: compound CREATE + SET_INFO + CLOSE, one
 /// round-trip, the shape the crate itself uses for `rename`.
 ///
-/// This is the one `Vfs` operation the crate offers no high-level call for, and the one the
-/// rest of the backend cannot do without — the compare window reads mtimes, and
-/// `fs::lock::RootLock`'s heartbeat *is* a repeated `set_mtime`, so a backend that cannot do
-/// this cannot hold a root lock. Shared by `Vfs::set_mtime` and the staged write's commit.
+/// This is the one `Vfs` operation the crate offers no high-level call for. The compare window
+/// reads mtimes, staged commits preserve them, and the root lease refreshes its owner-specific
+/// heartbeat timestamp for observation; immutable claims, not this timestamp, prove ownership.
+/// Shared by `Vfs::set_mtime` and the staged write's commit.
 ///
 /// `wire_path` must already be normalized (see `SmbBackend::wire_path`).
 /// `FileId::SENTINEL` is the compound's "the handle the previous operation just opened".
@@ -381,9 +382,9 @@ async fn set_write_time(
 fn meta_of(size: u64, is_dir: bool, modified_ticks: u64) -> VMeta {
     VMeta {
         kind: if is_dir {
-            EntryKind::Dir
+            VfsEntryKind::Directory
         } else {
-            EntryKind::File
+            VfsEntryKind::File
         },
         size,
         mtime_ms: basic_info::unix_ms_from_filetime(modified_ticks),
@@ -409,6 +410,10 @@ impl Vfs for SmbBackend {
             // FileRenameInformation goes out with ReplaceIfExists = 0, so an occupied target
             // is refused. The engine clears the destination itself; this records whose job it is.
             rename_overwrite: Support::No,
+            exclusive_staged_file_publish: Support::Yes,
+            exclusive_entry_rename: Support::Yes,
+            exclusive_symlink_publish: Support::No,
+            durable_namespace: Support::Unknown,
             ranged_read: Support::Yes, // positioned reads on one open handle
             write_at: Support::No,     // staged writes are sequential; delta is a both-local affair
             unix_mode: Support::No,
@@ -535,16 +540,23 @@ impl Vfs for SmbBackend {
         let entries = self.block("read_dir", async move {
             tree.list_directory(&mut conn, &p).await
         })?;
-        Ok(entries
-            .into_iter()
-            // The server sends the self and parent links; the table vocabulary has no room
-            // for them and the crate passes them through untouched.
-            .filter(|e| e.name != "." && e.name != "..")
-            .map(|e| VDirEntry {
-                meta: meta_of(e.size, e.is_directory, e.modified.0),
-                name: e.name,
-            })
-            .collect())
+        let mut out = Vec::new();
+        for entry in entries {
+            if entry.name == "." || entry.name == ".." {
+                continue;
+            }
+            let name = crate::foundation::path::EntryName::try_from(entry.name).map_err(|e| {
+                VfsError::new(
+                    VfsErrorKind::Protocol,
+                    format!("SMB server returned an invalid directory entry: {e}"),
+                )
+            })?;
+            out.push(VDirEntry {
+                meta: meta_of(entry.size, entry.is_directory, entry.modified.0),
+                name,
+            });
+        }
+        Ok(out)
     }
 
     fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>> {
@@ -603,7 +615,7 @@ impl Vfs for SmbBackend {
                     // "Already there" is the normal case on the way down an existing tree, but
                     // it is confirmed by looking rather than by trusting the status code.
                     match self.stat(&prefix)? {
-                        Some(m) if m.kind == EntryKind::Dir => {}
+                        Some(m) if m.kind == VfsEntryKind::Directory => {}
                         _ => return Err(e),
                     }
                 }
@@ -615,38 +627,55 @@ impl Vfs for SmbBackend {
     fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
         let c = self.conn()?;
         let (parent, base) = crate::foundation::path::split_parent(rel);
+        let token = super::random_name_token()?;
         let tmp_rel = format!(
-            "{parent}{}{base}.{}",
+            "{parent}{}{base}.{token}",
             crate::foundation::names::TEMP_PREFIX,
-            std::process::id()
         );
         let tmp_share_rel = self.share_rel(&tmp_rel);
 
-        // The staged open below does not truncate, so debris a previous interruption left
-        // under this name would survive as a tail on the new file. Clear it first; absent is
-        // the normal answer and not an error.
-        {
-            let (tree, mut conn) = (c.tree.clone(), c.conn.clone());
-            let p = tmp_share_rel.clone();
-            match self.block("clear stale temp", async move {
-                tree.delete_file(&mut conn, &p).await
-            }) {
-                Ok(()) => {}
-                Err(e) if e.kind == VfsErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        let (tree, mut conn) = (c.tree.clone(), c.conn.clone());
+        let (tree, conn) = (c.tree.clone(), c.conn.clone());
         // `Tree::open_file*` are the crate's raw primitives: unlike `stat`, `rename`,
         // `delete_file` and the `stream::open_file_*` helpers, they put the path on the wire
         // exactly as given. A '/'-separated one gets STATUS_INVALID_PARAMETER, so the wire
         // form goes in here and only here.
         let p = self.wire_path(&tmp_rel);
-        // Opened read+write with sharing allowed, which is what lets `staged_len` and the
-        // read-back ask the server directly while the handle is still open.
-        let (file_id, _) = self.block("open staged", async move {
-            tree.open_file_readwrite(&mut conn, &p).await
+        let (file_id, _) = self.block_vfs("open staged", async move {
+            let request = CreateRequest {
+                requested_oplock_level: OplockLevel::None,
+                impersonation_level: ImpersonationLevel::Impersonation,
+                desired_access: FileAccessMask::new(
+                    FileAccessMask::FILE_READ_DATA
+                        | FileAccessMask::FILE_WRITE_DATA
+                        | FileAccessMask::FILE_READ_ATTRIBUTES
+                        | FileAccessMask::FILE_WRITE_ATTRIBUTES
+                        | FileAccessMask::SYNCHRONIZE,
+                ),
+                file_attributes: 0x80,
+                share_access: ShareAccess(
+                    ShareAccess::FILE_SHARE_READ
+                        | ShareAccess::FILE_SHARE_WRITE
+                        | ShareAccess::FILE_SHARE_DELETE,
+                ),
+                create_disposition: CreateDisposition::FileCreate,
+                create_options: 0x0000_0040,
+                name: p,
+                create_contexts: vec![],
+            };
+            let frame = conn
+                .execute(Command::Create, &request, Some(tree.tree_id))
+                .await
+                .map_err(|e| map_smb_err("open staged", e))?;
+            if frame.header.status != NtStatus::SUCCESS {
+                return Err(status_err(
+                    "open staged",
+                    Command::Create,
+                    frame.header.status,
+                ));
+            }
+            let response = CreateResponse::unpack(&mut ReadCursor::new(&frame.body))
+                .map_err(|e| map_smb_err("open staged response", e))?;
+            Ok((response.file_id, response.end_of_file))
         })?;
         let max_write = c.conn.params().map(|p| p.max_write_size).unwrap_or(65_536);
         Ok(Box::new(SmbStaged {
@@ -724,10 +753,9 @@ impl Vfs for SmbBackend {
         }
     }
 
-    /// The one `Vfs` method the crate has no high-level call for, and the one the rest of the
-    /// backend cannot do without: the compare window reads mtimes, and `fs::lock::RootLock`'s
-    /// heartbeat *is* a repeated `set_mtime`, so a backend that cannot do this cannot hold a
-    /// root lock.
+    /// The one `Vfs` method the crate has no high-level call for. The compare window reads mtimes,
+    /// staged commits preserve them, and a root lease uses this only to refresh its observable
+    /// owner heartbeat; lease ownership comes from immutable no-replace claims.
     ///
     /// The wire work is `set_write_time`, shared with the staged write's commit.
     fn set_mtime(&self, rel: &str, mtime_ms: i64) -> VfsResult<()> {
@@ -763,7 +791,7 @@ mod tests {
     use crate::fs::vfs::spec::{parse, RootSpec};
 
     fn backend(s: &str) -> SmbBackend {
-        let RootSpec::Remote(r) = parse(s) else {
+        let RootSpec::Endpoint(r) = parse(s) else {
             panic!()
         };
         SmbBackend::new(r, crate::fs::vfs::cred::default_provider()).unwrap()
@@ -781,7 +809,7 @@ mod tests {
 
     #[test]
     fn no_share_is_refused_at_construction() {
-        let RootSpec::Remote(r) = parse("smb://server") else {
+        let RootSpec::Endpoint(r) = parse("smb://server") else {
             panic!()
         };
         assert!(SmbBackend::new(r, crate::fs::vfs::cred::default_provider()).is_err());

@@ -214,18 +214,14 @@ impl Write for Staged {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.file
             .as_mut()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed")
-            })?
+            .ok_or_else(|| std::io::Error::other("staged file already sealed"))?
             .write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.file
             .as_mut()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed")
-            })?
+            .ok_or_else(|| std::io::Error::other("staged file already sealed"))?
             .flush()
     }
 }
@@ -281,30 +277,22 @@ impl Staged {
         &self.tmp
     }
 
-    /// A caller may set mtime/mode on the sealed staging path before publication. When durable
-    /// writes were requested, persist those post-seal metadata changes without paying a second
-    /// file fsync for staged writes whose metadata was never touched.
-    pub(crate) fn resync_metadata_if_requested(&self) -> std::io::Result<()> {
-        if self.sync_parent_on_commit {
-            std::fs::File::open(&self.tmp)?.sync_all()?;
-        }
-        Ok(())
-    }
-
     /// Write the reader's entire content into the staged file
     pub fn write_all_from(&mut self, r: &mut dyn std::io::Read) -> std::io::Result<u64> {
-        let f = self.file.as_mut().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed")
-        })?;
+        let f = self
+            .file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("staged file already sealed"))?;
         std::io::copy(r, f)
     }
 
     /// Write a run of data at a given offset (delta transfer: patch only the chunks that differ)
     pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> std::io::Result<()> {
         use std::io::Seek;
-        let f = self.file.as_mut().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed")
-        })?;
+        let f = self
+            .file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("staged file already sealed"))?;
         f.seek(std::io::SeekFrom::Start(offset))?;
         f.write_all(buf)
     }
@@ -321,9 +309,10 @@ impl Staged {
         on_chunk: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
     ) -> std::io::Result<u64> {
         use std::io::Read;
-        let f = self.file.as_mut().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "staged file already sealed")
-        })?;
+        let f = self
+            .file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("staged file already sealed"))?;
         let mut reader = std::fs::File::open(src)?;
         let mut buf = vec![0u8; 1024 * 1024];
         let mut total = 0u64;

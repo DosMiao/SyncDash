@@ -81,7 +81,7 @@ fn nfc_and_nfd_agree_across_a_real_windows_mac_pair() {
     let local = std::env::temp_dir().join(format!("syncdash-uni-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&local);
     std::fs::create_dir_all(&local).unwrap();
-    let sv: Arc<dyn Vfs> = Arc::new(LocalVfs::new(local.clone()));
+    let sv: Arc<dyn Vfs> = Arc::new(LocalVfs::open(local.clone()).unwrap());
 
     place(&sv, NFC_NAME);
     place(&tv, NFD_NAME);

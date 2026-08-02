@@ -16,9 +16,8 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct Job {
-    /// Job-file schema version. A file written before the junk presets became part of `exclude`
-    /// carries no `schema` key, deserializes as 1, and is migrated on load — see `migrate_v1_junk_presets`.
-    /// `save_job` always stamps the current version, because a file we just wrote is by definition current.
+    /// Job-file schema version. A missing key means v1; load runs each one-way migration in order,
+    /// while every current save stamps `SCHEMA` and serializes only current fields.
     #[serde(default = "default_schema")]
     #[ts(type = "number")]
     pub schema: u32,
@@ -33,10 +32,9 @@ pub struct Job {
     /// Plain strings so a phrase survives serde untouched; `vfs::spec::parse` routes it.
     /// Serialized form is identical to the old PathBuf fields — existing job files load as-is.
     pub source: String,
-    pub target: String,
-    /// One source → **many targets** (the original 1:N requirement). Non-empty overrides the single target above:
-    /// each target gets its own comparison, its own plan, its own execution (source is scanned once).
-    /// mirror/enrich only — sync's N-way merge is version-vector territory, express it as paired jobs; ssh-peer jobs don't support multiple targets either.
+    /// One source → one or more targets. Each target owns its own comparison, plan, and execution.
+    /// The persisted current schema requires at least one entry; schema v1–v3 scalar `target`
+    /// storage is converted once by `migrate_v3_current_schema` during load.
     #[serde(default)]
     pub targets: Vec<String>,
     /// Archive of the last sync, for sync mode; refreshed automatically after a successful apply
@@ -56,8 +54,6 @@ pub struct Job {
     /// generated JSDoc, and those two characters would end the comment block early, yielding invalid .ts.
     #[serde(default)]
     pub exclude: Vec<String>,
-    #[serde(default)]
-    pub no_hash: bool,
     /// Rigor-level **shortcut preset**: quick | fast | balanced | standard | paranoid | custom.
     /// A preset is just a macro over the four detail knobs below; a detail field with a value **overrides** the preset's matching axis (the UI writes all four explicitly on save).
     #[serde(default = "default_rigor")]
@@ -85,7 +81,6 @@ pub struct Job {
     #[serde(default)]
     pub versioning: bool,
 
-    // v0.9 safety nets and new capabilities
     /// Require a `.syncdash-root` marker on both roots before touching anything (so an unmounted SMB share isn't treated as an empty directory).
     /// Recommended for new jobs; `syncdash mark <root>` writes the marker.
     #[serde(default)]
@@ -120,13 +115,13 @@ pub struct Job {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub parallel: Option<usize>,
-    /// M6 scheduled scan: compare automatically every N seconds (None = off). Second-level intervals = "near real-time"; use ≥30 for UNC targets
+    /// AutoScan's maximum full-verification interval in seconds (None = off).
     #[serde(default)]
     #[ts(type = "number | null")]
-    pub watch_interval_secs: Option<u64>,
-    /// Apply automatically when watch finds differences (default false = notify only, touch nothing)
+    pub autoscan_interval_secs: Option<u64>,
+    /// Apply an AutoScan result automatically when exact unattended authorization allows it.
     #[serde(default)]
-    pub watch_auto_apply: bool,
+    pub autoscan_auto_apply: bool,
 }
 
 impl Default for Job {
@@ -141,14 +136,12 @@ impl Default for Job {
             job_id: String::new(),
             mode: "mirror".into(),
             source: String::new(),
-            target: String::new(),
-            targets: Vec::new(),
+            targets: vec![String::new()],
             archive: None,
             include: Vec::new(),
             // A new job is born with the default-on junk presets already **written out** in exclude,
             // which is what `os_excludes = "auto"` used to mean invisibly
             exclude: crate::job::junk::default_junk_patterns(),
-            no_hash: false,
             rigor: default_rigor(),
             evidence: None,
             use_cache: None,
@@ -167,8 +160,8 @@ impl Default for Job {
             deletable: Vec::new(),
             delta: false,
             parallel: None,
-            watch_interval_secs: None,
-            watch_auto_apply: false,
+            autoscan_interval_secs: None,
+            autoscan_auto_apply: false,
         }
     }
 }
@@ -180,7 +173,7 @@ fn default_true() -> bool {
 /// Current job-file schema. Bump when a load-time migration is added, and give the migration a
 /// `schema < N` guard — the version is what tells "the user deleted this rule" apart from
 /// "this file predates the rule", which no amount of inspecting the contents can.
-pub const SCHEMA: u32 = 3;
+pub const SCHEMA: u32 = 4;
 fn default_schema() -> u32 {
     1 // no `schema` key in the file = written before versioning existed = needs the v1 migration
 }
@@ -210,7 +203,7 @@ pub fn config_revision(job: &Job) -> Result<String, String> {
     let bytes = serde_json::to_vec(&canonical)
         .map_err(|e| format!("cannot identify this job configuration: {e}"))?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"syncdash-job-config-v1\0");
+    hasher.update(b"syncdash-job-config-v2\0");
     hasher.update(&bytes);
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -235,20 +228,6 @@ impl Job {
     /// The source root as a filesystem path (valid for local roots; VFS roots go through `vfs::open`)
     pub fn source_path(&self) -> &std::path::Path {
         std::path::Path::new(&self.source)
-    }
-
-    /// The target root as a filesystem path (valid for local roots; VFS roots go through `vfs::open`)
-    pub fn target_path(&self) -> &std::path::Path {
-        std::path::Path::new(&self.target)
-    }
-
-    /// The effective target list: `targets` when non-empty, otherwise fall back to the single `target`
-    pub fn target_list(&self) -> Vec<String> {
-        if self.targets.is_empty() {
-            vec![self.target.clone()]
-        } else {
-            self.targets.clone()
-        }
     }
 
     /// Validate every persisted engine setting before the job can be compared or written.
@@ -281,25 +260,29 @@ impl Job {
                 return Err("parallel must be between 1 and 16".into());
             }
         }
-        if self.watch_interval_secs == Some(0) {
-            return Err("watch_interval_secs must be at least 1 when watch is enabled".into());
+        if self.autoscan_interval_secs == Some(0) {
+            return Err(
+                "autoscan_interval_secs must be at least 1 when AutoScan is enabled".into(),
+            );
         }
-        if self.watch_auto_apply && self.watch_interval_secs.is_none() {
-            return Err("watch_auto_apply requires watch_interval_secs".into());
+        if self.autoscan_auto_apply && self.autoscan_interval_secs.is_none() {
+            return Err("autoscan_auto_apply requires autoscan_interval_secs".into());
         }
 
-        self.validate_multi_target()?;
-        validate_root_relationships(&self.source, &self.target_list())
+        self.validate_target_rules()?;
+        validate_root_relationships(&self.source, &self.targets)
     }
 
-    /// Validity of the job's shape (multi-target rules + root phrases — the error must be clear before comparing)
-    pub fn validate_multi_target(&self) -> Result<(), String> {
+    fn validate_target_rules(&self) -> Result<(), String> {
+        if self.targets.is_empty() {
+            return Err("a job must contain at least one target root".into());
+        }
         if self.targets.len() > 1 {
             if self.mode == "sync" {
                 return Err("sync mode does not support multiple targets (N-way merge needs version-vector attribution) — use paired sync jobs instead (hub-and-spoke)".into());
             }
             if self
-                .target_list()
+                .targets
                 .iter()
                 .any(|t| crate::fs::vfs::spec::is_peer(t))
             {
@@ -321,12 +304,11 @@ impl Job {
         if self.source.trim().is_empty() {
             return Err("source root cannot be empty".into());
         }
-        let targets = self.target_list();
-        if targets.iter().any(|target| target.trim().is_empty()) {
+        if self.targets.iter().any(|target| target.trim().is_empty()) {
             return Err("target root cannot be empty".into());
         }
         for (label, s) in std::iter::once(("source", &self.source))
-            .chain(targets.iter().map(|target| ("target", target)))
+            .chain(self.targets.iter().map(|target| ("target", target)))
         {
             match parse(s) {
                 RootSpec::UnknownScheme { scheme, .. } => {
@@ -335,14 +317,14 @@ impl Job {
                         KNOWN_SCHEMES.join(", ")
                     ));
                 }
-                RootSpec::Remote(remote) if remote.host.trim().is_empty() => {
-                    return Err(format!("{label} '{s}': remote root host cannot be empty"));
+                RootSpec::Endpoint(endpoint) if endpoint.host.trim().is_empty() => {
+                    return Err(format!("{label} '{s}': endpoint host cannot be empty"));
                 }
-                RootSpec::Remote(remote)
-                    if remote.root.split('/').any(|segment| segment == "..") =>
+                RootSpec::Endpoint(endpoint)
+                    if endpoint.root.split('/').any(|segment| segment == "..") =>
                 {
                     return Err(format!(
-                        "{label} '{s}': remote root cannot contain a '..' segment"
+                        "{label} '{s}': endpoint root cannot contain a '..' segment"
                     ));
                 }
                 _ => {}
@@ -360,12 +342,53 @@ impl Job {
         Ok(())
     }
 
-    /// Derive a "single-target view" of the job: the engine's / desktop's single pipeline is reused as-is
-    pub fn for_target(&self, t: &str) -> Job {
-        let mut j = self.clone();
-        j.target = t.to_string();
-        j.targets = Vec::new();
-        j
+    /// Bind the persisted configuration to exactly one target before entering a phrase-based
+    /// compare or apply pipeline.
+    pub fn select_target(&self, target_index: usize) -> Result<SingleTargetJob, String> {
+        self.validate()?;
+        let target = self.targets.get(target_index).cloned().ok_or_else(|| {
+            format!(
+                "target index {target_index} is out of range ({} total)",
+                self.targets.len()
+            )
+        })?;
+        let mut configuration = self.clone();
+        configuration.targets = vec![target];
+        Ok(SingleTargetJob {
+            configuration,
+            target_index,
+        })
+    }
+}
+
+/// A validated job configuration normalized to exactly one target, plus its index in the persisted
+/// job that selected it.
+///
+/// Phrase-based execution accepts this type instead of `Job`, so no run can accidentally infer a
+/// scalar target from a multi-target configuration. The fields stay private to preserve the
+/// validation, bounds, and one-target checks performed by `Job::select_target`.
+#[derive(Clone, Debug)]
+pub struct SingleTargetJob {
+    configuration: Job,
+    target_index: usize,
+}
+
+impl SingleTargetJob {
+    pub fn configuration(&self) -> &Job {
+        &self.configuration
+    }
+
+    pub fn target_index(&self) -> usize {
+        self.target_index
+    }
+
+    pub fn target(&self) -> &str {
+        &self.configuration.targets[0]
+    }
+
+    /// The target root as a filesystem path (valid for local roots; VFS roots go through `vfs::open`).
+    pub fn target_path(&self) -> &std::path::Path {
+        std::path::Path::new(self.target())
     }
 }
 
@@ -407,26 +430,28 @@ struct ComparableLocalRoot {
 }
 
 #[derive(PartialEq, Eq)]
-struct ComparableRemoteRoot {
+struct ComparableEndpointRoot {
     endpoint: String,
     segments: Vec<String>,
 }
 
-fn comparable_remote_root(raw: &str) -> Option<ComparableRemoteRoot> {
+fn comparable_endpoint_root(raw: &str) -> Option<ComparableEndpointRoot> {
     use crate::fs::vfs::spec::{default_port, parse, RootSpec};
-    let RootSpec::Remote(remote) = parse(raw) else {
+    let RootSpec::Endpoint(endpoint_spec) = parse(raw) else {
         return None;
     };
-    let user = remote.user.as_deref().unwrap_or("");
+    let user = endpoint_spec.user.as_deref().unwrap_or("");
     let endpoint = format!(
         "{}://{}@{}:{}",
-        remote.scheme,
+        endpoint_spec.scheme,
         user,
-        remote.host.to_lowercase(),
-        remote.port.unwrap_or(default_port(&remote.scheme)),
+        endpoint_spec.host.to_lowercase(),
+        endpoint_spec
+            .port
+            .unwrap_or(default_port(&endpoint_spec.scheme)),
     );
-    let case_insensitive = remote.scheme == "smb";
-    let segments = remote
+    let case_insensitive = endpoint_spec.scheme == "smb";
+    let segments = endpoint_spec
         .root
         .split('/')
         .filter(|segment| !segment.is_empty() && *segment != ".")
@@ -438,7 +463,7 @@ fn comparable_remote_root(raw: &str) -> Option<ComparableRemoteRoot> {
             }
         })
         .collect();
-    Some(ComparableRemoteRoot { endpoint, segments })
+    Some(ComparableEndpointRoot { endpoint, segments })
 }
 
 fn comparable_local_root(raw: &str) -> Option<ComparableLocalRoot> {
@@ -491,7 +516,7 @@ fn comparable_local_root(raw: &str) -> Option<ComparableLocalRoot> {
 
 fn validate_root_relationships(source: &str, targets: &[String]) -> Result<(), String> {
     let source_local = comparable_local_root(source);
-    let source_remote = comparable_remote_root(source);
+    let source_endpoint = comparable_endpoint_root(source);
     let source_identity = root_identity(source);
     let mut seen = Vec::<String>::new();
     for (index, target) in targets.iter().enumerate() {
@@ -518,7 +543,7 @@ fn validate_root_relationships(source: &str, targets: &[String]) -> Result<(), S
         }
 
         if let (Some(source_root), Some(target_root)) =
-            (source_remote.as_ref(), comparable_remote_root(target))
+            (source_endpoint.as_ref(), comparable_endpoint_root(target))
         {
             if source_root.endpoint == target_root.endpoint {
                 if target_root.segments.starts_with(&source_root.segments) {
@@ -539,8 +564,8 @@ pub fn validate_root_pair(source: &str, target: &str) -> Result<(), String> {
 
 fn root_identity(raw: &str) -> String {
     match crate::fs::vfs::spec::parse(raw) {
-        crate::fs::vfs::spec::RootSpec::Remote(remote) => {
-            format!("remote:{}", remote.identity())
+        crate::fs::vfs::spec::RootSpec::Endpoint(endpoint) => {
+            format!("endpoint:{}", endpoint.identity())
         }
         crate::fs::vfs::spec::RootSpec::Local(_) => comparable_local_root(raw)
             .map(|root| format!("local:{}:{}", root.prefix, root.segments.join("/")))
@@ -554,14 +579,13 @@ fn root_identity(raw: &str) -> String {
 /// The **resolved** rigor level: the preset lays the base, the four detail Options override it.
 
 impl Job {
-    /// preset → baseline; a detail field with a value overrides its axis; `no_hash` (legacy field) forces hashing off last
+    /// Resolve a rigor preset plus any explicit detail overrides.
     pub fn rigor_resolved(&self) -> RigorResolved {
         RigorResolved::from_preset(&self.rigor)
             .with_evidence(self.evidence.as_deref())
             .with_cache(self.use_cache)
             .with_escalate(self.escalate)
             .with_verify_writes(self.verify_writes)
-            .with_no_hash(self.no_hash)
     }
 
     /// The read-side capability query (window already widened to the coarser backend)
@@ -619,7 +643,7 @@ impl Job {
             },
             sync_mode: self.sync_mode,
             max_conflicts: self.max_conflicts,
-            // Widened to max(source, target) backend precision once the roots resolve through the VFS (M3)
+            // Root resolution widens this to the coarser backend precision.
             mtime_window_ms: crate::model::plan::MTIME_SLACK_MS,
         }
     }
@@ -770,6 +794,17 @@ fn load_path(path: &Path) -> std::io::Result<(String, Job)> {
             format!("bad job file {}: {e}", path.display()),
         )
     })?;
+    if job.schema > SCHEMA {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bad job file {}: schema v{} is newer than supported schema v{}",
+                path.display(),
+                job.schema,
+                SCHEMA
+            ),
+        ));
+    }
     // Each migration guards its own version and none of them stamps `schema`; the stamp happens
     // once, here, after the last one. A migration that stamped SCHEMA itself would skip every
     // later migration the moment one was added.
@@ -778,6 +813,23 @@ fn load_path(path: &Path) -> std::io::Result<(String, Job)> {
     }
     if job.schema < 3 {
         migrate_v2_peer_target(&mut job, &text);
+    }
+    if job.schema < 4 {
+        migrate_v3_current_schema(&mut job, &text).map_err(|reason| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad job file {}: {reason}", path.display()),
+            )
+        })?;
+    }
+    if job.targets.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bad job file {}: current job schema requires at least one target",
+                path.display()
+            ),
+        ));
     }
     job.schema = SCHEMA;
     Ok((name, job))
@@ -850,6 +902,9 @@ struct LegacyPeerKeys {
 /// keeps a migrated job doing exactly what it did before, which is the whole bar for a migration —
 /// quietly losing the pull direction would be a data-flow change disguised as a rename.
 fn migrate_v2_peer_target(job: &mut Job, text: &str) {
+    if !job.targets.is_empty() {
+        return;
+    }
     let Ok(legacy) = toml::from_str::<LegacyPeerKeys>(text) else {
         return;
     };
@@ -871,10 +926,53 @@ fn migrate_v2_peer_target(job: &mut Job, text: &str) {
     }
     // The old target was the mount the pull direction used. An empty one means there was never a
     // pull path, so there is nothing to declare.
-    if !job.target.trim().is_empty() {
-        phrase.push_str(&format!("|mount={}", job.target.trim()));
+    let Ok(mut legacy) = toml::from_str::<LegacyV3Fields>(text) else {
+        return;
+    };
+    let legacy_target = legacy.target.take().unwrap_or_default();
+    if !legacy_target.trim().is_empty() {
+        phrase.push_str(&format!("|mount={}", legacy_target.trim()));
     }
-    job.target = phrase;
+    job.targets = vec![phrase];
+}
+
+#[derive(Deserialize)]
+struct LegacyV3Fields {
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    watch_interval_secs: Option<u64>,
+    #[serde(default)]
+    watch_auto_apply: bool,
+    #[serde(default)]
+    no_hash: bool,
+}
+
+/// v3 → v4: remove the three settings that duplicated current runtime policy.
+///
+/// The target precedence and `no_hash` override are reproduced here once so legacy jobs retain
+/// their effective roots and evidence behavior. After this boundary the current `Job` type carries
+/// only canonical target, AutoScan, and evidence fields.
+fn migrate_v3_current_schema(job: &mut Job, text: &str) -> Result<(), String> {
+    let legacy: LegacyV3Fields =
+        toml::from_str(text).map_err(|error| format!("cannot read legacy settings: {error}"))?;
+    if job.targets.is_empty() {
+        let target = legacy
+            .target
+            .ok_or_else(|| "legacy job has neither `target` nor `targets`".to_string())?;
+        job.targets.push(target);
+    }
+    job.autoscan_interval_secs = legacy.watch_interval_secs;
+    job.autoscan_auto_apply = legacy.watch_auto_apply;
+    if legacy.no_hash {
+        let verify_writes = job.rigor_resolved().verify_writes;
+        job.rigor = "custom".into();
+        job.evidence = Some("none".into());
+        job.use_cache = Some(false);
+        job.escalate = Some(false);
+        job.verify_writes = Some(verify_writes);
+    }
+    Ok(())
 }
 
 pub fn load_all() -> std::io::Result<Vec<(String, Job)>> {
@@ -1003,6 +1101,14 @@ pub enum JobMutationEffect {
     Deleted,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../typescript/core/types/generated/")]
+pub enum JobRootField {
+    Source,
+    Target,
+}
+
 #[derive(Debug)]
 pub struct SavedJob {
     pub name: String,
@@ -1011,6 +1117,13 @@ pub struct SavedJob {
     pub config_revision: String,
     pub effect: JobMutationEffect,
     pub previous_name: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct JobRootMutation {
+    pub mutation: SavedJob,
+    pub source: String,
+    pub targets: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1075,6 +1188,46 @@ fn require_revision(path: &Path, name: &str, expected: &str) -> std::io::Result<
     Ok(())
 }
 
+fn load_expected_job(
+    path: &Path,
+    name: &str,
+    expected_job_id: &str,
+    expected_config_revision: &str,
+) -> std::io::Result<Job> {
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("job not found: {name}"),
+        ));
+    }
+    let (_, current) = load_path(path)?;
+    validate_job_id(&current.job_id).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("bad job file {}: {error}", path.display()),
+        )
+    })?;
+    if current.job_id != expected_job_id {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "job '{name}' was replaced since this editor loaded it (expected job_id '{expected_job_id}', found '{}') — reload before saving",
+                current.job_id
+            ),
+        ));
+    }
+    let current_revision = config_revision(&current).map_err(invalid_job)?;
+    if current_revision != expected_config_revision {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "job '{name}' changed on disk (expected revision {expected_config_revision}, found {current_revision}) — reload before saving"
+            ),
+        ));
+    }
+    Ok(current)
+}
+
 fn staged_job(path: &Path, job: &Job) -> std::io::Result<crate::fs::staged::Staged> {
     let text = toml::to_string_pretty(job).map_err(|e| {
         std::io::Error::new(
@@ -1099,6 +1252,156 @@ fn rename_without_overwrite(source: &Path, destination: &Path) -> std::io::Resul
         return Err(error);
     }
     Ok(())
+}
+
+fn require_target(job: &Job, target_index: usize) -> std::io::Result<()> {
+    if target_index >= job.targets.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "target_index {target_index} is out of range for {} target(s)",
+                job.targets.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn target_mut(job: &mut Job, target_index: usize) -> &mut String {
+    &mut job.targets[target_index]
+}
+
+fn mutate_job_roots_in<F>(
+    dir: &Path,
+    name: &str,
+    expected_job_id: &str,
+    expected_config_revision: &str,
+    target_index: usize,
+    mutate: F,
+) -> std::io::Result<JobRootMutation>
+where
+    F: FnOnce(&mut Job) -> std::io::Result<()>,
+{
+    validate_job_id(expected_job_id)?;
+    let _lock = lock_job_mutations(dir)?;
+    let path = registered_job_path_in(dir, name)?;
+    let mut current = load_expected_job(&path, name, expected_job_id, expected_config_revision)?;
+    require_target(&current, target_index)?;
+    mutate(&mut current)?;
+    current.schema = SCHEMA;
+    current.validate().map_err(invalid_job)?;
+    let config_revision = config_revision(&current).map_err(invalid_job)?;
+    let effect = if config_revision == expected_config_revision && file_schema_at(&path)? == SCHEMA
+    {
+        JobMutationEffect::NoOp
+    } else {
+        let staged = staged_job(&path, &current)?;
+        load_expected_job(&path, name, expected_job_id, expected_config_revision)?;
+        staged.commit()?;
+        JobMutationEffect::Updated
+    };
+    Ok(JobRootMutation {
+        mutation: SavedJob {
+            name: name.to_string(),
+            path,
+            job_id: current.job_id,
+            config_revision,
+            effect,
+            previous_name: None,
+        },
+        source: current.source,
+        targets: current.targets,
+    })
+}
+
+pub fn update_job_root(
+    name: &str,
+    expected_job_id: &str,
+    expected_config_revision: &str,
+    target_index: usize,
+    field: JobRootField,
+    value: &str,
+) -> std::io::Result<JobRootMutation> {
+    update_job_root_in(
+        &crate::foundation::dirs::jobs_dir(),
+        name,
+        expected_job_id,
+        expected_config_revision,
+        target_index,
+        field,
+        value,
+    )
+}
+
+fn update_job_root_in(
+    dir: &Path,
+    name: &str,
+    expected_job_id: &str,
+    expected_config_revision: &str,
+    target_index: usize,
+    field: JobRootField,
+    value: &str,
+) -> std::io::Result<JobRootMutation> {
+    if value.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "root value cannot be empty",
+        ));
+    }
+    mutate_job_roots_in(
+        dir,
+        name,
+        expected_job_id,
+        expected_config_revision,
+        target_index,
+        |current| {
+            match field {
+                JobRootField::Source => current.source = value.to_string(),
+                JobRootField::Target => {
+                    *target_mut(current, target_index) = value.to_string();
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+pub fn swap_job_roots(
+    name: &str,
+    expected_job_id: &str,
+    expected_config_revision: &str,
+    target_index: usize,
+) -> std::io::Result<JobRootMutation> {
+    swap_job_roots_in(
+        &crate::foundation::dirs::jobs_dir(),
+        name,
+        expected_job_id,
+        expected_config_revision,
+        target_index,
+    )
+}
+
+fn swap_job_roots_in(
+    dir: &Path,
+    name: &str,
+    expected_job_id: &str,
+    expected_config_revision: &str,
+    target_index: usize,
+) -> std::io::Result<JobRootMutation> {
+    mutate_job_roots_in(
+        dir,
+        name,
+        expected_job_id,
+        expected_config_revision,
+        target_index,
+        |current| {
+            let previous_source = std::mem::take(&mut current.source);
+            let previous_target =
+                std::mem::replace(target_mut(current, target_index), previous_source);
+            current.source = previous_target;
+            Ok(())
+        },
+    )
 }
 
 /// Create, update, or rename one registered job without overwriting an unseen revision.
@@ -1278,11 +1581,11 @@ fn delete_job_in(
 }
 
 pub const SAMPLE: &str = r#"# <name>.toml in the jobs directory — one file, one job
-schema = 3                              # job-file schema; a file without it is migrated on load (junk presets -> exclude)
+schema = 4                              # job-file schema; older scalar-target files migrate on load
 # job_id is assigned by the registry on first load/save; do not copy it to another job
 mode = "mirror"                         # mirror | sync | enrich
 source = 'D:\some\dir'                  # a Windows path; on mac/Linux e.g. '/Users/me/Code'
-target = '\\host\share\dir'             # or a root phrase: smb:// sftp:// ftp:// ftps:// peer://
+targets = ['\\host\share\dir']          # one or more roots: local paths, smb:// sftp:// ftp:// ftps:// peer://
 # archive = '…/syncdash/archive/<name>.jsonl'   # sync mode only; sits beside this jobs/ directory.
 #                                       # Without it deletes and moves are not attributed — `syncdash gen-jobs` writes the path for you
 # include = ['*']                       # FFS filter-syntax allowlist (empty = everything)
@@ -1300,9 +1603,8 @@ target = '\\host\share\dir'             # or a root phrase: smb:// sftp:// ftp:/
 # symlinks = "exclude"                  # exclude | direct (sync the link itself)
 # versioning = true                     # deleted/overwritten files go into each root's .version_syncDash/
 #                                       # (browse and recover with syncdash versions / restore; the local trash by default)
-# no_hash = false
 #
-# --- safety gates (v0.9) ---
+# --- safety gates ---
 # require_marker = true                 # both roots need .syncdash-root before anything is touched
 #                                       # (`syncdash mark <root>` writes it; stops an unmounted share from looking like an empty directory)
 # min_free_pct = 0.01                   # minimum free ratio to leave after writing; 0 disables
@@ -1322,14 +1624,14 @@ target = '\\host\share\dir'             # or a root phrase: smb:// sftp:// ftp:/
 # delta = true                          # big files on local/mounted disks written chunk-wise; pays off for SMB uploads, a wash on symmetric links
 # parallel = 4                          # Copy/Update parallel width (1 = sequential; over SMB 2-4 streams basically saturate the uplink)
 #
-# --- watch (M6 scheduled scan) ---
-# watch_interval_secs = 30              # compare automatically every N seconds; fast/balanced let an unchanged tree reuse content evidence
-# watch_auto_apply = false              # apply automatically on differences (notify only by default)
+# --- AutoScan ---
+# autoscan_interval_secs = 30           # maximum full verification interval; local macOS roots also react to FSEvents
+# autoscan_auto_apply = false           # run an authorized result automatically; notify/review by default
 #
 # --- peer targets (optional) ---
 # A `peer://` target means the far side runs its own syncdash: it scans its own disk (no hashing
 # over a share) and applies a package this side builds. The whole link is in the phrase.
-# target = 'peer://mac/Users/xxx/Code/some/dir|exe=~/Code/SyncDash/target/release/syncdash|mount=\\mac\share\some\dir'
+# targets = ['peer://mac/Users/xxx/Code/some/dir|exe=~/Code/SyncDash/target/release/syncdash|mount=\\mac\share\some\dir']
 #   exe=    path to syncdash on the far side; omit if it is on PATH
 #   mount=  a local path serving the SAME tree. The peer lane only pushes, so the pull (source-side)
 #           direction writes through this instead. Omit it and a job that only pushes is unaffected;
@@ -1449,14 +1751,15 @@ mod migration_tests {
         );
         assert_eq!(j.schema, SCHEMA);
         assert_eq!(
-            j.target,
-            r"peer://mac/Users/ben/Code/x|exe=~/bin/syncdash|mount=\\mac\share\x"
+            j.targets,
+            vec![r"peer://mac/Users/ben/Code/x|exe=~/bin/syncdash|mount=\\mac\share\x".to_string()]
         );
         // …and it still routes to the peer lane, which is the behaviour that must not change
-        assert!(crate::fs::vfs::spec::is_peer(&j.target));
-        let crate::fs::vfs::spec::RootSpec::Remote(r) = crate::fs::vfs::spec::parse(&j.target)
+        assert!(crate::fs::vfs::spec::is_peer(&j.targets[0]));
+        let crate::fs::vfs::spec::RootSpec::Endpoint(r) =
+            crate::fs::vfs::spec::parse(&j.targets[0])
         else {
-            panic!("a migrated peer target must parse as a remote root")
+            panic!("a migrated peer target must parse as an endpoint root")
         };
         assert_eq!(r.host, "mac");
         assert_eq!(r.root, "Users/ben/Code/x");
@@ -1472,7 +1775,8 @@ mod migration_tests {
              remote_host = 'mac'\nremote_root = '/Users/ben/x'\n",
         );
         assert_eq!(
-            j.target, "peer://mac/Users/ben/x",
+            j.targets,
+            vec!["peer://mac/Users/ben/x".to_string()],
             "no exe and no mount = nothing to declare"
         );
     }
@@ -1485,8 +1789,80 @@ mod migration_tests {
             "v2-nopeer",
             "schema = 2\nmode = 'mirror'\nsource = 'S'\ntarget = 'T'\n",
         );
-        assert_eq!(j.target, "T");
-        assert!(!crate::fs::vfs::spec::is_peer(&j.target));
+        assert_eq!(j.targets, vec!["T"]);
+        assert!(!crate::fs::vfs::spec::is_peer(&j.targets[0]));
+    }
+
+    #[test]
+    fn v3_target_storage_migrates_to_one_canonical_list() {
+        let scalar = load_text(
+            "v3-scalar-target",
+            "schema = 3\nmode = 'mirror'\nsource = 'S'\ntarget = 'T'\n",
+        );
+        assert_eq!(scalar.targets, vec!["T"]);
+
+        let list = load_text(
+            "v3-list-targets",
+            "schema = 3\nmode = 'mirror'\nsource = 'S'\ntarget = 'obsolete'\n\
+             targets = ['A', 'B']\n",
+        );
+        assert_eq!(list.targets, vec!["A", "B"]);
+
+        let serialized = toml::to_string_pretty(&list).unwrap();
+        assert!(serialized.contains("targets = ["));
+        assert!(!serialized.lines().any(|line| line.starts_with("target = ")));
+    }
+
+    #[test]
+    fn v3_watch_and_no_hash_settings_migrate_to_canonical_policy() {
+        let migrated = load_text(
+            "v3-canonical-policy",
+            "schema = 3\nmode = 'mirror'\nsource = 'S'\ntarget = 'T'\n\
+             rigor = 'paranoid'\nno_hash = true\nwatch_interval_secs = 45\nwatch_auto_apply = true\n",
+        );
+        assert_eq!(migrated.autoscan_interval_secs, Some(45));
+        assert!(migrated.autoscan_auto_apply);
+        assert_eq!(migrated.rigor, "custom");
+        assert_eq!(migrated.evidence.as_deref(), Some("none"));
+        assert_eq!(migrated.use_cache, Some(false));
+        assert_eq!(migrated.escalate, Some(false));
+        assert_eq!(migrated.verify_writes, Some(true));
+        let resolved = migrated.rigor_resolved();
+        assert!(!resolved.hash);
+        assert!(resolved.verify_writes);
+
+        let serialized = toml::to_string_pretty(&migrated).unwrap();
+        for retired in ["no_hash", "watch_interval_secs", "watch_auto_apply"] {
+            assert!(!serialized.lines().any(|line| line.starts_with(retired)));
+        }
+    }
+
+    #[test]
+    fn current_schema_refuses_missing_target_authority() {
+        let path = std::env::temp_dir().join(format!(
+            "syncdash-job-v4-missing-targets-{}.toml",
+            crate::foundation::time::now_ms()
+        ));
+        std::fs::write(&path, "schema = 4\nmode = 'mirror'\nsource = 'S'\n").unwrap();
+        let error = load(&path.to_string_lossy()).unwrap_err();
+        let _ = std::fs::remove_file(path);
+        assert!(error.to_string().contains("requires at least one target"));
+    }
+
+    #[test]
+    fn future_schema_is_refused_instead_of_downgraded() {
+        let path = std::env::temp_dir().join(format!(
+            "syncdash-job-future-schema-{}.toml",
+            crate::foundation::time::now_ms()
+        ));
+        std::fs::write(
+            &path,
+            "schema = 5\nmode = 'mirror'\nsource = 'S'\ntargets = ['T']\n",
+        )
+        .unwrap();
+        let error = load(&path.to_string_lossy()).unwrap_err();
+        let _ = std::fs::remove_file(path);
+        assert!(error.to_string().contains("schema v5 is newer"));
     }
 
     /// A v1 peer job has to pass through BOTH migrations. This is what the per-version guards buy:
@@ -1506,7 +1882,8 @@ mod migration_tests {
             "the v1 junk migration still ran"
         );
         assert_eq!(
-            j.target, "peer://mac/Users/ben/x|mount=T",
+            j.targets,
+            vec!["peer://mac/Users/ben/x|mount=T".to_string()],
             "…and so did the v2 one"
         );
     }
@@ -1524,7 +1901,7 @@ mod migration_tests {
         );
         let j = Job {
             source: "S".into(),
-            target: "T".into(),
+            targets: vec!["T".into()],
             exclude: vec!["*/only_mine/".into()],
             ..Default::default()
         };
@@ -1666,7 +2043,7 @@ mod revision_tests {
         let original = Job {
             schema: 1,
             source: "source".into(),
-            target: "target".into(),
+            targets: vec!["target".into()],
             exclude: vec!["*.tmp".into()],
             ..Default::default()
         };
@@ -1715,7 +2092,7 @@ mod validation_tests {
     fn valid_job() -> Job {
         Job {
             source: "/data/source".into(),
-            target: "/data/target".into(),
+            targets: vec!["/data/target".into()],
             ..Default::default()
         }
     }
@@ -1776,15 +2153,25 @@ mod validation_tests {
         job.max_conflicts = -2;
         assert!(job.validate().unwrap_err().contains("max_conflicts"));
         let mut job = valid_job();
-        job.watch_interval_secs = Some(0);
-        assert!(job.validate().unwrap_err().contains("watch_interval_secs"));
+        job.autoscan_interval_secs = Some(0);
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .contains("autoscan_interval_secs"));
         let mut job = valid_job();
-        job.watch_auto_apply = true;
-        assert!(job.validate().unwrap_err().contains("watch_auto_apply"));
+        job.autoscan_auto_apply = true;
+        assert!(job.validate().unwrap_err().contains("autoscan_auto_apply"));
     }
 
     #[test]
     fn roots_must_be_present_distinct_and_not_nested() {
+        let mut job = valid_job();
+        job.targets.clear();
+        assert!(job
+            .validate()
+            .unwrap_err()
+            .contains("at least one target root"));
+
         let mut job = valid_job();
         job.source.clear();
         assert!(job
@@ -1793,14 +2180,14 @@ mod validation_tests {
             .contains("source root cannot be empty"));
 
         let mut job = valid_job();
-        job.target = "/data/source".into();
+        job.targets[0] = "/data/source".into();
         assert!(job
             .validate()
             .unwrap_err()
             .contains("different directories"));
 
         let mut job = valid_job();
-        job.target = "/data/source/child".into();
+        job.targets[0] = "/data/source/child".into();
         assert!(job
             .validate()
             .unwrap_err()
@@ -1808,7 +2195,7 @@ mod validation_tests {
 
         let mut job = valid_job();
         job.source = r"C:\Data\Source".into();
-        job.target = r"c:/data/source/child".into();
+        job.targets[0] = r"c:/data/source/child".into();
         assert!(job
             .validate()
             .unwrap_err()
@@ -1820,7 +2207,7 @@ mod validation_tests {
 
         let mut job = valid_job();
         job.source = "sftp://user@host/data/source".into();
-        job.target = "sftp://user@HOST:22/data/source/child".into();
+        job.targets[0] = "sftp://user@HOST:22/data/source/child".into();
         assert!(job
             .validate()
             .unwrap_err()
@@ -1828,11 +2215,25 @@ mod validation_tests {
 
         let mut job = valid_job();
         job.source = "sftp://host/data".into();
-        job.target = "sftp://host/data/../escape".into();
+        job.targets[0] = "sftp://host/data/../escape".into();
         assert!(job
             .validate()
             .unwrap_err()
             .contains("cannot contain a '..'"));
+    }
+
+    #[test]
+    fn single_target_job_binds_one_validated_target_index() {
+        let mut job = valid_job();
+        job.mode = "mirror".into();
+        job.targets.push("/data/backup".into());
+        let selected = job.select_target(1).unwrap();
+        assert_eq!(selected.target_index(), 1);
+        assert_eq!(selected.target(), "/data/backup");
+        assert_eq!(selected.configuration().targets, vec!["/data/backup"]);
+
+        let error = job.select_target(2).unwrap_err();
+        assert!(error.contains("out of range"));
     }
 
     #[test]
@@ -1937,6 +2338,199 @@ mod validation_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn create_root_mutation_fixture(tag: &str) -> (PathBuf, SavedJob, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "syncdash-job-root-{tag}-{}-{}",
+            std::process::id(),
+            crate::foundation::time::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = Job {
+            source: "/data/source".into(),
+            targets: vec!["/data/one".into(), "/data/two".into()],
+            ..Default::default()
+        };
+        let revision = config_revision(&job).unwrap();
+        let saved = save_job_in(&dir, "photos", &job, None, None, revision.clone()).unwrap();
+        (dir, saved, revision)
+    }
+
+    #[test]
+    fn root_mutations_fence_job_identity_revision_and_target_index() {
+        let (dir, saved, revision) = create_root_mutation_fixture("fencing");
+        let wrong_identity = update_job_root_in(
+            &dir,
+            "photos",
+            "ffffffffffffffffffffffffffffffff",
+            &revision,
+            0,
+            JobRootField::Source,
+            "/data/revised",
+        )
+        .unwrap_err();
+        assert_eq!(wrong_identity.kind(), std::io::ErrorKind::WouldBlock);
+
+        let stale_revision = update_job_root_in(
+            &dir,
+            "photos",
+            &saved.job_id,
+            "stale-revision",
+            0,
+            JobRootField::Source,
+            "/data/revised",
+        )
+        .unwrap_err();
+        assert_eq!(stale_revision.kind(), std::io::ErrorKind::WouldBlock);
+
+        let missing_target = update_job_root_in(
+            &dir,
+            "photos",
+            &saved.job_id,
+            &revision,
+            2,
+            JobRootField::Target,
+            "/data/revised",
+        )
+        .unwrap_err();
+        assert_eq!(missing_target.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(current_revision_at(&saved.path).unwrap(), revision);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn root_updates_preserve_multi_target_storage_and_report_no_op() {
+        let (dir, saved, revision) = create_root_mutation_fixture("update");
+        let updated = update_job_root_in(
+            &dir,
+            "photos",
+            &saved.job_id,
+            &revision,
+            1,
+            JobRootField::Target,
+            "/data/revised-two",
+        )
+        .unwrap();
+        assert_eq!(updated.mutation.effect, JobMutationEffect::Updated);
+        assert_eq!(
+            updated.targets,
+            vec!["/data/one".to_string(), "/data/revised-two".to_string()]
+        );
+        let (_, persisted) = load_path(&updated.mutation.path).unwrap();
+        assert_eq!(persisted.targets, updated.targets);
+
+        let no_op = update_job_root_in(
+            &dir,
+            "photos",
+            &saved.job_id,
+            &updated.mutation.config_revision,
+            1,
+            JobRootField::Target,
+            "/data/revised-two",
+        )
+        .unwrap();
+        assert_eq!(no_op.mutation.effect, JobMutationEffect::NoOp);
+        assert_eq!(
+            no_op.mutation.config_revision,
+            updated.mutation.config_revision
+        );
+
+        let source_updated = update_job_root_in(
+            &dir,
+            "photos",
+            &saved.job_id,
+            &no_op.mutation.config_revision,
+            0,
+            JobRootField::Source,
+            "/data/revised-source",
+        )
+        .unwrap();
+        assert_eq!(source_updated.source, "/data/revised-source");
+        assert_eq!(source_updated.targets, no_op.targets);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn root_swap_is_atomic_and_root_updates_are_fully_validated() {
+        let (dir, saved, revision) = create_root_mutation_fixture("swap");
+        let swapped = swap_job_roots_in(&dir, "photos", &saved.job_id, &revision, 1).unwrap();
+        assert_eq!(swapped.source, "/data/two");
+        assert_eq!(
+            swapped.targets,
+            vec!["/data/one".to_string(), "/data/source".to_string()]
+        );
+        assert_eq!(swapped.mutation.effect, JobMutationEffect::Updated);
+
+        let empty = update_job_root_in(
+            &dir,
+            "photos",
+            &saved.job_id,
+            &swapped.mutation.config_revision,
+            0,
+            JobRootField::Source,
+            "  ",
+        )
+        .unwrap_err();
+        assert_eq!(empty.kind(), std::io::ErrorKind::InvalidInput);
+
+        let duplicate = update_job_root_in(
+            &dir,
+            "photos",
+            &saved.job_id,
+            &swapped.mutation.config_revision,
+            0,
+            JobRootField::Target,
+            "/data/source",
+        )
+        .unwrap_err();
+        assert_eq!(duplicate.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            current_revision_at(&swapped.mutation.path).unwrap(),
+            swapped.mutation.config_revision
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn single_target_root_mutations_keep_canonical_list_storage() {
+        let dir = std::env::temp_dir().join(format!(
+            "syncdash-job-root-single-{}-{}",
+            std::process::id(),
+            crate::foundation::time::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = valid_job();
+        let revision = config_revision(&job).unwrap();
+        let saved = save_job_in(&dir, "photos", &job, None, None, revision.clone()).unwrap();
+
+        let updated = update_job_root_in(
+            &dir,
+            "photos",
+            &saved.job_id,
+            &revision,
+            0,
+            JobRootField::Target,
+            "/data/revised-target",
+        )
+        .unwrap();
+        assert_eq!(updated.targets, vec!["/data/revised-target"]);
+        let (_, persisted_update) = load_path(&updated.mutation.path).unwrap();
+        assert_eq!(persisted_update.targets, vec!["/data/revised-target"]);
+
+        let swapped = swap_job_roots_in(
+            &dir,
+            "photos",
+            &saved.job_id,
+            &updated.mutation.config_revision,
+            0,
+        )
+        .unwrap();
+        assert_eq!(swapped.source, "/data/revised-target");
+        assert_eq!(swapped.targets, vec!["/data/source"]);
+        let (_, persisted_swap) = load_path(&swapped.mutation.path).unwrap();
+        assert_eq!(persisted_swap.targets, vec!["/data/source"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn create_and_rename_never_overwrite_an_existing_job() {
         let dir = std::env::temp_dir().join(format!(
@@ -2011,9 +2605,5 @@ mod rigor_tests {
         let rc = c.rigor_resolved();
         assert!(!rc.hash);
         assert!(rc.verify_writes, "custom base inherits standard verify");
-        // the legacy no_hash field forces hashing off last
-        let mut n = job("paranoid");
-        n.no_hash = true;
-        assert!(!n.rigor_resolved().hash);
     }
 }

@@ -6,82 +6,265 @@
 
 use crate::job::Job;
 use crate::model::plan::{Action, Plan};
-use crate::model::table::Snapshot;
+use crate::model::table::{Blake3Digest, TableArtifact};
 use crate::pipeline::scan;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
-use crate::foundation::names::TEMP_PREFIX;
+use crate::foundation::path::RootRelativePath;
+use crate::fs::local_root::LocalRoot;
 
-static ARCHIVE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-struct ArchiveTemp {
-    path: PathBuf,
-    committed: bool,
+struct ArchiveTarget {
+    parent: LocalRoot,
+    relative: RootRelativePath,
 }
 
-impl ArchiveTemp {
-    fn create(dst: &Path) -> io::Result<(Self, std::fs::File)> {
-        let dir = archive_parent(dst);
-        let base = dst
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "archive path has no UTF-8 file name",
-                )
-            })?;
-        for _ in 0..16 {
-            let sequence = ARCHIVE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = dir.join(format!(
-                "{TEMP_PREFIX}{base}.archive.{}.{}",
-                std::process::id(),
-                sequence
+struct ArchiveLock {
+    _file: std::fs::File,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ArchiveMigrationReceipt {
+    schema: String,
+    version: u32,
+    archive: RootRelativePath,
+    backup: RootRelativePath,
+    source_blake3: Blake3Digest,
+    target_blake3: Blake3Digest,
+}
+
+impl ArchiveTarget {
+    fn open_for_read(destination: &Path) -> io::Result<Option<Self>> {
+        let (parent_path, relative) = archive_location(destination)?;
+        let parent = match LocalRoot::open(parent_path.to_path_buf()) {
+            Ok(parent) => parent,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let target = Self { parent, relative };
+        if target.validate_existing(destination)? {
+            Ok(Some(target))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn open_for_write(destination: &Path) -> io::Result<Self> {
+        let (parent_path, relative) = archive_location(destination)?;
+        std::fs::create_dir_all(parent_path)?;
+        let target = Self {
+            parent: LocalRoot::open(parent_path.to_path_buf())?,
+            relative,
+        };
+        target.validate_existing(destination)?;
+        Ok(target)
+    }
+
+    fn validate_existing(&self, destination: &Path) -> io::Result<bool> {
+        match self.parent.metadata_path(&self.relative) {
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "archive path is not a regular file: {}",
+                    destination.display()
+                ),
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn acquire_lock(&self) -> io::Result<ArchiveLock> {
+        let file = self.parent.open_lock_file(&self.migration_path("lock")?)?;
+        file.lock()?;
+        Ok(ArchiveLock { _file: file })
+    }
+
+    fn migration_path(&self, suffix: &str) -> io::Result<RootRelativePath> {
+        let digest = Blake3Digest::hash_bytes(self.relative.as_str().as_bytes());
+        RootRelativePath::try_from(format!(
+            ".syncdash.archive-migration.{}.{}",
+            &digest.as_str()[..16],
+            suffix
+        ))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
+    }
+
+    fn load_current(&self) -> io::Result<Option<TableArtifact>> {
+        match self.parent.open_read(&self.relative) {
+            Ok(file) => TableArtifact::read_archive(io::BufReader::new(file)).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn load_or_migrate(&self, _lock: &ArchiveLock) -> io::Result<Option<TableArtifact>> {
+        let format = match self.parent.open_read(&self.relative) {
+            Ok(file) => crate::model::table::migrate::classify_archive(io::BufReader::new(file))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if format == crate::model::table::migrate::ArchiveFormat::Current {
+            return self.load_current();
+        }
+
+        let source_blake3 = hash_file(&self.parent, &self.relative)?;
+        let migrated = {
+            let file = self.parent.open_read(&self.relative)?;
+            crate::model::table::migrate::migrate_v1_archive(io::BufReader::new(file))?
+        };
+        let mut target_bytes = Vec::new();
+        migrated.write_to(&mut target_bytes)?;
+        let target_blake3 = Blake3Digest::hash_bytes(&target_bytes);
+        let backup = self.migration_path("v1.backup")?;
+        publish_immutable_copy(&self.parent, &self.relative, &backup, &source_blake3)?;
+        let receipt_path = self.migration_path("prepared.json")?;
+        let receipt = ArchiveMigrationReceipt {
+            schema: "syncdash.archive-migration".into(),
+            version: 1,
+            archive: self.relative.clone(),
+            backup,
+            source_blake3,
+            target_blake3: target_blake3.clone(),
+        };
+        publish_receipt(&self.parent, &receipt_path, &receipt)?;
+        if hash_file(&self.parent, &self.relative)? != receipt.source_blake3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "archive changed after its migration was prepared; refusing replacement",
             ));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(file) => {
-                    return Ok((
-                        ArchiveTemp {
-                            path,
-                            committed: false,
-                        },
-                        file,
-                    ))
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
+        }
+        let mut staged = self.parent.create_staged(&self.relative)?;
+        staged.write_all(&target_bytes)?;
+        staged.seal(true)?;
+        if let Err(error) = staged.commit() {
+            match hash_file(&self.parent, &self.relative) {
+                Ok(actual) if actual == receipt.target_blake3 => {}
+                _ => return Err(error),
             }
         }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate a unique archive staging file",
-        ))
+        self.load_current()
     }
 }
 
-impl Drop for ArchiveTemp {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = std::fs::remove_file(&self.path);
+pub fn load_archive(destination: &Path) -> io::Result<Option<TableArtifact>> {
+    match ArchiveTarget::open_for_read(destination)? {
+        Some(target) => {
+            let lock = target.acquire_lock()?;
+            target.load_or_migrate(&lock)
         }
+        None => Ok(None),
     }
 }
 
-fn archive_parent(dst: &Path) -> &Path {
-    dst.parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
+fn hash_file(root: &LocalRoot, relative: &RootRelativePath) -> io::Result<Blake3Digest> {
+    use std::io::Read as _;
+    let mut file = root.open_read(relative)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(Blake3Digest::from_hash(hasher.finalize()))
 }
 
-#[cfg(windows)]
-fn archive_backup_path(dst: &Path) -> io::Result<PathBuf> {
-    let base = dst
+fn publish_immutable_copy(
+    root: &LocalRoot,
+    source: &RootRelativePath,
+    destination: &RootRelativePath,
+    expected: &Blake3Digest,
+) -> io::Result<()> {
+    let mut source_file = root.open_read(source)?;
+    let mut staged = root.create_staged(destination)?;
+    staged.write_all_from(&mut source_file)?;
+    staged.seal(true)?;
+    match staged.commit_noreplace() {
+        Ok(()) => {}
+        Err(_error) if hash_file(root, destination).ok().as_ref() == Some(expected) => {}
+        Err(error) => return Err(error),
+    }
+    let actual = hash_file(root, destination)?;
+    if &actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "immutable archive migration backup does not match its source",
+        ));
+    }
+    Ok(())
+}
+
+fn publish_receipt(
+    root: &LocalRoot,
+    path: &RootRelativePath,
+    expected: &ArchiveMigrationReceipt,
+) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(expected).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    let expected_hash = Blake3Digest::hash_bytes(&bytes);
+    let mut staged = root.create_staged(path)?;
+    staged.write_all(&bytes)?;
+    staged.seal(true)?;
+    match staged.commit_noreplace() {
+        Ok(()) => {}
+        Err(_error) if hash_file(root, path).ok().as_ref() == Some(&expected_hash) => {}
+        Err(error) => return Err(error),
+    }
+    let stored: ArchiveMigrationReceipt =
+        serde_json::from_slice(&root.read(path)?).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid archive migration receipt: {error}"),
+            )
+        })?;
+    if &stored != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive migration receipt does not match the prepared migration",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_archive_atomic(
+    dst: &Path,
+    write_snapshot: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+    before_commit: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let target = ArchiveTarget::open_for_write(dst)?;
+    let lock = target.acquire_lock()?;
+    write_archive_to(&target, &lock, write_snapshot, before_commit)
+}
+
+fn write_archive_to(
+    target: &ArchiveTarget,
+    _lock: &ArchiveLock,
+    write_snapshot: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+    before_commit: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut staged = target.parent.create_staged(&target.relative)?;
+    {
+        let mut writer = io::BufWriter::new(&mut staged);
+        write_snapshot(&mut writer)?;
+        writer.flush()?;
+    }
+    staged.seal(true)?;
+    before_commit()?;
+    staged.commit()
+}
+
+fn archive_location(destination: &Path) -> io::Result<(&Path, RootRelativePath)> {
+    let parent = destination
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = destination
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| {
@@ -90,97 +273,15 @@ fn archive_backup_path(dst: &Path) -> io::Result<PathBuf> {
                 "archive path has no UTF-8 file name",
             )
         })?;
-    Ok(archive_parent(dst).join(format!("{TEMP_PREFIX}{base}.archive-backup")))
+    let relative = RootRelativePath::try_from(name)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    Ok((parent, relative))
 }
 
-#[cfg(windows)]
-fn recover_archive_target(dst: &Path) -> io::Result<()> {
-    let backup = archive_backup_path(dst)?;
-    match (dst.exists(), backup.exists()) {
-        (false, true) => std::fs::rename(backup, dst),
-        (true, true) => std::fs::remove_file(backup),
-        _ => Ok(()),
-    }
-}
-
-#[cfg(not(windows))]
-fn recover_archive_target(_dst: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(windows)]
-fn replace_archive(temp: &Path, dst: &Path) -> io::Result<()> {
-    if !dst.exists() {
-        return std::fs::rename(temp, dst);
-    }
-    let backup = archive_backup_path(dst)?;
-    if backup.exists() {
-        std::fs::remove_file(&backup)?;
-    }
-    std::fs::rename(dst, &backup)?;
-    match std::fs::rename(temp, dst) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(backup);
-            Ok(())
-        }
-        Err(commit_error) => match std::fs::rename(&backup, dst) {
-            Ok(()) => Err(commit_error),
-            Err(restore_error) => Err(io::Error::new(
-                commit_error.kind(),
-                format!(
-                    "archive replacement failed: {commit_error}; restoring the previous archive also failed: {restore_error}"
-                ),
-            )),
-        },
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_archive(temp: &Path, dst: &Path) -> io::Result<()> {
-    std::fs::rename(temp, dst)
-}
-
-fn write_archive_atomic(
-    dst: &Path,
-    write_snapshot: impl FnOnce(&mut dyn Write) -> io::Result<()>,
-    before_commit: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
-    let dir = archive_parent(dst);
-    std::fs::create_dir_all(dir)?;
-    recover_archive_target(dst)?;
-    if dst.exists() && !dst.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("archive path is not a file: {}", dst.display()),
-        ));
-    }
-
-    let (mut temp, file) = ArchiveTemp::create(dst)?;
-    let mut writer = io::BufWriter::new(file);
-    write_snapshot(&mut writer)?;
-    writer.flush()?;
-    let file = writer.into_inner().map_err(|e| e.into_error())?;
-    file.sync_all()?;
-    drop(file);
-    before_commit()?;
-    replace_archive(&temp.path, dst)?;
-    temp.committed = true;
-    Ok(())
-}
-
-/// Refresh the archive after a successful sync: rescan source, drop conflicted paths (a conflict keeps being reported, never silently arbitrated).
-/// v0.9 M1: make the Refresh phase visible — the archive rescan is a long phase that is completely invisible today, so wire it to the event stream and cancellation.
-/// Being cancelled only means conflicts get re-reported next round — safe.
+/// Refreshes the archive from the already-open source after a successful sync.
 ///
-/// Takes the **already-open** source root rather than re-opening `job.source`. Re-resolving here
-/// paid for a second full handshake on every sync run to an sftp or smb root, for no reason beyond
-/// the handle having been dropped across a call boundary.
-///
-/// `opt` is the caller's, and must be the options the comparison actually ran at — not
-/// `scan_opts(job)`. The archive exists to be compared against those digests, so it has to be
-/// written in the same evidence tier; when this recomputed the tier from the job instead, an
-/// asymmetric pair of roots (a source that can do ranged reads, a target that cannot) wrote a
-/// sampled archive that the next full-tier comparison could never match.
+/// Conflicted paths remain absent so the next run reports them again. `opt` must be the effective
+/// comparison options because archive digests are only comparable within the same evidence tier.
 pub fn refresh_archive_with(
     job: &Job,
     plan: &Plan,
@@ -228,22 +329,20 @@ pub fn refresh_archive_with(
             0,
         );
         pp.checkpoint()?;
-        // The previous-generation archive: every row of the new table pushes the old hash onto the prev chain, so that
-        // "one generation behind" can be told apart from "concurrent modification" (P1-3, see compare::generation_of)
-        recover_archive_target(arch_path)?;
-        let previous = if arch_path.is_file() {
-            Some(Snapshot::load(arch_path)?)
-        } else {
-            None
-        };
-        snap.header.kind = "archive".into();
+        // The generation chain distinguishes one-generation lag from concurrent modification.
+        let archive = ArchiveTarget::open_for_write(arch_path)?;
+        let lock = archive.acquire_lock()?;
+        let previous = archive.load_or_migrate(&lock)?;
+        snap.header.kind = crate::model::table::TableKind::Archive;
         snap.entries
-            .retain(|e| !conflicted.contains(e.path.as_str()));
+            .retain(|entry| !conflicted.contains(entry.path().as_str()));
+        snap.header.entry_count = snap.entries.len() as u64;
         if let Some(prev) = &previous {
             crate::model::table::roll_generations(&mut snap.entries, &prev.entries);
         }
-        write_archive_atomic(
-            arch_path,
+        write_archive_to(
+            &archive,
+            &lock,
             |writer| snap.write_to(writer),
             || pp.checkpoint(),
         )?;
@@ -282,6 +381,141 @@ mod tests {
     use crate::obs::progress::{RunCtl, RunCtx};
     use std::sync::{Arc, Mutex};
 
+    fn legacy_archive_bytes() -> Vec<u8> {
+        let digest = Blake3Digest::hash_bytes(b"legacy payload");
+        format!(
+            "{{\"schema\":1,\"kind\":\"archive\",\"root\":\"/data\",\"host\":\"host\",\"os\":\"linux\",\"scanned_at_ms\":1,\"duration_ms\":2,\"entry_count\":1,\"hashed\":true}}\n{{\"path\":\"file.txt\",\"kind\":\"File\",\"size\":14,\"mtime_ms\":3,\"hash\":\"{digest}\"}}\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn legacy_archive_migration_keeps_an_immutable_backup_and_receipt() {
+        let directory =
+            std::env::temp_dir().join(format!("syncdash-archive-migration-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let archive = directory.join("archive.jsonl");
+        let legacy = legacy_archive_bytes();
+        std::fs::write(&archive, &legacy).unwrap();
+
+        let migrated = load_archive(&archive).unwrap().unwrap();
+        assert_eq!(migrated.header.schema, crate::model::table::TABLE_SCHEMA);
+        let names = std::fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let backup = names
+            .iter()
+            .find(|name| name.ends_with(".v1.backup"))
+            .expect("immutable v1 backup");
+        assert_eq!(std::fs::read(directory.join(backup)).unwrap(), legacy);
+        assert!(names.iter().any(|name| name.ends_with(".prepared.json")));
+        assert_ne!(std::fs::read(&archive).unwrap(), legacy);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn mismatched_prepared_receipt_blocks_migration_without_touching_the_archive() {
+        let directory = std::env::temp_dir().join(format!(
+            "syncdash-archive-migration-receipt-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let archive = directory.join("archive.jsonl");
+        let legacy = legacy_archive_bytes();
+        std::fs::write(&archive, &legacy).unwrap();
+        let target = ArchiveTarget::open_for_read(&archive).unwrap().unwrap();
+        let receipt = target.migration_path("prepared.json").unwrap();
+        std::fs::write(directory.join(receipt.as_str()), b"{}\n").unwrap();
+
+        assert!(load_archive(&archive).is_err());
+        assert_eq!(std::fs::read(&archive).unwrap(), legacy);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn archive_read_does_not_create_a_missing_parent() {
+        let base = std::env::temp_dir().join(format!(
+            "syncdash-archive-missing-parent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let missing_parent = base.join("missing");
+
+        assert!(load_archive(&missing_parent.join("archive.jsonl"))
+            .unwrap()
+            .is_none());
+        assert!(!missing_parent.exists());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_read_refuses_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "syncdash-archive-read-symlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let outside = base.join("outside.jsonl");
+        std::fs::write(&outside, b"outside").unwrap();
+        let archive = base.join("archive.jsonl");
+        symlink(&outside, &archive).unwrap();
+
+        assert!(load_archive(&archive).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_read_stays_with_the_retained_parent_after_a_name_swap() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "syncdash-archive-read-parent-swap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let selected = base.join("selected");
+        let detached = base.join("detached");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            selected.join("archive.jsonl"),
+            b"{\"schema\":1,\"kind\":\"archive\",\"root\":\"retained\",\"host\":\"\",\"os\":\"\",\"scanned_at_ms\":0,\"duration_ms\":0,\"entry_count\":0,\"hashed\":false}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            outside.join("archive.jsonl"),
+            b"{\"schema\":1,\"kind\":\"archive\",\"root\":\"outside\",\"host\":\"\",\"os\":\"\",\"scanned_at_ms\":0,\"duration_ms\":0,\"entry_count\":0,\"hashed\":false}\n",
+        )
+        .unwrap();
+        let target = ArchiveTarget::open_for_read(&selected.join("archive.jsonl"))
+            .unwrap()
+            .unwrap();
+
+        std::fs::rename(&selected, &detached).unwrap();
+        symlink(&outside, &selected).unwrap();
+        let lock = target.acquire_lock().unwrap();
+        let snapshot = target.load_or_migrate(&lock).unwrap().unwrap();
+
+        assert_eq!(snapshot.header.root, "retained");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn archive_replacement_keeps_the_previous_file_until_commit() {
         let dir =
@@ -295,10 +529,7 @@ mod tests {
             &archive,
             |writer| {
                 writer.write_all(b"partial replacement\n")?;
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "simulated write failure",
-                ))
+                Err(io::Error::other("simulated write failure"))
             },
             || Ok(()),
         );
@@ -332,6 +563,43 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_write_stays_with_the_retained_parent_after_a_name_swap() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "syncdash-archive-parent-swap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let selected = base.join("selected");
+        let detached = base.join("detached");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(selected.join("archive.jsonl"), b"old").unwrap();
+        let target = ArchiveTarget::open_for_write(&selected.join("archive.jsonl")).unwrap();
+
+        std::fs::rename(&selected, &detached).unwrap();
+        symlink(&outside, &selected).unwrap();
+        let lock = target.acquire_lock().unwrap();
+        write_archive_to(
+            &target,
+            &lock,
+            |writer| writer.write_all(b"confined"),
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(detached.join("archive.jsonl")).unwrap(),
+            b"confined"
+        );
+        assert!(!outside.join("archive.jsonl").exists());
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

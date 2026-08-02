@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MTIME_SLACK_MS: i64 = 2000;
 
-/// The plan file format's own version, distinct from `table::SCHEMA` — a plan and a snapshot are
+/// The plan file format's own version, distinct from `table::TABLE_SCHEMA` — a plan and a snapshot are
 /// different artifacts and have no reason to move together. The header carried the table's number
 /// for want of one of its own, and nothing read it back, so the field was decoration.
 ///
@@ -145,18 +145,29 @@ impl Plan {
     /// struct field order fixed by the Rust schema. Hashing those bytes catches any header or op
     /// mutation while deliberately excluding desktop-only evidence/view metadata.
     pub fn digest(&self) -> String {
-        let mut bytes = Vec::new();
-        self.write_to(&mut bytes)
-            .expect("serializing a Plan into memory cannot fail");
+        Self::digest_parts(&self.header, &self.ops)
+    }
+
+    /// Compute the canonical plan digest from borrowed parts without cloning a large operation list.
+    pub fn digest_parts(header: &PlanHeader, operations: &[Op]) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"syncdash-plan-v1\0");
-        hasher.update(&bytes);
+        Self::write_parts_to(header, operations, &mut Blake3Writer(&mut hasher))
+            .expect("serializing a Plan into a digest cannot fail");
         hasher.finalize().to_hex().to_string()
     }
 
     pub fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
-        writeln!(w, "{}", serde_json::to_string(&self.header)?)?;
-        for op in &self.ops {
+        Self::write_parts_to(&self.header, &self.ops, w)
+    }
+
+    fn write_parts_to(
+        header: &PlanHeader,
+        operations: &[Op],
+        w: &mut dyn std::io::Write,
+    ) -> std::io::Result<()> {
+        writeln!(w, "{}", serde_json::to_string(header)?)?;
+        for op in operations {
             writeln!(w, "{}", serde_json::to_string(op)?)?;
         }
         Ok(())
@@ -201,6 +212,19 @@ impl Plan {
             })?);
         }
         Ok(Plan { header, ops })
+    }
+}
+
+struct Blake3Writer<'a>(&'a mut blake3::Hasher);
+
+impl std::io::Write for Blake3Writer<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -275,7 +299,7 @@ mod tests {
     }
 
     /// The plan crosses machines inside a package and is replayed on the far side, so what
-    /// survives serialization is exactly what the remote will execute.
+    /// survives serialization is exactly what the peer will execute.
     #[test]
     fn a_plan_survives_write_then_read() {
         let plan = Plan {

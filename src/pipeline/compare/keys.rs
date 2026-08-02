@@ -6,52 +6,67 @@
 use std::collections::BTreeMap;
 
 use crate::foundation::text::norm_key;
-use crate::model::table::{Entry, EntryKind, Snapshot};
+use crate::model::table::{
+    FileIdentityObservation, ObservedEntry, ObservedEntryKind, TableArtifact,
+};
 
-pub(super) fn files_equal(a: &Entry, b: &Entry, win_ms: i64) -> bool {
+pub(super) fn files_equal(a: &ObservedEntry, b: &ObservedEntry, win_ms: i64) -> bool {
+    let (Some(a), Some(b)) = (a.as_file(), b.as_file()) else {
+        return false;
+    };
     // Evidence that was asked for and not obtained must never resolve to "equal". The size+mtime
     // line below is the *intended* judgment when hashing was not requested; reaching it because a
     // read failed is a silent downgrade, and it is the one direction that loses data — a file whose
     // content changed under a preserved size and mtime would be declared identical forever.
     // Answering "not equal" here is the safe half; the decision sites turn it into a Conflict so it
     // is not merely re-copied every run.
-    if a.hash_failed || b.hash_failed {
+    if a.identity.is_unreadable() || b.identity.is_unreadable() {
         return false;
     }
-    if let (Some(ha), Some(hb)) = (&a.hash, &b.hash) {
-        return ha == hb;
+    match (&a.identity, &b.identity) {
+        (FileIdentityObservation::SizeAndMtime, FileIdentityObservation::SizeAndMtime) => {
+            a.size == b.size && (a.mtime_ms - b.mtime_ms).abs() <= win_ms
+        }
+        (left, right) if left.digest().is_some() && right.digest().is_some() => left == right,
+        _ => false,
     }
-    a.size == b.size && (a.mtime_ms - b.mtime_ms).abs() <= win_ms
 }
 
 /// Whether this pair cannot be judged on content because one side's content could not be read.
-pub(super) fn evidence_missing(a: &Entry, b: &Entry) -> bool {
-    a.hash_failed || b.hash_failed
+pub(super) fn evidence_missing(a: &ObservedEntry, b: &ObservedEntry) -> bool {
+    a.as_file()
+        .is_some_and(|file| file.identity.is_unreadable())
+        || b.as_file()
+            .is_some_and(|file| file.identity.is_unreadable())
 }
 
 /// Which generation of archive entry `r` the content of `e` corresponds to:
 /// `Some(0)` = matches what the archive currently records, `Some(n)` = the n-th historic generation, `None` = the archive has never seen it.
 /// The lower the generation number the newer it is — this is what lets "one generation behind" be told apart from "concurrent edit" (P1-3).
-pub(super) fn generation_of(e: &Entry, r: &Entry, win_ms: i64) -> Option<usize> {
+pub(super) fn generation_of(e: &ObservedEntry, r: &ObservedEntry, win_ms: i64) -> Option<usize> {
     if files_equal(e, r, win_ms) {
         return Some(0);
     }
-    let h = e.hash.as_deref()?;
-    r.prev.as_ref()?.iter().position(|x| x == h).map(|i| i + 1)
+    let identity = &e.as_file()?.identity;
+    r.as_file()?
+        .previous_identities
+        .iter()
+        .position(|previous| previous == identity)
+        .map(|index| index + 1)
 }
 
 /// Normalized key → entry; on a collision (NFD/NFC or case twins) the first one seen is kept and recorded
 pub(super) fn map_of<'a>(
-    snap: &'a Snapshot,
-    kind: EntryKind,
+    snap: &'a TableArtifact,
+    kind: ObservedEntryKind,
     ci: bool,
-) -> (BTreeMap<String, &'a Entry>, Vec<String>) {
-    let mut m: BTreeMap<String, &Entry> = BTreeMap::new();
+) -> (BTreeMap<String, &'a ObservedEntry>, Vec<String>) {
+    let mut m: BTreeMap<String, &ObservedEntry> = BTreeMap::new();
     let mut dups = Vec::new();
-    for e in snap.entries.iter().filter(|e| e.kind == kind) {
-        let k = norm_key(&e.path, ci);
+    for e in snap.entries.iter().filter(|entry| entry.kind() == kind) {
+        let k = norm_key(e.path().as_str(), ci);
         if m.contains_key(&k) {
-            dups.push(e.path.clone());
+            dups.push(e.path().as_str().to_owned());
         } else {
             m.insert(k, e);
         }

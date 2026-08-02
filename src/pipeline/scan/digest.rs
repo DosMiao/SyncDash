@@ -1,14 +1,61 @@
 //! Sampled content evidence: hash three windows and the size rather than the whole file.
 //!
 //! The two lanes each read bytes their own way, but the digest they produce must be identical or
-//! a file would compare unequal to itself across backends — same windows, same size prefix, same
-//! `~` marker. `local` reads with std::fs, the generic lane through `Vfs::read_range`.
+//! a file would compare unequal to itself across backends. The observation enum distinguishes a
+//! sampled digest from a full digest, so the digest bytes remain canonical BLAKE3 text.
 
+#[cfg(test)]
 use std::path::Path;
 
-/// Parameters and implementation of the sampled digest (the fast rigor tier)
 pub const SAMPLE_MIN: u64 = 4 * 1024 * 1024;
 const SAMPLE_CHUNK: usize = 256 * 1024;
+
+pub(crate) struct SampledDigestBuilder {
+    size: u64,
+    windows: [(u64, Vec<u8>); 3],
+}
+
+impl SampledDigestBuilder {
+    pub(crate) fn new(size: u64) -> Self {
+        Self {
+            size,
+            windows: [
+                (0, Vec::with_capacity(SAMPLE_CHUNK)),
+                (size / 2, Vec::with_capacity(SAMPLE_CHUNK)),
+                (
+                    size.saturating_sub(SAMPLE_CHUNK as u64),
+                    Vec::with_capacity(SAMPLE_CHUNK),
+                ),
+            ],
+        }
+    }
+
+    pub(crate) fn update(&mut self, offset: u64, bytes: &[u8]) {
+        let input_end = offset.saturating_add(bytes.len() as u64);
+        for (window_start, window) in &mut self.windows {
+            let window_end = window_start
+                .saturating_add(SAMPLE_CHUNK as u64)
+                .min(self.size);
+            let overlap_start = offset.max(*window_start);
+            let overlap_end = input_end.min(window_end);
+            if overlap_start < overlap_end {
+                let start = (overlap_start - offset) as usize;
+                let end = (overlap_end - offset) as usize;
+                window.extend_from_slice(&bytes[start..end]);
+            }
+        }
+    }
+
+    pub(crate) fn finish(self) -> crate::model::table::Blake3Digest {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.size.to_le_bytes());
+        for (_, window) in self.windows {
+            hasher.update(&window);
+        }
+        crate::model::table::Blake3Digest::from_hash(hasher.finalize())
+    }
+}
+
 /// Bytes this scan will actually read in fast mode (only counting these makes the progress total and rate honest)
 pub(super) fn effective_read(size: u64, sampled: bool) -> u64 {
     if sampled && size >= SAMPLE_MIN {
@@ -19,31 +66,48 @@ pub(super) fn effective_read(size: u64, sampled: bool) -> u64 {
 }
 
 #[cfg(test)]
-pub(super) fn sampled_digest(path: &Path, size: u64) -> std::io::Result<String> {
+pub(super) fn sampled_digest(
+    path: &Path,
+    size: u64,
+) -> std::io::Result<crate::model::table::Blake3Digest> {
     sampled_digest_with_buffer(path, size, &mut Vec::new(), |_| {})
 }
 
+#[cfg(test)]
 pub(super) fn sampled_digest_with_buffer<P>(
     path: &Path,
     size: u64,
     buf: &mut Vec<u8>,
-    mut on_read: P,
-) -> std::io::Result<String>
+    on_read: P,
+) -> std::io::Result<crate::model::table::Blake3Digest>
 where
     P: FnMut(u64),
 {
-    use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path)?;
+    sampled_digest_stream(&mut f, size, buf, on_read)
+}
+
+pub(super) fn sampled_digest_stream<R, P>(
+    stream: &mut R,
+    size: u64,
+    buf: &mut Vec<u8>,
+    mut on_read: P,
+) -> std::io::Result<crate::model::table::Blake3Digest>
+where
+    R: std::io::Read + std::io::Seek + ?Sized,
+    P: FnMut(u64),
+{
+    use std::io::SeekFrom;
     let mut hasher = blake3::Hasher::new();
     hasher.update(&size.to_le_bytes());
     if buf.len() < SAMPLE_CHUNK {
         buf.resize(SAMPLE_CHUNK, 0);
     }
     for off in [0u64, size / 2, size.saturating_sub(SAMPLE_CHUNK as u64)] {
-        f.seek(SeekFrom::Start(off))?;
+        stream.seek(SeekFrom::Start(off))?;
         let mut read = 0usize;
         while read < SAMPLE_CHUNK {
-            let n = f.read(&mut buf[read..SAMPLE_CHUNK])?;
+            let n = stream.read(&mut buf[read..SAMPLE_CHUNK])?;
             if n == 0 {
                 break;
             }
@@ -52,7 +116,9 @@ where
         }
         hasher.update(&buf[..read]);
     }
-    Ok(format!("~{}", hasher.finalize().to_hex()))
+    Ok(crate::model::table::Blake3Digest::from_hash(
+        hasher.finalize(),
+    ))
 }
 
 pub(super) fn sampled_digest_vfs<P>(
@@ -60,7 +126,7 @@ pub(super) fn sampled_digest_vfs<P>(
     rel: &str,
     size: u64,
     mut on_read: P,
-) -> Result<String, crate::fs::vfs::error::VfsError>
+) -> Result<crate::model::table::Blake3Digest, crate::fs::vfs::error::VfsError>
 where
     P: FnMut(u64),
 {
@@ -71,9 +137,9 @@ where
         on_read(buf.len() as u64);
         hasher.update(&buf);
     }
-    // Same windows, same size prefix, same `~` marker as the local sampled_digest —
-    // the two lanes must produce identical digests for identical content
-    Ok(format!("~{}", hasher.finalize().to_hex()))
+    Ok(crate::model::table::Blake3Digest::from_hash(
+        hasher.finalize(),
+    ))
 }
 
 fn full_hash_stream<R, C, P>(
@@ -82,7 +148,7 @@ fn full_hash_stream<R, C, P>(
     expected_size: u64,
     mut checkpoint: C,
     mut on_read: P,
-) -> Result<String, crate::fs::vfs::error::VfsError>
+) -> Result<crate::model::table::Blake3Digest, crate::fs::vfs::error::VfsError>
 where
     R: std::io::Read + ?Sized,
     C: FnMut() -> Result<(), crate::fs::vfs::error::VfsError>,
@@ -109,7 +175,9 @@ where
         on_read(n as u64);
         remaining -= n as u64;
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(crate::model::table::Blake3Digest::from_hash(
+        hasher.finalize(),
+    ))
 }
 
 pub(super) fn full_hash_vfs<P>(
@@ -118,7 +186,7 @@ pub(super) fn full_hash_vfs<P>(
     expected_size: u64,
     pp: &crate::obs::progress::PhaseProgress<'_>,
     on_read: P,
-) -> Result<String, crate::fs::vfs::error::VfsError>
+) -> Result<crate::model::table::Blake3Digest, crate::fs::vfs::error::VfsError>
 where
     P: FnMut(u64),
 {
@@ -149,7 +217,7 @@ mod tests {
         let mut data = vec![5u8; 8 * 1024 * 1024];
         std::fs::write(&f, &data).unwrap();
         let a = sampled_digest(&f, data.len() as u64).unwrap();
-        assert!(a.starts_with('~'), "sampled digests carry the ~ marker");
+        assert_eq!(a.as_str().len(), 64);
         // The midpoint falls inside a sample window → the digest must change
         data[4 * 1024 * 1024 + 10] = 9;
         std::fs::write(&f, &data).unwrap();
@@ -191,6 +259,31 @@ mod tests {
         assert_eq!(buf.capacity(), capacity);
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sequential_sample_builder_matches_the_seek_based_digest() {
+        for size in [100_000usize, 8 * 1024 * 1024] {
+            let data: Vec<u8> = (0..size)
+                .map(|index| (index.wrapping_mul(31).wrapping_add(7) >> 3) as u8)
+                .collect();
+            let expected = sampled_digest_stream(
+                &mut std::io::Cursor::new(&data),
+                data.len() as u64,
+                &mut Vec::new(),
+                |_| {},
+            )
+            .unwrap();
+            let mut builder = SampledDigestBuilder::new(data.len() as u64);
+            let mut offset = 0usize;
+            while offset < data.len() {
+                let end = (offset + 73_117).min(data.len());
+                builder.update(offset as u64, &data[offset..end]);
+                offset = end;
+            }
+
+            assert_eq!(builder.finish(), expected);
+        }
     }
 
     #[test]

@@ -290,9 +290,9 @@ pub fn apply_edits(v: &Arc<dyn Vfs>, edits: &[Edit]) {
 pub fn prune_empty_dirs(v: &Arc<dyn Vfs>, rel: &str) {
     let Ok(entries) = v.read_dir(rel) else { return };
     for e in entries {
-        if e.meta.kind == crate::model::table::EntryKind::Dir {
+        if e.meta.kind == crate::fs::vfs::VfsEntryKind::Directory {
             let child = if rel.is_empty() {
-                e.name.clone()
+                e.name.as_str().to_owned()
             } else {
                 format!("{rel}/{}", e.name)
             };

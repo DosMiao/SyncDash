@@ -1,9 +1,4 @@
-//! The local backend: std::fs + the existing `fs::staged::Staged`, nothing reinvented.
-//!
-//! `as_local()` returns the root, which routes scan down the existing
-//! walkdir fast path — this impl is what the *generic* engine lanes use, and
-//! its write side deliberately wraps the very same `Staged` the direct lane uses,
-//! so local behavior cannot drift between lanes.
+//! The local backend, confined to one retained root directory handle.
 //!
 //! Layering: this L0 module reaches up to L1 `obs::logging` through `log_warn!`, in `read_dir`,
 //! where an entry whose name is not valid Unicode is skipped. The skip has no return channel —
@@ -12,17 +7,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use super::error::VfsResult;
+use super::error::{VfsError, VfsErrorKind, VfsResult};
+use super::VfsEntryKind;
 use super::{
     CaseSense, CommitReport, Medium, ReadStream, Support, VDirEntry, VMeta, Vfs, VfsCaps,
     WriteHint, WriteStaged,
 };
-use crate::foundation::path::join_native;
-use crate::fs::staged::Staged;
-use crate::model::table::EntryKind;
+use crate::foundation::path::{RootRelativeDir, RootRelativePath};
+use crate::fs::local_root::{LocalRoot, LocalStagedFile};
 
 pub struct LocalVfs {
-    root: PathBuf,
+    root: LocalRoot,
     /// The root exactly as the job spelled it — `identity()` must reproduce it so
     /// existing hash-cache / mtime-fix files keep their names.
     root_str: String,
@@ -33,27 +28,41 @@ pub struct LocalVfs {
 }
 
 impl LocalVfs {
-    pub fn new(root: PathBuf) -> LocalVfs {
-        let root_str = root.to_string_lossy().into_owned();
-        LocalVfs {
-            root,
+    pub fn open(root_path: PathBuf) -> VfsResult<LocalVfs> {
+        let root_str = root_path.to_string_lossy().into_owned();
+        Ok(LocalVfs {
+            root: LocalRoot::open(root_path)?,
             root_str,
             vol: OnceLock::new(),
-        }
+        })
     }
 
-    fn abs(&self, rel: &str) -> PathBuf {
-        if rel.is_empty() {
-            self.root.clone()
-        } else {
-            join_native(&self.root, rel)
-        }
+    pub fn local_root(&self) -> &LocalRoot {
+        &self.root
     }
 
     /// What the OS says about the volume this root sits on. Probed once, then cached.
     pub fn volume(&self) -> &Volume {
-        self.vol.get_or_init(|| probe(&self.root))
+        self.vol.get_or_init(|| probe(self.root.display_path()))
     }
+}
+
+fn relative_path(relative: &str) -> VfsResult<RootRelativePath> {
+    RootRelativePath::try_from(relative).map_err(|error| {
+        VfsError::new(
+            VfsErrorKind::Protocol,
+            format!("path is outside the local VFS contract: {error}"),
+        )
+    })
+}
+
+fn relative_directory(relative: &str) -> VfsResult<RootRelativeDir> {
+    RootRelativeDir::try_from(relative).map_err(|error| {
+        VfsError::new(
+            VfsErrorKind::Protocol,
+            format!("directory is outside the local VFS contract: {error}"),
+        )
+    })
 }
 
 /// What the OS reported about a volume. `Unknown` fields mean the question was asked and not
@@ -411,43 +420,51 @@ unsafe fn fs_name_of(st: &libc::statfs) -> String {
     name.to_string()
 }
 
-fn meta_of(md: &std::fs::Metadata) -> VMeta {
-    let kind = if md.file_type().is_symlink() {
-        EntryKind::Symlink
-    } else if md.is_dir() {
-        EntryKind::Dir
+fn meta_of(metadata: &cap_primitives::fs::Metadata) -> VMeta {
+    let kind = if metadata.is_symlink() {
+        VfsEntryKind::Symlink
+    } else if metadata.is_dir() {
+        VfsEntryKind::Directory
     } else {
-        EntryKind::File
+        VfsEntryKind::File
     };
     VMeta {
         kind,
-        size: md.len(),
-        mtime_ms: crate::foundation::time::meta_mtime_ms(md),
-        mode: mode_of(md),
-        file_id: file_id_of(md),
-        link: None, // lazy: read_link on demand
+        size: metadata.len(),
+        mtime_ms: metadata_mtime_ms(metadata),
+        mode: mode_of(metadata),
+        file_id: file_id_of(metadata),
+        link: None,
     }
 }
 
+fn metadata_mtime_ms(metadata: &cap_primitives::fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .map(|time| crate::foundation::time::systime_ms(time.into_std()))
+        .unwrap_or(0)
+}
+
 #[cfg(unix)]
-fn mode_of(md: &std::fs::Metadata) -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-    Some(md.mode() & 0o7777)
+fn mode_of(metadata: &cap_primitives::fs::Metadata) -> Option<u32> {
+    use cap_primitives::fs::MetadataExt;
+    Some(metadata.mode() & 0o7777)
 }
 
 #[cfg(not(unix))]
-fn mode_of(_md: &std::fs::Metadata) -> Option<u32> {
+fn mode_of(_metadata: &cap_primitives::fs::Metadata) -> Option<u32> {
     None
 }
 
 #[cfg(unix)]
-fn file_id_of(md: &std::fs::Metadata) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    Some(format!("{}:{}", md.dev(), md.ino()))
+fn file_id_of(metadata: &cap_primitives::fs::Metadata) -> Option<String> {
+    use cap_primitives::fs::MetadataExt;
+    Some(format!("{}:{}", metadata.dev(), metadata.ino()))
 }
 
 #[cfg(not(unix))]
-fn file_id_of(_md: &std::fs::Metadata) -> Option<String> {
+fn file_id_of(_metadata: &cap_primitives::fs::Metadata) -> Option<String> {
     None
 }
 
@@ -466,15 +483,12 @@ impl ReadStream for LocalRead {
         1024 * 1024
     }
 }
-use std::io::Read as _;
-
-/// `Staged` plus the write hint: mtime/mode land on the temp file (pre-rename, the
-/// same order the direct apply lane uses), the post-rename stat feeds the
-/// mtime-correction table.
 struct LocalStaged {
-    staged: Option<Staged>,
-    dst: PathBuf,
+    root: LocalRoot,
+    staged: Option<LocalStagedFile>,
+    destination: RootRelativePath,
     hint: WriteHint,
+    sync_requested: bool,
 }
 
 impl LocalStaged {
@@ -483,25 +497,20 @@ impl LocalStaged {
         let mut report = CommitReport::default();
 
         if let Some(ms) = self.hint.mtime_ms {
-            let ft = filetime::FileTime::from_unix_time(
-                ms.div_euclid(1000),
-                (ms.rem_euclid(1000) * 1_000_000) as u32,
-            );
-            if let Err(e) = filetime::set_file_mtime(staged.path(), ft) {
-                report.mtime_error = Some(e.into());
+            if let Err(error) = staged.set_mtime(ms) {
+                report.mtime_error = Some(error.into());
             }
         }
         #[cfg(unix)]
         if let Some(mode) = self.hint.mode {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) =
-                std::fs::set_permissions(staged.path(), std::fs::Permissions::from_mode(mode))
-            {
-                report.mode_error = Some(e.into());
+            if let Err(error) = staged.set_mode(mode) {
+                report.mode_error = Some(error.into());
             }
         }
-        if self.hint.mtime_ms.is_some() || (cfg!(unix) && self.hint.mode.is_some()) {
-            staged.resync_metadata_if_requested()?;
+        if self.sync_requested
+            && (self.hint.mtime_ms.is_some() || (cfg!(unix) && self.hint.mode.is_some()))
+        {
+            staged.sync_file()?;
         }
 
         if replace {
@@ -511,9 +520,11 @@ impl LocalStaged {
         }
 
         if self.hint.mtime_ms.is_some() {
-            report.mtime_ondisk_ms = std::fs::metadata(&self.dst)
+            report.mtime_ondisk_ms = self
+                .root
+                .metadata_path(&self.destination)
                 .ok()
-                .map(|md| crate::foundation::time::meta_mtime_ms(&md));
+                .map(|metadata| metadata_mtime_ms(&metadata));
         }
         Ok(report)
     }
@@ -538,19 +549,20 @@ impl WriteStaged for LocalStaged {
 
     fn seal(&mut self, fsync: bool) -> VfsResult<()> {
         let s = self.staged.as_mut().expect("seal after commit");
+        self.sync_requested |= fsync;
         s.seal(fsync)?;
         Ok(())
     }
 
     fn staged_len(&self) -> VfsResult<u64> {
         let s = self.staged.as_ref().expect("staged_len after commit");
-        Ok(std::fs::metadata(s.path())?.len())
+        Ok(s.staged_len()?)
     }
 
     fn open_staged_read(&self) -> VfsResult<Box<dyn ReadStream>> {
         let s = self.staged.as_ref().expect("read after commit");
         Ok(Box::new(LocalRead {
-            file: std::fs::File::open(s.path())?,
+            file: s.try_clone_file()?,
         }))
     }
 
@@ -566,6 +578,7 @@ impl WriteStaged for LocalStaged {
 impl Vfs for LocalVfs {
     fn caps(&self) -> VfsCaps {
         let vol = self.volume();
+        let symlink = symlink_support_for_fs(&vol.fs_name);
         VfsCaps {
             protocol: "local",
             // Measured, not assumed: FAT stores two-second mtimes and exFAT ten-millisecond ones,
@@ -575,6 +588,32 @@ impl Vfs for LocalVfs {
             fsync: Support::Yes,
             rename: Support::Yes,
             rename_overwrite: Support::Yes,
+            exclusive_staged_file_publish: if cfg!(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "macos",
+                windows
+            )) {
+                Support::Yes
+            } else {
+                Support::No
+            },
+            exclusive_entry_rename: if cfg!(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "macos",
+                windows
+            )) {
+                Support::Yes
+            } else {
+                Support::No
+            },
+            exclusive_symlink_publish: symlink,
+            durable_namespace: if cfg!(unix) {
+                Support::Yes
+            } else {
+                Support::Unknown
+            },
             ranged_read: Support::Yes,
             write_at: Support::Yes,
             // Host syscalls are not the filesystem contract: FAT/exFAT synthesize permission
@@ -582,7 +621,7 @@ impl Vfs for LocalVfs {
             unix_mode: unix_mode_support(&vol.fs_name),
             // macOS FSKit-backed exFAT represents real links despite the portable exFAT format
             // having no POSIX mode bits. Other FAT drivers cannot be assumed to do so.
-            symlink: symlink_support_for_fs(&vol.fs_name),
+            symlink,
             file_id: if cfg!(unix) && file_ids_stable_for_fs(&vol.fs_name) {
                 Support::Yes
             } else {
@@ -591,7 +630,7 @@ impl Vfs for LocalVfs {
             free_space: Support::Yes,
             read_back: Support::Yes,
             medium: vol.medium,
-            local_trash: central_trash_reaches(&self.root, vol.medium),
+            local_trash: central_trash_reaches(self.root.display_path(), vol.medium),
             case_sensitivity: vol.case_sensitivity,
             // Whatever this process's own path layer enforces. SMB inherits this deliberately:
             // a Windows client gets Win32 name parsing even when the share is served by Samba.
@@ -610,7 +649,7 @@ impl Vfs for LocalVfs {
         self.root_str.clone()
     }
 
-    fn as_local(&self) -> Option<&Path> {
+    fn local_root(&self) -> Option<&LocalRoot> {
         Some(&self.root)
     }
 
@@ -622,131 +661,94 @@ impl Vfs for LocalVfs {
     }
 
     fn stat(&self, rel: &str) -> VfsResult<Option<VMeta>> {
-        match std::fs::symlink_metadata(self.abs(rel)) {
-            Ok(md) => Ok(Some(meta_of(&md))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+        let metadata = if rel.is_empty() {
+            self.root.metadata_directory(&relative_directory(rel)?)
+        } else {
+            self.root.metadata_path(&relative_path(rel)?)
+        };
+        match metadata {
+            Ok(metadata) => Ok(Some(meta_of(&metadata))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
         }
     }
 
     fn read_dir(&self, rel: &str) -> VfsResult<Vec<VDirEntry>> {
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(self.abs(rel))? {
-            let entry = entry?;
-            // A name that is not valid Unicode has no faithful rel: `to_string_lossy` would
-            // substitute U+FFFD, and that spelling points at a different (nonexistent) file.
-            // Skip it loudly rather than hand the engine a name it cannot act on. Scanning a
-            // local or SMB root does not come through here (`as_local` sends it down the
-            // walkdir lane, which counts these into the snapshot's walk errors) — this is the
-            // directory-deletion probe, where a skipped entry makes remove_dir fail as
-            // NotEmpty and the directory is honestly reported as kept.
-            let Some(name) = entry.file_name().to_str().map(|s| s.to_owned()) else {
-                crate::log_warn!(
-                    "vfs",
-                    "skipping '{}': name is not valid Unicode on this platform",
-                    entry.path().to_string_lossy()
-                );
-                continue;
-            };
-            // lstat semantics, and a file vanishing between listing and stat is a scan race, not an error
-            let md = match std::fs::symlink_metadata(entry.path()) {
-                Ok(md) => md,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            out.push(VDirEntry {
-                name,
-                meta: meta_of(&md),
-            });
-        }
-        Ok(out)
+        Ok(self
+            .root
+            .read_directory(&relative_directory(rel)?)?
+            .into_iter()
+            .map(|entry| VDirEntry {
+                name: entry.name,
+                meta: meta_of(&entry.metadata),
+            })
+            .collect())
     }
 
     fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>> {
         Ok(Box::new(LocalRead {
-            file: std::fs::File::open(self.abs(rel))?,
+            file: self.root.open_read(&relative_path(rel)?)?,
         }))
     }
 
     fn read_range(&self, rel: &str, off: u64, len: u32) -> VfsResult<Vec<u8>> {
-        use std::io::{Seek, SeekFrom};
-        let mut f = std::fs::File::open(self.abs(rel))?;
-        f.seek(SeekFrom::Start(off))?;
-        let mut buf = vec![0u8; len as usize];
-        let mut got = 0usize;
-        while got < buf.len() {
-            let n = f.read(&mut buf[got..])?;
-            if n == 0 {
-                break; // short only at EOF, per contract
-            }
-            got += n;
-        }
-        buf.truncate(got);
-        Ok(buf)
+        Ok(self
+            .root
+            .read_range(&relative_path(rel)?, off, len as usize)?)
     }
 
     fn read_link(&self, rel: &str) -> VfsResult<String> {
-        Ok(std::fs::read_link(self.abs(rel))?
+        Ok(self
+            .root
+            .read_link(&relative_path(rel)?)?
             .to_string_lossy()
             .into_owned())
     }
 
     fn mkdir_all(&self, rel: &str) -> VfsResult<()> {
-        Ok(std::fs::create_dir_all(self.abs(rel))?)
+        Ok(self.root.create_directory_all(&relative_directory(rel)?)?)
     }
 
     fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
-        let dst = self.abs(rel);
-        let staged = Staged::create(&dst)?;
+        let destination = relative_path(rel)?;
+        let staged = self.root.create_staged(&destination)?;
         Ok(Box::new(LocalStaged {
+            root: self.root.clone(),
             staged: Some(staged),
-            dst,
+            destination,
             hint: hint.clone(),
+            sync_requested: false,
         }))
     }
 
     fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
-        // force: an SMB server mapping unix modes can refuse to move a read-only source
-        Ok(crate::fs::rename_force(
-            &self.abs(from_rel),
-            &self.abs(to_rel),
-        )?)
+        Ok(self
+            .root
+            .rename(&relative_path(from_rel)?, &relative_path(to_rel)?)?)
     }
 
     fn rename_noreplace(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
-        let (from, to) = (self.abs(from_rel), self.abs(to_rel));
-        // Never turn ENOTSUP (notably FSKit exFAT) into stat + replacing rename: another writer
-        // can create `to` between those calls. Unsupported filesystems must fail closed.
-        Ok(crate::fs::staged::atomic_rename_noreplace(&from, &to)?)
+        Ok(self
+            .root
+            .rename_noreplace(&relative_path(from_rel)?, &relative_path(to_rel)?)?)
     }
 
     fn remove_file(&self, rel: &str) -> VfsResult<()> {
-        // force: read-only files (git objects) must still be deletable, as on unix
-        Ok(crate::fs::remove_file_force(&self.abs(rel))?)
+        Ok(self.root.remove_file(&relative_path(rel)?)?)
     }
 
     fn remove_dir(&self, rel: &str) -> VfsResult<()> {
-        // force: a directory carrying the Windows read-only attribute is refused by
-        // RemoveDirectory just as a read-only file is refused by DeleteFile
-        Ok(crate::fs::remove_dir_force(&self.abs(rel))?)
+        Ok(self.root.remove_directory(&relative_directory(rel)?)?)
     }
 
     fn set_mtime(&self, rel: &str, mtime_ms: i64) -> VfsResult<()> {
-        let ft = filetime::FileTime::from_unix_time(
-            mtime_ms.div_euclid(1000),
-            (mtime_ms.rem_euclid(1000) * 1_000_000) as u32,
-        );
-        Ok(filetime::set_file_mtime(self.abs(rel), ft)?)
+        Ok(self.root.set_mtime(&relative_path(rel)?, mtime_ms)?)
     }
 
     fn set_mode(&self, rel: &str, mode: u32) -> VfsResult<()> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            Ok(std::fs::set_permissions(
-                self.abs(rel),
-                std::fs::Permissions::from_mode(mode),
-            )?)
+            Ok(self.root.set_mode(&relative_path(rel)?, mode)?)
         }
         #[cfg(not(unix))]
         {
@@ -759,23 +761,15 @@ impl Vfs for LocalVfs {
     }
 
     fn make_symlink(&self, rel: &str, target: &str) -> VfsResult<()> {
-        #[cfg(unix)]
-        {
-            Ok(std::os::unix::fs::symlink(target, self.abs(rel))?)
-        }
-        #[cfg(windows)]
-        {
-            // File link first, directory link as the fallback (the target may be a dir).
-            // Needs developer mode or a privilege; when both fail, the error says so
-            // and preflight's Unknown-capability listing already warned.
-            let dst = self.abs(rel);
-            Ok(std::os::windows::fs::symlink_file(target, &dst)
-                .or_else(|_| std::os::windows::fs::symlink_dir(target, &dst))?)
-        }
+        Ok(self
+            .root
+            .make_symlink(&relative_path(rel)?, Path::new(target))?)
     }
 
     fn free_space(&self) -> VfsResult<Option<(u64, u64)>> {
-        Ok(crate::foundation::disk::disk_space(&self.root))
+        Ok(crate::foundation::disk::disk_space(
+            self.root.display_path(),
+        ))
     }
 }
 
@@ -925,7 +919,7 @@ mod volume_tests {
 
     #[test]
     fn a_real_local_root_probes_as_a_disk_on_this_machine() {
-        let v = LocalVfs::new(std::env::temp_dir());
+        let v = LocalVfs::open(std::env::temp_dir()).unwrap();
         let caps = v.caps();
         assert_ne!(
             caps.medium,

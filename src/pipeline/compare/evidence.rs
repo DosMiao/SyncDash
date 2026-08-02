@@ -10,18 +10,16 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model::plan::{Action, Op, Plan, Side};
-use crate::model::table::{Entry, Snapshot};
+use crate::model::table::{ObservedEntry, ObservedEntryKind, TableArtifact};
 
 use std::collections::BTreeMap;
 
-use crate::foundation::text::norm_key;
-use crate::model::table::EntryKind;
-
 use super::keys::{files_equal, map_of};
 use super::CompareOptions;
+use crate::foundation::text::norm_key;
 
 /// One side's measured state at compare time. **For display and sorting only** — apply never reads a single byte of it.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, ts_rs::TS)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct SideMeta {
     #[ts(type = "number")]
@@ -31,7 +29,7 @@ pub struct SideMeta {
 }
 
 /// Measured state of both sides, one-to-one with `plan.ops[i]` (the absent side is None)
-#[derive(Serialize, Deserialize, Clone, Default, Debug, ts_rs::TS)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq, Eq, ts_rs::TS)]
 #[ts(export, export_to = "../typescript/core/types/generated/")]
 pub struct RowMeta {
     pub src: Option<SideMeta>,
@@ -53,32 +51,40 @@ pub struct Evidence {
 /// executable operation fields; putting them on `Op` would also change the plan JSONL format and CLI
 /// contract. Identical totals use the comparison's own key folding and equality predicate.
 pub fn evidence(
-    source: &Snapshot,
-    target: &Snapshot,
+    source: &TableArtifact,
+    target: &TableArtifact,
     plan: &Plan,
+    copts: &CompareOptions,
+) -> Evidence {
+    evidence_for_operations(source, target, &plan.ops, copts)
+}
+
+pub fn evidence_for_operations(
+    source: &TableArtifact,
+    target: &TableArtifact,
+    operations: &[Op],
     copts: &CompareOptions,
 ) -> Evidence {
     let ci = copts.case_insensitive;
     let win = copts.mtime_window_ms;
-    let (s_files, _) = map_of(source, EntryKind::File, ci);
-    let (t_files, _) = map_of(target, EntryKind::File, ci);
-    let (s_dirs, _) = map_of(source, EntryKind::Dir, ci);
-    let (t_dirs, _) = map_of(target, EntryKind::Dir, ci);
+    let (s_files, _) = map_of(source, ObservedEntryKind::File, ci);
+    let (t_files, _) = map_of(target, ObservedEntryKind::File, ci);
+    let (s_dirs, _) = map_of(source, ObservedEntryKind::Directory, ci);
+    let (t_dirs, _) = map_of(target, ObservedEntryKind::Directory, ci);
 
-    let meta = |e: &Entry| SideMeta {
-        size: e.size,
-        mtime_ms: e.mtime_ms,
+    let meta = |entry: &ObservedEntry| SideMeta {
+        size: entry.size(),
+        mtime_ms: entry.mtime_ms(),
     };
-    let look = |files: &BTreeMap<String, &Entry>,
-                dirs: &BTreeMap<String, &Entry>,
+    let look = |files: &BTreeMap<String, &ObservedEntry>,
+                dirs: &BTreeMap<String, &ObservedEntry>,
                 rel: &str|
      -> Option<SideMeta> {
         let k = norm_key(rel, ci);
         files.get(&k).or_else(|| dirs.get(&k)).map(|e| meta(e))
     };
 
-    let metas = plan
-        .ops
+    let metas = operations
         .iter()
         .map(|op| {
             // On the executing side a move is still called from, on the other side it is already path — each side is looked up under its own name
@@ -103,8 +109,11 @@ pub fn evidence(
     for (k, se) in &s_files {
         if let Some(te) = t_files.get(k) {
             if files_equal(se, te, win) {
+                let source_file = se
+                    .as_file()
+                    .expect("the file observation map contains only files");
                 identical_count += 1;
-                identical_bytes += se.size;
+                identical_bytes += source_file.size;
             }
         }
     }
@@ -131,8 +140,8 @@ pub struct IdenticalRow {
 /// Files judged identical on both sides, paged in source-side path order. This retained evidence lets
 /// the UI distinguish an identical file from a path absent because it was excluded or unread.
 pub fn identical_page(
-    source: &Snapshot,
-    target: &Snapshot,
+    source: &TableArtifact,
+    target: &TableArtifact,
     compare_options: &CompareOptions,
     query: &str,
     offset: usize,
@@ -140,8 +149,8 @@ pub fn identical_page(
 ) -> (u64, Vec<IdenticalRow>) {
     let case_insensitive = compare_options.case_insensitive;
     let mtime_window_ms = compare_options.mtime_window_ms;
-    let (source_files, _) = map_of(source, EntryKind::File, case_insensitive);
-    let (target_files, _) = map_of(target, EntryKind::File, case_insensitive);
+    let (source_files, _) = map_of(source, ObservedEntryKind::File, case_insensitive);
+    let (target_files, _) = map_of(target, ObservedEntryKind::File, case_insensitive);
     let normalized_query = query.trim().to_lowercase();
     let mut total = 0u64;
     let mut rows = Vec::new();
@@ -152,8 +161,18 @@ pub fn identical_page(
         if !files_equal(source_entry, target_entry, mtime_window_ms) {
             continue;
         }
+        let source_file = source_entry
+            .as_file()
+            .expect("the source file observation map contains only files");
+        let target_file = target_entry
+            .as_file()
+            .expect("the target file observation map contains only files");
         if !normalized_query.is_empty()
-            && !source_entry.path.to_lowercase().contains(&normalized_query)
+            && !source_file
+                .path
+                .as_str()
+                .to_lowercase()
+                .contains(&normalized_query)
         {
             continue;
         }
@@ -161,10 +180,10 @@ pub fn identical_page(
         let result_index = (total - 1) as usize;
         if result_index >= offset && rows.len() < limit {
             rows.push(IdenticalRow {
-                path: source_entry.path.clone(),
-                size: source_entry.size,
-                source_mtime_ms: source_entry.mtime_ms,
-                target_mtime_ms: target_entry.mtime_ms,
+                path: source_file.path.as_str().to_owned(),
+                size: source_file.size,
+                source_mtime_ms: source_file.mtime_ms,
+                target_mtime_ms: target_file.mtime_ms,
             });
         }
     }
@@ -181,7 +200,7 @@ pub fn reverse_op(operation: &Op) -> Option<Op> {
         Side::Source => Side::Target,
         Side::Target => Side::Source,
     };
-    let reason = format!("flipped({})", operation.reason);
+    let reason = format!("reversed({})", operation.reason);
     match operation.action {
         // Copy becomes Delete: the content evidence describes a file that is about to be removed,
         // not written, so hash and mtime are dropped on purpose. `size` stays — it is what the
@@ -223,15 +242,19 @@ pub fn reverse_op(operation: &Op) -> Option<Op> {
 mod tests {
     use super::super::{compare, CompareOptions};
     use super::*;
-    use crate::model::table::{Header, SCHEMA};
+    use crate::foundation::path::RootRelativePath;
+    use crate::model::table::{
+        Blake3Digest, FileIdentityObservation, ObservedFile, TableEvidence, TableHeader, TableKind,
+        TABLE_SCHEMA,
+    };
 
-    /// A flipped row is executed, not just displayed, so the reversal must not quietly drop fields.
+    /// A reversed row is executed, not just displayed, so the reversal must not quietly drop fields.
     /// `link` is the sharp one: a symlink op that loses it stops being a symlink op and takes the
     /// content-copy lane instead. `mode` is inert only until Copy/Update start carrying it, at which
     /// point the loss would be *selective* — the one row the user looked hardest at is the one
     /// written without its mode.
     #[test]
-    fn a_flipped_op_keeps_the_fields_that_decide_how_it_is_written() {
+    fn a_reversed_op_keeps_the_fields_that_decide_how_it_is_written() {
         let source_operation = Op {
             side: Side::Target,
             action: Action::Update,
@@ -248,32 +271,32 @@ mod tests {
         assert_eq!(
             reversed.side,
             Side::Source,
-            "the flip is what the side is for"
+            "the reversal is what the side is for"
         );
         assert_eq!(
             reversed.link.as_deref(),
             Some("../nodejs/bin/node"),
             "a symlink op must stay a symlink op"
         );
-        assert_eq!(reversed.mode, Some(0o755), "the mode survives the flip");
+        assert_eq!(reversed.mode, Some(0o755), "the mode survives the reversal");
         assert_eq!(reversed.path, "bin/node");
         // The content evidence belonged to the side that just lost, so it is dropped deliberately.
         assert_eq!(reversed.hash, None);
         assert_eq!(reversed.size, None);
     }
 
-    fn snap(os: &str, entries: Vec<Entry>) -> Snapshot {
-        Snapshot {
-            header: Header {
-                schema: SCHEMA,
-                kind: "snapshot".into(),
+    fn snap(os: &str, entries: Vec<ObservedEntry>) -> TableArtifact {
+        TableArtifact {
+            header: TableHeader {
+                schema: TABLE_SCHEMA,
+                kind: TableKind::Snapshot,
                 root: "/r".into(),
                 host: "h".into(),
                 os: os.into(),
                 scanned_at_ms: 0,
                 duration_ms: 0,
                 entry_count: entries.len() as u64,
-                hashed: true,
+                evidence: TableEvidence::Full,
                 excluded_dirs: 0,
                 excluded_files: 0,
                 walk_errors: 0,
@@ -287,27 +310,23 @@ mod tests {
             entries,
         }
     }
-    fn file(path: &str, hash: &str) -> Entry {
-        Entry {
-            path: path.into(),
-            kind: EntryKind::File,
-            size: 1,
-            mtime_ms: 0,
-            hash: Some(hash.into()),
-            hash_failed: false,
-            file_id: None,
-            mode: None,
-            link: None,
-            prev: None,
-        }
+    fn file(path: &str, hash: &str) -> ObservedEntry {
+        file_with_metadata(path, hash, 1, 0)
     }
-    /// A file with an mtime (conflict arbitration goes by mtime)
-    /// An archive entry: current hash + historic generations
-    /// A snapshot of a VFS root: `header.os` carries the *protocol*, and the naming rules
-    /// live in the VfsNote — exactly the shape `scan_vfs` writes.
 
-    // P2-5: empty files / ambiguous pairing
-
+    fn file_with_metadata(path: &str, hash: &str, size: u64, mtime_ms: i64) -> ObservedEntry {
+        ObservedEntry::File(ObservedFile {
+            path: RootRelativePath::try_from(path).unwrap(),
+            size,
+            mtime_ms,
+            identity: FileIdentityObservation::FullBlake3 {
+                digest: Blake3Digest::hash_bytes(hash.as_bytes()),
+            },
+            file_system_id: None,
+            mode: None,
+            previous_identities: Vec::new(),
+        })
+    }
     #[test]
     fn reverse_op_semantics() {
         let copy = Op {
@@ -394,41 +413,17 @@ mod tests {
         let s = snap(
             "windows",
             vec![
-                Entry {
-                    size: 10,
-                    mtime_ms: 1_000,
-                    ..file("same.txt", "h0")
-                },
-                Entry {
-                    size: 30,
-                    mtime_ms: 9_000,
-                    ..file("upd.txt", "hs")
-                },
-                Entry {
-                    size: 7,
-                    mtime_ms: 5_000,
-                    ..file("only_s.txt", "h1")
-                },
+                file_with_metadata("same.txt", "h0", 10, 1_000),
+                file_with_metadata("upd.txt", "hs", 30, 9_000),
+                file_with_metadata("only_s.txt", "h1", 7, 5_000),
             ],
         );
         let t = snap(
             "windows",
             vec![
-                Entry {
-                    size: 10,
-                    mtime_ms: 1_000,
-                    ..file("same.txt", "h0")
-                },
-                Entry {
-                    size: 20,
-                    mtime_ms: 2_000,
-                    ..file("upd.txt", "ht")
-                },
-                Entry {
-                    size: 4,
-                    mtime_ms: 3_000,
-                    ..file("only_t.txt", "h2")
-                },
+                file_with_metadata("same.txt", "h0", 10, 1_000),
+                file_with_metadata("upd.txt", "ht", 20, 2_000),
+                file_with_metadata("only_t.txt", "h2", 4, 3_000),
             ],
         );
         let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
@@ -463,10 +458,13 @@ mod tests {
 
     #[test]
     fn identical_page_lists_only_identical_files_and_pages() {
-        let make_entry = |index: usize, hash: &str| Entry {
-            size: index as u64,
-            mtime_ms: index as i64 * 1000,
-            ..file(&format!("d{}/f{index}.bin", index % 3), hash)
+        let make_entry = |index: usize, hash: &str| {
+            file_with_metadata(
+                &format!("d{}/f{index}.bin", index % 3),
+                hash,
+                index as u64,
+                index as i64 * 1000,
+            )
         };
         let source = snap(
             "windows",
@@ -531,19 +529,11 @@ mod tests {
         // Same-content rename: source is already called b.bin, target is still a.bin — each side is looked up under its own name
         let s = snap(
             "windows",
-            vec![Entry {
-                size: 42,
-                mtime_ms: 8_000,
-                ..file("b.bin", "hm")
-            }],
+            vec![file_with_metadata("b.bin", "hm", 42, 8_000)],
         );
         let t = snap(
             "windows",
-            vec![Entry {
-                size: 42,
-                mtime_ms: 4_000,
-                ..file("a.bin", "hm")
-            }],
+            vec![file_with_metadata("a.bin", "hm", 42, 4_000)],
         );
         let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
         let i = plan

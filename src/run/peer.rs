@@ -4,19 +4,85 @@
 //! applies a package we build here. That is why the capability consent and the disk-space gate do
 //! not apply to this lane — they are questions about roots this process opened, and it opened none.
 
-use crate::job::Job;
+use crate::job::{Job, SingleTargetJob};
 use crate::model::plan::{Action, Op, Plan};
 use crate::pipeline::{compare, scan};
 
 use super::archive::refresh_archive_with;
 use super::{scan_opts, CompareOutcome};
-use crate::model::table::Snapshot;
+use crate::foundation::path::RootRelativePath;
+use crate::fs::local_root::LocalRoot;
+use crate::model::table::TableArtifact;
 
-/// Remote pipeline (the v0.6 end-to-end over ssh): ssh probe → remote-local scan (table collected from stdout) → local scan → compare
-/// → pack the target side and ship it over ssh to apply-pack → write the source side straight through the mounted path → refresh the archive on a successful sync.
+struct TemporaryPeerPackage {
+    root: LocalRoot,
+    relative: RootRelativePath,
+    file: std::fs::File,
+}
+
+impl TemporaryPeerPackage {
+    fn create() -> std::io::Result<Self> {
+        let root = LocalRoot::open(std::env::temp_dir())?;
+        for _ in 0..16 {
+            let mut random = [0u8; 16];
+            getrandom::fill(&mut random).map_err(|error| {
+                std::io::Error::other(format!("random token generation failed: {error}"))
+            })?;
+            let mut token = String::with_capacity(random.len() * 2);
+            for byte in random {
+                use std::fmt::Write as _;
+                write!(token, "{byte:02x}").expect("writing into a String cannot fail");
+            }
+            let relative = RootRelativePath::try_from(format!("syncdash-peer-{token}.tar"))
+                .expect("generated peer package names satisfy the relative-path contract");
+            match root.create_regular_file_new(&relative) {
+                Ok(file) => {
+                    return Ok(Self {
+                        root,
+                        relative,
+                        file,
+                    })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate an exclusive peer package file",
+        ))
+    }
+
+    fn output(&self) -> std::io::Result<std::fs::File> {
+        self.file.try_clone()
+    }
+
+    fn reader(&self) -> std::io::Result<std::fs::File> {
+        use std::io::{Seek, SeekFrom};
+
+        let mut reader = self.file.try_clone()?;
+        reader.seek(SeekFrom::Start(0))?;
+        Ok(reader)
+    }
+
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    fn file_name(&self) -> &str {
+        self.relative.as_str()
+    }
+}
+
+impl Drop for TemporaryPeerPackage {
+    fn drop(&mut self) {
+        let _ = self.root.remove_open_file(&self.relative, &self.file);
+    }
+}
+
 pub fn run_peer_job(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     do_apply: bool,
     verbose: bool,
     acknowledged: bool,
@@ -31,12 +97,11 @@ pub fn run_peer_job(
     )
 }
 
-/// v0.9 M1/M3: the remote pipeline = a compare stage plus an apply stage (desktop calls each over its own IPC round; the CLI runs both end-to-end here).
-/// PhaseStart at each stage boundary, cooperation points between stages, a Summary terminal state; byte-level counting inside the
-/// ssh transfer and kill-on-cancel are explicitly deferred (M1 step 8).
+/// Keep the CLI's combined Compare/Apply flow on the same progress contract as the desktop's
+/// separate commands, including a terminal Summary when Compare is cancelled.
 pub fn run_peer_job_with(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     do_apply: bool,
     verbose: bool,
     acknowledged: bool,
@@ -56,7 +121,7 @@ pub fn run_peer_job_with(
         crate::model::event::LogLevel::Info,
         "run",
         format!(
-            "[{name}] {} op(s), {} conflict(s)  (remote pipeline via ssh)",
+            "[{name}] {} op(s), {} conflict(s)  (peer pipeline via ssh)",
             plan.header.op_count, plan.header.conflict_count
         ),
     );
@@ -74,9 +139,14 @@ pub fn run_peer_job_with(
         .cloned()
         .collect();
     let t0 = std::time::Instant::now();
-    let rec = crate::obs::runlog::Recorder::start(name, &super::run_kind(job, "apply"), ctx, &ops);
+    let rec = crate::obs::runlog::Recorder::start(
+        crate::obs::runlog::RunSubject::for_job(name, job),
+        super::apply_run_kind(job),
+        ctx,
+        &ops,
+    );
     let out = apply_peer_job_with(name, job, &plan, &ops, verbose, acknowledged, &rec.ctx)?;
-    rec.finish(&out, t0.elapsed().as_millis() as u64);
+    let _ = rec.finish(&out, t0.elapsed().as_millis() as u64);
     Ok((
         out.done,
         out.skipped,
@@ -113,12 +183,12 @@ fn emit_apply_summary(
     });
 }
 
-/// Remote connection parameters (the product of a probe). The desktop's compare and apply are two independent IPC rounds
+/// Peer connection parameters (the product of a probe). The desktop's compare and apply are two independent IPC rounds
 /// with no connection kept in between — the apply stage probes again (one ssh round trip, which doubles as a reachability preflight).
-pub struct RemoteLink {
+pub struct PeerLink {
     pub host: String,
-    pub exe: String,
-    pub rroot: String,
+    pub executable: String,
+    pub peer_root: String,
     /// A local path serving the *same* tree the peer syncs — the `|mount=` option.
     ///
     /// The peer lane pushes: it packs the target-side ops and the far side applies them. The
@@ -128,17 +198,24 @@ pub struct RemoteLink {
     /// `remote_root`, nothing said the two named one tree, and a missing mount skipped those ops
     /// with a warning nobody had a reason to expect.
     pub mount: Option<std::path::PathBuf>,
-    pub shell: crate::transfer::peer::RemoteShell,
+    pub shell: crate::transfer::peer::PeerShell,
     /// The live ssh session, held for the whole stage. The old transport handshook once per
     /// command; a compare stage runs several.
     pub session: crate::transfer::peer::PeerSession,
 }
 
-impl RemoteLink {
-    /// Build one remote syncdash command line for this peer's shell dialect.
-    fn cmd(&self, args: &[String]) -> String {
-        crate::transfer::peer::remote_cmd(self.shell, &self.exe, args)
+impl PeerLink {
+    /// Build one syncdash command line for this peer's shell dialect.
+    fn command(&self, arguments: &[String]) -> String {
+        crate::transfer::peer::peer_command(self.shell, &self.executable, arguments)
     }
+}
+
+struct PeerLinkSettings {
+    host: String,
+    executable: String,
+    peer_root: String,
+    mount: Option<std::path::PathBuf>,
 }
 
 /// Restore a peer root to the absolute path the far side will resolve.
@@ -151,7 +228,7 @@ impl RemoteLink {
 ///
 /// A drive letter is already absolute (a Windows peer takes `C:\…` verbatim); everything else lost
 /// a `/` on the way in and gets it back.
-fn absolute_remote_root(root: &str) -> String {
+fn absolute_peer_root(root: &str) -> String {
     let b = root.as_bytes();
     if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
         root.to_string()
@@ -160,64 +237,103 @@ fn absolute_remote_root(root: &str) -> String {
     }
 }
 
-/// Pull the link out of a `peer://` target phrase.
-fn link_of(job: &Job) -> std::io::Result<(String, String, String, Option<std::path::PathBuf>)> {
+fn parse_peer_link_settings(job: &SingleTargetJob) -> std::io::Result<PeerLinkSettings> {
     use crate::fs::vfs::spec::{parse, RootSpec};
-    let bad = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, m);
-    let RootSpec::Remote(r) = parse(&job.target) else {
-        return Err(bad(format!(
+    let invalid_input =
+        |message: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+    let RootSpec::Endpoint(peer_spec) = parse(job.target()) else {
+        return Err(invalid_input(format!(
             "target '{}' is not a peer:// root",
-            job.target
+            job.target()
         )));
     };
-    if r.root.is_empty() {
-        return Err(bad(format!(
+    if peer_spec.root.is_empty() {
+        return Err(invalid_input(format!(
             "target '{}' names no path on {} — a peer root needs one (peer://{}/path/to/tree)",
-            job.target, r.host, r.host
+            job.target(),
+            peer_spec.host,
+            peer_spec.host
         )));
     }
-    Ok((
-        r.host.clone(),
-        r.opt("exe")
+    Ok(PeerLinkSettings {
+        host: peer_spec.host.clone(),
+        executable: peer_spec
+            .opt("exe")
             .filter(|e| !e.is_empty())
             .unwrap_or("syncdash")
             .to_string(),
-        absolute_remote_root(&r.root),
-        r.opt("mount")
+        peer_root: absolute_peer_root(&peer_spec.root),
+        mount: peer_spec
+            .opt("mount")
             .filter(|m| !m.is_empty())
             .map(std::path::PathBuf::from),
-    ))
+    })
 }
 
 #[cfg(test)]
 mod link_tests {
-    use super::absolute_remote_root;
+    use super::absolute_peer_root;
 
     /// Caught on real hardware: the far side was sent `Users/xuanbomiao/x` and resolved it against
     /// the login home. A peer root has to arrive as the absolute path it was written as.
     #[test]
     fn a_posix_peer_root_gets_its_leading_slash_back() {
-        assert_eq!(absolute_remote_root("Users/ben/Code"), "/Users/ben/Code");
-        assert_eq!(absolute_remote_root("srv/data"), "/srv/data");
+        assert_eq!(absolute_peer_root("Users/ben/Code"), "/Users/ben/Code");
+        assert_eq!(absolute_peer_root("srv/data"), "/srv/data");
     }
 
     #[test]
     fn a_windows_peer_root_is_already_absolute() {
-        assert_eq!(absolute_remote_root("C:/Users/ben"), "C:/Users/ben");
-        assert_eq!(absolute_remote_root(r"D:\Code"), r"D:\Code");
+        assert_eq!(absolute_peer_root("C:/Users/ben"), "C:/Users/ben");
+        assert_eq!(absolute_peer_root(r"D:\Code"), r"D:\Code");
+    }
+}
+
+#[cfg(test)]
+mod temporary_package_tests {
+    use super::TemporaryPeerPackage;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn peer_package_is_exclusive_reopen_free_and_removed_on_drop() {
+        let package = TemporaryPeerPackage::create().unwrap();
+        let path = package.root.display_path().join(package.file_name());
+        let mut output = package.output().unwrap();
+        output.write_all(b"package").unwrap();
+        output.sync_all().unwrap();
+
+        let mut reader = package.reader().unwrap();
+        let mut contents = Vec::new();
+        reader.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"package");
+        assert_eq!(package.len().unwrap(), b"package".len() as u64);
+        assert!(path.is_file());
+
+        drop(reader);
+        drop(output);
+        drop(package);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn concurrent_peer_packages_never_share_a_name() {
+        let first = TemporaryPeerPackage::create().unwrap();
+        let second = TemporaryPeerPackage::create().unwrap();
+
+        assert_ne!(first.file_name(), second.file_name());
     }
 }
 
 #[cfg(test)]
 mod filter_tests {
-    use super::remote_scan_args;
+    use super::build_peer_scan_arguments;
     use crate::job::Job;
 
     fn job_with(include: &[&str], exclude: &[&str]) -> Job {
         Job {
             mode: "mirror".into(),
             source: r"D:\src".into(),
-            target: "peer://mac/Users/ben/dst".into(),
+            targets: vec!["peer://mac/Users/ben/dst".into()],
             include: include.iter().map(|s| s.to_string()).collect(),
             exclude: exclude.iter().map(|s| s.to_string()).collect(),
             ..Job::default()
@@ -233,12 +349,15 @@ mod filter_tests {
 
     #[test]
     fn every_exclude_crosses_the_link() {
-        let a = remote_scan_args(
+        let arguments = build_peer_scan_arguments(
             &job_with(&[], &["*/big_temp/", "*/*.log"]),
             "/Users/ben/dst",
         );
-        assert_eq!(pairs(&a, "--exclude"), vec!["*/big_temp/", "*/*.log"]);
-        assert_eq!(pairs(&a, "--junk"), vec!["none"]);
+        assert_eq!(
+            pairs(&arguments, "--exclude"),
+            vec!["*/big_temp/", "*/*.log"]
+        );
+        assert_eq!(pairs(&arguments, "--junk"), vec!["none"]);
     }
 
     /// The whole filter has to cross, not half of it.
@@ -251,63 +370,63 @@ mod filter_tests {
     /// asymmetry.
     #[test]
     fn every_include_crosses_the_link_too() {
-        let a = remote_scan_args(&job_with(&["*/keep/", "/docs/"], &[]), "/Users/ben/dst");
+        let arguments =
+            build_peer_scan_arguments(&job_with(&["*/keep/", "/docs/"], &[]), "/Users/ben/dst");
         assert_eq!(
-            pairs(&a, "--include"),
+            pairs(&arguments, "--include"),
             vec!["*/keep/", "/docs/"],
-            "an allowlist that binds only the local root turns every unlisted remote file into a deletion"
+            "an allowlist that binds only the local root turns every unlisted peer file into a deletion"
         );
     }
 }
 
-/// Stage 1: probe reachability + schema agreement + the remote OS (which decides the shell dialect).
-///
 /// It takes `ctx` for the sake of the schema-mismatch warning: that one has to reach the UI **during compare**.
 /// Going through the macro and the global registry, no sink is installed during compare (only apply starts a Recorder),
 /// so this line in particular would fall back to stderr — which in a windowed desktop build is the same as saying nothing.
 pub fn probe_peer(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     ctx: &crate::obs::progress::RunCtx,
-) -> std::io::Result<RemoteLink> {
-    let (host, exe, rroot, mount) = link_of(job)?;
-    let (host, exe, rroot) = (host.as_str(), exe.as_str(), rroot.as_str());
-    let session = crate::transfer::peer::PeerSession::open(&job.target)?;
-    let probe = session.capture(&format!("{exe} probe"))?;
+) -> std::io::Result<PeerLink> {
+    let settings = parse_peer_link_settings(job)?;
+    let host = settings.host.as_str();
+    let executable = settings.executable.as_str();
+    let session = crate::transfer::peer::PeerSession::open(job.target())?;
+    let probe = session.capture(&format!("{executable} probe"))?;
     let pv: serde_json::Value = serde_json::from_slice(&probe).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("bad probe output: {e}"),
         )
     })?;
-    if pv["schema"].as_u64() != Some(crate::model::table::SCHEMA as u64) {
+    if pv["schema"].as_u64() != Some(crate::model::table::TABLE_SCHEMA as u64) {
         ctx.log(
             crate::model::event::LogLevel::Warn,
-            "remote",
+            "peer",
             format!(
-                "[{name}] warning: remote schema {} != local {} — rebuild the remote binary",
+                "[{name}] warning: peer schema {} != local {} — rebuild the peer binary",
                 pv["schema"],
-                crate::model::table::SCHEMA
+                crate::model::table::TABLE_SCHEMA
             ),
         );
     }
-    let remote_os = pv["os"].as_str().unwrap_or("").to_string();
+    let peer_os = pv["os"].as_str().unwrap_or("").to_string();
     ctx.log(
         crate::model::event::LogLevel::Info,
-        "remote",
+        "peer",
         format!(
-            "[{name}] remote {}: {} {}",
+            "[{name}] peer {}: {} {}",
             host,
-            remote_os,
+            peer_os,
             pv["arch"].as_str().unwrap_or("?")
         ),
     );
-    Ok(RemoteLink {
-        host: host.to_string(),
-        exe: exe.to_string(),
-        rroot: rroot.to_string(),
-        mount,
-        shell: crate::transfer::peer::RemoteShell::from_os(&remote_os),
+    Ok(PeerLink {
+        host: settings.host,
+        executable: settings.executable,
+        peer_root: settings.peer_root,
+        mount: settings.mount,
+        shell: crate::transfer::peer::PeerShell::from_os(&peer_os),
         session,
     })
 }
@@ -316,7 +435,7 @@ pub fn probe_peer(
 /// without one.
 ///
 /// **Both roots must be filtered by the same rule**, and that governs everything below: the whole
-/// mask crosses (`--include` as well as `--exclude`), and `--junk none` stops the remote adding its
+/// mask crosses (`--include` as well as `--exclude`), and `--junk none` stops the peer adding its
 /// own CLI default on top of rules the job already spells out in full. A rule binding one root only
 /// is the shape that gets a tree proposed for deletion — with `include` dropped, the far side
 /// reports files the local filter hid, and `mirror` reads those as "on the target, not on the
@@ -324,13 +443,13 @@ pub fn probe_peer(
 ///
 /// The rigor knobs go over **resolved**, because a preset name is not enough: details may have
 /// overridden it.
-fn remote_scan_args(job: &Job, rroot: &str) -> Vec<String> {
+fn build_peer_scan_arguments(job: &Job, peer_root: &str) -> Vec<String> {
     // The job's own tier, not a narrowed one: this process holds no handle on the far root, so there
     // is no second backend to negotiate down to.
     let opt = scan_opts(job);
-    let mut a: Vec<String> = vec![
+    let mut arguments: Vec<String> = vec![
         "scan".into(),
-        rroot.to_string(),
+        peer_root.to_string(),
         "--evidence".into(),
         super::evidence_label(&opt).into(),
         "--cache".into(),
@@ -338,56 +457,54 @@ fn remote_scan_args(job: &Job, rroot: &str) -> Vec<String> {
         "--junk".into(),
         "none".into(),
     ];
-    for inc in &job.include {
-        a.push("--include".into());
-        a.push(inc.clone());
+    for include in &job.include {
+        arguments.push("--include".into());
+        arguments.push(include.clone());
     }
-    for ex in &job.exclude {
-        a.push("--exclude".into());
-        a.push(ex.clone());
+    for exclude in &job.exclude {
+        arguments.push("--exclude".into());
+        arguments.push(exclude.clone());
     }
     if job.symlinks == "direct" {
-        a.push("--symlinks-direct".into());
+        arguments.push("--symlinks-direct".into());
     }
-    a
+    arguments
 }
 
-/// The same detailed variant for the remote pipeline: the remote snapshot is a complete table pulled back over ssh,
+/// The same detailed variant for the peer pipeline: the peer snapshot is a complete table pulled back over ssh,
 /// so the evidence layer (both sides' size/mtime, identical items) is just as computable here as for a local job.
 pub fn compare_peer_job_detailed(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<CompareOutcome> {
     use crate::model::event::Phase;
     use crate::obs::progress::PhaseProgress;
+    let configuration = job.configuration();
     let link = probe_peer(name, job, ctx)?;
 
-    // 2) Remote scan (hashing on the remote's own disk — far faster than pulling the data over UNC)
-    // The remote is passed the **resolved** knobs explicitly (a preset name isn't enough — details may have overridden it)
-    let scan_args = remote_scan_args(job, &link.rroot);
+    let scan_arguments = build_peer_scan_arguments(configuration, &link.peer_root);
     ctx.checkpoint()?;
-    // The remote scans on its own disk, so locally all we can show is "in progress" — totals zeroed, the label spells out who we are waiting on
+    // The peer scans on its own disk, so this process has no totals until the table returns.
     let pp_rs = PhaseProgress::begin(
         ctx,
         Phase::ScanTarget,
-        Some(format!("ssh:{} {}", link.host, link.rroot)),
+        Some(format!("ssh:{} {}", link.host, link.peer_root)),
         0,
         0,
     );
-    let table_bytes = link.session.capture(&link.cmd(&scan_args))?;
-    let t = Snapshot::from_reader(std::io::BufReader::new(&table_bytes[..]))?;
+    let table_bytes = link.session.capture(&link.command(&scan_arguments))?;
+    let t = TableArtifact::read_snapshot(std::io::BufReader::new(&table_bytes[..]))?;
     pp_rs.finish()?;
 
-    // 3) Local scan + compare (the local source side goes through the mount-point gate too)
     let mut v = crate::pipeline::guard::Verdict {
         blockers: Vec::new(),
         warnings: Vec::new(),
     };
     crate::pipeline::guard::roots::check_root(
         "source",
-        job.source_path(),
-        job.require_marker,
+        configuration.source_path(),
+        configuration.require_marker,
         &mut v,
     );
     for w in &v.warnings {
@@ -403,11 +520,14 @@ pub fn compare_peer_job_detailed(
             v.blockers.join("; "),
         ));
     }
-    let s = scan::scan_ctx(job.source_path(), &scan_opts(job), ctx, Phase::ScanSource)?;
-    let archive = match (&job.archive, job.mode.as_str()) {
-        (Some(p), "sync") if p.is_file() => Some(Snapshot::load(p)?),
-        _ => None,
-    };
+    let options = scan_opts(configuration);
+    let s = scan::scan_ctx(
+        configuration.source_path(),
+        &options,
+        ctx,
+        Phase::ScanSource,
+    )?;
+    let archive = super::load_comparison_archive(configuration, &options, ctx)?;
     let pp_cmp = PhaseProgress::begin(
         ctx,
         Phase::Compare,
@@ -418,8 +538,8 @@ pub fn compare_peer_job_detailed(
         0,
         0,
     );
-    let copts = job.compare_opts();
-    let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
+    let copts = configuration.compare_opts();
+    let plan = compare::compare(&s, &t, &configuration.mode, archive.as_ref(), false, &copts);
     pp_cmp.finish()?;
     Ok(CompareOutcome {
         plan,
@@ -429,15 +549,15 @@ pub fn compare_peer_job_detailed(
     })
 }
 
-/// The plan health check for a remote job (used by the desktop confirmation sheet): the deletion-share gate only —
-/// disk space and the marker live on the remote machine; we cannot check them locally and must not pretend we did.
+/// The peer plan health check can prove deletion share locally; disk space and the marker live on
+/// the peer and remain explicit capability limitations.
 pub fn preflight_peer_job(
-    job: &Job,
+    job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
     acknowledged: bool,
 ) -> crate::pipeline::guard::Verdict {
-    let g = job.guards(acknowledged);
+    let g = job.configuration().guards(acknowledged);
     let st = crate::pipeline::guard::stats::stat_plan(ops);
     let mut gv = crate::pipeline::guard::Verdict {
         blockers: Vec::new(),
@@ -465,9 +585,9 @@ pub fn preflight_peer_job(
             )
     });
     if needs_pull_mount {
-        match crate::fs::vfs::spec::parse(&job.target) {
-            crate::fs::vfs::spec::RootSpec::Remote(remote) => {
-                match remote.opt("mount").filter(|mount| !mount.is_empty()) {
+        match crate::fs::vfs::spec::parse(job.target()) {
+            crate::fs::vfs::spec::RootSpec::Endpoint(peer_spec) => {
+                match peer_spec.opt("mount").filter(|mount| !mount.is_empty()) {
                     Some(mount) if std::path::Path::new(mount).is_dir() => {}
                     Some(mount) => gv.blockers.push(format!(
                         "source-side actions require the peer mount '{mount}', but it is not an accessible directory"
@@ -488,7 +608,10 @@ pub fn preflight_peer_job(
 
 /// Limitations the controlling process can prove before shipping a package to a peer.
 /// Anything unobservable is represented as structured review data instead of being fabricated.
-pub fn apply_capabilities(job: &Job, ops: &[Op]) -> crate::pipeline::guard::caps::CapReport {
+pub fn apply_capabilities(
+    job: &SingleTargetJob,
+    ops: &[Op],
+) -> crate::pipeline::guard::caps::CapReport {
     use crate::model::plan::{Action, Side};
     use crate::pipeline::guard::caps::{CapItem, CapReport, CapSeverity};
 
@@ -499,30 +622,31 @@ pub fn apply_capabilities(job: &Job, ops: &[Op]) -> crate::pipeline::guard::caps
         return CapReport::default();
     }
     let mut report = CapReport::default();
-    if job.require_marker {
+    let configuration = job.configuration();
+    if configuration.require_marker {
         report.items.push(CapItem {
             feature: "require_marker".into(),
             side: "target".into(),
             severity: CapSeverity::Block,
             requested: "a .syncdash-root marker verified before writing".into(),
-            actual: "the current peer package protocol cannot inspect the remote marker".into(),
+            actual: "the current peer package protocol cannot inspect the peer marker".into(),
             effect:
                 "the required mount-point gate cannot be proven, so target-side writes are refused"
                     .into(),
         });
     }
-    if job.min_free_pct > 0.0 {
+    if configuration.min_free_pct > 0.0 {
         report.items.push(CapItem {
             feature: "min_free_pct".into(),
             side: "target".into(),
             severity: CapSeverity::NeedsAck,
             requested: format!(
                 "at least {:.2}% free space retained before writing",
-                job.min_free_pct * 100.0
+                configuration.min_free_pct * 100.0
             ),
-            actual: "remote free space is not observable through the current peer package protocol"
+            actual: "peer free space is not observable through the current package protocol"
                 .into(),
-            effect: "the remote target can run out of space; staged writes still fail per file without publishing partial content"
+            effect: "the peer target can run out of space; staged writes still fail per file without publishing partial content"
                 .into(),
         });
     }
@@ -551,36 +675,39 @@ mod apply_capability_tests {
     }
 
     #[test]
-    fn peer_limitations_are_structured_only_when_the_remote_side_writes() {
+    fn peer_limitations_are_structured_only_when_the_peer_side_writes() {
         let mut job = Job::default();
-        job.target = "peer://host/srv/data".into();
-        let report = apply_capabilities(&job, &[target_write()]);
+        job.source = "/source".into();
+        job.targets = vec!["peer://host/srv/data".into()];
+        let selected = job.select_target(0).unwrap();
+        let report = apply_capabilities(&selected, &[target_write()]);
         assert!(report.items.iter().any(|item| {
             item.feature == "min_free_pct" && item.severity == CapSeverity::NeedsAck
         }));
 
         let mut source = target_write();
         source.side = Side::Source;
-        assert!(apply_capabilities(&job, &[source]).items.is_empty());
+        assert!(apply_capabilities(&selected, &[source]).items.is_empty());
     }
 
     #[test]
     fn an_unobservable_required_peer_marker_is_a_hard_blocker() {
         let mut job = Job::default();
-        job.target = "peer://host/srv/data".into();
+        job.source = "/source".into();
+        job.targets = vec!["peer://host/srv/data".into()];
         job.require_marker = true;
-        let report = apply_capabilities(&job, &[target_write()]);
+        let selected = job.select_target(0).unwrap();
+        let report = apply_capabilities(&selected, &[target_write()]);
         assert!(report.items.iter().any(|item| {
             item.feature == "require_marker" && item.severity == CapSeverity::Block
         }));
     }
 }
 
-/// v0.9 M3: the **apply stage** of a remote job — `ops` is the subset the user finalised in the diff table (direction flips / check marks already applied).
-/// Probe again → health check → pack the selection → ship the package over ssh → remote apply-pack → pull the source side back → refresh → Summary.
+/// The peer apply stage receives the reviewed subset after direction changes and inclusion decisions.
 pub fn apply_peer_job_with(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
     verbose: bool,
@@ -592,7 +719,7 @@ pub fn apply_peer_job_with(
 
 pub fn apply_peer_job_with_classified(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
     verbose: bool,
@@ -674,10 +801,10 @@ mod apply_boundary_tests {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // reviewed inputs and the write-boundary witness remain explicit
 fn apply_peer_inner(
     name: &str,
-    job: &Job,
+    job: &SingleTargetJob,
     plan_full: &Plan,
     sel_ops: &[Op],
     verbose: bool,
@@ -689,7 +816,7 @@ fn apply_peer_inner(
     use crate::model::plan::Side;
     use crate::obs::progress::{ApplyOutcome, PhaseProgress};
 
-    // Plan health check: remote disk space is unknowable, but an accident like "delete most of the other side" can be caught locally
+    let configuration = job.configuration();
     let gv = preflight_peer_job(job, plan_full, sel_ops, acknowledged);
     if !gv.report(name) {
         for b in &gv.blockers {
@@ -712,7 +839,7 @@ fn apply_peer_inner(
     }
 
     let link = probe_peer(name, job, ctx)?;
-    let (host, rroot, shell) = (link.host.as_str(), link.rroot.as_str(), link.shell);
+    let (host, peer_root, shell) = (link.host.as_str(), link.peer_root.as_str(), link.shell);
     // Packing and the pull-back only look at the finalised subset; the full plan is used only for the archive refresh (dropping conflicted paths needs all of it)
     let plan = Plan {
         header: plan_full.header.clone(),
@@ -724,7 +851,6 @@ fn apply_peer_inner(
     let mut errors = 0u64;
     let mut bytes_done_total = 0u64;
 
-    // 4) Target side: (for large updates, fetch the remote chunk table first so FastCDC delta can be used) pack → ship the package over ssh → remote apply-pack
     let has_target_ops = plan
         .ops
         .iter()
@@ -743,15 +869,16 @@ fn apply_peer_inner(
             })
             .map(|o| o.path.clone())
             .collect();
-        let remote_chunks = if delta_rels.is_empty() {
+        let peer_chunks = if delta_rels.is_empty() {
             None
         } else {
-            let mut args: Vec<String> = vec!["chunks".into(), "--root".into(), rroot.to_string()];
+            let mut args: Vec<String> =
+                vec!["chunks".into(), "--root".into(), peer_root.to_string()];
             for r in &delta_rels {
                 args.push("--file".into());
                 args.push(r.clone());
             }
-            match link.session.capture(&link.cmd(&args)) {
+            match link.session.capture(&link.command(&args)) {
                 Ok(bytes) => {
                     let mut m = std::collections::HashMap::new();
                     for line in String::from_utf8_lossy(&bytes).lines() {
@@ -762,7 +889,7 @@ fn apply_peer_inner(
                         if let Ok(fc) =
                             serde_json::from_str::<crate::model::chunk::FileChunks>(line)
                         {
-                            m.insert(fc.rel.clone(), fc);
+                            m.insert(fc.rel.as_str().to_owned(), fc);
                         }
                     }
                     ctx.log(
@@ -793,12 +920,13 @@ fn apply_peer_inner(
             0,
             0,
         );
-        let tmp = std::env::temp_dir().join(format!(
-            "syncdash-remote-{}.tar",
-            crate::foundation::time::now_ms()
-        ));
-        let sum =
-            crate::transfer::pack::pack(&plan, job.source_path(), &tmp, remote_chunks.as_ref())?;
+        let package = TemporaryPeerPackage::create()?;
+        let sum = crate::transfer::pack::pack_to_open_file(
+            &plan,
+            configuration.source_path(),
+            package.output()?,
+            peer_chunks.as_ref(),
+        )?;
         pp_pack.set_totals(sum.ops, sum.bytes);
         if sum.delta_saved > 0 {
             ctx.log(
@@ -811,31 +939,28 @@ fn apply_peer_inner(
             );
         }
         pp_pack.complete("package");
-        if let Err(e) = pp_pack.finish() {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        let rpkg = if shell == crate::transfer::peer::RemoteShell::PowerShell {
-            format!("syncdash-{}.tar", crate::foundation::time::now_ms()) // relative path → the remote home directory
+        pp_pack.finish()?;
+        let peer_package_path = if shell == crate::transfer::peer::PeerShell::PowerShell {
+            // PowerShell resolves this relative path in the peer account's home directory.
+            package.file_name().to_owned()
         } else {
-            format!("/tmp/syncdash-{}.tar", crate::foundation::time::now_ms())
+            format!("/tmp/{}", package.file_name())
         };
         ctx.checkpoint()?;
-        let tar_len = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        let tar_len = package.len()?;
         let pp_ship =
             PhaseProgress::begin(ctx, Phase::Ship, Some(format!("→ ssh:{host}")), 1, tar_len);
-        let recv_cmd = link.cmd(&["recv".into(), rpkg.clone()]);
+        let recv_cmd = link.command(&["recv".into(), peer_package_path.clone()]);
         // Bytes are counted as they leave, not assumed once the transfer returns: the old
         // transport handed the file to a child process and learned nothing until it exited, so a
         // multi-gigabyte package sat at 0% for its whole duration.
-        let ship = link.session.send_file(&recv_cmd, &tmp, &mut |n| {
-            pp_ship.add_bytes(n, &rpkg);
-            // Cancel now stops the upload instead of letting it run to completion unwatched
-            ctx.checkpoint()
-        });
-        let _ = std::fs::remove_file(&tmp);
-        ship?;
-        pp_ship.item_done(&rpkg);
+        link.session
+            .send_file(&recv_cmd, package.reader()?, &mut |n| {
+                pp_ship.add_bytes(n, &peer_package_path);
+                // Cancel now stops the upload instead of letting it run to completion unwatched
+                ctx.checkpoint()
+            })?;
+        pp_ship.item_done(&peer_package_path);
         pp_ship.finish()?;
         bytes_done_total += sum.bytes;
 
@@ -849,11 +974,11 @@ fn apply_peer_inner(
         );
         let mut ap_args: Vec<String> = vec![
             "apply-pack".into(),
-            rpkg.clone(),
+            peer_package_path.clone(),
             "--apply".into(),
             "--remove-pkg".into(),
         ];
-        if job.versioning {
+        if configuration.versioning {
             ap_args.push("--versioning".into());
         }
         if verbose {
@@ -862,10 +987,10 @@ fn apply_peer_inner(
         // Once this command is handed to ssh, a transport error cannot prove whether the far side
         // started publishing files. Mark the boundary before invocation, not after its response.
         *writes_started = true;
-        let ok = link.session.run_status(&link.cmd(&ap_args))?;
+        let ok = link.session.run_status(&link.command(&ap_args))?;
         if ok {
             done += sum.ops;
-            pp_ra.complete(&rpkg);
+            pp_ra.complete(&peer_package_path);
             if pp_ra.finish().is_err() {
                 return Ok(ApplyOutcome {
                     done,
@@ -879,23 +1004,23 @@ fn apply_peer_inner(
             errors += 1;
             ctx.log(
                 crate::model::event::LogLevel::Error,
-                "remote",
-                format!("[{name}] remote apply-pack reported failure"),
+                "peer",
+                format!("[{name}] peer apply-pack reported failure"),
             );
             ctx.sink.emit(ProgressEvent::Error {
                 phase: Phase::Apply,
                 ts_ms: crate::foundation::time::now_ms(),
-                path: rpkg.clone(),
+                path: peer_package_path.clone(),
                 action: "apply-pack".into(),
                 side: "target".into(),
-                message: "remote apply-pack reported failure".into(),
+                message: "peer apply-pack reported failure".into(),
             });
             pp_ra.fail();
         }
     }
 
-    // 5) Source side (sync's pull direction). The peer lane only pushes — it packs ops for the far
-    // side to apply — so a pull has to read the remote tree through a mount of it, named by
+    // The peer lane only pushes — it packs ops for the far
+    // side to apply — so a pull has to read the peer tree through a mount of it, named by
     // `|mount=` on the phrase. No mount means the job never had a pull path; say so plainly
     // rather than reporting ops as skipped for a reason the config does not mention.
     let src_ops: Vec<Op> = plan
@@ -910,9 +1035,9 @@ fn apply_peer_inner(
                 *writes_started = true;
                 let out = crate::pipeline::apply::apply_with(
                     &src_ops,
-                    job.source_path(),
+                    configuration.source_path(),
                     m,
-                    &job.apply_opts(None, verbose),
+                    &configuration.apply_opts(None, verbose),
                     ctx,
                 );
                 done += out.done;
@@ -924,7 +1049,7 @@ fn apply_peer_inner(
                 skipped += src_ops.len() as u64;
                 ctx.log(
                     crate::model::event::LogLevel::Warn,
-                    "remote",
+                    "peer",
                     format!(
                         "[{name}] {} pull op(s) skipped: the declared mount '{}' is not reachable — check the share, or drop |mount= if this job only pushes",
                         src_ops.len(),
@@ -936,28 +1061,33 @@ fn apply_peer_inner(
                 skipped += src_ops.len() as u64;
                 ctx.log(
                     crate::model::event::LogLevel::Warn,
-                    "remote",
+                    "peer",
                     format!(
                         "[{name}] {} pull op(s) skipped: '{}' declares no |mount=, and the peer lane cannot pull without one (add |mount=<path serving the same tree>)",
                         src_ops.len(),
-                        job.target
+                        job.target()
                     ),
                 );
             }
         }
     }
 
-    if errors == 0 && !ctx.ctl.cancelled() && job.mode == "sync" {
+    if errors == 0 && !ctx.ctl.cancelled() && configuration.mode == "sync" {
         // A peer job's source is a root this process owns, so opening it is local work, not a
         // second handshake. A failure here used to return silently; an archive that did not get
         // refreshed changes what the next run concludes, so it says so.
-        match super::roots::resolve_root(&job.source) {
+        match super::roots::resolve_root(&configuration.source) {
             // The peer lane has no local handle on the far root, so no joint-tier narrowing applies
             // and never did: its comparison runs at the job's own tier, and the archive matches it.
             Ok(sv) => {
                 *writes_started = true;
-                if !refresh_archive_with(job, plan_full, &sv, &scan_opts(job), ctx)
-                    && !ctx.ctl.cancelled()
+                if !refresh_archive_with(
+                    configuration,
+                    plan_full,
+                    &sv,
+                    &scan_opts(configuration),
+                    ctx,
+                ) && !ctx.ctl.cancelled()
                 {
                     errors += 1;
                 }
@@ -967,7 +1097,7 @@ fn apply_peer_inner(
                 ctx.sink.emit(ProgressEvent::Error {
                     phase: Phase::Refresh,
                     ts_ms: crate::foundation::time::now_ms(),
-                    path: job.source.clone(),
+                    path: configuration.source.clone(),
                     action: "archive".into(),
                     side: "source".into(),
                     message: format!("archive not refreshed — the source root would not open: {e}"),

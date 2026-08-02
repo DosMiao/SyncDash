@@ -123,9 +123,9 @@ impl Drop for SmbRead {
 
 /// The staged write: a temp name in the destination's own directory (so the landing rename
 /// stays inside one share), written through a handle that permits sharing, sealed by FLUSH +
-/// CLOSE, and landed by delete-then-rename because SMB2's FileRenameInformation goes out with
-/// ReplaceIfExists = 0. mtime goes on by path *after* the rename — a server updates the write
-/// time of an open handle when it closes, so stamping any earlier would be overwritten.
+/// CLOSE, and landed with `ReplaceIfExists = 0`. Ordinary commit clears the destination first;
+/// no-replace commit relies on the rename refusal. mtime goes on by path after the rename because
+/// a server may replace an open handle's write time when it closes.
 pub(super) struct SmbStaged {
     pub(super) rt: tokio::runtime::Handle,
     pub(super) timeout: Duration,
@@ -162,6 +162,56 @@ impl SmbStaged {
                 .await
                 .map_err(|e| map_smb_err("close", e))
         })
+    }
+
+    fn commit_inner(&mut self, replace: bool) -> VfsResult<CommitReport> {
+        self.seal(false)?;
+        if replace {
+            let (tree, mut conn) = (self.tree.clone(), self.conn.clone());
+            let destination = self.dst_share_rel.clone();
+            match self.block("clear destination", async move {
+                tree.delete_file(&mut conn, &destination)
+                    .await
+                    .map_err(|e| map_smb_err("clear destination", e))
+            }) {
+                Ok(()) => {}
+                Err(e) if e.kind == VfsErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let (tree, mut conn) = (self.tree.clone(), self.conn.clone());
+        let (temp, destination) = (self.tmp_share_rel.clone(), self.dst_share_rel.clone());
+        self.block("rename into place", async move {
+            tree.rename(&mut conn, &temp, &destination)
+                .await
+                .map_err(|e| map_smb_err("rename into place", e))
+        })?;
+        self.committed = true;
+
+        let mut report = CommitReport::default();
+        if let Some(ms) = self.hint.mtime_ms {
+            let (tree, conn) = (self.tree.clone(), self.conn.clone());
+            let path = self.dst_wire_path.clone();
+            let ticks = basic_info::filetime_from_unix_ms(ms);
+            match self.block("set mtime after rename", async move {
+                set_write_time(&tree, &conn, &path, ticks).await
+            }) {
+                Ok(()) => {
+                    let (tree, mut conn) = (self.tree.clone(), self.conn.clone());
+                    let destination = self.dst_share_rel.clone();
+                    if let Ok(info) = self.block("stat back", async move {
+                        tree.stat(&mut conn, &destination)
+                            .await
+                            .map_err(|e| map_smb_err("stat back", e))
+                    }) {
+                        report.mtime_ondisk_ms =
+                            Some(basic_info::unix_ms_from_filetime(info.modified.0));
+                    }
+                }
+                Err(e) => report.mtime_error = Some(e),
+            }
+        }
+        Ok(report)
     }
 }
 
@@ -279,63 +329,11 @@ impl WriteStaged for SmbStaged {
     }
 
     fn commit(mut self: Box<Self>) -> VfsResult<CommitReport> {
-        self.seal(false)?;
+        self.commit_inner(true)
+    }
 
-        // Clear the destination first: FileRenameInformation goes out with ReplaceIfExists = 0,
-        // so the rename refuses an occupied name. That refusal is the atomicity contract
-        // caps().rename_overwrite declares, not something to work around.
-        {
-            let (tree, mut conn) = (self.tree.clone(), self.conn.clone());
-            let dst = self.dst_share_rel.clone();
-            match self.block("clear destination", async move {
-                tree.delete_file(&mut conn, &dst)
-                    .await
-                    .map_err(|e| map_smb_err("clear destination", e))
-            }) {
-                Ok(()) => {}
-                Err(e) if e.kind == VfsErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-        {
-            let (tree, mut conn) = (self.tree.clone(), self.conn.clone());
-            let (t, dst) = (self.tmp_share_rel.clone(), self.dst_share_rel.clone());
-            self.block("rename into place", async move {
-                tree.rename(&mut conn, &t, &dst)
-                    .await
-                    .map_err(|e| map_smb_err("rename into place", e))
-            })?;
-        }
-        self.committed = true;
-
-        // From here nothing may fail the copy: the bytes are in place under the right name.
-        // An mtime that will not stick is a report, never an error (FFS's errorModTime lesson).
-        let mut report = CommitReport::default();
-        if let Some(ms) = self.hint.mtime_ms {
-            let (tree, conn) = (self.tree.clone(), self.conn.clone());
-            let path = self.dst_wire_path.clone();
-            let ticks = basic_info::filetime_from_unix_ms(ms);
-            match self.block("set mtime after rename", async move {
-                set_write_time(&tree, &conn, &path, ticks).await
-            }) {
-                Ok(()) => {
-                    let (tree, mut conn) = (self.tree.clone(), self.conn.clone());
-                    let dst = self.dst_share_rel.clone();
-                    if let Ok(i) = self.block("stat back", async move {
-                        tree.stat(&mut conn, &dst)
-                            .await
-                            .map_err(|e| map_smb_err("stat back", e))
-                    }) {
-                        report.mtime_ondisk_ms =
-                            Some(basic_info::unix_ms_from_filetime(i.modified.0));
-                    }
-                }
-                Err(e) => report.mtime_error = Some(e),
-            }
-        }
-        // The mode hint is dropped on the floor deliberately: caps().unix_mode says No, so
-        // preflight has already told the user this root cannot carry one.
-        Ok(report)
+    fn commit_noreplace(mut self: Box<Self>) -> VfsResult<CommitReport> {
+        self.commit_inner(false)
     }
 }
 

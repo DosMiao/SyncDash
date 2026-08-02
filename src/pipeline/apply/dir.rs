@@ -24,9 +24,13 @@ pub(super) fn try_delete_dir_vfs(
     exec: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     rel: &str,
     filter: Option<&crate::pipeline::filter::PathFilter>,
+    mut checkpoint: impl FnMut() -> std::io::Result<()>,
 ) -> DirOutcome {
     use crate::fs::vfs::error::VfsErrorKind;
-    use crate::model::table::EntryKind;
+    use crate::fs::vfs::VfsEntryKind;
+    if let Err(error) = checkpoint() {
+        return DirOutcome::Failed(error);
+    }
     match exec.remove_dir(rel) {
         Ok(_) => return DirOutcome::Removed,
         Err(e) if e.kind == VfsErrorKind::NotFound => return DirOutcome::Absent,
@@ -58,11 +62,11 @@ pub(super) fn try_delete_dir_vfs(
         for e in list {
             let child_rel = format!("{}/{}", d.trim_end_matches('/'), e.name);
             match e.meta.kind {
-                EntryKind::Dir => {
+                VfsEntryKind::Directory => {
                     dirs.push(child_rel.clone());
                     stack.push(child_rel);
                 }
-                EntryKind::File | EntryKind::Symlink => {
+                VfsEntryKind::File | VfsEntryKind::Symlink => {
                     count += 1;
                     let deletable = filter.map(|f| f.is_deletable(&child_rel)).unwrap_or(false);
                     if !deletable {
@@ -81,6 +85,9 @@ pub(super) fn try_delete_dir_vfs(
     }
     // Only deletable leftovers / only subdirectories: remove the tree, deepest first
     for f in &files {
+        if let Err(error) = checkpoint() {
+            return DirOutcome::Failed(error);
+        }
         if let Err(e) = exec.remove_file(f) {
             if e.kind != VfsErrorKind::NotFound {
                 return DirOutcome::Failed(e.into());
@@ -89,11 +96,17 @@ pub(super) fn try_delete_dir_vfs(
     }
     dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
     for d in &dirs {
+        if let Err(error) = checkpoint() {
+            return DirOutcome::Failed(error);
+        }
         if let Err(e) = exec.remove_dir(d) {
             if e.kind != VfsErrorKind::NotFound {
                 return DirOutcome::Failed(e.into());
             }
         }
+    }
+    if let Err(error) = checkpoint() {
+        return DirOutcome::Failed(error);
     }
     match exec.remove_dir(rel) {
         Ok(_) => DirOutcome::Removed,

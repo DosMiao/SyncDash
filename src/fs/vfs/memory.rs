@@ -1,6 +1,6 @@
 //! An in-memory `Vfs`, for tests only.
 //!
-//! Its reason to exist is `as_local() -> None`: that is what makes `scan_root` take the generic
+//! It intentionally exposes no retained local root, which makes `scan_root` take the generic
 //! `scan_vfs` lane instead of the walkdir fast path, so this is the only way the VFS lane — the
 //! one every protocol backend rides — gets exercised without a live server. It also carries
 //! capability knobs, which is how the degraded-evidence consent gate is testable at all.
@@ -13,11 +13,12 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use super::error::{VfsError, VfsErrorKind, VfsResult};
+use super::VfsEntryKind;
 use super::{
     CaseSense, CommitReport, Medium, NameRules, ReadStream, Support, VDirEntry, VMeta, Vfs,
     VfsCaps, WriteHint, WriteStaged,
 };
-use crate::model::table::EntryKind;
+use crate::foundation::path::EntryName;
 
 #[derive(Clone, Debug)]
 enum Node {
@@ -37,7 +38,17 @@ pub struct MemVfs {
     id: String,
     caps: VfsCaps,
     tree: Arc<Mutex<BTreeMap<String, Node>>>,
+    read_hook: Arc<Mutex<Option<ReadHook>>>,
+    commit_hook: Arc<Mutex<Option<CommitHook>>>,
+    noreplace_pre_publish_hook: Arc<Mutex<Option<CommitHook>>>,
+    noreplace_post_publish_error: Arc<Mutex<Option<PostPublishErrorHook>>>,
+    set_mtime_failure: Option<VfsErrorKind>,
+    commit_mode_failure: Option<VfsErrorKind>,
 }
+
+type ReadHook = Arc<dyn Fn(&str, usize) + Send + Sync>;
+type CommitHook = Arc<dyn Fn(&str) + Send + Sync>;
+type PostPublishErrorHook = Arc<dyn Fn(&str) -> Option<VfsErrorKind> + Send + Sync>;
 
 /// Content a given (seed, size) always generates identically, so two independent roots can hold
 /// "the same file" and compare equal by hash without either one copying from the other.
@@ -64,6 +75,10 @@ fn default_caps() -> VfsCaps {
         fsync: Support::Yes,
         rename: Support::Yes,
         rename_overwrite: Support::Yes,
+        exclusive_staged_file_publish: Support::Yes,
+        exclusive_entry_rename: Support::Yes,
+        exclusive_symlink_publish: Support::Yes,
+        durable_namespace: Support::Yes,
         ranged_read: Support::Yes,
         write_at: Support::Yes,
         unix_mode: Support::Yes,
@@ -89,12 +104,28 @@ impl MemVfs {
             id: id.to_string(),
             caps: default_caps(),
             tree: Arc::new(Mutex::new(tree)),
+            read_hook: Arc::new(Mutex::new(None)),
+            commit_hook: Arc::new(Mutex::new(None)),
+            noreplace_pre_publish_hook: Arc::new(Mutex::new(None)),
+            noreplace_post_publish_error: Arc::new(Mutex::new(None)),
+            set_mtime_failure: None,
+            commit_mode_failure: None,
         }
     }
 
     /// Capability knobs, chained: `MemVfs::new("x").without(|c| c.ranged_read = Support::No)`.
     pub fn without(mut self, f: impl FnOnce(&mut VfsCaps)) -> MemVfs {
         f(&mut self.caps);
+        self
+    }
+
+    pub fn failing_set_mtime(mut self, kind: VfsErrorKind) -> MemVfs {
+        self.set_mtime_failure = Some(kind);
+        self
+    }
+
+    pub fn failing_commit_mode(mut self, kind: VfsErrorKind) -> MemVfs {
+        self.commit_mode_failure = Some(kind);
         self
     }
 
@@ -115,10 +146,29 @@ impl MemVfs {
         );
     }
 
+    pub fn set_read_hook(&self, hook: impl Fn(&str, usize) + Send + Sync + 'static) {
+        *self.read_hook.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    pub fn set_commit_hook(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+        *self.commit_hook.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    pub fn set_noreplace_pre_publish_hook(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+        *self.noreplace_pre_publish_hook.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    pub fn set_noreplace_post_publish_error(
+        &self,
+        hook: impl Fn(&str) -> Option<VfsErrorKind> + Send + Sync + 'static,
+    ) {
+        *self.noreplace_post_publish_error.lock().unwrap() = Some(Arc::new(hook));
+    }
+
     fn meta_of(node: &Node) -> VMeta {
         match node {
             Node::Dir => VMeta {
-                kind: EntryKind::Dir,
+                kind: VfsEntryKind::Directory,
                 size: 0,
                 mtime_ms: 0,
                 mode: None,
@@ -130,7 +180,7 @@ impl MemVfs {
                 mtime_ms,
                 mode,
             } => VMeta {
-                kind: EntryKind::File,
+                kind: VfsEntryKind::File,
                 size: data.len() as u64,
                 mtime_ms: *mtime_ms,
                 mode: *mode,
@@ -138,7 +188,7 @@ impl MemVfs {
                 link: None,
             },
             Node::Link { target, mtime_ms } => VMeta {
-                kind: EntryKind::Symlink,
+                kind: VfsEntryKind::Symlink,
                 size: target.len() as u64,
                 mtime_ms: *mtime_ms,
                 mode: None,
@@ -198,7 +248,8 @@ impl Vfs for MemVfs {
             }
             let parent = crate::foundation::path::parent(k).unwrap_or("");
             if parent == rel {
-                let name = k.rsplit('/').next().unwrap_or(k).to_string();
+                let name = EntryName::try_from(k.rsplit('/').next().unwrap_or(k))
+                    .expect("MemVfs keys are valid root-relative paths");
                 out.push(VDirEntry {
                     name,
                     meta: MemVfs::meta_of(node),
@@ -213,6 +264,8 @@ impl Vfs for MemVfs {
             Some(Node::File { data, .. }) => Ok(Box::new(MemRead {
                 data: data.clone(),
                 pos: 0,
+                rel: rel.to_owned(),
+                hook: self.read_hook.lock().unwrap().clone(),
             })),
             Some(_) => Err(VfsError::new(
                 VfsErrorKind::Io,
@@ -266,6 +319,10 @@ impl Vfs for MemVfs {
             caps_read_back: self.caps.read_back,
             caps_write_at: self.caps.write_at,
             tree: self.tree.clone(),
+            commit_hook: self.commit_hook.lock().unwrap().clone(),
+            noreplace_pre_publish_hook: self.noreplace_pre_publish_hook.lock().unwrap().clone(),
+            noreplace_post_publish_error: self.noreplace_post_publish_error.lock().unwrap().clone(),
+            commit_mode_failure: self.commit_mode_failure,
         }))
     }
 
@@ -335,6 +392,9 @@ impl Vfs for MemVfs {
     }
 
     fn set_mtime(&self, rel: &str, ms: i64) -> VfsResult<()> {
+        if let Some(kind) = self.set_mtime_failure {
+            return Err(VfsError::new(kind, "injected set_mtime failure"));
+        }
         if !self.caps.set_mtime.yes() {
             return Err(VfsError::unsupported("set_mtime"));
         }
@@ -369,6 +429,12 @@ impl Vfs for MemVfs {
             return Err(VfsError::unsupported("symlink"));
         }
         let mut t = self.tree.lock().unwrap();
+        if t.contains_key(rel) {
+            return Err(VfsError::new(
+                VfsErrorKind::AlreadyExists,
+                format!("symlink target name already exists: {rel}"),
+            ));
+        }
         mkdirs(&mut t, crate::foundation::path::parent(rel));
         t.insert(
             rel.to_string(),
@@ -392,6 +458,8 @@ impl Vfs for MemVfs {
 struct MemRead {
     data: Vec<u8>,
     pos: usize,
+    rel: String,
+    hook: Option<ReadHook>,
 }
 
 impl std::io::Read for MemRead {
@@ -399,6 +467,11 @@ impl std::io::Read for MemRead {
         let n = (self.data.len() - self.pos).min(buf.len());
         buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
         self.pos += n;
+        if n > 0 {
+            if let Some(hook) = &self.hook {
+                hook(&self.rel, n);
+            }
+        }
         Ok(n)
     }
 }
@@ -420,6 +493,10 @@ struct MemStaged {
     caps_read_back: Support,
     caps_write_at: Support,
     tree: Arc<Mutex<BTreeMap<String, Node>>>,
+    commit_hook: Option<CommitHook>,
+    noreplace_pre_publish_hook: Option<CommitHook>,
+    noreplace_post_publish_error: Option<PostPublishErrorHook>,
+    commit_mode_failure: Option<VfsErrorKind>,
 }
 
 impl WriteStaged for MemStaged {
@@ -454,6 +531,8 @@ impl WriteStaged for MemStaged {
         Ok(Box::new(MemRead {
             data: self.buf.clone(),
             pos: 0,
+            rel: self.rel.clone(),
+            hook: None,
         }))
     }
     fn commit(self: Box<Self>) -> VfsResult<CommitReport> {
@@ -468,13 +547,23 @@ impl WriteStaged for MemStaged {
                 mode: self.mode,
             },
         );
+        drop(t);
+        if let Some(hook) = &self.commit_hook {
+            hook(&self.rel);
+        }
         Ok(CommitReport {
             mtime_ondisk_ms: Some(mtime),
+            mode_error: self
+                .commit_mode_failure
+                .map(|kind| VfsError::new(kind, "injected mode failure after publication")),
             ..Default::default()
         })
     }
 
     fn commit_noreplace(self: Box<Self>) -> VfsResult<CommitReport> {
+        if let Some(hook) = &self.noreplace_pre_publish_hook {
+            hook(&self.rel);
+        }
         let mut t = self.tree.lock().unwrap();
         if t.contains_key(&self.rel) {
             return Err(VfsError::new(
@@ -492,8 +581,25 @@ impl WriteStaged for MemStaged {
                 mode: self.mode,
             },
         );
+        drop(t);
+        if let Some(hook) = &self.commit_hook {
+            hook(&self.rel);
+        }
+        if let Some(kind) = self
+            .noreplace_post_publish_error
+            .as_ref()
+            .and_then(|hook| hook(&self.rel))
+        {
+            return Err(VfsError::new(
+                kind,
+                format!("injected no-replace error after publishing {}", self.rel),
+            ));
+        }
         Ok(CommitReport {
             mtime_ondisk_ms: Some(mtime),
+            mode_error: self
+                .commit_mode_failure
+                .map(|kind| VfsError::new(kind, "injected mode failure after publication")),
             ..Default::default()
         })
     }

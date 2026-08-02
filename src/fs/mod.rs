@@ -1,7 +1,8 @@
 //! L0 filesystem primitives that own a lifecycle.
 //!
-//! `staged` is the atomic-write staging handle (same-directory temp file, fsync, rename);
-//! `lock` is the root heartbeat lock. Named `fs::staged` rather than `atomic` because
+//! `chunk` streams content-defined chunks from retained local files; `staged` is the atomic-write
+//! staging handle (same-directory temp file, fsync, rename);
+//! `lock` is the generational root lease ledger. Named `fs::staged` rather than `atomic` because
 //! `crate::atomic` read as `std::sync::atomic`, which several of these modules also import.
 //! `vfs` is the virtual filesystem a sync root lives on — local disk today, SMB/SFTP/FTP
 //! backends behind the same trait; its write side wraps `staged` rather than reimplementing it.
@@ -10,6 +11,8 @@
 //! different means. `watch` owns optional local change triggers; their events wake a compare but
 //! never replace a verified filesystem snapshot.
 
+pub mod chunk;
+pub mod local_root;
 pub mod lock;
 pub mod ssh;
 pub mod staged;

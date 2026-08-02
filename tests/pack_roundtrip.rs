@@ -97,9 +97,46 @@ fn packs_and_applies_a_copy() {
     assert_eq!(std::fs::read(tgt.join("two.bin")).unwrap(), vec![7u8; 5000]);
 }
 
+#[cfg(unix)]
+#[test]
+fn package_metadata_is_applied_by_the_leased_write_transaction() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let src = tmp("src-mode");
+    let tgt = tmp("tgt-mode");
+    let out = tmp("pkg-mode").join("p.tar");
+    write(&src, "script.sh", b"#!/bin/sh\nexit 0\n");
+    std::fs::set_permissions(
+        src.join("script.sh"),
+        std::fs::Permissions::from_mode(0o751),
+    )
+    .unwrap();
+
+    let plan = plan_of(&tgt.to_string_lossy(), vec![copy_op("script.sh")]);
+    pack::pack(&plan, &src, &out, None).unwrap();
+    let (done, _, errors) = pack::apply_pack(&out, Some(&tgt), true, false, false).unwrap();
+
+    assert_eq!((done, errors), (1, 0));
+    assert_eq!(
+        std::fs::metadata(tgt.join("script.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o751
+    );
+}
+
 fn update_op(rel: &str) -> Op {
     Op {
         action: Action::Update,
+        ..copy_op(rel)
+    }
+}
+
+fn delete_op(rel: &str) -> Op {
+    Op {
+        action: Action::Delete,
         ..copy_op(rel)
     }
 }
@@ -110,9 +147,29 @@ fn body(seed: u32, len: usize) -> Vec<u8> {
         .collect()
 }
 
+fn compare_plan(src: &Path, tgt: &Path, rigor: &str) -> Plan {
+    let job = syncdash::job::Job {
+        source: src.to_string_lossy().into_owned(),
+        targets: vec![tgt.to_string_lossy().into_owned()],
+        rigor: rigor.into(),
+        exclude: Vec::new(),
+        ..Default::default()
+    };
+    let selected = job.select_target(0).unwrap();
+    syncdash::run::local::compare_job_detailed(
+        &selected,
+        &syncdash::obs::progress::RunCtx::null(),
+        false,
+    )
+    .unwrap()
+    .plan
+}
+
 /// Pack `rel` as a delta against the copy the target already holds.
 fn pack_delta(src: &Path, tgt: &Path, out: &Path, rel: &str) -> pack::PackSummary {
-    let base = syncdash::model::chunk::chunk_file(tgt, rel).unwrap();
+    let rel_path = syncdash::foundation::path::RootRelativePath::try_from(rel).unwrap();
+    let target_root = syncdash::fs::local_root::LocalRoot::open(tgt.to_path_buf()).unwrap();
+    let base = syncdash::fs::chunk::chunk_file(&target_root, &rel_path).unwrap();
     let plan = plan_of(&tgt.to_string_lossy(), vec![update_op(rel)]);
     pack::pack(
         &plan,
@@ -158,6 +215,85 @@ fn packs_and_applies_a_delta() {
         new,
         "reassembly must be byte-exact"
     );
+}
+
+#[test]
+fn whole_pack_refuses_content_that_changed_after_compare() {
+    let src = tmp("src-stale-whole-evidence");
+    let tgt = tmp("tgt-stale-whole-evidence");
+    let out = tmp("pkg-stale-whole-evidence").join("p.tar");
+    let original = body(17, 5 * 1024 * 1024);
+    write(&src, "big.bin", &original);
+    let plan = compare_plan(&src, &tgt, "paranoid");
+    assert!(plan.ops[0]
+        .hash
+        .as_deref()
+        .is_some_and(|hash| !hash.starts_with('~')));
+
+    let mut changed = original;
+    changed[2_000_000] ^= 0xFF;
+    write(&src, "big.bin", &changed);
+
+    let error = match pack::pack(&plan, &src, &out, None) {
+        Ok(_) => panic!("changed source evidence must not be packaged"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("content changed after Compare"));
+}
+
+#[test]
+fn metadata_only_pack_refuses_timestamp_drift_after_compare() {
+    let src = tmp("src-stale-metadata-evidence");
+    let tgt = tmp("tgt-stale-metadata-evidence");
+    let out = tmp("pkg-stale-metadata-evidence").join("p.tar");
+    write(&src, "same-size.bin", b"before");
+    let plan = compare_plan(&src, &tgt, "quick");
+    assert!(plan.ops[0].hash.is_none());
+
+    write(&src, "same-size.bin", b"after!");
+    filetime::set_file_mtime(
+        src.join("same-size.bin"),
+        filetime::FileTime::from_unix_time(2_000_000_000, 0),
+    )
+    .unwrap();
+
+    let error = match pack::pack(&plan, &src, &out, None) {
+        Ok(_) => panic!("changed metadata evidence must not be packaged"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("timestamp changed after Compare"));
+}
+
+#[test]
+fn delta_pack_refuses_sampled_content_that_changed_after_compare() {
+    let src = tmp("src-stale-delta-evidence");
+    let tgt = tmp("tgt-stale-delta-evidence");
+    let out = tmp("pkg-stale-delta-evidence").join("p.tar");
+    let old = body(21, 10 * 1024 * 1024);
+    let mut current = old.clone();
+    current[5_300_000..5_301_000].fill(0x5A);
+    write(&src, "big.bin", &current);
+    write(&tgt, "big.bin", &old);
+    let plan = compare_plan(&src, &tgt, "standard");
+    assert!(plan.ops[0]
+        .hash
+        .as_deref()
+        .is_some_and(|hash| hash.starts_with('~')));
+    let target_root = syncdash::fs::local_root::LocalRoot::open(tgt.clone()).unwrap();
+    let relative = syncdash::foundation::path::RootRelativePath::try_from("big.bin").unwrap();
+    let base = syncdash::fs::chunk::chunk_file(&target_root, &relative).unwrap();
+
+    current[10] ^= 0xFF;
+    write(&src, "big.bin", &current);
+    let peer_chunks = [("big.bin".to_string(), base)].into_iter().collect();
+
+    let error = match pack::pack(&plan, &src, &out, Some(&peer_chunks)) {
+        Ok(_) => panic!("changed sampled evidence must not be packaged"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("content changed after Compare"));
 }
 
 /// A recipe is only meaningful against the exact bytes it was computed from. If the target moved on
@@ -307,6 +443,134 @@ fn a_package_without_a_manifest_is_refused() {
     assert!(e.to_string().contains("no manifest.json"), "{e}");
 }
 
+#[test]
+fn a_missing_payload_aborts_before_any_plan_operation() {
+    let src = tmp("src-missing-payload");
+    let tgt = tmp("tgt-missing-payload");
+    let out = tmp("pkg-missing-payload").join("p.tar");
+    write(&src, "new.txt", b"new");
+    write(&tgt, "keep.txt", b"must survive");
+    let plan = plan_of(
+        &tgt.to_string_lossy(),
+        vec![copy_op("new.txt"), delete_op("keep.txt")],
+    );
+    pack::pack(&plan, &src, &out, None).unwrap();
+    let stripped = tmp("pkg-missing-payload-2").join("p.tar");
+    drop_member(&out, &stripped, "payload/new.txt");
+
+    let error = pack::apply_pack(&stripped, Some(&tgt), true, false, false).unwrap_err();
+    assert!(
+        error.to_string().contains("missing from the tar archive"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(tgt.join("keep.txt")).unwrap(),
+        b"must survive"
+    );
+    assert!(!tgt.join("new.txt").exists());
+}
+
+#[test]
+fn duplicate_manifest_payloads_are_refused() {
+    let src = tmp("src-duplicate-manifest");
+    let tgt = tmp("tgt-duplicate-manifest");
+    let out = tmp("pkg-duplicate-manifest").join("p.tar");
+    write(&src, "f.txt", b"payload");
+    pack::pack(
+        &plan_of(&tgt.to_string_lossy(), vec![copy_op("f.txt")]),
+        &src,
+        &out,
+        None,
+    )
+    .unwrap();
+    let repacked = tmp("pkg-duplicate-manifest-2").join("p.tar");
+    rewrite_member(&out, &repacked, "manifest.json", |body| {
+        let mut manifest: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let duplicate = manifest["payload"][0].clone();
+        manifest["payload"].as_array_mut().unwrap().push(duplicate);
+        serde_json::to_vec(&manifest).unwrap()
+    });
+
+    let error = pack::apply_pack(&repacked, Some(&tgt), true, false, false).unwrap_err();
+    assert!(error.to_string().contains("duplicate payload"), "{error}");
+}
+
+#[test]
+fn duplicate_tar_payloads_are_refused() {
+    let src = tmp("src-duplicate-tar");
+    let tgt = tmp("tgt-duplicate-tar");
+    let out = tmp("pkg-duplicate-tar").join("p.tar");
+    write(&src, "f.txt", b"payload");
+    pack::pack(
+        &plan_of(&tgt.to_string_lossy(), vec![copy_op("f.txt")]),
+        &src,
+        &out,
+        None,
+    )
+    .unwrap();
+    let repacked = tmp("pkg-duplicate-tar-2").join("p.tar");
+    append_member(&out, &repacked, "payload/f.txt", b"payload");
+
+    let error = pack::apply_pack(&repacked, Some(&tgt), true, false, false).unwrap_err();
+    assert!(error.to_string().contains("duplicate payload"), "{error}");
+}
+
+#[test]
+fn a_tampered_combined_payload_digest_is_refused() {
+    let src = tmp("src-combined-digest");
+    let tgt = tmp("tgt-combined-digest");
+    let out = tmp("pkg-combined-digest").join("p.tar");
+    write(&src, "f.txt", b"payload");
+    pack::pack(
+        &plan_of(&tgt.to_string_lossy(), vec![copy_op("f.txt")]),
+        &src,
+        &out,
+        None,
+    )
+    .unwrap();
+    let repacked = tmp("pkg-combined-digest-2").join("p.tar");
+    rewrite_member(&out, &repacked, "manifest.json", |body| {
+        let mut manifest: serde_json::Value = serde_json::from_slice(body).unwrap();
+        manifest["payload_combined_blake3"] = serde_json::json!("0".repeat(64));
+        serde_json::to_vec(&manifest).unwrap()
+    });
+
+    let error = pack::apply_pack(&repacked, Some(&tgt), true, false, false).unwrap_err();
+    assert!(
+        error.to_string().contains("combined digest mismatch"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_older_pack_version_is_refused() {
+    let src = tmp("src-old-version");
+    let tgt = tmp("tgt-old-version");
+    let out = tmp("pkg-old-version").join("p.tar");
+    write(&src, "f.txt", b"payload");
+    pack::pack(
+        &plan_of(&tgt.to_string_lossy(), vec![copy_op("f.txt")]),
+        &src,
+        &out,
+        None,
+    )
+    .unwrap();
+    let repacked = tmp("pkg-old-version-2").join("p.tar");
+    rewrite_member(&out, &repacked, "manifest.json", |body| {
+        let mut manifest: serde_json::Value = serde_json::from_slice(body).unwrap();
+        manifest["pack_version"] = serde_json::json!(pack::PACK_VERSION - 1);
+        serde_json::to_vec(&manifest).unwrap()
+    });
+
+    let error = pack::apply_pack(&repacked, Some(&tgt), true, false, false).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("older than this binary requires"),
+        "{error}"
+    );
+}
+
 // ---- tar surgery helpers: rebuild a package with one member replaced or dropped ----
 
 fn rewrite_member(src: &Path, dst: &Path, member: &str, mut f: impl FnMut(&[u8]) -> Vec<u8>) {
@@ -339,6 +603,23 @@ fn drop_member(src: &Path, dst: &Path, member: &str) {
         b.append_data(&mut h, &name, &body[..]).unwrap();
     }
     b.finish().unwrap();
+}
+
+fn append_member(src: &Path, dst: &Path, name: &str, body: &[u8]) {
+    let mut members = read_members(src);
+    members.push((name.to_owned(), body.to_vec()));
+    let out = std::fs::File::create(dst).unwrap();
+    let mut builder = tar::Builder::new(out);
+    for (member_name, member_body) in members {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(member_body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, &member_name, &member_body[..])
+            .unwrap();
+    }
+    builder.finish().unwrap();
 }
 
 fn read_members(src: &Path) -> Vec<(String, Vec<u8>)> {

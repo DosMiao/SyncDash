@@ -6,9 +6,9 @@ use std::io::Read;
 use std::sync::Arc;
 
 use super::error::VfsErrorKind;
+use super::VfsEntryKind;
 use super::{Support, Vfs, WriteHint};
 use crate::foundation::names::TEMP_PREFIX;
-use crate::model::table::EntryKind;
 
 /// Run the whole contract. `mk` must return a **fresh, empty** root each call.
 pub fn run_all(mk: &mut dyn FnMut() -> Arc<dyn Vfs>) {
@@ -55,7 +55,7 @@ fn root_stat(v: Arc<dyn Vfs>) {
     let m = v.stat("").expect("stat root").expect("root exists");
     assert_eq!(
         m.kind,
-        EntryKind::Dir,
+        VfsEntryKind::Directory,
         "rel=\"\" must name the root directory"
     );
 }
@@ -74,7 +74,7 @@ fn single_level_listing(v: Arc<dyn Vfs>) {
         .read_dir("a")
         .expect("read_dir")
         .into_iter()
-        .map(|e| e.name)
+        .map(|e| e.name.into_string())
         .collect();
     assert!(
         names.contains(&"b".to_string()),
@@ -103,7 +103,7 @@ fn write_commit_visibility(v: Arc<dyn Vfs>) {
     );
     for e in v.read_dir("d").unwrap() {
         assert!(
-            e.name.starts_with(TEMP_PREFIX),
+            e.name.as_str().starts_with(TEMP_PREFIX),
             "visible staging artifact without temp prefix: {}",
             e.name
         );
@@ -111,7 +111,7 @@ fn write_commit_visibility(v: Arc<dyn Vfs>) {
     w.seal(false).unwrap();
     w.commit().unwrap();
     let m = v.stat("d/f.bin").unwrap().expect("visible after commit");
-    assert_eq!(m.kind, EntryKind::File);
+    assert_eq!(m.kind, VfsEntryKind::File);
     assert_eq!(m.size, 7);
     assert_eq!(read_file(&v, "d/f.bin"), b"payload");
 }
@@ -131,7 +131,7 @@ fn abandoned_write_leaves_nothing(v: Arc<dyn Vfs>) {
     );
     for e in v.read_dir("d").unwrap() {
         assert!(
-            !e.name.starts_with(TEMP_PREFIX),
+            !e.name.as_str().starts_with(TEMP_PREFIX),
             "abandoned temp not cleaned up: {}",
             e.name
         );
@@ -182,18 +182,44 @@ fn rename_matches_declared_semantics(v: Arc<dyn Vfs>) {
 }
 
 fn no_replace_operations_fail_closed_without_damage(v: Arc<dyn Vfs>) {
+    let capabilities = v.caps();
+    let staged_publish_advertised = capabilities.exclusive_staged_file_publish == Support::Yes;
+    let entry_rename_advertised = capabilities.exclusive_entry_rename == Support::Yes;
+    v.mkdir_all("nr")
+        .expect("create no-replace fixture directory");
+    let mut publish = v
+        .open_write("nr/new.txt", &WriteHint::default())
+        .expect("open absent staged no-replace write");
+    publish.write(b"new").expect("write absent staged payload");
+    publish.seal(false).expect("seal absent staged payload");
+    match publish.commit_noreplace() {
+        Ok(_) => assert_eq!(read_file(&v, "nr/new.txt"), b"new"),
+        Err(error) if error.kind == VfsErrorKind::Unsupported && !staged_publish_advertised => {
+            assert!(v.stat("nr/new.txt").unwrap().is_none())
+        }
+        Err(error) => panic!("no-replace publish onto an absent path failed: {error}"),
+    }
+
     write_file(&v, "nr/source.txt", b"source", None);
     write_file(&v, "nr/occupied.txt", b"external", None);
     let rename_error = v
         .rename_noreplace("nr/source.txt", "nr/occupied.txt")
         .expect_err("no-replace rename must never replace an occupied destination");
-    assert!(
-        matches!(
+    if entry_rename_advertised {
+        assert_eq!(
             rename_error.kind,
-            VfsErrorKind::AlreadyExists | VfsErrorKind::Unsupported
-        ),
-        "a backend must either refuse the occupied name atomically or fail closed: {rename_error}"
-    );
+            VfsErrorKind::AlreadyExists,
+            "exclusive_entry_rename=Yes must implement existing-source no-replace rename"
+        );
+    } else {
+        assert!(
+            matches!(
+                rename_error.kind,
+                VfsErrorKind::AlreadyExists | VfsErrorKind::Unsupported
+            ),
+            "a backend must either refuse the occupied name atomically or fail closed: {rename_error}"
+        );
+    }
     assert_eq!(read_file(&v, "nr/source.txt"), b"source");
     assert_eq!(read_file(&v, "nr/occupied.txt"), b"external");
 
@@ -205,17 +231,25 @@ fn no_replace_operations_fail_closed_without_damage(v: Arc<dyn Vfs>) {
     let commit_error = staged
         .commit_noreplace()
         .expect_err("no-replace commit must never replace an occupied destination");
-    assert!(
-        matches!(
+    if staged_publish_advertised {
+        assert_eq!(
             commit_error.kind,
-            VfsErrorKind::AlreadyExists | VfsErrorKind::Unsupported
-        ),
-        "a backend must either refuse the staged publish atomically or fail closed: {commit_error}"
-    );
+            VfsErrorKind::AlreadyExists,
+            "exclusive_staged_file_publish=Yes must implement staged no-replace publication"
+        );
+    } else {
+        assert!(
+            matches!(
+                commit_error.kind,
+                VfsErrorKind::AlreadyExists | VfsErrorKind::Unsupported
+            ),
+            "a backend must either refuse the staged publish atomically or fail closed: {commit_error}"
+        );
+    }
     assert_eq!(read_file(&v, "nr/occupied.txt"), b"external");
     for entry in v.read_dir("nr").expect("list after refused publish") {
         assert!(
-            !entry.name.starts_with(TEMP_PREFIX),
+            !entry.name.as_str().starts_with(TEMP_PREFIX),
             "refused no-replace publish leaked a staging artifact: {}",
             entry.name
         );
@@ -279,11 +313,24 @@ fn symlink_is_not_followed(v: Arc<dyn Vfs>) {
     let m = v.stat("link.txt").unwrap().expect("link exists");
     assert_eq!(
         m.kind,
-        EntryKind::Symlink,
+        VfsEntryKind::Symlink,
         "stat is lstat: the link itself, never the target"
     );
     let t = v.read_link("link.txt").expect("read_link");
     assert!(t.contains("target.txt"), "read_link returned {t}");
+
+    write_file(&v, "occupied-link.txt", b"external", None);
+    let error = v
+        .make_symlink("occupied-link.txt", "target.txt")
+        .expect_err("symlink creation must not replace an occupied name");
+    if v.caps().exclusive_symlink_publish == Support::Yes {
+        assert_eq!(
+            error.kind,
+            VfsErrorKind::AlreadyExists,
+            "exclusive_symlink_publish=Yes must classify an occupied name"
+        );
+    }
+    assert_eq!(read_file(&v, "occupied-link.txt"), b"external");
 }
 
 fn staged_read_back_returns_written_bytes(v: Arc<dyn Vfs>) {
@@ -313,7 +360,7 @@ pub fn remove_tree(v: &Arc<dyn Vfs>, rel: &str) -> super::error::VfsResult<()> {
     let Some(m) = v.stat(rel)? else {
         return Ok(());
     };
-    if m.kind == EntryKind::Dir {
+    if m.kind == VfsEntryKind::Directory {
         for (name, _) in v.read_dir_names(rel)? {
             remove_tree(v, &format!("{rel}/{name}"))?;
         }
@@ -340,7 +387,7 @@ mod suite {
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             dirs.push(d.clone());
-            Arc::new(LocalVfs::new(d)) as Arc<dyn Vfs>
+            Arc::new(LocalVfs::open(d).unwrap()) as Arc<dyn Vfs>
         });
         for d in dirs {
             let _ = std::fs::remove_dir_all(&d);
@@ -393,7 +440,7 @@ mod suite {
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             dirs.push(d.clone());
-            Arc::new(LocalVfs::new(d)) as Arc<dyn Vfs>
+            Arc::new(LocalVfs::open(d).unwrap()) as Arc<dyn Vfs>
         });
         for d in dirs {
             let _ = std::fs::remove_dir_all(&d);
@@ -404,10 +451,10 @@ mod suite {
     /// client, no OS mount involved. This is what an `smb://` phrase actually resolves to.
     ///
     /// It is the admission ticket the backend was held to before `vfs::open` was pointed at it,
-    /// scored against `os_route_smb_conforms` on the same server. `set_mtime` is the check that
-    /// earns its keep: the crate has no high-level call for it, so it is the one operation here
-    /// written against the wire format directly, and `fs::lock::RootLock`'s heartbeat is a
-    /// repeated `set_mtime` — a backend failing it could not hold a root lock at all.
+    /// scored against `os_route_smb_conforms` on the same server. `set_mtime` earns its keep: the
+    /// crate has no high-level call for it, so it is the one operation here written against the
+    /// wire format directly. Root-lock ownership is established by immutable no-replace claims;
+    /// this operation only refreshes the owner-specific heartbeat timestamp for observation.
     ///
     /// Needs a server *and* a stored credential; an `smb://` root cannot ride this machine's
     /// session login the way a `\\host\share` path can:
@@ -430,7 +477,7 @@ mod suite {
         };
         let creds = crate::fs::vfs::cred::default_provider();
         let open = |url: &str| -> Arc<dyn Vfs> {
-            let RootSpec::Remote(spec) = parse(url) else {
+            let RootSpec::Endpoint(spec) = parse(url) else {
                 panic!("'{url}' is not an smb:// phrase");
             };
             let b = SmbBackend::new(spec, creds.clone())

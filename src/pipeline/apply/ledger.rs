@@ -70,6 +70,9 @@ pub(super) fn record(
         }
         Err(e) => {
             acc.errors.fetch_add(1, Ordering::Relaxed);
+            if sh.lease_lost() {
+                acc.lease_failure_recorded.store(true, Ordering::Relaxed);
+            }
             // Plain stderr for the CLI. Deliberately NOT the log_error! macro: with the
             // desktop's sink installed, the macro line arrives as a Log{Error} event on
             // top of the structured Error event below — the panel then counts every

@@ -17,6 +17,8 @@
 use crate::foundation::names::{
     APP_LOG_FILE, RUNLOG_ERRORS_FILE, RUNLOG_ITEMS_FILE, RUNLOG_RUN_FILE,
 };
+use crate::foundation::path::EntryName;
+use crate::fs::local_root::LocalDirectory;
 use crate::model::event::{LogLevel, ProgressEvent};
 use crate::obs::progress::{current, ProgressSink};
 use std::io::Write;
@@ -36,7 +38,7 @@ pub fn emit(level: LogLevel, scope: &str, message: String) {
     }
 }
 
-/// `log_info!("run", "remote {host}: {os}")` — the arguments match `format!`.
+/// `log_info!("run", "peer {host}: {os}")` — the arguments match `format!`.
 /// Messages keep the prefix the call site already had (`[job] warning: …`), so the swap does not change one byte of CLI output.
 #[macro_export]
 macro_rules! log_info {
@@ -117,14 +119,16 @@ struct Appender {
 const FLUSH_EVERY: u32 = 64;
 
 impl Appender {
-    fn create(path: &Path) -> Option<Appender> {
-        match std::fs::File::create(path) {
+    fn create_in(directory: &LocalDirectory, name: &'static str) -> Option<Appender> {
+        let entry_name =
+            EntryName::try_from(name).expect("run-log artifact names are valid entries");
+        match directory.create_new_file(&entry_name) {
             Ok(f) => Some(Appender {
                 w: std::io::BufWriter::new(f),
                 since_flush: 0,
             }),
             Err(e) => {
-                eprintln!("logging: cannot create {}: {e}", path.display());
+                eprintln!("logging: cannot create run artifact {name}: {e}");
                 None
             }
         }
@@ -159,11 +163,11 @@ pub struct FileSink {
 }
 
 impl FileSink {
-    pub fn open(dir: &Path, min_level: LogLevel) -> FileSink {
+    pub(crate) fn open_in(directory: &LocalDirectory, min_level: LogLevel) -> FileSink {
         FileSink {
-            run: Mutex::new(Appender::create(&dir.join(RUNLOG_RUN_FILE))),
-            errors: Mutex::new(Appender::create(&dir.join(RUNLOG_ERRORS_FILE))),
-            items: Mutex::new(Appender::create(&dir.join(RUNLOG_ITEMS_FILE))),
+            run: Mutex::new(Appender::create_in(directory, RUNLOG_RUN_FILE)),
+            errors: Mutex::new(Appender::create_in(directory, RUNLOG_ERRORS_FILE)),
+            items: Mutex::new(Appender::create_in(directory, RUNLOG_ITEMS_FILE)),
             min_level,
         }
     }
@@ -263,11 +267,10 @@ impl AppLogSink {
     }
 
     fn open_target(dir: &Path, min_level: LogLevel) -> std::io::Result<AppLogTarget> {
-        std::fs::create_dir_all(dir)?;
-        let w = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(APP_LOG_FILE))?;
+        let root = crate::fs::local_root::LocalRoot::create(dir.to_path_buf())?;
+        let app_log = crate::foundation::path::RootRelativePath::try_from(APP_LOG_FILE)
+            .expect("the application log name is a valid relative path");
+        let w = root.open_append(&app_log)?;
         Ok(AppLogTarget {
             w: Some(w),
             min_level,
@@ -413,8 +416,12 @@ mod tests {
             crate::foundation::time::now_ms()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        let local = crate::fs::local_root::LocalRoot::open(dir.clone()).unwrap();
+        let root_directory = local
+            .open_directory(&crate::foundation::path::RootRelativeDir::try_from("").unwrap())
+            .unwrap();
         {
-            let fs_sink = FileSink::open(&dir, LogLevel::Info);
+            let fs_sink = FileSink::open_in(&root_directory, LogLevel::Info);
             fs_sink.emit(ev_log(LogLevel::Info, "narrative"));
             fs_sink.emit(ev_log(LogLevel::Warn, "careful"));
             fs_sink.emit(ProgressEvent::Error {
@@ -483,8 +490,12 @@ mod tests {
             crate::foundation::time::now_ms()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        let local = crate::fs::local_root::LocalRoot::open(dir.clone()).unwrap();
+        let root_directory = local
+            .open_directory(&crate::foundation::path::RootRelativeDir::try_from("").unwrap())
+            .unwrap();
         {
-            let fs_sink = FileSink::open(&dir, LogLevel::Warn);
+            let fs_sink = FileSink::open_in(&root_directory, LogLevel::Warn);
             fs_sink.emit(ev_log(LogLevel::Info, "chatter"));
             fs_sink.emit(ev_log(LogLevel::Error, "boom"));
         }

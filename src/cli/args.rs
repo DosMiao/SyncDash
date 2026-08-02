@@ -29,7 +29,7 @@ pub enum Mode {
 
 #[derive(Subcommand)]
 pub enum Cmd {
-    /// Print this machine's environment info (used for remote probing: this is what runs over ssh on the far side)
+    /// Print this machine's environment info (used when probing an SSH peer)
     Probe,
     /// List job configs (the *.toml files in the jobs directory; `syncdash probe` prints its path)
     Jobs,
@@ -48,7 +48,7 @@ pub enum Cmd {
         /// Allow the "plan health check" through (deletion share too high). A missing marker / insufficient space still blocks
         #[arg(long = "i-know")]
         i_know: bool,
-        /// Consent to the capability degradations a remote backend forces (each one is listed first).
+        /// Consent to the capability degradations a VFS backend forces (each one is listed first).
         /// Separate from --i-know on purpose: two different risks, two separate nods
         #[arg(long = "accept-caps")]
         accept_caps: bool,
@@ -57,10 +57,10 @@ pub enum Cmd {
         /// M6 watch: loop compare → (on differences, in auto mode) apply → sleep. Ctrl-C to stop
         #[arg(long)]
         watch: bool,
-        /// Watch interval in seconds (defaults to the job's watch_interval_secs, then 30)
+        /// Watch interval in seconds (defaults to the job's autoscan_interval_secs, then 30)
         #[arg(long)]
         interval: Option<u64>,
-        /// Apply automatically when watch finds differences (same as watch_auto_apply = true in the job)
+        /// Apply automatically when watch finds differences (same as autoscan_auto_apply = true in the job)
         #[arg(long = "auto-apply")]
         auto_apply: bool,
     },
@@ -148,15 +148,15 @@ pub enum Cmd {
         mode: String,
         #[arg(long, default_value = "standard")]
         rigor: String,
-        /// Generate remote-pipeline jobs: the ssh host alias (e.g. mac)
+        /// Generate peer jobs: the SSH host alias (e.g. mac)
         #[arg(long)]
-        remote_host: Option<String>,
-        /// Remote root path prefix (the remote's own local path, e.g. /Users/xxx/Code)
+        peer_host: Option<String>,
+        /// Root path prefix on the peer (e.g. /Users/xxx/Code)
         #[arg(long)]
-        remote_root_base: Option<String>,
-        /// Path to the remote syncdash (defaults to assuming it is on PATH)
+        peer_root_base: Option<String>,
+        /// Path to SyncDash on the peer (defaults to assuming it is on PATH)
         #[arg(long)]
-        remote_exe: Option<String>,
+        peer_exe: Option<String>,
         /// Junk presets to seed each job's `exclude` with, comma-separated (`syncdash junk` lists them;
         /// `none` seeds nothing). The patterns are written into the job file in full — nothing is applied
         /// on top of what the file says. Defaults to windows,macos,dev: a .ffs-sync marker means a git-kept
@@ -169,7 +169,7 @@ pub enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Receive a file on stdin and write it to path (used to ship remote packages: this runs over ssh on the far side, binary-safe on both platforms)
+    /// Receive a file on stdin and write it to path (used to ship peer packages over SSH)
     Recv { path: PathBuf },
     /// Emit the FastCDC chunk table for the given files (used for delta transfer; one JSON line per file)
     Chunks {
@@ -196,7 +196,7 @@ pub enum Cmd {
         target_root: Option<PathBuf>,
         #[arg(long)]
         apply: bool,
-        /// Delete the package file on success (the remote pipeline's cleanup step, free of shell-dialect differences)
+        /// Delete the package file on success (the peer pipeline's shell-independent cleanup step)
         #[arg(long)]
         remove_pkg: bool,
         /// Put deleted/overwritten files in target's .version_syncDash/ (instead of the local trash)
@@ -251,7 +251,7 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: TrashCmd,
     },
-    /// Credentials for remote roots — kept in the OS store (Windows Credential Manager / macOS Keychain), never in a job file
+    /// Credentials for network/VFS roots — kept in the OS store, never in a job file
     Cred {
         #[command(subcommand)]
         cmd: CredCmd,
@@ -291,9 +291,9 @@ pub enum Cmd {
 
 #[derive(Subcommand)]
 pub enum CredCmd {
-    /// Store the password for a remote phrase (prompts without echo; secrets never touch argv or job files)
+    /// Store the password for a network endpoint phrase (prompts without echo)
     Set {
-        /// The remote phrase, e.g. "smb://ben@server/share" — server+user derive the entry, the path plays no part
+        /// The endpoint phrase, e.g. "smb://ben@server/share"; server and user derive the entry
         phrase: String,
         /// Read the password from stdin instead of prompting (for scripts; beware shell history when piping)
         #[arg(long)]
@@ -318,8 +318,8 @@ pub enum LogsCmd {
     },
     /// View one run's artifacts. Shows the event stream by default
     Show {
-        /// Run id (= the directory name, the column in `syncdash logs list`)
-        run_id: String,
+        /// Stable record identity (the ID column in `syncdash logs list`)
+        record_id: String,
         /// The error manifest
         #[arg(long)]
         errors: bool,

@@ -18,7 +18,7 @@ use crate::fs::vfs::local::LocalVfs;
 use crate::fs::vfs::memory::MemVfs;
 use crate::fs::vfs::{Support, Vfs};
 
-/// The generic VFS lane — `as_local()` is `None`, so this drives the same `scan_vfs` path every
+/// The generic VFS lane — no retained local root is exposed, so this drives `scan_vfs` every
 /// protocol backend rides, with no server involved.
 #[test]
 fn memory_lane_syncs() {
@@ -38,7 +38,7 @@ fn memory_lane_syncs() {
     );
 }
 
-/// The real filesystem, and the only lane where `as_local()` is `Some` — so it is the only one that
+/// The real filesystem, and the only lane with a retained local root — so it is the only one that
 /// exercises the walkdir/mmap fast path, the central trash route, and real NTFS timestamps.
 /// Everything the memory lane proves about semantics, this proves about a disk.
 #[test]
@@ -52,7 +52,7 @@ fn local_lane_syncs() {
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             dirs.push(d.clone());
-            Arc::new(LocalVfs::new(d)) as Arc<dyn Vfs>
+            Arc::new(LocalVfs::open(d).unwrap()) as Arc<dyn Vfs>
         };
         run_all("local", &mut mk)
     };
@@ -94,17 +94,18 @@ fn ftp_list_only() -> Arc<dyn Vfs> {
         c.free_space = Support::No;
         c.write_at = Support::No;
         c.rename_overwrite = Support::Unknown;
+        c.exclusive_staged_file_publish = Support::No;
     })) as Arc<dyn Vfs>
 }
 
 /// `MemVfs` wearing the worst FTP shape — LIST-only, so no ranged reads, no `set_mtime`, and a
 /// sixty-second view of time.
 ///
-/// Its contract is that it **cannot be written at all**: the root lock's heartbeat is a repeated
-/// `set_mtime`, so a remote backend without one has no way to tell another machine it is still
-/// alive, and the write side refuses rather than sync without that. Every case therefore skips, and
-/// the skip set being *complete* is the assertion — if some future change let one of them through,
-/// this test fails, which is exactly what should happen.
+/// Its contract is that it **cannot be written at all**: FTP has no protocol primitive that can
+/// atomically publish only when a name is absent, so it cannot establish an exclusive root-lock
+/// claim across machines. Every case therefore skips, and the skip set being *complete* is the
+/// assertion — if some future change let one of them through, this test fails, which is exactly
+/// what should happen.
 #[test]
 fn ftp_list_only_lane_is_readable_but_never_writable() {
     let rep = run_all("ftp-list-only", &mut ftp_list_only);
@@ -150,15 +151,11 @@ fn ftp_list_only_still_compares_and_says_why_it_will_not_write() {
         .expect("a read-only backend must still compare");
     assert_eq!(out.plan.ops.len(), 1, "the comparison itself is unaffected");
 
-    // Both sides lose sampling together: a `~` digest can only ever match another `~` digest, so a
+    // Both sides lose sampling together: a sampled observation can only match another sampled observation, so a
     // one-sided upgrade would make identical files look different.
     assert_eq!(
-        out.source
-            .header
-            .vfs
-            .as_ref()
-            .map(|v| v.evidence_effective.as_str()),
-        Some("full"),
+        out.source.header.evidence,
+        crate::model::table::TableEvidence::Full,
         "no ranged reads on either side means both sides read whole"
     );
 
@@ -318,12 +315,12 @@ fn exfat_live_lane() {
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             dirs.push(d.clone());
-            Arc::new(LocalVfs::new(d)) as Arc<dyn Vfs>
+            Arc::new(LocalVfs::open(d).unwrap()) as Arc<dyn Vfs>
         };
         conformance::run_all(&mut mk);
         run_all("exfat", &mut mk)
     };
-    let caps = LocalVfs::new(base.clone()).caps();
+    let caps = LocalVfs::open(base.clone()).unwrap().caps();
     let precision = caps.mtime_precision_ms;
     assert_eq!(
         caps.unix_mode,
@@ -358,7 +355,11 @@ fn exfat_live_lane() {
     )
     .unwrap();
     assert!(
-        snapshot.entries.iter().all(|entry| entry.file_id.is_none()),
+        snapshot
+            .entries
+            .iter()
+            .filter_map(crate::model::table::ObservedEntry::as_file)
+            .all(|file| file.file_system_id.is_none()),
         "exFAT snapshots must omit unstable synthetic object IDs",
     );
     let _ = std::fs::remove_dir_all(&id_probe);

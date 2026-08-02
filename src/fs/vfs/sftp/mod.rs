@@ -7,6 +7,9 @@
 //! (ring backend). The FFS survey's *protocol*-level lessons still apply — SFTP v3
 //! rename refuses existing targets, setstat-by-path after close, no statvfs — they
 //! were never libssh2-specific.
+//! Root-lock claims require the stronger cross-session guarantee supplied by
+//! `hardlink@openssh.com`; a connected backend that cannot establish that capability remains
+//! readable but is blocked from apply before the first mutation.
 //!
 //! Concurrency model: one SSH session, one SFTP channel, requests multiplexed by the
 //! protocol's own ids (russh-sftp is fully concurrent). The tokio runtime is private
@@ -20,12 +23,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::error::{VfsError, VfsErrorKind, VfsResult};
-use super::spec::RemoteSpec;
+use super::spec::EndpointSpec;
+use super::VfsEntryKind;
 use super::{
     CaseSense, CredentialProvider, Credentials, ReadStream, Support, VDirEntry, VMeta, Vfs,
     VfsCaps, WriteHint, WriteStaged,
 };
-use crate::model::table::EntryKind;
+use crate::foundation::names::TEMP_PREFIX;
 
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, StatusCode};
@@ -37,13 +41,14 @@ mod staged;
 use staged::{SftpRead, SftpStaged};
 
 pub struct SftpBackend {
-    spec: RemoteSpec,
+    spec: EndpointSpec,
     creds: Arc<dyn CredentialProvider>,
     rt: tokio::runtime::Runtime,
     timeout: Duration,
     conn: OnceLock<Conn>,
     connect_gate: Mutex<()>,
     server_line: Mutex<Option<String>>,
+    exclusive_staged_file_publish: Mutex<Support>,
 }
 
 struct Conn {
@@ -55,7 +60,7 @@ struct Conn {
 }
 
 impl SftpBackend {
-    pub fn new(spec: RemoteSpec, creds: Arc<dyn CredentialProvider>) -> SftpBackend {
+    pub fn new(spec: EndpointSpec, creds: Arc<dyn CredentialProvider>) -> SftpBackend {
         let timeout = spec
             .opt("timeout")
             .and_then(|t| t.parse::<u64>().ok())
@@ -76,6 +81,7 @@ impl SftpBackend {
             conn: OnceLock::new(),
             connect_gate: Mutex::new(()),
             server_line: Mutex::new(None),
+            exclusive_staged_file_publish: Mutex::new(Support::Unknown),
         }
     }
 
@@ -183,11 +189,11 @@ pub(super) fn attrs_none() -> FileAttributes {
 
 fn meta_of(a: &FileAttributes) -> VMeta {
     let kind = if a.is_dir() {
-        EntryKind::Dir
+        VfsEntryKind::Directory
     } else if a.is_symlink() {
-        EntryKind::Symlink
+        VfsEntryKind::Symlink
     } else {
-        EntryKind::File
+        VfsEntryKind::File
     };
     VMeta {
         kind,
@@ -235,8 +241,12 @@ impl Vfs for SftpBackend {
             fsync: Support::Unknown,  // fsync@openssh.com probed when the write lane lands
             rename: Support::Yes,
             rename_overwrite: Support::No, // v3 rename refuses an existing target (relied upon)
-            ranged_read: Support::Yes,     // seekable file handles → real sampled evidence
-            write_at: Support::No,         // revisited with the write lane
+            exclusive_staged_file_publish: *self.exclusive_staged_file_publish.lock().unwrap(),
+            exclusive_entry_rename: Support::Unknown,
+            exclusive_symlink_publish: Support::Unknown,
+            durable_namespace: Support::Unknown,
+            ranged_read: Support::Yes, // seekable file handles → real sampled evidence
+            write_at: Support::No,     // revisited with the write lane
             unix_mode: Support::Yes,
             symlink: Support::Yes,
             file_id: Support::No,
@@ -288,6 +298,7 @@ impl Vfs for SftpBackend {
             connect_and_open(&host, port, &user, &creds, timeout, &root_spec, &display).await
         })?;
         *self.server_line.lock().unwrap() = Some(built.3);
+        *self.exclusive_staged_file_publish.lock().unwrap() = built.4;
         let _ = self.conn.set(Conn {
             _session: built.0,
             sftp: Arc::new(built.1),
@@ -322,6 +333,12 @@ impl Vfs for SftpBackend {
             if name == "." || name == ".." {
                 continue;
             }
+            let name = crate::foundation::path::EntryName::try_from(name).map_err(|e| {
+                VfsError::new(
+                    VfsErrorKind::Protocol,
+                    format!("SFTP server returned an invalid directory entry: {e}"),
+                )
+            })?;
             out.push(VDirEntry {
                 name,
                 meta: meta_of(&e.metadata()),
@@ -402,7 +419,7 @@ impl Vfs for SftpBackend {
                 Err(e) => {
                     // v3 answers a generic Failure for "already exists" — confirm before propagating
                     match self.stat(&prefix)? {
-                        Some(m) if m.kind == EntryKind::Dir => {}
+                        Some(m) if m.kind == VfsEntryKind::Directory => {}
                         _ => return Err(e),
                     }
                 }
@@ -415,20 +432,14 @@ impl Vfs for SftpBackend {
         use russh_sftp::protocol::OpenFlags;
         let conn = self.conn()?;
         let (parent, base) = crate::foundation::path::split_parent(rel);
+        let token = super::random_name_token()?;
         let tmp_rel = format!(
-            "{parent}{}{base}.{}",
+            "{parent}{}{base}.{token}",
             crate::foundation::names::TEMP_PREFIX,
-            std::process::id()
         );
         let tmp_abs = self.abs(&tmp_rel);
         let dst_abs = self.abs(rel);
         let sftp = conn.sftp.clone();
-        // A previous interruption may have left debris under the same name
-        {
-            let s = sftp.clone();
-            let t = tmp_abs.clone();
-            let _ = self.block("clear stale temp", async move { s.remove_file(t).await });
-        }
         let s2 = sftp.clone();
         let t2 = tmp_abs.clone();
         // CREATE|EXCL: the server's own O_EXCL refuses to overwrite (the FFS reliance)
@@ -540,7 +551,8 @@ impl Vfs for SftpBackend {
     }
 }
 
-/// The whole connect sequence, async side. Returns (session, sftp, root_abs, server line).
+/// The whole connect sequence, async side. Returns the session, SFTP client, root, server line,
+/// and negotiated exclusive staged-file publication support.
 ///
 /// The handshake itself — connect, host-key check, auth chain — is `fs::ssh`, shared with the peer
 /// lane. What is left here is the part that is actually sftp: requesting the subsystem and
@@ -558,6 +570,7 @@ async fn connect_and_open(
     SftpSession,
     String,
     String,
+    Support,
 )> {
     let session = crate::fs::ssh::connect(host, port, user, creds, timeout, display).await?;
     let auth = session.auth_summary();
@@ -590,13 +603,48 @@ async fn connect_and_open(
         format!("/{root_spec}")
     };
 
-    let server_line = format!("sftp v3 via ssh, auth: {auth}");
+    let root_abs = root_abs.trim_end_matches('/').to_string();
+    let exclusive_staged_file_publish = probe_hardlink_support(&sftp, &root_abs).await?;
+    let server_line = format!(
+        "sftp v3 via ssh, auth: {auth}, hardlink@openssh.com: {}",
+        exclusive_staged_file_publish.as_str()
+    );
     Ok((
         session,
         sftp,
-        root_abs.trim_end_matches('/').to_string(),
+        root_abs,
         server_line,
+        exclusive_staged_file_publish,
     ))
+}
+
+async fn probe_hardlink_support(sftp: &SftpSession, root_abs: &str) -> VfsResult<Support> {
+    let token = super::random_name_token()?;
+    let missing_parent = if root_abs.is_empty() {
+        format!("/{TEMP_PREFIX}hardlink-probe.{token}")
+    } else {
+        format!("{root_abs}/{TEMP_PREFIX}hardlink-probe.{token}")
+    };
+    let source = format!("{missing_parent}/source");
+    let destination = format!("{missing_parent}/destination");
+    match sftp.hardlink(source, destination.clone()).await {
+        Ok(false) => Ok(Support::No),
+        Ok(true) => {
+            let _ = sftp.remove_file(destination).await;
+            Ok(Support::Yes)
+        }
+        Err(russh_sftp::client::error::Error::Status(status))
+            if status.status_code == StatusCode::NoSuchFile =>
+        {
+            Ok(Support::Yes)
+        }
+        Err(russh_sftp::client::error::Error::Status(status))
+            if status.status_code == StatusCode::OpUnsupported =>
+        {
+            Ok(Support::No)
+        }
+        Err(_) => Ok(Support::Unknown),
+    }
 }
 
 #[cfg(test)]
@@ -605,7 +653,7 @@ mod tests {
     use crate::fs::vfs::spec::{parse, RootSpec};
 
     fn backend(s: &str) -> SftpBackend {
-        let RootSpec::Remote(r) = parse(s) else {
+        let RootSpec::Endpoint(r) = parse(s) else {
             panic!()
         };
         SftpBackend::new(r, crate::fs::vfs::cred::default_provider())
@@ -617,6 +665,8 @@ mod tests {
         let c = b.caps();
         assert_eq!(c.mtime_precision_ms, 1000);
         assert_eq!(c.rename_overwrite, Support::No);
+        assert_eq!(c.exclusive_staged_file_publish, Support::Unknown);
+        assert_eq!(c.exclusive_entry_rename, Support::Unknown);
         assert_eq!(c.free_space, Support::No);
         assert!(c.ranged_read.yes());
     }
