@@ -1,3 +1,5 @@
+import type { RunSummaryEvent } from '#core/domain/runs/runEvents.ts';
+import type { Phase } from '#core/types/generated/Phase.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -12,13 +14,16 @@ import {
 } from '#core/application/progress/runstate.ts';
 import type { ProgressStage } from '#core/application/progress/runstate.ts';
 
+/// The envelope is a discriminated union now, so a fixture cannot claim to be every variant at
+/// once. Building it loosely and asserting the shape at the boundary keeps these cases readable
+/// without weakening the type the production code sees.
 const event = (
   kind: CompareProgressEvent['kind'],
-  phase: CompareProgressEvent['phase'],
-  extra: Partial<CompareProgressEvent> = {},
+  phase: Phase,
+  extra: Record<string, unknown> = {},
 ): CompareProgressEvent => ({
   sequence: 1, kind, phase, run_id: 1, purpose: 'compare', ts_ms: 1, ...extra,
-});
+} as unknown as CompareProgressEvent);
 
 test('parallel scan start does not complete the other scan', () => {
   let stages = reduceCompareStages([], event('phase_start', 'scan-target'));
@@ -63,6 +68,13 @@ test('delayed worker snapshots cannot regress a compare row', () => {
   assert.equal(stages[0].bytesDone, 500);
 });
 
+/// A terminal summary, with every counter the wire type requires.
+const summary = (over: Partial<RunSummaryEvent> = {}): RunSummaryEvent => ({
+  sequence: 1, kind: 'summary', run_id: 1, ts_ms: Date.now(), purpose: 'apply',
+  done: 0, skipped: 0, errors: 0, bytes_done: 0, elapsed_ms: 0, paused_ms: 0, cancelled: false,
+  ...over,
+});
+
 test('live progress reserves 100 for a successful Summary', () => {
   const run = newRunState(1, Date.now());
   run.totals = { items: 1, bytes: 1000 };
@@ -70,18 +82,12 @@ test('live progress reserves 100 for a successful Summary', () => {
   assert.equal(completionPercent(run), 99);
 
   run.running = false;
-  run.summary = {
-    sequence: 1, kind: 'summary', run_id: 1, ts_ms: Date.now(), purpose: 'apply',
-    done: 1, skipped: 0, errors: 0, cancelled: false,
-  };
+  run.summary = summary({ done: 1 });
   assert.equal(completionPercent(run), 100);
 
   const empty = newRunState(2, Date.now());
   empty.running = false;
-  empty.summary = {
-    sequence: 1, kind: 'summary', run_id: 2, ts_ms: Date.now(), purpose: 'apply',
-    done: 0, skipped: 0, errors: 0, cancelled: false,
-  };
+  empty.summary = summary({ run_id: 2 });
   assert.equal(completionPercent(empty), 100);
 });
 

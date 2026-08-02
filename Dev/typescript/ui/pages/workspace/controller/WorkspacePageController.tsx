@@ -3,6 +3,7 @@
 // and rendering is grouped by feature below ui/. Execution receives only a one-use authorization
 // token; Rust owns the authenticated plan and reconstructs every operation.
 
+import { useWorkspaceShell } from './composition/useWorkspaceShell.ts';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { useStatus } from '#ui/shared/status/useStatus.ts';
 import { useZoomControl } from '#ui/shared/hooks/useZoomControl.ts';
@@ -50,7 +51,6 @@ import { createWorkspaceMainPresentation } from './composition/createWorkspaceMa
 import { createWorkspaceOverlayPresentation } from './composition/createWorkspaceOverlayPresentation.ts';
 
 export function WorkspacePageController() {
-  const session = useWorkspaceSessionState();
   const {
     jobs,
     selectedJob,
@@ -59,26 +59,15 @@ export function WorkspacePageController() {
     selectedTargetIndex,
     setSelectedTargetIndex,
     selectionRef,
-  } = session;
-  const rootEditorState = useRootEditorState(selectedJob, selectedTargetIndex);
-  const {
-    dispatch: dispatchRootEditor,
+    dispatchRootEditor,
     liveRootEditor,
     rootDraftOpen,
     rootPickerRequestId,
     rootSaveInFlight,
     rootSaveRequestId,
     selectedRootEditor,
-  } = rootEditorState;
-
-  const [compareWorkspaceRepository, dispatchCompareWorkspace] = useReducer(
     reduceCompareWorkspaces,
     emptyCompareWorkspaceRepository,
-  );
-  const [busy, setBusy] = useState(false);
-  const autoApplyInFlight = useRef(false);
-  const panels = useWorkspacePanels();
-  const {
     advancedFiltersAnchor,
     askSwap,
     candidateAdoption,
@@ -104,32 +93,36 @@ export function WorkspacePageController() {
     setResultViewportElement,
     setSettingsOpen,
     settingsOpen,
-  } = panels;
-  const statusApi = useStatus('');
-  const {
     status,
-    setMessage: setStatus,
-    offerAction: setStatusAction,
-    executeAction: runStatusAction,
-    dismissNotice: dismissStatusNotice,
-  } = statusApi;
-  const compareRun = useCompareRunState(setStatus);
-  const {
-    active: compareActive,
-    activityRequestId: compareActivityRequestId,
-    cancel: cancelCompare,
-    cancelling: compareCancelling,
-    inFlight: compareInFlight,
-    rateByPhase: compareRateByPhase,
+    setStatus,
+    setStatusAction,
+    runStatusAction,
+    dismissStatusNotice,
+    compareActive,
+    compareActivityRequestId,
+    cancelCompare,
+    compareCancelling,
+    compareInFlight,
+    compareRateByPhase,
     restoreRequestId,
-    runFloor: compareRunFloor,
-    runId: compareRunId,
-    runReady: compareRunReady,
-    setActive: setCompareActive,
-    setCancelling: setCompareCancelling,
-    setStages: setCompareStages,
-    stages: compareStages,
-  } = compareRun;
+    compareRunFloor,
+    compareRunId,
+    compareRunReady,
+    setCompareActive,
+    setCompareCancelling,
+    setCompareStages,
+    compareStages,
+    compareWorkspaceRepository,
+    dispatchCompareWorkspace,
+    busy,
+    setBusy,
+    session,
+    rootEditorState,
+    autoApplyInFlight,
+    panels,
+    statusApi,
+    compareRun,
+  } = useWorkspaceShell();
 
   // AutoScan is backend-owned. The webview renders status and handles exact trigger tickets; it
   // never owns the clock or assumes that remaining mounted means the watcher is still alive.
@@ -572,11 +565,11 @@ export function WorkspacePageController() {
     autoScanControls,
     busy,
     compare,
-    compareRun,
     csv,
     dispatchCompare: dispatchCompareWorkspace,
     jobState,
     openConfirm,
+    compareRun,
     panels,
     resetSafetyUi,
     result,
@@ -599,10 +592,10 @@ export function WorkspacePageController() {
     confirmTotals,
     dispatchCompare: dispatchCompareWorkspace,
     editorLifecycle: jobEditorLifecycle,
-    panels,
     repository: compareWorkspaceRepository,
     resetSafetyUi,
     result,
+    panels,
     reviews,
     rootMutations,
     session,
