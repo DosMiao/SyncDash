@@ -142,11 +142,7 @@ pub(super) fn validate_result_id(result_id: &str) -> std::io::Result<()> {
 }
 
 pub(super) fn validate_digest(digest: &str, label: &str) -> std::io::Result<()> {
-    if digest.len() != DIGEST_HEX_LENGTH
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !syncdash::model::digest::is_blake3_hex(digest) {
         return Err(invalid_data(format!(
             "{label} is not {DIGEST_HEX_LENGTH} lowercase hexadecimal characters"
         )));

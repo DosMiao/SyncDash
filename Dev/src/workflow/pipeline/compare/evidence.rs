@@ -246,9 +246,9 @@ mod tests {
     use super::super::{compare, CompareOptions};
     use super::*;
     use crate::foundation::path::RootRelativePath;
+    use crate::model::digest::Blake3Digest;
     use crate::model::table::{
-        Blake3Digest, FileIdentityObservation, ObservedFile, TableEvidence, TableHeader, TableKind,
-        TABLE_SCHEMA,
+        FileIdentityObservation, ObservedFile, TableEvidence, TableHeader, TableKind, TABLE_SCHEMA,
     };
 
     /// A reversed row is executed, not just displayed, so the reversal must not quietly drop fields.

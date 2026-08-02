@@ -1,9 +1,10 @@
 use super::*;
 use crate::foundation::path::RootRelativePath;
+use crate::model::digest::Blake3Digest;
 use crate::model::plan::{Action, Op, Plan, Side};
 use crate::model::table::{
-    Blake3Digest, FileIdentityObservation, ObservedEntry, ObservedFile, ObservedMedium,
-    ObservedNameRules, TableArtifact, TableEvidence, TableHeader, TableKind, VfsNote, TABLE_SCHEMA,
+    FileIdentityObservation, ObservedEntry, ObservedFile, ObservedMedium, ObservedNameRules,
+    TableArtifact, TableEvidence, TableHeader, TableKind, VfsNote, TABLE_SCHEMA,
 };
 use crate::pipeline::compare::policy::ConflictPolicy;
 

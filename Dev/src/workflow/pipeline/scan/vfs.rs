@@ -9,9 +9,10 @@ use std::collections::{HashMap, HashSet};
 use crate::foundation::path::RootRelativePath;
 use crate::foundation::time::now_ms;
 use crate::fs::vfs::VfsEntryKind;
+use crate::model::digest::Blake3Digest;
 use crate::model::table::{
-    Blake3Digest, FileIdentityObservation, ObservedDirectory, ObservedEntry, ObservedFile,
-    ObservedSymlink, TableArtifact, TableEvidence, TableHeader, TableKind, TABLE_SCHEMA,
+    FileIdentityObservation, ObservedDirectory, ObservedEntry, ObservedFile, ObservedSymlink,
+    TableArtifact, TableEvidence, TableHeader, TableKind, TABLE_SCHEMA,
 };
 
 use super::digest::{effective_read, full_hash_vfs, sampled_digest_vfs, SAMPLE_MIN};

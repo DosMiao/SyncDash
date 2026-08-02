@@ -5,8 +5,9 @@
 //! overwrite.
 
 use crate::job::Job;
+use crate::model::digest::Blake3Digest;
 use crate::model::plan::{Action, Plan};
-use crate::model::table::{Blake3Digest, TableArtifact};
+use crate::model::table::TableArtifact;
 use crate::pipeline::scan;
 use std::io::{self, Write};
 use std::path::Path;

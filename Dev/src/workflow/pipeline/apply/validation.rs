@@ -15,11 +15,8 @@ fn mutates_path(op: &Op) -> bool {
 }
 
 fn is_valid_move_identity_digest(hash: &str) -> bool {
-    let digest = hash.strip_prefix('~').unwrap_or(hash);
-    digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    // A move may be identified by a sampled digest, so the sigil is stripped rather than rejected.
+    crate::model::digest::is_blake3_hex(crate::model::digest::digest_body(hash))
 }
 
 fn is_ordered_move_source_recreation(ops: &[Op], moving: &Op, mutation: &Op) -> bool {

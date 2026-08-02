@@ -281,9 +281,10 @@ pub(super) fn escalate_sampled_disagreements(
     target: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     pp: &crate::obs::progress::PhaseProgress<'_>,
 ) -> std::io::Result<Plan> {
+    use crate::model::digest::Blake3Digest;
     use crate::model::event::LogLevel;
     use crate::model::plan::Side;
-    use crate::model::table::{Blake3Digest, FileIdentityObservation, ObservedFile};
+    use crate::model::table::{FileIdentityObservation, ObservedFile};
     // The same equality window used by the comparison above. Protocol roots such as FTP can be
     // coarser than the job default, and that precision must not manufacture escalation work.
     let slack_ms = job

@@ -2,11 +2,12 @@ use serde::Deserialize;
 use std::io::BufRead;
 
 use super::{
-    Blake3Digest, FileIdentityObservation, ObservedDirectory, ObservedEntry, ObservedFile,
-    ObservedMedium, ObservedNameRules, ObservedSymlink, TableArtifact, TableEvidence, TableHeader,
-    TableKind, VfsNote, TABLE_SCHEMA,
+    FileIdentityObservation, ObservedDirectory, ObservedEntry, ObservedFile, ObservedMedium,
+    ObservedNameRules, ObservedSymlink, TableArtifact, TableEvidence, TableHeader, TableKind,
+    VfsNote, TABLE_SCHEMA,
 };
 use crate::foundation::path::RootRelativePath;
+use crate::model::digest::Blake3Digest;
 
 pub(crate) const LEGACY_ARCHIVE_SCHEMA: u32 = 1;
 
@@ -195,7 +196,7 @@ fn migrate_evidence(
             entry
                 .hash
                 .as_deref()
-                .is_some_and(|hash| hash.starts_with('~'))
+                .is_some_and(|hash| crate::model::digest::is_sampled_digest(hash))
         }) =>
         {
             TableEvidence::Sampled
@@ -350,7 +351,7 @@ fn migrate_identity(
 }
 
 fn migrate_historic_identity(value: &str) -> std::io::Result<FileIdentityObservation> {
-    match value.strip_prefix('~') {
+    match value.strip_prefix(crate::model::digest::SAMPLED_PREFIX) {
         Some(digest) => Ok(FileIdentityObservation::SampledBlake3 {
             digest: Blake3Digest::try_from(digest)
                 .map_err(|error| migration_error(error.to_string()))?,

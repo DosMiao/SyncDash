@@ -1,7 +1,8 @@
 //! Local-scan working data passed from discovery to content evidence collection.
 
 use crate::foundation::path::RootRelativePath;
-use crate::model::table::{Blake3Digest, FileIdentityObservation, ObservedEntry, ObservedFile};
+use crate::model::digest::Blake3Digest;
+use crate::model::table::{FileIdentityObservation, ObservedEntry, ObservedFile};
 
 pub(super) struct PendingFile {
     pub relative: RootRelativePath,

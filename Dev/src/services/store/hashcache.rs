@@ -238,7 +238,8 @@ pub(crate) fn save_local(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::table::{Blake3Digest, ObservedFile};
+    use crate::model::digest::Blake3Digest;
+    use crate::model::table::ObservedFile;
 
     fn temp_file(tag: &str) -> PathBuf {
         let directory =
