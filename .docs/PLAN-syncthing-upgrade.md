@@ -3,6 +3,10 @@
 > Written: 2026-07-26
 > Reference source: `.docs/syncthing` (`git clone --depth 1`, commit `119d5e72` / 2026-07-25, Go 1.25, MPL-2.0)
 > This document only **borrows semantics**; it does not copy code (MPL-2.0 is not necessarily compatible with this project's license, and Go's concurrency model differs enough from Rust's that copying verbatim would be pointless).
+>
+> **Current status:** historical research and implementation snapshot. Paths, names, test counts,
+> and architecture claims below describe the 2026-07-26 tree; `README.md` and `AGENTS.md` define
+> the live implementation and validation contract.
 
 ## Implementation status (wrapped up 2026-07-26)
 
@@ -14,7 +18,7 @@
 | P0-2 Mount-point marker + plan health check | ✅ | new [src/preflight.rs](src/preflight.rs), `syncdash mark`, `require_marker` / `max_delete_ratio` / `--i-know` |
 | P0-3 Disk space preflight | ✅ | [preflight.rs](src/preflight.rs) `disk_space` (Win: `GetDiskFreeSpaceExW`; unix: `statvfs`) + `min_free_pct` |
 | P0-4 Classified reporting for directory deletion | ✅ | [apply.rs](src/apply.rs) `try_delete_dir` / `DirOutcome` |
-| P1-1 Delta transfer | ✅ | the remote pack path already had it in v0.7; this adds the local/mounted-drive path (`delta`, [apply.rs](src/apply.rs) `update_with_delta`) |
+| P1-1 Delta transfer | ✅ | the peer package path already had it in v0.7; this adds the local/mounted-drive path (`delta`, [apply.rs](src/apply.rs) `update_with_delta`) |
 | P1-2 Conflict copies | ✅ | [compare.rs](src/compare.rs) `ConflictPolicy` / `conflict_name` / `max_conflicts` |
 | P1-3 Multi-generation archive | ✅ | [table.rs](src/table.rs) `prev` + `roll_generations`, [compare.rs](src/compare.rs) `generation_of` |
 | P1-4 mtime read-back correction | ✅ | [apply.rs](src/apply.rs) read-back + [scan.rs](src/scan.rs) `record_mtime_fixes` / `load_mtime_fixes` |
@@ -36,7 +40,7 @@ false-positive conflicts).
 
 **Two corrections to the original plan** (the plan was written when the repo was at v0.5; by
 implementation time it had reached v0.8):
-- P1-1's claim of "whole-file copying" holds only for the **local/mounted-drive** path; the remote pack
+- P1-1's claim of "whole-file copying" holds only for the **local/mounted-drive** path; the peer package
   pipeline already had FastCDC deltas in v0.7. This round fills in the former.
 - P2-2's claim of "no versioning" is inaccurate: v0.8 already had a `versioning` mode
   (`.version_syncDash/` inside each root). What was genuinely missing is that **the default trash is
