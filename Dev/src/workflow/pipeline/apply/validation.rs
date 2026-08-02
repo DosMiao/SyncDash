@@ -162,8 +162,7 @@ pub(super) fn validate_operation_name_rules(
             Side::Source => (source_rules, target_rules),
             Side::Target => (target_rules, source_rules),
         };
-        let creates_name = matches!(operation.action, Action::Copy | Action::Move);
-        let reads_other_root = matches!(operation.action, Action::Copy | Action::Update);
+        let roles = crate::pipeline::name_safety::NameRoles::of(&operation.action);
 
         for path in [Some(operation.path.as_str()), operation.from.as_deref()]
             .into_iter()
@@ -172,13 +171,15 @@ pub(super) fn validate_operation_name_rules(
             let Some((fault, reason)) = windows_name_fault(path) else {
                 continue;
             };
-            let unsafe_on_executing_root = executing_rules == NameRules::Windows
-                && (fault.changes_addressed_path() || creates_name);
-            let unsafe_on_reading_root = reads_other_root
-                && reading_rules == NameRules::Windows
-                && fault.changes_addressed_path();
-            if unsafe_on_executing_root || unsafe_on_reading_root {
-                let affected_root = match (unsafe_on_executing_root, unsafe_on_reading_root) {
+            let hazard = crate::pipeline::name_safety::hazard_sides(
+                fault,
+                roles,
+                executing_rules,
+                reading_rules,
+                NameRules::Windows,
+            );
+            if hazard.any() {
+                let affected_root = match (hazard.executing, hazard.reading) {
                     (true, true) => "executing and reading",
                     (true, false) => "executing",
                     (false, true) => "reading",

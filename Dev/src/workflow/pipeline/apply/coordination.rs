@@ -270,80 +270,26 @@ pub(super) fn execute(
     let finalize_versions = lease_healthy_for_wrapup;
     let (source_local_root, target_local_root) =
         (sh.source_local_root.clone(), sh.target_local_root.clone());
-    if let Some(w) = sh.ver_source.into_inner().unwrap() {
-        let side_ops: Vec<Op> = ops
-            .iter()
-            .filter(|o| o.side == Side::Source)
-            .cloned()
-            .collect();
-        if finalize_versions && lease_guard.check_before_mutation().is_ok() {
-            match w.finish(&side_ops, opt.fsync, || lease_guard.check_before_mutation()) {
-                Ok(Some(id)) => {
-                    if let Some(root) = &source_local_root {
-                        println!(
-                            "version saved: {} (id {id})",
-                            root.display_path()
-                                .join(crate::foundation::names::VERSION_STORE_DIR)
-                                .display()
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    acc.errors.fetch_add(1, Ordering::Relaxed);
-                    crate::log_error!(
-                        "apply",
-                        "could not finalize source version history: {error}"
-                    );
-                }
-            }
-        } else if let Some(root) = &source_local_root {
-            crate::log_warn!(
-                "apply",
-                "leaving the unindexed version staging directory under {} because root-lock ownership was lost",
-                root.display_path()
-                    .join(crate::foundation::names::VERSION_STORE_DIR)
-                    .display()
-            );
-        }
-    }
-    if let Some(w) = sh.ver_target.into_inner().unwrap() {
-        let side_ops: Vec<Op> = ops
-            .iter()
-            .filter(|o| o.side == Side::Target)
-            .cloned()
-            .collect();
-        if finalize_versions && lease_guard.check_before_mutation().is_ok() {
-            match w.finish(&side_ops, opt.fsync, || lease_guard.check_before_mutation()) {
-                Ok(Some(id)) => {
-                    if let Some(root) = &target_local_root {
-                        println!(
-                            "version saved: {} (id {id})",
-                            root.display_path()
-                                .join(crate::foundation::names::VERSION_STORE_DIR)
-                                .display()
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    acc.errors.fetch_add(1, Ordering::Relaxed);
-                    crate::log_error!(
-                        "apply",
-                        "could not finalize target version history: {error}"
-                    );
-                }
-            }
-        } else if let Some(root) = &target_local_root {
-            crate::log_warn!(
-                "apply",
-                "leaving the unindexed version staging directory under {} because root-lock ownership was lost",
-                root.display_path()
-                    .join(crate::foundation::names::VERSION_STORE_DIR)
-                    .display()
-            );
-        }
-    }
+    finalize_version_side(
+        Side::Source,
+        sh.ver_source.into_inner().unwrap(),
+        source_local_root.as_ref(),
+        ops,
+        opt.fsync,
+        finalize_versions,
+        &lease_guard,
+        &acc,
+    );
+    finalize_version_side(
+        Side::Target,
+        sh.ver_target.into_inner().unwrap(),
+        target_local_root.as_ref(),
+        ops,
+        opt.fsync,
+        finalize_versions,
+        &lease_guard,
+        &acc,
+    );
     let done = acc.done.load(Ordering::Relaxed);
     let lease_lost = lease_guard.lost();
     let mut out = ApplyOutcome {
@@ -361,4 +307,67 @@ pub(super) fn execute(
         out.cancelled = pp.finish().is_err() || ctx.ctl.cancelled();
     }
     out
+}
+
+/// Finalize one side's retained version history, or deliberately leave it unindexed.
+///
+/// `lease_healthy` is sampled once before either side runs, and the lease is re-checked here as
+/// well — and again inside `finish` for every entry it indexes. All three checks are load-bearing
+/// and none replaces another: the sample decides whether finalization is attempted at all, this
+/// check catches a lease lost between the two sides, and the closure catches one lost part-way
+/// through indexing.
+///
+/// Losing the lease is not an error. The staging directory is left in place and the loss is
+/// logged, because the alternative — indexing into a root another process now owns, or deleting
+/// content that is the only remaining copy of an overwritten file — is worse than a directory the
+/// user can see and remove.
+#[allow(clippy::too_many_arguments)] // each is a distinct decision the wrap-up has already made
+fn finalize_version_side(
+    side: Side,
+    writer: Option<crate::store::version::VersionWriter>,
+    local_root: Option<&crate::fs::local_root::LocalRoot>,
+    ops: &[Op],
+    fsync: bool,
+    lease_healthy: bool,
+    lease_guard: &ApplyLeaseGuard,
+    acc: &Counters,
+) {
+    let Some(writer) = writer else {
+        return;
+    };
+    let label = match side {
+        Side::Source => "source",
+        Side::Target => "target",
+    };
+    let store_path = |root: &crate::fs::local_root::LocalRoot| {
+        root.display_path()
+            .join(crate::foundation::names::VERSION_STORE_DIR)
+            .display()
+            .to_string()
+    };
+
+    if lease_healthy && lease_guard.check_before_mutation().is_ok() {
+        let side_ops: Vec<Op> = ops.iter().filter(|o| o.side == side).cloned().collect();
+        match writer.finish(&side_ops, fsync, || lease_guard.check_before_mutation()) {
+            Ok(Some(id)) => {
+                if let Some(root) = local_root {
+                    println!("version saved: {} (id {id})", store_path(root));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                acc.errors.fetch_add(1, Ordering::Relaxed);
+                crate::log_error!(
+                    "apply",
+                    "could not finalize {label} version history: {error}"
+                );
+            }
+        }
+    } else if let Some(root) = local_root {
+        crate::log_warn!(
+            "apply",
+            "leaving the unindexed version staging directory under {} because root-lock ownership was lost",
+            store_path(root)
+        );
+    }
 }
