@@ -87,7 +87,8 @@ test('reducer accepts only explicit transitions owned by the current request fen
     review: applyConfirmation(),
   });
   assert.equal(state.phase, 'ready');
-  assert.equal(state.review?.challenge_id, 'challenge-1');
+  assert.ok(state.review !== null && 'challenge_id' in state.review);
+  assert.equal(state.review.challenge_id, 'challenge-1');
   const invalidTransition = operationReviewReducer(state, {
     type: 'authorized',
     request: second,

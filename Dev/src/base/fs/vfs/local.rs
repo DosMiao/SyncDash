@@ -1,8 +1,10 @@
 //! The local backend, confined to one retained root directory handle.
 //!
-//! Layering: this L0 module reaches up to L1 `obs::logging` through `log_warn!`, in `read_dir`,
-//! where an entry whose name is not valid Unicode is skipped. The skip has no return channel —
-//! the signature yields entries, not diagnostics — so without the log it is silent. See `lib.rs`.
+//! Every operation resolves segment-by-segment from that handle, so a path can never address
+//! outside the root it was opened against. `read_dir` delegates to `LocalRoot::read_directory`,
+//! which fails an entry whose name is not valid Unicode rather than skipping it: a name this
+//! process cannot spell is a name it cannot later address, and a scan that silently omits one
+//! would report a deletion the user never made.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

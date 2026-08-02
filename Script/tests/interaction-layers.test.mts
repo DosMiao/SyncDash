@@ -63,7 +63,9 @@ test('an exclusive top layer blocks commands from every underlying surface', () 
   const logPanel = layer('auxiliary_panel', 3, { find: () => {} });
   const popover = layer('popover', 4, { dismiss: () => {} });
 
-  assert.equal(resolveInteractionCommand('dismiss', [application, workspace, logPanel, popover]).layerId, popover.id);
+  const dismiss = resolveInteractionCommand('dismiss', [application, workspace, logPanel, popover]);
+  assert.ok(dismiss.disposition !== 'unhandled');
+  assert.equal(dismiss.layerId, popover.id);
   assert.deepEqual(resolveInteractionCommand('find', [application, workspace, logPanel, popover]), {
     disposition: 'blocked',
     layerId: popover.id,
@@ -79,7 +81,9 @@ test('log search owns find and blocks run commands while the log is active', () 
   const workspace = layer('workspace', 2, { find: () => {} });
   const logPanel = layer('auxiliary_panel', 3, { find: () => {} });
 
-  assert.equal(resolveInteractionCommand('find', [application, workspace, logPanel]).layerId, logPanel.id);
+  const find = resolveInteractionCommand('find', [application, workspace, logPanel]);
+  assert.ok(find.disposition !== 'unhandled');
+  assert.equal(find.layerId, logPanel.id);
   assert.deepEqual(resolveInteractionCommand('compare', [application, workspace, logPanel]), {
     disposition: 'blocked',
     layerId: logPanel.id,
@@ -98,5 +102,7 @@ test('a child layer stays above its parent without outranking a newer root modal
 test('zoom remains globally accessible across an exclusive layer', () => {
   const application = layer('application', 1, { zoom_in: () => {} });
   const modal = layer('modal', 2, { dismiss: () => {} });
-  assert.equal(resolveInteractionCommand('zoom_in', [application, modal]).layerId, application.id);
+  const zoomIn = resolveInteractionCommand('zoom_in', [application, modal]);
+  assert.ok(zoomIn.disposition !== 'unhandled');
+  assert.equal(zoomIn.layerId, application.id);
 });

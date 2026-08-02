@@ -149,6 +149,9 @@ test('capabilities are explicit, split by window, and grant no frontend event em
   const allPermissions = [...mainCapability.permissions, ...progressCapability.permissions];
   assert.equal(allPermissions.includes('core:default'), false);
   assert.equal(allPermissions.some((permission) => /^core:event:allow-emit(?:-to)?$/.test(permission)), false);
-  assert.equal(progressCapability.permissions.some((permission) => permission.startsWith('dialog:')), false);
+  assert.equal(
+    progressCapability.permissions.some((permission: string) => permission.startsWith('dialog:')),
+    false,
+  );
   assert.doesNotMatch(progressApp, /import\s*\{[^}]*\bemit\b[^}]*\}\s*from\s*['"]@tauri-apps\/api\/event['"]/s);
 });

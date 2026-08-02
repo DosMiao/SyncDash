@@ -13,8 +13,11 @@ Dev/
 └── typescript/             Shared frontend logic and both webview windows
 ```
 
-Build manifests, executable tests, repository tooling, and the committed `dist/` bundle stay at the
-repository root because they operate on more than one source root.
+Build manifests, repository tooling, and the committed `dist/` bundle stay at the repository root
+because they operate on more than one source root. `tests/` is there for a different reason: Cargo
+resolves integration tests only at the package root, so its location is a toolchain requirement
+rather than an ownership statement. Those three files exercise the library across a crate boundary,
+which is what makes them integration tests; everything else lives beside the behavior it protects.
 
 ## First-principles structure rules
 
@@ -91,9 +94,12 @@ Dev/src/
 │   │   ├── policy/         validation and runtime projection
 │   │   └── persistence/    codec, migrations, registry, and atomic mutation
 │   └── run/
+│       ├── archive.rs      the sync-mode record of what the two sides last agreed on
+│       ├── e2e/            cross-lane pipeline smoke and safety checks (test-only)
 │       ├── history/        model, codec, migration, recording, queries, and retention
 │       ├── local/          Compare, guarded Apply, and execution-loop orchestration
 │       ├── peer/           configuration, probe, package, Compare, and guarded Apply
+│       ├── roots.rs        root-phrase resolution shared by both lanes
 │       └── watch/          watch validation, trigger state machine, and behavior tests
 ├── shell/cli/
 │   └── commands/           jobs, snapshots, packages, recovery, history, and system delivery
@@ -132,16 +138,24 @@ Dev/src-tauri/src/
 │   ├── operations/
 │   │   ├── apply/          preparation, review, and authorized execution
 │   │   ├── authorization/  challenges, target policy, Compare/Apply review, and token store
+│   │   ├── autoscan_authority.rs  AutoScan permit and verification-ticket vocabulary
 │   │   ├── compare/        review, approval, and authorized execution
+│   │   ├── decisions.rs    shared row-authentication rules for reviewed operations
+│   │   ├── events/         run-event model, repository, sink, and throttle
 │   │   ├── execution/      shared execution guards and error classification
 │   │   ├── lifecycle/      coordinator, leases, preparation, reservation, and control
+│   │   ├── projection.rs   operation state projected for delivery
 │   │   └── target/         registered target resolution and revision validation
 │   ├── jobs/               target resolution and mutation effects
 │   └── settings/           authorization, transactional save, and log selection
 ├── ipc/
 │   ├── commands/
+│   │   ├── autoscan.rs     AutoScan arm, disarm, and status delivery
 │   │   ├── compare/        workspace, export, identical results, and reveal delivery
+│   │   ├── desktop/        progress-window construction and power actions
+│   │   ├── job_editor.rs   job-editor endpoint readiness delivery
 │   │   ├── jobs/           query, projection, mutation, and event delivery
+│   │   ├── logs/           run-history query and artifact reveal delivery
 │   │   ├── operations/     thin Apply/Compare role checks and use-case delegation
 │   │   └── settings/       query, save, and selection delivery
 │   └── native/             dialogs and native adapters shared by commands
@@ -170,6 +184,7 @@ Dev/typescript/
 │   ├── features/           feature-owned components, controllers, hooks, and models
 │   ├── pages/
 │   │   ├── workspace/
+│   │   │   ├── components/ page-owned toolbar, sidebar, status bar, and results section
 │   │   │   ├── controller/ route composition and typed runtime-to-view adapters
 │   │   │   ├── model/      page vocabulary and immutable presentation inputs
 │   │   │   ├── presentation/ complete page views with no platform effects
@@ -177,7 +192,12 @@ Dev/typescript/
 │   │   │   └── runtime/    use-case groups: execution, state authorities, and platform effects
 │   │   └── progress/       controller over launch, controls, power, events, and window runtime
 │   ├── shared/
-│   │   └── components/     focused feedback, floating, menu, and overlay primitive families
+│   │   ├── components/     focused feedback, floating, menu, and overlay primitive families
+│   │   ├── errors/         window-level error boundary and reporting surface
+│   │   ├── hooks/          reusable scroll, zoom, and status bindings
+│   │   ├── icons/          shared icon set
+│   │   ├── interaction/    the interaction-layer stack and command resolution
+│   │   └── status/         the status authority and its React binding
 │   └── windows/
 │       ├── main/           thin workspace-window composition root
 │       └── progress/       thin independent progress-window composition root

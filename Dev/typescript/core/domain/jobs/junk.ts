@@ -9,7 +9,7 @@
 
 import type { JunkPresetDto } from '#core/types/generated/JunkPresetDto.ts';
 
-/// Line identity for an exclude entry, matching Rust `filter::same_exclude_entry` step for step:
+/// Line identity for an exclude entry, matching Rust `job::junk::same_exclude_entry` step for step:
 /// `fold(trim(s))` then backslash → slash, where `fold` is `text::norm_key(s, true)` = **NFC + uppercase**.
 ///
 /// Both halves matter and neither is cosmetic. NFC: macOS/APFS writes NFD, so a path pasted from Finder

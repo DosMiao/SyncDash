@@ -345,3 +345,52 @@ fn recursive_remove_refuses_a_symlinked_directory() {
     let _ = std::fs::remove_dir_all(root_path);
     let _ = std::fs::remove_dir_all(outside);
 }
+
+fn set_read_only(path: &Path, read_only: bool) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(read_only);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+/// The read-only file case, at the descriptor-relative level. Git marks loose objects
+/// `r--r--r--`, and Windows refuses to delete or move them; on unix the first call already
+/// succeeds, so this asserts the outcome rather than the mechanism on both.
+#[test]
+fn a_read_only_file_can_still_be_removed_and_renamed() {
+    let root_path = test_directory("read-only-file");
+    let root = LocalRoot::open(root_path.clone()).unwrap();
+    std::fs::write(root_path.join("a.txt"), b"git-loose-object").unwrap();
+    set_read_only(&root_path.join("a.txt"), true);
+
+    root.rename(&path("a.txt"), &path("b.txt"))
+        .expect("rename must survive the read-only source");
+    root.remove_file(&path("b.txt"))
+        .expect("removal must survive the read-only attribute");
+
+    assert!(!root_path.join("b.txt").exists());
+    let _ = std::fs::remove_dir_all(root_path);
+}
+
+/// The directory counterpart. `force` clears the attribute that blocks the removal; it must
+/// never widen into a recursive delete, so a non-empty directory still refuses.
+#[test]
+fn a_read_only_directory_is_removed_without_becoming_a_recursive_delete() {
+    let root_path = test_directory("read-only-directory");
+    let root = LocalRoot::open(root_path.clone()).unwrap();
+    std::fs::create_dir_all(root_path.join("locked")).unwrap();
+    set_read_only(&root_path.join("locked"), true);
+
+    root.remove_directory(&directory("locked"))
+        .expect("force removal must succeed");
+    assert!(!root_path.join("locked").exists());
+
+    std::fs::create_dir_all(root_path.join("full")).unwrap();
+    std::fs::write(root_path.join("full/x"), b"x").unwrap();
+    assert!(
+        root.remove_directory(&directory("full")).is_err(),
+        "force must not turn into a recursive delete"
+    );
+
+    let _ = std::fs::remove_dir_all(root_path);
+}

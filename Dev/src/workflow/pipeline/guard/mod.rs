@@ -15,14 +15,12 @@ pub mod scan;
 pub mod space;
 pub mod stats;
 
-use std::path::Path;
-
 use crate::model::plan::{Op, PlanHeader};
 
 use ratio::check_delete_ratio;
-use roots::{check_root, check_root_vfs};
+use roots::check_root_vfs;
 use scan::{check_materialized, check_scan_complete};
-use space::{check_space, check_space_vfs};
+use space::check_space;
 use stats::stat_plan;
 
 #[derive(Clone, Debug)]
@@ -71,8 +69,12 @@ impl Verdict {
     }
 }
 
-/// `run_all` over a backend pair: the same gates, with root and space checks going
-/// through the VFS (an sftp root honestly reports "cannot determine" instead of a number).
+/// Every gate in one pass over a backend pair. The plan header carries every number the gates
+/// judge — entry counts, exclusions, walk errors — so it is passed whole rather than unpacked at
+/// the call site.
+///
+/// Root and space checks go through the `Vfs`, so an sftp root honestly reports "cannot determine"
+/// instead of a number it cannot know.
 pub fn run_all_vfs(
     ops: &[Op],
     source: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
@@ -118,83 +120,16 @@ pub fn run_all_vfs(
         &mut v,
     );
     let st = stat_plan(ops);
-    check_space_vfs(
+    check_space(
         "target",
         target,
         st.target.write_bytes,
         g.min_free_pct,
         &mut v,
     );
-    check_space_vfs(
+    check_space(
         "source",
         source,
-        st.source.write_bytes,
-        g.min_free_pct,
-        &mut v,
-    );
-    check_delete_ratio("target", &st.target, head.target_entries, g, &mut v);
-    check_delete_ratio("source", &st.source, head.source_entries, g, &mut v);
-    v
-}
-
-/// The plan header carries every number the gates judge — entry counts, exclusions, walk errors —
-/// so it is passed whole rather than unpacked at the call site. Two `u64` parameters in a row is
-/// exactly the shape that lets source and target be handed over swapped.
-pub fn run_all(
-    ops: &[Op],
-    source_root: &Path,
-    target_root: &Path,
-    head: &PlanHeader,
-    g: &Guards,
-) -> Verdict {
-    let mut v = Verdict {
-        blockers: Vec::new(),
-        warnings: Vec::new(),
-    };
-    check_root("source", source_root, g.require_marker, &mut v);
-    check_root("target", target_root, g.require_marker, &mut v);
-    if !v.ok() {
-        return v; // with a root unavailable, the later checks are meaningless
-    }
-    check_scan_complete(
-        "source",
-        head.source_walk_errors,
-        &head.source_walk_err_samples,
-        g,
-        &mut v,
-    );
-    check_scan_complete(
-        "target",
-        head.target_walk_errors,
-        &head.target_walk_err_samples,
-        g,
-        &mut v,
-    );
-    check_materialized(
-        "source",
-        head.source_icloud_stubs,
-        &head.source_icloud_stub_samples,
-        g,
-        &mut v,
-    );
-    check_materialized(
-        "target",
-        head.target_icloud_stubs,
-        &head.target_icloud_stub_samples,
-        g,
-        &mut v,
-    );
-    let st = stat_plan(ops);
-    check_space(
-        "target",
-        target_root,
-        st.target.write_bytes,
-        g.min_free_pct,
-        &mut v,
-    );
-    check_space(
-        "source",
-        source_root,
         st.source.write_bytes,
         g.min_free_pct,
         &mut v,

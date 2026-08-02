@@ -232,6 +232,25 @@ pub fn sep_of(root: &str) -> char {
     }
 }
 
+/// Root phrase + portable relative path → the path spelled the way the *far* machine spells it.
+///
+/// This is display only: the result is shown to a user or written into an export, never opened.
+/// [`join_native`] is the one that produces something this host can address.
+///
+/// Every trailing separator is trimmed, of either flavour, not just one of the inferred flavour.
+/// A root recorded as `//server/share//` or `C:\root\\` is ordinary — UNC phrases and hand-edited
+/// job files both produce it — and trimming only one would emit a doubled separator in the middle
+/// of a path the user is meant to read and paste back.
+pub fn join_display(root: &str, relative: &str) -> String {
+    let separator = sep_of(root);
+    let root = root.trim_end_matches(['/', '\\']);
+    if separator == '\\' {
+        format!("{root}{separator}{}", relative.replace('/', "\\"))
+    } else {
+        format!("{root}{separator}{relative}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +263,26 @@ mod tests {
         assert_eq!(base_name("top.txt"), "top.txt");
         assert_eq!(split_parent("a/b/c.txt"), ("a/b/", "c.txt"));
         assert_eq!(split_parent("top.txt"), ("", "top.txt"));
+    }
+
+    #[test]
+    fn display_join_spells_the_far_machine_and_never_doubles_a_separator() {
+        // The separator comes from the root phrase, not from this host.
+        assert_eq!(join_display("/mnt/share", "a/b.txt"), "/mnt/share/a/b.txt");
+        assert_eq!(
+            join_display(r"C:\root", "a/b.txt"),
+            r"C:\root\a\b.txt",
+            "a windows-spelled root takes windows separators throughout"
+        );
+
+        // Repeated and mixed trailing separators are trimmed whole. Trimming only the last one
+        // would emit a doubled separator into a path the user is meant to read and paste back.
+        assert_eq!(
+            join_display("//server/share//", "a.txt"),
+            "//server/share/a.txt"
+        );
+        assert_eq!(join_display(r"C:\root\\", "a.txt"), r"C:\root\a.txt");
+        assert_eq!(join_display("/mnt/share/", "a.txt"), "/mnt/share/a.txt");
     }
 
     #[test]

@@ -71,7 +71,7 @@ test('live progress reserves 100 for a successful Summary', () => {
 
   run.running = false;
   run.summary = {
-    kind: 'summary', run_id: 1, ts_ms: Date.now(), purpose: 'apply',
+    sequence: 1, kind: 'summary', run_id: 1, ts_ms: Date.now(), purpose: 'apply',
     done: 1, skipped: 0, errors: 0, cancelled: false,
   };
   assert.equal(completionPercent(run), 100);
@@ -79,7 +79,7 @@ test('live progress reserves 100 for a successful Summary', () => {
   const empty = newRunState(2, Date.now());
   empty.running = false;
   empty.summary = {
-    kind: 'summary', run_id: 2, ts_ms: Date.now(), purpose: 'apply',
+    sequence: 1, kind: 'summary', run_id: 2, ts_ms: Date.now(), purpose: 'apply',
     done: 0, skipped: 0, errors: 0, cancelled: false,
   };
   assert.equal(completionPercent(empty), 100);
