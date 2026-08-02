@@ -144,6 +144,28 @@ impl LocalDirectory {
         capability_fs::remove_file(&self.handle, Path::new(name))
     }
 
+    /// `remove_file`, clearing the read-only attribute on a PermissionDenied retry — **on Windows**.
+    ///
+    /// Git marks loose objects `r--r--r--`, and Windows (plus SMB servers honoring the DOS
+    /// attribute) refuses to delete such files — a real sync against a `.git`-carrying tree failed
+    /// thousands of deletes with os error 5 exactly this way.
+    ///
+    /// The retry is Windows-only because it is only *correct* on Windows, where the read-only DOS
+    /// attribute really is the cause and clearing it really is the remedy. It is tempting to think
+    /// the retry simply never fires on unix, but that is wrong about the trigger: `unlink` returns
+    /// EACCES when the **parent directory** is not writable, under a sticky-bit directory you do
+    /// not own, or on a `chflags uchg` file — measured, errno 13. And on unix
+    /// `set_readonly(false)` is not an attribute, it is `mode |= 0o222`: measured, 0600 becomes
+    /// 0622. So in the commonest case the chmod succeeded (you own the file), the retry failed
+    /// again (the parent is still not writable), and the file was left group- and world-writable
+    /// permanently. Mirroring into `/Users/Shared` or another user's tree widened one more file on
+    /// every failed delete.
+    ///
+    /// On unix the original PermissionDenied propagates untouched. That is both the loud failure
+    /// and the honest diagnosis: the file's own mode was never the problem.
+    ///
+    /// A symlink stays failed rather than being retried: std has no `lchmod`, so clearing
+    /// permissions would chmod the **target**.
     pub(super) fn remove_file_force(&self, name: &OsStr) -> std::io::Result<()> {
         match self.remove_file(name) {
             #[cfg(windows)]
@@ -186,6 +208,15 @@ impl LocalDirectory {
         capability_fs::remove_dir(&self.handle, Path::new(name))
     }
 
+    /// The directory half of [`Self::remove_file_force`], and a distinct case: on Windows the
+    /// read-only attribute on a *directory* is nominally a "this folder is customized" flag, but
+    /// `RemoveDirectory` still refuses it. Measured on Win11 26200: removing an empty directory
+    /// carrying the attribute fails with `PermissionDenied` (os error 5), the same wording users
+    /// saw on the read-only file case.
+    ///
+    /// Windows-only for the same reason as the file case: on unix the retry turned 0755 into 0777.
+    ///
+    /// This never becomes a recursive delete — a non-empty directory still reports NotEmpty.
     pub(super) fn remove_directory_force(&self, name: &OsStr) -> std::io::Result<()> {
         match self.remove_directory(name) {
             #[cfg(windows)]
@@ -223,6 +254,13 @@ impl LocalDirectory {
         self.rename_windows(source_name, destination_parent, destination_name, true)
     }
 
+    /// `rename`, with the same read-only-clearing retry on the source. NTFS moves read-only files
+    /// fine, but an SMB server mapping unix modes may refuse.
+    ///
+    /// Windows-only, as in [`Self::remove_file_force`] — and this is the variant that hid the unix
+    /// permission widening the hardest, because an earlier ambient version discarded the chmod's
+    /// own failure with `let _ =`, so a rename could widen the source mode and still report the
+    /// original error.
     pub(super) fn rename_force(
         &self,
         source_name: &OsStr,
