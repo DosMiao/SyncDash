@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use crate::features::operations::autoscan_authority::AutoApplyTicket;
+use crate::features::autoscan::authority::AutoApplyTicket;
 
 use super::super::apply::{
     ApplyAuthorization, ApplyReview, AutoApplyAuthorization, OperationAuthorization,

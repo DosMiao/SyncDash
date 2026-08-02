@@ -1,6 +1,7 @@
 //! Compare permit issuance, launch authentication, and evidence publication.
 
 use super::AutoScanController;
+use crate::features::autoscan::authority::{AutoApplyTicket, AutoScanComparePermit};
 use crate::features::autoscan::model::AutoScanTriggerDto;
 use crate::features::autoscan::runtime::{
     allocate_unique_id, AutoScanComparePublication, WorkerCommand,
@@ -8,7 +9,6 @@ use crate::features::autoscan::runtime::{
 use crate::features::autoscan::state::AutoScanTicketLifecycle;
 use crate::features::autoscan::worker::observation::mark_shared_inactive;
 use crate::features::compare::evidence::model::result::SuccessfulCompareResult;
-use crate::features::operations::autoscan_authority::{AutoApplyTicket, AutoScanComparePermit};
 
 impl AutoScanController {
     /// Issue one exact permit while a trigger is still pending. Manual Compare review never calls

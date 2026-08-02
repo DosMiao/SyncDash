@@ -1,7 +1,7 @@
 //! One-generation ticket state machine and its observable status projection.
 
+use crate::features::autoscan::authority::{AutoApplyTicket, AutoScanComparePermit};
 use crate::features::compare::evidence::model::verification::CompareVerificationTicket;
-use crate::features::operations::autoscan_authority::{AutoApplyTicket, AutoScanComparePermit};
 
 use super::model::{AutoScanBinding, AutoScanStatusDto, AutoScanStatusMode, AutoScanTriggerDto};
 

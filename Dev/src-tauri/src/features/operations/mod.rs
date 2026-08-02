@@ -2,7 +2,6 @@
 
 pub(crate) mod apply;
 pub(crate) mod authorization;
-pub(crate) mod autoscan_authority;
 pub(crate) mod compare;
 pub(crate) mod decisions;
 pub(crate) mod events;

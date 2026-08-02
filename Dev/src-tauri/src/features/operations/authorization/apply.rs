@@ -1,7 +1,7 @@
 //! Apply review fingerprint and interactive or unattended authorization payloads.
 
 use crate::contracts::compare::{CompareIdentity, ReviewedRowDecisionDto};
-use crate::features::operations::autoscan_authority::AutoApplyTicket;
+use crate::features::autoscan::authority::AutoApplyTicket;
 
 use super::compare::CompareAuthorization;
 use super::digest::reviewed_row_decisions_digest;

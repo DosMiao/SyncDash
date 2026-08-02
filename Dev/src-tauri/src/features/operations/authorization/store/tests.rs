@@ -2,8 +2,8 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use crate::contracts::compare::{CompareIdentity, ReviewedRowDecisionDto};
+use crate::features::autoscan::authority::AutoApplyTicket;
 use crate::features::compare::evidence::model::scope::CompareScope;
-use crate::features::operations::autoscan_authority::AutoApplyTicket;
 
 use super::super::{apply::*, challenge::*, compare::*, digest::*, target::*};
 use super::state::*;

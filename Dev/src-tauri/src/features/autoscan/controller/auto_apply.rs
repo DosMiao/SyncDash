@@ -2,8 +2,8 @@
 
 use super::ownership::active_owns_ticket;
 use super::AutoScanController;
+use crate::features::autoscan::authority::AutoApplyTicket;
 use crate::features::autoscan::state::AutoScanTicketLifecycle;
-use crate::features::operations::autoscan_authority::AutoApplyTicket;
 
 impl AutoScanController {
     /// Move one exact completed ticket into a non-retryable claimed state. Endpoint probes happen

@@ -2,11 +2,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex};
 
 use crate::contracts::compare::{CompareOwner, CompareScopeExecutionStatusDto};
+use crate::features::autoscan::authority::AutoScanComparePermit;
 use crate::features::compare::evidence::model::result::SuccessfulCompareResult;
 use crate::features::compare::evidence::model::verification::CompareVerificationTicket;
 use crate::features::compare::evidence::repository::CompareResultRepository;
 use crate::features::operations::authorization::store::OperationAuthorizationStore;
-use crate::features::operations::autoscan_authority::AutoScanComparePermit;
 
 use super::worker::binding::validate_resolved_binding;
 use super::worker::configuration::{configured_interval, next_ticket_id, DEFAULT_INTERVAL_SECS};
