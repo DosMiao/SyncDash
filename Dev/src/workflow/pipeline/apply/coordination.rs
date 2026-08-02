@@ -39,10 +39,7 @@ pub(super) fn execute(
         };
     }
     // Apply's totals are known before it starts: the UI percentage formula is valid from t=0
-    let items_total = ops
-        .iter()
-        .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
-        .count() as u64;
+    let items_total = ops.iter().filter(|o| o.action.is_executable()).count() as u64;
     let bytes_total: u64 = ops
         .iter()
         .filter(|o| matches!(o.action, Action::Copy | Action::Update) && o.link.is_none())
@@ -72,10 +69,7 @@ pub(super) fn execute(
     }
 
     if opt.dry_run {
-        for op in ops
-            .iter()
-            .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
-        {
+        for op in ops.iter().filter(|o| o.action.is_executable()) {
             if opt.verbose {
                 let label = format!(
                     "[{}] {:?} {}",

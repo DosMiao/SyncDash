@@ -1,6 +1,6 @@
 //! Reconstruction of executable operations from authenticated review decisions.
 
-use syncdash::model::plan::{Action, Op};
+use syncdash::model::plan::Op;
 
 use crate::contracts::compare::ReviewedRowDecisionDto;
 
@@ -44,7 +44,7 @@ pub(crate) fn resolve_reviewed_operations(
                 )
             })?
         } else {
-            if matches!(original.action, Action::Conflict | Action::Note) {
+            if !original.action.is_executable() {
                 return Err(format!(
                     "Reviewed row {} is a report, not an operation — run Compare again",
                     index + 1
@@ -60,7 +60,7 @@ pub(crate) fn resolve_reviewed_operations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syncdash::model::plan::Side;
+    use syncdash::model::plan::{Action, Side};
 
     fn operation(action: Action, path: &str) -> Op {
         Op {

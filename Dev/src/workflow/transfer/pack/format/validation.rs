@@ -51,9 +51,7 @@ pub(super) fn validate_package_structure(
 
     let mut required_payload = std::collections::HashSet::new();
     for operation in &plan.ops {
-        if operation.side != Side::Target
-            || matches!(operation.action, Action::Conflict | Action::Note)
-        {
+        if operation.side != Side::Target || !operation.action.is_executable() {
             return Err(package_error(format!(
                 "package plan contains an operation that cannot execute on the target: {:?} {:?}",
                 operation.side, operation.action

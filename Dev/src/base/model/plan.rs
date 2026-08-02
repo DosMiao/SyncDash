@@ -39,6 +39,19 @@ pub enum Action {
     Note,
 }
 
+impl Action {
+    /// Whether this row is work to perform, as opposed to something to report.
+    ///
+    /// `Conflict` and `Note` are the plan's way of telling the user something; they name no
+    /// mutation and are never executed, counted as transferable, packed, or sent to a peer. Every
+    /// stage that walks a plan has to make this distinction, so it is stated once here rather than
+    /// re-spelled at each site — a spelling that drifts is a row silently executed or silently
+    /// dropped, and both are data-safety failures.
+    pub fn is_executable(&self) -> bool {
+        !matches!(self, Self::Conflict | Self::Note)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, ts_rs::TS)]
 #[cfg_attr(feature = "export-types", ts(export))]
 #[ts(export_to = "../Dev/typescript/core/types/generated/")]
@@ -258,6 +271,25 @@ mod tests {
             msg.contains("re-run Compare"),
             "the message has to carry the remedy: {msg}"
         );
+    }
+
+    /// Conflict and Note are reports; everything else is work. Fifteen call sites depended on
+    /// this split before it had a name, and a row misclassified either way is either executed
+    /// without review or dropped without notice.
+    #[test]
+    fn only_conflict_and_note_are_reports() {
+        for action in [
+            Action::Copy,
+            Action::Update,
+            Action::Move,
+            Action::Delete,
+            Action::DeleteDir,
+            Action::Chmod,
+        ] {
+            assert!(action.is_executable(), "{action:?} is work to perform");
+        }
+        assert!(!Action::Conflict.is_executable());
+        assert!(!Action::Note.is_executable());
     }
 
     fn header(ops: usize) -> PlanHeader {

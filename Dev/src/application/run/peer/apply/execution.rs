@@ -59,7 +59,7 @@ pub(super) fn apply_peer_inner(
     let has_target_ops = plan
         .ops
         .iter()
-        .any(|o| o.side == Side::Target && !matches!(o.action, Action::Conflict | Action::Note));
+        .any(|o| o.side == Side::Target && o.action.is_executable());
     if has_target_ops {
         let delta_rels: Vec<String> = plan
             .ops
@@ -231,7 +231,7 @@ pub(super) fn apply_peer_inner(
     let src_ops: Vec<Op> = plan
         .ops
         .iter()
-        .filter(|o| o.side == Side::Source && !matches!(o.action, Action::Conflict | Action::Note))
+        .filter(|o| o.side == Side::Source && o.action.is_executable())
         .cloned()
         .collect();
     if !src_ops.is_empty() {

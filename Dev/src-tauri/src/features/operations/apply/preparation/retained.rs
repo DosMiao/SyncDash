@@ -1,7 +1,7 @@
 //! Immutable Compare-result loading and reviewed-operation selection.
 
 use syncdash::job;
-use syncdash::model::plan::{Action, Op, Plan};
+use syncdash::model::plan::{Op, Plan};
 
 use crate::contracts::compare::{CompareIdentity, CompareOwner, ReviewedRowDecisionDto};
 use crate::features::compare::evidence::repository::validation::validate_retained_compare;
@@ -98,7 +98,7 @@ fn server_owned_reviewed_row_decisions(ops: &[Op]) -> Result<Vec<ReviewedRowDeci
     let reviewed_row_decisions: Vec<ReviewedRowDecisionDto> = ops
         .iter()
         .enumerate()
-        .filter(|(_, operation)| !matches!(operation.action, Action::Conflict | Action::Note))
+        .filter(|(_, operation)| operation.action.is_executable())
         .map(|(index, _)| ReviewedRowDecisionDto {
             index,
             direction_reversed: false,
@@ -127,7 +127,7 @@ pub(in crate::features::operations::apply) fn prepare_autoscan_apply(
 
 #[cfg(test)]
 mod tests {
-    use syncdash::model::plan::Side;
+    use syncdash::model::plan::{Action, Side};
 
     use super::*;
 
