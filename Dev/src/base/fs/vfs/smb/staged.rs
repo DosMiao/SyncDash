@@ -27,7 +27,9 @@ use smb2::types::status::NtStatus;
 use smb2::types::{Command, CreditCharge, FileId};
 use smb2::Tree;
 
-use super::{basic_info, map_smb_err, set_write_time, status_err};
+use super::basic_info;
+use super::errors::{map_smb_err, status_err};
+use super::set_write_time;
 
 /// One SMB2 credit covers 64 KiB; a larger payload has to charge — and consume — one per
 /// 64 KiB, because a gap in the message-id sequence makes the server drop the connection.

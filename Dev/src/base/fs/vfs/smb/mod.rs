@@ -24,17 +24,27 @@
 //! the crate has no high-level call for. Lease ownership itself uses immutable no-replace claims;
 //! mtime only keeps their owner-specific heartbeat record observable.
 
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+mod basic_info;
+mod errors;
+mod meta;
+mod session;
+mod staged;
 
+#[cfg(test)]
+mod tests;
+
+pub use session::SmbBackend;
+
+use self::errors::{map_smb_err, status_err};
+use self::meta::meta_of;
+use self::session::Conn;
+use self::staged::{SmbRead, SmbStaged};
 use super::error::{VfsError, VfsErrorKind, VfsResult};
-use super::spec::EndpointSpec;
 use super::VfsEntryKind;
 use super::{
-    CaseSense, CredentialProvider, Medium, NameRules, ReadStream, Support, VDirEntry, VMeta, Vfs,
-    VfsCaps, WriteHint, WriteStaged,
+    CaseSense, Medium, NameRules, ReadStream, Support, VDirEntry, VMeta, Vfs, VfsCaps, WriteHint,
+    WriteStaged,
 };
-
 use smb2::client::connection::{CompoundOp, Connection};
 use smb2::msg::close::CloseRequest;
 use smb2::msg::create::{
@@ -46,231 +56,8 @@ use smb2::types::flags::FileAccessMask;
 use smb2::types::status::NtStatus;
 use smb2::types::{Command, FileId, OplockLevel};
 use smb2::{ClientConfig, SmbClient, Tree};
+use std::sync::Arc;
 
-mod basic_info;
-mod staged;
-
-use staged::{SmbRead, SmbStaged};
-
-/// `STATUS_DIRECTORY_NOT_EMPTY`. The crate's NtStatus table has no constant for it and its
-/// `ErrorKind` folds it into `Other`, but the engine's whole delete-dir classification rides
-/// on telling this one apart from a generic protocol error, so it is matched on the raw code.
-const STATUS_DIRECTORY_NOT_EMPTY: u32 = 0xC000_0101;
-
-pub struct SmbBackend {
-    spec: EndpointSpec,
-    creds: Arc<dyn CredentialProvider>,
-    /// Share name (first segment of the phrase root); the tree is connected to this.
-    share: String,
-    /// Path below the share named by the phrase. Every `rel` is resolved under it.
-    sub: String,
-    timeout: Duration,
-    /// Declared ahead of `rt` deliberately: struct fields drop in declaration order, and the
-    /// session's teardown aborts a task belonging to that runtime. Dropping the runtime first
-    /// would leave it reaching into an executor that no longer exists.
-    conn: OnceLock<Conn>,
-    rt: tokio::runtime::Runtime,
-    connect_gate: Mutex<()>,
-    server_line: Mutex<Option<String>>,
-}
-
-struct Conn {
-    /// Held only to keep the session and its receiver task alive; every operation runs on a
-    /// clone of `conn` instead, because the client's own methods want `&mut self` and would
-    /// serialize the backend behind one lock.
-    _client: SmbClient,
-    conn: Connection,
-    tree: Arc<Tree>,
-}
-
-impl SmbBackend {
-    pub fn new(spec: EndpointSpec, creds: Arc<dyn CredentialProvider>) -> VfsResult<SmbBackend> {
-        let mut segs = spec.root.splitn(2, '/');
-        let share = segs.next().unwrap_or("").to_string();
-        if share.is_empty() {
-            return Err(VfsError::new(
-                VfsErrorKind::Protocol,
-                format!(
-                    "'{}' names no share — an smb root needs at least smb://host/share",
-                    spec.display()
-                ),
-            ));
-        }
-        let sub = segs.next().unwrap_or("").trim_matches('/').to_string();
-        let timeout = spec
-            .opt("timeout")
-            .and_then(|t| t.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(20));
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_io()
-            .enable_time()
-            .thread_name("syncdash-smb")
-            .build()
-            .expect("tokio runtime");
-        Ok(SmbBackend {
-            spec,
-            creds,
-            share,
-            sub,
-            timeout,
-            conn: OnceLock::new(),
-            rt,
-            connect_gate: Mutex::new(()),
-            server_line: Mutex::new(None),
-        })
-    }
-
-    fn conn(&self) -> VfsResult<&Conn> {
-        self.conn.get().ok_or_else(|| {
-            VfsError::new(
-                VfsErrorKind::Transient,
-                format!(
-                    "'{}' is not connected — connect() must run first",
-                    self.spec.display()
-                ),
-            )
-        })
-    }
-
-    /// A table rel resolved against the phrase's own subdirectory, still '/'-separated.
-    ///
-    /// This is what the crate's own methods want: they run `format_path` over whatever they
-    /// are given. Only the hand-rolled compound in `set_mtime` needs `wire_path` instead.
-    fn share_rel(&self, rel: &str) -> String {
-        match (self.sub.as_str(), rel) {
-            ("", r) => r.to_string(),
-            (s, "") => s.to_string(),
-            (s, r) => format!("{s}/{r}"),
-        }
-    }
-
-    /// `share_rel`, then the normalization the crate applies on the way to the wire.
-    ///
-    /// `Tree::format_path` is `pub(crate)`, so its rule is restated rather than called:
-    /// '/' becomes '\', no leading separator, and a DFS tree wants `server\share\` in front.
-    fn wire_path(&self, rel: &str) -> String {
-        let p = self.share_rel(rel);
-        let normalized = p.replace('/', "\\");
-        let normalized = normalized.trim_start_matches('\\');
-        let tree = match self.conn.get() {
-            Some(c) => &c.tree,
-            None => return normalized.to_string(),
-        };
-        if !tree.is_dfs {
-            return normalized.to_string();
-        }
-        let host = tree.server.split(':').next().unwrap_or(&tree.server);
-        if normalized.is_empty() {
-            format!("{host}\\{}", tree.share_name)
-        } else {
-            format!("{host}\\{}\\{normalized}", tree.share_name)
-        }
-    }
-
-    /// Run one operation under the backend's timeout. A timeout is connection trouble, i.e.
-    /// `Transient` — never anything a caller could read as "the file is gone".
-    fn block<F, T>(&self, what: &str, fut: F) -> VfsResult<T>
-    where
-        F: std::future::Future<Output = smb2::Result<T>>,
-    {
-        let d = self.timeout;
-        // The timeout future has to be built inside the runtime (it takes the timer at
-        // construction), hence the async block rather than a bare block_on(timeout(..)).
-        match self
-            .rt
-            .block_on(async { tokio::time::timeout(d, fut).await })
-        {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(map_smb_err(what, e)),
-            Err(_) => Err(VfsError::new(
-                VfsErrorKind::Transient,
-                format!("{what} timed out after {d:?} on '{}'", self.spec.display()),
-            )),
-        }
-    }
-
-    /// `block` for a step that classifies its own failures (the hand-rolled compounds).
-    fn block_vfs<F, T>(&self, what: &str, fut: F) -> VfsResult<T>
-    where
-        F: std::future::Future<Output = VfsResult<T>>,
-    {
-        let d = self.timeout;
-        match self
-            .rt
-            .block_on(async { tokio::time::timeout(d, fut).await })
-        {
-            Ok(r) => r,
-            Err(_) => Err(VfsError::new(
-                VfsErrorKind::Transient,
-                format!("{what} timed out after {d:?} on '{}'", self.spec.display()),
-            )),
-        }
-    }
-
-    /// Absence is confirmed by [`super::absence::confirm_absent`]; this backend supplies only
-    /// its own parent listing.
-    fn confirm_absent(&self, rel: &str) -> VfsResult<()> {
-        super::absence::confirm_absent(rel, |parent| {
-            self.read_dir(parent).map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|entry| entry.name.as_str().to_owned())
-                    .collect()
-            })
-        })
-    }
-}
-
-/// Map the crate's errors onto the VFS taxonomy.
-///
-/// The asymmetry in `error.rs` is the point: everything ambiguous goes to `Transient`, and
-/// only a server's own definite "no such name" becomes `NotFound` — which callers still
-/// double-check before trusting.
-fn map_smb_err(what: &str, e: smb2::Error) -> VfsError {
-    use smb2::ErrorKind as K;
-    if let smb2::Error::Protocol { status, .. } = &e {
-        if status.0 == STATUS_DIRECTORY_NOT_EMPTY {
-            return VfsError::new(
-                VfsErrorKind::NotEmpty,
-                format!("{what}: the directory is not empty"),
-            );
-        }
-    }
-    let kind = match e.kind() {
-        K::NotFound => VfsErrorKind::NotFound,
-        K::AlreadyExists => VfsErrorKind::AlreadyExists,
-        K::AccessDenied => VfsErrorKind::PermissionDenied,
-        K::AuthRequired | K::SigningRequired => VfsErrorKind::Auth,
-        K::Cancelled => VfsErrorKind::Cancelled,
-        // A held file, a dropped link and an expired session all clear on a retry, and none
-        // of them says anything about whether the file exists.
-        K::SharingViolation | K::ConnectionLost | K::TimedOut | K::SessionExpired => {
-            VfsErrorKind::Transient
-        }
-        K::Io => VfsErrorKind::Io,
-        // The server answered with a code — evidence the connection itself is fine.
-        _ => VfsErrorKind::Protocol,
-    };
-    VfsError::new(kind, format!("{what}: {e}"))
-}
-
-/// A non-success status from one sub-response of a compound, routed through the same table.
-fn status_err(what: &str, command: Command, status: NtStatus) -> VfsError {
-    map_smb_err(what, smb2::Error::Protocol { status, command })
-}
-
-/// Set a file's write time and nothing else: compound CREATE + SET_INFO + CLOSE, one
-/// round-trip, the shape the crate itself uses for `rename`.
-///
-/// This is the one `Vfs` operation the crate offers no high-level call for. The compare window
-/// reads mtimes, staged commits preserve them, and the root lease refreshes its owner-specific
-/// heartbeat timestamp for observation; immutable claims, not this timestamp, prove ownership.
-/// Shared by `Vfs::set_mtime` and the staged write's commit.
-///
-/// `wire_path` must already be normalized (see `SmbBackend::wire_path`).
-/// `FileId::SENTINEL` is the compound's "the handle the previous operation just opened".
 async fn set_write_time(
     tree: &Tree,
     conn: &Connection,
@@ -362,23 +149,6 @@ async fn set_write_time(
     // The CLOSE's own status is not worth failing a landed stamp over: the time is set, and a
     // handle the server chose not to close is its own to reap.
     Ok(())
-}
-
-fn meta_of(size: u64, is_dir: bool, modified_ticks: u64) -> VMeta {
-    VMeta {
-        kind: if is_dir {
-            VfsEntryKind::Directory
-        } else {
-            VfsEntryKind::File
-        },
-        size,
-        mtime_ms: basic_info::unix_ms_from_filetime(modified_ticks),
-        // SMB2 carries DOS attributes, not a unix mode; inventing 0o644 here would be a lie
-        // the engine cannot tell from a real one.
-        mode: None,
-        file_id: None,
-        link: None,
-    }
 }
 
 impl Vfs for SmbBackend {
@@ -767,173 +537,5 @@ impl Vfs for SmbBackend {
         let (tree, mut conn) = (c.tree.clone(), c.conn.clone());
         let i = self.block("free_space", async move { tree.fs_info(&mut conn).await })?;
         Ok(Some((i.free_bytes, i.total_bytes)))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fs::vfs::spec::{parse, RootSpec};
-
-    fn backend(s: &str) -> SmbBackend {
-        let RootSpec::Endpoint(r) = parse(s) else {
-            panic!()
-        };
-        SmbBackend::new(r, crate::fs::vfs::cred::default_provider()).unwrap()
-    }
-
-    #[test]
-    fn share_and_sub_split() {
-        let b = backend("smb://ben@server/photos/2026/07");
-        assert_eq!(b.share, "photos");
-        assert_eq!(b.sub, "2026/07");
-        let b2 = backend("smb://server/backup");
-        assert_eq!(b2.share, "backup");
-        assert_eq!(b2.sub, "");
-    }
-
-    #[test]
-    fn no_share_is_refused_at_construction() {
-        let RootSpec::Endpoint(r) = parse("smb://server") else {
-            panic!()
-        };
-        assert!(SmbBackend::new(r, crate::fs::vfs::cred::default_provider()).is_err());
-    }
-
-    /// The share is the tree, so it must never reappear inside the path; the phrase's
-    /// subdirectory must.
-    #[test]
-    fn paths_resolve_under_the_subdirectory_not_the_share() {
-        let b = backend("smb://ben@server/photos/2026/07");
-        assert_eq!(b.share_rel("a/b.txt"), "2026/07/a/b.txt");
-        assert_eq!(b.share_rel(""), "2026/07");
-        let flat = backend("smb://ben@server/photos");
-        assert_eq!(flat.share_rel("a/b.txt"), "a/b.txt");
-        assert_eq!(flat.share_rel(""), "");
-    }
-
-    /// What actually goes on the wire: backslashes, and no leading separator for the server
-    /// to read as an absolute path.
-    #[test]
-    fn wire_paths_are_backslashed_and_relative() {
-        let b = backend("smb://ben@server/photos/2026");
-        assert_eq!(b.wire_path("a/b.txt"), "2026\\a\\b.txt");
-        assert_eq!(b.wire_path(""), "2026");
-        let flat = backend("smb://ben@server/photos");
-        assert_eq!(
-            flat.wire_path(""),
-            "",
-            "the share root is the empty path, not '\\'"
-        );
-        assert_eq!(flat.wire_path("x.txt"), "x.txt");
-    }
-
-    #[test]
-    fn unconnected_backend_reports_transient_not_missing() {
-        let b = backend("smb://ben@server/share");
-        let e = b.stat("x").unwrap_err();
-        assert_eq!(e.kind, VfsErrorKind::Transient);
-    }
-
-    #[test]
-    fn write_side_still_needs_a_connection_first() {
-        let b = backend("smb://ben@server/share");
-        let e = b.set_mtime("x", 0).unwrap_err();
-        assert_eq!(
-            e.kind,
-            VfsErrorKind::Transient,
-            "unconnected is a transient state, never a judgment about files"
-        );
-    }
-
-    #[test]
-    fn caps_declare_the_smb_profile() {
-        let c = backend("smb://ben@server/share").caps();
-        assert_eq!(c.protocol, "smb");
-        assert!(c.set_mtime.yes(), "the whole point of this backend");
-        assert_eq!(
-            c.rename_overwrite,
-            Support::No,
-            "ReplaceIfExists goes out as 0"
-        );
-        assert_eq!(c.symlink, Support::No);
-        assert_eq!(c.unix_mode, Support::No);
-        assert!(c.ranged_read.yes());
-        assert!(!c.local_trash);
-        // Nothing passes through the local path layer, so the client's rules do not apply.
-        assert_eq!(c.name_rules, NameRules::Unknown);
-    }
-
-    /// The capability map and the run-time answers have to agree: a `No` must come back as
-    /// `Unsupported`, not as a silent success or a protocol error.
-    #[test]
-    fn declared_gaps_refuse_honestly() {
-        let b = backend("smb://ben@server/share");
-        assert_eq!(
-            b.set_mode("x", 0o644).unwrap_err().kind,
-            VfsErrorKind::Unsupported
-        );
-        assert_eq!(
-            b.make_symlink("x", "y").unwrap_err().kind,
-            VfsErrorKind::Unsupported
-        );
-        assert_eq!(
-            b.read_link("x").unwrap_err().kind,
-            VfsErrorKind::Unsupported
-        );
-    }
-
-    /// The engine's delete-dir classification rides on this one code, which the crate folds
-    /// into a generic `Other`.
-    #[test]
-    fn directory_not_empty_is_classified_not_lumped_into_protocol() {
-        let e = map_smb_err(
-            "remove_dir",
-            smb2::Error::Protocol {
-                status: NtStatus(STATUS_DIRECTORY_NOT_EMPTY),
-                command: Command::Create,
-            },
-        );
-        assert_eq!(e.kind, VfsErrorKind::NotEmpty);
-    }
-
-    /// A held file and a dropped link must never read as "the file is gone" — that asymmetry
-    /// is the difference between an annoyance and a reverse delete.
-    #[test]
-    fn ambiguous_failures_stay_transient() {
-        for status in [NtStatus::SHARING_VIOLATION, NtStatus::ACCESS_DENIED] {
-            let e = map_smb_err(
-                "op",
-                smb2::Error::Protocol {
-                    status,
-                    command: Command::Create,
-                },
-            );
-            assert_ne!(
-                e.kind,
-                VfsErrorKind::NotFound,
-                "{status} must not read as absence"
-            );
-        }
-        assert_eq!(
-            map_smb_err("op", smb2::Error::Disconnected).kind,
-            VfsErrorKind::Transient
-        );
-        assert_eq!(
-            map_smb_err("op", smb2::Error::Timeout).kind,
-            VfsErrorKind::Transient
-        );
-    }
-
-    #[test]
-    fn a_missing_name_is_the_only_thing_that_becomes_not_found() {
-        let e = map_smb_err(
-            "stat",
-            smb2::Error::Protocol {
-                status: NtStatus::OBJECT_NAME_NOT_FOUND,
-                command: Command::Create,
-            },
-        );
-        assert_eq!(e.kind, VfsErrorKind::NotFound);
     }
 }
