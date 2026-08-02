@@ -1,3 +1,4 @@
+import { eventLabel, eventPhase } from '#core/domain/runs/runEvents.ts';
 import type { RunEventEnvelope } from '#core/domain/runs/runEvents.ts';
 
 export type CompareProgressEvent = RunEventEnvelope;
@@ -18,7 +19,7 @@ export interface CompareStage {
 
 function createCompareStage(event: CompareProgressEvent): CompareStage {
   return {
-    phase: event.phase!, label: event.label ?? '',
+    phase: eventPhase(event)!, label: eventLabel(event) ?? '',
     itemsDone: 0, itemsTotal: 0, bytesDone: 0, bytesTotal: 0, rate: 0,
     active: true, done: false, failed: false, cancelled: false,
   };
@@ -31,13 +32,14 @@ export function reduceCompareStages(
   event: CompareProgressEvent,
   rate = 0,
 ): CompareStage[] {
-  if (!event.phase) return previousStages;
-  const current = previousStages.find((stage) => stage.phase === event.phase) ?? createCompareStage(event);
+  const phase = eventPhase(event);
+  if (!phase) return previousStages;
+  const current = previousStages.find((stage) => stage.phase === phase) ?? createCompareStage(event);
   let next: CompareStage;
   switch (event.kind) {
     case 'phase_start':
       next = {
-        ...current, label: event.label ?? current.label,
+        ...current, label: eventLabel(event) ?? current.label,
         itemsDone: 0, itemsTotal: event.items_total ?? 0,
         bytesDone: 0, bytesTotal: event.bytes_total ?? 0, rate: 0,
         active: true, done: false, failed: false, cancelled: false,

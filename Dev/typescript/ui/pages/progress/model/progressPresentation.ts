@@ -1,3 +1,4 @@
+import { isCountedEvent } from '#core/domain/runs/runEvents.ts';
 import { humanDuration, humanSize } from '#core/shared/format.ts';
 import {
   calculateWindowRate,
@@ -26,10 +27,12 @@ export interface ProgressPresentation {
 }
 
 export function formatStageProgress(event: RunProgressEvent): string {
-  const itemTotal = event.items_total ?? 0;
-  const byteTotal = event.bytes_total ?? 0;
-  const completedItems = event.items_done ?? 0;
-  const completedBytes = humanSize(event.bytes_done ?? 0);
+  // Only the counter-bearing variants have totals; anything else formats as no progress.
+  const counted = isCountedEvent(event) ? event : null;
+  const itemTotal = counted?.items_total ?? 0;
+  const byteTotal = counted?.bytes_total ?? 0;
+  const completedItems = counted && 'items_done' in counted ? counted.items_done : 0;
+  const completedBytes = humanSize(counted && 'bytes_done' in counted ? counted.bytes_done : 0);
   const itemProgress = itemTotal ? `${completedItems} / ${itemTotal}` : `${completedItems}`;
   const byteProgress = byteTotal ? `${completedBytes} / ${humanSize(byteTotal)}` : completedBytes;
   return `${itemProgress} items · ${byteProgress}`;

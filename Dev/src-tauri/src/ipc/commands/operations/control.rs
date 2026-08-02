@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::features::operations::events::model::RunEvent;
+use crate::contracts::events::{RunEventDto, RunEventPurposeDto};
 use crate::features::operations::events::repository::RunEventRepository;
 use crate::features::operations::lifecycle::coordinator::RunLifecycle;
 use crate::features::operations::lifecycle::model::RunPurpose;
@@ -44,9 +44,9 @@ pub fn replay_compare_events(
     window: tauri::WebviewWindow,
     events: tauri::State<'_, Arc<RunEventRepository>>,
     after_sequence: Option<u64>,
-) -> Result<Vec<RunEvent>, String> {
+) -> Result<Vec<RunEventDto>, String> {
     require_window_role(&window, WindowRole::Main)?;
-    Ok(events.replay("compare", after_sequence.unwrap_or(0)))
+    Ok(events.replay(RunEventPurposeDto::Compare, after_sequence.unwrap_or(0)))
 }
 
 #[tauri::command]
@@ -54,7 +54,7 @@ pub fn replay_apply_events(
     window: tauri::WebviewWindow,
     events: tauri::State<'_, Arc<RunEventRepository>>,
     after_sequence: Option<u64>,
-) -> Result<Vec<RunEvent>, String> {
+) -> Result<Vec<RunEventDto>, String> {
     require_window_role(&window, WindowRole::Progress)?;
-    Ok(events.replay("apply", after_sequence.unwrap_or(0)))
+    Ok(events.replay(RunEventPurposeDto::Apply, after_sequence.unwrap_or(0)))
 }

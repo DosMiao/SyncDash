@@ -1,3 +1,4 @@
+import { eventPhase } from '#core/domain/runs/runEvents.ts';
 import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from 'react';
 import { listenToMainWindowEvent } from '#core/infrastructure/tauri/mainWindow.ts';
 import { replayCompareEvents } from '#core/infrastructure/tauri/commands/compare.ts';
@@ -52,7 +53,7 @@ export function useCompareProgressSubscription({
         setStatus(`${event.action === 'walk' ? 'Scan could not read' : 'Error'}: ${event.message ?? ''}`, 'err');
         return;
       }
-      if (!event.phase) return;
+      if (!eventPhase(event)) return;
       if (event.kind === 'phase_start') {
         setStages((previous) => reduceCompareStages(previous, event));
       } else if (event.kind === 'totals') {

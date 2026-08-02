@@ -3,23 +3,28 @@ use std::sync::Mutex;
 
 use syncdash::model::event::ProgressEvent;
 
-use super::model::RunEvent;
+use crate::contracts::events::{RunEventDto, RunEventPurposeDto};
 
 const MAX_REPLAY_DIAGNOSTICS: usize = 256;
 
 #[derive(Default)]
 struct RunEventStore {
     run_id: Option<u64>,
-    purpose: Option<&'static str>,
+    purpose: Option<RunEventPurposeDto>,
     next_sequence: u64,
-    events: VecDeque<RunEvent>,
+    events: VecDeque<RunEventDto>,
 }
 
 #[derive(Default)]
 pub(crate) struct RunEventRepository(Mutex<RunEventStore>);
 
 impl RunEventRepository {
-    pub(super) fn record(&self, run_id: u64, purpose: &'static str, ev: ProgressEvent) -> RunEvent {
+    pub(super) fn record(
+        &self,
+        run_id: u64,
+        purpose: RunEventPurposeDto,
+        ev: ProgressEvent,
+    ) -> RunEventDto {
         let mut store = self.0.lock().unwrap();
         if store.run_id != Some(run_id) {
             store.run_id = Some(run_id);
@@ -27,7 +32,7 @@ impl RunEventRepository {
             store.events.clear();
         }
         store.next_sequence = store.next_sequence.saturating_add(1);
-        let event = RunEvent {
+        let event = RunEventDto {
             sequence: store.next_sequence,
             run_id,
             purpose,
@@ -41,7 +46,11 @@ impl RunEventRepository {
         event
     }
 
-    pub(crate) fn replay(&self, purpose: &str, after_sequence: u64) -> Vec<RunEvent> {
+    pub(crate) fn replay(
+        &self,
+        purpose: RunEventPurposeDto,
+        after_sequence: u64,
+    ) -> Vec<RunEventDto> {
         let store = self.0.lock().unwrap();
         if store.purpose != Some(purpose) {
             return Vec::new();
@@ -66,7 +75,7 @@ fn replayable(ev: &ProgressEvent) -> bool {
     )
 }
 
-fn compact_for(events: &mut VecDeque<RunEvent>, next: &ProgressEvent) {
+fn compact_for(events: &mut VecDeque<RunEventDto>, next: &ProgressEvent) {
     match next {
         ProgressEvent::Progress { phase, .. } => events.retain(|event| {
             !matches!(&event.ev, ProgressEvent::Progress { phase: old, .. } if old == phase)
@@ -98,7 +107,7 @@ fn diagnostic(ev: &ProgressEvent) -> bool {
     )
 }
 
-fn trim_diagnostics(events: &mut VecDeque<RunEvent>) {
+fn trim_diagnostics(events: &mut VecDeque<RunEventDto>) {
     while events.iter().filter(|event| diagnostic(&event.ev)).count() > MAX_REPLAY_DIAGNOSTICS {
         let Some(index) = events.iter().position(|event| diagnostic(&event.ev)) else {
             break;
@@ -118,7 +127,7 @@ mod tests {
         let repository = RunEventRepository::default();
         repository.record(
             1,
-            "compare",
+            RunEventPurposeDto::Compare,
             ProgressEvent::PhaseStart {
                 phase: Phase::ScanSource,
                 ts_ms: 1,
@@ -130,7 +139,7 @@ mod tests {
         for done in [1, 2] {
             repository.record(
                 1,
-                "compare",
+                RunEventPurposeDto::Compare,
                 ProgressEvent::Progress {
                     phase: Phase::ScanSource,
                     ts_ms: done,
@@ -142,19 +151,25 @@ mod tests {
                 },
             );
         }
-        let replay = repository.replay("compare", 0);
+        let replay = repository.replay(RunEventPurposeDto::Compare, 0);
         assert_eq!(replay.len(), 2);
         assert!(matches!(&replay[0].ev, ProgressEvent::PhaseStart { .. }));
         assert!(matches!(
             &replay[1].ev,
             ProgressEvent::Progress { items_done: 2, .. }
         ));
-        assert!(repository.replay("apply", 0).is_empty());
-        repository.record(2, "apply", ProgressEvent::Paused { ts_ms: 3 });
-        assert!(repository.replay("compare", 0).is_empty());
-        let next_run = repository.replay("apply", 0);
+        assert!(repository.replay(RunEventPurposeDto::Apply, 0).is_empty());
+        repository.record(
+            2,
+            RunEventPurposeDto::Apply,
+            ProgressEvent::Paused { ts_ms: 3 },
+        );
+        assert!(repository.replay(RunEventPurposeDto::Compare, 0).is_empty());
+        let next_run = repository.replay(RunEventPurposeDto::Apply, 0);
         assert_eq!(next_run.len(), 1);
         assert!(next_run[0].sequence > replay[1].sequence);
-        assert!(repository.replay("apply", next_run[0].sequence).is_empty());
+        assert!(repository
+            .replay(RunEventPurposeDto::Apply, next_run[0].sequence)
+            .is_empty());
     }
 }

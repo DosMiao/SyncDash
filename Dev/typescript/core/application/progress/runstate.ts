@@ -1,9 +1,11 @@
+import type { RunSummaryEvent } from '#core/domain/runs/runEvents.ts';
 import type { RunEventEnvelope } from '#core/domain/runs/runEvents.ts';
 import type { Phase } from '#core/types/generated/Phase.ts';
 import type { PhaseStatus } from '#core/types/generated/PhaseStatus.ts';
 
 export type RunPhase = Phase;
 export type RunProgressEvent = RunEventEnvelope;
+export type { RunSummaryEvent } from '#core/domain/runs/runEvents.ts';
 
 export const PHASE_LABELS: Record<RunPhase, string> = {
   'scan-source': 'Scan source',
@@ -66,7 +68,7 @@ export interface RunState {
   currentPath: string;
   stages: ProgressStage[];
   errors: ProgressIssue[];
-  summary: RunProgressEvent | null;
+  summary: RunSummaryEvent | null;
   closeAfterStop: boolean;
 }
 
@@ -97,7 +99,7 @@ export function activeElapsedMs(state: RunState): number {
 }
 
 export function completionPercent(state: RunState): number {
-  if (state.summary && !state.summary.cancelled && (state.summary.errors ?? 0) === 0) return 100;
+  if (state.summary && !state.summary.cancelled && state.summary.errors === 0) return 100;
   const totalWork = state.totals.bytes + state.totals.items;
   if (totalWork <= 0) return 0;
   const rawPercent = Math.max(
