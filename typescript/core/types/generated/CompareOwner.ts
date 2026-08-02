@@ -2,6 +2,6 @@
 import type { CompareIdentity } from "./CompareIdentity";
 
 /**
- * A stable Compare identity paired with its current presentation label.
+ * An immutable Compare identity paired with its current display label.
  */
 export type CompareOwner = { identity: CompareIdentity, job_name: string, };

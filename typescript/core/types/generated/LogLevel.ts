@@ -3,6 +3,6 @@
 /**
  * Log level. Division of labor with the `Error` event: `Error` is a structured **single-op failure**
  * (carrying path/action/side, naturally a line in the error detail), `Log` is pipeline narration
- * (remote probe results, delta downgrades, lock takeover…) — the sink for those in-library `eprintln!`s.
+ * (endpoint probe results, delta downgrades, lock contention…) — the sink for those in-library `eprintln!`s.
  */
 export type LogLevel = "info" | "warn" | "error";
