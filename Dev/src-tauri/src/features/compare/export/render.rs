@@ -11,17 +11,9 @@ use crate::contracts::compare::CsvRowPresentationDto;
 use super::presentation::{operation_side_paths, validated_rows};
 
 fn full_path(root: &str, relative: Option<&str>) -> String {
-    let Some(relative) = relative else {
-        return String::new();
-    };
-    let separator = if root.contains('\\') { '\\' } else { '/' };
-    let root = root.trim_end_matches(['/', '\\']);
-    let relative = if separator == '\\' {
-        relative.replace('/', "\\")
-    } else {
-        relative.to_string()
-    };
-    format!("{root}{separator}{relative}")
+    relative.map_or_else(String::new, |relative| {
+        syncdash::foundation::path::join_display(root, relative)
+    })
 }
 
 fn spreadsheet_safe(value: &str) -> String {
