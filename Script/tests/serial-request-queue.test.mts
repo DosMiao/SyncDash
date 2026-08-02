@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { SerialRequestQueue } from '../../typescript/ui/state/serial-request-queue.ts';
+import { SerialRequestQueue } from '#core/application/coordination/serialRequestQueue.ts';
 
 test('serial request queue preserves invocation order across reordered completions', async () => {
   const queue = new SerialRequestQueue();

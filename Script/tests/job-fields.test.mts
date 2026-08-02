@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { formToJob, jobToForm } from '../../typescript/core/formSchema.ts';
-import type { Job } from '../../typescript/core/types/generated/Job.ts';
+import { formToJob, jobToForm } from '#core/domain/jobs/formSchema.ts';
+import type { Job } from '#core/types/generated/Job.ts';
 
 function job(): Job {
   return {

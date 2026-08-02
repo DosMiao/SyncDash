@@ -8,7 +8,7 @@ import {
   type InteractionCommand,
   type InteractionLayerEntry,
   type InteractionLayerKind,
-} from '../../typescript/ui/state/interactionLayers.ts';
+} from '#ui/shared/interaction/interactionLayers.ts';
 
 function key(
   value: string,

@@ -5,7 +5,7 @@ import {
   maximumPhysicalBodyPixels,
   projectLogicalScrollTop,
   projectVirtualGeometry,
-} from '../../typescript/ui/hooks/virtualGeometry.ts';
+} from '#ui/features/compare-results/model/virtualGeometry.ts';
 
 test('logical and physical scroll positions round-trip for an uncapped result', () => {
   const input = {

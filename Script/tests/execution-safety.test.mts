@@ -5,8 +5,8 @@ import {
   interactionBlocksUnattendedWrite,
   interactionConflictsWithReservedWrite,
   rootEditKeyAction,
-} from '../../typescript/ui/state/execution-safety.ts';
-import type { ExecutionInteractionState } from '../../typescript/ui/state/execution-safety.ts';
+} from '#core/application/safety/executionSafety.ts';
+import type { ExecutionInteractionState } from '#core/application/safety/executionSafety.ts';
 
 test('Escape reverts a root edit while Enter is the only commit key', () => {
   assert.equal(rootEditKeyAction('Escape'), 'revert');

@@ -172,8 +172,8 @@ fn dev(runtime: &Runtime) -> BuildResult<()> {
     free_desktop(runtime)?;
     runtime.kill_port(VITE_PORT)?;
     println!();
-    println!("  [Dev] npx tauri dev - Vite + Tauri");
-    runtime.run("npx", ["tauri", "dev"], runtime.root(), &[])
+    println!("  [Dev] npx tauri dev from Dev/ - Vite + Tauri");
+    runtime.run("npx", ["tauri", "dev"], &runtime.path("Dev"), &[])
 }
 
 fn build_tiers(runtime: &Runtime, tiers: &[Tier]) -> BuildResult<()> {
@@ -311,13 +311,14 @@ fn build_installer(runtime: &Runtime) -> BuildResult<()> {
     free_desktop(runtime)?;
     runtime.wait_unlocked(&desktop_binary(runtime))?;
     let environment = Tier::Release.release_environment(runtime.host());
+    let tauri_root = runtime.path("Dev");
     match runtime.host() {
         Host::Windows => runtime.total(|| {
             runtime.phase("INSTALLER - Vite bundle + exe + NSIS setup", || {
                 runtime.run(
                     "npx",
                     ["tauri", "build", "--bundles", "nsis"],
-                    runtime.root(),
+                    &tauri_root,
                     &environment,
                 )
             })?;
@@ -331,7 +332,7 @@ fn build_installer(runtime: &Runtime) -> BuildResult<()> {
                 runtime.run(
                     "npx",
                     ["tauri", "build", "--bundles", "app,dmg"],
-                    runtime.root(),
+                    &tauri_root,
                     &environment,
                 )
             })?;
@@ -350,12 +351,13 @@ fn build_app_self(runtime: &Runtime) -> BuildResult<()> {
     runtime.ensure_node_modules(runtime.root())?;
     free_desktop(runtime)?;
     let environment = Tier::Max.release_environment(runtime.host());
+    let tauri_root = runtime.path("Dev");
     runtime.total(|| {
         runtime.phase("SELF-USE APP - tauri build (.app)", || {
             runtime.run(
                 "npx",
                 ["tauri", "build", "--bundles", "app"],
-                runtime.root(),
+                &tauri_root,
                 &environment,
             )
         })?;
@@ -455,7 +457,7 @@ fn doctor(runtime: &Runtime) -> BuildResult<()> {
     runtime.doctor_header(PROJECT_NAME);
     runtime.assert_file("Cargo.toml", "workspace manifest")?;
     runtime.assert_file("package.json", "frontend package")?;
-    runtime.assert_file("src-tauri/Cargo.toml", "Tauri manifest")?;
+    runtime.assert_file("Dev/src-tauri/Cargo.toml", "Tauri manifest")?;
     runtime.require_directory(&runtime.path("dist"), "committed frontend output")?;
     println!(
         "  [ok] cargo: {}",

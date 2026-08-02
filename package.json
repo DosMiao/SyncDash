@@ -3,10 +3,14 @@
   "version": "0.3.0",
   "type": "module",
   "private": true,
+  "imports": {
+    "#core/*": "./Dev/typescript/core/*",
+    "#ui/*": "./Dev/typescript/ui/*"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "tauri": "tauri",
+    "tauri": "cd Dev && tauri",
     "typecheck": "tsc --noEmit",
     "test": "npm run test:rust && npm run test:frontend",
     "test:rust": "cargo test --workspace --quiet --lib --bins",

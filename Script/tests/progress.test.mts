@@ -1,16 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { reduceCompareStages } from '../../typescript/core/compareProgress.ts';
-import type { CompareProgressEvent } from '../../typescript/core/compareProgress.ts';
-import { mergeRunEventReplay } from '../../typescript/core/runEvents.ts';
+import { reduceCompareStages } from '#core/domain/compare/compareProgress.ts';
+import type { CompareProgressEvent } from '#core/domain/compare/compareProgress.ts';
+import { mergeRunEventReplay } from '#core/domain/runs/runEvents.ts';
 import {
   completionPercent,
   endStage,
   newRunState,
   startStage,
-} from '../../typescript/progress/runstate.ts';
-import type { ProgressStage } from '../../typescript/progress/runstate.ts';
+} from '#core/application/progress/runstate.ts';
+import type { ProgressStage } from '#core/application/progress/runstate.ts';
 
 const event = (
   kind: CompareProgressEvent['kind'],

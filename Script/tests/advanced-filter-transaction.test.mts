@@ -6,7 +6,7 @@ import {
   createEmptyAdvancedFilterDraft,
   validateAdvancedFilterDraft,
   validatedAdvancedFilter,
-} from '../../typescript/ui/state/compareWorkspaceFilters.ts';
+} from '#core/application/compare-workspace/compareWorkspaceFilters.ts';
 
 test('advanced-filter drafts round-trip applied criteria without retaining editable text', () => {
   assert.deepEqual(createAdvancedFilterDraft({

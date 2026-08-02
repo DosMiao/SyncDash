@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Generate Rust-owned TypeScript contracts, then sanitize ts-rs JSDoc and whitespace.
-// Never edit typescript/core/types/generated/ by hand.
+// Never edit Dev/typescript/core/types/generated/ by hand.
 
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -9,10 +9,12 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const genDir = join(repoRoot, "typescript", "core", "types", "generated");
+const genDir = join(repoRoot, "Dev", "typescript", "core", "types", "generated");
 const checkOnly = process.argv.includes("--check");
 const scratch = checkOnly ? mkdtempSync(join(tmpdir(), "syncdash-types-")) : null;
-const outputDir = scratch ? join(scratch, "typescript", "core", "types", "generated") : genDir;
+const outputDir = scratch
+  ? join(scratch, "Dev", "typescript", "core", "types", "generated")
+  : genDir;
 
 function run(args) {
   execFileSync("cargo", args, {

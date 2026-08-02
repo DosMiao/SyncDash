@@ -9,24 +9,24 @@ import {
   isMaskMatchResult,
   matchesFolderScope,
   parseScopeMasks,
-} from '../../typescript/core/runScope.ts';
+} from '#core/domain/compare/runScope.ts';
 import {
   RESULT_TYPES,
   resultTypeOf,
   describeRowAction,
   effectiveOperation,
   rowTransferBytes,
-} from '../../typescript/core/plan.ts';
-import type { PlanDto, PlanOperation, ResultType } from '../../typescript/core/plan.ts';
+} from '#core/domain/compare/plan.ts';
+import type { PlanDto, PlanOperation, ResultType } from '#core/domain/compare/plan.ts';
 import {
   deriveApplyAvailability,
-} from '../../typescript/ui/state/applyAvailability.ts';
+} from '#core/application/apply/applyAvailability.ts';
 import {
   loadCompareWorkspacePreferences,
   saveCompareWorkspacePreferences,
-} from '../../typescript/ui/state/compareWorkspacePreferences.ts';
-import { createCompareWorkspace } from '../../typescript/ui/state/compareWorkspaceModel.ts';
-import { deriveWorkspaceExecutionAccess } from '../../typescript/ui/state/compareWorkspaceExecution.ts';
+} from '#core/infrastructure/preferences/compareWorkspacePreferences.ts';
+import { createCompareWorkspace } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
+import { deriveWorkspaceExecutionAccess } from '#core/application/compare-workspace/compareWorkspaceExecution.ts';
 
 function operation(path: string, action: PlanOperation['action'] = 'copy'): PlanOperation {
   return { side: 'target', action, path, reason: 'fixture' };

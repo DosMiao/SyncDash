@@ -1,0 +1,199 @@
+/// Discrete webview factors keep text and fixed-pixel layout geometry on the same scale.
+export const ZOOM_STEPS = [0.8, 0.9, 1, 1.1, 1.25, 1.4, 1.6, 1.8, 2] as const;
+
+export type ZoomFactor = typeof ZOOM_STEPS[number];
+
+export interface ZoomPreferenceLoad {
+  factor: ZoomFactor;
+  persistedFactor: ZoomFactor | null;
+  warning: string | null;
+}
+
+export interface ZoomAuthorityState {
+  desiredFactor: ZoomFactor;
+  appliedFactor: ZoomFactor;
+  persistedFactor: ZoomFactor | null;
+  latestRequestId: number;
+  pending: boolean;
+}
+
+export type ZoomRequestReason = 'restore' | 'change';
+
+export type ZoomRequestOptions =
+  | { persist: false; reason: 'restore' }
+  | { persist: true; reason: 'change' };
+
+export type ZoomAuthorityFailure =
+  | {
+      kind: 'application';
+      factor: ZoomFactor;
+      reason: ZoomRequestReason;
+      error: unknown;
+    }
+  | {
+      kind: 'persistence';
+      factor: ZoomFactor;
+      reason: ZoomRequestReason;
+      error: string;
+    };
+
+interface ZoomAuthorityDependencies {
+  applyWebviewZoom(factor: ZoomFactor): Promise<unknown>;
+  persistPreference(factor: ZoomFactor): string | null;
+  publishState(state: ZoomAuthorityState): void;
+  onFailure(failure: ZoomAuthorityFailure): void;
+}
+
+interface PendingZoomRequest {
+  requestId: number;
+  factor: ZoomFactor;
+  options: ZoomRequestOptions;
+}
+
+export function isZoomFactor(factor: number): factor is ZoomFactor {
+  return ZOOM_STEPS.some((candidateFactor) => candidateFactor === factor);
+}
+
+export function requireZoomFactor(factor: number): ZoomFactor {
+  if (!isZoomFactor(factor)) throw new Error(`Invalid interface zoom factor: ${factor}`);
+  return factor;
+}
+
+export function stepZoom(currentFactor: number, direction: 1 | -1): ZoomFactor {
+  const validatedCurrentFactor = requireZoomFactor(currentFactor);
+  const currentIndex = ZOOM_STEPS.indexOf(validatedCurrentFactor);
+  const nextIndex = Math.min(
+    ZOOM_STEPS.length - 1,
+    Math.max(0, currentIndex + direction),
+  );
+  return ZOOM_STEPS[nextIndex];
+}
+
+export function createInitialZoomAuthorityState(
+  preference: ZoomPreferenceLoad,
+): ZoomAuthorityState {
+  return {
+    desiredFactor: preference.factor,
+    appliedFactor: 1,
+    persistedFactor: preference.persistedFactor,
+    latestRequestId: 0,
+    pending: false,
+  };
+}
+
+export class ZoomAuthority {
+  private desiredFactor: ZoomFactor;
+  private appliedFactor: ZoomFactor;
+  private persistedFactor: ZoomFactor | null;
+  private latestRequestId: number;
+  private pendingRequest: PendingZoomRequest | null = null;
+  private processingRequests = false;
+  private readonly dependencies: ZoomAuthorityDependencies;
+
+  constructor(
+    initialState: ZoomAuthorityState,
+    dependencies: ZoomAuthorityDependencies,
+  ) {
+    if (initialState.pending) {
+      throw new Error('Zoom authority cannot be initialized with an ownerless pending request');
+    }
+    if (!Number.isSafeInteger(initialState.latestRequestId) || initialState.latestRequestId < 0) {
+      throw new Error(`Invalid initial zoom request ID: ${initialState.latestRequestId}`);
+    }
+    this.desiredFactor = requireZoomFactor(initialState.desiredFactor);
+    this.appliedFactor = requireZoomFactor(initialState.appliedFactor);
+    this.persistedFactor = initialState.persistedFactor === null
+      ? null
+      : requireZoomFactor(initialState.persistedFactor);
+    this.latestRequestId = initialState.latestRequestId;
+    this.dependencies = dependencies;
+  }
+
+  getState(): ZoomAuthorityState {
+    return {
+      desiredFactor: this.desiredFactor,
+      appliedFactor: this.appliedFactor,
+      persistedFactor: this.persistedFactor,
+      latestRequestId: this.latestRequestId,
+      pending: this.pendingRequest !== null,
+    };
+  }
+
+  requestZoom(factor: number, options: ZoomRequestOptions): number {
+    const validatedFactor = requireZoomFactor(factor);
+    const requestId = this.advanceRequestFence();
+    this.desiredFactor = validatedFactor;
+    this.pendingRequest = { requestId, factor: validatedFactor, options };
+    this.publishState();
+    void this.processRequests();
+    return requestId;
+  }
+
+  cancelPendingRequests(): void {
+    this.advanceRequestFence();
+    this.pendingRequest = null;
+    this.desiredFactor = this.appliedFactor;
+  }
+
+  private advanceRequestFence(): number {
+    this.latestRequestId += 1;
+    return this.latestRequestId;
+  }
+
+  private publishState(): void {
+    this.dependencies.publishState(this.getState());
+  }
+
+  private async processRequests(): Promise<void> {
+    if (this.processingRequests) return;
+    this.processingRequests = true;
+    try {
+      while (this.pendingRequest !== null) {
+        const request = this.pendingRequest;
+        try {
+          await this.dependencies.applyWebviewZoom(request.factor);
+        } catch (error) {
+          if (this.pendingRequest?.requestId !== request.requestId) continue;
+          this.pendingRequest = null;
+          this.desiredFactor = this.appliedFactor;
+          this.publishState();
+          this.dependencies.onFailure({
+            kind: 'application',
+            factor: request.factor,
+            reason: request.options.reason,
+            error,
+          });
+          continue;
+        }
+
+        // A request can become stale while awaiting. Track the webview's real factor, but publish
+        // only the latest request so an intermediate completion never moves the displayed value.
+        this.appliedFactor = request.factor;
+        if (this.pendingRequest?.requestId !== request.requestId) continue;
+        let persistenceError: string | null = null;
+        if (request.options.persist) {
+          try {
+            persistenceError = this.dependencies.persistPreference(request.factor);
+          } catch (error) {
+            persistenceError = String(error);
+          }
+          if (persistenceError === null) this.persistedFactor = request.factor;
+        }
+        if (this.pendingRequest?.requestId !== request.requestId) continue;
+        this.pendingRequest = null;
+        this.publishState();
+        if (persistenceError !== null) {
+          this.dependencies.onFailure({
+            kind: 'persistence',
+            factor: request.factor,
+            reason: request.options.reason,
+            error: persistenceError,
+          });
+        }
+      }
+    } finally {
+      this.processingRequests = false;
+      if (this.pendingRequest !== null) void this.processRequests();
+    }
+  }
+}

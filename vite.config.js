@@ -34,7 +34,7 @@ export default defineConfig({
           // Everything both windows share: core/ and the stylesheet. The emitted CSS attaches to
           // whichever chunk pulls it in, so naming this one is what stops the whole stylesheet
           // shipping as `zoom.css`.
-          if (id.includes('/typescript/core/') || id.endsWith('styles.css')) return 'shared';
+          if (id.includes('/Dev/typescript/core/') || id.endsWith('styles.css')) return 'shared';
           return null;
         },
       },

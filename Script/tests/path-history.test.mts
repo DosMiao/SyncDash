@@ -5,7 +5,7 @@ import {
   addPathToHistory,
   loadPathHistory,
   savePathHistory,
-} from '../../typescript/ui/state/pathHistory.ts';
+} from '#core/infrastructure/preferences/pathHistory.ts';
 
 test('path history validates, normalizes, deduplicates, and bounds persisted input', () => {
   const values = new Map<string, string>([[

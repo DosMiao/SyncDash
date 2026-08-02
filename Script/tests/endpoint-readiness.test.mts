@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { endpointInputState } from '../../typescript/core/endpoint-readiness.ts';
-import type { PathInfo } from '../../typescript/core/types/generated/PathInfo.ts';
+import { endpointInputState } from '#core/domain/paths/endpointReadiness.ts';
+import type { PathInfo } from '#core/types/generated/PathInfo.ts';
 
 function info(readiness: PathInfo['readiness']): PathInfo {
   return { readiness, exists: null, is_dir: null, has_marker: null };

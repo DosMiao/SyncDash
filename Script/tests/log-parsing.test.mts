@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parseLogArtifactLine } from '../../typescript/core/logs.ts';
+import { parseLogArtifactLine } from '#core/domain/runs/logs.ts';
 
 test('legacy text remains visible while malformed JSON is explicit', () => {
   assert.deepEqual(parseLogArtifactLine('old plain-text event', 'run'), {

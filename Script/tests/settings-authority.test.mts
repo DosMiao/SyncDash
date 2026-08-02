@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { formToSettings, settingsToForm } from '../../typescript/core/formSchema.ts';
-import type { AppSettings } from '../../typescript/core/types/generated/AppSettings.ts';
-import type { SettingsNumericLimitsDto } from '../../typescript/core/types/generated/SettingsNumericLimitsDto.ts';
+import { formToSettings, settingsToForm } from '#core/domain/jobs/formSchema.ts';
+import type { AppSettings } from '#core/types/generated/AppSettings.ts';
+import type { SettingsNumericLimitsDto } from '#core/types/generated/SettingsNumericLimitsDto.ts';
 
 const limits: SettingsNumericLimitsDto = {
   maximum_keep_days: 36_500,

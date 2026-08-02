@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildLayout, flattenLayout, layoutFolderPaths } from '../../typescript/core/grouping.ts';
-import type { FolderNode, PlanLayout, RowSpec } from '../../typescript/core/grouping.ts';
-import type { PlanDto, PlanOperation, Sort } from '../../typescript/core/plan.ts';
+import { buildLayout, flattenLayout, layoutFolderPaths } from '#core/domain/compare/grouping.ts';
+import type { FolderNode, PlanLayout, RowSpec } from '#core/domain/compare/grouping.ts';
+import type { PlanDto, PlanOperation, Sort } from '#core/domain/compare/plan.ts';
 
 function operation(path: string, patch: Partial<PlanOperation> = {}): PlanOperation {
   return {

@@ -13,27 +13,27 @@ import {
   preferredTargetIndex,
   sameCompareIdentity,
   scopeWorkspace,
-} from '../../typescript/ui/state/compareWorkspaceModel.ts';
+} from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import type {
   CompareResultKey,
   CompareWorkspace,
   CompareWorkspaceRepository,
-} from '../../typescript/ui/state/compareWorkspaceModel.ts';
+} from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import {
   deriveWorkspaceExecutionAccess,
   reconcileExecutionStatus,
-} from '../../typescript/ui/state/compareWorkspaceExecution.ts';
-import { reduceCompareWorkspaces } from '../../typescript/ui/state/compareWorkspaceRepository.ts';
-import type { CompareWorkspaceAction } from '../../typescript/ui/state/compareWorkspaceRepository.ts';
-import type { PlanDto, PlanOperation } from '../../typescript/core/plan.ts';
-import type { CompareIdentity } from '../../typescript/core/types/generated/CompareIdentity.ts';
-import type { CompareOwner } from '../../typescript/core/types/generated/CompareOwner.ts';
-import type { CompareScopeDto } from '../../typescript/core/types/generated/CompareScopeDto.ts';
-import type { CompareScopeExecutionStatusDto } from '../../typescript/core/types/generated/CompareScopeExecutionStatusDto.ts';
-import type { CompareWorkspaceLookupDto } from '../../typescript/core/types/generated/CompareWorkspaceLookupDto.ts';
-import type { CompareWorkspaceSnapshotDto } from '../../typescript/core/types/generated/CompareWorkspaceSnapshotDto.ts';
-import type { IdenticalRow } from '../../typescript/core/types/generated/IdenticalRow.ts';
-import type { JobDto } from '../../typescript/core/types/generated/JobDto.ts';
+} from '#core/application/compare-workspace/compareWorkspaceExecution.ts';
+import { reduceCompareWorkspaces } from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
+import type { CompareWorkspaceAction } from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
+import type { PlanDto, PlanOperation } from '#core/domain/compare/plan.ts';
+import type { CompareIdentity } from '#core/types/generated/CompareIdentity.ts';
+import type { CompareOwner } from '#core/types/generated/CompareOwner.ts';
+import type { CompareScopeDto } from '#core/types/generated/CompareScopeDto.ts';
+import type { CompareScopeExecutionStatusDto } from '#core/types/generated/CompareScopeExecutionStatusDto.ts';
+import type { CompareWorkspaceLookupDto } from '#core/types/generated/CompareWorkspaceLookupDto.ts';
+import type { CompareWorkspaceSnapshotDto } from '#core/types/generated/CompareWorkspaceSnapshotDto.ts';
+import type { IdenticalRow } from '#core/types/generated/IdenticalRow.ts';
+import type { JobDto } from '#core/types/generated/JobDto.ts';
 
 function identity(jobId: string, targetIndex: number, configRevision: string, compareRunId: number): CompareIdentity {
   const resultId = createHash('sha256')

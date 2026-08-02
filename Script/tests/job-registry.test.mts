@@ -5,8 +5,8 @@ import {
   emptyJobRegistryState,
   reduceJobRegistry,
   validateJobRegistrySnapshot,
-} from '../../typescript/ui/state/jobRegistry.ts';
-import type { JobDto } from '../../typescript/core/types/generated/JobDto.ts';
+} from '#core/application/jobs/jobRegistry.ts';
+import type { JobDto } from '#core/types/generated/JobDto.ts';
 
 function job(jobId: string, name: string, configRevision = 'revision-a'): JobDto {
   return {

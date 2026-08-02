@@ -6,8 +6,8 @@ import {
   emptyRootEditorRepository,
   reduceRootEditors,
   rootDraftIsDirty,
-} from '../../typescript/ui/state/rootEditor.ts';
-import type { RootEditorOwner } from '../../typescript/ui/state/rootEditor.ts';
+} from '#core/application/jobs/rootEditor.ts';
+import type { RootEditorOwner } from '#core/application/jobs/rootEditor.ts';
 
 const owner: RootEditorOwner = {
   jobId: 'job-a',

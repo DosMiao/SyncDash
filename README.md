@@ -25,27 +25,35 @@ SyncDash supports local folders, mounted shares, SFTP, FTP/FTPS, native SMB, and
 
 ```text
 SyncDash/
-├── src/                Rust core library and CLI
-│   ├── foundation/     formatting, time, paths, text, names, directories
-│   ├── model/          plan, event, table, and chunk artifact schemas/codecs
-│   ├── fs/             chunk I/O, staged writes, leases, SSH, and VFS backends
-│   ├── store/          settings, trash, versions, caches, and migrations
-│   ├── obs/            progress, logging, and run records
-│   ├── pipeline/       scan, compare, apply, guards, and filters
-│   ├── transfer/       peer transport and packages
-│   ├── job/            job schema, territories, junk presets, and rigor
-│   ├── run/            local/peer orchestration behind one transport router
-│   └── cli/            command-line contract and dispatch
-├── src-tauri/          Tauri shell, DTOs, IPC, authorization, and run lifecycle
-├── typescript/
-│   ├── core/           framework-free domain logic and all IPC
-│   ├── ui/             main window
-│   ├── progress/       independent run window
-│   └── styles.css      design tokens and all styling
-└── dist/               committed frontend output embedded by Tauri
+├── Dev/                        product source
+│   ├── src/                    Rust core library and CLI
+│   │   ├── base/               foundation, persisted model, and filesystem boundaries
+│   │   ├── services/           observability and durable stores
+│   │   ├── workflow/           scan/compare/apply pipelines and transfer
+│   │   ├── application/        startup, jobs, run history, and orchestration
+│   │   └── shell/cli/          command-line contract and dispatch
+│   ├── src-tauri/              Tauri desktop crate
+│   │   └── src/                app, contracts, features, and grouped IPC commands
+│   └── typescript/
+│       ├── core/               types, pure domain/application logic, and infrastructure
+│       ├── ui/features/        feature-owned React components and hooks
+│       ├── ui/pages/           workspace and progress controllers, runtime, and views
+│       ├── ui/shared/          focused reusable UI primitive families
+│       ├── ui/windows/         thin independent window composition roots
+│       └── styles.css          design tokens and all styling
+├── Script/                     generators, behavior tests, and architecture audits
+├── tests/                      Rust integration tests
+├── tools/builder/              cross-platform project Builder adapter
+└── dist/                       committed frontend output embedded by Tauri
 ```
 
-Rust dependencies point downward through the layers; `src/lib.rs` is the authoritative contract. `run` selects the transport once. A VFS root such as `sftp://host/path` is operated by this process, while `peer://host/path` delegates scanning and apply to SyncDash on the peer.
+The full placement and dependency rules are in [`Dev/ARCHITECTURE.md`](Dev/ARCHITECTURE.md).
+Rust dependencies point downward through the layers; `Dev/src/lib.rs` is the authoritative Rust
+contract. Multi-responsibility branches recursively separate models, policy/state, persistence,
+coordination, execution, and delivery; architecture audits reject upward dependencies and generic
+catch-all directories. `run` selects the transport once. A VFS root such as `sftp://host/path` is
+operated by this process, while `peer://host/path` delegates scanning and apply to SyncDash on the
+peer.
 
 ## Sync behavior
 
@@ -215,4 +223,7 @@ Use the repository Builder for builds and launches. Its Windows and macOS launch
 
 Use the equivalent `builder.bat` commands on Windows. Tiers `1`, `2`, and `3` are Dist, Max, and Release; compact inputs build them sequentially. These optimized tiers package only the desktop artifact under `target/builder-tiers/<tier>/`. `build cli` is the sole standalone-CLI path, uses the Dist policy, and writes `target/release/syncdash[.exe]`; desktop tier builds never build the CLI implicitly. `--dry-run --host windows|macos` prints the complete plan without building or launching anything.
 
-Backend behavior is checked by `src/fs/vfs/conformance.rs`; end-to-end mode behavior lives in `src/run/e2e/`. Live SFTP, SMB, FTP, FTPS, and exFAT lanes require their documented `SYNCDASH_E2E_*` environment variables and an explicit `cargo test -- --ignored` invocation.
+Backend behavior is checked by `Dev/src/base/fs/vfs/conformance.rs`; end-to-end mode behavior lives
+in `Dev/src/application/run/e2e/`. Live SFTP, SMB, FTP, FTPS, and exFAT lanes require their
+documented `SYNCDASH_E2E_*` environment variables and an explicit
+`cargo test -- --ignored` invocation.

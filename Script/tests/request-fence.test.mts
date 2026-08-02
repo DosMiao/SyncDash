@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { RequestFence } from '../../typescript/ui/state/request-fence.ts';
+import { RequestFence } from '#core/application/coordination/requestFence.ts';
 
 test('only the newest request for an owner may publish', () => {
   const fence = new RequestFence();

@@ -16,10 +16,10 @@ import {
   reviewAllowsApproval,
   type ApprovalChoices,
   type ReviewRequestFence,
-} from '../../typescript/ui/state/operationReview.ts';
-import type { CompareIdentity } from '../../typescript/core/types/generated/CompareIdentity.ts';
-import type { OperationReviewDto } from '../../typescript/core/types/generated/OperationReviewDto.ts';
-import { buildReviewedRowDecisions } from '../../typescript/core/plan.ts';
+} from '#core/application/operations/operationReview.ts';
+import type { CompareIdentity } from '#core/types/generated/CompareIdentity.ts';
+import type { OperationReviewDto } from '#core/types/generated/OperationReviewDto.ts';
+import { buildReviewedRowDecisions } from '#core/domain/compare/plan.ts';
 
 const compareIdentity: CompareIdentity = {
   result_id: '33333333333333333333333333333333',

@@ -4,7 +4,7 @@ import test from 'node:test';
 import {
   deriveAutoCloseRequest,
   derivePowerActionCountdown,
-} from '../../typescript/progress/postRunActions.ts';
+} from '#core/application/progress/postRunActions.ts';
 
 const successful = {
   readyRunId: 7,

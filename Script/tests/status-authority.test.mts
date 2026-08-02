@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { StatusAuthority } from '../../typescript/ui/state/statusAuthority.ts';
+import { StatusAuthority } from '#ui/shared/status/statusAuthority.ts';
 
 function deferred() {
   let resolve!: () => void;

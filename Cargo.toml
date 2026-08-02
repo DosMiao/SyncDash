@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "src-tauri"]
+members = [".", "Dev/src-tauri"]
 
 [package]
 name = "syncdash"
@@ -7,6 +7,13 @@ version = "0.9.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Table-driven multi-node file sync: scan -> compare -> plan -> apply, with real move detection"
+
+[lib]
+path = "Dev/src/lib.rs"
+
+[[bin]]
+name = "syncdash"
+path = "Dev/src/main.rs"
 
 [features]
 export-types = []
@@ -18,7 +25,7 @@ serde_json = "1"
 # page whose file was truncated or whose volume vanished raises SIGBUS — a signal no `?` can catch.
 # Dropping the feature turns "don't map user files" from a convention into a compile error.
 # "rayon" only exists to enable `update_mmap_rayon`/`update_rayon`; the crate's own `rayon`
-# dependency below is unaffected. See the crate header in src/lib.rs.
+# dependency below is unaffected. See the crate header in Dev/src/lib.rs.
 blake3 = "1"
 getrandom = "0.3"
 walkdir = "2"

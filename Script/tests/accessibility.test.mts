@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { menuFocusIndex } from '../../typescript/ui/components/a11y.ts';
+import { menuFocusIndex } from '#ui/shared/components/a11y.ts';
 
 test('menu arrow navigation wraps in both directions', () => {
   assert.equal(menuFocusIndex('ArrowDown', 2, 3), 0);

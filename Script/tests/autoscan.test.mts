@@ -10,10 +10,10 @@ import {
   reconcileAutoScanStatus,
   statusCanOwnAutoScanTrigger,
   statusCompletesAutoScanTicket,
-} from '../../typescript/ui/state/autoscan.ts';
-import type { AutoScanStatusDto } from '../../typescript/core/types/generated/AutoScanStatusDto.ts';
-import type { AutoScanTriggerDto } from '../../typescript/core/types/generated/AutoScanTriggerDto.ts';
-import type { AutoScanTicket } from '../../typescript/ui/state/autoscan.ts';
+} from '#core/application/autoscan/autoscan.ts';
+import type { AutoScanStatusDto } from '#core/types/generated/AutoScanStatusDto.ts';
+import type { AutoScanTriggerDto } from '#core/types/generated/AutoScanTriggerDto.ts';
+import type { AutoScanTicket } from '#core/application/autoscan/autoscan.ts';
 
 const ticket: AutoScanTicket = {
   generation: 9,

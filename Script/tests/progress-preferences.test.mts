@@ -6,7 +6,7 @@ import {
   saveAutoClosePreference,
   saveWhenFinishedPreference,
   WHEN_FINISHED_PREFERENCE_KEY,
-} from '../../typescript/progress/preferences.ts';
+} from '#core/infrastructure/preferences/progressPreferences.ts';
 
 function memoryStorage(initial: Record<string, string> = {}) {
   const values = new Map(Object.entries(initial));

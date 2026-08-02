@@ -9,8 +9,8 @@ import {
   reviewApplyArgs,
   reviewCompareArgs,
   startAutoScanArgs,
-} from '../../typescript/core/operationProtocol.ts';
-import type { CompareOwner } from '../../typescript/core/types/generated/CompareOwner.ts';
+} from '#core/application/operations/operationProtocol.ts';
+import type { CompareOwner } from '#core/types/generated/CompareOwner.ts';
 
 const owner: CompareOwner = {
   identity: {

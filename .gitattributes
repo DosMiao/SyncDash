@@ -1,6 +1,6 @@
 # Everything is stored as LF in this repo. Without this declaration core.autocrlf=true wants to flip
 # the working tree to CRLF, while the generator (Script/gen-types.mjs) and every editor write LF — so
-# the 23 files under typescript/core/types/generated/ stay modified forever after commit, with an empty `git diff`.
+# the files under Dev/typescript/core/types/generated/ stay modified forever after commit, with an empty `git diff`.
 * text=auto eol=lf
 
 # Mac build scripts must be LF, otherwise bash hits a \r and reports command not found

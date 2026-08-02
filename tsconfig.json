@@ -10,5 +10,5 @@
     "jsx": "react-jsx",
     "types": ["vite/client"]
   },
-  "include": ["typescript"]
+  "include": ["Dev/typescript"]
 }

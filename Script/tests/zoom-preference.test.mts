@@ -4,15 +4,17 @@ import test from 'node:test';
 import {
   ZoomAuthority,
   createInitialZoomAuthorityState,
-  loadZoomPreference,
-  saveZoomPreference,
   stepZoom,
-} from '../../typescript/core/zoom.ts';
+} from '#core/application/zoom/zoomAuthority.ts';
 import type {
   ZoomAuthorityFailure,
   ZoomAuthorityState,
   ZoomFactor,
-} from '../../typescript/core/zoom.ts';
+} from '#core/application/zoom/zoomAuthority.ts';
+import {
+  loadZoomPreference,
+  saveZoomPreference,
+} from '#core/infrastructure/preferences/zoomPreference.ts';
 
 function storage(value: string | null): Storage {
   return {
