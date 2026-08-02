@@ -10,7 +10,9 @@ use std::io::{Read, Write};
 use crate::fs::vfs::error::{VfsError, VfsErrorKind, VfsResult};
 use crate::fs::vfs::{CommitReport, ReadStream, WriteHint, WriteStaged};
 
-use super::{map_ftp_err, ConnSlot, Feats};
+use super::session::map_ftp_err;
+use super::stream::Feats;
+use super::tls::ConnSlot;
 
 /// Blocking read over the FTP data connection. EOF finalizes the transfer on the
 /// control connection; an early drop aborts it — either way the control channel is
