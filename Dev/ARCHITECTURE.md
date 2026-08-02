@@ -73,18 +73,24 @@ perform only the minimal composition that belongs to the whole branch.
 ```text
 Dev/src/
 ├── base/
-│   ├── foundation/         paths, time, formatting, naming, and platform primitives
-│   ├── model/              persisted plan, event, table, and chunk vocabulary
+│   ├── foundation/         paths, time, formatting, naming, machine and volume identity
+│   ├── model/              persisted plan, event, table, chunk, and digest vocabulary
 │   └── fs/                 filesystem boundaries, VFS backends, staging, locks, and watches
+│       ├── lock/           ledger format, record store, fail-closed policy, and the guard
+│       └── vfs/
+│           ├── absence.rs  confirming a name is gone rather than momentarily unreachable
+│           └── local/      the backend, its volume tables, staged writes, and metadata
 ├── services/
 │   ├── obs/                logging and live progress
 │   └── store/
 │       ├── scan_state/     bound format, location, reporting, and rebuild policy
-│       └── version/        retained versions and transactional restore
+│       └── version/        format, content caps, writer, retention, and transactional restore
 ├── workflow/
 │   ├── pipeline/
 │   │   ├── scan/local/     model, state, progress, discovery, and stable hashing
 │   │   ├── compare/        matching, evidence, planning policy, and conflicts
+│   │   ├── guard/caps/     reviewable limitations and the consent digest that binds to them
+│   │   ├── name_safety.rs  the one Windows name-hazard decision, used by compare and apply
 │   │   └── apply/          validation, lease, reporting, coordination, and execution
 │   └── transfer/           peer transport and verified packages
 ├── application/
@@ -92,11 +98,13 @@ Dev/src/
 │   ├── job/
 │   │   ├── model.rs        persisted job vocabulary
 │   │   ├── policy/         validation and runtime projection
-│   │   └── persistence/    codec, migrations, registry, and atomic mutation
+│   │   └── persistence/    codec, migrations, registry, and mutation/ (fence, roots, save,
+│   │                       delete, seed)
 │   └── run/
-│       ├── archive.rs      the sync-mode record of what the two sides last agreed on
+│       ├── archive/        target and lock, paths, receipted publication, and refresh
 │       ├── e2e/            cross-lane pipeline smoke and safety checks (test-only)
-│       ├── history/        model, codec, migration, recording, queries, and retention
+│       ├── history/        model, codec, migration, recording, queries, retention, and the
+│       │                   run-log directory relocation
 │       ├── local/          Compare, guarded Apply, and execution-loop orchestration
 │       ├── peer/           configuration, probe, package, Compare, and guarded Apply
 │       ├── roots.rs        root-phrase resolution shared by both lanes
@@ -114,6 +122,8 @@ force callers through compatibility re-export hubs. Durable run history belongs 
 `run::history`, not observability, because it binds run records to jobs and orchestration.
 Within the workflow layer, `pipeline/compare/` separates matching from planning policy and evidence,
 while `transfer/pack/` separates its format, deterministic creation, staging, and application.
+`pipeline/scan/local/discovery/bulk/` separates the macOS traversal loop from the record decoder,
+because a misparsed `getattrlistbulk` record yields a plausible entry rather than an error.
 `pipeline/scan/local/` owns traversal and hashing as sibling capabilities, and
 `pipeline/apply/` keeps plan validation and lease/reporting policy outside the mutation executor.
 Application-level peer orchestration recursively separates connection configuration, probing,
@@ -127,9 +137,12 @@ Dev/src-tauri/src/
 ├── app/                    state construction, window lifecycle, and command registration
 ├── contracts/              Rust-to-TypeScript wire DTOs grouped by feature
 ├── features/
-│   ├── autoscan/           model, authoritative state, controller, runtime, and worker
+│   ├── autoscan/           authority, model, state, controller, runtime, and worker
 │   ├── compare/
-│   │   ├── export/          filename, row presentation, rendering, and receipts
+│   │   ├── export/          filename, row presentation, rendering, receipts, and the write
+│   │   │                    transaction
+│   │   ├── reveal.rs        the local-root path gate for File Manager reveal
+│   │   ├── workspace.rs     job-state classification and the restore revision fence
 │   │   └── evidence/
 │   │       ├── model/       errors, scope identity, result, execution, and verification data
 │   │       ├── persistence/ strict codecs, index integrity, paths, and disk I/O
@@ -138,15 +151,15 @@ Dev/src-tauri/src/
 │   ├── operations/
 │   │   ├── apply/          preparation, review, and authorized execution
 │   │   ├── authorization/  challenges, target policy, Compare/Apply review, and token store
-│   │   ├── autoscan_authority.rs  AutoScan permit and verification-ticket vocabulary
 │   │   ├── compare/        review, approval, and authorized execution
 │   │   ├── decisions.rs    shared row-authentication rules for reviewed operations
 │   │   ├── events/         run-event model, repository, sink, and throttle
 │   │   ├── execution/      shared execution guards and error classification
-│   │   ├── lifecycle/      coordinator, leases, preparation, reservation, and control
+│   │   ├── lifecycle/      coordinator, leases, preparation, reservation, control, and the
+│   │   │                   progress-window mount/arm handshake
 │   │   ├── projection.rs   operation state projected for delivery
 │   │   └── target/         registered target resolution and revision validation
-│   ├── jobs/               target resolution and mutation effects
+│   ├── jobs/               editor readiness, target resolution, and mutation effects
 │   └── settings/           authorization, transactional save, and log selection
 ├── ipc/
 │   ├── commands/
@@ -178,6 +191,8 @@ Dev/typescript/
 │   ├── types/generated/    Rust-owned snake_case wire contracts
 │   ├── domain/             pure compare, job, path, and run logic
 │   ├── application/        pure reducers, authorities, review state, and use-case policy
+│   │                       (compare-workspace/repository/ splits scope index, lookup,
+│   │                       lifecycle, and publication)
 │   ├── infrastructure/     window-scoped Tauri adapters and durable browser preferences
 │   └── shared/             framework-free formatting helpers
 ├── ui/
@@ -206,7 +221,9 @@ Dev/typescript/
 
 Dependencies point from `ui -> infrastructure/application -> domain -> generated types`. Domain
 and application code do not import React, Tauri, or browser persistence. All `@tauri-apps` imports
-and literal IPC invocations live in `core/infrastructure/tauri`. Shared UI cannot depend on a
+and literal IPC invocations live in `core/infrastructure/tauri`. Consumers name the command
+families they call; there is no aggregate module, and the window-authority boundary is asserted by
+the frontend-contracts audit rather than stated in a comment. Shared UI cannot depend on a
 feature, page, or window. Window roots depend on exactly one page; the progress page cannot reach
 workspace features or authority.
 Feature and page `model/` branches cannot reach platform delivery; `components/` cannot reach
@@ -220,6 +237,8 @@ owns; empty ceremonial branches are rejected as well.
 | New responsibility | Owner |
 | --- | --- |
 | Persisted engine vocabulary or codec | `Dev/src/base/model/` |
+| Content identity, or whether a digest is verifiable | `Dev/src/base/model/digest.rs` |
+| A fact this machine or a volume reports about itself | `Dev/src/base/foundation/` |
 | Filesystem/VFS capability | `Dev/src/base/fs/` |
 | Settings, cache, trash, or version storage | `Dev/src/services/store/` |
 | Scan/compare/apply behavior | `Dev/src/workflow/pipeline/` |
