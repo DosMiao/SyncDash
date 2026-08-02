@@ -55,10 +55,7 @@ fn is_ordered_move_source_recreation(ops: &[Op], moving: &Op, mutation: &Op) -> 
 pub(super) fn validate_operation_paths(ops: &[Op]) -> Result<(), String> {
     let mut mutations = std::collections::HashSet::new();
     let mut move_sources = std::collections::HashSet::new();
-    for op in ops
-        .iter()
-        .filter(|op| !matches!(op.action, Action::Conflict | Action::Note))
-    {
+    for op in ops.iter().filter(|op| op.action.is_executable()) {
         let operation_path = crate::foundation::path::RootRelativePath::try_from(op.path.as_str())
             .map_err(|_| format!("unsafe operation path: {}", op.path))?;
         if crate::foundation::names::is_internal_artifact_path(&operation_path) {
@@ -162,7 +159,7 @@ pub(super) fn validate_operation_name_rules(
 ) -> Result<(), String> {
     for operation in ops
         .iter()
-        .filter(|operation| !matches!(operation.action, Action::Conflict | Action::Note))
+        .filter(|operation| operation.action.is_executable())
     {
         let (executing_rules, reading_rules) = match operation.side {
             Side::Source => (source_rules, target_rules),

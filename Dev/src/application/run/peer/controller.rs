@@ -57,7 +57,7 @@ pub fn run_peer_job_with(
     let ops: Vec<Op> = plan
         .ops
         .iter()
-        .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
+        .filter(|o| o.action.is_executable())
         .cloned()
         .collect();
     let t0 = std::time::Instant::now();
@@ -114,6 +114,6 @@ pub(super) fn emit_apply_summary(
     });
 }
 use crate::job::SingleTargetJob;
-use crate::model::plan::{Action, Op};
+use crate::model::plan::Op;
 
 use super::apply::apply_peer_job_with;

@@ -49,10 +49,7 @@ pub(crate) fn pack_to_open_file(
     let target_ops: Vec<Op> = plan
         .ops
         .iter()
-        .filter(|operation| {
-            operation.side == Side::Target
-                && !matches!(operation.action, Action::Conflict | Action::Note)
-        })
+        .filter(|operation| operation.side == Side::Target && operation.action.is_executable())
         .cloned()
         .collect();
     let skipped_source_side = plan

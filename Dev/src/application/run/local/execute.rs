@@ -1,7 +1,7 @@
 //! CLI-facing iteration over targets and one complete local Compare/Apply run.
 
 use crate::job::{Job, SingleTargetJob};
-use crate::model::plan::{Action, Op};
+use crate::model::plan::Op;
 
 use super::{apply_job_guarded_with, compare_job_detailed};
 
@@ -74,7 +74,7 @@ pub fn run_local_single(
     let ops: Vec<Op> = plan
         .ops
         .iter()
-        .filter(|o| !matches!(o.action, Action::Conflict | Action::Note))
+        .filter(|o| o.action.is_executable())
         .cloned()
         .collect();
     // The CLI records here; the desktop records at its command boundary to retain its authorization identity.

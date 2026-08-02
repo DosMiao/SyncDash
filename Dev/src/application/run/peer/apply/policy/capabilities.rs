@@ -42,12 +42,12 @@ pub fn apply_capabilities(
     job: &SingleTargetJob,
     ops: &[Op],
 ) -> crate::pipeline::guard::caps::CapReport {
-    use crate::model::plan::{Action, Side};
+    use crate::model::plan::Side;
     use crate::pipeline::guard::caps::{CapItem, CapReport, CapSeverity};
 
     let writes_target = ops
         .iter()
-        .any(|op| op.side == Side::Target && !matches!(op.action, Action::Conflict | Action::Note));
+        .any(|op| op.side == Side::Target && op.action.is_executable());
     if !writes_target {
         return CapReport::default();
     }

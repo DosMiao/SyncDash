@@ -313,7 +313,7 @@ pub fn cap_report_write(
 
         let side_ops: Vec<&Op> = ops
             .iter()
-            .filter(|o| o.side == side && !matches!(o.action, Action::Conflict | Action::Note))
+            .filter(|o| o.side == side && o.action.is_executable())
             .collect();
         if side_ops.is_empty() {
             continue;

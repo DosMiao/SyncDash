@@ -80,7 +80,7 @@ pub fn bare_job() -> Job {
 fn executable_operations(operations: &[Op]) -> Vec<Op> {
     operations
         .iter()
-        .filter(|operation| !matches!(operation.action, Action::Conflict | Action::Note))
+        .filter(|operation| operation.action.is_executable())
         .cloned()
         .collect()
 }
