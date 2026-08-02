@@ -1,12 +1,7 @@
-//! Atomic writes (semantics modelled on syncthing `lib/osutil/atomic.go`, rewritten to match).
+//! Atomic local writes.
 //!
-//! Every write lands first in a temp file **in the same directory as the destination**; the data is fsynced, then renamed to the final name.
-//! A same-volume rename is atomic: an interruption (power loss / network drop / Ctrl-C) leaves at most a temp file behind,
-//! never half a file at the final path.
-//!
-//! This fixes a real data-loss path: `apply` used to call `fs::copy(src, dst)` directly, so an
-//! Update interrupted mid-write → target left holding a truncated file with a fresh mtime →
-//! the next sync compares it as "target-changed" → **the truncated file gets propagated back over source**.
+//! Data is written and optionally synced in a same-directory temporary file, then renamed into
+//! place. Interruption can leave a temporary file, never a partial destination.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -297,12 +292,8 @@ impl Staged {
         f.write_all(buf)
     }
 
-    /// v0.9 M1: the one streaming copy loop — 1MiB buffer, a callback after every chunk
-    /// (byte counting plus the cancel/pause checkpoint hang off it). An Err from on_chunk aborts:
-    /// Drop clears the temp file and the final path is untouched.
-    /// One loop serves all of: byte-level progress (M1), atomic writes (P0-1), the future write_at delta path (P1-1B).
-    /// The callback receives **this chunk's bytes** (not just its length): post-copy verification validates against the
-    /// full hash of the copy stream — the copy reads the whole file anyway, so hashing on the stream is free, and it decouples the check from scan-evidence depth (which may be only a sample).
+    /// Stream through a 1 MiB buffer and report each chunk for checkpoints, accounting, and
+    /// verification. A callback error aborts; Drop removes the temporary file.
     pub fn copy_from(
         &mut self,
         src: &Path,

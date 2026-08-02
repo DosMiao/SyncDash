@@ -195,9 +195,6 @@ export class ZoomAuthority {
   }
 
   private advanceRequestFence(): number {
-    if (this.latestRequestId >= Number.MAX_SAFE_INTEGER) {
-      throw new Error('Zoom request ID space is exhausted');
-    }
     this.latestRequestId += 1;
     return this.latestRequestId;
   }

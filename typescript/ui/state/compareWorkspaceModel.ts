@@ -87,7 +87,6 @@ export interface CompareWorkspace {
   key: CompareResultKey;
   identity: CompareIdentity;
   readonly plan: PlanDto;
-  display: { jobName: string };
   retention: ResultRetentionState;
   selectedView: CompareResultView;
   differences: DifferenceWorkspace;
@@ -200,7 +199,6 @@ export function createCompareWorkspace(
     key: compareResultKey(plan.owner.identity),
     identity: plan.owner.identity,
     plan,
-    display: { jobName: plan.owner.job_name },
     retention: { status: 'retained', requestId: 0 },
     selectedView: 'differences',
     differences: {
@@ -258,17 +256,6 @@ export function preferredTargetIndex(repository: CompareWorkspaceRepository, job
     && candidate.scope.target_index < job.targets.length
   ));
   return entry?.scope.target_index ?? 0;
-}
-
-export function workspaceByResultKey(
-  repository: CompareWorkspaceRepository,
-  resultKey: CompareResultKey,
-): CompareWorkspace | null {
-  for (const scope of repository.scopes) {
-    if (scope.active?.key === resultKey) return scope.active;
-    if (scope.candidate?.workspace.key === resultKey) return scope.candidate.workspace;
-  }
-  return null;
 }
 
 export function workspaceHasReviewEdits(workspace: CompareWorkspace): boolean {

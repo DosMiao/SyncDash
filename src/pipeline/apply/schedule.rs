@@ -42,9 +42,7 @@ pub(super) struct Shared<'a> {
     pub(super) ver_target: Mutex<Option<crate::store::version::VersionWriter>>,
     /// Directories already ensured on each side this run (spares one round-trip per network root)
     pub(super) mkdir_memo: Mutex<std::collections::HashSet<(bool, String)>>,
-    // P1-4: when the mtime the filesystem actually stored differs from the one we wanted (FAT's 2-second
-    // granularity, truncation by some SMB servers), record (ondisk, intended) for the next scan to convert with,
-    // instead of brute-forcing it with a ±2s tolerance. Same approach as syncthing's mtimeFS.
+    // Preserve rounded on-disk and intended mtimes so the next scan can reconcile them exactly.
     pub(super) mtime_fixes: Mutex<Vec<(bool, String, i64, i64)>>,
     pub(super) delta_saved: AtomicU64,
 }
@@ -140,12 +138,8 @@ pub(super) struct Counters {
     pub(super) lease_failure_recorded: AtomicBool,
 }
 
-/// Run one class of ops. width==1 runs sequentially on the current thread; otherwise a scoped thread pool
-/// (an AtomicUsize work-ticket index rather than range splitting — one big file can't drag a worker into a long tail).
-/// Not rayon: `checkpoint()` parks its caller in a 100ms sleep loop for the entire length of a
-/// pause, and these are threads of our own to park. Handing them to the global pool would mean a
-/// user pressing Pause pins rayon workers for as long as they like. (This used to be justified by
-/// verify's blake3 occupying that pool already; it no longer does — nothing here maps a file.)
+/// Run one operation class sequentially or on owned scoped threads. Work tickets avoid range
+/// imbalance, and owned threads keep a user pause from pinning Rayon workers.
 pub(super) fn run_class(
     class: &[&Op],
     width: usize,

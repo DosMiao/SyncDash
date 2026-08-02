@@ -869,7 +869,6 @@ pub(super) fn exec_op(sh: &Shared, op: &Op, pp: &PhaseProgress) -> std::io::Resu
             Ok(())
         }
         Action::DeleteDir => {
-            // P0-4: report by classification, no longer swallowed silently
             match try_delete_dir_vfs(exec, &op.path, sh.opt.filter.as_ref(), || {
                 sh.check_before_mutation()
             }) {

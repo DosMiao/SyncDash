@@ -76,7 +76,6 @@ type CompareWorkspaceRepositoryAction =
   }
   | { type: 'compare_activity_finished'; scopeKey: CompareScopeKey; requestId: number }
   | { type: 'compare_activity_failed'; scopeKey: CompareScopeKey; requestId: number; error: string }
-  | { type: 'job_display_name_rebound'; jobId: string; jobName: string }
   | {
     type: 'job_execution_expired';
     jobId: string;
@@ -309,12 +308,6 @@ function completeExactWorkspaceLookup(
   return repository;
 }
 
-function rebindDisplayName(workspace: CompareWorkspace, jobName: string): CompareWorkspace {
-  return workspace.display.jobName === jobName
-    ? workspace
-    : { ...workspace, display: { jobName } };
-}
-
 function refreshPublishedWorkspace(
   existing: CompareWorkspace,
   published: CompareWorkspace,
@@ -323,7 +316,6 @@ function refreshPublishedWorkspace(
   if (existing.key !== published.key) return published;
   return {
     ...existing,
-    display: published.display,
     retention: { status: 'retained', requestId: retentionRequestId },
   };
 }
@@ -687,21 +679,6 @@ export function reduceCompareWorkspaces(
         action.resultKey,
         (workspace) => reduceCompareWorkspaceReview(workspace, action),
       );
-    case 'job_display_name_rebound': {
-      let changed = false;
-      const scopes = repository.scopes.map((scope) => {
-        if (scope.scope.job_id !== action.jobId) return scope;
-        const active = scope.active ? rebindDisplayName(scope.active, action.jobName) : null;
-        const candidate = scope.candidate
-          ? { ...scope.candidate, workspace: rebindDisplayName(scope.candidate.workspace, action.jobName) }
-          : null;
-        if (active !== scope.active || candidate?.workspace !== scope.candidate?.workspace) changed = true;
-        return active === scope.active && candidate?.workspace === scope.candidate?.workspace
-          ? scope
-          : { ...scope, active, candidate };
-      });
-      return changed ? { scopes } : repository;
-    }
     case 'job_execution_expired': {
       let changed = false;
       const scopes = repository.scopes.map((scope) => {

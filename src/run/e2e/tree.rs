@@ -9,10 +9,6 @@
 //! - **Nothing is asserted that the backend does not declare.** `Tolerance::between` derives from
 //!   `caps()` and never from a per-lane table, so a backend that lies about its precision fails the
 //!   mtime assertion — which is the correct outcome, not a false alarm to paper over.
-//!
-//! Where a tolerance switches an assertion *off* (a target that cannot set mtimes), the case is
-//! expected to assert the **disclosure** instead — the caps report line that says so. Silence is
-//! never an acceptable substitute for an assertion.
 
 use std::io::Read;
 use std::sync::Arc;
@@ -130,8 +126,7 @@ pub struct Tolerance {
     /// explicitly sets the intended mtime, so anything beyond the coarser backend's own precision
     /// is a real failure.
     pub mtime_ms: i64,
-    /// False when the target cannot set mtimes at all. The case must then assert the caps report
-    /// line that discloses it.
+    /// False when the target cannot set mtimes.
     pub mtime_at_all: bool,
     pub mode: bool,
     pub link: bool,

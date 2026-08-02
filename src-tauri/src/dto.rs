@@ -7,7 +7,8 @@ use syncdash::model::plan::{Op, PlanHeader};
 use syncdash::pipeline::compare;
 
 #[derive(Serialize, Clone, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct SettingsNumericLimitsDto {
     #[ts(type = "number")]
     pub(crate) maximum_keep_days: u64,
@@ -16,7 +17,8 @@ pub(crate) struct SettingsNumericLimitsDto {
 }
 
 #[derive(Serialize, Clone, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct SettingsSnapshotDto {
     pub(crate) settings: syncdash::store::settings::AppSettings,
     pub(crate) revision: String,
@@ -39,21 +41,24 @@ impl From<syncdash::store::settings::AppSettingsSnapshot> for SettingsSnapshotDt
 }
 
 #[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct LogDirectorySelectionDto {
     pub(crate) directory: String,
     pub(crate) grant_id: Option<String>,
 }
 
 #[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct SettingsSaveDto {
     pub(crate) snapshot: SettingsSnapshotDto,
     pub(crate) migration: syncdash::store::migrate::MigrateReport,
 }
 
 #[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JobDto {
     pub(crate) job_id: String,
     pub(crate) name: String,
@@ -78,7 +83,8 @@ pub(crate) struct JobDto {
 }
 
 #[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JobDetailDto {
     pub(crate) job_id: String,
     pub(crate) name: String,
@@ -87,7 +93,8 @@ pub(crate) struct JobDetailDto {
 }
 
 #[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JobSaveDto {
     pub(crate) job_id: String,
     pub(crate) name: String,
@@ -98,7 +105,8 @@ pub(crate) struct JobSaveDto {
 }
 
 #[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JobRootMutationDto {
     pub(crate) mutation: JobSaveDto,
     pub(crate) source: String,
@@ -106,7 +114,8 @@ pub(crate) struct JobRootMutationDto {
 }
 
 #[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JobDeleteDto {
     pub(crate) job_id: String,
     pub(crate) name: String,
@@ -117,7 +126,8 @@ pub(crate) struct JobDeleteDto {
 
 /// Immutable identity for one successful Compare result.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct CompareIdentity {
     pub(crate) result_id: String,
     #[ts(type = "number")]
@@ -130,7 +140,8 @@ pub(crate) struct CompareIdentity {
 
 /// An immutable Compare identity paired with its current display label.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct CompareOwner {
     pub(crate) identity: CompareIdentity,
     pub(crate) job_name: String,
@@ -138,7 +149,8 @@ pub(crate) struct CompareOwner {
 
 /// The exact job-target revision used to look up retained results and execution status.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, Hash, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct CompareScopeDto {
     pub(crate) job_id: String,
     #[ts(type = "number")]
@@ -148,7 +160,8 @@ pub(crate) struct CompareScopeDto {
 
 /// One monotonic verification epoch and the Compare run currently associated with it, if launched.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct CompareVerificationAttemptDto {
     #[ts(type = "number")]
     pub(crate) verification_epoch: u64,
@@ -158,7 +171,8 @@ pub(crate) struct CompareVerificationAttemptDto {
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum CompareExecutionExpiryReasonDto {
     ApplicationRestarted,
     JobChanged,
@@ -171,7 +185,8 @@ pub(crate) enum CompareExecutionExpiryReasonDto {
 /// when this status says that their filesystem evidence is no longer eligible for Apply.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(tag = "status", rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum CompareScopeExecutionStatusDto {
     Unavailable {
         scope: CompareScopeDto,
@@ -208,7 +223,8 @@ pub(crate) enum CompareScopeExecutionStatusDto {
 /// An atomic restored Compare workspace: immutable plan evidence and its independently evolving
 /// execution status are read under the same repository lock.
 #[derive(Serialize, Clone, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct CompareWorkspaceSnapshotDto {
     pub(crate) plan: PlanDto,
     pub(crate) execution_status: CompareScopeExecutionStatusDto,
@@ -218,7 +234,8 @@ pub(crate) struct CompareWorkspaceSnapshotDto {
 /// authoritative scope status are read under the same repository lock.
 #[derive(Serialize, Clone, ts_rs::TS)]
 #[serde(tag = "status", rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum CompareWorkspaceLookupDto {
     Found {
         workspace: Box<CompareWorkspaceSnapshotDto>,
@@ -230,7 +247,8 @@ pub(crate) enum CompareWorkspaceLookupDto {
 
 #[derive(Serialize, Clone, ts_rs::TS)]
 #[serde(tag = "status", rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum CompareResultForgetDto {
     Forgotten { cleanup_warning: Option<String> },
     AlreadyForgotten,
@@ -239,7 +257,8 @@ pub(crate) enum CompareResultForgetDto {
 /// Identifies the backend AutoScan trigger for which Compare is being reviewed. The backend turns
 /// this public cursor into a private, one-use permit; it is not itself execution authority.
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct AutoScanCompareRequestDto {
     #[ts(type = "number")]
     pub(crate) generation: u64,
@@ -248,7 +267,8 @@ pub(crate) struct AutoScanCompareRequestDto {
 }
 
 #[derive(Serialize, Deserialize, Clone, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct PlanDto {
     pub(crate) header: PlanHeader,
     pub(crate) ops: Vec<Op>,
@@ -271,7 +291,8 @@ pub(crate) struct PlanDto {
 /// One reviewed plan row submitted for preflight/apply. The backend reconstructs the operation from
 /// the exact retained plan; the frontend never gets to submit an independent write instruction.
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct ReviewedRowDecisionDto {
     #[ts(type = "number")]
     pub(crate) index: usize,
@@ -279,7 +300,8 @@ pub(crate) struct ReviewedRowDecisionDto {
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct CsvRowPresentationDto {
     #[ts(type = "number")]
     pub(crate) index: usize,
@@ -289,7 +311,8 @@ pub(crate) struct CsvRowPresentationDto {
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(tag = "status", rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum CsvExportDto {
     Cancelled,
     Exported {
@@ -302,7 +325,8 @@ pub(crate) enum CsvExportDto {
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum CompareFileSideDto {
     Source,
     Target,
@@ -310,14 +334,16 @@ pub(crate) enum CompareFileSideDto {
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum PostRunPowerActionDto {
     Sleep,
     Shutdown,
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct PostRunPowerActionReadyDto {
     #[ts(type = "number")]
     pub(crate) run_id: u64,
@@ -325,7 +351,8 @@ pub(crate) struct PostRunPowerActionReadyDto {
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum CapabilitySeverityDto {
     Block,
     NeedsAck,
@@ -343,7 +370,8 @@ impl From<syncdash::pipeline::guard::caps::CapSeverity> for CapabilitySeverityDt
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct CapabilityIssueDto {
     pub(crate) feature: String,
     pub(crate) side: String,
@@ -367,7 +395,8 @@ impl From<&syncdash::pipeline::guard::caps::CapItem> for CapabilityIssueDto {
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct AuthorizationDto {
     pub(crate) authorization_token: String,
     #[ts(type = "number")]
@@ -376,7 +405,8 @@ pub(crate) struct AuthorizationDto {
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(tag = "status", rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum OperationReviewDto {
     Blocked {
         blockers: Vec<String>,
@@ -409,7 +439,8 @@ pub(crate) enum OperationReviewDto {
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(tag = "operation", rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum OperationApprovalDto {
     Compare {
         accept_capabilities: bool,
@@ -424,7 +455,8 @@ pub(crate) enum OperationApprovalDto {
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum ApplySessionGrantDecisionDto {
     None,
     RememberCapabilities,
@@ -432,7 +464,8 @@ pub(crate) enum ApplySessionGrantDecisionDto {
 }
 
 #[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct ApplyDto {
     #[ts(type = "number")]
     pub(crate) done: u64,
@@ -447,7 +480,8 @@ pub(crate) struct ApplyDto {
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum EndpointReadiness {
     Empty,
     Ready,
@@ -459,7 +493,8 @@ pub(crate) enum EndpointReadiness {
 }
 
 #[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct PathInfo {
     pub(crate) readiness: EndpointReadiness,
     pub(crate) exists: Option<bool>,
@@ -479,7 +514,8 @@ impl Default for PathInfo {
 }
 
 #[derive(Serialize, Default, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct PathVerdict {
     pub(crate) source: PathInfo,
     pub(crate) target: PathInfo,
@@ -493,7 +529,8 @@ pub(crate) struct PathVerdict {
 /// A page of identical rows from the bounded compare-result repository. Every request is
 /// authenticated against the exact job, target, revision, and compare owner that produced it.
 #[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct IdenticalPage {
     #[ts(type = "number")]
     pub(crate) total: u64,
@@ -505,7 +542,8 @@ pub(crate) struct IdenticalPage {
 /// exclude lines the file does not contain yet, and it has to be able to say so.
 /// The two differing means the v1 junk keys were expanded into `exclude` on load.
 #[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JobFileSchemaDto {
     #[ts(type = "number")]
     pub(crate) on_disk: u32,
@@ -514,7 +552,8 @@ pub(crate) struct JobFileSchemaDto {
 }
 
 #[derive(Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct JunkPresetDto {
     pub(crate) id: String,
     pub(crate) label: String,

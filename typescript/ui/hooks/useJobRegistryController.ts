@@ -12,7 +12,6 @@ import { SerialRequestQueue } from '../state/serial-request-queue.ts';
 export interface JobRegistryController {
   jobs: JobDto[];
   selectedJob: JobDto | null;
-  snapshotEpoch: number;
   refresh: () => Promise<JobDto[]>;
   select: (job: JobDto | null) => void;
 }
@@ -39,7 +38,6 @@ export function useJobRegistryController(): JobRegistryController {
   return {
     jobs: state.jobs,
     selectedJob,
-    snapshotEpoch: state.snapshotEpoch,
     refresh,
     select,
   };

@@ -1,4 +1,7 @@
-import type { CompareWorkspacePreferences } from './compareWorkspaceModel';
+import {
+  defaultCompareWorkspacePreferences,
+  type CompareWorkspacePreferences,
+} from './compareWorkspaceModel.ts';
 
 interface PreferenceStorage {
   getItem(key: string): string | null;
@@ -16,12 +19,6 @@ const LEGACY_GROUPING_KEY = 'sd.grouped';
 const LEGACY_PATH_MODE_KEY = 'sd.pathmode';
 const LEGACY_RUN_SCOPE_PANEL_KEY = 'sd.scope';
 const LEGACY_OVERVIEW_PANEL_KEY = 'sd.ov';
-
-const DEFAULT_PREFERENCES: CompareWorkspacePreferences = {
-  grouped: true,
-  pathMode: 'relative',
-  scopePanelCollapsed: true,
-};
 
 function validatePreferences(value: unknown): CompareWorkspacePreferences | null {
   if (!value || typeof value !== 'object') return null;
@@ -49,7 +46,7 @@ export function loadCompareWorkspacePreferences(
       const preferences = validatePreferences(JSON.parse(stored));
       if (preferences) return { preferences, warning: null };
       return {
-        preferences: DEFAULT_PREFERENCES,
+        preferences: defaultCompareWorkspacePreferences,
         warning: 'Saved Compare workspace preferences were invalid; defaults are active until you change a preference.',
       };
     }
@@ -78,7 +75,7 @@ export function loadCompareWorkspacePreferences(
     return { preferences, warning: null };
   } catch (error) {
     return {
-      preferences: DEFAULT_PREFERENCES,
+      preferences: defaultCompareWorkspacePreferences,
       warning: `Compare workspace preferences could not be loaded: ${errorMessage(error)}`,
     };
   }

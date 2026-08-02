@@ -1,17 +1,8 @@
-//! v0.9 M1: the pipeline-wide progress/cancel/pause substrate.
+//! Pipeline-wide progress, cancellation, and pause control.
 //!
-//! Design notes (see the plans/ffs-ui plan §M1-API; behavior parameters match FFS 14.10 progress_indicator.cpp):
-//! - The engine guarantees only: monotone counters, a timestamp on every event, cooperative
-//!   checkpoints. Rate (4s window) / ETA (60s window) / percentage
-//!   (bytesDone+itemsDone)/(bytesTotal+itemsTotal) are all UI-side arithmetic over the event stream.
-//! - Counters update at every file and chunk boundary, while progress snapshots are sampled once
-//!   per phase every 100ms. Terminal and total events remain exact and unthrottled.
-//! - Cancel rides `io::ErrorKind::Interrupted` — it reuses the io::Result already threaded end to end, zero new error types.
-//! - Pause = a 100ms nap spin: **the stack frame stays alive ⇒ the RootLock heartbeat thread keeps
-//!   beating**, so the owner remains observable while the run is paused. That is
-//!   the hard reason for not "returning suspended".
-//! - Relation to the parallel line P2-6 (scan_with_progress/ScanProgress): this module is a superset;
-//!   the blanket closure impl lets `Fn(ProgressEvent)` serve as a sink directly, and the scan side bridges the old callback shape.
+//! Counters are monotonic; terminal and total events are exact. Periodic snapshots are throttled,
+//! while rate, ETA, and percentage remain UI-derived. Cancellation uses
+//! `io::ErrorKind::Interrupted`; pause stays cooperative so the active root lease remains alive.
 
 use crate::model::event::{LogLevel, Phase, PhaseStatus, ProgressEvent};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,18 +25,12 @@ impl ProgressSink for NullSink {
     }
 }
 
-/// Any `Fn(ProgressEvent)+Send+Sync` closure is a sink — zero-cost compatibility with the closure call shape of the parallel line P2-6
+/// Any thread-safe event closure can be used as a sink.
 impl<F: Fn(ProgressEvent) + Send + Sync> ProgressSink for F {
     fn emit(&self, ev: ProgressEvent) {
         self(ev)
     }
 }
-
-//
-// The registry stores `Arc<dyn ProgressSink>`, and `ProgressSink` is this module's trait —
-// so it belongs here. It used to live in logging.rs, which forced `RunCtx::null()` to reach back for
-// `use crate::obs::progress::current()` while logging did `use crate::obs::progress::{...}`: two mutually
-// dependent modules, and the event vocabulary could never compile alone. After the move logging points only downward.
 
 type Slot = std::sync::RwLock<Option<Arc<dyn ProgressSink>>>;
 static CURRENT: std::sync::OnceLock<Slot> = std::sync::OnceLock::new();
@@ -257,6 +242,7 @@ impl<'a> PhaseProgress<'a> {
         self.items_done.store(0, Ordering::Relaxed);
         self.items_total.store(items, Ordering::Relaxed);
         self.bytes_total.store(bytes, Ordering::Relaxed);
+        self.last_progress_ms.store(0, Ordering::Relaxed);
         self.emit_totals(true);
     }
 
@@ -476,27 +462,24 @@ mod tests {
         let (ctx, store) = collecting_ctx();
         ctx.ctl.set_paused(true);
         let ctx2 = ctx.clone();
-        let counter = Arc::new(AtomicU64::new(0));
-        let c2 = counter.clone();
+        let (entered_send, entered_receive) = std::sync::mpsc::channel();
+        let (done_send, done_receive) = std::sync::mpsc::channel();
         let h = std::thread::spawn(move || {
             let prog = PhaseProgress::begin(&ctx2, Phase::Apply, None, 0, 0);
+            entered_send.send(()).unwrap();
             prog.checkpoint().unwrap();
-            c2.store(1, Ordering::SeqCst);
+            done_send.send(()).unwrap();
         });
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            0,
-            "checkpoint must block while paused"
-        );
+        entered_receive.recv().unwrap();
+        assert!(done_receive
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err());
         ctx.ctl.set_paused(false);
+        done_receive
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
         h.join().unwrap();
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-        assert!(
-            ctx.ctl.paused_total_ms() >= 200,
-            "paused_ms should accumulate, got {}",
-            ctx.ctl.paused_total_ms()
-        );
+        assert!(ctx.ctl.paused_total_ms() > 0);
         let evs = store.lock().unwrap();
         let paused = evs
             .iter()
@@ -513,16 +496,31 @@ mod tests {
     fn concurrent_pause_announces_once() {
         let (ctx, store) = collecting_ctx();
         ctx.ctl.set_paused(true);
+        let start = Arc::new(std::sync::Barrier::new(5));
+        let (done_send, done_receive) = std::sync::mpsc::channel();
         let mut handles = Vec::new();
         for _ in 0..4 {
             let ctx2 = ctx.clone();
+            let start = start.clone();
+            let done_send = done_send.clone();
             handles.push(std::thread::spawn(move || {
                 let prog = PhaseProgress::begin(&ctx2, Phase::Apply, None, 0, 0);
+                start.wait();
                 prog.checkpoint().unwrap();
+                done_send.send(()).unwrap();
             }));
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        drop(done_send);
+        start.wait();
+        assert!(done_receive
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err());
         ctx.ctl.set_paused(false);
+        for _ in 0..4 {
+            done_receive
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+        }
         for h in handles {
             h.join().unwrap();
         }

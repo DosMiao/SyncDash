@@ -24,6 +24,6 @@ max_total_mb: number,
  */
 log_compare: string,
 /**
- * CLI: also mirror log lines verbatim to stderr (keeps the pre-refactor terminal experience)
+ * Also mirror CLI log lines to stderr.
  */
 mirror_stderr: boolean, };

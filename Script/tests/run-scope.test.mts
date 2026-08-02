@@ -149,7 +149,6 @@ test('compare workspace preferences migrate once and write one coherent preferen
   assert.equal(loaded.warning, null);
   assert.equal(preferences.scopePanelCollapsed, false);
   assert.deepEqual(JSON.parse(values.get('sd.compare-workspace-preferences.v1')!), preferences);
-  assert.equal(values.has('sd.scope'), false);
   assert.equal(values.has('sd.ov'), false);
   assert.equal(saveCompareWorkspacePreferences(storage, {
     ...preferences,

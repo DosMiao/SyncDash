@@ -64,7 +64,7 @@ pub enum Cmd {
         #[arg(long = "auto-apply")]
         auto_apply: bool,
     },
-    /// Open the graphical interface (the Tauri desktop app; the old egui UI was retired in v0.9)
+    /// Open the Tauri desktop app.
     Gui,
     /// Print the junk exclude presets and the exact patterns each one contributes to a job's `exclude`
     Junk {
@@ -169,7 +169,7 @@ pub enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Receive a file on stdin and write it to path (used to ship peer packages over SSH)
+    /// Receive a peer package from stdin and write it to path.
     Recv { path: PathBuf },
     /// Emit the FastCDC chunk table for the given files (used for delta transfer; one JSON line per file)
     Chunks {
@@ -230,7 +230,7 @@ pub enum Cmd {
         #[arg(long, default_value = "")]
         note: String,
     },
-    /// Run history (M4): an overview of every apply's outcome; --prune-days N prunes old records
+    /// Run history; --prune-days N prunes old records.
     History {
         /// Only this job (omit for all)
         job: Option<String>,
@@ -241,7 +241,7 @@ pub enum Cmd {
         #[arg(long)]
         prune_days: Option<u64>,
     },
-    /// Central logs (v0.10): list runs / view one run's three manifests / prune / show where the directory is
+    /// List, inspect, prune, or locate logs.
     Logs {
         #[command(subcommand)]
         cmd: LogsCmd,

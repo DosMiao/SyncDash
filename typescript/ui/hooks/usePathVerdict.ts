@@ -20,10 +20,6 @@ export function usePathVerdict(source: string, target: string, enabled = true): 
       return;
     }
     const requestId = requestSequence.current + 1;
-    if (!Number.isSafeInteger(requestId)) {
-      setInspection({ status: 'failed', requestId: requestSequence.current, error: 'Path inspection request IDs are exhausted' });
-      return;
-    }
     requestSequence.current = requestId;
     setInspection({ status: 'debouncing', requestId });
     let active = true;

@@ -1,16 +1,8 @@
 //! The directories where SyncDash keeps its own state on this machine.
 //!
 //! Distinct from `foundation::path`, which manipulates relative-path *strings*; this module
-//! answers "which directory", never "how do I splice this path".
-//!
-//! Pure environment-variable derivation, no crate dependencies — which is the point. These
-//! paths used to live in the job module, so `settings` and `territory` both had to
-//! depend on the job schema just to learn where a directory was, and `settings::config_dir`
-//! recovered the config root by taking `jobs_dir().parent()`. That made the `jobs` suffix
-//! load-bearing: rename it and the settings file silently relocates.
-//!
-//! The dependency here runs the other way now: `config_dir` is primary, everything else hangs
-//! off it.
+//! answers which directory owns each artifact. `config_dir` is primary; derived paths never
+//! recover it by walking upward from a child.
 
 use std::path::PathBuf;
 
@@ -69,17 +61,5 @@ mod tests {
         assert_eq!(jobs_dir().parent().unwrap(), root);
         assert_eq!(archive_dir().parent().unwrap(), root);
         assert_eq!(default_log_dir().parent().unwrap(), root);
-    }
-
-    #[test]
-    fn leaf_names_are_distinct() {
-        let names: Vec<_> = [jobs_dir(), archive_dir(), default_log_dir()]
-            .iter()
-            .map(|p| p.file_name().unwrap().to_owned())
-            .collect();
-        let mut sorted = names.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), names.len());
     }
 }

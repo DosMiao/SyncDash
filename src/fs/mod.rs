@@ -1,15 +1,8 @@
 //! L0 filesystem primitives that own a lifecycle.
 //!
-//! `chunk` streams content-defined chunks from retained local files; `staged` is the atomic-write
-//! staging handle (same-directory temp file, fsync, rename);
-//! `lock` is the generational root lease ledger. Named `fs::staged` rather than `atomic` because
-//! `crate::atomic` read as `std::sync::atomic`, which several of these modules also import.
-//! `vfs` is the virtual filesystem a sync root lives on — local disk today, SMB/SFTP/FTP
-//! backends behind the same trait; its write side wraps `staged` rather than reimplementing it.
-//! `ssh` is the authenticated session both things that ride ssh share: the `sftp://` backend and
-//! `transfer::peer`'s peer lane, which used to reach the same hosts with the same keys by two
-//! different means. `watch` owns optional local change triggers; their events wake a compare but
-//! never replace a verified filesystem snapshot.
+//! `chunk` streams content-defined chunks, `staged` owns atomic local writes, `lock` owns root
+//! leases, and `vfs` provides local and protocol backends. `ssh` is shared by SFTP and peer
+//! execution. `watch` may trigger Compare but never replaces a verified snapshot.
 
 pub mod chunk;
 pub mod local_root;

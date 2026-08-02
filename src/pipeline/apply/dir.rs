@@ -4,9 +4,7 @@
 //! excluded by the filter, or a file appeared after the scan. The engine walks it to find out
 //! which, so the report names the reason instead of just "failed".
 
-/// Classified outcome of a failed directory deletion (P0-4).
-/// This used to be `Err(_) => Ok(())`: safe behavior (no recursive delete) but **completely silent** —
-/// the user sees "0 errors" while the directory is still there, the next comparison emits the same DeleteDir again, and it never converges.
+/// Classified outcome of a directory deletion attempt.
 pub(super) enum DirOutcome {
     Removed,
     /// It was never there in the first place

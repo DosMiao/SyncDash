@@ -510,6 +510,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "native FSEvents delivery acceptance; run explicitly on macOS"]
     fn pair_is_armed_before_a_post_start_change_is_received() {
         let base = std::env::temp_dir().join(format!(
             "syncdash-fsevents-pair-{}-{:?}",

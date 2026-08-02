@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn rdelta_roundtrip_bytes() {
-        let old = vec![7u8; 6 * 1024 * 1024];
+        let old = vec![7u8; crate::model::chunk::DELTA_MIN_SIZE as usize + 256 * 1024];
         let mut new = old.clone();
         for byte in new.iter_mut().take(3_004_096).skip(3_000_000) {
             *byte = 9;

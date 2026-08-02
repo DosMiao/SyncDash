@@ -14,7 +14,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub struct MigrateReport {
     #[ts(type = "number")]
     pub moved: u64,

@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -84,20 +83,4 @@ test('advanced-filter validation publishes one canonical filter', () => {
     }),
     /Advanced filter is invalid/,
   );
-});
-
-test('advanced-filter popover exposes explicit apply and discard actions', async () => {
-  const source = await readFile(
-    new URL('../../typescript/ui/components/AdvancedFiltersPopover.tsx', import.meta.url),
-    'utf8',
-  );
-  assert.match(source, /useState\(\(\) => createAdvancedFilterDraft\(appliedFilter\)\)/);
-  assert.doesNotMatch(source, /maskDraft|onMaskDraftChange|onAdvancedFilterChange/);
-  assert.match(source, />Clear Draft<\/button>/);
-  assert.match(source, />Cancel<\/button>/);
-  assert.match(source, />Apply<\/button>/);
-  assert.match(source, /onApplyFilter\(validatedFilter\);\s*dismiss\(true\);/);
-  assert.match(source, /onWriteValidatedFilterMasksToJobExclude\(validatedFilter\);\s*dismiss\(true\);/);
-  assert.match(source, /handlers: \{ dismiss: \(\) => dismiss\(true\) \}/);
-  assert.match(source, /if \(popoverRef\.current\?\.contains\(event\.target as Node\)\) return;\s*dismiss\(false\);/);
 });

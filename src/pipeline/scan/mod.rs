@@ -132,8 +132,7 @@ pub fn scan_with_progress(
     scan_local_path(root, opt, progress, None)
 }
 
-/// v0.9 M1 unified-foundation entry point: cancel/pause/ProgressEvent event stream (see progress.rs).
-/// The legacy ScanProgress callback and event-stream path share the same scan_impl.
+/// Scan with cooperative run control and progress events.
 pub fn scan_ctx(
     root: &Path,
     opt: &ScanOptions,
@@ -301,7 +300,7 @@ mod tests {
 
     #[test]
     fn local_large_file_reports_intermediate_hash_bytes() {
-        const SIZE: usize = 17 * 1024 * 1024;
+        const SIZE: usize = 9 * 1024 * 1024;
         let root = std::env::temp_dir().join(format!(
             "syncdash-local-chunk-progress-{}",
             std::process::id()
@@ -315,11 +314,6 @@ mod tests {
         let ctx = RunCtx::new(
             RunCtl::new(),
             Arc::new(move |event| {
-                if matches!(&event, ProgressEvent::Totals { reset: true, .. }) {
-                    // The discovery event may have just consumed the progress throttle window.
-                    // Make the first hash chunk observable without relying on disk speed.
-                    std::thread::sleep(std::time::Duration::from_millis(110));
-                }
                 copy.lock().unwrap().push(event);
             }),
         );
@@ -386,9 +380,6 @@ mod tests {
         let ctx = RunCtx::new(
             RunCtl::new(),
             Arc::new(move |event| {
-                if matches!(&event, ProgressEvent::Totals { reset: true, .. }) {
-                    std::thread::sleep(std::time::Duration::from_millis(110));
-                }
                 copy.lock().unwrap().push(event);
             }),
         );

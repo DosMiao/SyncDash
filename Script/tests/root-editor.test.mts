@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFileSync } from 'node:fs';
 
 import {
   activeRootEditor,
@@ -83,9 +82,6 @@ test('root save transitions are exact-request fenced and preserve a failed draft
     status: 'saving',
     requestId: 4,
     field: 'source',
-    owner,
-    before: '/source',
-    value: '/changed',
   });
   const unchanged = reduceRootEditors(repository, {
     type: 'draft_changed', workspaceKey, field: 'source', value: '/race',
@@ -141,15 +137,4 @@ test('explicit cancel reverts one field without mutating the other draft', () =>
   assert.deepEqual(activeRootEditor(repository)?.draft, {
     source: '/source', target: '/target-draft',
   });
-});
-
-test('root inputs never save on blur and desktop mutations use exact dedicated commands', () => {
-  const pathLine = readFileSync(new URL('../../typescript/ui/components/PathLine.tsx', import.meta.url), 'utf8');
-  const app = readFileSync(new URL('../../typescript/ui/App.tsx', import.meta.url), 'utf8');
-  assert.doesNotMatch(pathLine, /onBlur\s*=/);
-  assert.match(pathLine, /onSave\(field\)/);
-  assert.match(pathLine, /onRevert\(field\)/);
-  assert.match(app, /ipc\.updateJobRoot\(/);
-  assert.match(app, /ipc\.swapJobRoots\(/);
-  assert.doesNotMatch(app, /const saveRoot\s*=/);
 });

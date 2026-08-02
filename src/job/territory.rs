@@ -1,15 +1,7 @@
-//! v0.5: interop with the `.ffs-sync` marker of the CodeSync ecosystem.
-//! Marker semantics (see the win-mac sync architecture): a directory containing a `.ffs-sync` file = a sync territory.
-//! - find_territories: scan for markers, emit territory paths relative to the root
-//! - gen_jobs: generate one syncdash job per territory (cs-<slug>.toml, sync mode by default + an automatic archive path),
-//!   same origin and same meaning as FFS's Update-CodeSyncConfig.ps1 — CodeSync, the syncdash edition.
+//! Interop with CodeSync `.ffs-sync` territory markers.
 //!
-//! **A re-run does not overwrite a job that already exists** (pass `force` to say otherwise). It used to,
-//! and that was a quiet way to lose data: the generator writes a junk-preset selection into `exclude`, so
-//! a person who opened the editor and removed `*/build/` because their tree really has a `build/` folder
-//! of work got that exclusion silently reinstated the next time anyone ran gen-jobs. A filter nobody
-//! chose, reappearing without a word, is exactly the shape that quietly stops backing something up.
-//! Generating is therefore a one-time seed per territory; after that the job file belongs to its owner.
+//! Discovery returns marker directories relative to the root. Generation seeds one sync-mode job
+//! per territory and never overwrites an existing job unless `force` is explicit.
 
 use crate::job::Job;
 use std::path::{Path, PathBuf};

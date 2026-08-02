@@ -14,7 +14,8 @@ use crate::job::rigor::RigorResolved;
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub struct Job {
     /// Job-file schema version. A missing key means v1; load runs each one-way migration in order,
     /// while every current save stamps `SCHEMA` and serializes only current fields.
@@ -30,7 +31,6 @@ pub struct Job {
     pub mode: String,
     /// Root phrase: a local path, or `scheme://…` for a VFS root (sftp/ftp/ftps/smb).
     /// Plain strings so a phrase survives serde untouched; `vfs::spec::parse` routes it.
-    /// Serialized form is identical to the old PathBuf fields — existing job files load as-is.
     pub source: String,
     /// One source → one or more targets. Each target owns its own comparison, plan, and execution.
     /// The persisted current schema requires at least one entry; schema v1–v3 scalar `target`
@@ -46,12 +46,8 @@ pub struct Job {
     /// Excludes (FFS filter syntax, e.g. `big_temp/`, `*.log`; a leading `*` means any depth;
     /// a leading `!` makes the line an exception).
     ///
-    /// **This is the whole exclude policy** apart from the tool's own metadata. The junk presets
-    /// (Windows / macOS / Developer / …) write their patterns into this very list, so what the editor
-    /// shows here is what the filter does — there is no second set of rules applied behind it.
-    ///
-    /// Do not put a mask's star-slash sequence on this line: ts-rs copies this doc verbatim into the
-    /// generated JSDoc, and those two characters would end the comment block early, yielding invalid .ts.
+    /// This is the complete user-visible exclude policy. Junk presets write their patterns here
+    /// rather than applying hidden rules.
     #[serde(default)]
     pub exclude: Vec<String>,
     /// Rigor-level **shortcut preset**: quick | fast | balanced | standard | paranoid | custom.
@@ -127,11 +123,7 @@ pub struct Job {
 impl Default for Job {
     fn default() -> Self {
         Job {
-            // SCHEMA, **not** `default_schema()`: those two mean opposite things and conflating them is
-            // a live bug. `default_schema()` answers "this file has no schema key, so it predates the
-            // presets — migrate it"; a Job built here and now is current by construction. Getting this
-            // wrong made every job written straight to TOML (gen-jobs) come back through the v1
-            // migration on load and silently acquire preset patterns nobody selected.
+            // New jobs are current; default_schema() is only the serde fallback for unversioned files.
             schema: SCHEMA,
             job_id: String::new(),
             mode: "mirror".into(),
@@ -139,8 +131,7 @@ impl Default for Job {
             targets: vec![String::new()],
             archive: None,
             include: Vec::new(),
-            // A new job is born with the default-on junk presets already **written out** in exclude,
-            // which is what `os_excludes = "auto"` used to mean invisibly
+            // Presets are materialized so the editor and engine share one exclude policy.
             exclude: crate::job::junk::default_junk_patterns(),
             rigor: default_rigor(),
             evidence: None,
@@ -175,7 +166,7 @@ fn default_true() -> bool {
 /// "this file predates the rule", which no amount of inspecting the contents can.
 pub const SCHEMA: u32 = 4;
 fn default_schema() -> u32 {
-    1 // no `schema` key in the file = written before versioning existed = needs the v1 migration
+    1
 }
 
 /// Stable identity of one effective job configuration.
@@ -1092,7 +1083,8 @@ fn load_registered_path(path: &Path) -> std::io::Result<(String, Job)> {
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub enum JobMutationEffect {
     Created,
     Updated,
@@ -1103,7 +1095,8 @@ pub enum JobMutationEffect {
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub enum JobRootField {
     Source,
     Target,
@@ -1660,7 +1653,7 @@ mod migration_tests {
     const HEAD: &str = "mode = 'mirror'\nsource = 'S'\ntarget = 'T'\n";
 
     #[test]
-    fn legacy_presets_land_in_exclude_and_filter_identically() {
+    fn v1_migration_is_ordered_idempotent_and_preserves_user_rules() {
         // os_excludes = "auto" + dev_excludes = true, the shape `gen-jobs` wrote for every cs-* job
         let j = load_text(
             "auto-dev",
@@ -1689,16 +1682,11 @@ mod migration_tests {
             PathFilter::build(&[], &j.exclude).pass_file("a/Thumbs.db"),
             "'mac' must not drag Windows in"
         );
-    }
 
-    #[test]
-    fn migration_keeps_the_users_own_lines_and_never_duplicates() {
         let j = load_text(
             "mixed",
-            // Single-quoted TOML is literal — this reaches the job as one backslash, the Windows spelling
             &format!("{HEAD}os_excludes = 'windows'\nexclude = ['*/big_temp/', '*\\Thumbs.db', '!*/keep.log']\n"),
         );
-        // The user had already written Thumbs.db by hand (backslash, different case): one line, not two
         assert_eq!(
             j.exclude
                 .iter()
@@ -1715,13 +1703,7 @@ mod migration_tests {
             pf.pass_file("x/keep.log"),
             "the ! exception must survive the migration"
         );
-    }
 
-    /// The regression this whole version field exists to prevent: once migrated, a user who deletes a
-    /// preset line must find it still gone next time. A load that "helpfully" restores it is a filter
-    /// that silently disagrees with what the editor shows.
-    #[test]
-    fn a_v2_job_is_never_re_migrated() {
         let j = load_text(
             "v2",
             &format!("schema = 2\n{HEAD}exclude = ['*/only_this/']\n"),
@@ -1736,6 +1718,15 @@ mod migration_tests {
             j.exclude.is_empty(),
             "an empty exclude in a v2 file means empty"
         );
+
+        let j = load_text(
+            "v1-peer",
+            "mode = 'mirror'\nsource = 'S'\ntarget = 'T'\nos_excludes = 'windows'\n\
+             remote_host = 'mac'\nremote_root = '/Users/ben/x'\n",
+        );
+        assert_eq!(j.schema, SCHEMA);
+        assert_eq!(j.exclude, expand_junk_presets(["windows"]));
+        assert_eq!(j.targets, vec!["peer://mac/Users/ben/x|mount=T"]);
     }
 
     /// v2 → v3 must keep a peer job doing exactly what it did. The subtle half is `mount=`: a v2
@@ -1765,36 +1756,28 @@ mod migration_tests {
         assert_eq!(r.root, "Users/ben/Code/x");
         assert_eq!(r.opt("exe"), Some("~/bin/syncdash"));
         assert_eq!(r.opt("mount"), Some(r"\\mac\share\x"));
-    }
 
-    #[test]
-    fn a_peer_job_without_an_exe_or_a_mount_migrates_to_the_bare_phrase() {
-        let j = load_text(
+        let bare = load_text(
             "v2-peer-bare",
             "schema = 2\nmode = 'mirror'\nsource = 'D:\\Code\\x'\ntarget = ''\n\
              remote_host = 'mac'\nremote_root = '/Users/ben/x'\n",
         );
         assert_eq!(
-            j.targets,
+            bare.targets,
             vec!["peer://mac/Users/ben/x".to_string()],
             "no exe and no mount = nothing to declare"
         );
-    }
 
-    /// A v2 job with no peer keeps its target untouched — the migration must not touch the
-    /// overwhelming majority of jobs, which are plain local-to-local.
-    #[test]
-    fn a_v2_job_without_a_peer_keeps_its_target() {
-        let j = load_text(
+        let local = load_text(
             "v2-nopeer",
             "schema = 2\nmode = 'mirror'\nsource = 'S'\ntarget = 'T'\n",
         );
-        assert_eq!(j.targets, vec!["T"]);
-        assert!(!crate::fs::vfs::spec::is_peer(&j.targets[0]));
+        assert_eq!(local.targets, vec!["T"]);
+        assert!(!crate::fs::vfs::spec::is_peer(&local.targets[0]));
     }
 
     #[test]
-    fn v3_target_storage_migrates_to_one_canonical_list() {
+    fn v3_storage_and_runtime_policy_migrate_to_current_fields() {
         let scalar = load_text(
             "v3-scalar-target",
             "schema = 3\nmode = 'mirror'\nsource = 'S'\ntarget = 'T'\n",
@@ -1811,10 +1794,7 @@ mod migration_tests {
         let serialized = toml::to_string_pretty(&list).unwrap();
         assert!(serialized.contains("targets = ["));
         assert!(!serialized.lines().any(|line| line.starts_with("target = ")));
-    }
 
-    #[test]
-    fn v3_watch_and_no_hash_settings_migrate_to_canonical_policy() {
         let migrated = load_text(
             "v3-canonical-policy",
             "schema = 3\nmode = 'mirror'\nsource = 'S'\ntarget = 'T'\n\
@@ -1838,7 +1818,7 @@ mod migration_tests {
     }
 
     #[test]
-    fn current_schema_refuses_missing_target_authority() {
+    fn unsupported_current_and_future_shapes_are_refused() {
         let path = std::env::temp_dir().join(format!(
             "syncdash-job-v4-missing-targets-{}.toml",
             crate::foundation::time::now_ms()
@@ -1847,10 +1827,7 @@ mod migration_tests {
         let error = load(&path.to_string_lossy()).unwrap_err();
         let _ = std::fs::remove_file(path);
         assert!(error.to_string().contains("requires at least one target"));
-    }
 
-    #[test]
-    fn future_schema_is_refused_instead_of_downgraded() {
         let path = std::env::temp_dir().join(format!(
             "syncdash-job-future-schema-{}.toml",
             crate::foundation::time::now_ms()
@@ -1863,29 +1840,6 @@ mod migration_tests {
         let error = load(&path.to_string_lossy()).unwrap_err();
         let _ = std::fs::remove_file(path);
         assert!(error.to_string().contains("schema v5 is newer"));
-    }
-
-    /// A v1 peer job has to pass through BOTH migrations. This is what the per-version guards buy:
-    /// the junk migration used to stamp `SCHEMA` itself, which would now carry a v1 file straight
-    /// past the peer migration and leave it with a target nothing routes.
-    #[test]
-    fn a_v1_peer_job_runs_every_migration_in_order() {
-        let j = load_text(
-            "v1-peer",
-            "mode = 'mirror'\nsource = 'S'\ntarget = 'T'\nos_excludes = 'windows'\n\
-             remote_host = 'mac'\nremote_root = '/Users/ben/x'\n",
-        );
-        assert_eq!(j.schema, SCHEMA);
-        assert_eq!(
-            j.exclude,
-            expand_junk_presets(["windows"]),
-            "the v1 junk migration still ran"
-        );
-        assert_eq!(
-            j.targets,
-            vec!["peer://mac/Users/ben/x|mount=T".to_string()],
-            "…and so did the v2 one"
-        );
     }
 
     /// A Job built in memory and written straight to TOML — which is what `gen-jobs` does, bypassing
@@ -2578,21 +2532,7 @@ mod rigor_tests {
     }
 
     #[test]
-    fn presets_map_to_expected_knobs() {
-        let q = job("quick").rigor_resolved();
-        assert!(!q.hash && !q.use_cache && !q.verify_writes);
-        let f = job("fast").rigor_resolved();
-        assert!(f.hash && f.sampled && f.use_cache && f.escalate && !f.verify_writes);
-        let b = job("balanced").rigor_resolved();
-        assert!(b.hash && b.sampled && b.use_cache && b.escalate && b.verify_writes);
-        let s = job("standard").rigor_resolved();
-        assert!(s.hash && s.sampled && !s.use_cache && s.escalate && s.verify_writes);
-        let p = job("paranoid").rigor_resolved();
-        assert!(p.hash && !p.sampled && !p.use_cache && p.verify_writes);
-    }
-
-    #[test]
-    fn detail_overrides_beat_preset() {
+    fn job_resolution_applies_detail_overrides() {
         let mut j = job("fast");
         j.evidence = Some("full".into());
         j.use_cache = Some(false);

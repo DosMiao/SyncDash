@@ -36,15 +36,13 @@ use keys::{evidence_missing, files_equal, generation_of, map_of};
 use moves::{detect_moves, move_reason};
 use name_rules::name_rules_of;
 
-/// Conflict handling policy. Default is Report (report only, never arbitrate automatically) — this is
-/// what SyncDash stands on; aligning with syncthing does not change the default.
+/// Conflict handling policy. The default reports conflicts without arbitration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictPolicy {
     /// Report only; a human handles it
     Report,
-    /// The loser is renamed to `<name>.sync-conflict-<ts>-<host><ext>`, the winner lands
-    /// (syncthing `conflictName`, `lib/model/folder_sendrecv.go:2219`)
+    /// Preserve the loser as `<name>.sync-conflict-<ts>-<host><ext>`.
     Copy,
     /// Newer mtime wins; the older one is simply overwritten (no copy kept)
     Newer,
@@ -79,8 +77,7 @@ impl Default for CompareOptions {
     }
 }
 
-/// Conflict-copy name: `report.pdf` → `report.sync-conflict-20260726-143000-WIN01.pdf`
-/// (isomorphic to syncthing's naming, so a human recognizes it at a glance and both sides' filters can spot it)
+/// Conflict-copy name: `report.pdf` → `report.sync-conflict-20260726-143000-WIN01.pdf`.
 pub fn conflict_name(path: &str, host: &str, at_ms: u64) -> String {
     let (dir, base) = split_parent(path);
     // split_ext only recognizes the extension after the last dot; a hidden file (.gitignore) counts wholly as the stem
@@ -90,7 +87,7 @@ pub fn conflict_name(path: &str, host: &str, at_ms: u64) -> String {
     format!("{dir}{stem}{CONFLICT_INFIX}{ts}-{host}{ext}")
 }
 
-/// A conflict copy must not itself take part in sync/conflict decisions (syncthing `isConflict`, :2224)
+/// Conflict copies never participate in conflict decisions.
 pub fn is_conflict_copy(path: &str) -> bool {
     base_name(path).contains(CONFLICT_INFIX)
 }
@@ -329,7 +326,7 @@ pub fn compare(
                             continue;
                         }
                         if has_archive {
-                            // P1-3: don't only ask "is it equal to the archive's current generation" — look at historic generations too.
+                            // Historic generations distinguish a lagging side from a concurrent edit.
                             // One side merely being **behind** (stuck on some old version) is not a concurrent edit —
                             // syncthing achieves the same thing with PreviousBlocksHash
                             // (`lib/protocol/bep_fileinfo.go:200-207`).
@@ -714,7 +711,7 @@ pub fn compare(
         }
     }
 
-    // unix permission bits (P2-4)
+    // Unix permission bits.
     // Only done when both sides are unix and the job explicitly enabled sync_mode: the Windows side has no mode,
     // so leaving it on would report a difference on every compare. Previously mode was only recorded into the snapshot
     // table and never took part in the compare, so scripts synced over the mounted-drive path lost their exec bit (the pack path did restore it — the two paths behaved differently).
@@ -775,12 +772,9 @@ pub fn compare(
         }
     }
 
-    // Write-collision preflight in case-sensitive mode (P2-3)
-    // With case_sensitive = true the compare key distinguishes case, but the underlying NTFS/APFS usually does **not**:
-    // writing `Foo.txt` to target would silently overwrite the existing `foo.txt`. syncthing resolves
-    // the directory's real name before writing and raises CaseConflictError (`lib/fs/casefs.go:27-37`); we catch it at plan time.
+    // A case-sensitive comparison may still target case-insensitive storage. Reject folded-name
+    // collisions except when the existing entry is the source of the planned case-only rename.
     if !ci {
-        // fold = foundation::text::fold, the very same normalization implementation the compare key norm_key uses
         let mut folded: HashMap<(bool, String), Vec<&str>> = HashMap::new();
         for (is_target, snap) in [(false, source), (true, target)] {
             for e in &snap.entries {
@@ -797,8 +791,6 @@ pub fn compare(
             }
             let is_target = op.side == Side::Target;
             if let Some(existing) = folded.get(&(is_target, fold(&op.path))) {
-                // When a Move's from IS that "colliding" file, this is precisely a **case rename**
-                // (`readme.md` → `Readme.md`) — the correct product of move detection, not a collision accident.
                 let from = op.from.as_deref();
                 if let Some(other) = existing
                     .iter()
@@ -815,11 +807,8 @@ pub fn compare(
         }
     }
 
-    // Conflict policy (P1-2)
-    // Default Report: report only, a human handles it — this is what SyncDash stands on; unchanged.
-    // Copy/Newer are explicit opt-ins, so that in everyday two-machine use one conflict doesn't wedge a file until the end of time.
-    // Only **content conflicts** are handled (both sides have the file and both changed it); delete-vs-edit conflicts and
-    // illegal-on-windows always stay Report — automatically arbitrating "delete or keep" is too dangerous.
+    // Automatic policies resolve content conflicts only. Delete/edit and illegal-name conflicts
+    // remain reports because choosing either side can destroy data.
     if copts.conflict != ConflictPolicy::Report {
         const RESOLVABLE: [&str; 3] = ["both-changed", "differs-no-archive", "symlink-differs"];
         let now = now_ms();
@@ -1258,7 +1247,7 @@ mod tests {
             .collect()
     }
 
-    // P2-5: empty files / ambiguous pairing
+    // Empty files and ambiguous move pairing.
 
     #[test]
     fn empty_files_are_never_paired_as_moves() {
@@ -1361,7 +1350,7 @@ mod tests {
         );
     }
 
-    // P1-3: multi-generation archive attribution
+    // Multi-generation archive attribution.
 
     #[test]
     fn a_side_that_is_merely_behind_is_not_a_conflict() {
@@ -1432,7 +1421,7 @@ mod tests {
         assert_eq!(same_history[0].digest(), Some(&digest("H0")));
     }
 
-    // P1-2: conflict copies
+    // Conflict copies.
 
     #[test]
     fn conflict_policy_report_is_the_default_and_changes_nothing() {
@@ -1609,7 +1598,7 @@ mod tests {
         );
     }
 
-    // P2-4: unix permission bits
+    // Unix permission bits.
 
     #[test]
     fn mode_only_difference_produces_a_chmod_not_a_recopy() {
@@ -1683,7 +1672,7 @@ mod tests {
         );
     }
 
-    // P2-3: case collisions
+    // Case collisions.
 
     #[test]
     fn case_sensitive_mode_flags_a_write_that_would_clobber_a_case_twin() {

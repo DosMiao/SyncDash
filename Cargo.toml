@@ -8,6 +8,9 @@ edition = "2021"
 rust-version = "1.89"
 description = "Table-driven multi-node file sync: scan -> compare -> plan -> apply, with real move detection"
 
+[features]
+export-types = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,10 +32,7 @@ unicode-normalization = "0.1"
 rayon = "1"
 tar = "0.4"
 fastcdc = "3"
-# Rust → TypeScript type generation. The frontend used to hand-copy 17 Rust types into 26 mirrors
-# (`Job` alone had 4: Rust struct / JobFull / ED_FIELDS / defaultJob()), with no codegen and no
-# checking — the drift had already produced a real bug (`OpDto` was missing `link`, so symlink ops
-# silently degraded into content copies). Export directory: see `.cargo/config.toml`.
+# Rust → TypeScript wire contracts. `export-types` keeps generation out of normal tests.
 ts-rs = { version = "12", features = ["serde-compat", "no-serde-warnings"] }
 
 # OS credential store (Windows Credential Manager / macOS Keychain). Job files carry zero

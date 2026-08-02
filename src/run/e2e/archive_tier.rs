@@ -16,11 +16,11 @@ use super::*;
 use crate::fs::vfs::memory::MemVfs;
 use crate::fs::vfs::{Support, Vfs};
 
-/// 6 MiB, so it is over the 4 MiB sampling floor and actually gets sampled evidence.
+/// Exactly the 4 MiB sampling floor.
 const BIG: Seed = Seed {
     path: "big/handbook.bin",
     seed: 20,
-    size: 6 * 1_048_576,
+    size: 4 * 1_048_576,
     mtime_ms: 1_767_225_600_000,
 };
 

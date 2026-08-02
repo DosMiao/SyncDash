@@ -1,11 +1,7 @@
-//! v0.10: app-level settings.
+//! Application settings stored at `<config>/settings.toml`.
 //!
-//! Until now the project had only per-job TOML (`config.rs`) and frontend localStorage — "a
-//! configurable log directory" needs an app-level home, and this is the first one. Location:
-//! `<config>/settings.toml`, alongside the jobs directory.
-//!
-//! Same rule as `runlog`: **failing to read settings must never block a sync**. A parse failure or an
-//! unwritable directory always falls back to a usable value and leaves a log line — never propagates up.
+//! Read or write failures never block synchronization; callers receive usable defaults and log the
+//! failure.
 
 use crate::model::event::LogLevel;
 use serde::{Deserialize, Serialize};
@@ -16,7 +12,8 @@ pub const MAX_KEEP_DAYS: u64 = 36_500;
 pub const MAX_TOTAL_MB: u64 = 1_048_576;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub struct AppSettings {
     /// Empty = default `<config>/logs`
     #[serde(default)]
@@ -36,7 +33,7 @@ pub struct AppSettings {
     /// No `full` tier: watch on a 30s cycle = 2880 runs a day, and creating a directory each time would swamp the log disk.
     #[serde(default = "default_log_compare")]
     pub log_compare: String,
-    /// CLI: also mirror log lines verbatim to stderr (keeps the pre-refactor terminal experience)
+    /// Also mirror CLI log lines to stderr.
     #[serde(default = "default_true")]
     pub mirror_stderr: bool,
 }

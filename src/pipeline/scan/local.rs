@@ -331,8 +331,7 @@ pub(crate) fn scan_local_root_impl(
                     dataless_files += 1;
                 }
                 let size = item.size;
-                // P1-4: the filesystem once stored a different value than the mtime we asked for (FAT's 2-second granularity
-                // / SMB truncation); convert it back to what we meant so compare need not lean on a tolerance
+                // Translate a known rounded on-disk mtime back to the intended value.
                 let raw_mt = item.mtime_ms;
                 let mt = match mtime_fixes.get(&relative_text) {
                     Some((ondisk, intended)) if *ondisk == raw_mt => {
@@ -440,9 +439,7 @@ pub(crate) fn scan_local_root_impl(
         }
     }
 
-    // The totals are known the moment the walk ends (the P2-6 insight): items = file count; bytes = the part that really has to be read off disk and hashed.
-    // The item counter shifts gears: during the walk it counts "how many were found", during hashing it restarts from zero counting "how many are done"
-    // —— otherwise the UI would sit at N/N from the very start of hashing.
+    // Hashing restarts the item counter at zero; the walk's discovered count is its new total.
     let bytes_to_hash: u64 = if opt.hash {
         pending
             .iter()

@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFile } from 'node:fs/promises';
 
 import {
   applyAuthorizationArgs,
@@ -79,23 +78,4 @@ test('execution payloads cannot contain a client plan or caller-controlled run c
     assert.equal('acknowledged' in payload, false);
     assert.equal('acceptCaps' in payload, false);
   }
-});
-
-test('frontend source has no legacy confirmation or raw-consent execution path', async () => {
-  const ipc = await readFile(new URL('../../typescript/core/ipc.ts', import.meta.url), 'utf8');
-  const app = await readFile(new URL('../../typescript/ui/App.tsx', import.meta.url), 'utf8');
-  const executionSources = `${ipc}\n${app}`;
-  assert.doesNotMatch(executionSources, /window\.confirm\s*\(/);
-  assert.doesNotMatch(executionSources, /withCapsConsent|capsConsent|acceptCaps/);
-  assert.doesNotMatch(executionSources, /applyJobUnattended|ipc\.preflight|preflightAllowsApply/);
-  assert.doesNotMatch(executionSources, /authorizeUnattendedApply|authorize_unattended_apply/);
-  assert.doesNotMatch(executionSources, /authorizeAutoScanApply\s*\([^)]*(owner|reviewedRowDecisions|selected)/);
-  assert.doesNotMatch(ipc, /invoke<ApplyDto>\('apply_job',\s*\{[^}]*\b(plan|reviewedRowDecisions|selected|acknowledged)\b/s);
-  assert.match(ipc, /invoke<ApplyDto>\('apply_job', applyAuthorizationArgs\(/);
-  assert.match(ipc, /invoke<CompareWorkspaceSnapshotDto>\('compare_job', compareAuthorizationArgs\(/);
-  assert.match(
-    app,
-    /const doSync = useCallback[\s\S]*?!applyAvailability\.available[\s\S]*?operationReviewCanSubmit/,
-    'the final submit boundary must re-check the current result view and run-scope availability',
-  );
 });

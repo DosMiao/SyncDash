@@ -55,19 +55,11 @@ export function loadProgressPreferences(storage: PreferenceStorage): StoredProgr
       const legacyWhenFinished = storage.getItem(LEGACY_WHEN_FINISHED_PREFERENCE_KEY);
       if (legacyWhenFinished !== null && isWhenFinishedAction(legacyWhenFinished)) {
         whenFinishedAction = legacyWhenFinished;
-        let migrationPersisted = false;
         try {
           storage.setItem(WHEN_FINISHED_PREFERENCE_KEY, legacyWhenFinished);
-          migrationPersisted = true;
+          storage.removeItem(LEGACY_WHEN_FINISHED_PREFERENCE_KEY);
         } catch (error) {
           failures.push(`Could not migrate the When-finished preference: ${String(error)}`);
-        }
-        if (migrationPersisted) {
-          try {
-            storage.removeItem(LEGACY_WHEN_FINISHED_PREFERENCE_KEY);
-          } catch (error) {
-            failures.push(`Could not remove the migrated When-finished preference: ${String(error)}`);
-          }
         }
       } else if (legacyWhenFinished !== null) {
         failures.push('Legacy When-finished preference is invalid and was ignored');

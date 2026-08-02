@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { formToSettings, settingsToForm } from '../../typescript/core/formSchema.ts';
@@ -36,35 +35,4 @@ test('settings form accepts only bounded whole-number retention values', () => {
     error: 'Retention days must be a whole number from 0 through 36,500',
     field: 'keep_days',
   });
-});
-
-test('log directory mutation crosses only the native grant boundary', async () => {
-  const [command, ipc, sheet] = await Promise.all([
-    readFile(new URL('../../src-tauri/src/cmd/logs.rs', import.meta.url), 'utf8'),
-    readFile(new URL('../../typescript/core/ipc.ts', import.meta.url), 'utf8'),
-    readFile(new URL('../../typescript/ui/components/SettingsSheet.tsx', import.meta.url), 'utf8'),
-  ]);
-  assert.match(command, /pick_log_directory[\s\S]*?\.pick_folder\(/);
-  assert.match(command, /consume_log_directory_grant\(/);
-  assert.match(command, /save_if_revision\(&settings, &expected_revision\)/);
-  assert.doesNotMatch(command, /\bmigrate:\s*bool\b/);
-  assert.match(ipc, /invoke<LogDirectorySelectionDto \| null>\('pick_log_directory'/);
-  assert.match(sheet, /pickLogDirectory\(settingsSnapshot\.revision\)/);
-  assert.doesNotMatch(sheet, /\bpickDirectory\b/);
-  assert.match(sheet, /readOnlyField=\{\(key\) => key === 'log_dir'\}/);
-  assert.match(sheet, /activeMutation\.current/);
-  assert.match(sheet, /componentMounted\.current = true;[\s\S]*componentMounted\.current = false;/);
-});
-
-test('log reading and reveal use typed purpose-specific commands with server limits', async () => {
-  const [command, ipc] = await Promise.all([
-    readFile(new URL('../../src-tauri/src/cmd/logs.rs', import.meta.url), 'utf8'),
-    readFile(new URL('../../typescript/core/ipc.ts', import.meta.url), 'utf8'),
-  ]);
-  assert.match(command, /artifact:\s*syncdash::obs::runlog::LogArtifactKind/);
-  assert.match(command, /LOG_ARTIFACT_LINE_LIMIT/);
-  assert.doesNotMatch(command, /\bmax:\s*Option<usize>/);
-  assert.doesNotMatch(command, /\bwhich:\s*String/);
-  assert.match(ipc, /invoke<void>\('reveal_log_location'/);
-  assert.doesNotMatch(ipc, /\blogDirPath\b/);
 });

@@ -23,7 +23,8 @@ pub const MTIME_SLACK_MS: i64 = 2000;
 pub const PLAN_SCHEMA: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     Copy,
@@ -39,7 +40,8 @@ pub enum Action {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
     Source,
@@ -47,7 +49,8 @@ pub enum Side {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub struct Op {
     pub side: Side,
     pub action: Action,
@@ -73,7 +76,8 @@ pub struct Op {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub struct PlanHeader {
     pub schema: u32,
     pub kind: String,

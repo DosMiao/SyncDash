@@ -1,30 +1,25 @@
 #!/usr/bin/env node
-// The single entry point for Rust → TypeScript type generation.
-//
-//   node Script/gen-types.mjs
-//
-// Two steps:
-//   1. `cargo test export_bindings` — ts-rs exports from inside tests (see the
-//      `#[ts(export, export_to = ...)]` on each type); the export directory is pinned at the
-//      workspace root by TS_RS_EXPORT_DIR in `.cargo/config.toml`.
-//   2. Sanitize the output — ts-rs copies Rust doc comments verbatim into JSDoc, and a lot of the
-//      docs here describe FFS filter syntax (`*/big_temp/`, `*/*.log`). That literal `*/`
-//      **terminates the JSDoc block early**, producing syntactically invalid .ts. This escapes
-//      in-block `*/` to `*\/` (JSDoc still renders it as `*/`, but it no longer ends the block),
-//      and removes trailing whitespace emitted around multiline struct fields.
-//
-// Never hand-edit anything under typescript/core/types/generated/.
+// Generate Rust-owned TypeScript contracts, then sanitize ts-rs JSDoc and whitespace.
+// Never edit typescript/core/types/generated/ by hand.
 
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const genDir = join(repoRoot, "typescript", "core", "types", "generated");
+const checkOnly = process.argv.includes("--check");
+const scratch = checkOnly ? mkdtempSync(join(tmpdir(), "syncdash-types-")) : null;
+const outputDir = scratch ? join(scratch, "typescript", "core", "types", "generated") : genDir;
 
 function run(args) {
-  execFileSync("cargo", args, { cwd: repoRoot, stdio: "inherit" });
+  execFileSync("cargo", args, {
+    cwd: repoRoot,
+    stdio: "inherit",
+    env: { ...process.env, TS_RS_EXPORT_DIR: join(scratch ?? repoRoot, "bindings") },
+  });
 }
 
 // Escape star-slash sequences inside a doc block; the real terminator line (those two characters alone) is left as is.
@@ -53,20 +48,42 @@ function sanitize(text) {
   return out.join("\n").replace(/[ \t]+$/gm, "");
 }
 
-console.log("[1/2] cargo test export_bindings …");
-run(["test", "--workspace", "--quiet", "export_bindings"]);
-
-console.log("[2/2] sanitizing generated output …");
-let touched = 0;
-for (const name of readdirSync(genDir)) {
-  if (!name.endsWith(".ts")) continue;
-  const p = join(genDir, name);
-  const before = readFileSync(p, "utf8");
-  const after = sanitize(before);
-  if (after !== before) {
-    writeFileSync(p, after);
-    touched++;
-    console.log(`      fixed ${name}`);
-  }
+function typeFiles(directory) {
+  return readdirSync(directory).filter((name) => name.endsWith(".ts")).sort();
 }
-console.log(`done: ${readdirSync(genDir).filter((f) => f.endsWith(".ts")).length} types, ${touched} needed sanitizing.`);
+
+try {
+  console.log("[1/2] exporting Rust wire types …");
+  run(["test", "--workspace", "--quiet", "--lib", "--bins", "--features", "export-types", "export_bindings"]);
+
+  console.log("[2/2] sanitizing generated output …");
+  let touched = 0;
+  for (const name of typeFiles(outputDir)) {
+    const path = join(outputDir, name);
+    const before = readFileSync(path, "utf8");
+    const after = sanitize(before);
+    if (after !== before) {
+      writeFileSync(path, after);
+      touched++;
+      console.log(`      fixed ${name}`);
+    }
+  }
+
+  const files = typeFiles(outputDir);
+  if (checkOnly) {
+    const committed = typeFiles(genDir);
+    const stale = files.filter((name) => (
+      !committed.includes(name)
+      || readFileSync(join(outputDir, name), "utf8") !== readFileSync(join(genDir, name), "utf8")
+    ));
+    const removed = committed.filter((name) => !files.includes(name));
+    if (stale.length > 0 || removed.length > 0) {
+      throw new Error(`generated TypeScript bindings are stale: ${[...stale, ...removed].join(", ")}`);
+    }
+    console.log(`done: ${files.length} generated types are current.`);
+  } else {
+    console.log(`done: ${files.length} types, ${touched} needed sanitizing.`);
+  }
+} finally {
+  if (scratch) rmSync(scratch, { recursive: true, force: true });
+}

@@ -20,7 +20,8 @@ use crate::foundation::text::norm_key;
 
 /// One side's measured state at compare time. **For display and sorting only** — apply never reads a single byte of it.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub struct SideMeta {
     #[ts(type = "number")]
     pub size: u64,
@@ -30,7 +31,8 @@ pub struct SideMeta {
 
 /// Measured state of both sides, one-to-one with `plan.ops[i]` (the absent side is None)
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq, Eq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub struct RowMeta {
     pub src: Option<SideMeta>,
     pub dst: Option<SideMeta>,
@@ -126,7 +128,8 @@ pub fn evidence_for_operations(
 
 /// One "identical on both sides" record. It is not in the plan — it is not an action, it is evidence.
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub struct IdenticalRow {
     pub path: String,
     #[ts(type = "number")]

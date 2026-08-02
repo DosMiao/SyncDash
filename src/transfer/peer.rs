@@ -1,15 +1,8 @@
-//! ssh transport for the peer lane, in-process on russh.
+//! In-process SSH transport for the peer lane, sharing `fs::ssh` authentication and host checks.
 //!
-//! It used to spawn `ssh -o BatchMode=yes`, which meant SyncDash could only reach a peer on a
-//! machine with OpenSSH installed, could not measure a transfer while it ran, and could not stop
-//! one: a cancelled run left the child copying until it finished on its own. The session is
-//! `fs::ssh`'s, the same one `sftp://` uses — one auth chain, one `known_hosts` check.
-//!
-//! **Being in-process removes the child process, not the shell.** SSH's exec request (RFC 4254
-//! §6.5) carries a single command string that sshd hands to the user's login shell, so the far
-//! side still parses what we send. `PeerShell` and the quoting below therefore stay: OpenSSH on
-//! Windows defaults to PowerShell, whose quoting rules differ from POSIX, and the `chcp 65001`
-//! prelude is what keeps non-ASCII paths off the OEM code page.
+//! SSH exec (RFC 4254 §6.5) carries a command string interpreted by the remote login shell.
+//! `PeerShell` therefore preserves POSIX and PowerShell quoting; the Windows UTF-8 prelude keeps
+//! non-ASCII paths off the OEM code page.
 
 use std::io::{Error, ErrorKind, Read};
 use std::sync::Arc;

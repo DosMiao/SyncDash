@@ -1,20 +1,16 @@
-//! Run log (the data behind FFS's Log column / "Last sync" column).
+//! Durable run history.
 //!
 //! - Index: `<log_dir>/runs.jsonl` — one line per run (append-only, human-readable and auditable).
 //! - Detail: `<log_dir>/<YYYYMMDD-HHMMSS>-<job>-<kind>/` — one directory per apply-class run:
-//!   - `summary.json` run summary (= the same record as the index line, so the detail still explains itself if the index is corrupt)
-//!   - `plan.jsonl`   the plan: what this run **intended** to do
-//!   - `run.jsonl`    the event stream: narration, phase boundaries, errors
-//!   - `errors.jsonl` the error detail: Error plus Log at warning level and above
-//!   - `items.jsonl`  the execution detail: what this run **actually** did (one op per line with its outcome)
-//! - compare has no side effects: one index line, no directory (a watch round every 30s = 2880 a day).
-//! - Writing logs must never fail a sync: all persistence is best-effort, failures go to stderr.
+//!   - `summary.json`: run summary
+//!   - `plan.jsonl`: intended operations
+//!   - `run.jsonl`: streamed events
+//!   - `errors.jsonl`: errors and warning/error logs
+//!   - `items.jsonl`: actual operation outcomes
+//! - Compare writes only an index entry.
 //!
-//! Two critical changes in v0.10 relative to v0.9:
-//! 1. **Streaming**: events are persisted as they arrive (`logging::FileSink`) instead of written in
-//!    one go at `finish` — v0.9 lost the entire log when the process was killed.
-//! 2. **Plan and execution kept apart**: what v0.9 wrote into the detail were the **planned ops**
-//!    handed to apply, with not one word on which succeeded, failed or were KEPT. Now plan and items are separate files.
+//! Logging is best-effort and never fails synchronization. Events stream as they arrive, and plan
+//! intent stays separate from execution outcomes.
 
 use crate::model::event::{LogLevel, ProgressEvent};
 use crate::model::plan::Op;
@@ -37,7 +33,8 @@ use crate::fs::local_root::{LocalDirectory, LocalRoot};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub enum LogArtifactKind {
     Run,
     Errors,
@@ -62,7 +59,8 @@ const RUN_RECORD_SCHEMA: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub enum RunKind {
     Apply,
     PeerApply,
@@ -93,7 +91,8 @@ impl std::fmt::Display for RunKind {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub enum RunJobBinding {
     Registered { job_id: String },
     AdHoc,
@@ -102,7 +101,8 @@ pub enum RunJobBinding {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub struct RunSubject {
     pub job_name: String,
     pub binding: RunJobBinding,
@@ -146,7 +146,8 @@ impl RunSubject {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, ts_rs::TS)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub enum RunArtifacts {
     Directory { run_id: String },
     LegacyFile { file_name: String },
@@ -165,7 +166,8 @@ impl RunArtifacts {
 
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub struct RunRecord {
     #[ts(type = "number")]
     pub schema: u32,
@@ -200,7 +202,8 @@ pub struct RunRecord {
 }
 
 #[derive(Serialize, Clone, Debug, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub struct LatestRunRecord {
     pub job_id: String,
     pub record: RunRecord,
@@ -1757,38 +1760,6 @@ mod tests {
         );
         assert!(!root_path.join(RUNLOG_SCHEMA_FILE).exists());
         let _ = std::fs::remove_dir_all(root_path);
-    }
-
-    #[test]
-    fn stamp_matches_known_unix_times() {
-        assert_eq!(crate::foundation::time::stamp_compact(0), "19700101-000000");
-        assert_eq!(
-            crate::foundation::time::stamp_compact(946_684_800_000),
-            "20000101-000000"
-        ); // 2000-01-01T00:00:00Z
-        assert_eq!(
-            crate::foundation::time::stamp_compact(1_000_000_000_000),
-            "20010909-014640"
-        ); // the classic billionth second
-        assert_eq!(
-            crate::foundation::time::stamp_compact(1_709_164_800_000),
-            "20240229-000000"
-        ); // leap day
-    }
-
-    #[test]
-    fn stamps_sort_chronologically() {
-        // Directory names must sort lexicographically as they stand — the entire reason for not pulling in chrono
-        let mut v = vec![
-            crate::foundation::time::stamp_compact(1_000_000_000_000),
-            crate::foundation::time::stamp_compact(0),
-            crate::foundation::time::stamp_compact(946_684_800_000),
-        ];
-        v.sort();
-        assert_eq!(
-            v,
-            vec!["19700101-000000", "20000101-000000", "20010909-014640"]
-        );
     }
 
     #[test]

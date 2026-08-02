@@ -8,17 +8,13 @@
 //! Filesystem entry kinds stay in this layer; table observations translate them into their own
 //! closed artifact schema at the scan boundary.
 //!
-//! Design lineage (from the FreeFileSync AFS layer and syncthing's lib/fs, both
-//! surveyed in-repo under `.libs/`):
-//! - capabilities are declared (`caps()`), not discovered by runtime failure —
-//!   preflight routes around missing ones *before* work starts, and every
-//!   degradation is surfaced, never silent;
+//! Backend contracts:
+//! - capabilities are declared by `caps()`, so preflight can reject or report degradation;
 //! - `stat` returning `Ok(None)` is a **confirmed** absence; ambiguous protocol
-//!   errors must resolve to `Transient` instead (see `error.rs` for why);
+//!   errors resolve to `Transient`;
 //! - writes stage into a temp name and land by rename (`WriteStaged`), so an
 //!   interruption anywhere leaves either the old file or the new one, never half;
-//! - mtime that fails to stick is a report, not a failure (`CommitReport`) — FFS's
-//!   errorModTime lesson: plenty of real servers can copy bytes but not set times.
+//! - an mtime that fails to stick is reported by `CommitReport`, not treated as a failed copy.
 
 pub mod error;
 pub mod spec;

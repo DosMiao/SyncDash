@@ -188,15 +188,19 @@ The plan records intent; `items.jsonl` records actual per-operation outcomes. In
 
 ## Development, testing, and builds
 
-After any edit, run the complete verification suite:
+Use the fast behavior suite while developing:
 
 ```bash
-cargo check --workspace
-cargo test --workspace
+npm test
 npm run typecheck
 ```
 
-After changing a Rust `#[ts(export)]` type, run `npm run gen:types`. After a frontend change, run `npm run build` and include the refreshed committed `dist/`; optimized macOS builds embed it without requiring Node.
+`npm test` covers Rust library/binary tests and executable frontend behavior. Run
+`npm run test:integration` for apply, package, restore, lease, or filesystem-transaction changes;
+`npm run test:frontend:audit` for TSX/CSP/IPC permission changes; and `npm run test:all` for a
+release or broad refactor.
+
+After changing a Rust `#[ts(export_to = ...)]` type, run `npm run gen:types`. After a frontend change, run `npm run build` and include the refreshed committed `dist/`; optimized macOS builds embed it without requiring Node.
 
 Use the repository Builder for builds and launches. Its Windows and macOS launchers share the Rust implementation under `tools/builder/`:
 
@@ -211,6 +215,4 @@ Use the repository Builder for builds and launches. Its Windows and macOS launch
 
 Use the equivalent `builder.bat` commands on Windows. Tiers `1`, `2`, and `3` are Dist, Max, and Release; compact inputs build them sequentially. These optimized tiers package only the desktop artifact under `target/builder-tiers/<tier>/`. `build cli` is the sole standalone-CLI path, uses the Dist policy, and writes `target/release/syncdash[.exe]`; desktop tier builds never build the CLI implicitly. `--dry-run --host windows|macos` prints the complete plan without building or launching anything.
 
-Backend behavior is checked by `src/fs/vfs/conformance.rs`; end-to-end mode behavior lives in `src/run/e2e/`. Live SFTP, SMB, FTP, and exFAT lanes are ignored by default and enabled through their documented `SYNCDASH_E2E_*` environment variables.
-
-Design history and deeper research are retained in `.docs/`, `.docs/PLAN-refactor.md`, and `.docs/PLAN-syncthing-upgrade.md`. SyncDash reimplements selected semantics from FreeFileSync, Unison, and Syncthing while keeping its own table-driven, review-first architecture.
+Backend behavior is checked by `src/fs/vfs/conformance.rs`; end-to-end mode behavior lives in `src/run/e2e/`. Live SFTP, SMB, FTP, FTPS, and exFAT lanes require their documented `SYNCDASH_E2E_*` environment variables and an explicit `cargo test -- --ignored` invocation.

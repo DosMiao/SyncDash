@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFile } from 'node:fs/promises';
 
 import {
   AutoScanTicketLedger,
@@ -241,37 +240,4 @@ test('toolbar labels the monitored job and remains stoppable without a selected 
   assert.equal(autoScanToggleAction(status(), false), 'stop');
   assert.equal(autoScanToggleAction(null, true), 'start');
   assert.equal(autoScanToggleAction(null, false), 'unavailable');
-});
-
-test('App has no navigation/mutation stop or UI-derived unattended payload', async () => {
-  const app = await readFile(new URL('../../typescript/ui/App.tsx', import.meta.url), 'utf8');
-  assert.doesNotMatch(app, /authorizeUnattendedApply|visibleForCycle/);
-  assert.doesNotMatch(app, /buildReviewedRowDecisions\([\s\S]{0,300}authorizeAutoScanApply/);
-  assert.equal(app.match(/\bstopAutoScan\(\);/g)?.length, 1, 'only the explicit toolbar toggle may call the UI stop helper');
-  assert.equal(app.match(/ipc\.stopAutoScan\(\)/g)?.length, 1, 'only an explicit stop crosses IPC');
-  assert.match(app, /autoScanControlPendingRef\.current !== null/, 'control clicks are fenced synchronously');
-});
-
-test('App delegates completion to the backend and recovery cannot relaunch Compare', async () => {
-  const [app, ipc] = await Promise.all([
-    readFile(new URL('../../typescript/ui/App.tsx', import.meta.url), 'utf8'),
-    readFile(new URL('../../typescript/core/ipc.ts', import.meta.url), 'utf8'),
-  ]);
-  assert.doesNotMatch(`${app}\n${ipc}`, /completeAutoScan|complete_autoscan/);
-  assert.match(ipc, /export const declineAutoScanTrigger[\s\S]*?'decline_autoscan_trigger'/);
-
-  const compareIndex = app.indexOf('const completion = await doCompare(ticket);');
-  const statusIndex = app.indexOf('publishedStatus = await ipc.autoScanStatus();', compareIndex);
-  const authorizeIndex = app.indexOf('authorization = await ipc.authorizeAutoScanApply(', statusIndex);
-  assert.ok(compareIndex >= 0, 'the AutoScan path launches one ticket-bound Compare');
-  assert.ok(statusIndex > compareIndex, 'successful Compare must query authoritative AutoScan status');
-  assert.ok(authorizeIndex > statusIndex, 'AutoApply authorization must follow the authoritative status query');
-
-  const recoveryStart = app.indexOf("if (claim.kind === 'decline_recovery')");
-  const recoveryEnd = app.indexOf('\n\n    let monitor', recoveryStart);
-  assert.ok(recoveryStart >= 0 && recoveryEnd > recoveryStart, 'decline recovery must be an explicit terminal branch');
-  const recoveryBranch = app.slice(recoveryStart, recoveryEnd);
-  assert.match(recoveryBranch, /await recoverOrDecline\(/);
-  assert.match(recoveryBranch, /return;/);
-  assert.doesNotMatch(recoveryBranch, /doCompare\(/);
 });

@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   emptyJobRegistryState,
   reduceJobRegistry,
+  validateJobRegistrySnapshot,
 } from '../../typescript/ui/state/jobRegistry.ts';
 import type { JobDto } from '../../typescript/core/types/generated/JobDto.ts';
 
@@ -27,7 +28,6 @@ test('job selection follows stable identity across rename and refreshed fields',
 
   assert.equal(state.selectedJobId, 'job-a');
   assert.equal(state.jobs[0], renamed);
-  assert.equal(state.snapshotEpoch, 2);
 });
 
 test('deletion and same-name recreation cannot transfer selection authority', () => {
@@ -44,12 +44,12 @@ test('deletion and same-name recreation cannot transfer selection authority', ()
 });
 
 test('malformed registry snapshots fail before they can become selection authority', () => {
-  assert.throws(() => reduceJobRegistry(emptyJobRegistryState, {
-    type: 'snapshot_received',
-    jobs: [job('job-a', 'One'), job('job-a', 'Two')],
-  }), /duplicate identity/);
-  assert.throws(() => reduceJobRegistry(emptyJobRegistryState, {
-    type: 'snapshot_received',
-    jobs: [job('job-a', 'Same'), job('job-b', 'Same')],
-  }), /duplicate name/);
+  assert.throws(
+    () => validateJobRegistrySnapshot([job('job-a', 'One'), job('job-a', 'Two')]),
+    /duplicate identity/,
+  );
+  assert.throws(
+    () => validateJobRegistrySnapshot([job('job-a', 'Same'), job('job-b', 'Same')]),
+    /duplicate name/,
+  );
 });

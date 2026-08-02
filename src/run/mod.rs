@@ -11,8 +11,7 @@
 //! `roots` opens root phrases, `archive` refreshes the sync-mode archive after a successful apply.
 
 pub mod archive;
-/// The pipeline contract as executable cases — the twin of `fs::vfs::conformance`, one layer up.
-/// `cfg(test)` for the same reason `fs::vfs::memory` is: a fixture must not ship in the binary.
+/// Focused pipeline smoke and safety checks; test fixtures do not ship in the binary.
 #[cfg(test)]
 pub mod e2e;
 pub mod local;

@@ -1,9 +1,6 @@
 //! How much evidence a comparison gathers, resolved from a preset plus per-axis overrides.
 //!
-//! One ladder, composed by two callers. `Job::rigor_resolved` applies the job file's fields; the
-//! CLI's `scan` applies its flags. It used to be written out twice, and the copies had drifted:
-//! the CLI's omitted `escalate` and `verify_writes` entirely, so `syncdash scan --rigor paranoid`
-//! quietly skipped the post-write verification that the same word means everywhere else.
+//! `Job::rigor_resolved` and CLI scan flags compose the same five-axis policy.
 
 /// The five axes a rigor setting actually controls. Presets are macros over these; nothing reads
 /// the preset name after resolution.

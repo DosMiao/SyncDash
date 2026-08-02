@@ -1,17 +1,9 @@
 //! One ssh session, shared by everything that rides ssh.
 //!
-//! Two things in this crate speak ssh and they used to do it by different means: `vfs::sftp` opened
-//! a russh session in-process, while `transfer::peer` shelled out to the `ssh` binary and quoted
-//! commands for whatever shell the far side runs. Same hosts, same keys, same `known_hosts` — two
-//! implementations, one of which needed OpenSSH installed and could not be cancelled or measured.
+//! This module connects, verifies the host key against `~/.ssh/known_hosts`, and performs
+//! authentication. SFTP requests a subsystem; the peer lane executes commands.
 //!
-//! So the handshake lives here once: connect, verify the host key against the user's own
-//! `~/.ssh/known_hosts`, and walk the authentication chain. What each caller does with the session
-//! afterwards is its own business — sftp requests a subsystem, the peer lane runs commands.
-//!
-//! **`exec` is not argv.** SSH's exec request (RFC 4254 §6.5) carries a single command string that
-//! sshd hands to the user's login shell, so a caller still has to quote for the dialect the far
-//! side runs. Being in-process removes the child process, not the shell.
+//! SSH exec is a shell command string, not argv, so callers still quote for the remote dialect.
 
 use std::path::PathBuf;
 use std::sync::Arc;

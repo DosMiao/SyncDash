@@ -242,10 +242,6 @@ export function JobEditor(props: JobEditorProps) {
   const pickPathForField = async (key: string, kind: 'dir' | 'file') => {
     if (pickerRequest.current !== null) return;
     const requestId = nextPickerRequestId.current + 1;
-    if (!Number.isSafeInteger(requestId)) {
-      onStatusRef.current('Path-picker request IDs are exhausted; close and reopen the editor', 'err');
-      return;
-    }
     nextPickerRequestId.current = requestId;
     const request = {
       id: requestId,

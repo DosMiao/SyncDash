@@ -31,7 +31,7 @@ interface PlanTableProps {
   reversedRows: boolean[];
   includedRows: boolean[];
   rowPlan: RowSpec[];
-  // Collapsed descendants remain in this display order so folder ranges and CSV stay complete.
+  // Includes collapsed descendants so folder ranges and CSV remain complete.
   displayOrder: number[];
   inScopeIndices: number[];
   pathMode: 'relative' | 'full';
@@ -41,7 +41,7 @@ interface PlanTableProps {
   workspaceKey: CompareResultKey;
   viewport: ResultViewport;
   reviewEditable: boolean;
-  // Both virtualization and responsive columns measure the caller-owned scroll container.
+  // The caller-owned scroll container controls virtual and responsive geometry.
   wrap: HTMLElement | null;
   onSetRowIncluded: (index: number, value: boolean) => void;
   onSetRowsIncluded: (indices: number[], value: boolean) => void;
@@ -58,8 +58,7 @@ type ColumnLayout =
   | 'withoutReasonOrTimestamps'
   | 'synchronizePathsAndAction';
 
-/// A column's identity **is** its sort key — there is no column you can sort by two ways, and no key
-/// without a column. Only the Synchronize selection has neither.
+/// Sortable columns use their sort key as identity; Synchronize is the sole exception.
 type ColumnId = 'synchronize' | SortKey;
 type TableSide = 'source' | 'target';
 
@@ -70,39 +69,23 @@ const SIDE_COLUMN_IDS = {
 
 interface ColumnDefinition {
   id: ColumnId;
-  /// Keys this header takes over in layouts where their own column is gone. A column that drops
-  /// must not take its sort key with it: the header that owns the key would then be unmounted in
-  /// exactly the layout where it is the last place left to click, leaving a stale sort you can see but
-  /// not change.
+  /// A visible header adopts sort keys whose columns are hidden in this layout.
   adoptedSortKeys?: Partial<Record<ColumnLayout, SortKey[]>>;
-  /// CSS-pixel width per layout. An absent layout omits the column; null leaves a path column flexible.
+  /// An absent layout omits the column; null leaves its width flexible.
   widthByLayout: Partial<Record<ColumnLayout, number | null>>;
   className: string;
   title?: string;
   editableTitle?: string;
 }
 
-/// Header text. Short and contextual, because the column it sits over says which side it is;
-/// SORT_LABEL in core/plan.ts carries the unambiguous name for the "sorted by" indicator.
 const COLUMN_HEADER_LABELS: Record<SortKey, string> = {
   's.path': 'source', 't.path': 'target', action: 'action',
   's.size': 'size', 't.size': 'size', 's.mtime': 'time', 't.mtime': 'time',
   reason: 'reason',
 };
 
-/// The table's whole layout, in order. The row reads left to right as source facts → what happens →
-/// target facts, so the action sits on the axis between the two sides rather than in front of them,
-/// and each side's size and time are their own columns rather than one fused cell.
-///
-/// One descriptor per column drives the <colgroup>, the <thead> and the row cells. The alternative —
-/// a width array per layout plus `layout === 'allColumns' &&` guards repeated in the header and the
-/// body — is a dozen places that have to agree, and under `table-layout: fixed` a disagreement is
-/// *silent*:
-/// surplus <col>s are ignored and missing ones make the trailing columns split the remainder, so the
-/// failure reads as "the widths went odd at one window size" and nobody bisects it.
-///
-/// The 1240→1000 step is exactly the reason column's 240px, so crossing it does not take width from
-/// the two primary path columns.
+/// Ordered source of truth for colgroup, headers, cells, and responsive widths.
+/// Layout steps remove fixed columns without shrinking the flexible path columns.
 const COLUMN_DEFINITIONS: ColumnDefinition[] = [
   {
     id: 'synchronize',
@@ -124,8 +107,7 @@ const COLUMN_DEFINITIONS: ColumnDefinition[] = [
       synchronizePathsAndAction: null,
     },
   },
-  // 112 rather than 92 without timestamps: an ellipsized "size · ti…" would leave the time
-  // span unclickable, and the table header clips. 92 fits "894.0 MB"; 112 fits the composite header.
+  // The composite size/time header needs 112 px to keep both sort controls clickable.
   {
     id: 's.size', className: 'c-size',
     adoptedSortKeys: { withoutReasonOrTimestamps: ['s.mtime'] },
@@ -172,9 +154,7 @@ const columnLayoutForWidth = (containerWidthPixels: number): ColumnLayout => (
         : 'synchronizePathsAndAction'
 );
 
-/// The narrowest a path column may be before the table stops shrinking and scrolls sideways instead.
-/// Under fixed layout the columns with no <col> width absorb every shortfall, so without a floor they
-/// go to zero and the paths vanish entirely rather than the table admitting it has run out of room.
+/// Below this path width, the fixed-layout table overflows horizontally instead of hiding paths.
 const MINIMUM_PATH_COLUMN_WIDTH = 140;
 
 function columnWidthForLayout(
@@ -188,10 +168,7 @@ function columnWidthForLayout(
   return width;
 }
 
-/// Minimum table width for a column set: everything pinned, plus a floor for each path column. A
-/// static number cannot do this job — the pinned total is 878 with all columns and 182 with only
-/// Synchronize selection, paths, and action, so one value is either too wide for the narrow set or no constraint
-/// for the wide one.
+/// Minimum width is derived per layout because each layout has a different fixed-column total.
 function calculateMinimumTableWidth(columns: ColumnDefinition[], layout: ColumnLayout): number {
   let fixedWidth = 0;
   let flexibleColumnCount = 0;
@@ -202,8 +179,7 @@ function calculateMinimumTableWidth(columns: ColumnDefinition[], layout: ColumnL
   return fixedWidth + flexibleColumnCount * MINIMUM_PATH_COLUMN_WIDTH;
 }
 
-/// The column set tracks the scroll container because collapsing Run Scope changes that width
-/// without resizing the window.
+/// Observe the container because adjacent panels can change its width without resizing the window.
 function useContainerWidth(container: HTMLElement | null): number {
   const [containerWidthPixels, setContainerWidthPixels] = useState(1600);
   useLayoutEffect(() => {
@@ -216,9 +192,7 @@ function useContainerWidth(container: HTMLElement | null): number {
   return containerWidthPixels;
 }
 
-/// A clickable header. Declared at module scope, not inside PlanTable: a component defined in a
-/// render body is a *new type* on every render, so React unmounts and rebuilds every one of these
-/// controls — and this table re-renders on every scroll frame.
+/// Module scope preserves component identity across virtual-scroll renders.
 function SortHeader(props: { sortKey: SortKey; sort: Sort | null; onSort: (key: SortKey) => void }) {
   const { sortKey, sort, onSort } = props;
   const isActiveSort = sort?.key === sortKey;
@@ -274,12 +248,10 @@ function IndeterminateCheckbox(props: {
   );
 }
 
-/// What a column contributes to one row. The <td> itself is emitted by the single loop below, so
-/// the cell count can never disagree with the <col> count.
+/// Cells are keyed by the same column definitions that emit colgroup and headers.
 interface TableCell { className?: string; title?: string; children?: ReactNode }
 
-/// Both metadata cells carry the whole truth in their tooltip regardless of layout, so dropping the
-/// time column does not drop its information.
+/// Metadata tooltips preserve both values when responsive layouts hide a column.
 const formatMetadataTitle = (metadata: SideMeta) => (
   `${metadata.size.toLocaleString()} bytes\n${new Date(metadata.mtime_ms).toLocaleString()}`
 );
@@ -533,10 +505,7 @@ export function PlanTable(props: PlanTableProps) {
     scrollContainer.scrollTop = nextScrollTop;
   }, [rowPlan, scrollContainer, virtualWindow.from, virtualWindow.to, workspaceKey]);
 
-  // Scrolling updates this component's local virtual-window state every animation frame. These two
-  // full-plan passes used to run on every one of those renders; at several hundred thousand rows,
-  // trackpad momentum allocated another multi-megabyte index array per frame until WebKit hit
-  // memory pressure and painted the window black.
+  // Memoize full-plan scans; virtual scrolling rerenders every frame and large index arrays are costly.
   const executableInScope = useMemo(
     () => inScopeIndices.filter(
       (index) => isExecutableOperation(effectiveOperation(plan, reversedRows, index)),
@@ -552,10 +521,7 @@ export function PlanTable(props: PlanTableProps) {
     [executableInScope, includedRows],
   );
 
-  // A folder row needs the Synchronize-selected count of an arbitrary subtree. Prefixing the one
-  // DFS order once makes that O(1) per rendered folder, instead of repeatedly scanning a 100k-file
-  // parent on every virtual-scroll render. Descendant indices themselves are materialized only
-  // when a checkbox is actually clicked.
+  // Prefix counts make subtree selection O(1) per folder; materialize indices only on interaction.
   const synchronizationSelectionCountPrefix = useMemo(() => {
     const prefixCounts = new Uint32Array(displayOrder.length + 1);
     for (let position = 0; position < displayOrder.length; position++) {
@@ -567,8 +533,7 @@ export function PlanTable(props: PlanTableProps) {
     return prefixCounts;
   }, [plan, reversedRows, includedRows, displayOrder]);
 
-  // Newness is a timestamp claim. When the responsive layout removes that column, carry its cue to
-  // size and then path so the evidence remains visible in every layout.
+  // Move the timestamp cue to a visible metadata column in compact layouts.
   const highlightColumnForSide = (side: TableSide): ColumnId => {
     const sideColumns = SIDE_COLUMN_IDS[side];
     if (visibleColumnIds.has(sideColumns.timestamp)) return sideColumns.timestamp;
@@ -757,9 +722,7 @@ export function PlanTable(props: PlanTableProps) {
             ? highlightColumnForSide(newerMetadataSide === 's' ? 'source' : 'target')
             : null;
 
-          // Relative tree rows compact entries owned by their displayed folder to a basename. Full
-          // mode is literal even in the tree: choosing it must never continue showing compact paths.
-          // When this side's size column has dropped out, the path tooltip absorbs its numbers.
+          // Full mode stays literal in grouped rows; hidden metadata moves into the path tooltip.
           const buildPathCell = (
             relativePath: string | null,
             rootPath: string,
@@ -839,10 +802,7 @@ export function PlanTable(props: PlanTableProps) {
                   tabIndex={isActiveRow ? 0 : -1}
                   onClick={() => onToggleRowDirection(index)}
                 >
-                  {/* Both glyph slots are always rendered at a fixed width: reports have no
-                      direction, and without a reserved slot its label would start 16px to the left
-                      of every other row's — the arrow is the glyph you scan down this column, so its
-                      x has to be the same on every row. */}
+                  {/* Fixed glyph slots keep action labels horizontally aligned. */}
                   <span className="plan-row-action-direction" aria-hidden="true">{actionPresentation.direction ? DIRECTION_ICON[actionPresentation.direction] : null}</span>
                   <span className="plan-row-action-result" aria-hidden="true">{RESULT_TYPE_ICON[actionPresentation.resultType]}</span>
                   <span className="plan-row-action-label">{actionPresentation.label}</span>
@@ -924,9 +884,7 @@ export function PlanTable(props: PlanTableProps) {
     </tbody>
   );
 
-  // `useVirtualRows` maps the complete logical list onto a bounded physical canvas. Do not put the
-  // logical total or row offset directly into CSS: that recreates a multi-million-pixel render space
-  // even though only one screenful of rows is mounted.
+  // Keep logical heights in useVirtualRows; CSS receives only bounded physical canvas coordinates.
   return (
     <div
       ref={tableCanvasRef}

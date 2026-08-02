@@ -1,27 +1,11 @@
 //! The gates that must pass before anything is written.
 //!
-//! 1. **Mount-point marker** (`marker`) — semantics modelled on syncthing's `.stfolder`
-//!    (CheckPath in `lib/config/folderconfiguration.go:236`). When an SMB share isn't mounted,
-//!    target is usually an empty directory (it may even be auto-created locally), and mirror
-//!    then plans "delete everything in target" or "re-send tens of GB". The marker file is the
-//!    only reliable test: it travels with the **data**, so no mount means no marker.
-//! 2. **Disk-space preflight** (`space`) — every op in the plan carries a size, so summing them
-//!    up front tells us how much gets written. Modelled on syncthing's `CheckAvailableSpace` /
-//!    `minDiskFree` (1% by default).
-//! 3. **Plan health check** (`ratio`) — refuse to run when the deletion share is too high.
-//!    syncthing has no equivalent (it syncs continuously; there is no "one big plan"), but our
-//!    explicit model suits this gate well: it also catches a wrong filter, swapped source and
-//!    target, and typo'd paths.
-//! 4. **Scan completeness** (`scan`) — refuse a plan whose scan could not read part of a root.
-//!    The other three judge the plan; this one judges the evidence underneath it, because an
-//!    entry that was never read is indistinguishable from an entry that was deleted, and the
-//!    ratio gate only notices when the unread part is most of the root.
-//!
-//! `caps` is the fourth thing this module does, and the one the header used to leave out: the
-//! capability report listing every gap between what a job asks for and what the two backends can
-//! deliver, before any scanning starts. It shares no type with the three gates.
-//!
-//! `roots` probes reachability; `stats` reduces a plan to the totals the gates judge.
+//! - `marker` proves a root is mounted with its data.
+//! - `space` reserves the configured free-space margin.
+//! - `ratio` blocks unexpectedly destructive plans.
+//! - `scan` rejects incomplete evidence.
+//! - `caps` reports unsupported backend requirements.
+//! - `roots` probes reachability; `stats` computes plan totals.
 
 pub mod caps;
 pub mod marker;

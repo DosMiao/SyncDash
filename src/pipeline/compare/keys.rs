@@ -42,7 +42,7 @@ pub(super) fn evidence_missing(a: &ObservedEntry, b: &ObservedEntry) -> bool {
 
 /// Which generation of archive entry `r` the content of `e` corresponds to:
 /// `Some(0)` = matches what the archive currently records, `Some(n)` = the n-th historic generation, `None` = the archive has never seen it.
-/// The lower the generation number the newer it is — this is what lets "one generation behind" be told apart from "concurrent edit" (P1-3).
+/// Lower generation numbers are newer, distinguishing a lagging side from a concurrent edit.
 pub(super) fn generation_of(e: &ObservedEntry, r: &ObservedEntry, win_ms: i64) -> Option<usize> {
     if files_equal(e, r, win_ms) {
         return Some(0);

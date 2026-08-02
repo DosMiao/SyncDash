@@ -63,7 +63,8 @@ impl AutoScanBinding {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum AutoScanStatusMode {
     Starting,
     NativeFsevents,
@@ -72,7 +73,8 @@ pub(crate) enum AutoScanStatusMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum AutoScanDetectionMode {
     NativeFsevents,
     Polling,
@@ -89,7 +91,8 @@ impl From<AutoScanDetectionMode> for AutoScanStatusMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum AutoScanTriggerReason {
     Bootstrap,
     FilesystemChange,
@@ -98,7 +101,8 @@ pub(crate) enum AutoScanTriggerReason {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct AutoScanStatusDto {
     pub(crate) active: bool,
     #[ts(type = "number")]
@@ -176,7 +180,8 @@ impl AutoScanStatusCore {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) struct AutoScanTriggerDto {
     #[ts(type = "number")]
     pub(crate) generation: u64,
@@ -1766,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_id_allocation_fails_closed_at_the_u64_limit() {
+    fn counters_fail_closed_without_consuming_pending_work() {
         let counter = AtomicU64::new(u64::MAX - 1);
         assert_eq!(
             allocate_unique_id(&counter, "test identity").unwrap(),
@@ -1776,6 +1781,16 @@ mod tests {
             .unwrap_err()
             .contains("ID space is exhausted"));
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(next_ticket_id(u64::MAX - 1), Some(u64::MAX));
+        assert_eq!(next_ticket_id(u64::MAX), None);
+
+        let (controller, _receiver) = controller_waiting_for(29, false);
+        controller
+            .compare_permits
+            .store(u64::MAX, Ordering::Relaxed);
+        assert!(controller.issue_compare_permit(4, 29).is_err());
+        assert_eq!(controller.status().active_ticket, Some(29));
+        assert!(controller.decline_trigger(4, 29).is_ok());
     }
 
     fn trigger(binding: &AutoScanBinding, generation: u64, ticket_id: u64) -> AutoScanTriggerDto {
@@ -1943,6 +1958,7 @@ mod tests {
         let (controller, receiver) = controller_waiting_for(11, false);
         assert!(controller.decline_trigger(3, 11).is_err());
         assert!(controller.decline_trigger(4, 12).is_err());
+        controller.issue_compare_permit(4, 11).unwrap();
         let status = controller.decline_trigger(4, 11).unwrap();
         assert_eq!(status.active_ticket, None);
         assert!(matches!(
@@ -1981,7 +1997,20 @@ mod tests {
 
     #[test]
     fn successful_publication_requires_the_authenticated_running_compare() {
-        let (controller, receiver) = controller_waiting_for(12, false);
+        let (controller, receiver) = controller_waiting_for(12, true);
+        let forged_manual_permit = AutoScanComparePermit {
+            permit_id: 999,
+            generation: 4,
+            ticket_id: 12,
+            job_id: "job-id-photos".into(),
+            config_revision: "revision-a".into(),
+            target_index: 1,
+            verification: pending_verification(&controller),
+        };
+        assert!(controller
+            .publish_successful_compare(&forged_manual_permit, successful_result(owner()),)
+            .is_err());
+
         let permit = controller.issue_compare_permit(4, 12).unwrap();
         let mut wrong = owner();
         wrong.identity.target_index = 0;
@@ -1993,16 +2022,23 @@ mod tests {
             .mark_compare_launched(&permit, owner().identity.compare_run_id)
             .unwrap();
         assert!(controller.mark_compare_launched(&permit, 99).is_err());
-        let expected_owner = owner();
+        let mut expected_owner = owner();
+        expected_owner.job_name = "externally-renamed".into();
         let completed = controller
             .publish_successful_compare(&permit, successful_result(expected_owner))
             .unwrap();
         assert_eq!(completed.autoscan_status.active_ticket, None);
         assert_eq!(completed.autoscan_status.pending_trigger, None);
+        assert_eq!(
+            completed.autoscan_status.job_name.as_deref(),
+            Some("externally-renamed")
+        );
         assert!(matches!(
             receiver.try_recv(),
             Ok(WorkerCommand::VerificationPublished { ticket_id: 12 })
         ));
+        let ticket = controller.claim_completed_auto_apply(4, 12).unwrap();
+        assert_eq!(ticket.compare_identity(), &owner().identity);
     }
 
     #[test]
@@ -2028,36 +2064,6 @@ mod tests {
             .unwrap()
             .is_some());
         assert!(controller.claim_completed_auto_apply(4, 32).is_err());
-    }
-
-    #[test]
-    fn manual_same_scope_compare_cannot_satisfy_the_ticket_without_the_exact_permit() {
-        let (controller, _receiver) = controller_waiting_for(24, false);
-        let forged_manual_permit = AutoScanComparePermit {
-            permit_id: 999,
-            generation: 4,
-            ticket_id: 24,
-            job_id: "job-id-photos".into(),
-            config_revision: "revision-a".into(),
-            target_index: 1,
-            verification: pending_verification(&controller),
-        };
-        let expected_owner = owner();
-        assert!(controller
-            .publish_successful_compare(
-                &forged_manual_permit,
-                successful_result(expected_owner.clone()),
-            )
-            .is_err());
-
-        let exact_permit = controller.issue_compare_permit(4, 24).unwrap();
-        controller
-            .mark_compare_launched(&exact_permit, expected_owner.identity.compare_run_id)
-            .unwrap();
-        let completed = controller
-            .publish_successful_compare(&exact_permit, successful_result(expected_owner))
-            .unwrap();
-        assert_eq!(completed.autoscan_status.active_ticket, None);
     }
 
     #[test]
@@ -2088,21 +2094,6 @@ mod tests {
     }
 
     #[test]
-    fn ui_decline_accepts_an_issued_but_unlaunched_permit() {
-        let (controller, receiver) = controller_waiting_for(30, false);
-        controller.issue_compare_permit(4, 30).unwrap();
-
-        let status = controller.decline_trigger(4, 30).unwrap();
-
-        assert_eq!(status.active_ticket, None);
-        assert_eq!(status.pending_trigger, None);
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(WorkerCommand::VerificationTerminated { ticket_id: 30 })
-        ));
-    }
-
-    #[test]
     fn ui_decline_cannot_terminalize_a_compare_after_backend_launch() {
         let (controller, receiver) = controller_waiting_for(31, false);
         let permit = controller.issue_compare_permit(4, 31).unwrap();
@@ -2124,20 +2115,6 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_permit_ids_leave_the_pending_trigger_retryable() {
-        let (controller, _receiver) = controller_waiting_for(29, false);
-        controller
-            .compare_permits
-            .store(u64::MAX, Ordering::Relaxed);
-
-        assert!(controller.issue_compare_permit(4, 29).is_err());
-        let status = controller.status();
-        assert_eq!(status.active_ticket, Some(29));
-        assert_eq!(status.pending_trigger.unwrap().ticket_id, 29);
-        assert!(controller.decline_trigger(4, 29).is_ok());
-    }
-
-    #[test]
     fn stopped_generation_rejects_publication_before_repository_transition() {
         let (controller, _receiver) = controller_waiting_for(28, false);
         let permit = controller.issue_compare_permit(4, 28).unwrap();
@@ -2155,28 +2132,6 @@ mod tests {
             .get_exact(&expected_owner.identity)
             .unwrap()
             .is_none());
-    }
-
-    #[test]
-    fn successful_compare_refreshes_a_renamed_display_label_without_changing_authority() {
-        let (controller, _receiver) = controller_waiting_for(25, true);
-        let permit = controller.issue_compare_permit(4, 25).unwrap();
-        let mut renamed = owner();
-        renamed.job_name = "externally-renamed".into();
-        controller
-            .mark_compare_launched(&permit, renamed.identity.compare_run_id)
-            .unwrap();
-        let completed = controller
-            .publish_successful_compare(&permit, successful_result(renamed))
-            .unwrap();
-        let status = completed.autoscan_status;
-        assert_eq!(status.job_name.as_deref(), Some("externally-renamed"));
-        assert_eq!(status.active_ticket, None);
-        assert_eq!(status.pending_trigger, None);
-
-        // Display names are deliberately excluded from authority equality.
-        let ticket = controller.claim_completed_auto_apply(4, 25).unwrap();
-        assert_eq!(ticket.compare_identity(), &owner().identity);
     }
 
     #[test]
@@ -2441,12 +2396,5 @@ mod tests {
         registered.job_id = "job-id-replacement".into();
         let error = validate_resolved_binding(&binding, "old-name", &registered).unwrap_err();
         assert!(error.contains("replacement identity"), "{error}");
-    }
-
-    #[test]
-    fn ticket_cursor_never_wraps_within_a_generation() {
-        assert_eq!(next_ticket_id(1), Some(2));
-        assert_eq!(next_ticket_id(u64::MAX - 1), Some(u64::MAX));
-        assert_eq!(next_ticket_id(u64::MAX), None);
     }
 }

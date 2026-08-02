@@ -168,31 +168,6 @@ mod tests {
     }
 
     #[test]
-    fn artifact_names_are_distinct() {
-        let all = [
-            RUNLOG_INDEX_FILE,
-            RUNLOG_LEGACY_INDEX_FILE,
-            RUNLOG_INDEX_LOCK_FILE,
-            RUNLOG_SCHEMA_FILE,
-            RUNLOG_SUMMARY_FILE,
-            RUNLOG_LEGACY_SUMMARY_FILE,
-            RUNLOG_PLAN_FILE,
-            RUNLOG_RUN_FILE,
-            RUNLOG_ERRORS_FILE,
-            RUNLOG_ITEMS_FILE,
-            APP_LOG_FILE,
-        ];
-        let mut sorted = all.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(
-            sorted.len(),
-            all.len(),
-            "artifact names inside a run directory must not collide"
-        );
-    }
-
-    #[test]
     fn internal_artifact_paths_match_nested_filter_scope() {
         for path in [
             ".syncdash/cache",

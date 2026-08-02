@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 /// (carrying path/action/side, naturally a line in the error detail), `Log` is pipeline narration
 /// (endpoint probe results, delta downgrades, lock contention…) — the sink for those in-library `eprintln!`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Info,
@@ -24,10 +25,10 @@ pub enum LogLevel {
     Error,
 }
 
-/// What actually became of one op — the core field of the execution detail (items.jsonl).
-/// Today this information lives only in the four branches of `apply::record` and dies with that function.
+/// What became of an operation, emitted as `ItemResult` and persisted to `items.jsonl`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "lowercase")]
 pub enum ItemOutcome {
     Ok,
@@ -39,7 +40,8 @@ pub enum ItemOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "kebab-case")]
 pub enum Phase {
     ScanSource,
@@ -49,7 +51,7 @@ pub enum Phase {
     Pack,
     Ship,
     Verify,
-    /// The archive rescan after a successful apply — a long phase that is completely invisible today
+    /// Rescan after a successful Apply, before the refreshed archive is persisted.
     Refresh,
     /// Persist the refreshed sync archive after its source rescan completes.
     Archive,
@@ -58,7 +60,8 @@ pub enum Phase {
 /// How a phase stopped. `Completed` means the phase reached its own boundary; individual apply
 /// operations may still have accumulated errors, which remain represented by Error and Summary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 #[serde(rename_all = "lowercase")]
 pub enum PhaseStatus {
     Completed,
@@ -67,7 +70,8 @@ pub enum PhaseStatus {
 }
 
 #[derive(Clone, Debug, Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProgressEvent {
     /// Entering a phase. totals of 0 = not yet known. label = human context (root path, ssh:host…)

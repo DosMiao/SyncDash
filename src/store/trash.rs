@@ -1,17 +1,7 @@
-//! Retention policy and recovery for the local trash directory (P2-2).
+//! Local trash retention and recovery.
 //!
-//! Every `apply` run leaves the originals it deleted/overwrote under `<trash_root>/<millisecond timestamp>/`.
-//! Those directories used to be **never cleaned up**: long-term use fills the disk, and finding one file among hundreds of timestamp directories is down to luck.
-//!
-//! Three things are added here (semantics modelled on syncthing `lib/versioner/`):
-//!   - `find`  — locate historical versions of one path across every timestamp directory (what a trash is actually for)
-//!   - `restore` — pull one version back (dry-run by default)
-//!   - `prune` — clean up by retention days / total size cap; optional **staggered thinning**
-//!     (the interval table from `lib/versioner/staggered.go:47-53`: one copy per 30s for the first hour,
-//!      one per hour for the rest of the day, one per day within 30 days, one per week after that)
-//!
-//! Note: jobs with `versioning = true` go to `.version_syncDash/` inside each root instead (see version.rs),
-//! a path entirely separate from the local trash here; this module only handles the local trash.
+//! Each Apply stores displaced files under `<trash_root>/<timestamp>/`. This module lists, finds,
+//! restores, and prunes those runs. Per-root `.version_syncDash/` history is owned by `version`.
 
 use std::path::{Path, PathBuf};
 

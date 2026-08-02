@@ -126,7 +126,8 @@ impl Drop for ActiveRunLease {
 
 #[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(tag = "decision", rename_all = "snake_case")]
-#[ts(export, export_to = "../typescript/core/types/generated/")]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../typescript/core/types/generated/")]
 pub(crate) enum ProgressWindowCloseDecisionDto {
     PendingLaunchCancelled,
     ActiveRunCancellationRequested {

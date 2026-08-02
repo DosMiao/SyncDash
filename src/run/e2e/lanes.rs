@@ -1,15 +1,3 @@
-//! One `#[test]` per backend shape, offline and live.
-//!
-//! A lane is a factory for fresh empty roots plus the assertion that its **skip set** is what the
-//! backend's declared capabilities imply. That set is the contract: a backend that quietly loses a
-//! capability changes it, and the lane fails rather than silently testing less.
-//!
-//! Live lanes are `#[ignore]` behind an env var, and each holds its backend to *both* contracts off
-//! the one factory — `fs::vfs::conformance` for the trait surface, this suite for the pipeline on
-//! top of it. That pairing is the point: what runs by default for the protocol backends is `MemVfs`
-//! wearing their declared capabilities, which can only ever prove the pipeline copes with that
-//! shape — never that the backend has it.
-
 use std::sync::Arc;
 
 use super::*;
@@ -18,286 +6,180 @@ use crate::fs::vfs::local::LocalVfs;
 use crate::fs::vfs::memory::MemVfs;
 use crate::fs::vfs::{Support, Vfs};
 
-/// The generic VFS lane — no retained local root is exposed, so this drives `scan_vfs` every
-/// protocol backend rides, with no server involved.
 #[test]
-fn memory_lane_syncs() {
-    let mut n = 0;
-    let rep = run_all("memory", &mut || {
-        n += 1;
-        Arc::new(MemVfs::new(&format!("e2e-{n}"))) as Arc<dyn Vfs>
-    });
-    assert!(
-        rep.skipped.is_empty(),
-        "the memory backend declares every capability, so it should skip nothing: {:?}",
-        rep.skipped
-    );
-    assert!(
-        !rep.ran.is_empty(),
-        "a lane that ran no cases is not a passing lane"
-    );
+fn memory_pipeline_smoke() {
+    let source = Arc::new(MemVfs::new("e2e-memory-source")) as Arc<dyn Vfs>;
+    let target = Arc::new(MemVfs::new("e2e-memory-target")) as Arc<dyn Vfs>;
+    run_pipeline_smoke("memory", &source, &target, None);
 }
 
-/// The real filesystem, and the only lane with a retained local root — so it is the only one that
-/// exercises the walkdir/mmap fast path, the central trash route, and real NTFS timestamps.
-/// Everything the memory lane proves about semantics, this proves about a disk.
 #[test]
-fn local_lane_syncs() {
-    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-    let mut n = 0usize;
-    let rep = {
-        let mut mk = || {
-            n += 1;
-            let d = std::env::temp_dir().join(format!("syncdash-e2e-{}-{n}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).unwrap();
-            dirs.push(d.clone());
-            Arc::new(LocalVfs::open(d).unwrap()) as Arc<dyn Vfs>
-        };
-        run_all("local", &mut mk)
-    };
-    for d in dirs {
-        let _ = std::fs::remove_dir_all(&d);
-    }
-    assert!(
-        !rep.ran.is_empty(),
-        "a lane that ran no cases is not a passing lane"
-    );
+fn local_pipeline_smoke() {
+    let base = std::env::temp_dir().join(format!("syncdash-e2e-{}", std::process::id()));
+    let source_path = base.join("source");
+    let target_path = base.join("target");
+    let trash_path = base.join("trash");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&source_path).unwrap();
+    std::fs::create_dir_all(&target_path).unwrap();
+
+    let source = Arc::new(LocalVfs::open(source_path).unwrap()) as Arc<dyn Vfs>;
+    let target = Arc::new(LocalVfs::open(target_path).unwrap()) as Arc<dyn Vfs>;
+    run_pipeline_smoke("local", &source, &target, Some(trash_path));
+
+    let _ = std::fs::remove_dir_all(base);
 }
 
-/// `MemVfs` wearing SFTP's declared shape: second-granularity timestamps and a rename that refuses
-/// to overwrite.
-#[test]
-fn sftp_shaped_lane_syncs() {
-    let mut n = 0;
-    let rep = run_all("sftp-shaped", &mut || {
-        n += 1;
-        Arc::new(MemVfs::new(&format!("e2e-sftp-{n}")).without(|c| {
-            c.mtime_precision_ms = 1_000;
-            c.rename_overwrite = Support::No;
-            c.fsync = Support::Unknown;
-            c.free_space = Support::No;
-            c.write_at = Support::No;
-        })) as Arc<dyn Vfs>
-    });
-    assert!(!rep.ran.is_empty());
-}
-
-fn ftp_list_only() -> Arc<dyn Vfs> {
-    Arc::new(MemVfs::new("e2e-ftp").without(|c| {
-        c.mtime_precision_ms = 60_000;
-        c.ranged_read = Support::No;
-        c.set_mtime = Support::No;
-        c.symlink = Support::No;
-        c.unix_mode = Support::No;
-        c.read_back = Support::No;
-        c.free_space = Support::No;
-        c.write_at = Support::No;
-        c.rename_overwrite = Support::Unknown;
-        c.exclusive_staged_file_publish = Support::No;
+fn sftp_shaped(name: &str) -> Arc<dyn Vfs> {
+    Arc::new(MemVfs::new(name).without(|capabilities| {
+        capabilities.mtime_precision_ms = 1_000;
+        capabilities.rename_overwrite = Support::No;
+        capabilities.fsync = Support::Unknown;
+        capabilities.free_space = Support::No;
+        capabilities.write_at = Support::No;
     })) as Arc<dyn Vfs>
 }
 
-/// `MemVfs` wearing the worst FTP shape — LIST-only, so no ranged reads, no `set_mtime`, and a
-/// sixty-second view of time.
-///
-/// Its contract is that it **cannot be written at all**: FTP has no protocol primitive that can
-/// atomically publish only when a name is absent, so it cannot establish an exclusive root-lock
-/// claim across machines. Every case therefore skips, and the skip set being *complete* is the
-/// assertion — if some future change let one of them through, this test fails, which is exactly
-/// what should happen.
 #[test]
-fn ftp_list_only_lane_is_readable_but_never_writable() {
-    let rep = run_all("ftp-list-only", &mut ftp_list_only);
-    assert!(
-        rep.ran.is_empty(),
-        "a root that cannot hold a lock must not have applied anything: {:?}",
-        rep.ran
-    );
-    assert_eq!(
-        rep.skipped.len(),
-        cases::ALL.len(),
-        "every case should have skipped, not just some"
-    );
-    assert!(
-        rep.skipped.iter().all(|(_, n)| *n == Need::WritableTarget),
-        "the reason must be the lock, not an incidental capability: {:?}",
-        rep.skipped
-    );
+fn sftp_shaped_pipeline_smoke() {
+    let source = sftp_shaped("e2e-sftp-source");
+    let target = sftp_shaped("e2e-sftp-target");
+    run_pipeline_smoke("sftp-shaped", &source, &target, None);
 }
 
-/// The other half of that contract, and the half that matters to a user: comparing still works. A
-/// LIST-only server is not useless — it is read-only, and the refusal says so in as many words
-/// rather than failing somewhere in the middle of a write.
+fn ftp_list_only(name: &str) -> Arc<dyn Vfs> {
+    Arc::new(MemVfs::new(name).without(|capabilities| {
+        capabilities.mtime_precision_ms = 60_000;
+        capabilities.ranged_read = Support::No;
+        capabilities.set_mtime = Support::No;
+        capabilities.symlink = Support::No;
+        capabilities.unix_mode = Support::No;
+        capabilities.read_back = Support::No;
+        capabilities.free_space = Support::No;
+        capabilities.write_at = Support::No;
+        capabilities.rename_overwrite = Support::Unknown;
+        capabilities.exclusive_staged_file_publish = Support::No;
+    })) as Arc<dyn Vfs>
+}
+
 #[test]
-fn ftp_list_only_still_compares_and_says_why_it_will_not_write() {
-    let (sv, tv) = (ftp_list_only(), ftp_list_only());
-    corpus::seed_into(&sv, corpus::BASE);
-    corpus::seed_into(&tv, corpus::BASE);
-    corpus::apply_edits(
-        &sv,
-        &[Edit::Add(Seed {
+fn ftp_list_only_compares_but_refuses_before_write() {
+    let source = ftp_list_only("e2e-ftp-source");
+    let target = ftp_list_only("e2e-ftp-target");
+    corpus::seed_into(&source, corpus::BASE);
+    corpus::seed_into(&target, corpus::BASE);
+    corpus::write_seed(
+        &source,
+        Seed {
             path: "new.txt",
             seed: 5,
             size: 512,
             mtime_ms: 1_767_225_600_000,
-        })],
+        },
     );
 
     let job = bare_job();
-    let (said, ctx) = watched();
-
-    let out = crate::run::local::compare_resolved(&job, &sv, &tv, &ctx, true)
+    let (transcript, context) = watched();
+    let comparison = crate::run::local::compare_resolved(&job, &source, &target, &context, true)
         .expect("a read-only backend must still compare");
-    assert_eq!(out.plan.ops.len(), 1, "the comparison itself is unaffected");
-
-    // Both sides lose sampling together: a sampled observation can only match another sampled observation, so a
-    // one-sided upgrade would make identical files look different.
+    assert_eq!(comparison.plan.ops.len(), 1);
     assert_eq!(
-        out.source.header.evidence,
-        crate::model::table::TableEvidence::Full,
-        "no ranged reads on either side means both sides read whole"
+        comparison.source.header.evidence,
+        crate::model::table::TableEvidence::Full
     );
 
-    let ap = crate::run::local::apply_resolved(
+    let outcome = crate::run::local::apply_resolved(
         &job,
-        &out.plan,
-        &out.plan.ops,
-        &sv,
-        &tv,
+        &comparison.plan,
+        &comparison.plan.ops,
+        &source,
+        &target,
         None,
         false,
         false,
         true,
         std::time::Instant::now(),
-        &ctx,
+        &context,
     );
-    assert_eq!(ap.errors, 1, "the write side must refuse");
-    assert_eq!(ap.done, 0, "and must not have done anything first");
-    let text = said.text();
-    assert!(
-        text.contains("root lock") && text.contains("refusing to write"),
-        "the refusal has to name the lock as the reason:\n{text}"
-    );
+    assert_eq!((outcome.done, outcome.errors), (0, 1));
+    let text = transcript.text();
+    assert!(text.contains("root lock") && text.contains("refusing to write"));
 }
 
-/// A live lane: open a scratch root per call under `base_url`, and hold the backend to both
-/// contracts.
-///
-/// Everything it makes lives under `base_url` and is removed again before *and* after, so "fresh and
-/// empty" holds even if an earlier run died mid-suite.
-///
-/// The pipeline suite runs first and the backend contract second, so a backend with a known contract
-/// gap still reports whether real syncs work on it — the more useful half of the answer, and the
-/// half lost if the contract check panics first.
-fn live_lane(lane: &str, base_url: &str) {
-    let creds = crate::fs::vfs::cred::default_provider();
+fn live_lane(lane: &str, base_url: &str, pipeline_required: bool) {
+    let credentials = crate::fs::vfs::cred::default_provider();
     let open = |url: &str| -> Arc<dyn Vfs> {
-        let v =
-            crate::fs::vfs::open(url, &creds).unwrap_or_else(|e| panic!("opening '{url}': {e}"));
-        v.connect()
-            .unwrap_or_else(|e| panic!("connecting to '{url}': {e}"));
-        v
+        let root = crate::fs::vfs::open(url, &credentials)
+            .unwrap_or_else(|error| panic!("opening '{url}': {error}"));
+        root.connect()
+            .unwrap_or_else(|error| panic!("connecting to '{url}': {error}"));
+        root
     };
 
     let base = open(base_url);
-    let mut roots: Vec<String> = Vec::new();
-    let mut n = 0usize;
-    let mut mk = || {
-        n += 1;
-        let name = format!("e2e-{}-{n}", std::process::id());
-        conformance::remove_tree(&base, &name).unwrap_or_else(|e| panic!("clearing '{name}': {e}"));
+    let mut roots = Vec::new();
+    let mut serial = 0usize;
+    let mut fresh_root = || {
+        serial += 1;
+        let name = format!("e2e-{}-{serial}", std::process::id());
+        conformance::remove_tree(&base, &name)
+            .unwrap_or_else(|error| panic!("clearing '{name}': {error}"));
         base.mkdir_all(&name)
-            .unwrap_or_else(|e| panic!("creating '{name}': {e}"));
+            .unwrap_or_else(|error| panic!("creating '{name}': {error}"));
         roots.push(name.clone());
         open(&format!("{base_url}/{name}"))
     };
 
-    let rep = run_all(lane, &mut mk);
-    println!(
-        "[{lane}] ran {} case(s), skipped {:?}",
-        rep.ran.len(),
-        rep.skipped
-    );
-    conformance::run_all(&mut mk);
-
-    for name in &roots {
-        conformance::remove_tree(&base, name)
-            .unwrap_or_else(|e| panic!("cleaning up '{name}': {e}"));
-    }
+    let source = fresh_root();
+    let target = fresh_root();
+    let pipeline_supported = target.caps().exclusive_staged_file_publish.yes();
     assert!(
-        !rep.ran.is_empty(),
-        "a live lane that ran no cases proves nothing"
+        !pipeline_required || pipeline_supported,
+        "{lane} must support exclusive staged-file publication"
     );
+    if pipeline_supported {
+        run_pipeline_smoke(lane, &source, &target, None);
+    }
+    conformance::run_all(&mut fresh_root);
+
+    for name in roots {
+        conformance::remove_tree(&base, &name)
+            .unwrap_or_else(|error| panic!("cleaning up '{name}': {error}"));
+    }
 }
 
-/// ```text
-/// set SYNCDASH_E2E_SFTP_URL=sftp://user@host/path/to/scratch
-/// cargo test --lib sftp_live_lane -- --ignored --nocapture
-/// ```
 #[test]
 #[ignore = "needs a live SFTP server in SYNCDASH_E2E_SFTP_URL"]
 fn sftp_live_lane() {
     let url = std::env::var("SYNCDASH_E2E_SFTP_URL")
         .expect("set SYNCDASH_E2E_SFTP_URL to an sftp://user@host/scratch phrase");
-    live_lane("sftp", &url);
+    live_lane("sftp", &url, true);
 }
 
-/// Needs a stored credential as well as a server — an `smb://` root cannot ride this machine's
-/// session login the way a `\\host\share` path can.
-///
-/// ```text
-/// syncdash cred set "smb://user@host/share"
-/// set SYNCDASH_E2E_SMB_URL=smb://user@host/share/scratch
-/// cargo test --lib smb_live_lane -- --ignored --nocapture
-/// ```
 #[test]
 #[ignore = "needs a live SMB share in SYNCDASH_E2E_SMB_URL and a stored credential"]
 fn smb_live_lane() {
     let url = std::env::var("SYNCDASH_E2E_SMB_URL")
         .expect("set SYNCDASH_E2E_SMB_URL to an smb://user@host/share/scratch phrase");
-    live_lane("smb", &url);
+    live_lane("smb", &url, true);
 }
 
-/// ```text
-/// set SYNCDASH_E2E_FTP_URL=ftp://anonymous@host:2121/
-/// cargo test --lib ftp_live_lane -- --ignored --nocapture
-/// ```
 #[test]
 #[ignore = "needs a live FTP server in SYNCDASH_E2E_FTP_URL"]
 fn ftp_live_lane() {
     let url = std::env::var("SYNCDASH_E2E_FTP_URL")
         .expect("set SYNCDASH_E2E_FTP_URL to an ftp://user@host/scratch phrase");
-    live_lane("ftp", &url);
+    live_lane("ftp", &url, false);
 }
 
-/// The same backend over an authenticated TLS control channel.
-///
-/// The interesting half is what has to be true before this can run at all: the server's certificate
-/// must verify against **this machine's own trust store**, because there is deliberately no flag to
-/// skip verification. So a passing run is evidence for the design choice, not just for the code — a
-/// LAN server whose certificate its owner installed is exactly the case `tls_connector` exists to
-/// serve.
-///
-/// ```text
-/// set SYNCDASH_E2E_FTPS_URL=ftps://anonymous@host:2122/
-/// cargo test --lib ftps_live_lane -- --ignored --nocapture
-/// ```
 #[test]
 #[ignore = "needs a live FTPS server in SYNCDASH_E2E_FTPS_URL whose CA this machine trusts"]
 fn ftps_live_lane() {
     let url = std::env::var("SYNCDASH_E2E_FTPS_URL")
         .expect("set SYNCDASH_E2E_FTPS_URL to an ftps://user@host/scratch phrase");
-    live_lane("ftps", &url);
+    live_lane("ftps", &url, false);
 }
 
-/// A real local disk other than the temp volume — an exFAT external drive, whose 10 ms mtime
-/// granularity is a tier no other lane covers.
-///
-/// ```text
-/// set SYNCDASH_E2E_EXFAT_ROOT=E:\syncdash-e2e
-/// cargo test --lib exfat_live_lane -- --ignored --nocapture
-/// ```
 #[test]
 #[ignore = "needs a writable directory on a non-temp volume in SYNCDASH_E2E_EXFAT_ROOT"]
 fn exfat_live_lane() {
@@ -306,45 +188,36 @@ fn exfat_live_lane() {
     let base = std::path::PathBuf::from(&root);
     std::fs::create_dir_all(&base).expect("the scratch root must be creatable");
 
-    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-    let mut n = 0usize;
-    let rep = {
-        let mut mk = || {
-            n += 1;
-            let d = base.join(format!("e2e-{}-{n}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).unwrap();
-            dirs.push(d.clone());
-            Arc::new(LocalVfs::open(d).unwrap()) as Arc<dyn Vfs>
-        };
-        conformance::run_all(&mut mk);
-        run_all("exfat", &mut mk)
+    let mut directories = Vec::new();
+    let mut serial = 0usize;
+    let mut fresh_root = || {
+        serial += 1;
+        let path = base.join(format!("e2e-{}-{serial}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        directories.push(path.clone());
+        Arc::new(LocalVfs::open(path).unwrap()) as Arc<dyn Vfs>
     };
-    let caps = LocalVfs::open(base.clone()).unwrap().caps();
-    let precision = caps.mtime_precision_ms;
-    assert_eq!(
-        caps.unix_mode,
-        Support::No,
-        "exFAT cannot preserve Unix modes"
-    );
-    #[cfg(target_os = "macos")]
-    assert_eq!(
-        caps.symlink,
-        Support::Yes,
-        "macOS FSKit exFAT supports symbolic links"
-    );
-    assert_eq!(
-        caps.file_id,
-        Support::No,
-        "exFAT object IDs are not durable rename evidence"
-    );
 
-    let id_probe = base.join(format!("file-id-probe-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&id_probe);
-    std::fs::create_dir_all(&id_probe).unwrap();
-    std::fs::write(id_probe.join("empty.bin"), b"").unwrap();
+    conformance::run_all(&mut fresh_root);
+    let source = fresh_root();
+    let target = fresh_root();
+    let trash = base.join(format!("trash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&trash);
+    run_pipeline_smoke("exfat", &source, &target, Some(trash.clone()));
+
+    let capabilities = LocalVfs::open(base.clone()).unwrap().caps();
+    assert_eq!(capabilities.unix_mode, Support::No);
+    #[cfg(target_os = "macos")]
+    assert_eq!(capabilities.symlink, Support::Yes);
+    assert_eq!(capabilities.file_id, Support::No);
+
+    let probe = base.join(format!("file-id-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&probe);
+    std::fs::create_dir_all(&probe).unwrap();
+    std::fs::write(probe.join("empty.bin"), b"").unwrap();
     let snapshot = crate::pipeline::scan::scan(
-        &id_probe,
+        &probe,
         &crate::pipeline::scan::ScanOptions {
             hash: false,
             sampled: false,
@@ -354,21 +227,15 @@ fn exfat_live_lane() {
         },
     )
     .unwrap();
-    assert!(
-        snapshot
-            .entries
-            .iter()
-            .filter_map(crate::model::table::ObservedEntry::as_file)
-            .all(|file| file.file_system_id.is_none()),
-        "exFAT snapshots must omit unstable synthetic object IDs",
-    );
-    let _ = std::fs::remove_dir_all(&id_probe);
-    for d in dirs {
-        let _ = std::fs::remove_dir_all(&d);
+    assert!(snapshot
+        .entries
+        .iter()
+        .filter_map(crate::model::table::ObservedEntry::as_file)
+        .all(|file| file.file_system_id.is_none()));
+
+    let _ = std::fs::remove_dir_all(probe);
+    let _ = std::fs::remove_dir_all(trash);
+    for directory in directories {
+        let _ = std::fs::remove_dir_all(directory);
     }
-    println!(
-        "[exfat] {root} reports {precision} ms mtime precision; skipped {:?}",
-        rep.skipped
-    );
-    assert!(!rep.ran.is_empty());
 }

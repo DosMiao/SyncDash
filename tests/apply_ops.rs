@@ -720,7 +720,7 @@ fn delta_update_produces_identical_content() {
     std::fs::create_dir_all(&s).unwrap();
     std::fs::create_dir_all(&t).unwrap();
     // Larger than DELTA_MIN_SIZE, with only a short stretch in the middle differing
-    let mut old = vec![0u8; 6 * 1024 * 1024];
+    let mut old = vec![0u8; syncdash::model::chunk::DELTA_MIN_SIZE as usize + 256 * 1024];
     for (i, b) in old.iter_mut().enumerate() {
         *b = (i % 251) as u8;
     }
@@ -747,8 +747,8 @@ fn delta_update_handles_shrinking_files() {
     let (s, t) = (base.join("s"), base.join("t"));
     std::fs::create_dir_all(&s).unwrap();
     std::fs::create_dir_all(&t).unwrap();
-    let old = vec![7u8; 8 * 1024 * 1024];
-    let new = vec![7u8; 5 * 1024 * 1024];
+    let old = vec![7u8; 5 * 1024 * 1024];
+    let new = vec![7u8; syncdash::model::chunk::DELTA_MIN_SIZE as usize + 64 * 1024];
     std::fs::write(s.join("shrink.bin"), &new).unwrap();
     std::fs::write(t.join("shrink.bin"), &old).unwrap();
 
@@ -812,8 +812,6 @@ fn verify_reads_the_staged_file_back_in_both_lanes() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
-
-// v0.9 M1: parallelism / progress / cancellation
 
 fn collecting_ctx() -> (RunCtx, Arc<Mutex<Vec<ProgressEvent>>>) {
     let store: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -926,9 +924,9 @@ fn cancel_mid_copy_leaves_no_debris() {
     let (s, t) = (base.join("s"), base.join("t"));
     std::fs::create_dir_all(&s).unwrap();
     std::fs::create_dir_all(&t).unwrap();
-    std::fs::write(s.join("big.bin"), vec![3u8; 64 * 1024 * 1024]).unwrap();
+    std::fs::write(s.join("big.bin"), vec![3u8; 2 * 1024 * 1024]).unwrap();
     let mut o = op(Action::Copy, "big.bin");
-    o.size = Some(64 * 1024 * 1024);
+    o.size = Some(2 * 1024 * 1024);
 
     let ctl = RunCtl::new();
     let ctl2 = ctl.clone();

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 
 use crate::foundation::names::LOCK_NAME;
@@ -80,7 +81,7 @@ pub struct RootLock {
     vfs: Arc<dyn Vfs>,
     anchor: LockAnchor,
     claim: LockClaim,
-    stop: Arc<AtomicBool>,
+    heartbeat_stop: Option<Sender<()>>,
     lease_lost: Arc<AtomicBool>,
     heartbeat: Option<std::thread::JoinHandle<()>>,
 }
@@ -508,9 +509,8 @@ impl RootLock {
             }
         }
 
-        let stop = Arc::new(AtomicBool::new(false));
+        let (heartbeat_stop, heartbeat_wake) = mpsc::channel();
         let lease_lost = Arc::new(AtomicBool::new(false));
-        let heartbeat_stop = stop.clone();
         let heartbeat_lost = lease_lost.clone();
         let heartbeat_vfs = vfs.clone();
         let heartbeat_anchor = anchor.clone();
@@ -518,8 +518,13 @@ impl RootLock {
         let heartbeat = std::thread::spawn(move || {
             let mut elapsed = 0u64;
             let mut touch_warning_emitted = false;
-            while !heartbeat_stop.load(Ordering::Acquire) {
-                std::thread::sleep(std::time::Duration::from_millis(HEARTBEAT_POLL_MS));
+            loop {
+                match heartbeat_wake
+                    .recv_timeout(std::time::Duration::from_millis(HEARTBEAT_POLL_MS))
+                {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
                 if !lease_identity_is_current(&heartbeat_vfs, &heartbeat_anchor, &heartbeat_claim) {
                     heartbeat_lost.store(true, Ordering::Release);
                     break;
@@ -554,7 +559,7 @@ impl RootLock {
             vfs: vfs.clone(),
             anchor,
             claim,
-            stop,
+            heartbeat_stop: Some(heartbeat_stop),
             lease_lost,
             heartbeat: Some(heartbeat),
         })
@@ -579,7 +584,9 @@ impl RootLock {
 
 impl Drop for RootLock {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        if let Some(stop) = self.heartbeat_stop.take() {
+            let _ = stop.send(());
+        }
         if let Some(heartbeat) = self.heartbeat.take() {
             let _ = heartbeat.join();
         }

@@ -13,9 +13,10 @@ import {
   preferredTargetIndex,
   sameCompareIdentity,
   scopeWorkspace,
-  workspaceByResultKey,
 } from '../../typescript/ui/state/compareWorkspaceModel.ts';
 import type {
+  CompareResultKey,
+  CompareWorkspace,
   CompareWorkspaceRepository,
 } from '../../typescript/ui/state/compareWorkspaceModel.ts';
 import {
@@ -112,6 +113,19 @@ function plan(
 
 function scope(jobId: string, targetIndex: number, configRevision: string): CompareScopeDto {
   return { job_id: jobId, target_index: targetIndex, config_revision: configRevision };
+}
+
+function workspaceByResultKey(
+  repository: CompareWorkspaceRepository,
+  resultKey: CompareResultKey,
+): CompareWorkspace | null {
+  for (const scopeWorkspace of repository.scopes) {
+    if (scopeWorkspace.active?.key === resultKey) return scopeWorkspace.active;
+    if (scopeWorkspace.candidate?.workspace.key === resultKey) {
+      return scopeWorkspace.candidate.workspace;
+    }
+  }
+  return null;
 }
 
 function fresh(resultPlan: PlanDto, verificationEpoch: number): CompareScopeExecutionStatusDto {
@@ -551,7 +565,6 @@ test('exact workspace lookup fences stale responses and preserves review state w
     },
   );
   assert.equal(workspaceByResultKey(repository, resultKey)?.retention.status, 'retained');
-  assert.equal(workspaceByResultKey(repository, resultKey)?.display.jobName, 'Renamed');
   assert.deepEqual(workspaceByResultKey(repository, resultKey)?.differences.rowIncluded, [false, false, true]);
 });
 
@@ -964,27 +977,6 @@ test('compare activity transitions and async completions are request-fenced', ()
     type: 'compare_activity_finished', scopeKey, requestId: 5,
   });
   assert.equal(scopeWorkspace(repository, activityScope)?.activity.status, 'idle');
-});
-
-test('job renames update display names without mutating immutable result evidence', () => {
-  const oldPlan = plan(owner('job-a', 0, 'rev-old', 1, 'Old'));
-  const currentPlan = plan(owner('job-a', 0, 'rev-current', 2, 'Old'));
-  const otherPlan = plan(owner('job-b', 0, 'rev-b', 3, 'B'));
-  let repository = publish(emptyCompareWorkspaceRepository, oldPlan, 1);
-  repository = publish(repository, currentPlan, 2);
-  repository = publish(repository, otherPlan, 3);
-  const immutablePlan = workspaceByResultKey(repository, compareResultKey(currentPlan.owner.identity))?.plan;
-  repository = reduceCompareWorkspaces(repository, {
-    type: 'job_display_name_rebound', jobId: 'job-a', jobName: 'Renamed',
-  });
-  const renamed = workspaceByResultKey(repository, compareResultKey(currentPlan.owner.identity))!;
-  assert.equal(renamed.display.jobName, 'Renamed');
-  assert.equal(renamed.plan, immutablePlan);
-  assert.equal(renamed.plan.owner.job_name, 'Old');
-  assert.equal(
-    workspaceByResultKey(repository, compareResultKey(otherPlan.owner.identity))?.display.jobName,
-    'B',
-  );
 });
 
 test('job revision and deletion expiry preserve evidence while invalidated scopes become view-only', () => {

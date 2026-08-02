@@ -24,9 +24,6 @@ export type RootSaveState =
     status: 'saving';
     requestId: number;
     field: RootField;
-    owner: RootEditorOwner;
-    before: string;
-    value: string;
   }
   | { status: 'failed'; requestId: number; field: RootField; error: string };
 
@@ -77,12 +74,6 @@ export function rootEditorKey(owner: Pick<RootEditorOwner, 'jobId' | 'targetInde
 
 export function activeRootEditor(repository: RootEditorRepository): RootEditorWorkspace | null {
   return repository.workspaces.find((workspace) => workspace.key === repository.activeKey) ?? null;
-}
-
-export function sameRootEditorOwner(left: RootEditorOwner, right: RootEditorOwner): boolean {
-  return left.jobId === right.jobId
-    && left.configRevision === right.configRevision
-    && left.targetIndex === right.targetIndex;
 }
 
 export function rootDraftIsDirty(workspace: RootEditorWorkspace, field: RootField): boolean {
@@ -224,9 +215,6 @@ export function reduceRootEditors(
             status: 'saving',
             requestId: action.requestId,
             field: action.field,
-            owner: workspace.owner,
-            before: workspace.committed[action.field],
-            value: workspace.draft[action.field].trim(),
           },
         };
       });

@@ -8,8 +8,14 @@
     "build": "vite build",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
+    "test": "npm run test:rust && npm run test:frontend",
+    "test:rust": "cargo test --workspace --quiet --lib --bins",
+    "test:integration": "cargo test --quiet --test apply_ops --test pack_roundtrip --test version_restore",
     "test:frontend": "node --test Script/tests/*.test.mts",
-    "gen:types": "node Script/gen-types.mjs"
+    "test:frontend:audit": "node --test Script/audits/*.audit.mts",
+    "test:all": "npm run gen:types:check && cargo test --workspace --quiet && npm run test:frontend && npm run test:frontend:audit",
+    "gen:types": "node Script/gen-types.mjs",
+    "gen:types:check": "node Script/gen-types.mjs --check"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

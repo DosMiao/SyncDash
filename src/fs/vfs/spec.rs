@@ -12,7 +12,7 @@
 //! `peer://` is the odd one: it does not name a protocol this process speaks, it names a machine
 //! running its own syncdash. It lives in the same grammar anyway because it answers the same
 //! question — *where does this root live* — and that question is supposed to have one answer in
-//! one place. It used to have two: this grammar, and a `remote_host` field on the job.
+//! one place.
 //!
 //! Everything that is not a known scheme is a local path — with one deliberate
 //! exception: `xyz://` with an *unknown* scheme parses to `UnknownScheme` instead of
@@ -22,8 +22,7 @@
 //! config validation / `open()`, not here: parsing never fails, so a half-typed phrase
 //! in an editor field stays representable.
 //!
-//! Credentials never appear in a phrase: no `user:pass@`, no FFS-style `|pass64=`.
-//! Secrets live in the OS credential store, keyed off the phrase (M2).
+//! Credentials never appear in a phrase. Secrets live in the OS credential store.
 
 use std::path::PathBuf;
 
@@ -335,9 +334,15 @@ mod tests {
 
     #[test]
     fn unknown_scheme_never_silently_local() {
-        match parse("sfpt://host/x") {
-            RootSpec::UnknownScheme { scheme, .. } => assert_eq!(scheme, "sfpt"),
-            other => panic!("typo scheme must be caught, got {other:?}"),
+        for (phrase, expected) in [
+            ("sfpt://host/x", "sfpt"),
+            ("fake://seed1", "fake"),
+            ("nfs://server/export", "nfs"),
+        ] {
+            match parse(phrase) {
+                RootSpec::UnknownScheme { scheme, .. } => assert_eq!(scheme, expected),
+                other => panic!("unknown scheme must be caught, got {other:?}"),
+            }
         }
     }
 
@@ -368,20 +373,6 @@ mod tests {
     fn encoded_user_decodes() {
         let r = endpoint("sftp://user%40corp@host/x");
         assert_eq!(r.user.as_deref(), Some("user@corp"));
-    }
-
-    /// `fake://` was a routed scheme until the in-memory test backend was deleted. It must now
-    /// take the unknown-scheme path like any other typo, never fall back to a local path.
-    #[test]
-    fn unknown_scheme_is_refused_never_treated_as_local() {
-        assert!(matches!(
-            parse("fake://seed1"),
-            RootSpec::UnknownScheme { .. }
-        ));
-        assert!(matches!(
-            parse("nfs://server/export"),
-            RootSpec::UnknownScheme { .. }
-        ));
     }
 
     #[test]

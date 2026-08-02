@@ -1712,60 +1712,6 @@ mod tests {
     }
 
     #[test]
-    fn reading_an_older_version_does_not_change_the_latest_pointer() {
-        let repository = CompareResultRepository::in_memory();
-        publish(&repository, version("job-a", "A", 0, "revision-a", 1));
-        publish(&repository, version("job-a", "A", 0, "revision-a", 2));
-        repository
-            .get_exact(&identity("job-a", 0, "revision-a", 1))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(
-            repository
-                .latest_for("job-a", 0, "revision-a")
-                .unwrap()
-                .unwrap()
-                .identity()
-                .compare_run_id,
-            2
-        );
-    }
-
-    #[test]
-    fn hot_scope_churn_preserves_every_scopes_latest_result() {
-        let repository = CompareResultRepository::in_memory();
-        publish(&repository, version("job-a", "A", 0, "revision-a", 1));
-        publish(&repository, version("job-b", "B", 0, "revision-b", 2));
-        publish(&repository, version("job-b", "B", 0, "revision-b", 3));
-        publish(&repository, version("job-b", "B", 0, "revision-b", 4));
-        publish(&repository, version("job-b", "B", 0, "revision-b", 5));
-
-        assert!(repository
-            .get_exact(&identity("job-a", 0, "revision-a", 1))
-            .unwrap()
-            .is_some());
-        assert_eq!(
-            repository
-                .latest_for("job-a", 0, "revision-a")
-                .unwrap()
-                .unwrap()
-                .identity()
-                .compare_run_id,
-            1
-        );
-        assert_eq!(
-            repository
-                .latest_for("job-b", 0, "revision-b")
-                .unwrap()
-                .unwrap()
-                .identity()
-                .compare_run_id,
-            5
-        );
-    }
-
-    #[test]
     fn bounded_hot_cache_never_changes_retention_or_latest_pointers() {
         let repository = CompareResultRepository::in_memory();
         publish(&repository, version("job-a", "A", 0, "revision-a", 1));

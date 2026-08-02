@@ -3,7 +3,6 @@ import type { JobDto } from '../../core/types/generated/JobDto.ts';
 export interface JobRegistryState {
   jobs: JobDto[];
   selectedJobId: string | null;
-  snapshotEpoch: number;
 }
 
 export type JobRegistryAction =
@@ -13,7 +12,6 @@ export type JobRegistryAction =
 export const emptyJobRegistryState: JobRegistryState = {
   jobs: [],
   selectedJobId: null,
-  snapshotEpoch: 0,
 };
 
 export function validateJobRegistrySnapshot(jobs: JobDto[]): void {
@@ -37,21 +35,14 @@ export function reduceJobRegistry(
   action: JobRegistryAction,
 ): JobRegistryState {
   switch (action.type) {
-    case 'snapshot_received': {
-      validateJobRegistrySnapshot(action.jobs);
-      const nextEpoch = state.snapshotEpoch + 1;
-      if (!Number.isSafeInteger(nextEpoch)) {
-        throw new Error('Job-registry snapshot epochs are exhausted; restart SyncDash');
-      }
+    case 'snapshot_received':
       return {
         jobs: action.jobs,
         selectedJobId: state.selectedJobId !== null
           && action.jobs.some((job) => job.job_id === state.selectedJobId)
           ? state.selectedJobId
           : null,
-        snapshotEpoch: nextEpoch,
       };
-    }
     case 'selection_changed':
       return {
         ...state,

@@ -222,7 +222,7 @@ fn whole_pack_refuses_content_that_changed_after_compare() {
     let src = tmp("src-stale-whole-evidence");
     let tgt = tmp("tgt-stale-whole-evidence");
     let out = tmp("pkg-stale-whole-evidence").join("p.tar");
-    let original = body(17, 5 * 1024 * 1024);
+    let original = body(17, 256 * 1024);
     write(&src, "big.bin", &original);
     let plan = compare_plan(&src, &tgt, "paranoid");
     assert!(plan.ops[0]
@@ -230,8 +230,9 @@ fn whole_pack_refuses_content_that_changed_after_compare() {
         .as_deref()
         .is_some_and(|hash| !hash.starts_with('~')));
 
+    let midpoint = original.len() / 2;
     let mut changed = original;
-    changed[2_000_000] ^= 0xFF;
+    changed[midpoint] ^= 0xFF;
     write(&src, "big.bin", &changed);
 
     let error = match pack::pack(&plan, &src, &out, None) {
@@ -271,9 +272,13 @@ fn delta_pack_refuses_sampled_content_that_changed_after_compare() {
     let src = tmp("src-stale-delta-evidence");
     let tgt = tmp("tgt-stale-delta-evidence");
     let out = tmp("pkg-stale-delta-evidence").join("p.tar");
-    let old = body(21, 10 * 1024 * 1024);
+    let old = body(
+        21,
+        syncdash::model::chunk::DELTA_MIN_SIZE as usize + 1024 * 1024,
+    );
     let mut current = old.clone();
-    current[5_300_000..5_301_000].fill(0x5A);
+    let sampled_middle = current.len() / 2;
+    current[sampled_middle..sampled_middle + 1_000].fill(0x5A);
     write(&src, "big.bin", &current);
     write(&tgt, "big.bin", &old);
     let plan = compare_plan(&src, &tgt, "standard");
@@ -305,9 +310,12 @@ fn a_delta_base_that_changed_is_refused() {
     let tgt = tmp("tgt-stale");
     let out = tmp("pkg-stale").join("p.tar");
 
-    let old = body(1, 10 * 1024 * 1024);
+    let old = body(
+        1,
+        syncdash::model::chunk::DELTA_MIN_SIZE as usize + 1024 * 1024,
+    );
     let mut new = old.clone();
-    new[5_000_000..5_001_000].fill(0xCD);
+    new[2_500_000..2_501_000].fill(0xCD);
     write(&tgt, "big.bin", &old);
     write(&src, "big.bin", &new);
     pack_delta(&src, &tgt, &out, "big.bin");

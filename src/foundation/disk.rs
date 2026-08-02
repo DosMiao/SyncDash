@@ -1,11 +1,7 @@
 //! Free-space probe for a path.
 //!
-//! Lives at L0 because both ends of the layer graph need it and neither may reach the other:
-//! `pipeline::guard` runs it as the pre-apply space gate, and `fs::vfs::local` answers
-//! `free_space()` with it. It used to exist as two byte-identical copies, the one in `local.rs`
-//! carrying a comment explaining that it was duplicated because `fs` must not reach up into
-//! `pipeline`. Correct diagnosis, wrong remedy: `foundation` is the layer both may reach down to,
-//! and two hand-maintained copies of an `unsafe` FFI call is exactly the thing it exists to end.
+//! This foundation-level implementation is shared by the pre-apply space guard and local VFS,
+//! keeping the platform FFI in one place without an upward dependency.
 
 use std::path::Path;
 

@@ -53,8 +53,7 @@ pub(crate) fn write_out<F: Fn(&mut dyn std::io::Write) -> std::io::Result<()>>(
     }
 }
 
-/// v0.9 M5: with egui retired, GUI = the Tauri desktop app. Look for syncdash-desktop next to this binary and launch it;
-/// if it isn't there, say plainly where to get it instead of exiting silently.
+/// Launch the adjacent Tauri desktop binary or report where it was expected.
 fn launch_desktop() -> std::io::Result<i32> {
     let exe_name = if cfg!(windows) {
         "syncdash-desktop.exe"

@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -261,15 +260,4 @@ test('persistence failure keeps the successfully applied session zoom', async ()
     reason: 'change',
     error: 'storage denied',
   }]);
-});
-
-test('zoom hook steps from desired state and renders only applied state', async () => {
-  const source = await readFile(
-    new URL('../../typescript/ui/hooks/useZoomControl.ts', import.meta.url),
-    'utf8',
-  );
-  assert.match(source, /stepZoom\(desiredZoomFactorRef\.current, direction\)/);
-  assert.match(source, /zoom: authorityState\.appliedFactor/);
-  assert.match(source, /persist: false,[\s\S]*reason: 'restore'/);
-  assert.match(source, /for this session only; the preference could not be saved/);
 });

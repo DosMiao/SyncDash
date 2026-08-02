@@ -10,7 +10,7 @@
 //! - timestamps: MLSD carries UTC seconds (precision 1000 ms); a LIST-only server
 //!   thinks in minutes and pretends UTC (60000 ms, FileZilla's stance) — declared in
 //!   caps, so the compare window widens out loud;
-//! - MFMT is FEAT-gated. Without it mtimes cannot be set — the P1-4 correction table
+//! - MFMT is FEAT-gated. Without it mtimes cannot be set — the correction table
 //!   absorbs that for compare. FTP remains read-only for apply independently of MFMT because the
 //!   protocol has no exclusive staged-file publication primitive for a root-lock claim;
 //! - one control connection, operations serialized (`max_parallel_streams = 1`) — and the apply

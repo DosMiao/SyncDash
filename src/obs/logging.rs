@@ -1,18 +1,8 @@
-//! v0.10: centralised logging.
+//! Logging over the existing progress-event bus.
 //!
-//! **Why not pull in tracing/log**: the project already has one event bus running through the whole
-//! pipeline (`progress::ProgressSink`), `RunCtx` already reaches every engine function, and
-//! `runlog::ErrCollector` has already demonstrated the sink-decorator pattern. Stacking another
-//! facade on top would only give one thing two outlets.
-//! This module does exactly one thing: it merges the stray `eprintln!`s into that existing bus.
-//!
-//! **Why macros plus a process-wide registry**: the call sites in `trash.rs` / `version.rs` / `lock.rs`
-//! have no `RunCtx`, and changing signatures would ripple through dozens of functions. The registry
-//! puts them on the bus with zero signature churn; where ctx is in hand the code still calls `ctx.log()` directly.
-//!
-//! **With no sink installed, print verbatim to stderr** — this is what makes "CLI output is byte-for-byte
-//! identical before and after the rework" hold, so the correctness of the swap (P3) does not depend on
-//! whether the desktop shell or the CLI installed a sink.
+//! Code with a `RunCtx` logs through it. Low-level lifecycle code uses the macros, which route to
+//! the process sink without adding context parameters throughout the filesystem layer. With no
+//! installed sink, messages go to stderr.
 
 use crate::foundation::names::{
     APP_LOG_FILE, RUNLOG_ERRORS_FILE, RUNLOG_ITEMS_FILE, RUNLOG_RUN_FILE,
@@ -25,7 +15,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// Where the macros land. With nobody holding the sink it goes verbatim to stderr — the pre-rework behavior.
+/// Route a macro-generated message to the current sink or stderr.
 pub fn emit(level: LogLevel, scope: &str, message: String) {
     match current() {
         Some(s) => s.emit(ProgressEvent::Log {
@@ -38,8 +28,7 @@ pub fn emit(level: LogLevel, scope: &str, message: String) {
     }
 }
 
-/// `log_info!("run", "peer {host}: {os}")` — the arguments match `format!`.
-/// Messages keep the prefix the call site already had (`[job] warning: …`), so the swap does not change one byte of CLI output.
+/// Arguments follow `format!`.
 #[macro_export]
 macro_rules! log_info {
     ($scope:expr, $($arg:tt)*) => {
@@ -61,10 +50,7 @@ macro_rules! log_error {
     };
 }
 
-/// The CLI's old behavior: `Log` goes verbatim to stderr.
-///
-/// Only `Log` — after the swap every `Error` event also carries a `Log` alongside it (`apply::record`
-/// emits both), and printing both would double the output.
+/// Print only `Log` events; `Error` events have a matching log entry.
 pub struct StderrSink {
     pub min_level: LogLevel,
 }

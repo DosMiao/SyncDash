@@ -574,12 +574,6 @@ export function App() {
         configRevision: previous.configRevision,
         reason: 'job_changed',
       });
-    } else {
-      dispatchCompareWorkspace({
-        type: 'job_display_name_rebound',
-        jobId: previous.jobId,
-        jobName: refreshedJob.name,
-      });
     }
   }, []);
 
@@ -600,12 +594,6 @@ export function App() {
         jobId: previous.jobId,
         configRevision: previous.configRevision,
         reason: 'job_changed',
-      });
-    } else {
-      dispatchCompareWorkspace({
-        type: 'job_display_name_rebound',
-        jobId: saved.job_id,
-        jobName: saved.name,
       });
     }
   }, []);
@@ -778,12 +766,8 @@ export function App() {
     comparedJob: JobIdentitySnapshot,
     targetIndex: number,
     origin: { kind: 'interactive' } | { kind: 'auto_scan'; generation: number; ticketId: number },
-  ): CompareActivityRequest | null => {
+  ): CompareActivityRequest => {
     const requestId = compareActivityRequestId.current + 1;
-    if (!Number.isSafeInteger(requestId)) {
-      setStatus('Compare activity request IDs are exhausted; restart SyncDash before comparing', 'err');
-      return null;
-    }
     compareActivityRequestId.current = requestId;
     const scope = {
       job_id: comparedJob.jobId,
@@ -792,7 +776,7 @@ export function App() {
     };
     dispatchCompareWorkspace({ type: 'compare_activity_started', scope, requestId, origin });
     return { scope, requestId };
-  }, [setStatus]);
+  }, []);
 
   const failCompareActivity = useCallback((activity: CompareActivityRequest, error: string) => {
     dispatchCompareWorkspace({
@@ -810,10 +794,6 @@ export function App() {
     announce = true,
   ) => {
     const requestId = restoreRequestId.current + 1;
-    if (!Number.isSafeInteger(requestId)) {
-      setStatus('Compare workspace request IDs are exhausted; restart SyncDash before restoring results', 'err');
-      return;
-    }
     restoreRequestId.current = requestId;
     const scope = compareScopeForJob(job, targetIndex);
     const scopeKey = compareScopeKey(scope);
@@ -932,7 +912,6 @@ export function App() {
         ? { kind: 'auto_scan', generation: autoTicket.generation, ticketId: autoTicket.ticketId }
         : { kind: 'interactive' },
     );
-    if (!activity) return null;
     compareInFlight.current = true;
     const name = comparedJob.name;
     if (!autoTicket) resetSafetyUi();
@@ -1081,7 +1060,6 @@ export function App() {
         generation: autoTicket.generation,
         ticketId: autoTicket.ticketId,
       });
-      if (!activity) return null;
       setStatus(`AutoScan is reviewing Compare authorization for '${comparedJob.name}'…`);
       try {
         const review = await ipc.reviewCompare(comparedJob.jobId, targetIndex, {
@@ -1409,10 +1387,6 @@ export function App() {
       return;
     }
     const requestId = rootSaveRequestId.current + 1;
-    if (!Number.isSafeInteger(requestId)) {
-      setStatus('Root-save request IDs are exhausted; restart SyncDash before editing roots', 'err');
-      return;
-    }
     rootSaveRequestId.current = requestId;
     const workspaceKey = workspace.key;
     const owner = workspace.owner;
@@ -1758,10 +1732,6 @@ export function App() {
     const workspace = liveRootEditor.current;
     if (!workspace) return;
     const requestId = rootPickerRequestId.current + 1;
-    if (!Number.isSafeInteger(requestId)) {
-      setStatus('Directory-picker request IDs are exhausted; reload SyncDash', 'err');
-      return;
-    }
     rootPickerRequestId.current = requestId;
     try {
       const selectedPath = await ipc.pickDirectory({

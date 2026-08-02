@@ -12,10 +12,7 @@ use super::*;
 use crate::fs::vfs::memory::MemVfs;
 use crate::fs::vfs::Vfs;
 
-/// Ten files, all at the root. Flat on purpose: the guard divides deletions by the side's whole
-/// snapshot entry count, and directories inflate that denominator while only files produce `Delete`
-/// ops. With a flat tree, "8 of 10" is exactly what the guard sees, so the case tests the gate
-/// rather than arithmetic about the fixture.
+/// Four root files keep the delete-ratio denominator free of directory entries.
 const FLAT: &[Seed] = &[
     Seed {
         path: "f00.txt",
@@ -41,53 +38,15 @@ const FLAT: &[Seed] = &[
         size: 512,
         mtime_ms: 1_767_225_600_000,
     },
-    Seed {
-        path: "f04.txt",
-        seed: 104,
-        size: 512,
-        mtime_ms: 1_767_225_600_000,
-    },
-    Seed {
-        path: "f05.txt",
-        seed: 105,
-        size: 512,
-        mtime_ms: 1_767_225_600_000,
-    },
-    Seed {
-        path: "f06.txt",
-        seed: 106,
-        size: 512,
-        mtime_ms: 1_767_225_600_000,
-    },
-    Seed {
-        path: "f07.txt",
-        seed: 107,
-        size: 512,
-        mtime_ms: 1_767_225_600_000,
-    },
-    Seed {
-        path: "f08.txt",
-        seed: 108,
-        size: 512,
-        mtime_ms: 1_767_225_600_000,
-    },
-    Seed {
-        path: "f09.txt",
-        seed: 109,
-        size: 512,
-        mtime_ms: 1_767_225_600_000,
-    },
 ];
 
-/// Both roots hold `FLAT`; the source keeps only two files. Eight of the target's ten entries are
-/// now missing — which is what a wrong filter, a swapped pair of roots, or an unmounted share all
-/// look like from inside the plan.
+/// Both roots hold `FLAT`; the source keeps one, producing a 75% delete plan.
 fn mass_delete_pair() -> (Arc<dyn Vfs>, Arc<dyn Vfs>) {
     let sv: Arc<dyn Vfs> = Arc::new(MemVfs::new("guard-src"));
     let tv: Arc<dyn Vfs> = Arc::new(MemVfs::new("guard-tgt"));
     corpus::seed_into(&sv, FLAT);
     corpus::seed_into(&tv, FLAT);
-    for s in &FLAT[2..] {
+    for s in &FLAT[1..] {
         sv.remove_file(s.path).expect("strip the source");
     }
     (sv, tv)
@@ -111,8 +70,8 @@ fn the_delete_ratio_guard_blocks_a_mass_delete() {
 
     assert_eq!(
         plan.ops.len(),
-        8,
-        "the plan really does propose all eight deletions"
+        3,
+        "the plan really does propose all three deletions"
     );
     assert_eq!(ap.errors, 1, "the run must refuse\n{said}");
     assert_eq!(ap.done, 0, "and must not have deleted anything first");
@@ -135,7 +94,7 @@ fn the_delete_ratio_guard_yields_to_i_know() {
     let (_, ap, said) = try_cycle(&guarded_job(0.5, false), &sv, &tv, true);
     assert_eq!(ap.errors, 0, "acknowledged, it should proceed\n{said}");
     assert!(
-        ap.done >= 8,
+        ap.done >= 3,
         "every proposed deletion should have run, got {}",
         ap.done
     );

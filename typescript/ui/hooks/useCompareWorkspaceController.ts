@@ -16,7 +16,6 @@ const IDENTICAL_PAGE_SIZE = 300;
 
 function nextRequestId(sequence: MutableRefObject<number>, floor: number): number {
   const next = Math.max(sequence.current + 1, floor + 1);
-  if (!Number.isSafeInteger(next)) throw new Error('Compare workspace request IDs are exhausted');
   sequence.current = next;
   return next;
 }

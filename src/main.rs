@@ -11,8 +11,7 @@ use clap::Parser;
 use cli::args::Cli;
 
 fn main() {
-    // The CLI has a console: pipe the library's diagnostics back to stderr verbatim — the
-    // pre-refactor terminal experience, word for word. `_session` must live to process exit.
+    // Keep the process sink installed until CLI shutdown.
     let _session = syncdash::boot::init(|cfg| {
         cfg.mirror_stderr.then(|| {
             Arc::new(syncdash::obs::logging::StderrSink {

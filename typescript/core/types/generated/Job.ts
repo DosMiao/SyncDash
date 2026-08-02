@@ -19,7 +19,6 @@ mode: string,
 /**
  * Root phrase: a local path, or `scheme://…` for a VFS root (sftp/ftp/ftps/smb).
  * Plain strings so a phrase survives serde untouched; `vfs::spec::parse` routes it.
- * Serialized form is identical to the old PathBuf fields — existing job files load as-is.
  */
 source: string,
 /**
@@ -40,12 +39,8 @@ include: Array<string>,
  * Excludes (FFS filter syntax, e.g. `big_temp/`, `*.log`; a leading `*` means any depth;
  * a leading `!` makes the line an exception).
  *
- * **This is the whole exclude policy** apart from the tool's own metadata. The junk presets
- * (Windows / macOS / Developer / …) write their patterns into this very list, so what the editor
- * shows here is what the filter does — there is no second set of rules applied behind it.
- *
- * Do not put a mask's star-slash sequence on this line: ts-rs copies this doc verbatim into the
- * generated JSDoc, and those two characters would end the comment block early, yielding invalid .ts.
+ * This is the complete user-visible exclude policy. Junk presets write their patterns here
+ * rather than applying hidden rules.
  */
 exclude: Array<string>,
 /**
