@@ -8,4 +8,5 @@ pub mod apply;
 pub mod compare;
 pub mod filter;
 pub mod guard;
+pub(crate) mod name_safety;
 pub mod scan;
