@@ -4,10 +4,11 @@ use crate::foundation::path::{RootRelativeDir, RootRelativePath};
 use crate::fs::local_root::{LocalRoot, LocalStagedFile};
 use crate::fs::lock::RootLock;
 
-use super::super::{
-    check_version_lease, hash_local_file, invalid_data, parent_directory, relative_directory,
-    relative_path, PreservedEntry, READ_CHUNK,
+use super::super::content::{
+    hash_local_file, invalid_data, parent_directory, relative_directory, relative_path, READ_CHUNK,
 };
+use super::super::model::PreservedEntry;
+use super::super::retention::check_version_lease;
 use super::manifest::{verify_reverse_delta, RestorePayload, ValidatedRestoreEntry};
 
 struct StagedRestoreSymlink {
