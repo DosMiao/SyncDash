@@ -1,3 +1,4 @@
+import { exactWorkspaceLookupProblem, scopeWorkspaceLookupProblem } from '#core/application/compare-workspace/repository/lookup.ts';
 import { useCallback } from 'react';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 import * as compareIpc from '#core/infrastructure/tauri/commands/compare.ts';
@@ -11,8 +12,6 @@ import {
 } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import type { CompareWorkspacePreferences } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import {
-  exactWorkspaceLookupProblem,
-  scopeWorkspaceLookupProblem,
 } from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
 import type { CompareWorkspaceAction } from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
 import {
