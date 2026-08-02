@@ -8,6 +8,7 @@ import type {
   RootEditorWorkspace,
   RootField,
 } from '#core/application/jobs/rootEditor.ts';
+import { rootSaveBlocked } from '#core/application/safety/executionSafety.ts';
 import type { ExecutionInteractionState } from '#core/application/safety/executionSafety.ts';
 import type { AutoScanStatusDto } from '#core/types/generated/AutoScanStatusDto.ts';
 import type { JobDto } from '#core/types/generated/JobDto.ts';
@@ -83,14 +84,7 @@ export function useRootMutations({
       setStatus(`The saved ${field} changed — choose Keep draft or Cancel before saving`, 'err');
       return;
     }
-    if (interaction.busy
-      || interaction.editorOpen
-      || interaction.settingsOpen
-      || interaction.confirmationOpen
-      || interaction.candidateAdoptionOpen
-      || interaction.rootSwapOpen
-      || interaction.contextMenuOpen
-      || interaction.reviewPending
+    if (rootSaveBlocked(interaction)
       || compareInFlightRef.current
       || autoApplyInFlightRef.current
       || (autoScanStatusRef.current?.active_ticket ?? null) !== null
