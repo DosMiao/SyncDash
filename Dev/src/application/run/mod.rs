@@ -26,10 +26,7 @@ use crate::model::plan::{Op, Plan};
 use crate::model::table::TableArtifact;
 
 use crate::pipeline::{compare::CompareOptions, scan};
-use local::{
-    apply_job_guarded_with, compare_job_detailed, compare_job_detailed_with_consent, preflight_job,
-    run_local_job,
-};
+use local::{compare_job_detailed_with_consent, preflight_job, run_local_job};
 use peer::{compare_peer_job_detailed, preflight_peer_job, run_peer_job};
 pub use roots::resolve_root;
 
@@ -216,21 +213,6 @@ pub fn apply_run_kind(job: &SingleTargetJob) -> crate::run::history::RunKind {
     }
 }
 
-/// Compare, whichever side does the scanning.
-pub fn compare(
-    name: &str,
-    job: &SingleTargetJob,
-    ctx: &crate::obs::progress::RunCtx,
-    accept_caps: bool,
-) -> std::io::Result<CompareOutcome> {
-    compare_with_capability_consent(
-        name,
-        job,
-        ctx,
-        &crate::pipeline::guard::caps::CapabilityConsent::explicit_cli(accept_caps),
-    )
-}
-
 pub fn compare_with_capability_consent(
     name: &str,
     job: &SingleTargetJob,
@@ -286,58 +268,6 @@ pub fn apply_requirements(
     }
 }
 
-/// Apply, whichever side does the writing.
-#[allow(clippy::too_many_arguments)] // every one is a distinct decision the caller has already made
-pub fn apply(
-    name: &str,
-    job: &SingleTargetJob,
-    plan: &Plan,
-    ops: &[Op],
-    trash: Option<std::path::PathBuf>,
-    verbose: bool,
-    acknowledged: bool,
-    accept_caps: bool,
-    ctx: &crate::obs::progress::RunCtx,
-) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
-    apply_with_capability_consent(
-        name,
-        job,
-        plan,
-        ops,
-        trash,
-        verbose,
-        acknowledged,
-        &crate::pipeline::guard::caps::CapabilityConsent::explicit_cli(accept_caps),
-        ctx,
-    )
-}
-
-#[allow(clippy::too_many_arguments)] // each argument is an independently reviewed apply decision
-pub fn apply_with_capability_consent(
-    name: &str,
-    job: &SingleTargetJob,
-    plan: &Plan,
-    ops: &[Op],
-    trash: Option<std::path::PathBuf>,
-    verbose: bool,
-    acknowledged: bool,
-    consent: &crate::pipeline::guard::caps::CapabilityConsent,
-    ctx: &crate::obs::progress::RunCtx,
-) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
-    apply_with_capability_consent_classified(
-        name,
-        job,
-        plan,
-        ops,
-        trash,
-        verbose,
-        acknowledged,
-        consent,
-        ctx,
-    )
-    .into_result()
-}
-
 /// Apply with an explicit mutation boundary. New interactive callers should use this form so a
 /// refused run can preserve its reviewed Compare result without guessing from text or counters.
 #[allow(clippy::too_many_arguments)] // each argument is an independently reviewed apply decision
@@ -353,28 +283,16 @@ pub fn apply_with_capability_consent_classified(
     ctx: &crate::obs::progress::RunCtx,
 ) -> ApplyExecution {
     if is_peer_target(job) {
-        let capabilities = peer::apply_capabilities(job, ops);
-        let blockers = capabilities.blockers();
-        if !blockers.is_empty() {
-            return ApplyExecution::failed_before_write(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                blockers
-                    .iter()
-                    .map(|item| item.render())
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ));
-        }
-        if !capabilities.consent_satisfied(
-            crate::pipeline::guard::caps::CapabilityScope::ApplyWrite,
+        peer::apply_peer_job_with_classified(
+            name,
+            job,
+            plan,
+            ops,
+            verbose,
+            acknowledged,
             consent,
-        ) {
-            return ApplyExecution::failed_before_write(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "peer apply capability limitations require exact review or --accept-caps",
-            ));
-        }
-        peer::apply_peer_job_with_classified(name, job, plan, ops, verbose, acknowledged, ctx)
+            ctx,
+        )
     } else {
         local::apply_job_guarded_with_consent_classified(
             job,
@@ -403,7 +321,7 @@ pub fn run_job(
         let target = job
             .select_target(0)
             .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))?;
-        run_peer_job(name, &target, do_apply, verbose, acknowledged)
+        run_peer_job(name, &target, do_apply, verbose, acknowledged, accept_caps)
     } else {
         run_local_job(name, job, do_apply, verbose, acknowledged, accept_caps)
     }
@@ -412,10 +330,6 @@ pub fn run_job(
 fn validate_job(job: &Job) -> std::io::Result<()> {
     job.validate()
         .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))
-}
-
-pub fn compare_job(job: &SingleTargetJob) -> std::io::Result<Plan> {
-    compare_job_with(job, &crate::obs::progress::RunCtx::null())
 }
 
 /// One connected backend's capability sheet, rendered for `syncdash caps`.
@@ -502,48 +416,6 @@ pub struct CompareOutcome {
     pub source: TableArtifact,
     pub target: TableArtifact,
     pub compare_options: CompareOptions,
-}
-
-pub fn compare_job_with(
-    job: &SingleTargetJob,
-    ctx: &crate::obs::progress::RunCtx,
-) -> std::io::Result<Plan> {
-    compare_job_detailed(job, ctx, false).map(|o| o.plan)
-}
-
-/// Execute the selected ops; on complete success in sync mode, refresh the archive (conflicted paths are dropped from it, so the conflict is reported again next time).
-pub fn apply_job(
-    job: &SingleTargetJob,
-    plan: &Plan,
-    ops: &[Op],
-    trash: Option<std::path::PathBuf>,
-    verbose: bool,
-) -> (u64, u64, u64) {
-    apply_job_guarded(job, plan, ops, trash, verbose, false, false)
-}
-
-/// `acknowledged` = the user passed --i-know explicitly; it only allows the "plan health check" gates through.
-/// A missing marker and insufficient disk space always block (those are environment problems, not judgment calls).
-pub fn apply_job_guarded(
-    job: &SingleTargetJob,
-    plan: &Plan,
-    ops: &[Op],
-    trash: Option<std::path::PathBuf>,
-    verbose: bool,
-    acknowledged: bool,
-    accept_caps: bool,
-) -> (u64, u64, u64) {
-    apply_job_guarded_with(
-        job,
-        plan,
-        ops,
-        trash,
-        verbose,
-        acknowledged,
-        accept_caps,
-        &crate::obs::progress::RunCtx::null(),
-    )
-    .into_tuple()
 }
 
 /// Scan the target on its peer instead of treating the phrase as a locally mounted root.

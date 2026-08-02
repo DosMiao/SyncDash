@@ -24,7 +24,12 @@ pub(super) fn resolve(
         return;
     }
 
-    const RESOLVABLE: [&str; 3] = ["both-changed", "differs-no-archive", "symlink-differs"];
+    // Content conflicts only. Resolution works by picking an mtime winner and retaining the loser
+    // as a conflict *copy of its bytes*, which is not a thing a symlink has — and the maps consulted
+    // below are built with `ObservedEntryKind::File`, so a link row could never match anyway.
+    // `symlink-differs` was listed here and was unreachable for both reasons; a differing symlink
+    // stays reported, which is the honest outcome rather than a silently skipped resolution.
+    const RESOLVABLE: [&str; 2] = ["both-changed", "differs-no-archive"];
     let now = now_ms();
     let mut resolutions = Vec::new();
     for operation in operations.iter_mut() {

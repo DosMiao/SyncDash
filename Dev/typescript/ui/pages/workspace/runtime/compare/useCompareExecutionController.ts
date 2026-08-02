@@ -30,6 +30,7 @@ import type {
   OperationReviewState,
   ReviewRequestFence,
 } from '#core/application/operations/operationReview.ts';
+import { compareLaunchBlocked } from '#core/application/safety/executionSafety.ts';
 import type { ExecutionInteractionState } from '#core/application/safety/executionSafety.ts';
 import type { CompareStage } from '#core/domain/compare/compareProgress.ts';
 import type { AutoScanStatusDto } from '#core/types/generated/AutoScanStatusDto.ts';
@@ -252,14 +253,7 @@ export function useCompareExecutionController(options: CompareExecutionControlle
     prestartedActivity?: CompareActivityRequest,
   ): Promise<CompareCompletion | null> => {
     const interaction = liveInteractionState.current;
-    if (interaction.busy
-      || interaction.editorOpen
-      || interaction.settingsOpen
-      || interaction.confirmationOpen
-      || interaction.candidateAdoptionOpen
-      || interaction.rootDraftOpen
-      || interaction.rootSwapOpen
-      || interaction.contextMenuOpen
+    if (compareLaunchBlocked(interaction)
       || compareInFlight.current
       || autoApplyInFlight.current) {
       if (prestartedActivity) failCompareActivity(prestartedActivity, 'Another interaction took ownership before Compare launched');
