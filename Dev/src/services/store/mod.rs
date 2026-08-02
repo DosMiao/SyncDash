@@ -8,7 +8,6 @@
 pub(crate) mod atomic;
 pub mod hashcache;
 pub(crate) mod localid;
-pub mod migrate;
 pub mod mtimefix;
 pub(crate) mod scan_state;
 pub mod settings;

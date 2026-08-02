@@ -49,5 +49,5 @@ pub(crate) struct LogDirectorySelectionDto {
 #[ts(export_to = "../Dev/typescript/core/types/generated/")]
 pub(crate) struct SettingsSaveDto {
     pub(crate) snapshot: SettingsSnapshotDto,
-    pub(crate) migration: syncdash::store::migrate::MigrateReport,
+    pub(crate) migration: syncdash::run::history::MigrateReport,
 }
