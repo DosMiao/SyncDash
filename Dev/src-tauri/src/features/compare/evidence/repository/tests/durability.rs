@@ -181,3 +181,45 @@ fn corrupt_artifact_blocks_repository_startup() {
         Err(CompareResultRepositoryError::Storage(_))
     ));
 }
+
+/// The equality window a comparison used is part of its evidence, not a constant the window can
+/// look up. `run` widens it for a backend whose timestamps are coarser than the policy floor — an
+/// FTP LIST root reports whole minutes — and every surface that draws a "newer" or "drifted" cue
+/// has to be told that number, or it will contradict the verdict the same result carries. It must
+/// therefore survive the artifact round trip as faithfully as the operations do.
+#[test]
+fn the_effective_mtime_window_is_published_and_survives_a_restart() {
+    let directory = TestDirectory::new("mtime-window");
+    let widened = syncdash::pipeline::compare::CompareOptions {
+        mtime_window_ms: 60_000,
+        ..Default::default()
+    };
+    {
+        let repository = CompareResultRepository::open_at(directory.0.clone()).unwrap();
+        publish(
+            &repository,
+            version_with_compare_options("job-a", "A", 0, "revision-a", 1, widened),
+        );
+        let retained = repository
+            .get_exact(&identity("job-a", 0, "revision-a", 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained.plan().mtime_window_ms,
+            60_000,
+            "a live result publishes the window its comparison applied"
+        );
+    }
+
+    let repository = CompareResultRepository::open_at(directory.0.clone()).unwrap();
+    let restored = repository
+        .restore_workspace("job-a", 0, "revision-a")
+        .unwrap();
+    let CompareWorkspaceLookupDto::Found { workspace } = restored else {
+        panic!("the published result must restore");
+    };
+    assert_eq!(
+        workspace.plan.mtime_window_ms, 60_000,
+        "the widened window must not decay to the policy floor across a restart"
+    );
+}

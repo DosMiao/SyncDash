@@ -1,6 +1,5 @@
 import { useId, useRef } from 'react';
 import { formatCount, formatFileTimestamp, humanSize } from '#core/shared/format.ts';
-import { MTIME_SLACK_MS, MTIME_SLACK_SECONDS } from '#core/domain/compare/plan.ts';
 import { useInteractionLayer } from '#ui/shared/interaction/useInteractionLayer.tsx';
 import type { IdenticalWorkspace } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 
@@ -40,7 +39,7 @@ export function IdenticalResultsPanel(props: IdenticalResultsPanelProps) {
       <div className="identical-results-head">
         <h2 id={titleId}>Files Identical on Both Sides</h2>
         <span className="identical-results-drift-legend">
-          <i aria-hidden="true" /> Target Timestamp Differs by More Than {MTIME_SLACK_SECONDS} Seconds
+          <i aria-hidden="true" /> Target Timestamp Outside This Comparison's Equality Window
         </span>
         <input
           ref={searchRef}
@@ -75,8 +74,10 @@ export function IdenticalResultsPanel(props: IdenticalResultsPanelProps) {
               </td>
             </tr>
           )}
+          {/* The engine decides the drift cue: its equality window is per-run — a coarse-timestamp
+              backend widens it — so asking here would flag pairs it called the same instant. */}
           {rows.map((row) => {
-            const timestampDrift = Math.abs(row.source_mtime_ms - row.target_mtime_ms) > MTIME_SLACK_MS;
+            const timestampDrift = row.mtime_outside_window;
             return (
               <tr key={row.path}>
                 <td className="mono c-path" title={row.path}>{row.path}</td>
@@ -84,9 +85,9 @@ export function IdenticalResultsPanel(props: IdenticalResultsPanelProps) {
                 <td className="c-meta mono">{formatFileTimestamp(row.source_mtime_ms)}</td>
                 <td
                   className={'c-meta mono' + (timestampDrift ? ' drift' : '')}
-                  title={timestampDrift ? `Target timestamp differs from the source by more than ${MTIME_SLACK_SECONDS} seconds` : undefined}
+                  title={timestampDrift ? 'Identical content; the target timestamp is outside the equality window this comparison used' : undefined}
                 >
-                  {timestampDrift && <span className="sr-only">Timestamp differs beyond tolerance. </span>}
+                  {timestampDrift && <span className="sr-only">Timestamp outside the equality window. </span>}
                   {formatFileTimestamp(row.target_mtime_ms)}
                 </td>
               </tr>

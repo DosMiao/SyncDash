@@ -1,4 +1,5 @@
 import type { Dispatch } from 'react';
+import type { CompareForgetAvailability } from '#core/application/compare-workspace/compareWorkspaceForget.ts';
 import type { CompareWorkspaceRepository } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import type { CompareWorkspaceAction } from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
 import type { ApplyReviewTotals } from '#ui/features/apply-review/model/applyReviewTotals.ts';
@@ -7,6 +8,7 @@ import type { JobEditorProps } from '#ui/features/jobs/controllers/JobEditorCont
 import type { SettingsSheetProps } from '#ui/features/settings/controllers/SettingsSheetController.tsx';
 import type { useApplyExecutionController } from '../../runtime/apply/useApplyExecutionController.ts';
 import type { useCompareExecutionController } from '../../runtime/compare/useCompareExecutionController.ts';
+import type { useForgetCompareResult } from '../../runtime/results/useForgetCompareResult.ts';
 import type { useJobEditorLifecycle } from '../../runtime/jobs/useJobEditorLifecycle.ts';
 import type { useJobExcludeMutation } from '../../runtime/jobs/useJobExcludeMutation.ts';
 import type { useWorkspacePanels } from '../../runtime/interaction/useWorkspacePanels.ts';
@@ -24,6 +26,8 @@ interface WorkspaceOverlayPresentationOptions {
   confirmTotals: ApplyReviewTotals | null;
   dispatchCompare: Dispatch<CompareWorkspaceAction>;
   editorLifecycle: ReturnType<typeof useJobEditorLifecycle>;
+  forget: ReturnType<typeof useForgetCompareResult>;
+  forgetAvailability: CompareForgetAvailability;
   panels: ReturnType<typeof useWorkspacePanels>;
   repository: CompareWorkspaceRepository;
   resetSafetyUi: () => void;
@@ -51,6 +55,8 @@ export function createWorkspaceOverlayPresentation({
   confirmTotals,
   dispatchCompare,
   editorLifecycle,
+  forget,
+  forgetAvailability,
   panels,
   repository,
   resetSafetyUi,
@@ -61,7 +67,7 @@ export function createWorkspaceOverlayPresentation({
   statusApi,
 }: WorkspaceOverlayPresentationOptions): WorkspaceOverlayComposition {
   const { plan, appliedAdvancedFilter, inScopeIndices, selectedCompareWorkspace, workspaceController } = result;
-  const { askSwap, candidateAdoption, editor } = panels;
+  const { askSwap, candidateAdoption, editor, forgetRequest } = panels;
 
   const presentation: RenderedWorkspaceOverlays = {
     contextMenu: panels.contextMenu
@@ -103,6 +109,21 @@ export function createWorkspaceOverlayPresentation({
         },
       },
       onCancel: () => panels.setCandidateAdoption(null),
+    } : null,
+    forgetDialog: forgetRequest ? {
+      title: 'Permanently forget this Compare result?',
+      message: 'This deletes the stored evidence for this exact result:\n\n'
+        + '· Its plan, Identical snapshot, and this review workspace are discarded\n'
+        + '· Neither root is touched — no file on either side is read, moved or removed\n'
+        + '· Past run logs and anything already in the trash are left alone\n\n'
+        + 'Forgetting cannot be undone. Only a new Compare can produce evidence for this job and target again.',
+      action: {
+        label: 'Forget this result',
+        danger: true,
+        disabled: forget.forgetPending || !forgetAvailability.available,
+        onConfirm: () => { void forget.forgetResult(forgetRequest); },
+      },
+      onCancel: () => panels.setForgetRequest(null),
     } : null,
     rootSwapDialog: askSwap ? {
       title: `Swap the two roots of '${askSwap.owner.jobName}'?`,

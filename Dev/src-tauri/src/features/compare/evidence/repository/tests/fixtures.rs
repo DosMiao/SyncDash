@@ -46,6 +46,27 @@ pub(super) fn version(
     revision: &str,
     compare_run_id: u64,
 ) -> SuccessfulCompareResult {
+    version_with_compare_options(
+        job_id,
+        job_name,
+        target_index,
+        revision,
+        compare_run_id,
+        syncdash::pipeline::compare::CompareOptions::default(),
+    )
+}
+
+/// The comparison policy a run ended up with is retained evidence: `run` widens the mtime equality
+/// window for coarse backends, and the suites that assert what a restored result publishes need to
+/// build a result whose window is not the policy default.
+pub(super) fn version_with_compare_options(
+    job_id: &str,
+    job_name: &str,
+    target_index: usize,
+    revision: &str,
+    compare_run_id: u64,
+    compare_options: syncdash::pipeline::compare::CompareOptions,
+) -> SuccessfulCompareResult {
     let owner = owner(job_id, job_name, target_index, revision, compare_run_id);
     let plan_header = PlanHeader {
         schema: syncdash::model::plan::PLAN_SCHEMA,
@@ -103,11 +124,12 @@ pub(super) fn version(
             metas: Vec::new(),
             identical_count: 0,
             identical_bytes: 0,
+            mtime_window_ms: compare_options.mtime_window_ms,
             owner,
         },
         snapshot("/source"),
         snapshot("/target"),
-        syncdash::pipeline::compare::CompareOptions::default(),
+        compare_options,
     )
 }
 

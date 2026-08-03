@@ -1,4 +1,4 @@
-import { MTIME_SLACK_SECONDS } from '#core/domain/compare/plan.ts';
+import { MTIME_WINDOW_FLOOR_MS } from '#core/types/generated/comparePlanRuleVectors.ts';
 import { formatCount } from '#core/shared/format.ts';
 import type { AppSettings } from '#core/types/generated/AppSettings.ts';
 import type { Job as JobFull } from '#core/types/generated/Job.ts';
@@ -48,7 +48,7 @@ export const JOB_FORM_FIELDS: FormFieldSpec[] = [
     desc: 'none = metadata only · sampled = size + 256 KB at head, middle and tail · full = whole-file BLAKE3',
   },
   { key: 'use_cache', label: 'Use the hash cache', kind: 'bool', parent: 'rigor', desc: 'Trust the last result for unchanged files instead of reading them again.' },
-  { key: 'escalate', label: 'Escalate on divergence', kind: 'bool', parent: 'rigor', desc: `Same digest but mtime differs by more than ${MTIME_SLACK_SECONDS}s — re-verify both sides in full.` },
+  { key: 'escalate', label: 'Escalate on divergence', kind: 'bool', parent: 'rigor', desc: `Same digest but mtime differs by more than the equality window — at least ${MTIME_WINDOW_FLOOR_MS / 1000}s, wider on backends with coarser timestamps — re-verify both sides in full.` },
   { key: 'verify_writes', label: 'Verify after write', kind: 'bool', parent: 'rigor', desc: 'Hash the copy stream and compare it against a re-read from disk.' },
   { key: 'symlinks', label: 'Symlink policy', kind: 'select', opts: ['exclude', 'direct'], desc: 'exclude = skip them · direct = copy the link itself, not its target' },
   { key: 'case_sensitive', label: 'Case-sensitive compare', kind: 'bool', desc: 'Off matches how NTFS and APFS behave by default.' },
@@ -63,7 +63,7 @@ export const JOB_FORM_FIELDS: FormFieldSpec[] = [
 
   { key: 'require_marker', label: 'Require a .syncdash-root marker', kind: 'bool', group: 'Guardrails', desc: 'Refuse to run unless both roots carry the marker file — catches an unmounted drive.' },
   { key: 'min_free_pct', label: 'Minimum free disk ratio', kind: 'num', desc: '0.01 = 1%. The run is blocked below this.' },
-  { key: 'max_delete_ratio', label: 'Delete ratio notice', kind: 'num', desc: '0.5 = 50%. A plan deleting more than this share is marked in Review & Apply; it never withholds a manual Apply. Only an unattended AutoScan auto-apply refuses on it.' },
+  { key: 'max_delete_ratio', label: 'Delete ratio notice', kind: 'num', desc: '0.5 = 50%. A plan deleting more than this share of a side is marked in Review & Apply; it never withholds a manual Apply. Only an unattended AutoScan auto-apply refuses on it. Review & Apply also borrows this number to mark a large overwrite or move share, which the engine does not judge and which carries no such consequence.' },
 
   {
     key: '__junk', label: 'Junk presets', kind: 'custom', group: 'Filters',

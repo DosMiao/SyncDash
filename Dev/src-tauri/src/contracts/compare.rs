@@ -165,6 +165,15 @@ pub(crate) struct PlanDto {
     #[serde(default)]
     #[ts(type = "number")]
     pub(crate) identical_bytes: u64,
+    /// The mtime equality window this comparison actually applied, in milliseconds.
+    ///
+    /// `pipeline::compare::MTIME_SLACK_MS` is only a floor. `run::local::compare` widens it to the
+    /// coarser of the two backends' declared mtime precision before comparing, so an FTP LIST root
+    /// — whole minutes — is judged on a far wider window than a local volume. Publishing the number
+    /// the run used is what keeps a window cue from calling one side newer on a pair the engine
+    /// already ruled the same instant. Projected from the retained `CompareOptions`, which owns it.
+    #[ts(type = "number")]
+    pub(crate) mtime_window_ms: i64,
     pub(crate) owner: CompareOwner,
 }
 

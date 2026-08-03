@@ -10,6 +10,7 @@ import {
   List,
   ListFilter,
   Route,
+  Trash2,
   X,
 } from 'lucide-react';
 import { formatCount } from '#core/shared/format.ts';
@@ -59,6 +60,13 @@ interface ResultBarProps {
   onToggleAdvancedFilters: (anchor: DOMRect) => void;
   exportPending: boolean;
   onExportCsv: () => void;
+
+  /// Discarding retained evidence is permanent, so the bar states why it is unavailable instead of
+  /// hiding the control and leaving the only removal path invisible.
+  forgetAvailable: boolean;
+  forgetBlockedMessage: string | null;
+  forgetPending: boolean;
+  onForgetResult: () => void;
 
   grouped: boolean;
   sort: Sort | null;
@@ -152,6 +160,10 @@ export function ResultBar(props: ResultBarProps) {
     onToggleAdvancedFilters,
     exportPending,
     onExportCsv,
+    forgetAvailable,
+    forgetBlockedMessage,
+    forgetPending,
+    onForgetResult,
     grouped,
     sort,
     anyCollapsed,
@@ -251,8 +263,8 @@ export function ResultBar(props: ResultBarProps) {
           </button>
         </div>
 
-        {resultView === 'differences' && (
-          <div className="result-bar-primary-actions">
+        <div className="result-bar-primary-actions">
+          {resultView === 'differences' && (
             <button
               type="button"
               className="btn result-bar-export"
@@ -271,8 +283,22 @@ export function ResultBar(props: ResultBarProps) {
               <Download size={13} aria-hidden="true" />
               {exportPending ? 'Exporting…' : 'Export CSV'}
             </button>
-          </div>
-        )}
+          )}
+          <button
+            type="button"
+            className="btn danger result-bar-forget"
+            title={forgetPending
+              ? 'This Compare result is being discarded'
+              : forgetAvailable
+                ? 'Permanently discard the stored evidence for this Compare result'
+                : forgetBlockedMessage ?? 'This Compare result cannot be discarded right now'}
+            disabled={forgetPending || !forgetAvailable}
+            onClick={onForgetResult}
+          >
+            <Trash2 size={13} aria-hidden="true" />
+            {forgetPending ? 'Forgetting…' : 'Forget Result'}
+          </button>
+        </div>
       </div>
 
       {resultView === 'differences' && (

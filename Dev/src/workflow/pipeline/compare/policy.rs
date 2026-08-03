@@ -2,12 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
-/// How far apart two mtimes may be and still count as the same instant.
+/// The floor for how far apart two mtimes may be and still count as the same instant.
 ///
 /// FAT stores timestamps at 2-second granularity and SMB shares round-trip through it, so a file
 /// copied between two such volumes comes back with a time that differs from its source by up to
 /// two seconds without anything having changed. Without this window every such file would compare
 /// as modified on every run.
+///
+/// It is a floor, not the window: `run::local::compare` raises `CompareOptions::mtime_window_ms`
+/// to the coarser of the two backends' declared mtime precision before comparing, because an FTP
+/// LIST root reports whole minutes. The widened value is what the comparison used and what its
+/// result publishes; a reader that wants to judge one comparison's rows must read that, not this.
 ///
 /// This is a knob on how a comparison is made, not part of the artifact it emits — it appears in
 /// no PlanHeader, no Op and no plan JSONL — so it lives beside the `CompareOptions` default it

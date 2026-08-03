@@ -57,7 +57,7 @@ export function configPills(
       key: 'Gates',
       value: `≤${formatPercentage(job.max_delete_ratio)} del · ≥${formatPercentage(job.min_free_pct)} free${job.require_marker ? ' · marker' : ''}`,
       group: 'Guardrails',
-      title: `Review & Apply colors a category red once it touches more than ${formatPercentage(job.max_delete_ratio)} of the target. A run is blocked only if free disk is under ${formatPercentage(job.min_free_pct)}.`
+      title: `A side deleting more than ${formatPercentage(job.max_delete_ratio)} of its own entries is flagged in Review & Apply — a notice, not a block; only an unattended AutoScan Apply refuses on it. The panel reuses the same share to mark large overwrites and moves, which is a panel cue rather than an engine rule. A run is blocked when free space cannot cover the writes plus 10% headroom plus the ${formatPercentage(job.min_free_pct)} reserve.`
         + (job.require_marker ? '\nBoth roots must also carry a .syncdash-root marker.' : ''),
     },
     {

@@ -41,6 +41,7 @@ function plan(operations: PlanOperation[]): PlanDto {
     metas: operations.map(() => null),
     identical_count: 0,
     identical_bytes: 0,
+    mtime_window_ms: 2000,
   };
 }
 

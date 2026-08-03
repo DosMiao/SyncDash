@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   COMPARE_PLAN_RULE_VECTORS,
+  MTIME_WINDOW_FLOOR_MS,
   type ComparePlanRuleVector,
 } from '#core/types/generated/comparePlanRuleVectors.ts';
 import {
@@ -52,6 +53,7 @@ function singleRowPlan(vector: ComparePlanRuleVector, metas: PlanDto['metas']): 
     metas,
     identical_count: 0,
     identical_bytes: 0,
+    mtime_window_ms: MTIME_WINDOW_FLOOR_MS,
   };
 }
 

@@ -119,25 +119,23 @@ export function formatPlanShare(count: number, targetEntries: number): string {
 }
 
 /**
- * The deletion side the panel marks, or null when neither is over the mark.
+ * Every deletion side over the mark, in the order the engine checks them, and empty when neither is.
  *
- * The engine judges the two sides independently and can flag both; the sheet has one Delete row, so
- * it names the larger flagged share rather than inventing a combined one. Which side is being
- * emptied is part of the statement: a sync plan can delete most of the source while the target
- * loses nothing.
+ * `guard/mod.rs` runs its per-side check twice and can raise two independent findings, so this
+ * returns both rather than choosing between them: naming only the larger share dropped a fact the
+ * engine had already stated in the same sheet's warning list. Which side is being emptied is part of
+ * the statement — a sync plan can delete most of the source while the target loses nothing.
  */
-export function flaggedDeletionSide(
+export function flaggedDeletionSides(
   totals: ApplyReviewTotals,
   threshold: number,
-): DeletionSideTotals | null {
-  const flagged = totals.deletionSides
-    .filter((side) => planShareIsHigh(side.deletes, side.entries, threshold))
-    .sort((a, b) => (b.deletes / b.entries) - (a.deletes / a.entries));
-  return flagged[0] ?? null;
+): DeletionSideTotals[] {
+  return totals.deletionSides.filter((side) =>
+    planShareIsHigh(side.deletes, side.entries, threshold)
+  );
 }
 
-export function formatDeletionShare(side: DeletionSideTotals | null): string {
-  if (!side) return '';
+export function formatDeletionShare(side: DeletionSideTotals): string {
   const share = planShare(side.deletes, side.entries);
   return share === null ? '' : `${Math.round(share * 100)}% of ${side.side}`;
 }

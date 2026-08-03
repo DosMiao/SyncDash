@@ -1,5 +1,6 @@
 import type { Dispatch } from 'react';
 import { countActiveAdvancedFilterGroups } from '#core/domain/compare/runScope.ts';
+import type { CompareForgetAvailability } from '#core/application/compare-workspace/compareWorkspaceForget.ts';
 import { workspaceHasReviewEdits } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import type { CompareWorkspaceAction } from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
 import type { StatusApi } from '#ui/shared/status/useStatus.ts';
@@ -8,6 +9,7 @@ import type { useAutoScanState } from '../../runtime/autoscan/useAutoScanState.t
 import type { useAutoScanControls } from '../../runtime/autoscan/useAutoScanControls.ts';
 import type { useCompareRunState } from '../../runtime/compare/useCompareRunState.ts';
 import type { useCsvExport } from '../../runtime/results/useCsvExport.ts';
+import type { useForgetCompareResult } from '../../runtime/results/useForgetCompareResult.ts';
 import type { useResultTableActions } from '../../runtime/results/useResultTableActions.ts';
 import type { useRootDraftActions } from '../../runtime/roots/useRootDraftActions.ts';
 import type { useRootEditorState } from '../../runtime/roots/useRootEditorState.ts';
@@ -37,11 +39,14 @@ export interface WorkspaceMainPresentation {
 interface WorkspaceMainPresentationOptions {
   autoScan: ReturnType<typeof useAutoScanState>;
   autoScanControls: ReturnType<typeof useAutoScanControls>;
+  autoScanVerificationPending: boolean;
   busy: boolean;
   compare: { doCompare: () => Promise<unknown> | void };
   compareRun: ReturnType<typeof useCompareRunState>;
   csv: ReturnType<typeof useCsvExport>;
   dispatchCompare: Dispatch<CompareWorkspaceAction>;
+  forget: ReturnType<typeof useForgetCompareResult>;
+  forgetAvailability: CompareForgetAvailability;
   jobState: ReturnType<typeof useWorkspaceJobState>;
   openConfirm: () => Promise<unknown> | void;
   panels: ReturnType<typeof useWorkspacePanels>;
@@ -63,11 +68,14 @@ interface WorkspaceMainPresentationOptions {
 export function createWorkspaceMainPresentation({
   autoScan,
   autoScanControls,
+  autoScanVerificationPending,
   busy,
   compare,
   compareRun,
   csv,
   dispatchCompare,
+  forget,
+  forgetAvailability,
   jobState,
   openConfirm,
   panels,
@@ -120,8 +128,6 @@ export function createWorkspaceMainPresentation({
     workspaceExecutionAccess,
   } = result;
   const hasDifferences = !!plan && plan.ops.length > 0;
-  const autoScanVerificationPending = autoScan.status?.active === true
-    && autoScan.status.active_ticket !== null;
   const runScopeProps = plan && hasDifferences && resultView === 'differences' && !compareRun.active
     ? {
         plan,
@@ -283,6 +289,16 @@ export function createWorkspaceMainPresentation({
       onToggleAdvancedFilters: (anchor) => panels.setAdvancedFiltersAnchor((current) => (current ? null : anchor)),
       exportPending: csv.exportPending,
       onExportCsv: () => { void csv.exportCsv(); },
+      forgetAvailable: forgetAvailability.available,
+      forgetBlockedMessage: forgetAvailability.available ? null : forgetAvailability.blockedMessage,
+      forgetPending: forget.forgetPending,
+      onForgetResult: () => {
+        if (!selectedScopeWorkspace || !selectedCompareWorkspace) return;
+        panels.setForgetRequest({
+          scopeKey: selectedScopeWorkspace.key,
+          resultKey: selectedCompareWorkspace.key,
+        });
+      },
       grouped,
       sort,
       anyCollapsed,

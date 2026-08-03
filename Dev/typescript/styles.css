@@ -655,7 +655,7 @@ button.plan-row-action { width: 100%; padding: 0; border: 0; background: none; t
   min-width: 0;
 }
 .result-bar-primary { grid-area: primary; display: flex; align-items: center; gap: 8px; min-width: 0; }
-.result-bar-primary-actions { margin-left: auto; flex: none; }
+.result-bar-primary-actions { margin-left: auto; flex: none; display: flex; align-items: center; gap: 6px; }
 .result-bar-tabs { display: flex; align-items: stretch; gap: 2px; min-width: 0; }
 .result-bar-tab {
   display: inline-flex; align-items: center; gap: 6px; min-height: var(--ctl-h);

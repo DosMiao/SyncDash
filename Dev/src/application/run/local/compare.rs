@@ -103,6 +103,10 @@ pub fn compare_resolved(
     super::super::fail_on_root_blockers(&v, ctx, None)?;
     // The no-hash equality window widens to the coarser of the two backends' declared
     // mtime precision (an FTP LIST root thinks in minutes). Hash evidence is unaffected.
+    // This widened value is the window: it is what `compare` judges on, what escalation and the
+    // capability list read, and — through the returned `compare_options` — the number the desktop
+    // publishes as `PlanDto.mtime_window_ms`. Nothing downstream may re-derive it from the policy
+    // default.
     let mut copts = job.compare_opts();
     copts.mtime_window_ms = copts
         .mtime_window_ms
@@ -159,7 +163,9 @@ pub fn compare_resolved(
         0,
     );
     let plan = compare::compare(&s, &t, &job.mode, archive.as_ref(), false, &copts);
-    // Disagreement escalation: in the sampled evidence tier, a file whose digests match but whose mtimes differ by >2s may not simply be ruled identical (the knob can turn this off)
+    // Disagreement escalation: in the sampled evidence tier, a file whose digests match but whose
+    // mtimes fall outside the effective window above may not simply be ruled identical (the knob
+    // can turn this off)
     let rr = job.rigor_resolved();
     let plan = if rr.sampled && rr.escalate {
         escalate_sampled_disagreements(

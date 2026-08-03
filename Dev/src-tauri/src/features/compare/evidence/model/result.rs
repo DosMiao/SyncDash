@@ -43,6 +43,9 @@ impl SuccessfulCompareResult {
             metas,
             identical_count,
             identical_bytes,
+            // The effective equality window is retained on `compare_options` below, which is its
+            // single owner; the DTO field is projected from there on every read.
+            mtime_window_ms: _,
             owner,
         } = plan;
         Self {
@@ -117,6 +120,7 @@ impl RetainedCompareResult {
             metas: self.version.plan.metadata.clone(),
             identical_count: self.version.plan.identical_count,
             identical_bytes: self.version.plan.identical_bytes,
+            mtime_window_ms: self.version.compare_options.mtime_window_ms,
             owner: self.owner.clone(),
         }
     }

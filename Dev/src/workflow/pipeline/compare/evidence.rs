@@ -23,6 +23,13 @@
 //! Rust owns all three. `Dev/src/workflow/pipeline/compare/tests/rule_vectors.rs` emits the vectors
 //! that hold the TypeScript copy to them, and `npm run gen:types` refuses to leave those vectors
 //! stale.
+//!
+//! The mtime equality window is deliberately not a fourth. It is not a rule the window could
+//! replay but a per-run measurement — `run::local::compare` widens it to the coarser of the two
+//! backends' declared mtime precision — so it is published rather than mirrored:
+//! `IdenticalRow::mtime_outside_window` carries the verdict for a paged identical row, and the
+//! desktop result carries the window itself for the plan table. A second copy of the policy
+//! default would contradict this engine on every coarse-timestamp root.
 
 use serde::{Deserialize, Serialize};
 
@@ -159,6 +166,14 @@ pub struct IdenticalRow {
     pub source_mtime_ms: i64,
     #[ts(type = "number")]
     pub target_mtime_ms: i64,
+    /// Whether the two timestamps are further apart than the window *this* comparison used.
+    ///
+    /// Content evidence can rule a pair identical whatever their timestamps say, so a drift cue is
+    /// worth showing — but only against the window the comparison actually applied. That window is
+    /// `CompareOptions::mtime_window_ms` after `run` has widened it for coarse backends, and it is
+    /// not knowable from the row. Deciding here is what stops a reader from re-deriving the
+    /// question against the policy floor and flagging a pair the engine called the same instant.
+    pub mtime_outside_window: bool,
 }
 
 /// Files judged identical on both sides, paged in source-side path order. This retained evidence lets
@@ -208,6 +223,8 @@ pub fn identical_page(
                 size: source_file.size,
                 source_mtime_ms: source_file.mtime_ms,
                 target_mtime_ms: target_file.mtime_ms,
+                mtime_outside_window: (source_file.mtime_ms - target_file.mtime_ms).abs()
+                    > mtime_window_ms,
             });
         }
     }

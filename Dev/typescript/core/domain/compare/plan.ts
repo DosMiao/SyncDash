@@ -14,6 +14,10 @@ import type { ReviewedRowDecisionDto } from '#core/types/generated/ReviewedRowDe
 /// `actionRank` recovers the engine's own grouping so an action sort cannot invent a new one.
 /// Execution membership stays with Run Scope in engine plan order; grouping, sorting, folding, and
 /// path shortening are this layer's alone and have no counterpart in Rust.
+///
+/// The mtime equality window is not a fifth: it is a per-run measurement the result publishes as
+/// `plan.mtime_window_ms`, because a run widens it to the coarser backend's declared precision.
+/// `MTIME_WINDOW_FLOOR_MS` in the generated contracts states the configured floor and nothing more.
 
 export type PlanOperation = Op;
 export type PlanDto = GeneratedPlanDto;
@@ -47,14 +51,6 @@ export const SORT_LABEL: Record<SortKey, string> = {
   't.size': 'target size', 't.mtime': 'target time',
   reason: 'reason',
 };
-
-/// Same value as `pipeline::compare::policy::MTIME_SLACK_MS` on the Rust side: FAT/SMB
-/// timestamp granularity. Presentation only — the engine's own comparison already applied it.
-export const MTIME_SLACK_MS = 2000;
-
-/// Every sentence that spells the tolerance out to the user derives it from the constant above, so
-/// changing the engine value cannot leave prose claiming a tolerance the product no longer applies.
-export const MTIME_SLACK_SECONDS = MTIME_SLACK_MS / 1000;
 
 // Materialize and cache reversals only for requested rows; eager copies duplicate large plan graphs.
 // Keyed by the operation because `metas[i]` is defined as one entry per op: a row's retained
@@ -284,11 +280,17 @@ export function rowModifiedTime(plan: PlanDto, index: number): number {
   return Math.max(metadata.src?.mtime_ms ?? 0, metadata.dst?.mtime_ms ?? 0);
 }
 
-/// Returns no side when timestamps differ by at most `MTIME_SLACK_MS`.
+/// Returns no side when the two timestamps are within the window *this* comparison applied.
+///
+/// The window is a per-run measurement, not a constant: `pipeline::compare::policy` supplies a
+/// floor and `run::local::compare` widens it to the coarser of the two backends' declared mtime
+/// precision, so on a minute-precision root the engine rules pairs equal that the floor would
+/// separate. Reading `plan.mtime_window_ms` is what stops this cue from contradicting the verdict
+/// the same result already carries.
 export function newerSide(plan: PlanDto, index: number): '' | 's' | 't' {
   const metadata = rowMetadata(plan, index);
   if (!metadata.src || !metadata.dst) return '';
-  if (metadata.src.mtime_ms - metadata.dst.mtime_ms > MTIME_SLACK_MS) return 's';
-  if (metadata.dst.mtime_ms - metadata.src.mtime_ms > MTIME_SLACK_MS) return 't';
+  if (metadata.src.mtime_ms - metadata.dst.mtime_ms > plan.mtime_window_ms) return 's';
+  if (metadata.dst.mtime_ms - metadata.src.mtime_ms > plan.mtime_window_ms) return 't';
   return '';
 }

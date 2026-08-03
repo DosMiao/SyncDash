@@ -54,6 +54,7 @@ pub(super) fn prepare_successful_result(
         metas,
         identical_count: evidence.identical_count,
         identical_bytes: evidence.identical_bytes,
+        mtime_window_ms: outcome.compare_options.mtime_window_ms,
     };
 
     let (current_name, current_job) = job::load_by_id(&owner.identity.job_id).map_err(|error| {

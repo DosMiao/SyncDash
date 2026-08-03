@@ -57,7 +57,7 @@ evidence: string | null,
  */
 use_cache: boolean | null,
 /**
- * Disagreement escalation: sampled digests equal but |Δmtime|>2s → re-verify both sides in full before ruling (only meaningful with evidence=sampled)
+ * Disagreement escalation: sampled digests equal but the mtimes fall outside the comparison's equality window (≥ 2 s, widened on coarse-timestamp backends) → re-verify both sides in full before ruling (only meaningful with evidence=sampled)
  */
 escalate: boolean | null,
 /**

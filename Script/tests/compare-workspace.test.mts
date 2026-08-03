@@ -108,6 +108,7 @@ function plan(
     metas: operations.map(() => null),
     identical_count: 4,
     identical_bytes: 512,
+    mtime_window_ms: 2000,
   };
 }
 
@@ -184,7 +185,7 @@ function publish(
 }
 
 function identicalRow(path: string): IdenticalRow {
-  return { path, size: 64, source_mtime_ms: 10, target_mtime_ms: 10 };
+  return { path, size: 64, source_mtime_ms: 10, target_mtime_ms: 10, mtime_outside_window: false };
 }
 
 test('workspace creation validates plan shape and derives executable review defaults', () => {

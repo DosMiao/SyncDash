@@ -464,3 +464,37 @@ fn only_a_row_that_rebuilds_its_own_evidence_may_have_it_elided() {
     };
     assert_eq!(row_meta(&onto_target, Some(&retained)), retained);
 }
+
+/// The drift cue an identical row carries is the engine's answer, measured against the window this
+/// comparison used. Content evidence rules a pair identical whatever the clocks say, so the cue is
+/// worth drawing — but a reader that asked the question itself would have to guess the window, and
+/// on a coarse-timestamp backend it would flag pairs the engine called the same instant.
+#[test]
+fn identical_rows_report_drift_against_the_window_the_comparison_used() {
+    // Same content on both sides, 30 s apart.
+    let source = snap(
+        "windows",
+        vec![file_with_metadata("drifted.bin", "same", 4_096, 30_000)],
+    );
+    let target = snap(
+        "windows",
+        vec![file_with_metadata("drifted.bin", "same", 4_096, 0)],
+    );
+
+    let floor = CompareOptions::default();
+    let (_, rows) = identical_page(&source, &target, &floor, "", 0, 10);
+    assert!(
+        rows[0].mtime_outside_window,
+        "30 s is outside the policy floor"
+    );
+
+    let widened = CompareOptions {
+        mtime_window_ms: 60_000,
+        ..CompareOptions::default()
+    };
+    let (_, rows) = identical_page(&source, &target, &widened, "", 0, 10);
+    assert!(
+        !rows[0].mtime_outside_window,
+        "a minute-precision backend treats 30 s as the same instant, and the row must say so"
+    );
+}

@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from 'react';
+import type { CompareForgetRequest } from '#core/application/compare-workspace/compareWorkspaceForget.ts';
 import type { JobEditorApi } from '#ui/features/jobs/model/jobEditorModel.ts';
 import type {
   CandidateAdoption,
@@ -25,6 +26,7 @@ export function useWorkspacePanels() {
   const [dropTargetKey, setDropTargetKey] = useState<string | null>(null);
   const [resultViewportElement, setResultViewportElement] = useState<HTMLDivElement | null>(null);
   const [candidateAdoption, setCandidateAdoption] = useState<CandidateAdoption | null>(null);
+  const [forgetRequest, setForgetRequest] = useState<CompareForgetRequest | null>(null);
   const [askSwap, setAskSwap] = useState<RootSwapRequest | null>(null);
 
   // The native drag listener is registered once and reads the live droppable regions at drop time.
@@ -47,6 +49,7 @@ export function useWorkspacePanels() {
     setContextMenu(null);
     setAskSwap(null);
     setCandidateAdoption(null);
+    setForgetRequest(null);
   }, []);
 
   return {
@@ -58,6 +61,7 @@ export function useWorkspacePanels() {
     dropTargetKey,
     editor,
     editorApi,
+    forgetRequest,
     logOpen,
     logReload,
     resetTransientPanels,
@@ -69,6 +73,7 @@ export function useWorkspacePanels() {
     setDropTargetKey,
     setEditor,
     setEditorScope,
+    setForgetRequest,
     setLogOpen,
     setLogReload,
     setPathScope,

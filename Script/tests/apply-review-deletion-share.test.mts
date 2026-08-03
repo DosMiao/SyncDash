@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  flaggedDeletionSide,
+  flaggedDeletionSides,
   formatDeletionShare,
   summarizeApplyReview,
 } from '#ui/features/apply-review/model/applyReviewTotals.ts';
@@ -30,6 +30,7 @@ function plan(
     metas: operations.map(() => null),
     identical_count: 0,
     identical_bytes: 0,
+    mtime_window_ms: 2000,
   };
 }
 
@@ -53,9 +54,9 @@ test('a deletion share is measured against the entries of the side it deletes fr
     { source: 1000, target: 100 },
   );
 
-  const flagged = flaggedDeletionSide(totals, 0.5);
-  assert.equal(flagged?.side, 'source');
-  assert.equal(formatDeletionShare(flagged), '90% of source');
+  const flagged = flaggedDeletionSides(totals, 0.5);
+  assert.deepEqual(flagged.map((side) => side.side), ['source']);
+  assert.deepEqual(flagged.map((side) => formatDeletionShare(side)), ['90% of source']);
 });
 
 /// The engine counts `Action::Delete` and keeps `Action::DeleteDir` in its own field
@@ -71,9 +72,9 @@ test('a removed directory is not part of the deletion share', () => {
   );
 
   assert.equal(totals.deleteCount, 60, 'the row still counts every deletion it will perform');
-  assert.equal(
-    flaggedDeletionSide(totals, 0.5),
-    null,
+  assert.deepEqual(
+    flaggedDeletionSides(totals, 0.5),
+    [],
     '40 of 100 entries is under the mark, exactly as the engine judges it',
   );
 });
@@ -83,8 +84,9 @@ test('a side with no entries to judge against reports no share', () => {
     repeat(3, (index) => operation('target', 'delete', `t/${index}`)),
     { source: 0, target: 0 },
   );
-  assert.equal(flaggedDeletionSide(totals, 0.5), null);
-  assert.equal(formatDeletionShare(null), '');
+  assert.deepEqual(flaggedDeletionSides(totals, 0.5), []);
+  // Nothing to measure against is not a 0% or an Infinity; the caption is simply absent.
+  assert.equal(formatDeletionShare({ side: 'target', deletes: 3, entries: 0 }), '');
 });
 
 /// A threshold outside (0, 1) is the job switching the mark off, which is how the engine reads the
@@ -94,8 +96,61 @@ test('the mark fires at the configured share and the job can switch it off', () 
     repeat(50, (index) => operation('target', 'delete', `t/${index}`)),
     { source: 100, target: 100 },
   );
-  assert.equal(flaggedDeletionSide(halfTheTarget(), 0.5)?.side, 'target', 'exactly at the mark counts');
-  assert.equal(flaggedDeletionSide(halfTheTarget(), 0.51), null);
-  assert.equal(flaggedDeletionSide(halfTheTarget(), 0), null);
-  assert.equal(flaggedDeletionSide(halfTheTarget(), 1), null);
+  assert.deepEqual(
+    flaggedDeletionSides(halfTheTarget(), 0.5).map((side) => side.side),
+    ['target'],
+    'exactly at the mark counts',
+  );
+  assert.deepEqual(flaggedDeletionSides(halfTheTarget(), 0.51), []);
+  assert.deepEqual(flaggedDeletionSides(halfTheTarget(), 0), []);
+  assert.deepEqual(flaggedDeletionSides(halfTheTarget(), 1), []);
+});
+
+/// The engine runs `check_delete_ratio` once per side and can push two independent warnings, so the
+/// sheet states one caption per flagged side in that same order. A single caption had to pick one of
+/// the two and drop the other, which hid half of what the engine had already said in the same sheet.
+test('both flagged sides are named, in the order the engine checks them', () => {
+  const totals = totalsOf(
+    [
+      ...repeat(90, (index) => operation('target', 'delete', `t/${index}`)),
+      ...repeat(80, (index) => operation('source', 'delete', `s/${index}`)),
+    ],
+    { source: 100, target: 100 },
+  );
+
+  const flagged = flaggedDeletionSides(totals, 0.5);
+  assert.deepEqual(flagged.map((side) => side.side), ['target', 'source']);
+  assert.deepEqual(
+    flagged.map((side) => formatDeletionShare(side)),
+    ['90% of target', '80% of source'],
+  );
+});
+
+/// Each side is judged on its own, so a plan that empties the target while barely touching the
+/// source states one fact, not two, and names which side it is about.
+test('only the side over the mark is named', () => {
+  const totals = totalsOf(
+    [
+      ...repeat(90, (index) => operation('target', 'delete', `t/${index}`)),
+      ...repeat(10, (index) => operation('source', 'delete', `s/${index}`)),
+    ],
+    { source: 100, target: 100 },
+  );
+
+  const flagged = flaggedDeletionSides(totals, 0.5);
+  assert.deepEqual(flagged.map((side) => side.side), ['target']);
+  assert.deepEqual(flagged.map((side) => formatDeletionShare(side)), ['90% of target']);
+});
+
+test('a plan under the mark on both sides is named on neither', () => {
+  const totals = totalsOf(
+    [
+      ...repeat(10, (index) => operation('target', 'delete', `t/${index}`)),
+      ...repeat(10, (index) => operation('source', 'delete', `s/${index}`)),
+    ],
+    { source: 100, target: 100 },
+  );
+
+  assert.equal(totals.deleteCount, 20, 'the row still counts every deletion it will perform');
+  assert.deepEqual(flaggedDeletionSides(totals, 0.5), []);
 });

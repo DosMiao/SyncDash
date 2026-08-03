@@ -18,6 +18,7 @@ export interface WorkspacePagePresentationProps {
   jobEditor: ReactNode;
   settings: ReactNode;
   candidateDialog: ComponentProps<typeof ConfirmDialog> | null;
+  forgetDialog: ComponentProps<typeof ConfirmDialog> | null;
   rootSwapDialog: ComponentProps<typeof ConfirmDialog> | null;
   applyReview: ComponentProps<typeof ConfirmSheet> | null;
   compareReview: ComponentProps<typeof CompareReviewSheet> | null;
@@ -30,6 +31,7 @@ export function WorkspacePagePresentation({
   jobEditor,
   settings,
   candidateDialog,
+  forgetDialog,
   rootSwapDialog,
   applyReview,
   compareReview,
@@ -49,6 +51,7 @@ export function WorkspacePagePresentation({
       {jobEditor}
       {settings}
       {candidateDialog && <ConfirmDialog {...candidateDialog} />}
+      {forgetDialog && <ConfirmDialog {...forgetDialog} />}
       {rootSwapDialog && <ConfirmDialog {...rootSwapDialog} />}
       {applyReview && <ConfirmSheet {...applyReview} />}
       {compareReview && <CompareReviewSheet {...compareReview} />}

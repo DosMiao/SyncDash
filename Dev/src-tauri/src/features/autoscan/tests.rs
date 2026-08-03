@@ -183,6 +183,7 @@ fn successful_result(owner: CompareOwner) -> SuccessfulCompareResult {
         metas: Vec::new(),
         identical_count: 0,
         identical_bytes: 0,
+        mtime_window_ms: syncdash::pipeline::compare::MTIME_SLACK_MS,
     };
     let snapshot = |root: &str| syncdash::model::table::TableArtifact {
         header: syncdash::model::table::TableHeader {

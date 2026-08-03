@@ -622,3 +622,84 @@ fn terminal_summary_observes_a_last_moment_cancel_request() {
         })
     ));
 }
+
+/// The equality window a Compare result publishes is the one the comparison was made with.
+///
+/// `MTIME_SLACK_MS` is a floor: a backend whose timestamps are coarser than it (an FTP LIST root
+/// reports whole minutes) widens the window before `compare` runs, and every later reader —
+/// escalation, the capability list, and the desktop's evidence — has to read the widened number
+/// rather than the policy default.
+#[test]
+fn the_published_equality_window_is_the_one_the_comparison_used() {
+    let job = Job {
+        mode: "mirror".into(),
+        ..Default::default()
+    };
+    let fine = |name: &str| Arc::new(MemVfs::new(name)) as Arc<dyn Vfs>;
+    let coarse = |name: &str| {
+        Arc::new(MemVfs::new(name).without(|caps| caps.mtime_precision_ms = 60_000)) as Arc<dyn Vfs>
+    };
+
+    let local =
+        compare_resolved(&job, &fine("win-src"), &fine("win-tgt"), &RunCtx::null()).unwrap();
+    assert_eq!(
+        local.compare_options.mtime_window_ms,
+        compare::MTIME_SLACK_MS,
+        "a backend finer than the floor keeps the floor"
+    );
+
+    let protocol =
+        compare_resolved(&job, &coarse("ftp-src"), &fine("ftp-tgt"), &RunCtx::null()).unwrap();
+    assert_eq!(
+        protocol.compare_options.mtime_window_ms, 60_000,
+        "one coarse side widens the window for the whole comparison"
+    );
+}
+
+/// The widened window is what the equality decision itself used, not a number computed beside it.
+#[test]
+fn a_coarse_backend_widens_the_window_the_equality_decision_applies() {
+    // `quick` asks for no content evidence, so size and mtime are the only signals and the window
+    // is the whole of the equality rule.
+    let job = Job {
+        mode: "mirror".into(),
+        rigor: "quick".into(),
+        ..Default::default()
+    };
+    let compare_drift = |drift_ms: i64| {
+        let source = MemVfs::new("coarse-src").without(|caps| caps.mtime_precision_ms = 60_000);
+        let target = MemVfs::new("coarse-tgt").without(|caps| caps.mtime_precision_ms = 60_000);
+        source.seed_file("drifted.bin", 4_096, 1_767_225_600_000 + drift_ms);
+        target.seed_file("drifted.bin", 4_096, 1_767_225_600_000);
+        let (source, target) = (
+            Arc::new(source) as Arc<dyn Vfs>,
+            Arc::new(target) as Arc<dyn Vfs>,
+        );
+        compare_resolved(&job, &source, &target, &RunCtx::null()).unwrap()
+    };
+
+    // 30 s apart: far outside the policy floor, inside a minute-precision backend's window.
+    let inside = compare_drift(30_000);
+    assert_eq!(inside.source.header.evidence, TableEvidence::None);
+    assert!(
+        inside.compare_options.mtime_window_ms > compare::MTIME_SLACK_MS,
+        "the run must have widened the window"
+    );
+    assert_eq!(
+        inside.plan.ops.len(),
+        0,
+        "a 30 s difference is the same instant on a minute-precision backend"
+    );
+
+    // Past the widened window the same pair is a real difference again.
+    let outside = compare_drift(90_000);
+    assert_eq!(
+        outside
+            .plan
+            .ops
+            .iter()
+            .map(|operation| operation.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["drifted.bin"],
+    );
+}

@@ -47,6 +47,7 @@ type CompareWorkspaceRepositoryAction =
   }
   | { type: 'candidate_adopted'; scopeKey: CompareScopeKey; expectedResultKey: CompareResultKey }
   | { type: 'candidate_discarded'; scopeKey: CompareScopeKey; expectedResultKey: CompareResultKey }
+  | { type: 'result_forgotten'; resultKey: CompareResultKey }
   | { type: 'workspace_lookup_started'; workspace: CompareWorkspace; requestId: number }
   | {
     type: 'workspace_lookup_completed';
@@ -78,6 +79,7 @@ type CompareWorkspaceRepositoryAction =
 import { createScopeWorkspace, promoteScope, replaceExactWorkspace, replaceExecutableActiveWorkspace, replaceScope } from './repository/scopeIndex.ts';
 import { beginExactWorkspaceLookup, completeExactWorkspaceLookup } from './repository/lookup.ts';
 import { expireJobExecution } from './repository/lifecycle.ts';
+import { forgetRetainedResult } from './repository/forget.ts';
 import { completeScopeRestoration, publishAutoScanWorkspace, publishManualWorkspace } from './repository/publication.ts';
 
 export type CompareWorkspaceAction = CompareWorkspaceRepositoryAction | CompareWorkspaceReviewAction;
@@ -157,6 +159,8 @@ export function reduceCompareWorkspaces(
           dismissedCandidateKey: action.expectedResultKey,
         };
       });
+    case 'result_forgotten':
+      return forgetRetainedResult(repository, action.resultKey);
     case 'workspace_lookup_started':
       return beginExactWorkspaceLookup(repository, action.workspace, action.requestId);
     case 'workspace_lookup_completed':

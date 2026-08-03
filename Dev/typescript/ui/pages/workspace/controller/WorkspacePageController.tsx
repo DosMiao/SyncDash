@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo } from 'react';
 import { useZoomControl } from '#ui/shared/hooks/useZoomControl.ts';
 import { useInteractionLayer } from '#ui/shared/interaction/useInteractionLayer.tsx';
 import { operationReviewPending } from '#core/application/operations/operationReview.ts';
+import { deriveCompareForgetAvailability } from '#core/application/compare-workspace/compareWorkspaceForget.ts';
 import { summarizeApplyReview, type ApplyReviewTotals } from '#ui/features/apply-review/model/applyReviewTotals.ts';
 import { JobEditorController } from '#ui/features/jobs/controllers/JobEditorController.tsx';
 import { LogPanelController } from '#ui/features/logs/controllers/LogPanelController.tsx';
@@ -29,6 +30,7 @@ import {
 } from '../presentation/WorkspacePagePresentation.tsx';
 import { useWorkspaceResultViewModel } from '../view-model/useWorkspaceResultViewModel.ts';
 import { useCsvExport } from '../runtime/results/useCsvExport.ts';
+import { useForgetCompareResult } from '../runtime/results/useForgetCompareResult.ts';
 import { useResultTableActions } from '../runtime/results/useResultTableActions.ts';
 import { useRunScopeActions } from '../runtime/results/useRunScopeActions.ts';
 import { useJobExcludeMutation } from '../runtime/jobs/useJobExcludeMutation.ts';
@@ -165,6 +167,7 @@ export function WorkspacePageController() {
     folderPathsInLayout,
     anyCollapsed,
     applyAvailability,
+    selectedScopeWorkspace,
   } = result;
 
   const reviews = useWorkspaceReviewState({
@@ -243,6 +246,26 @@ export function WorkspacePageController() {
     resetCompareReview();
     resetTransientPanels();
   }, [resetCompareReview, resetConfirmation, resetTransientPanels]);
+
+  // Forgetting destroys the only copy of a result, so it stays closed while a run, an AutoScan
+  // verification, or an open review can still depend on that evidence.
+  const autoScanVerificationPending = autoScan.status?.active === true
+    && autoScan.status.active_ticket !== null;
+  const forgetRunInFlight = busy || autoScanVerificationPending;
+  const forget = useForgetCompareResult({
+    repository: compareWorkspaceRepository,
+    runInFlight: forgetRunInFlight,
+    reviewPending: reviewBusy,
+    dispatch: dispatchCompareWorkspace,
+    resetSafetyUi,
+    setStatus,
+  });
+  const forgetAvailability = deriveCompareForgetAvailability({
+    scope: selectedScopeWorkspace,
+    workspace: selectedCompareWorkspace,
+    runInFlight: forgetRunInFlight,
+    reviewPending: reviewBusy,
+  });
 
   const autoScanControls = useAutoScanControls({
     runtime: autoScan,
@@ -489,10 +512,13 @@ export function WorkspacePageController() {
   const mainComposition = createWorkspaceMainPresentation({
     autoScan,
     autoScanControls,
+    autoScanVerificationPending,
     busy,
     compare,
     csv,
     dispatchCompare: dispatchCompareWorkspace,
+    forget,
+    forgetAvailability,
     jobState,
     openConfirm,
     compareRun,
@@ -518,6 +544,8 @@ export function WorkspacePageController() {
     confirmTotals,
     dispatchCompare: dispatchCompareWorkspace,
     editorLifecycle: jobEditorLifecycle,
+    forget,
+    forgetAvailability,
     repository: compareWorkspaceRepository,
     resetSafetyUi,
     result,

@@ -54,7 +54,7 @@ pub struct Job {
     /// Whether to trust the (path,size,mtime) hash cache (unchanged faces reuse last round's result instead of really reading)
     #[serde(default)]
     pub use_cache: Option<bool>,
-    /// Disagreement escalation: sampled digests equal but |Δmtime|>2s → re-verify both sides in full before ruling (only meaningful with evidence=sampled)
+    /// Disagreement escalation: sampled digests equal but the mtimes fall outside the comparison's equality window (≥ 2 s, widened on coarse-timestamp backends) → re-verify both sides in full before ruling (only meaningful with evidence=sampled)
     #[serde(default)]
     pub escalate: Option<bool>,
     /// Verify after write: full blake3 of the copy stream vs a re-read from disk; no rename unless they match
