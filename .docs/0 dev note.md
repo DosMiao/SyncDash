@@ -3,13 +3,6 @@
 # user edit only
 # Do not Edit If you are AI AGENT, unless user give you clear instruction to do so, and you have double checked with user about the instruction before editing.
 
-## Shared Agent Skills
-
-- Refer to reusable workflows by canonical skill name, never by a filesystem path.
-- Explicit invocation uses `$skill-name` in Codex and `/skill-name` in Claude Code.
-- This note uses `plan-complex-work`, `refine-phase-plan`, `execute-phase-plan`, `review-change`, `create-phased-commits`, and `integrate-git-worktrees`.
-- A persistent note or a skill mention does not grant standing permission to implement, commit, integrate, rebase, push, clean up, or perform another side effect. The current user request must authorize each mutation.
-
 
 Full app wide swap for redundant code, logic, using parallel agent
 1. clean code, check my code find potential item to be cleaned, like: one time code (like database mitigation, and etc), unused code which is in npx tauri warning (and we shouldn't use too much of #[allow(dead_code)] #[allow(unused_imports)]); 
@@ -22,27 +15,31 @@ Full app wide swap for redundant code, logic, using parallel agent
 
 优化代码
 
-For a full-app optimization plan, use `plan-complex-work` in adaptive parallel-decomposition mode:
+Full app wide swap using parallel agent:
 1. give me a plan to optimize the codebase — it requires an in-depth understanding first, then splitting and refactoring.
 2. I prefer a more hierarchical (tree-like) rather than flat code structure.
 3. Avoid single files being overly long/short unless absolutely necessary. Code file can be extensive long/short if needed, but not encoraged.
 4. Look for code that should be relocated out to other locations, and also look for code from other locations that should be moved in.
 5. Prefer unidirectional dependencies with clear layering; reverse references are acceptable when necessary — don't force their elimination; avoid barrel files.
 
-Use `refine-phase-plan` to review and refine the selected plan phase by phase; add subphases only when needed.
-Use `execute-phase-plan` only after the current user request explicitly authorizes implementation of that identified plan.
+Review and refine the plan phase by phase again, make sub-phase plan if needed.
+And then you can proceed the entire plan
 
 
 ## Master plan prompt
-Use `refine-phase-plan` for the specific master plan selected in the current request.
-Resolve the master plan, its note, and the original user request relative to the repository root, and verify each path exists before relying on it.
-Treat additional plans as unverified context until fact-checked; never reuse a path copied from another project.
+Read master plan, plan to process the Sub-Plan 5 of master plan. before you make revise, please check note and user's want. if you are planing to do something different from the note and user's want,  you can do it, but you need to double check to user before process
+here is the master plan, .docs\devPlan\03-25 rust_framework_upgrade.md, here is the note for it .docs\devPlan\03-25 rust_framework_note.md, here is the original user's want .docs\devPlan\User demand\03-25 streaming chart service.md.
+Additional info can be found here (but they are not assured to be right)
+.docs\devPlan\03-25 Streaming_Chart_Master_Plan.md
+.docs\devPlan\03-25 melodic-exploring-island.md
+.docs\devPlan\03-25 tender-sauteeing-lark.md
 
-# Complex planning
-Use `plan-complex-work`.
-Scale independent lanes and challenge rounds to problem uncertainty, blast radius, ownership boundaries, and available capacity.
-When materially different strategies exist, compare aggressive/innovative, neutral/moderate, and conservative/pragmatic options. I generally prefer fundamental fixes, while accepting a simple approach when it is both clean and effective.
-Use independent review only when it can materially change the recommendation.
+# Challeng thinking 
+Please hire 5 sub-agents simultaneously (3 aggressive/innovative, 1 neutral/moderate, and 1 conservative/pragmatic). 
+Each one should provide a full round of opinions on the requests. 
+Then initiate 3 rounds of cross-discussion, where all five agents' opinions are mutually consulted and debated. 
+Ultimately, for each point, produce 3 sets of proposals (aggressive (innovative, and for the long run), neutral, conservative — I personally lean toward the aggressive/innovative side, hoping for fundamental fixes/reforms to the code rather than superficial patches; of course, if something is both simple and effective, that's even better). 
+Then hire 3 additional review agents to audit the resulting A/B/C proposals, explain the functionality, pros, and cons of each to me, and finally settle on one definitive plan.
 
 
 ## Deep Dive
@@ -57,7 +54,7 @@ Please:
 1. Research the relevant code to understand the already realized functionalities
 2. Set the goal as the functionality to present, dont consider what we have implemented now, but focus on the desired outcome: redisgn it from the first principles, to achieve the best result, what we will organize it?
 3. reseach the the current external API, the data available (Internal and external), and the infa we have now. consider the job more realistic, and the diff between current status and the things we are adding or refactoring.
-4. Provide me with a list of the modifications you plan to make, including a comparison with the original implementation. Use an available visualization, Mermaid diagram, or ASCII diagram only when it materially clarifies the comparison.
+4. Provide me with a list of the modifications you plan to make, including a comparison with the original implementation. Explain to me use show_widget tool.
 5. Please carry out detailed planning.
 
 # Refactor/New function add
@@ -65,42 +62,40 @@ Please:
 1. Research the relevant code to understand the current external API, the data available (Internal and external), and the infa we have now; understand the functionalities we already have in relevant modules, and the diff between current status and the things we are adding or refactoring.
 2. For the things we are adding or refactoring, design it from first principles and consider how to embed, integrate, or reorganize the existing modules to fit it in.
 3. Research the code and carefully consider what needs to be modified, upgraded, or adjusted in terms of architecture, data, UI, and pipeline.
-4. Provide me with a list of the modifications you plan to make, including a comparison with the original implementation. Use an available visualization, Mermaid diagram, or ASCII diagram only when it materially clarifies the comparison.
+4. Provide me with a list of the modifications you plan to make, including a comparison with the original implementation. Explain to me use show_widget tool.
 5. Please carry out detailed planning.
 
 # modification improve
 1. Regarding the modifications you have made/are going to make: please ensure the changes are clean, complete, and logically coherent, rather than just "bridging" old code. If necessary, I want a restructuring of the code architecture to create a cleaner, more seamless design. Avoid taking shortcuts—such as using proxies—simply to save effort; what I require is a clean upgrade, migration, or refactoring.
 2. Check all related code file's name, the function's name, the variable's name, label， token, comments, and every the naming issue, namespace issue. Make sure they are intuitive and consistent are updated accordingly. 
 3. Review the relevant logic trees; I need clear logical flows and structures—avoid creating "logic black holes."
-4. If the revisions are already complete, explain what you modified, why, and why the result is effective. If you are planning revisions, explain the plan in Chinese and use an available visualization only when it materially improves clarity.
-5. Review every comment added or touched using the `review-change` skill's comment-audit policy.
-6. Review outdated code, comments, persistent agent memory, and documentation to ensure everything reflects the current implementation and planned modifications.
-7. After review, create only the currently authorized scoped local commits using `create-phased-commits`.
+4. If the revisions are already complete, please explain your revise reasoning: what exactly did you modify, and why are those changes effective? If you are going to revise, show me your plan using Chinese. Please show me with show_widget tool.
+5. Review the comment you added per review-change/references/comment-policy.md. 
+6. Review out of date code, comments, claude memory, and documentation to ensure everything reflects the current implementation and planned modifications.
+7. After check, commit the code you revised, by follow create-phased-commits
 
 
-## Commit and worktree plan
-Create explicitly authorized scoped local commits using `create-phased-commits`.
+## Auto Commit Plan
+commit by follow create-phased-commits
 
-Audit and integrate committed worktree branches using `integrate-git-worktrees`; handle any explicitly authorized uncommitted scope separately with `create-phased-commits`.
+check/merge worktrees /commit the mian, follow integrate-git-worktrees
 
 What I should test for this phase
 
 1.fact check； 2. 告诉我方案的主要内容是什么；3. 评价
 
-Before execution, re-read the current repository state and fact-check the plan; an idle interval does not authorize a rebase or prove that the worktree is stable.
-When the current request explicitly authorizes full implementation, use `execute-phase-plan` to complete the approved phases and their validation gates.
-When the current request explicitly authorizes commits, create scoped commits for completed phases using `create-phased-commits`.
+start your execution after there is no code change for 5 minutes, be patient, just keep waiting. when waiting done, re-base code.
+proceed all as your recommended, please execute all phases, non stop until all done
+commit per phase done by follow create-phased-commits
 
-Proceed autonomously within the current request's explicit scope; stop when new authority or a material user decision is required.
+Please don't stop, and don't ask me any questions—just proceed exactly as you recommended. I'm going to sleep now and won't be answering any questions; I trust your choices.
 
 
 do second round fact check. you investigate what My evidence give to you from the very beginning, and investigate in detailed, double confirm the root cause finding
 
-## Windows-only local command
-
 & "$env:LOCALAPPDATA\CLIProxyAPI\cli-proxy-api.exe" -config "$env:USERPROFILE\.cli-proxy-api\config.yaml"
 
-Audit comments across the current repository's `Dev` tree using the applicable `AGENTS.md` or `CLAUDE.md` instructions and the `review-change` comment-audit policy.
+audit over comment cross all part over my code D:\Code\AlexQuant\Dev\Desktop, by following my standard set in claude.md and memory
 
  用中文+ASCII图向我解释，你原因是什么，你修改了什么，为什么你的修改有用
 
