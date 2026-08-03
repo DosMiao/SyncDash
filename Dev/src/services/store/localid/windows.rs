@@ -3,6 +3,11 @@
 //! Every item keeps the `cfg` it had before this file existed; the module itself is ungated.
 
 #[cfg(windows)]
+use super::{named_filesystem_has_stable_file_ids, PlatformIdentity};
+#[cfg(windows)]
+use std::path::Path;
+
+#[cfg(windows)]
 pub(super) fn platform_identity(canonical: &Path) -> PlatformIdentity {
     use std::os::windows::ffi::OsStrExt;
 

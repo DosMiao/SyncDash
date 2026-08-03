@@ -6,6 +6,9 @@
 //!
 //! Every item keeps the `cfg` it had before this file existed; the module itself is ungated.
 
+#[cfg(all(unix, not(target_os = "macos")))]
+use super::PlatformIdentity;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

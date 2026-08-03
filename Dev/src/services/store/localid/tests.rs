@@ -1,8 +1,13 @@
 use super::*;
-use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+use std::path::Path;
+use std::path::PathBuf;
 
 #[cfg(test)]
 mod tests {
+    // macos.rs contributes nothing on other platforms, so an ungated glob would be an unused
+    // import there. unix.rs and windows.rs both expose items to the cross-platform tests below.
+    #[cfg(target_os = "macos")]
     use super::macos::*;
     use super::unix::*;
     use super::windows::*;

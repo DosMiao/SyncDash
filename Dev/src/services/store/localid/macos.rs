@@ -3,9 +3,9 @@
 //! Every item keeps the `cfg` it had before this file existed; the module itself is ungated, so
 //! the set of code compiled on each platform is unchanged.
 
-use super::named_filesystem_has_stable_file_ids;
-use super::unix::device_root;
-use super::PlatformIdentity;
+#[cfg(target_os = "macos")]
+use super::{named_filesystem_has_stable_file_ids, unix::device_root, PlatformIdentity};
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]

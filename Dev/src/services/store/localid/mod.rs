@@ -13,7 +13,15 @@ mod windows;
 #[cfg(test)]
 mod tests;
 
-use self::macos::*;
+// Exactly one arm defines `platform_identity` for any given target, so the router below carries
+// the same predicates the definitions do. A target matching none of them fails to build here
+// rather than silently binding scan state to an identity nobody verified.
+#[cfg(target_os = "macos")]
+use self::macos::platform_identity;
+#[cfg(all(unix, not(target_os = "macos")))]
+use self::unix::platform_identity;
+#[cfg(windows)]
+use self::windows::platform_identity;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,14 +83,14 @@ impl LocalScanStateIdentity {
 }
 
 #[derive(Debug)]
-pub(super) struct PlatformIdentity {
-    pub(super) volume: Vec<u8>,
-    pub(super) relative_root: Vec<u8>,
-    pub(super) file_ids_stable: bool,
-    pub(super) persistent_reuse: bool,
+struct PlatformIdentity {
+    volume: Vec<u8>,
+    relative_root: Vec<u8>,
+    file_ids_stable: bool,
+    persistent_reuse: bool,
 }
 
-pub(super) fn encode_binding(volume: &[u8], relative_root: &[u8]) -> Vec<u8> {
+fn encode_binding(volume: &[u8], relative_root: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + volume.len() + relative_root.len());
     out.extend_from_slice(b"syncdash.local-scan-state\0");
     out.extend_from_slice(&(volume.len() as u64).to_le_bytes());
@@ -92,7 +100,7 @@ pub(super) fn encode_binding(volume: &[u8], relative_root: &[u8]) -> Vec<u8> {
     out
 }
 
-pub(super) fn canonical_or_absolute(root: &Path) -> PathBuf {
+fn canonical_or_absolute(root: &Path) -> PathBuf {
     std::fs::canonicalize(root).unwrap_or_else(|_| {
         if root.is_absolute() {
             root.to_path_buf()
@@ -103,14 +111,14 @@ pub(super) fn canonical_or_absolute(root: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-pub(super) fn fat_family(fs_name: &str) -> bool {
+fn fat_family(fs_name: &str) -> bool {
     matches!(
         fs_name.to_ascii_lowercase().as_str(),
         "fat" | "fat12" | "fat16" | "fat32" | "msdos" | "vfat" | "exfat"
     )
 }
 
-pub(super) fn named_filesystem_has_stable_file_ids(fs_name: &str) -> bool {
+fn named_filesystem_has_stable_file_ids(fs_name: &str) -> bool {
     matches!(
         fs_name.to_ascii_lowercase().as_str(),
         "apfs"
