@@ -1,7 +1,7 @@
 use syncdash::job::{self};
 use syncdash::run;
 
-use crate::contracts::jobs::{JobDetailDto, JobDto, JobFileSchemaDto};
+use crate::contracts::jobs::{JobDetailDto, JobDto, JobFileSchemaDto, PeerLinkDto};
 use crate::ipc::{require_window_role, WindowRole};
 
 #[tauri::command]
@@ -46,10 +46,14 @@ pub fn get_job(window: tauri::WebviewWindow, name: String) -> Result<JobDetailDt
     require_window_role(&window, WindowRole::Main)?;
     let (name, job) = job::load_named(&name).map_err(|e| e.to_string())?;
     let config_revision = job::config_revision(&job).map_err(|e| format!("Job '{name}': {e}"))?;
+    let peer_link = run::is_peer_job(&job).then(|| PeerLinkDto {
+        pull_mount: run::peer_pull_mount(&job).map(|mount| mount.display().to_string()),
+    });
     Ok(JobDetailDto {
         job_id: job.job_id.clone(),
         name,
         job,
+        peer_link,
         config_revision,
     })
 }

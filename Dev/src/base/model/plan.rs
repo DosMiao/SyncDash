@@ -48,6 +48,24 @@ impl Action {
     pub fn is_executable(&self) -> bool {
         !matches!(self, Self::Conflict | Self::Note)
     }
+
+    /// Where this action sits in the order a plan is written in: renames before the copies that may
+    /// depend on them, content before permission bits, removals after everything that reads them,
+    /// and reports last.
+    ///
+    /// The plan file records the resulting order but not the rank itself, so the desktop table has
+    /// to re-derive it to sort by action without losing the engine's grouping. Stated once here so
+    /// the sorted order the operator reads is the order the engine chose.
+    pub fn plan_rank(&self) -> u8 {
+        match self {
+            Self::Move => 0,
+            Self::Copy | Self::Update => 1,
+            Self::Chmod => 2,
+            Self::Delete => 3,
+            Self::DeleteDir => 4,
+            Self::Conflict | Self::Note => 5,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, ts_rs::TS)]

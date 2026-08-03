@@ -37,7 +37,22 @@ pub(crate) struct JobDetailDto {
     pub(crate) job_id: String,
     pub(crate) name: String,
     pub(crate) job: syncdash::job::Job,
+    /// Present exactly when the transport router routes this job to a peer. Derived here from the
+    /// same target phrases the job carries, so no reader downstream re-parses a root phrase: a
+    /// string test on the phrase disagrees with `spec::parse` about an upper-case scheme, a spaced
+    /// `| mount = /x`, and an empty `|mount=`.
+    pub(crate) peer_link: Option<PeerLinkDto>,
     pub(crate) config_revision: String,
+}
+
+/// What a peer target declares beyond its own phrase.
+#[derive(Serialize, ts_rs::TS)]
+#[cfg_attr(feature = "export-types", ts(export))]
+#[ts(export_to = "../Dev/typescript/core/types/generated/")]
+pub(crate) struct PeerLinkDto {
+    /// The local path source-side (pull) operations write through, or `null` for a push-only job.
+    /// Null covers both an absent and an empty `|mount=`, because Apply refuses the pull for either.
+    pub(crate) pull_mount: Option<String>,
 }
 
 #[derive(Serialize, ts_rs::TS)]

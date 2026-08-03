@@ -54,9 +54,6 @@ pub(in crate::run::peer) fn parse_peer_link_settings(
             .unwrap_or("syncdash")
             .to_string(),
         peer_root: absolute_peer_root(&peer_spec.root),
-        mount: peer_spec
-            .opt("mount")
-            .filter(|m| !m.is_empty())
-            .map(std::path::PathBuf::from),
+        mount: crate::run::peer_pull_mount(job.configuration()),
     })
 }

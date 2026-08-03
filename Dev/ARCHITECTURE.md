@@ -155,8 +155,8 @@ Dev/src-tauri/src/
 │   │   ├── decisions.rs    shared row-authentication rules for reviewed operations
 │   │   ├── events/         run-event model, repository, sink, and throttle
 │   │   ├── execution/      shared execution guards and error classification
-│   │   ├── lifecycle/      coordinator, leases, preparation, reservation, control, and the
-│   │   │                   progress-window mount/arm handshake
+│   │   ├── lifecycle/      run vocabulary, the locked active-run state, leases, preparation,
+│   │   │                   reservation, control, and the progress-window mount/arm handshake
 │   │   ├── projection.rs   operation state projected for delivery
 │   │   └── target/         registered target resolution and revision validation
 │   ├── jobs/               editor readiness, target resolution, and mutation effects
@@ -188,7 +188,7 @@ composition root and the only place that registers the complete command surface.
 ```text
 Dev/typescript/
 ├── core/
-│   ├── types/generated/    Rust-owned snake_case wire contracts
+│   ├── types/generated/    Rust-owned snake_case wire contracts and rule vectors
 │   ├── domain/             pure compare, job, path, and run logic
 │   ├── application/        pure reducers, authorities, review state, and use-case policy
 │   │                       (compare-workspace/repository/ splits scope index, lookup,
@@ -218,6 +218,12 @@ Dev/typescript/
 │       └── progress/       thin independent progress-window composition root
 └── styles.css              centralized tokens and CSP-safe styling
 ```
+
+`types/generated/` also holds the compare-plan rule vectors. A handful of engine rules are
+necessarily re-derived in TypeScript — a direction toggle cannot cost an IPC round trip and a
+six-figure table cannot cost one per keystroke — so Rust emits its own answers there through the
+same `npm run gen:types` path as the wire contracts, and the frontend tests replay them. Rust stays
+the owner; the generated file is what makes that ownership checkable instead of stated.
 
 Dependencies point from `ui -> infrastructure/application -> domain -> generated types`. Domain
 and application code do not import React, Tauri, or browser persistence. All `@tauri-apps` imports

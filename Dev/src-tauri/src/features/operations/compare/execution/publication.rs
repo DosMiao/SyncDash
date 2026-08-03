@@ -1,6 +1,5 @@
 //! Successful Compare evidence projection and post-run job-revision validation.
 
-use syncdash::model::plan::Action;
 use syncdash::pipeline::compare as pipeline_compare;
 use syncdash::{job, run::CompareOutcome};
 
@@ -34,15 +33,14 @@ pub(super) fn prepare_successful_result(
         &outcome.plan,
         &outcome.compare_options,
     );
+    // Elide only what a reader can rebuild byte-for-byte. `implied_row_meta` is the one statement of
+    // that redundancy; artifact validation and every decoder read the same function.
     let metas = evidence
         .metas
         .into_iter()
         .zip(&outcome.plan.ops)
         .map(|(meta, operation)| {
-            if matches!(operation.action, Action::Copy)
-                && operation.size.is_some()
-                && operation.mtime_ms.is_some()
-            {
+            if pipeline_compare::evidence::implied_row_meta(operation).as_ref() == Some(&meta) {
                 None
             } else {
                 Some(meta)

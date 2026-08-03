@@ -9,7 +9,7 @@ use crate::features::compare::evidence::repository::CompareResultRepository;
 use crate::features::compare::export::receipt::CsvExportReceiptRepository;
 use crate::features::operations::authorization::store::OperationAuthorizationStore;
 use crate::features::operations::events::repository::RunEventRepository;
-use crate::features::operations::lifecycle::RunLifecycle;
+use crate::features::operations::lifecycle::{progress_window, RunLifecycle};
 use crate::features::settings::authorization::grant::SettingsAuthority;
 use crate::window::{MAIN_WINDOW_LABEL, PROGRESS_WINDOW_LABEL};
 
@@ -72,12 +72,9 @@ pub(crate) fn run() {
 
                     window.state::<Arc<AutoScanController>>().stop();
 
-                    if let Some(p) = window
-                        .app_handle()
-                        .get_webview_window(PROGRESS_WINDOW_LABEL)
-                    {
-                        let _ = p.destroy();
-                    }
+                    // Through the lifecycle owner, not `destroy()`: removing the progress window
+                    // is also what settles a close the webview began, and only that owner does both.
+                    let _ = progress_window::destroy(window.app_handle(), &lifecycle);
                 }
             }
         })

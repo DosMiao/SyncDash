@@ -74,6 +74,7 @@ fn load_retained_apply(
         target,
         owner,
         plan,
+        plan_metadata: retained.plan_metadata().to_vec(),
         plan_digest,
     })
 }
@@ -82,8 +83,11 @@ fn prepare_retained_apply(
     retained_plan: RetainedApplyPlan,
     reviewed_row_decisions: Vec<ReviewedRowDecisionDto>,
 ) -> Result<PreparedApply, String> {
-    let reviewed_operations =
-        resolve_reviewed_operations(&retained_plan.plan.ops, &reviewed_row_decisions)?;
+    let reviewed_operations = resolve_reviewed_operations(
+        &retained_plan.plan.ops,
+        &retained_plan.plan_metadata,
+        &reviewed_row_decisions,
+    )?;
     Ok(PreparedApply {
         target: retained_plan.target,
         owner: retained_plan.owner,

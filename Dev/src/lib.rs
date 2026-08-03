@@ -18,6 +18,10 @@
 //! release failure has no return channel because it happens on a background thread and in `Drop`,
 //! and `fs/vfs/sftp/staged.rs` once, on the same reasoning. `model` owns persisted vocabulary,
 //! not engines.
+//!
+//! The six per-domain `InvalidData` constructors are deliberate call-site vocabulary — each names
+//! which artifact was rejected across roughly 200 sites spanning L0 through L3 — and are settled
+//! as not to be consolidated.
 //! Single-file domains stay flat, `mod.rs` files carry behavior, and callers use full module paths
 //! instead of re-export hubs.
 //!

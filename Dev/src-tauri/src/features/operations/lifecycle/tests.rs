@@ -1,7 +1,98 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::model::{ProgressWindowCloseDecisionDto, RunPurpose};
+use super::progress_window::{self, ProgressWindowSurface};
 use super::RunLifecycle;
+
+/// Stands in for the progress webview. Whether an abandoned handshake leaves a window on screen,
+/// and whether it leaves the lifecycle able to start another run, is decided in `progress_window`
+/// and has to be observable without a webview.
+#[derive(Default)]
+struct FakeProgressWindow {
+    destroyed: AtomicBool,
+}
+
+impl FakeProgressWindow {
+    fn destroyed(&self) -> bool {
+        self.destroyed.load(Ordering::Relaxed)
+    }
+}
+
+impl ProgressWindowSurface for FakeProgressWindow {
+    fn emit_arm(&self, _launch_id: u64) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn destroy_window(&self) -> Result<(), String> {
+        self.destroyed.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[test]
+fn tearing_the_window_down_mid_mount_settles_a_close_the_webview_can_no_longer_finish() {
+    let lifecycle = RunLifecycle::default();
+    let launch_id = lifecycle.reserve_progress_launch().unwrap();
+    let mounted_rx = lifecycle.prepare_progress_window_mount(launch_id).unwrap();
+    let window = FakeProgressWindow::default();
+
+    // The progress webview asks to close while preparation is still waiting for the mount signal.
+    // Taking the pending launch drops the mount sender under the lock, so the wait is released at
+    // once and preparation reaches its teardown ahead of the webview's own destroy request.
+    assert_eq!(
+        lifecycle.begin_progress_window_close(),
+        ProgressWindowCloseDecisionDto::PendingLaunchCancelled
+    );
+
+    let error = tauri::async_runtime::block_on(progress_window::arm(
+        &window,
+        &lifecycle,
+        launch_id,
+        Some(mounted_rx),
+    ))
+    .unwrap_err();
+    assert!(error.contains("did not load"), "{error}");
+    assert!(window.destroyed());
+
+    // Destroying the window is what ends the close, whoever destroys it. Only the progress webview
+    // may call `destroy_progress_window`, so a teardown here that does not settle the close leaves
+    // `reserve_progress_launch` refusing every later Apply for the life of the process.
+    lifecycle
+        .reserve_progress_launch()
+        .expect("a backend teardown must settle the progress-window close");
+}
+
+#[test]
+fn a_launch_withdrawn_between_mount_and_arm_leaves_no_window_and_no_stranded_close() {
+    let lifecycle = RunLifecycle::default();
+    let launch_id = lifecycle.reserve_progress_launch().unwrap();
+    let mounted_rx = lifecycle.prepare_progress_window_mount(launch_id).unwrap();
+    lifecycle.report_progress_window_mounted(launch_id).unwrap();
+    let window = FakeProgressWindow::default();
+
+    // The webview reported mounted and is then closed, in the gap before preparation arms it.
+    assert_eq!(
+        lifecycle.begin_progress_window_close(),
+        ProgressWindowCloseDecisionDto::PendingLaunchCancelled
+    );
+
+    let error = tauri::async_runtime::block_on(progress_window::arm(
+        &window,
+        &lifecycle,
+        launch_id,
+        Some(mounted_rx),
+    ))
+    .unwrap_err();
+    assert!(error.contains("no longer active"), "{error}");
+    assert!(
+        window.destroyed(),
+        "a window that never armed must not stay on screen"
+    );
+    lifecycle
+        .reserve_progress_launch()
+        .expect("a backend teardown must settle the progress-window close");
+}
 
 #[test]
 fn progress_launch_is_reserved_and_consumed_exactly_once() {

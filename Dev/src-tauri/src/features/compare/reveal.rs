@@ -7,9 +7,11 @@
 //! computer can open, and joining it to something that looks like one would address a local file
 //! that merely shares the remote's spelling.
 
+use syncdash::pipeline::compare::evidence::side_paths;
+
 use crate::contracts::compare::{CompareFileSideDto, CompareIdentity};
 use crate::features::compare::evidence::repository::CompareResultRepository;
-use crate::features::compare::export::presentation::{operation_side_paths, presented_operation};
+use crate::features::compare::export::presentation::presented_operation;
 
 /// Resolve one reviewed row of a retained Compare result to a path on this computer. The row is
 /// reconstructed from the retained plan in the direction the operator is looking at it, so the
@@ -24,8 +26,13 @@ pub(crate) fn compare_row_path(
     let retained = results
         .require_exact(compare_identity)
         .map_err(|error| error.to_string())?;
-    let operation = presented_operation(retained.plan_operations(), index, direction_reversed)?;
-    let (source_relative, target_relative) = operation_side_paths(&operation);
+    let operation = presented_operation(
+        retained.plan_operations(),
+        retained.plan_metadata(),
+        index,
+        direction_reversed,
+    )?;
+    let (source_relative, target_relative) = side_paths(&operation);
     let (root, relative, side_name) = match side {
         CompareFileSideDto::Source => (
             retained.plan_header().source_root.as_str(),

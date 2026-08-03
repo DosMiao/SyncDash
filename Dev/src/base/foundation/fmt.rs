@@ -3,6 +3,8 @@
 //! Units are KiB/MiB/GiB (base 1024, named for base 1024).
 //! `Dev/typescript/core/shared/format.ts` mirrors this
 //! rendering for the GUI; the two must agree, or one byte count reads two ways.
+//! This module is the arbiter of that agreement, including how the tenth is rounded, so the tie
+//! cases below are pinned rather than inherited silently from `format!`.
 
 /// What a command reports in place of its action verb when nothing was written.
 ///
@@ -40,5 +42,15 @@ mod tests {
         assert_eq!(human_bytes(1024u64.pow(4)), "1.0 TiB");
         // Caps at TiB, never rolls off the end of the unit table
         assert_eq!(human_bytes(1024u64.pow(5)), "1024.0 TiB");
+    }
+
+    /// `n / 1024^k` is dyadic, so an exact tie at one decimal really occurs — at `.25` and `.75`,
+    /// the only two dyadic tie fractions. `{:.1}` breaks them to the even tenth. The GUI mirror
+    /// pins the same values, so a change here has to be a deliberate change on both sides.
+    #[test]
+    fn an_exact_tenth_tie_rounds_to_the_even_tenth() {
+        assert_eq!(human_bytes(1280), "1.2 KiB");
+        assert_eq!(human_bytes(1792), "1.8 KiB");
+        assert_eq!(human_bytes(1024 * 1024 * 5 / 4), "1.2 MiB");
     }
 }

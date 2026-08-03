@@ -220,6 +220,34 @@ fn is_peer_target(job: &SingleTargetJob) -> bool {
     crate::fs::vfs::spec::is_peer(job.target())
 }
 
+/// The local path a peer job's source-side (pull) operations write through, if it declares one.
+///
+/// `|mount=` on the peer target phrase is the only declaration of it, and an empty value declares
+/// nothing: without a usable mount the job is push only, and Apply refuses every source-side
+/// operation. This is the one place that reads the option, so the peer link, the Apply preflight,
+/// and the desktop's Peer pill cannot disagree about whether a pull can run — and none of them
+/// re-derives it from the phrase, where a trimmed `| mount = /x` or an upper-case `PEER://` scheme
+/// reads differently to a string test than it does to `spec::parse`.
+///
+/// Reads the first peer target for the same reason `is_peer_job` uses `any`: a valid peer job has
+/// exactly one target, and an invalid hand-edited one should still be described honestly before
+/// validation explains why it cannot run.
+pub fn peer_pull_mount(job: &Job) -> Option<std::path::PathBuf> {
+    let peer_target = job
+        .targets
+        .iter()
+        .find(|target| crate::fs::vfs::spec::is_peer(target))?;
+    let crate::fs::vfs::spec::RootSpec::Endpoint(peer_spec) =
+        crate::fs::vfs::spec::parse(peer_target)
+    else {
+        return None;
+    };
+    peer_spec
+        .opt("mount")
+        .filter(|mount| !mount.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 pub fn compare_run_kind(job: &SingleTargetJob) -> crate::run::history::RunKind {
     if is_peer_target(job) {
         crate::run::history::RunKind::PeerCompare
@@ -482,4 +510,57 @@ pub fn compare_peer_job_with(
     ctx: &crate::obs::progress::RunCtx,
 ) -> std::io::Result<Plan> {
     compare_peer_job_detailed(name, job, ctx).map(|o| o.plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job_with_target(target: &str) -> Job {
+        Job {
+            targets: vec![target.to_string()],
+            ..Default::default()
+        }
+    }
+
+    /// The three phrase shapes a string test gets wrong. The scheme is case-insensitive, option
+    /// keys and values are trimmed, and an empty value declares nothing — so a reader that matches
+    /// `peer://` or `|mount=` literally reports a push-only job as pulling and a pulling job as
+    /// push only.
+    #[test]
+    fn the_pull_mount_follows_the_parsed_phrase_rather_than_its_spelling() {
+        assert!(is_peer_job(&job_with_target("PEER://mac/Users/ben/Code")));
+        assert_eq!(
+            peer_pull_mount(&job_with_target(
+                "PEER://mac/Users/ben/Code|mount=/Volumes/peer"
+            )),
+            Some(std::path::PathBuf::from("/Volumes/peer"))
+        );
+        assert_eq!(
+            peer_pull_mount(&job_with_target(
+                "peer://mac/Users/ben/Code|exe=~/bin/syncdash| mount = /Volumes/peer"
+            )),
+            Some(std::path::PathBuf::from("/Volumes/peer"))
+        );
+        assert_eq!(
+            peer_pull_mount(&job_with_target("peer://mac/Users/ben/Code|mount=")),
+            None,
+            "an empty value declares no mount, and Apply refuses source-side ops without one"
+        );
+        assert_eq!(
+            peer_pull_mount(&job_with_target("peer://mac/Users/ben/Code")),
+            None
+        );
+    }
+
+    /// A local or protocol target is not a peer link, so it never carries a pull mount — even when
+    /// the phrase happens to spell a `mount=` option.
+    #[test]
+    fn a_non_peer_target_has_no_pull_mount() {
+        assert_eq!(
+            peer_pull_mount(&job_with_target("sftp://host/srv|mount=/Volumes/peer")),
+            None
+        );
+        assert_eq!(peer_pull_mount(&job_with_target("/Volumes/peer")), None);
+    }
 }

@@ -4,11 +4,11 @@ use std::io::Write;
 
 use serde::Serialize;
 use syncdash::model::plan::{Op, PlanHeader};
-use syncdash::pipeline::compare::evidence::RowMeta;
+use syncdash::pipeline::compare::evidence::{side_paths, RowMeta};
 
 use crate::contracts::compare::CsvRowPresentationDto;
 
-use super::presentation::{operation_side_paths, validated_rows};
+use super::presentation::validated_rows;
 
 fn full_path(root: &str, relative: Option<&str>) -> String {
     relative.map_or_else(String::new, |relative| {
@@ -61,7 +61,7 @@ pub(crate) fn write_compare_csv(
         .map_err(|error| error.to_string())?;
     for row in &rows {
         let operation = &row.operation;
-        let (source_relative, target_relative) = operation_side_paths(operation);
+        let (source_relative, target_relative) = side_paths(operation);
         let source_path = full_path(&header.source_root, source_relative);
         let target_path = full_path(&header.target_root, target_relative);
         writeln!(
@@ -100,20 +100,55 @@ pub(crate) fn write_compare_csv(
 
 #[cfg(test)]
 mod tests {
-    use syncdash::model::plan::{Action, Side};
+    use syncdash::model::plan::{Action, Plan, Side, PLAN_SCHEMA};
 
     use super::super::fixtures::operation;
     use super::*;
 
+    /// Spelled out field by field on purpose. Deserializing a base from JSON let every
+    /// `#[serde(default)]` addition slip in unnoticed, and the fixture silently drifted a schema
+    /// version and four fields behind `PlanHeader`. A literal stops compiling the moment the
+    /// header grows, which is the same lockstep every other plan fixture in the workspace has.
     fn header() -> PlanHeader {
         PlanHeader {
+            schema: PLAN_SCHEMA,
+            kind: "plan".into(),
+            mode: "mirror".into(),
+            generated_at_ms: 0,
             source_root: "/source".into(),
+            source_host: String::new(),
             target_root: "/target".into(),
-            ..serde_json::from_str(
-                r#"{"schema":1,"kind":"plan","mode":"mirror","generated_at_ms":0,"source_root":"","source_host":"","target_root":"","target_host":"","op_count":0,"conflict_count":0,"source_entries":0,"target_entries":0,"source_excluded":0,"target_excluded":0,"source_walk_errors":0,"target_walk_errors":0,"source_walk_err_samples":[],"target_walk_err_samples":[]}"#,
-            )
-            .unwrap()
+            target_host: String::new(),
+            op_count: 0,
+            conflict_count: 0,
+            source_entries: 0,
+            target_entries: 0,
+            source_excluded: 0,
+            target_excluded: 0,
+            source_walk_errors: 0,
+            target_walk_errors: 0,
+            source_walk_err_samples: Vec::new(),
+            target_walk_err_samples: Vec::new(),
+            source_icloud_stubs: 0,
+            target_icloud_stubs: 0,
+            source_icloud_stub_samples: Vec::new(),
+            target_icloud_stub_samples: Vec::new(),
         }
+    }
+
+    /// The fixture stands in for a header this build actually produces, so it has to survive the
+    /// plan reader. Round-tripping it is what makes a schema bump visible here instead of leaving
+    /// the export tests rendering a header no current Compare could have written.
+    #[test]
+    fn the_export_fixture_header_is_one_this_build_can_write_and_read_back() {
+        let plan = Plan {
+            header: header(),
+            ops: Vec::new(),
+        };
+        let mut encoded = Vec::new();
+        plan.write_to(&mut encoded).unwrap();
+        let reloaded = Plan::from_reader(encoded.as_slice()).unwrap();
+        assert_eq!(reloaded.header.schema, PLAN_SCHEMA);
     }
 
     #[test]

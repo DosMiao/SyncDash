@@ -89,9 +89,10 @@ pub(super) fn validate_compare_result(version: &CompareResultVersion) -> std::io
     {
         match retained {
             Some(retained) if retained == derived => {}
-            None if matches!(operation.action, Action::Copy)
-                && operation.size.is_some()
-                && operation.mtime_ms.is_some() => {}
+            // An elided entry is only valid where the row rebuilds it exactly, which is the same
+            // rule publication elided it by — one function, so the two cannot drift apart.
+            None if syncdash::pipeline::compare::evidence::implied_row_meta(operation).as_ref()
+                == Some(derived) => {}
             _ => {
                 return Err(invalid_data(
                     "retained Compare row metadata does not match its snapshots",

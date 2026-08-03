@@ -32,22 +32,22 @@ pub fn preflight_peer_job(
             )
     });
     if needs_pull_mount {
-        match crate::fs::vfs::spec::parse(job.target()) {
-            crate::fs::vfs::spec::RootSpec::Endpoint(peer_spec) => {
-                match peer_spec.opt("mount").filter(|mount| !mount.is_empty()) {
-                    Some(mount) if std::path::Path::new(mount).is_dir() => {}
-                    Some(mount) => gv.blockers.push(format!(
-                        "source-side actions require the peer mount '{mount}', but it is not an accessible directory"
-                    )),
-                    None => gv.blockers.push(
-                        "source-side actions require |mount=<local path serving the peer tree>; this peer job is push-only without it"
-                            .into(),
-                    ),
-                }
+        let configuration = job.configuration();
+        if !crate::run::is_peer_job(configuration) {
+            gv.blockers
+                .push("the peer target phrase is no longer valid — run Compare again".into());
+        } else {
+            match crate::run::peer_pull_mount(configuration) {
+                Some(mount) if mount.is_dir() => {}
+                Some(mount) => gv.blockers.push(format!(
+                    "source-side actions require the peer mount '{}', but it is not an accessible directory",
+                    mount.display()
+                )),
+                None => gv.blockers.push(
+                    "source-side actions require |mount=<local path serving the peer tree>; this peer job is push-only without it"
+                        .into(),
+                ),
             }
-            _ => gv
-                .blockers
-                .push("the peer target phrase is no longer valid — run Compare again".into()),
         }
     }
     gv
