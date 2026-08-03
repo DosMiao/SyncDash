@@ -1,6 +1,7 @@
 import { useCallback } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import type {
+  CompareResultView,
   CompareWorkspace,
   CompareWorkspacePreferences,
 } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
@@ -41,11 +42,6 @@ export function useRunScopeActions({
   changeSearchDraft,
   applyAdvancedFilter,
 }: RunScopeActionsOptions) {
-  const dispatchToWorkspace = useCallback((action: Omit<CompareWorkspaceAction, 'resultKey'>) => {
-    if (!workspace) return;
-    dispatch({ ...action, resultKey: workspace.key } as CompareWorkspaceAction);
-  }, [dispatch, workspace]);
-
   const clearAdvancedFilters = useCallback(() => {
     applyAdvancedFilter({ ...EMPTY_ADVANCED_SCOPE_FILTER, masks: [] });
     setAdvancedFiltersAnchor(null);
@@ -119,7 +115,7 @@ export function useRunScopeActions({
     persistPreferences(nextPreferences);
   }, [dispatch, pathMode, persistPreferences, preferences, setPreferences, workspace]);
 
-  const changeResultView = useCallback((view: 'differences' | 'identical') => {
+  const changeResultView = useCallback((view: CompareResultView) => {
     if (workspace) dispatch({ type: 'result_view_changed', resultKey: workspace.key, view });
     if (view === 'identical') setAdvancedFiltersAnchor(null);
   }, [dispatch, setAdvancedFiltersAnchor, workspace]);

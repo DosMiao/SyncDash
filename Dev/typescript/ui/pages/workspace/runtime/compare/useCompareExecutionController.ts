@@ -11,21 +11,14 @@ import {
   compareScopeKey,
 } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import type { CompareWorkspacePreferences } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
-import {
-} from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
 import type { CompareWorkspaceAction } from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
 import {
   compareReviewKey,
   directAuthorization,
-  EMPTY_APPROVAL_CHOICES,
-  normalizeApprovalChoices,
-  operationApprovalFromChoices,
-  operationReviewCanSubmit,
   operationReviewPending,
   ownsOperationReviewRequest,
 } from '#core/application/operations/operationReview.ts';
 import type {
-  ApprovalChoices,
   OperationReviewAction,
   OperationReviewState,
   ReviewRequestFence,
@@ -51,7 +44,6 @@ interface CompareExecutionControllerOptions {
   editor: { name: string | null; focusGroup?: string } | null;
   compareReview: OperationReviewState;
   applyReview: OperationReviewState;
-  compareChoices: ApprovalChoices;
   confirmOpen: boolean;
   selectedTargetIndex: number;
   workspacePreferences: CompareWorkspacePreferences;
@@ -80,7 +72,6 @@ interface CompareExecutionControllerOptions {
   compareRunReady: MutableRefObject<boolean>;
   dispatchCompareWorkspace: Dispatch<CompareWorkspaceAction>;
   dispatchCompareReview: Dispatch<OperationReviewAction>;
-  setCompareChoices: Dispatch<SetStateAction<ApprovalChoices>>;
   setSelectedTargetIndex: Dispatch<SetStateAction<number>>;
   setBusy: Dispatch<SetStateAction<boolean>>;
   setCompareStages: Dispatch<SetStateAction<CompareStage[]>>;
@@ -99,7 +90,6 @@ export function useCompareExecutionController(options: CompareExecutionControlle
     editor,
     compareReview,
     applyReview,
-    compareChoices,
     confirmOpen,
     selectedTargetIndex,
     workspacePreferences,
@@ -124,7 +114,6 @@ export function useCompareExecutionController(options: CompareExecutionControlle
     compareRunReady,
     dispatchCompareWorkspace,
     dispatchCompareReview,
-    setCompareChoices,
     setSelectedTargetIndex,
     setBusy,
     setCompareStages,
@@ -476,7 +465,6 @@ export function useCompareExecutionController(options: CompareExecutionControlle
     compareReviewRequestId.current = request.requestId;
     compareReviewRequest.current = request;
     compareReviewFetchRequest.current = request;
-    setCompareChoices(EMPTY_APPROVAL_CHOICES);
     dispatchCompareReview({ type: 'begin', request });
     setStatus(`Reviewing Compare authorization for '${comparedJob.name}'…`);
     try {

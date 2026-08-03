@@ -3,7 +3,7 @@ import { Menu } from '#ui/shared/components/menu/Menu.tsx';
 import type { ReactNode } from 'react';
 import type { FormFieldSpec, FormValues } from '#core/domain/jobs/formSchema.ts';
 
-export interface SchemaSectionProps {
+interface SchemaSectionProps {
   fields: FormFieldSpec[];
   values: FormValues;
   set: (key: string, value: string | boolean) => void;

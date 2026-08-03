@@ -7,14 +7,14 @@
 
 export const maximumPhysicalBodyPixels = 1_500_000;
 
-export interface VirtualGeometryInput {
+interface VirtualGeometryInput {
   logicalBodyHeight: number;
   headHeight: number;
   viewportHeight: number;
   physicalScrollTop: number;
 }
 
-export interface VirtualGeometry {
+interface VirtualGeometry {
   /// Height assigned to the real DOM canvas.
   canvasHeight: number;
   /// Browser scrollTop, clamped to the real canvas range (rubber-band scrolling can report < 0).

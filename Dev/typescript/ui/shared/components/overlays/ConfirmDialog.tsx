@@ -1,20 +1,21 @@
 import { Sheet } from './Sheet.tsx';
 
-export interface ConfirmAction {
+interface ConfirmAction {
   label: string;
   onConfirm: () => void;
   danger?: boolean;
   disabled?: boolean;
 }
 
-export function ConfirmDialog({ title, message, actions, onCancel }: {
+export function ConfirmDialog({ title, message, action, onCancel }: {
   title: string;
   message: string;
-  actions: ConfirmAction[];
+  action: ConfirmAction;
   onCancel: () => void;
 }) {
-  const dangerConfirmation = actions.some((action) => action.danger && !action.disabled);
-  const firstEnabledAction = actions.findIndex((action) => !action.disabled);
+  // A destructive confirmation opens with Cancel focused, so Enter never carries out the
+  // destruction the dialog exists to question. A disabled action cannot be the safe default either.
+  const dangerConfirmation = action.danger && !action.disabled;
   return (
     <Sheet
       title={title}
@@ -22,18 +23,15 @@ export function ConfirmDialog({ title, message, actions, onCancel }: {
       footer={
         <>
           <button type="button" className="btn" autoFocus={dangerConfirmation} onClick={onCancel}>Cancel (Esc)</button>
-          {actions.map((action, index) => (
-            <button
-              key={action.label}
-              type="button"
-              className={'btn ' + (action.danger ? 'danger' : 'accent')}
-              disabled={action.disabled}
-              autoFocus={!dangerConfirmation && index === firstEnabledAction}
-              onClick={() => { onCancel(); action.onConfirm(); }}
-            >
-              {action.label}
-            </button>
-          ))}
+          <button
+            type="button"
+            className={'btn ' + (action.danger ? 'danger' : 'accent')}
+            disabled={action.disabled}
+            autoFocus={!dangerConfirmation && !action.disabled}
+            onClick={() => { onCancel(); action.onConfirm(); }}
+          >
+            {action.label}
+          </button>
         </>
       }
     >

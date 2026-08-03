@@ -1,5 +1,5 @@
 import { useId, useMemo, useRef } from 'react';
-import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
 import {
   ArrowUpDown,
   ChevronsDownUp,
@@ -12,6 +12,7 @@ import {
   Route,
   X,
 } from 'lucide-react';
+import { formatCount } from '#core/shared/format.ts';
 import { RESULT_TYPE_DEFINITIONS, RESULT_TYPES, SORT_LABEL } from '#core/domain/compare/plan.ts';
 import { ROOT_FOLDER_PATH, ROOT_LEVEL_LABEL } from '#core/domain/compare/folders.ts';
 import type { PlanDto, ResultType, Sort } from '#core/domain/compare/plan.ts';
@@ -26,7 +27,7 @@ import { useInteractionLayer } from '#ui/shared/interaction/useInteractionLayer.
  * subset of that scope. Keeping all three explicit prevents a folded tree from
  * being mistaken for an execution filter.
  */
-export interface RunScopeSummary {
+interface RunScopeSummary {
   foundCount: number;
   inScopeCount: number;
   selectedCount: number;
@@ -35,7 +36,7 @@ export interface RunScopeSummary {
   advancedFilterCount: number;
 }
 
-export interface ResultBarProps {
+interface ResultBarProps {
   plan: PlanDto;
 
   resultView: CompareResultView;
@@ -73,8 +74,62 @@ export interface ResultBarProps {
   identicalTabId: string;
 }
 
-function count(value: number): string {
-  return value.toLocaleString();
+/// One active scope constraint, shown as the control that clears it.
+function ScopeBadge(props: {
+  kind: 'folder' | 'result-types' | 'search' | 'filters';
+  label: ReactNode;
+  value: ReactNode;
+  clearTitle: string;
+  clearAriaLabel: string;
+  onClear: () => void;
+}) {
+  const { kind, label, value, clearTitle, clearAriaLabel, onClear } = props;
+  return (
+    <button
+      type="button"
+      className={`result-bar-scope-badge result-bar-scope-${kind}`}
+      title={clearTitle}
+      aria-label={clearAriaLabel}
+      onClick={onClear}
+    >
+      <span className="result-bar-scope-badge-label">{label}</span>
+      {value}
+      <X size={11} aria-hidden="true" />
+    </button>
+  );
+}
+
+interface SegmentedOption {
+  key: string;
+  label: ReactNode;
+  active: boolean;
+  onSelect: () => void;
+}
+
+/// A labelled group of mutually exclusive view options. Selecting the active option is a no-op, so
+/// each option owns that guard rather than the group.
+function SegmentedControl(props: {
+  labelId: string;
+  label: ReactNode;
+  options: SegmentedOption[];
+}) {
+  const { labelId, label, options } = props;
+  return (
+    <div className="segmented-control" role="group" aria-labelledby={labelId}>
+      <span id={labelId} className="segmented-label">{label}</span>
+      {options.map((option) => (
+        <button
+          key={option.key}
+          type="button"
+          className={'segmented-option' + (option.active ? ' is-active' : '')}
+          aria-pressed={option.active}
+          onClick={option.onSelect}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 export function ResultBar(props: ResultBarProps) {
@@ -176,7 +231,7 @@ export function ResultBar(props: ResultBarProps) {
             onClick={() => selectResultView('differences')}
           >
             <span>Differences</span>
-            <span className="result-bar-tab-count">{count(plan.ops.length)}</span>
+            <span className="result-bar-tab-count">{formatCount(plan.ops.length)}</span>
           </button>
           <button
             ref={identicalTabRef}
@@ -192,7 +247,7 @@ export function ResultBar(props: ResultBarProps) {
           >
             <Equal size={13} aria-hidden="true" />
             <span>Identical</span>
-            <span className="result-bar-tab-count">{count(plan.identical_count)}</span>
+            <span className="result-bar-tab-count">{formatCount(plan.identical_count)}</span>
           </button>
         </div>
 
@@ -256,8 +311,8 @@ export function ResultBar(props: ResultBarProps) {
               <ListFilter size={13} aria-hidden="true" />
               Advanced Filters
               {hasAdvancedFilters && (
-                <span className="control-count" aria-label={`${count(scope.advancedFilterCount)} active`}>
-                  {count(scope.advancedFilterCount)}
+                <span className="control-count" aria-label={`${formatCount(scope.advancedFilterCount)} active`}>
+                  {formatCount(scope.advancedFilterCount)}
                 </span>
               )}
             </button>
@@ -293,50 +348,43 @@ export function ResultBar(props: ResultBarProps) {
               </button>
             )}
 
-            <div className="segmented-control" role="group" aria-labelledby={layoutLabelId}>
-              <span id={layoutLabelId} className="segmented-label">Layout</span>
-              <button
-                type="button"
-                className={'segmented-option' + (grouped ? ' is-active' : '')}
-                aria-pressed={grouped}
-                onClick={() => { if (!grouped) onToggleGroup(); }}
-              >
-                <FolderTree size={13} aria-hidden="true" />
-                Tree
-              </button>
-              <button
-                type="button"
-                className={'segmented-option' + (!grouped ? ' is-active' : '')}
-                aria-pressed={!grouped}
-                onClick={() => { if (grouped) onToggleGroup(); }}
-              >
-                <List size={13} aria-hidden="true" />
-                List
-              </button>
-            </div>
+            <SegmentedControl
+              labelId={layoutLabelId}
+              label="Layout"
+              options={[
+                {
+                  key: 'tree',
+                  label: <><FolderTree size={13} aria-hidden="true" />Tree</>,
+                  active: grouped,
+                  onSelect: () => { if (!grouped) onToggleGroup(); },
+                },
+                {
+                  key: 'list',
+                  label: <><List size={13} aria-hidden="true" />List</>,
+                  active: !grouped,
+                  onSelect: () => { if (grouped) onToggleGroup(); },
+                },
+              ]}
+            />
 
-            <div className="segmented-control" role="group" aria-labelledby={pathLabelId}>
-              <span id={pathLabelId} className="segmented-label">
-                <Route size={13} aria-hidden="true" />
-                Paths
-              </span>
-              <button
-                type="button"
-                className={'segmented-option' + (pathMode === 'relative' ? ' is-active' : '')}
-                aria-pressed={pathMode === 'relative'}
-                onClick={() => { if (pathMode !== 'relative') onTogglePathMode(); }}
-              >
-                Relative
-              </button>
-              <button
-                type="button"
-                className={'segmented-option' + (pathMode === 'full' ? ' is-active' : '')}
-                aria-pressed={pathMode === 'full'}
-                onClick={() => { if (pathMode !== 'full') onTogglePathMode(); }}
-              >
-                Full
-              </button>
-            </div>
+            <SegmentedControl
+              labelId={pathLabelId}
+              label={<><Route size={13} aria-hidden="true" />Paths</>}
+              options={[
+                {
+                  key: 'relative',
+                  label: 'Relative',
+                  active: pathMode === 'relative',
+                  onSelect: () => { if (pathMode !== 'relative') onTogglePathMode(); },
+                },
+                {
+                  key: 'full',
+                  label: 'Full',
+                  active: pathMode === 'full',
+                  onSelect: () => { if (pathMode !== 'full') onTogglePathMode(); },
+                },
+              ]}
+            />
           </div>
 
           <div className="result-bar-scope" aria-label="Run Scope Summary" aria-busy={scopeCalculationPending}>
@@ -345,56 +393,44 @@ export function ResultBar(props: ResultBarProps) {
               <div className="result-bar-scope-badges" aria-label="Active Scope Constraints">
                 {!hasScopedResult && <span className="result-bar-scope-badge is-neutral">Any Difference</span>}
                 {hasFolder && (
-                  <button
-                    type="button"
-                    className="result-bar-scope-badge result-bar-scope-folder"
-                    title="Clear folder scope"
-                    aria-label={`Clear folder scope: ${scope.folderScope === ROOT_FOLDER_PATH ? ROOT_LEVEL_LABEL : scope.folderScope}`}
-                    onClick={onClearFolderScope}
-                  >
-                    <span className="result-bar-scope-badge-label">Folder</span>
-                    {scope.folderScope === ROOT_FOLDER_PATH ? ROOT_LEVEL_LABEL : scope.folderScope}
-                    <X size={11} aria-hidden="true" />
-                  </button>
+                  <ScopeBadge
+                    kind="folder"
+                    label="Folder"
+                    value={scope.folderScope === ROOT_FOLDER_PATH ? ROOT_LEVEL_LABEL : scope.folderScope}
+                    clearTitle="Clear folder scope"
+                    clearAriaLabel={`Clear folder scope: ${scope.folderScope === ROOT_FOLDER_PATH ? ROOT_LEVEL_LABEL : scope.folderScope}`}
+                    onClear={onClearFolderScope}
+                  />
                 )}
                 {hasResultTypes && (
-                  <button
-                    type="button"
-                    className="result-bar-scope-badge result-bar-scope-result-types"
-                    title="Clear result-type scope"
-                    aria-label={`Clear result-type scope: ${activeResultTypeLabels.join(', ')}`}
-                    onClick={onClearSelectedResultTypes}
-                  >
-                    <span className="result-bar-scope-badge-label">Result Types</span>
-                    {activeResultTypeLabels.join(', ')}
-                    <X size={11} aria-hidden="true" />
-                  </button>
+                  <ScopeBadge
+                    kind="result-types"
+                    label="Result Types"
+                    value={activeResultTypeLabels.join(', ')}
+                    clearTitle="Clear result-type scope"
+                    clearAriaLabel={`Clear result-type scope: ${activeResultTypeLabels.join(', ')}`}
+                    onClear={onClearSelectedResultTypes}
+                  />
                 )}
                 {hasSearch && (
-                  <button
-                    type="button"
-                    className="result-bar-scope-badge result-bar-scope-search"
-                    title="Clear search"
-                    aria-label={`Clear search: ${searchDraft.trim()}`}
-                    onClick={clearSearch}
-                  >
-                    <span className="result-bar-scope-badge-label">{searchPending ? 'Search Applying' : 'Search'}</span>
-                    “{searchDraft.trim()}”
-                    <X size={11} aria-hidden="true" />
-                  </button>
+                  <ScopeBadge
+                    kind="search"
+                    label={searchPending ? 'Search Applying' : 'Search'}
+                    value={`“${searchDraft.trim()}”`}
+                    clearTitle="Clear search"
+                    clearAriaLabel={`Clear search: ${searchDraft.trim()}`}
+                    onClear={clearSearch}
+                  />
                 )}
                 {hasAdvancedFilters && (
-                  <button
-                    type="button"
-                    className="result-bar-scope-badge result-bar-scope-filters"
-                    title="Clear advanced filters"
-                    aria-label={`Clear ${count(scope.advancedFilterCount)} active advanced filters`}
-                    onClick={onClearAdvancedFilters}
-                  >
-                    <span className="result-bar-scope-badge-label">Advanced Filters</span>
-                    {count(scope.advancedFilterCount)}
-                    <X size={11} aria-hidden="true" />
-                  </button>
+                  <ScopeBadge
+                    kind="filters"
+                    label="Advanced Filters"
+                    value={formatCount(scope.advancedFilterCount)}
+                    clearTitle="Clear advanced filters"
+                    clearAriaLabel={`Clear ${formatCount(scope.advancedFilterCount)} active advanced filters`}
+                    onClear={onClearAdvancedFilters}
+                  />
                 )}
               </div>
             </div>
@@ -402,15 +438,15 @@ export function ResultBar(props: ResultBarProps) {
             <dl className="result-bar-scope-counts" aria-label="Scope Counts" aria-live="polite">
               <div className="result-bar-scope-count">
                 <dt>Found</dt>
-                <dd>{count(scope.foundCount)}</dd>
+                <dd>{formatCount(scope.foundCount)}</dd>
               </div>
               <div className="result-bar-scope-count">
                 <dt>In Scope</dt>
-                <dd>{count(scope.inScopeCount)}</dd>
+                <dd>{formatCount(scope.inScopeCount)}</dd>
               </div>
               <div className="result-bar-scope-count result-bar-scope-count-selected">
                 <dt>Selected</dt>
-                <dd>{count(scope.selectedCount)}</dd>
+                <dd>{formatCount(scope.selectedCount)}</dd>
               </div>
             </dl>
 

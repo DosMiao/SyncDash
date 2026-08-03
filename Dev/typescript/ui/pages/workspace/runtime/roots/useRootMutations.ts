@@ -23,6 +23,7 @@ import type {
   JobIdentitySnapshot,
   RootSwapRequest,
 } from '../../model/workspacePageModel.ts';
+import type { JobListRefreshOutcome } from '../jobs/useWorkspaceJobState.ts';
 
 interface RootMutationsOptions {
   liveRootEditorRef: MutableRefObject<RootEditorWorkspace | null>;
@@ -41,16 +42,33 @@ interface RootMutationsOptions {
   dispatchRootEditor: Dispatch<RootEditorAction>;
   setBusy: Dispatch<SetStateAction<boolean>>;
   setAskSwap: Dispatch<SetStateAction<RootSwapRequest | null>>;
-  describeMutationFailure: (name: string, action: string, error: unknown) => Promise<string>;
+  describeMutationFailure: (action: string, error: unknown) => Promise<string>;
   reconcileSavedWorkspaceJob: (
     saved: JobSaveDto,
     previous: JobIdentitySnapshot | null,
   ) => void;
   resetSafetyUi: () => void;
   pushHistory: (candidatePath: string) => void;
-  refreshJobs: () => Promise<JobDto[]>;
+  refreshJobsForAnnouncement: () => Promise<JobListRefreshOutcome>;
   setStatus: StatusApi['setMessage'];
   setStatusAction: StatusApi['offerAction'];
+}
+
+/**
+ * A root mutation that already landed, together with everything its reversal needs. Undo is not a
+ * plain retry of the forward call: it rebinds the same editor workspace, reconciles retained
+ * evidence against the identity the *forward* mutation produced, and resets the safety UI again,
+ * so those inputs have to travel with the committed result rather than be rediscovered.
+ */
+interface CommittedRootMutation {
+  result: JobRootMutationDto;
+  workspaceKey: RootEditorKey;
+  targetIndex: number;
+  restore: () => Promise<JobRootMutationDto>;
+  restoreFailureAction: string;
+  restoredMessage: (restored: JobRootMutationDto) => string;
+  successMessage: string;
+  undoLabel: string;
 }
 
 export function useRootMutations({
@@ -71,10 +89,56 @@ export function useRootMutations({
   reconcileSavedWorkspaceJob,
   resetSafetyUi,
   pushHistory,
-  refreshJobs,
+  refreshJobsForAnnouncement,
   setStatus,
   setStatusAction,
 }: RootMutationsOptions) {
+  const announceRootMutation = useCallback(async (commit: CommittedRootMutation) => {
+    const undo = async () => {
+      let restored: JobRootMutationDto;
+      try {
+        restored = await commit.restore();
+      } catch (error) {
+        throw new Error(await describeMutationFailure(commit.restoreFailureAction, error));
+      }
+      const restoredState = rootMutationState(restored, commit.targetIndex);
+      dispatchRootEditor({
+        type: 'workspace_rebound',
+        workspaceKey: commit.workspaceKey,
+        owner: restoredState.owner,
+        values: restoredState.values,
+      });
+      reconcileSavedWorkspaceJob(restored.mutation, {
+        jobId: commit.result.mutation.job_id,
+        name: commit.result.mutation.name,
+        configRevision: commit.result.mutation.config_revision,
+      });
+      resetSafetyUi();
+      const restoredWarning = statusDeliveryWarning(restored.mutation);
+      const restoredRefresh = await refreshJobsForAnnouncement();
+      setStatus(
+        `${commit.restoredMessage(restored)}${restoredWarning}${restoredRefresh.suffix}`,
+        restoredWarning || restoredRefresh.failed ? 'err' : '',
+      );
+    };
+    const warning = statusDeliveryWarning(commit.result.mutation);
+    const refresh = await refreshJobsForAnnouncement();
+    setStatusAction(
+      `${commit.successMessage}${warning}${refresh.suffix}`,
+      commit.undoLabel,
+      undo,
+      warning || refresh.failed ? 'err' : '',
+    );
+  }, [
+    describeMutationFailure,
+    dispatchRootEditor,
+    reconcileSavedWorkspaceJob,
+    refreshJobsForAnnouncement,
+    resetSafetyUi,
+    setStatus,
+    setStatusAction,
+  ]);
+
   const saveRootDraft = useCallback(async (field: RootField) => {
     const workspace = liveRootEditorRef.current;
     const interaction = liveInteractionStateRef.current;
@@ -119,7 +183,6 @@ export function useRootMutations({
     } catch (error) {
       dispatchRootEditor({ type: 'save_failed', workspaceKey, requestId, error: String(error) });
       setStatus(await describeMutationFailure(
-        owner.jobName,
         `Could not save ${field}; the draft was retained`,
         error,
       ), 'err');
@@ -145,54 +208,25 @@ export function useRootMutations({
     });
     resetSafetyUi();
     pushHistory(value);
-    const undo = async () => {
-      let restored: JobRootMutationDto;
-      try {
-        restored = await jobsIpc.updateJobRoot(
-          result.mutation.name,
-          result.mutation.job_id,
-          result.mutation.config_revision,
-          owner.targetIndex,
-          field,
-          before,
-        );
-      } catch (error) {
-        throw new Error(await describeMutationFailure(
-          result.mutation.name,
-          `Could not restore ${field}`,
-          error,
-        ));
-      }
-      const restoredState = rootMutationState(restored, owner.targetIndex);
-      dispatchRootEditor({
-        type: 'workspace_rebound',
-        workspaceKey,
-        owner: restoredState.owner,
-        values: restoredState.values,
-      });
-      reconcileSavedWorkspaceJob(restored.mutation, {
-        jobId: result.mutation.job_id,
-        name: result.mutation.name,
-        configRevision: result.mutation.config_revision,
-      });
-      resetSafetyUi();
-      const warning = statusDeliveryWarning(restored.mutation);
-      try {
-        await refreshJobs();
-        setStatus(`Restored ${field}${warning}`, warning ? 'err' : '');
-      } catch (error) {
-        setStatus(`Restored ${field}${warning} · job-list refresh failed: ${error}`, 'err');
-      }
-    };
-    const warning = statusDeliveryWarning(result.mutation);
-    const success = `Changed ${field} → ${value} — Compare again (Ctrl+R)${warning}`;
-    try {
-      await refreshJobs();
-      setStatusAction(success, `Undo ${field} change`, undo, warning ? 'err' : '');
-    } catch (error) {
-      setStatusAction(`${success} · job-list refresh failed: ${error}`, `Undo ${field} change`, undo, 'err');
-    }
+    await announceRootMutation({
+      result,
+      workspaceKey,
+      targetIndex: owner.targetIndex,
+      restore: () => jobsIpc.updateJobRoot(
+        result.mutation.name,
+        result.mutation.job_id,
+        result.mutation.config_revision,
+        owner.targetIndex,
+        field,
+        before,
+      ),
+      restoreFailureAction: `Could not restore ${field}`,
+      restoredMessage: () => `Restored ${field}`,
+      successMessage: `Changed ${field} → ${value} — Compare again (Ctrl+R)`,
+      undoLabel: `Undo ${field} change`,
+    });
   }, [
+    announceRootMutation,
     autoApplyInFlightRef,
     autoScanStatusRef,
     autoScanTicketRef,
@@ -203,12 +237,10 @@ export function useRootMutations({
     liveRootEditorRef,
     pushHistory,
     reconcileSavedWorkspaceJob,
-    refreshJobs,
     resetSafetyUi,
     rootSaveInFlightRef,
     rootSaveRequestIdRef,
     setStatus,
-    setStatusAction,
   ]);
 
   const requestSwap = useCallback(() => {
@@ -261,11 +293,7 @@ export function useRootMutations({
       );
     } catch (error) {
       setBusy(false);
-      setStatus(await describeMutationFailure(
-        request.owner.jobName,
-        'Root swap failed',
-        error,
-      ), 'err');
+      setStatus(await describeMutationFailure('Root swap failed', error), 'err');
       return;
     }
     const committed = rootMutationState(result, request.owner.targetIndex);
@@ -284,61 +312,30 @@ export function useRootMutations({
     pushHistory(committed.values.source);
     pushHistory(committed.values.target);
     setBusy(false);
-    const undo = async () => {
-      let restored: JobRootMutationDto;
-      try {
-        restored = await jobsIpc.swapJobRoots(
-          result.mutation.name,
-          result.mutation.job_id,
-          result.mutation.config_revision,
-          request.owner.targetIndex,
-        );
-      } catch (error) {
-        throw new Error(await describeMutationFailure(
-          result.mutation.name,
-          'Could not undo the root swap',
-          error,
-        ));
-      }
-      const restoredState = rootMutationState(restored, request.owner.targetIndex);
-      dispatchRootEditor({
-        type: 'workspace_rebound',
-        workspaceKey: request.workspaceKey,
-        owner: restoredState.owner,
-        values: restoredState.values,
-      });
-      reconcileSavedWorkspaceJob(restored.mutation, {
-        jobId: result.mutation.job_id,
-        name: result.mutation.name,
-        configRevision: result.mutation.config_revision,
-      });
-      resetSafetyUi();
-      const warning = statusDeliveryWarning(restored.mutation);
-      try {
-        await refreshJobs();
-        setStatus(`Restored the two roots of '${restored.mutation.name}'${warning}`, warning ? 'err' : '');
-      } catch (error) {
-        setStatus(`Restored the two roots of '${restored.mutation.name}'${warning} · job-list refresh failed: ${error}`, 'err');
-      }
-    };
-    const warning = statusDeliveryWarning(result.mutation);
-    const success = `Swapped target ${request.owner.targetIndex + 1} and source for '${result.mutation.name}' — Compare again (Ctrl+R)${warning}`;
-    try {
-      await refreshJobs();
-      setStatusAction(success, 'Undo swap', undo, warning ? 'err' : '');
-    } catch (error) {
-      setStatusAction(`${success} · job-list refresh failed: ${error}`, 'Undo swap', undo, 'err');
-    }
+    await announceRootMutation({
+      result,
+      workspaceKey: request.workspaceKey,
+      targetIndex: request.owner.targetIndex,
+      restore: () => jobsIpc.swapJobRoots(
+        result.mutation.name,
+        result.mutation.job_id,
+        result.mutation.config_revision,
+        request.owner.targetIndex,
+      ),
+      restoreFailureAction: 'Could not undo the root swap',
+      restoredMessage: (restored) => `Restored the two roots of '${restored.mutation.name}'`,
+      successMessage: `Swapped target ${request.owner.targetIndex + 1} and source for '${result.mutation.name}' — Compare again (Ctrl+R)`,
+      undoLabel: 'Undo swap',
+    });
   }, [
+    announceRootMutation,
     describeMutationFailure,
     dispatchRootEditor,
     pushHistory,
     reconcileSavedWorkspaceJob,
-    refreshJobs,
     resetSafetyUi,
     setBusy,
     setStatus,
-    setStatusAction,
   ]);
 
   return { saveRootDraft, requestSwap, doSwap };

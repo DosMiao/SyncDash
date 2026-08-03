@@ -4,7 +4,6 @@ import * as applyIpc from '#core/infrastructure/tauri/commands/apply.ts';
 import * as autoscanIpc from '#core/infrastructure/tauri/commands/autoscan.ts';
 import {
   monitorOwnsAutoScanResult,
-  monitorOwnsAutoScanTicket,
   statusCanOwnAutoScanTrigger,
   statusCompletesAutoScanTicket,
 } from '#core/application/autoscan/autoscan.ts';

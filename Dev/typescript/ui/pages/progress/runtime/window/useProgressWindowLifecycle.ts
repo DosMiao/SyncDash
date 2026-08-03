@@ -17,7 +17,8 @@ import type {
   AutoCloseRequest,
   PowerActionCountdown,
 } from '#core/application/progress/postRunActions.ts';
-import type { PauseRequest, PendingLaunch, StopRequest, StopState } from '../progressRuntimeTypes.ts';
+import type { PausePending, StopState } from '../../model/progressPresentation.ts';
+import type { PauseRequest, PendingLaunch, StopRequest } from '../progressRuntimeTypes.ts';
 
 const progressWindow = getProgressWindow();
 
@@ -94,7 +95,7 @@ interface ProgressWindowCloseOptions {
   windowDestructionPendingRef: MutableRefObject<boolean>;
   setScheduledAutoClose: Dispatch<SetStateAction<AutoCloseRequest | null>>;
   setPowerActionCountdown: Dispatch<SetStateAction<PowerActionCountdown | null>>;
-  setPausePending: Dispatch<SetStateAction<'pause' | 'resume' | null>>;
+  setPausePending: Dispatch<SetStateAction<PausePending>>;
   setStopState: Dispatch<SetStateAction<StopState>>;
   requestRender: () => void;
   requestWindowDestruction: () => Promise<void>;

@@ -1,6 +1,8 @@
 import { useRef } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Circle, Pencil, Plus } from 'lucide-react';
 import { formatRelativeTimestamp } from '#core/shared/format.ts';
+import { isRovingFocusKey, rovingFocusIndex } from '#ui/shared/components/a11y.ts';
 import type { JobDto } from '#core/types/generated/JobDto.ts';
 import type { RunRecord } from '#core/types/generated/RunRecord.ts';
 
@@ -52,11 +54,11 @@ export function Sidebar(props: SidebarProps) {
   } = props;
   const jobButtons = useRef<Array<HTMLButtonElement | null>>([]);
 
-  const moveFocus = (from: number, direction: -1 | 1 | 'first' | 'last') => {
-    if (jobs.length === 0) return;
-    const next = direction === 'first' ? 0
-      : direction === 'last' ? jobs.length - 1
-      : (from + direction + jobs.length) % jobs.length;
+  const moveFocus = (event: ReactKeyboardEvent<HTMLButtonElement>, from: number) => {
+    if (!isRovingFocusKey(event.key)) return;
+    const next = rovingFocusIndex(event.key, from, jobs.length);
+    if (next === null) return;
+    event.preventDefault();
     jobButtons.current[next]?.focus();
   };
 
@@ -80,18 +82,7 @@ export function Sidebar(props: SidebarProps) {
               aria-current={active ? 'page' : undefined}
               tabIndex={active || (!currentJobId && index === 0) ? 0 : -1}
               onClick={() => { if (!active) onSelect(job); }}
-              onKeyDown={(event) => {
-                if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
-                  event.preventDefault();
-                  moveFocus(index, 1);
-                } else if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
-                  event.preventDefault();
-                  moveFocus(index, -1);
-                } else if (event.key === 'Home' || event.key === 'End') {
-                  event.preventDefault();
-                  moveFocus(index, event.key === 'Home' ? 'first' : 'last');
-                }
-              }}
+              onKeyDown={(event) => moveFocus(event, index)}
             >
               <span className="jrow1">
                 <span className="name">{job.name}</span>

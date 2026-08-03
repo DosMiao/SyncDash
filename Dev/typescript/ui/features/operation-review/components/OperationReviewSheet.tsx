@@ -3,11 +3,8 @@ import { Sheet } from '#ui/shared/components/overlays/Sheet.tsx';
 import {
   directAuthorization,
   isConfirmationReview,
-  operationReviewCanSubmit,
   operationReviewExpired,
   operationReviewFailed,
-  type ApprovalChoices,
-  type ConfirmationReview,
   type OperationReviewState,
 } from '#core/application/operations/operationReview.ts';
 
@@ -104,19 +101,18 @@ export function OperationReviewDetails({ state }: { state: OperationReviewState 
   );
 }
 
+/**
+ * Compare only reads, so its review is either authorized directly — in which case this sheet never
+ * opens — or it reports why Compare cannot run. Nothing here is approvable, so the sheet offers no
+ * approval control.
+ */
 export function CompareReviewSheet({
   state,
-  choices,
-  onChoices,
   onCancel,
-  onApprove,
   onReviewAgain,
 }: {
   state: OperationReviewState;
-  choices: ApprovalChoices;
-  onChoices: (choices: ApprovalChoices) => void;
   onCancel: () => void;
-  onApprove: () => void;
   onReviewAgain: () => void;
 }) {
   const review = state.review;
@@ -135,18 +131,9 @@ export function CompareReviewSheet({
           <button type="button" className="btn" onClick={onCancel}>
             {blocked || operationReviewFailed(state) ? 'Close' : 'Cancel (Esc)'}
           </button>
-          {operationReviewExpired(state) ? (
+          {operationReviewExpired(state) && (
             <button type="button" className="btn accent" onClick={onReviewAgain}>
               Review Again
-            </button>
-          ) : !blocked && !operationReviewFailed(state) && (
-            <button
-              type="button"
-              className="btn accent"
-              disabled={!operationReviewCanSubmit(state, choices)}
-              onClick={onApprove}
-            >
-              {state.phase === 'approving' ? 'Authorizing…' : 'Approve & Compare'}
             </button>
           )}
         </>

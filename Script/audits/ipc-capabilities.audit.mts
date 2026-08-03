@@ -1,50 +1,24 @@
 import assert from 'node:assert/strict';
-import { readdir, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-const repositoryRoot = fileURLToPath(new URL('../..', import.meta.url));
+import { repositoryRoot, textUnder } from './tree.mts';
 
 async function source(path: string): Promise<string> {
   return readFile(join(repositoryRoot, path), 'utf8');
 }
 
 async function commandAdapterSource(directory: string): Promise<string> {
-  const absoluteDirectory = join(repositoryRoot, directory);
-  const entries = await readdir(absoluteDirectory, { withFileTypes: true });
-  const sources = await Promise.all(entries.map(async (entry) => {
-    const path = join(absoluteDirectory, entry.name);
-    if (entry.isDirectory()) {
-      return commandAdapterSource(join(directory, entry.name));
-    }
-    return entry.isFile() && entry.name.endsWith('.ts')
-      ? readFile(path, 'utf8')
-      : '';
-  }));
-  return sources.join('\n');
+  return textUnder(join(repositoryRoot, directory), (name) => name.endsWith('.ts'));
 }
 
 async function frontendTreeSource(directory: string): Promise<string> {
-  const absoluteDirectory = join(repositoryRoot, directory);
-  const entries = await readdir(absoluteDirectory, { withFileTypes: true });
-  const sources = await Promise.all(entries.map(async (entry) => {
-    const path = join(absoluteDirectory, entry.name);
-    if (entry.isDirectory()) return frontendTreeSource(join(directory, entry.name));
-    return entry.isFile() && /\.tsx?$/.test(entry.name) ? readFile(path, 'utf8') : '';
-  }));
-  return sources.join('\n');
+  return textUnder(join(repositoryRoot, directory), (name) => /\.tsx?$/.test(name));
 }
 
 async function rustTreeSource(directory: string): Promise<string> {
-  const absoluteDirectory = join(repositoryRoot, directory);
-  const entries = await readdir(absoluteDirectory, { withFileTypes: true });
-  const sources = await Promise.all(entries.map(async (entry) => {
-    const path = join(absoluteDirectory, entry.name);
-    if (entry.isDirectory()) return rustTreeSource(join(directory, entry.name));
-    return entry.isFile() && entry.name.endsWith('.rs') ? readFile(path, 'utf8') : '';
-  }));
-  return sources.join('\n');
+  return textUnder(join(repositoryRoot, directory), (name) => name.endsWith('.rs'));
 }
 
 function sorted(values: Iterable<string>): string[] {
@@ -57,7 +31,7 @@ function commandPermissions(toml: string): Set<string> {
 }
 
 const [mainRs, buildRs, commandAdapters, mainPermissionsToml, progressPermissionsToml] = await Promise.all([
-  source('Dev/src-tauri/src/app/mod.rs'),
+  source('Dev/src-tauri/src/app.rs'),
   source('Dev/src-tauri/build.rs'),
   commandAdapterSource('Dev/typescript/core/infrastructure/tauri/commands'),
   source('Dev/src-tauri/permissions/main.toml'),

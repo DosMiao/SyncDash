@@ -1,6 +1,6 @@
 import { useCallback } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
-import type { JobEditorIdentity } from '#ui/features/jobs/model/job-editor/jobEditorModel.ts';
+import type { JobEditorIdentity } from '#ui/features/jobs/model/jobEditorModel.ts';
 import type { Job as JobFull } from '#core/types/generated/Job.ts';
 import type { JobDeleteDto } from '#core/types/generated/JobDeleteDto.ts';
 import type { JobDto } from '#core/types/generated/JobDto.ts';
@@ -8,6 +8,7 @@ import type { JobSaveDto } from '#core/types/generated/JobSaveDto.ts';
 import type { StatusApi } from '#ui/shared/status/useStatus.ts';
 import { statusDeliveryWarning } from '../../model/workspacePageModel.ts';
 import type { JobEditorIntent } from '../interaction/useWorkspacePanels.ts';
+import type { JobListRefreshOutcome } from './useWorkspaceJobState.ts';
 
 interface JobEditorLifecycleOptions {
   selectedJob: JobDto | null;
@@ -19,6 +20,7 @@ interface JobEditorLifecycleOptions {
   setRegistrySelection: (job: JobDto | null) => void;
   setSelectedTargetIndex: Dispatch<SetStateAction<number>>;
   refreshJobs: () => Promise<JobDto[]>;
+  refreshJobsForAnnouncement: () => Promise<JobListRefreshOutcome>;
   setJobConfiguration: Dispatch<SetStateAction<JobFull | null>>;
   pushHistory: (path: string) => void;
   setStatus: StatusApi['setMessage'];
@@ -35,6 +37,7 @@ export function useJobEditorLifecycle({
   setRegistrySelection,
   setSelectedTargetIndex,
   refreshJobs,
+  refreshJobsForAnnouncement,
   setJobConfiguration,
   pushHistory,
   setStatus,
@@ -52,20 +55,20 @@ export function useJobEditorLifecycle({
     pushHistory(job.source);
     for (const target of job.targets) pushHistory(target);
     const warning = statusDeliveryWarning(saved);
-    try {
-      await refreshJobs();
-      if (selectedIdentity) setJobConfiguration(job);
-      setStatus(
-        (saved.effect === 'no_op' ? `No changes to save for '${saved.name}'` : `Saved '${saved.name}'`) + warning,
-        warning ? 'err' : 'ok',
-      );
-    } catch (error) {
-      setStatus(`Saved '${saved.name}'${warning} · job-list refresh failed: ${error}`, 'err');
+    const refresh = await refreshJobsForAnnouncement();
+    if (refresh.failed) {
+      setStatus(`Saved '${saved.name}'${warning}${refresh.suffix}`, 'err');
+      return;
     }
+    if (selectedIdentity) setJobConfiguration(job);
+    setStatus(
+      (saved.effect === 'no_op' ? `No changes to save for '${saved.name}'` : `Saved '${saved.name}'`) + warning,
+      warning ? 'err' : 'ok',
+    );
   }, [
     pushHistory,
     reconcileSavedWorkspaceJob,
-    refreshJobs,
+    refreshJobsForAnnouncement,
     resetSafetyUi,
     selectedJob?.job_id,
     setEditor,
@@ -82,15 +85,14 @@ export function useJobEditorLifecycle({
       setSelectedTargetIndex(0);
     }
     const warning = statusDeliveryWarning(deleted);
-    try {
-      await refreshJobs();
-      setStatus(`Deleted '${deleted.name}'${warning}`, warning ? 'err' : '');
-    } catch (error) {
-      setStatus(`Deleted '${deleted.name}'${warning} · job-list refresh failed: ${error}`, 'err');
-    }
+    const refresh = await refreshJobsForAnnouncement();
+    setStatus(
+      `Deleted '${deleted.name}'${warning}${refresh.suffix}`,
+      warning || refresh.failed ? 'err' : '',
+    );
   }, [
     expireDeletedJobState,
-    refreshJobs,
+    refreshJobsForAnnouncement,
     resetSafetyUi,
     selectedJob?.job_id,
     setEditor,

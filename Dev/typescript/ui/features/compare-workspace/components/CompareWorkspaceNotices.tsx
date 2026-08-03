@@ -1,3 +1,4 @@
+import { formatCount } from '#core/shared/format.ts';
 import type { CompareScopeExecutionStatusDto } from '#core/types/generated/CompareScopeExecutionStatusDto.ts';
 import type {
   CompareScopeActivity,
@@ -95,7 +96,7 @@ export function CompareCandidateNotice(props: {
     <section className="compare-workspace-notice candidate" role="status">
       <span>
         <strong>Newer AutoScan Result Ready</strong>
-        {' · '}{plan.ops.length.toLocaleString()} differences · {plan.header.conflict_count.toLocaleString()} conflicts
+        {' · '}{formatCount(plan.ops.length)} differences · {formatCount(plan.header.conflict_count)} conflicts
         {props.activeHasReviewEdits ? ' · your current review edits are retained until you choose' : ''}
       </span>
       <span className="compare-workspace-notice-actions">

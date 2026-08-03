@@ -14,6 +14,17 @@ import type { StatusApi } from '#ui/shared/status/useStatus.ts';
 import type { JobIdentitySnapshot } from '../../model/workspacePageModel.ts';
 import { useWorkspaceBootstrap } from '../lifecycle/useWorkspaceBootstrap.ts';
 
+/**
+ * How a mutation announcement must be worded once the job registry has been re-read. A failed
+ * refresh is never swallowed: callers append `suffix` to their message and must raise the error
+ * tone whenever `failed`, because the mutation itself landed while the job list the operator is
+ * looking at may no longer describe it.
+ */
+export interface JobListRefreshOutcome {
+  suffix: string;
+  failed: boolean;
+}
+
 interface WorkspaceJobStateOptions {
   selectedJob: JobDto | null;
   refreshJobs: () => Promise<JobDto[]>;
@@ -52,10 +63,18 @@ export function useWorkspaceJobState({
     if (warning) setStatus(warning, 'err');
   }, [setStatus]);
 
-  const reconcileWorkspaceJob = useCallback((previous: JobIdentitySnapshot, refreshedJob: JobDto | null) => {
-    if (!refreshedJob || refreshedJob.job_id !== previous.jobId) {
+  // Retained Compare evidence is bound to a job identity and its configuration revision. Each
+  // reconciler applies its own guard for what "the job as it exists now" means and then delegates
+  // here; a missing job expires as a deletion and a moved revision expires as a change. There is
+  // deliberately no default branch: an unchanged identity must never invalidate evidence.
+  const expireJobExecutionIfIdentityChanged = useCallback((
+    previous: JobIdentitySnapshot,
+    nextJobId: string | null,
+    nextConfigRevision: string | null,
+  ) => {
+    if (nextJobId !== previous.jobId) {
       dispatchCompare({ type: 'job_execution_expired', jobId: previous.jobId, reason: 'job_deleted' });
-    } else if (refreshedJob.config_revision !== previous.configRevision) {
+    } else if (nextConfigRevision !== previous.configRevision) {
       dispatchCompare({
         type: 'job_execution_expired',
         jobId: previous.jobId,
@@ -65,22 +84,21 @@ export function useWorkspaceJobState({
     }
   }, [dispatchCompare]);
 
+  const reconcileWorkspaceJob = useCallback((previous: JobIdentitySnapshot, refreshedJob: JobDto | null) => {
+    expireJobExecutionIfIdentityChanged(
+      previous,
+      refreshedJob?.job_id ?? null,
+      refreshedJob?.config_revision ?? null,
+    );
+  }, [expireJobExecutionIfIdentityChanged]);
+
   const reconcileSavedWorkspaceJob = useCallback((
     saved: JobSaveDto,
     previous: JobIdentitySnapshot | null,
   ) => {
     if (!previous || saved.effect === 'created' || saved.effect === 'no_op') return;
-    if (saved.job_id !== previous.jobId) {
-      dispatchCompare({ type: 'job_execution_expired', jobId: previous.jobId, reason: 'job_deleted' });
-    } else if (saved.config_revision !== previous.configRevision) {
-      dispatchCompare({
-        type: 'job_execution_expired',
-        jobId: previous.jobId,
-        configRevision: previous.configRevision,
-        reason: 'job_changed',
-      });
-    }
-  }, [dispatchCompare]);
+    expireJobExecutionIfIdentityChanged(previous, saved.job_id, saved.config_revision);
+  }, [expireJobExecutionIfIdentityChanged]);
 
   const refreshLatestRunSummaries = useCallback(() => {
     const ticket = latestRunSummaryFence.current.start('latest-run-summaries');
@@ -101,7 +119,6 @@ export function useWorkspaceJobState({
   }, [setStatus]);
 
   const describeMutationFailure = useCallback(async (
-    _name: string,
     action: string,
     error: unknown,
   ): Promise<string> => {
@@ -110,6 +127,15 @@ export function useWorkspaceJobState({
       return `${action}: ${error} · refreshed the job registry; no unseen changes were overwritten`;
     } catch (refreshError) {
       return `${action}: ${error} · job-registry refresh failed: ${refreshError}`;
+    }
+  }, [refreshJobs]);
+
+  const refreshJobsForAnnouncement = useCallback(async (): Promise<JobListRefreshOutcome> => {
+    try {
+      await refreshJobs();
+      return { suffix: '', failed: false };
+    } catch (error) {
+      return { suffix: ` · job-list refresh failed: ${error}`, failed: true };
     }
   }, [refreshJobs]);
 
@@ -144,6 +170,7 @@ export function useWorkspaceJobState({
     pushHistory,
     reconcileSavedWorkspaceJob,
     reconcileWorkspaceJob,
+    refreshJobsForAnnouncement,
     refreshLatestRunSummaries,
     setJobConfiguration,
   };

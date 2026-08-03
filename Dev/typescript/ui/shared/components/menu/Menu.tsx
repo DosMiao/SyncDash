@@ -9,7 +9,7 @@ import {
 } from 'react';
 import { Check } from 'lucide-react';
 import { InteractionLayerScope, useInteractionLayer } from '#ui/shared/interaction/useInteractionLayer.tsx';
-import { clampFloatingPanel } from '../floating/geometry.ts';
+import { useFloatingPosition } from '../floating/useFloatingPosition.ts';
 import { useOutsidePointerDismissal } from './menuInteraction.ts';
 
 interface MenuContextValue { close: () => void }
@@ -70,33 +70,25 @@ export function Menu({ trigger, children, disabled, title, align = 'start', clas
     },
   });
 
-  useLayoutEffect(() => {
-    const anchorElement = anchor.current;
-    const panelElement = panel.current;
-    if (!open || !anchorElement || !panelElement) return;
-    const updatePosition = () => {
+  // The anchor is re-measured on every reposition rather than captured once: a scroll or a resize
+  // moves the trigger, and the panel has to stay attached to it.
+  useFloatingPosition(
+    panel,
+    (panelElement) => {
+      const anchorElement = anchor.current;
+      if (!anchorElement) return null;
       const rect = anchorElement.getBoundingClientRect();
       const width = panelElement.offsetWidth || 200;
       const height = panelElement.offsetHeight || 200;
-      const position = clampFloatingPanel(
-        align === 'end' ? rect.right - width : rect.left,
-        rect.bottom + 4,
+      return {
+        left: align === 'end' ? rect.right - width : rect.left,
+        top: rect.bottom + 4,
         width,
         height,
-      );
-      panelElement.style.setProperty('--floating-panel-top', `${position.top}px`);
-      panelElement.style.setProperty('--floating-panel-left', `${position.left}px`);
-    };
-    updatePosition();
-    window.addEventListener('resize', updatePosition);
-    document.addEventListener('scroll', updatePosition, true);
-    return () => {
-      window.removeEventListener('resize', updatePosition);
-      document.removeEventListener('scroll', updatePosition, true);
-      panelElement.style.removeProperty('--floating-panel-top');
-      panelElement.style.removeProperty('--floating-panel-left');
-    };
-  }, [open, align]);
+      };
+    },
+    { enabled: open, repositionOnScroll: true, deps: [open, align] },
+  );
 
   useOutsidePointerDismissal(open, () => setOpen(false), [panel, anchor]);
 

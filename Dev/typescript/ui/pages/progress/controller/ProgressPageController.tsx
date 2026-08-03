@@ -1,13 +1,13 @@
 import { useCallback } from 'react';
 import { ProgressPageView } from '../components/ProgressPageView.tsx';
 import { deriveProgressPresentation } from '../model/progressPresentation.ts';
-import { useProgressRunControls } from '../runtime/controls/useProgressRunControls.ts';
-import { useProgressErrorState } from '../runtime/errors/useProgressErrorState.ts';
-import { useProgressRunEvents } from '../runtime/events/useProgressRunEvents.ts';
-import { useProgressLaunchLifecycle } from '../runtime/launch/useProgressLaunchLifecycle.ts';
-import { useProgressPowerActions } from '../runtime/power/useProgressPowerActions.ts';
-import { useProgressPreferences } from '../runtime/preferences/useProgressPreferences.ts';
-import { useProgressRunSession } from '../runtime/session/useProgressRunSession.ts';
+import { useProgressRunControls } from '../runtime/useProgressRunControls.ts';
+import { useProgressErrorState } from '../runtime/useProgressErrorState.ts';
+import { useProgressRunEvents } from '../runtime/useProgressRunEvents.ts';
+import { useProgressLaunchLifecycle } from '../runtime/useProgressLaunchLifecycle.ts';
+import { useProgressPowerActions } from '../runtime/useProgressPowerActions.ts';
+import { useProgressPreferences } from '../runtime/useProgressPreferences.ts';
+import { useProgressRunSession } from '../runtime/useProgressRunSession.ts';
 import { useProgressWindowDestruction } from '../runtime/window/useProgressWindowDestruction.ts';
 import {
   useProgressWindowChrome,

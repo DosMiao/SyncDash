@@ -12,7 +12,7 @@ const STICKY_H = 30;
 /// enough). Released as soon as it does land, so this is not a delay in the normal case.
 const SMOOTH_SCROLL_HOLD_MS = 600;
 
-export interface ScrollSpy {
+interface ScrollSpy {
   /// The section in view, or the target while smooth scrolling is in progress.
   active: string;
   /// Callback ref for a section element. Stable per ID: an inline callback would be a new

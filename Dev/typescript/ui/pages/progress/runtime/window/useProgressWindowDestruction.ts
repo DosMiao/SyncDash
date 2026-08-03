@@ -1,5 +1,5 @@
 import { useCallback, useRef } from 'react';
-import { progressPlatformActions } from '../actions/progressPlatformActions.ts';
+import { progressPlatformActions } from '../progressPlatformActions.ts';
 
 /** Fences irreversible progress-window destruction behind one in-flight request. */
 export function useProgressWindowDestruction(

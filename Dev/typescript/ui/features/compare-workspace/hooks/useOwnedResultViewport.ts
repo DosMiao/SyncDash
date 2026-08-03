@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef } from 'react';
 
-export interface OwnedResultViewport {
+interface OwnedResultViewport {
   scrollTop: number;
   scrollLeft: number;
 }

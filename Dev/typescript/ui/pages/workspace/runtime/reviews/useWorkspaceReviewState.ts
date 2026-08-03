@@ -1,14 +1,10 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import {
-  EMPTY_APPROVAL_CHOICES,
   INITIAL_OPERATION_REVIEW,
   operationReviewReducer,
 } from '#core/application/operations/operationReview.ts';
-import type {
-  ApprovalChoices,
-  ReviewRequestFence,
-} from '#core/application/operations/operationReview.ts';
+import type { ReviewRequestFence } from '#core/application/operations/operationReview.ts';
 import { useOperationReviewExpiry } from '#ui/features/operation-review/hooks/useOperationReviewExpiry.ts';
 import type { StatusApi } from '#ui/shared/status/useStatus.ts';
 import type { ContextMenuState } from '../../model/workspacePageModel.ts';
@@ -31,14 +27,12 @@ export function useWorkspaceReviewState({
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [confirmReviewKey, setConfirmReviewKey] = useState<string | null>(null);
   const [applyReview, dispatchApplyReview] = useReducer(operationReviewReducer, INITIAL_OPERATION_REVIEW);
-  const [applyChoices, setApplyChoices] = useState<ApprovalChoices>(EMPTY_APPROVAL_CHOICES);
   const applyReviewRequestId = useRef(0);
   const applyReviewRequest = useRef<ReviewRequestFence | null>(null);
   const applyExecutionRequest = useRef<ReviewRequestFence | null>(null);
   const confirmReviewKeyRef = useRef<string | null>(null);
 
   const [compareReview, dispatchCompareReview] = useReducer(operationReviewReducer, INITIAL_OPERATION_REVIEW);
-  const [compareChoices, setCompareChoices] = useState<ApprovalChoices>(EMPTY_APPROVAL_CHOICES);
   const compareReviewRequestId = useRef(0);
   const compareReviewRequest = useRef<ReviewRequestFence | null>(null);
   const compareReviewFetchRequest = useRef<ReviewRequestFence | null>(null);
@@ -50,7 +44,6 @@ export function useWorkspaceReviewState({
   const resetConfirmation = useCallback(() => {
     applyReviewRequest.current = null;
     confirmReviewKeyRef.current = null;
-    setApplyChoices(EMPTY_APPROVAL_CHOICES);
     setConfirmOpen(false);
     setConfirmReviewKey(null);
     dispatchApplyReview({ type: 'reset' });
@@ -60,7 +53,6 @@ export function useWorkspaceReviewState({
     compareReviewRequest.current = null;
     compareReviewFetchRequest.current = null;
     compareApprovalRequest.current = null;
-    setCompareChoices(EMPTY_APPROVAL_CHOICES);
     dispatchCompareReview({ type: 'reset' });
   }, []);
 
@@ -85,13 +77,11 @@ export function useWorkspaceReviewState({
   }, [reviewEditable, setContextMenu]);
 
   return {
-    applyChoices,
     applyExecutionRequest,
     applyReview,
     applyReviewRequest,
     applyReviewRequestId,
     compareApprovalRequest,
-    compareChoices,
     compareReview,
     compareReviewFetchRequest,
     compareReviewRequest,
@@ -103,8 +93,6 @@ export function useWorkspaceReviewState({
     dispatchCompareReview,
     resetCompareReview,
     resetConfirmation,
-    setApplyChoices,
-    setCompareChoices,
     setConfirmOpen,
     setConfirmReviewKey,
   };

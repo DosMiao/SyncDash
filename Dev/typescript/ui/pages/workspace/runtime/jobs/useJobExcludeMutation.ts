@@ -6,12 +6,13 @@ import { addExcludeEntries } from '#core/domain/jobs/junk.ts';
 import type { JobDto } from '#core/types/generated/JobDto.ts';
 import type { StatusApi } from '#ui/shared/status/useStatus.ts';
 import { statusDeliveryWarning, type JobIdentitySnapshot } from '../../model/workspacePageModel.ts';
+import type { JobListRefreshOutcome } from './useWorkspaceJobState.ts';
 
 interface JobExcludeMutationOptions {
   selectedJob: JobDto | null;
-  describeMutationFailure: (name: string, action: string, error: unknown) => Promise<string>;
+  describeMutationFailure: (action: string, error: unknown) => Promise<string>;
   reconcileSavedWorkspaceJob: (saved: JobSaveDto, previous: JobIdentitySnapshot | null) => void;
-  refreshJobs: () => Promise<JobDto[]>;
+  refreshJobsForAnnouncement: () => Promise<JobListRefreshOutcome>;
   resetSafetyUi: () => void;
   setStatus: StatusApi['setMessage'];
   offerStatusAction: StatusApi['offerAction'];
@@ -21,7 +22,7 @@ export function useJobExcludeMutation({
   selectedJob,
   describeMutationFailure,
   reconcileSavedWorkspaceJob,
-  refreshJobs,
+  refreshJobsForAnnouncement,
   resetSafetyUi,
   setStatus,
   offerStatusAction,
@@ -34,7 +35,6 @@ export function useJobExcludeMutation({
       detail = await jobsIpc.getJob(name);
     } catch (error) {
       setStatus(await describeMutationFailure(
-        name,
         'Failed to read the job before adding the exclude',
         error,
       ), 'err');
@@ -56,7 +56,7 @@ export function useJobExcludeMutation({
         expectedRevision: detail.config_revision,
       });
     } catch (error) {
-      setStatus(await describeMutationFailure(name, 'Failed to write exclude', error), 'err');
+      setStatus(await describeMutationFailure('Failed to write exclude', error), 'err');
       return;
     }
     reconcileSavedWorkspaceJob(
@@ -77,31 +77,31 @@ export function useJobExcludeMutation({
           { jobId: saved.job_id, name: saved.name, configRevision: saved.config_revision },
         );
       } catch (error) {
-        throw new Error(await describeMutationFailure(saved.name, 'Could not undo the exclude', error));
+        throw new Error(await describeMutationFailure('Could not undo the exclude', error));
       }
       resetSafetyUi();
-      const warning = statusDeliveryWarning(restored);
-      try {
-        await refreshJobs();
-        setStatus(`Exclude undone${warning}`, warning ? 'err' : '');
-      } catch (error) {
-        setStatus(`Exclude undone${warning} · job-list refresh failed: ${error}`, 'err');
-      }
+      const undoneWarning = statusDeliveryWarning(restored);
+      const undoneRefresh = await refreshJobsForAnnouncement();
+      setStatus(
+        `Exclude undone${undoneWarning}${undoneRefresh.suffix}`,
+        undoneWarning || undoneRefresh.failed ? 'err' : '',
+      );
     };
 
     const warning = statusDeliveryWarning(saved);
     const success = `${label}: ${addedMasks.join(', ')} — Compare again to build a result with this exclusion${warning}`;
-    try {
-      await refreshJobs();
-      offerStatusAction(success, 'Undo exclude', undo, warning ? 'err' : '');
-    } catch (error) {
-      offerStatusAction(`${success} · job-list refresh failed: ${error}`, 'Undo exclude', undo, 'err');
-    }
+    const refresh = await refreshJobsForAnnouncement();
+    offerStatusAction(
+      `${success}${refresh.suffix}`,
+      'Undo exclude',
+      undo,
+      warning || refresh.failed ? 'err' : '',
+    );
   }, [
     describeMutationFailure,
     offerStatusAction,
     reconcileSavedWorkspaceJob,
-    refreshJobs,
+    refreshJobsForAnnouncement,
     resetSafetyUi,
     selectedJob,
     setStatus,

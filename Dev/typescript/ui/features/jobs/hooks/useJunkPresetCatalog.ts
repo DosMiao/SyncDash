@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { junkPresets } from '#core/infrastructure/tauri/commands/paths.ts';
 import type { JunkPresetDto } from '#core/types/generated/JunkPresetDto.ts';
 
-export type JunkPresetCatalog =
+type JunkPresetCatalog =
   | { status: 'loading'; presets: JunkPresetDto[] }
   | { status: 'ready'; presets: JunkPresetDto[] }
   | { status: 'failed'; presets: JunkPresetDto[]; error: string };

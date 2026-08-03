@@ -9,7 +9,7 @@ import {
 } from '#core/application/jobs/jobRegistry.ts';
 import { SerialRequestQueue } from '#core/application/coordination/serialRequestQueue.ts';
 
-export interface JobRegistryController {
+interface JobRegistryController {
   jobs: JobDto[];
   selectedJob: JobDto | null;
   refresh: () => Promise<JobDto[]>;

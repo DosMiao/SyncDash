@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, type ComponentPropsWithoutRef, type ReactNode } from 'react';
 import { ChevronDown, ChevronUp } from 'lucide-react';
-import { formatFileTimestamp, humanSize } from '#core/shared/format.ts';
+import { formatCount, formatFileTimestamp, humanSize } from '#core/shared/format.ts';
+import { useCssVariables } from '#ui/shared/hooks/useCssVariables.ts';
 import type { Sort, SortKey } from '#core/domain/compare/plan.ts';
 import type { SideMeta } from '#core/types/generated/SideMeta.ts';
 import {
@@ -72,7 +73,7 @@ export function IndeterminateCheckbox(props: {
 export interface TableCell { className?: string; title?: string; children?: ReactNode }
 
 export const formatMetadataTitle = (metadata: SideMeta) => (
-  `${metadata.size.toLocaleString()} bytes\n${new Date(metadata.mtime_ms).toLocaleString()}`
+  `${formatCount(metadata.size)} bytes\n${new Date(metadata.mtime_ms).toLocaleString()}`
 );
 
 const ABSENT_METADATA_CELL: TableCell = { className: 'mono dim', children: '—' };
@@ -98,16 +99,11 @@ export function buildTimestampCell(metadata: SideMeta | null, highlighted: boole
 function PlanTableColumn(props: { widthPixels: number | null }) {
   const { widthPixels } = props;
   const columnRef = useRef<HTMLTableColElement>(null);
-  useLayoutEffect(() => {
-    const column = columnRef.current;
-    if (!column) return;
-    if (widthPixels === null) {
-      column.style.removeProperty('--plan-table-column-width');
-    } else {
-      column.style.setProperty('--plan-table-column-width', `${widthPixels}px`);
-    }
-    return () => { column.style.removeProperty('--plan-table-column-width'); };
-  }, [widthPixels]);
+  useCssVariables(
+    columnRef,
+    { '--plan-table-column-width': widthPixels === null ? null : `${widthPixels}px` },
+    [widthPixels],
+  );
   return <col ref={columnRef} className="plan-table-column" />;
 }
 
@@ -135,15 +131,10 @@ type TreeDepthTableRowProps = Omit<ComponentPropsWithoutRef<'tr'>, 'style'> & {
 export function TreeDepthTableRow(props: TreeDepthTableRowProps) {
   const { treeDepth, ...rowProps } = props;
   const tableRowRef = useRef<HTMLTableRowElement>(null);
-  useLayoutEffect(() => {
-    const tableRow = tableRowRef.current;
-    if (!tableRow) return;
-    if (treeDepth === undefined) {
-      tableRow.style.removeProperty('--tree-depth');
-    } else {
-      tableRow.style.setProperty('--tree-depth', String(treeDepth));
-    }
-    return () => { tableRow.style.removeProperty('--tree-depth'); };
-  }, [treeDepth]);
+  useCssVariables(
+    tableRowRef,
+    { '--tree-depth': treeDepth === undefined ? null : String(treeDepth) },
+    [treeDepth],
+  );
   return <tr ref={tableRowRef} {...rowProps} />;
 }

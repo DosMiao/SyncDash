@@ -4,6 +4,7 @@ import {
   newRunState,
 } from '#core/application/progress/runstate.ts';
 import type { RunState } from '#core/application/progress/runstate.ts';
+import { humanByteRate } from '#core/shared/format.ts';
 
 /** Owns the mutable run snapshot and the deliberately throttled render clock. */
 export function useProgressRunSession() {
@@ -20,7 +21,7 @@ export function useProgressRunSession() {
 
   const formatByteRate = useCallback((runState: RunState) => {
     const rate = calculateWindowRate(runState, 4000);
-    return rate ? `${(rate.bytesPerSecond / (1 << 20)).toFixed(2)} MiB/s` : '';
+    return rate ? humanByteRate(rate.bytesPerSecond) : '';
   }, []);
   const formatItemRate = useCallback((runState: RunState) => {
     const rate = calculateWindowRate(runState, 4000);

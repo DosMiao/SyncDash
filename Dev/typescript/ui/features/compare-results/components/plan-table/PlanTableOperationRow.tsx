@@ -122,6 +122,15 @@ export function PlanTableOperationRow(props: PlanTableOperationRowProps) {
     };
   };
 
+  // Fixed glyph slots keep action labels horizontally aligned.
+  const actionGlyphs = (
+    <>
+      <span className="plan-row-action-direction" aria-hidden="true">{actionPresentation.direction ? DIRECTION_ICON[actionPresentation.direction] : null}</span>
+      <span className="plan-row-action-result" aria-hidden="true">{RESULT_TYPE_ICON[actionPresentation.resultType]}</span>
+      <span className="plan-row-action-label">{actionPresentation.label}</span>
+    </>
+  );
+
   const cellsByColumn: Record<ColumnId, TableCell> = {
     synchronize: {
       children: (
@@ -172,16 +181,11 @@ export function PlanTableOperationRow(props: PlanTableOperationRowProps) {
           tabIndex={isActiveRow ? 0 : -1}
           onClick={() => onToggleRowDirection(index)}
         >
-          {/* Fixed glyph slots keep action labels horizontally aligned. */}
-          <span className="plan-row-action-direction" aria-hidden="true">{actionPresentation.direction ? DIRECTION_ICON[actionPresentation.direction] : null}</span>
-          <span className="plan-row-action-result" aria-hidden="true">{RESULT_TYPE_ICON[actionPresentation.resultType]}</span>
-          <span className="plan-row-action-label">{actionPresentation.label}</span>
+          {actionGlyphs}
         </button>
         ) : (
           <span className={`plan-row-action result-type-${actionPresentation.resultType}`}>
-            <span className="plan-row-action-direction" aria-hidden="true">{actionPresentation.direction ? DIRECTION_ICON[actionPresentation.direction] : null}</span>
-            <span className="plan-row-action-result" aria-hidden="true">{RESULT_TYPE_ICON[actionPresentation.resultType]}</span>
-            <span className="plan-row-action-label">{actionPresentation.label}</span>
+            {actionGlyphs}
           </span>
         )
       ),

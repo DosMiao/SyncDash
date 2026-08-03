@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
-import { clampFloatingPanel } from '#ui/shared/components/floating/geometry.ts';
+import { useFloatingPosition } from '#ui/shared/components/floating/useFloatingPosition.ts';
+import { useRestorePreviousFocus } from '#ui/shared/hooks/useRestorePreviousFocus.ts';
 import { useInteractionLayer } from '#ui/shared/interaction/useInteractionLayer.tsx';
 import {
   advancedFiltersEqual,
@@ -37,17 +38,12 @@ export function AdvancedFiltersPopover(props: AdvancedFiltersPopoverProps) {
     onDismiss,
   } = props;
   const popoverRef = useRef<HTMLDivElement>(null);
-  const previousFocus = useRef(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  const restorePreviousFocus = useRestorePreviousFocus();
   const [draft, setDraft] = useState(() => createAdvancedFilterDraft(appliedFilter));
   const validationMessageId = useId();
   const appliedScopeStatusId = useId();
   const latestOnDismiss = useRef(onDismiss);
   latestOnDismiss.current = onDismiss;
-
-  const restorePreviousFocus = useCallback(() => {
-    const previous = previousFocus.current;
-    if (previous?.isConnected) requestAnimationFrame(() => previous.focus());
-  }, []);
 
   const dismiss = useCallback((restoreFocus: boolean) => {
     latestOnDismiss.current();
@@ -61,33 +57,18 @@ export function AdvancedFiltersPopover(props: AdvancedFiltersPopoverProps) {
   });
 
   // Both axes are clamped because opening this tall panel near the bottom of a short window would
-  // otherwise leave its action buttons unreachable.
-  useLayoutEffect(() => {
-    const element = popoverRef.current;
-    if (!element) return;
-    const updatePosition = () => {
-    const position = clampFloatingPanel(
-        anchor.left,
-        anchor.bottom + 4,
-        element.offsetWidth || 400,
-        element.offsetHeight || 380,
-      );
-      element.style.setProperty('--advanced-filters-left', `${position.left}px`);
-      element.style.setProperty('--advanced-filters-top', `${position.top}px`);
-    };
-    updatePosition();
-    window.addEventListener('resize', updatePosition);
-    document.addEventListener('scroll', updatePosition, true);
-    const resizeObserver = new ResizeObserver(updatePosition);
-    resizeObserver.observe(element);
-    return () => {
-      resizeObserver.disconnect();
-      window.removeEventListener('resize', updatePosition);
-      document.removeEventListener('scroll', updatePosition, true);
-      element.style.removeProperty('--advanced-filters-left');
-      element.style.removeProperty('--advanced-filters-top');
-    };
-  }, [anchor]);
+  // otherwise leave its action buttons unreachable, and validation messages change its height while
+  // it is open — hence `observeSelf`.
+  useFloatingPosition(
+    popoverRef,
+    (element) => ({
+      left: anchor.left,
+      top: anchor.bottom + 4,
+      width: element.offsetWidth || 400,
+      height: element.offsetHeight || 380,
+    }),
+    { repositionOnScroll: true, observeSelf: true, deps: [anchor] },
+  );
 
   useLayoutEffect(() => {
     popoverRef.current?.querySelector<HTMLElement>('textarea, input, button')?.focus();

@@ -3,7 +3,7 @@ import type { CompareWorkspaceRepository } from '#core/application/compare-works
 import type { CompareWorkspaceAction } from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
 import type { ApplyReviewTotals } from '#ui/features/apply-review/model/applyReviewTotals.ts';
 import type { StatusApi } from '#ui/shared/status/useStatus.ts';
-import type { JobEditorProps } from '#ui/features/jobs/controllers/job-editor/JobEditorController.tsx';
+import type { JobEditorProps } from '#ui/features/jobs/controllers/JobEditorController.tsx';
 import type { SettingsSheetProps } from '#ui/features/settings/controllers/SettingsSheetController.tsx';
 import type { useApplyExecutionController } from '../../runtime/apply/useApplyExecutionController.ts';
 import type { useCompareExecutionController } from '../../runtime/compare/useCompareExecutionController.ts';
@@ -84,7 +84,7 @@ export function createWorkspaceOverlayPresentation({
     candidateDialog: candidateAdoption ? {
       title: 'Review the newer AutoScan result?',
       message: 'The newer exact result will replace this active review workspace. Your current row decisions, filters, folds, and scroll position do not carry into different filesystem evidence.',
-      actions: [{
+      action: {
         label: 'Review New Result',
         onConfirm: () => {
           const scope = repository.scopes.find((entry) => entry.key === candidateAdoption.scopeKey);
@@ -101,7 +101,7 @@ export function createWorkspaceOverlayPresentation({
           panels.setCandidateAdoption(null);
           resetSafetyUi();
         },
-      }],
+      },
       onCancel: () => panels.setCandidateAdoption(null),
     } : null,
     rootSwapDialog: askSwap ? {
@@ -112,15 +112,13 @@ export function createWorkspaceOverlayPresentation({
           ? 'In mirror mode this reverses which side is authoritative: after the swap, the original target wins.\n\n'
           : '')
         + 'The job file is rewritten atomically. Existing Compare evidence remains viewable, but cannot be applied after the configuration changes. The status bar keeps an undo.',
-      actions: [{ label: 'Swap them', onConfirm: () => { void rootMutations.doSwap(askSwap); } }],
+      action: { label: 'Swap them', onConfirm: () => { void rootMutations.doSwap(askSwap); } },
       onCancel: () => panels.setAskSwap(null),
     } : null,
     applyReview: reviews.confirmOpen && session.selectedJob && confirmTotals ? {
       job: session.selectedJob,
       totals: confirmTotals,
       reviewState: reviews.applyReview,
-      choices: reviews.applyChoices,
-      onChoices: reviews.setApplyChoices,
       onCancel: reviews.resetConfirmation,
       onConfirm: () => { void apply.doSync(); },
       onReviewAgain: () => {
@@ -131,10 +129,7 @@ export function createWorkspaceOverlayPresentation({
     compareReview: reviews.compareReview.phase !== 'idle'
       && reviews.compareReview.phase !== 'authorized' ? {
         state: reviews.compareReview,
-        choices: reviews.compareChoices,
-        onChoices: reviews.setCompareChoices,
         onCancel: reviews.resetCompareReview,
-        onApprove: () => { void compare.approveCompareReview(); },
         onReviewAgain: () => {
           reviews.resetCompareReview();
           void compare.doCompare();

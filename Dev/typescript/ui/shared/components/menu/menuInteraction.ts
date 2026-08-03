@@ -1,5 +1,5 @@
 import { useEffect, useRef, type KeyboardEvent as ReactKeyboardEvent, type RefObject } from 'react';
-import { menuFocusIndex, type MenuNavigationKey } from '../a11y.ts';
+import { rovingFocusIndex, type RovingFocusKey } from '../a11y.ts';
 
 export function directMenuItems(panel: HTMLElement): HTMLElement[] {
   return [...panel.querySelectorAll<HTMLElement>(
@@ -14,11 +14,13 @@ export function moveMenuFocus(
   event: ReactKeyboardEvent<HTMLElement>,
   panel: HTMLElement,
 ): boolean {
+  // Vertical only: ArrowLeft/ArrowRight stay free for submenu traversal even though the shared
+  // index helper understands them.
   if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return false;
   const menuItems = directMenuItems(panel);
   const currentIndex = menuItems.indexOf(document.activeElement as HTMLElement);
-  const nextIndex = menuFocusIndex(
-    event.key as MenuNavigationKey,
+  const nextIndex = rovingFocusIndex(
+    event.key as RovingFocusKey,
     currentIndex,
     menuItems.length,
   );
@@ -47,6 +49,5 @@ export function useOutsidePointerDismissal(
     return () => document.removeEventListener('mousedown', handleMouseDown);
     // `inside` is a fresh array literal each render; the refs inside it are stable, which is what
     // actually matters, so it is deliberately not a dependency.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 }

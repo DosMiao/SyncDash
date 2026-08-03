@@ -5,8 +5,8 @@ import {
 } from '#core/domain/jobs/formSchema.ts';
 import { defaultJob, deleteJob, getJob, jobFileSchema, saveJob } from '#core/infrastructure/tauri/commands/jobs.ts';
 import { pickDirectory, pickSavePath } from '#core/infrastructure/tauri/dialogs.ts';
-import { useJunkPresetCatalog } from '../../hooks/useJunkPresetCatalog.ts';
-import { JobEditorView } from '../../components/job-editor/JobEditorView.tsx';
+import { useJunkPresetCatalog } from '../hooks/useJunkPresetCatalog.ts';
+import { JobEditorView } from '../components/JobEditorView.tsx';
 import { useScrollSpy } from '#ui/shared/hooks/useScrollSpy.ts';
 import type { JobDeleteDto } from '#core/types/generated/JobDeleteDto.ts';
 import type { Job as JobFull } from '#core/types/generated/Job.ts';
@@ -14,13 +14,14 @@ import type { JobSaveDto } from '#core/types/generated/JobSaveDto.ts';
 import type { StatusAppearance } from '#ui/shared/status/useStatus.ts';
 import {
   JOB_FORM_GROUPS,
+  registeredIdentity,
   sameFormValues,
   type JobEditorApi,
   type JobEditorIdentity,
   type LoadedJobForm,
   type MutationKind,
   type SaveError,
-} from '../../model/job-editor/jobEditorModel.ts';
+} from '../model/jobEditorModel.ts';
 
 export interface JobEditorProps {
   name: string | null;
@@ -274,6 +275,25 @@ export function JobEditorController(props: JobEditorProps) {
     onCloseRef.current();
   };
 
+  // A failed mutation reports the same three things either way: what failed, whether the registry
+  // refresh that follows it succeeded, and what the failure left untouched.
+  const describeMutationConflict = async (
+    verb: string,
+    reassurance: string,
+    name: string,
+    identity: JobEditorIdentity | null,
+    error: unknown,
+  ): Promise<string> => {
+    let message = `${verb} failed: ${error}`;
+    try {
+      await onMutationConflict(name, identity);
+      message += ` · refreshed the job registry; ${reassurance}`;
+    } catch (refreshError) {
+      message += ` · job-registry refresh failed: ${refreshError}`;
+    }
+    return message;
+  };
+
   const saveCurrentJob = async () => {
     if (!loadedForm || busy || mutationInFlight.current) return;
     const conversion = formToJob(loadedForm.values, loadedForm.base);
@@ -298,45 +318,29 @@ export function JobEditorController(props: JobEditorProps) {
     }
     if (!beginMutation('save')) return;
     setSaveError(null);
+    const identity = registeredIdentity(loadedForm);
     try {
-      if (loadedForm.originalName && (!loadedForm.jobId || !loadedForm.configRevision)) {
+      // A job that was loaded under a name but carries no identity is corrupt evidence, not a new
+      // draft: saving it would overwrite a registered file without a revision fence.
+      if (loadedForm.originalName && identity === null) {
         throw new Error('The loaded job is missing registry identity or revision; close and reopen the editor');
       }
-      const existing = loadedForm.originalName && loadedForm.jobId && loadedForm.configRevision
-        ? { originalName: loadedForm.originalName, expectedRevision: loadedForm.configRevision }
+      const existing = identity
+        ? { originalName: identity.name, expectedRevision: identity.configRevision }
         : undefined;
       const saved = await saveJob(conversion.name, conversion.job, existing);
       if (!mounted.current) return;
       const persistedJob = { ...conversion.job, job_id: saved.job_id };
-      onSaved(
-        saved,
-        persistedJob,
-        loadedForm.originalName && loadedForm.jobId && loadedForm.configRevision
-          ? {
-              jobId: loadedForm.jobId,
-              name: loadedForm.originalName,
-              configRevision: loadedForm.configRevision,
-            }
-          : null,
-      );
+      onSaved(saved, persistedJob, identity);
     } catch (error) {
       if (!mounted.current) return;
-      let message = `Save failed: ${error}`;
-      try {
-        await onMutationConflict(
-          loadedForm.originalName ?? conversion.name,
-          loadedForm.originalName && loadedForm.jobId && loadedForm.configRevision
-            ? {
-                jobId: loadedForm.jobId,
-                name: loadedForm.originalName,
-                configRevision: loadedForm.configRevision,
-              }
-            : null,
-        );
-        message += ' · refreshed the job registry; the editor kept your draft and did not overwrite any file';
-      } catch (refreshError) {
-        message += ` · job-registry refresh failed: ${refreshError}`;
-      }
+      const message = await describeMutationConflict(
+        'Save',
+        'the editor kept your draft and did not overwrite any file',
+        loadedForm.originalName ?? conversion.name,
+        identity,
+        error,
+      );
       if (!mounted.current) return;
       setSaveError({ message });
       onStatusRef.current(message, 'err');
@@ -346,25 +350,23 @@ export function JobEditorController(props: JobEditorProps) {
   };
 
   const deleteCurrentJob = async () => {
-    if (!loadedForm?.originalName || !loadedForm.jobId || !loadedForm.configRevision || busy || mutationInFlight.current) return;
+    if (!loadedForm) return;
+    const identity = registeredIdentity(loadedForm);
+    if (identity === null || busy || mutationInFlight.current) return;
     if (!beginMutation('delete')) return;
     try {
-      const deleted = await deleteJob(loadedForm.originalName, loadedForm.jobId, loadedForm.configRevision);
+      const deleted = await deleteJob(identity.name, identity.jobId, identity.configRevision);
       if (!mounted.current) return;
       onDeleted(deleted);
     } catch (error) {
       if (!mounted.current) return;
-      let message = `Delete failed: ${error}`;
-      try {
-        await onMutationConflict(loadedForm.originalName, {
-          jobId: loadedForm.jobId,
-          name: loadedForm.originalName,
-          configRevision: loadedForm.configRevision,
-        });
-        message += ' · refreshed the job registry; no job file was deleted';
-      } catch (refreshError) {
-        message += ` · job-registry refresh failed: ${refreshError}`;
-      }
+      const message = await describeMutationConflict(
+        'Delete',
+        'no job file was deleted',
+        identity.name,
+        identity,
+        error,
+      );
       if (mounted.current) onStatusRef.current(message, 'err');
     } finally {
       finishMutation();

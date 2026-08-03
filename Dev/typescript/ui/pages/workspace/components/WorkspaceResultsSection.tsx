@@ -1,5 +1,6 @@
 import type { ComponentProps } from 'react';
 import { CircleCheck, FolderSearch } from 'lucide-react';
+import type { CompareResultView } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import type { PlanDto } from '#core/domain/compare/plan.ts';
 import { ComparePanel } from '#ui/features/compare-run/components/ComparePanel.tsx';
 import { IdenticalResultsPanel } from '#ui/features/compare-results/components/IdenticalResultsPanel.tsx';
@@ -11,7 +12,7 @@ import { Placeholder } from '#ui/shared/components/feedback/Placeholder.tsx';
 interface WorkspaceResultsSectionProps {
   plan: PlanDto | null;
   selectedJobName: string | null;
-  resultView: 'differences' | 'identical';
+  resultView: CompareResultView;
   hasDifferences: boolean;
   compareActive: boolean;
   resultPanelId: string;

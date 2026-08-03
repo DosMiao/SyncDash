@@ -3,7 +3,6 @@ import {
   operationReviewCanSubmit,
   operationReviewExpired,
   operationReviewFailed,
-  type ApprovalChoices,
   type OperationReviewState,
 } from '#core/application/operations/operationReview.ts';
 import { OperationReviewDetails } from '#ui/features/operation-review/components/OperationReviewSheet.tsx';
@@ -20,15 +19,13 @@ interface ConfirmSheetProps {
   job: JobDto;
   totals: ApplyReviewTotals;
   reviewState: OperationReviewState;
-  choices: ApprovalChoices;
-  onChoices: (choices: ApprovalChoices) => void;
   onCancel: () => void;
   onConfirm: () => void;
   onReviewAgain: () => void;
 }
 
 export function ConfirmSheet(props: ConfirmSheetProps) {
-  const { job, totals, reviewState, choices, onChoices, onCancel, onConfirm, onReviewAgain } = props;
+  const { job, totals, reviewState, onCancel, onConfirm, onReviewAgain } = props;
   const blocked = reviewState.review?.status === 'blocked';
   // The same share the engine reports and the job's Gates chip advertises. It colors the row and
   // names the number; it never decides whether Apply may run.
@@ -42,7 +39,7 @@ export function ConfirmSheet(props: ConfirmSheetProps) {
     totals.targetEntries,
     job.max_delete_ratio,
   );
-  const canApply = operationReviewCanSubmit(reviewState, choices);
+  const canApply = operationReviewCanSubmit(reviewState);
   const actionLabel = reviewState.phase === 'reviewing'
     ? 'Reviewing…'
     : reviewState.phase === 'approving'

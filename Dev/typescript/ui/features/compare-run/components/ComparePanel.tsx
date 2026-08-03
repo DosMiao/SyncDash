@@ -1,12 +1,10 @@
-import { useId, useLayoutEffect, useRef } from 'react';
+import { useId, useRef } from 'react';
 import { Check, RefreshCw, Square, TriangleAlert, X } from 'lucide-react';
-import { humanSize } from '#core/shared/format.ts';
+import { humanByteRate, humanSize } from '#core/shared/format.ts';
+import { useCssVariables } from '#ui/shared/hooks/useCssVariables.ts';
+import { PHASE_LABELS } from '#core/application/progress/runstate.ts';
+import type { RunPhase } from '#core/application/progress/runstate.ts';
 import type { CompareStage } from '#core/domain/compare/compareProgress.ts';
-
-export const COMPARE_PHASE_LABELS: Record<string, string> = {
-  'scan-source': 'Scan source', 'scan-target': 'Scan target', 'compare': 'Compare',
-  'refresh': 'Refresh archive', 'archive': 'Save archive',
-};
 
 interface ComparePanelProps {
   stages: CompareStage[];
@@ -16,12 +14,7 @@ interface ComparePanelProps {
 
 function CompareProgressFill({ percent }: { percent: number }) {
   const fillRef = useRef<HTMLElement>(null);
-  useLayoutEffect(() => {
-    const fill = fillRef.current;
-    if (!fill) return;
-    fill.style.setProperty('--compare-progress-width', `${percent}%`);
-    return () => { fill.style.removeProperty('--compare-progress-width'); };
-  }, [percent]);
+  useCssVariables(fillRef, { '--compare-progress-width': `${percent}%` }, [percent]);
   return <i ref={fillRef} />;
 }
 
@@ -40,6 +33,7 @@ export function ComparePanel({ stages, cancelling, onCancel }: ComparePanelProps
           const percent = stage.done ? 100
             : Math.min(99, Math.max(0, rawPercent));
           const showPercent = stage.done || stage.bytesTotal > 0 || stage.itemsTotal > 0;
+          const phaseLabel = PHASE_LABELS[stage.phase as RunPhase] ?? stage.phase;
           return (
             <div
               key={stage.phase}
@@ -52,11 +46,11 @@ export function ComparePanel({ stages, cancelling, onCancel }: ComparePanelProps
                     : stage.done ? <Check size={13} />
                       : <RefreshCw size={13} className={stage.active ? 'spin' : ''} />}
               </span>
-              <span className="st-name">{COMPARE_PHASE_LABELS[stage.phase] ?? stage.phase}</span>
+              <span className="st-name">{phaseLabel}</span>
               <span
                 className="st-bar"
                 role="progressbar"
-                aria-label={`${COMPARE_PHASE_LABELS[stage.phase] ?? stage.phase} progress`}
+                aria-label={`${phaseLabel} progress`}
                 aria-valuemin={0}
                 aria-valuemax={100}
                 aria-valuenow={Math.floor(percent)}
@@ -70,7 +64,9 @@ export function ComparePanel({ stages, cancelling, onCancel }: ComparePanelProps
                   ? `${humanSize(stage.bytesDone) || '0 B'} / ${humanSize(stage.bytesTotal)}`
                   : stage.bytesDone ? humanSize(stage.bytesDone) : ''}
               </span>
-              <span className="st-rate">{stage.rate > 512 * 1024 ? `${(stage.rate / (1 << 20)).toFixed(1)} MiB/s` : ''}</span>
+              {/* A stage row is one line high and repaints twice a second; below half a MiB/s the
+                  reading is noise, so this row shows nothing rather than a flickering rate. */}
+              <span className="st-rate">{stage.rate > 512 * 1024 ? humanByteRate(stage.rate) : ''}</span>
               <span className="sr-only" role="status" aria-live="polite">
                 {stage.failed ? 'Failed' : stage.cancelled ? 'Cancelled' : stage.done ? 'Complete' : stage.active ? 'In progress' : 'Waiting'}
               </span>

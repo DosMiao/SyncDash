@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { readdir } from 'node:fs/promises';
 import { basename, join, relative } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-const repositoryRoot = fileURLToPath(new URL('../..', import.meta.url));
+import { directoriesUnder, filesUnder, repositoryRoot } from './tree.mts';
+
 const forbiddenBuckets = new Set([
   'common',
   'helper',
@@ -17,30 +17,16 @@ const forbiddenBuckets = new Set([
   'utilities',
 ]);
 
-async function directories(root: string): Promise<string[]> {
-  const entries = await readdir(root, { withFileTypes: true });
-  const children = entries.filter((entry) => entry.isDirectory()).map((entry) => join(root, entry.name));
-  const nested = await Promise.all(children.map(directories));
-  return [...children, ...nested.flat()];
-}
-
-async function files(root: string): Promise<string[]> {
-  const entries = await readdir(root, { withFileTypes: true });
-  const ownFiles = entries.filter((entry) => entry.isFile()).map((entry) => join(root, entry.name));
-  const nested = await Promise.all(entries
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => files(join(root, entry.name))));
-  return [...ownFiles, ...nested.flat()];
-}
-
 test('product source has no generic ownership names', async () => {
   const roots = [
     join(repositoryRoot, 'Dev/src'),
     join(repositoryRoot, 'Dev/src-tauri/src'),
     join(repositoryRoot, 'Dev/typescript'),
   ];
-  const productDirectories = (await Promise.all(roots.map(directories))).flat();
-  const productFiles = (await Promise.all(roots.map(files))).flat();
+  const productDirectories = (await Promise.all(roots.map(directoriesUnder))).flat();
+  const productFiles = (await Promise.all(
+    roots.map((root) => filesUnder(root, () => true)),
+  )).flat();
 
   for (const path of productDirectories) {
     const name = basename(path).toLowerCase();

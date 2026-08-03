@@ -8,6 +8,12 @@ import {
 } from '#core/application/progress/runstate.ts';
 import type { PowerAction } from '#core/application/progress/postRunActions.ts';
 
+// The run-control states the controls runtime owns and the view renders. They live beside the
+// presentation model rather than in runtime/ because a components/ file cannot import runtime/,
+// and both sides must name the same finite states.
+export type PausePending = 'pause' | 'resume' | null;
+export type StopState = 'idle' | 'stopping' | 'finished';
+
 export interface PowerActionFailure {
   action: PowerAction;
   runId: number;

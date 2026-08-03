@@ -1,6 +1,7 @@
 import { useId, useLayoutEffect, useRef, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { InteractionLayerScope, useInteractionLayer } from '#ui/shared/interaction/useInteractionLayer.tsx';
+import { useRestorePreviousFocus } from '#ui/shared/hooks/useRestorePreviousFocus.ts';
 
 const FOCUSABLE = [
   'button:not(:disabled)',
@@ -18,7 +19,7 @@ function focusableIn(panel: HTMLElement): HTMLElement[] {
 
 export function Sheet({ title, width = 'sm', children, footer, onClose }: {
   title: string;
-  width?: 'sm' | 'mid' | 'wide' | 'xl';
+  width?: 'sm' | 'mid' | 'xl';
   children: ReactNode;
   footer: ReactNode;
   onClose: () => void;
@@ -26,7 +27,7 @@ export function Sheet({ title, width = 'sm', children, footer, onClose }: {
   const labelId = useId();
   const scrim = useRef<HTMLDivElement>(null);
   const panel = useRef<HTMLDivElement>(null);
-  const previousFocus = useRef(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  const restorePreviousFocus = useRestorePreviousFocus();
   const { layerId, isTopLayer } = useInteractionLayer({
     kind: 'modal',
     rootRef: scrim,
@@ -44,10 +45,9 @@ export function Sheet({ title, width = 'sm', children, footer, onClose }: {
 
     return () => {
       cancelAnimationFrame(frame);
-      const previous = previousFocus.current;
-      if (previous?.isConnected) requestAnimationFrame(() => previous.focus());
+      restorePreviousFocus();
     };
-  }, [isTopLayer]);
+  }, [isTopLayer, restorePreviousFocus]);
 
   const dialog = (
     // Mousedown preserves a drag that starts inside the sheet and releases on the scrim.

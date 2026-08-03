@@ -22,7 +22,7 @@ interface PendingPlanRowFocus {
   logicalRowIndex: number;
 }
 
-export interface PlanTableFocusState {
+interface PlanTableFocusState {
   activePlanRow: ActivePlanRow | null;
   setActivePlanRow: Dispatch<SetStateAction<ActivePlanRow | null>>;
   pendingPlanRowFocus: { current: PendingPlanRowFocus | null };

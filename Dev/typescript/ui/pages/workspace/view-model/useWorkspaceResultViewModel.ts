@@ -1,5 +1,5 @@
 import { useCallback, useId, useMemo, useRef } from 'react';
-import type { Dispatch, SetStateAction } from 'react';
+import type { Dispatch } from 'react';
 import { deriveApplyAvailability } from '#core/application/apply/applyAvailability.ts';
 import { deriveWorkspaceExecutionAccess } from '#core/application/compare-workspace/compareWorkspaceExecution.ts';
 import {

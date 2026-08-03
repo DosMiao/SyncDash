@@ -1,4 +1,5 @@
-import { useLayoutEffect, useMemo } from 'react';
+import { useMemo } from 'react';
+import { useCssVariables } from '#ui/shared/hooks/useCssVariables.ts';
 import { useContainerWidth } from './useContainerWidth.ts';
 import { useVirtualRows } from './useVirtualRows.ts';
 import {
@@ -62,23 +63,20 @@ export function usePlanTableCanvas(props: UsePlanTableCanvasProps) {
     columnLayout,
   );
 
-  useLayoutEffect(() => {
-    const tableCanvas = tableCanvasRef.current;
-    if (!tableCanvas) return;
-    tableCanvas.style.setProperty('--plan-table-minimum-width', `${minimumTableWidthPixels}px`);
-    tableCanvas.style.setProperty('--plan-table-canvas-height', `${virtualWindow.canvasHeight}px`);
-    return () => {
-      tableCanvas.style.removeProperty('--plan-table-minimum-width');
-      tableCanvas.style.removeProperty('--plan-table-canvas-height');
-    };
-  }, [minimumTableWidthPixels, tableCanvasRef, virtualWindow.canvasHeight]);
+  useCssVariables(
+    tableCanvasRef,
+    {
+      '--plan-table-minimum-width': `${minimumTableWidthPixels}px`,
+      '--plan-table-canvas-height': `${virtualWindow.canvasHeight}px`,
+    },
+    [minimumTableWidthPixels, virtualWindow.canvasHeight],
+  );
 
-  useLayoutEffect(() => {
-    const bodyTable = bodyTableRef.current;
-    if (!bodyTable) return;
-    bodyTable.style.setProperty('--plan-table-body-top', `${virtualWindow.bodyTop}px`);
-    return () => { bodyTable.style.removeProperty('--plan-table-body-top'); };
-  }, [bodyTableRef, virtualWindow.bodyTop]);
+  useCssVariables(
+    bodyTableRef,
+    { '--plan-table-body-top': `${virtualWindow.bodyTop}px` },
+    [virtualWindow.bodyTop],
+  );
 
   return {
     virtualWindow,

@@ -1,27 +1,18 @@
 import assert from 'node:assert/strict';
-import { readdir, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-const repositoryRoot = fileURLToPath(new URL('../..', import.meta.url));
+import { filesUnder, repositoryRoot } from './tree.mts';
 
-async function rustFiles(directory: string): Promise<string[]> {
-  const entries = await readdir(directory, { withFileTypes: true });
-  const nested = await Promise.all(entries.map(async (entry) => {
-    const path = join(directory, entry.name);
-    if (entry.isDirectory()) return rustFiles(path);
-    return entry.isFile() && entry.name.endsWith('.rs') ? [path] : [];
-  }));
-  return nested.flat();
-}
+const isRustSource = (name: string) => name.endsWith('.rs');
 
 async function assertFilesAvoid(
   directory: string,
   forbidden: RegExp,
   boundary: string,
 ): Promise<void> {
-  for (const path of await rustFiles(join(repositoryRoot, directory))) {
+  for (const path of await filesUnder(join(repositoryRoot, directory), isRustSource)) {
     const contents = await readFile(path, 'utf8');
     assert.doesNotMatch(
       contents,
@@ -117,7 +108,7 @@ test('the foundation layer depends on nothing in this crate', async () => {
   // foundation/mod.rs has always stated this contract in prose. Stating it is not enforcing it,
   // and the layer has just gained three new leaves (identity, machine, volume), so the moment for
   // a rule is now rather than after the first accidental edge.
-  for (const path of await rustFiles(join(repositoryRoot, 'Dev/src/base/foundation'))) {
+  for (const path of await filesUnder(join(repositoryRoot, 'Dev/src/base/foundation'), isRustSource)) {
     const contents = await readFile(path, 'utf8');
     for (const line of contents.split('\n')) {
       if (line.trimStart().startsWith('//')) continue;

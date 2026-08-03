@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from 'react';
-import type { JobEditorApi } from '#ui/features/jobs/model/job-editor/jobEditorModel.ts';
+import type { JobEditorApi } from '#ui/features/jobs/model/jobEditorModel.ts';
 import type {
   CandidateAdoption,
   ContextMenuState,

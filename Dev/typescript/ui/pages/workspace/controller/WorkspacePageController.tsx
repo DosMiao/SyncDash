@@ -4,17 +4,12 @@
 // token; Rust owns the authenticated plan and reconstructs every operation.
 
 import { useWorkspaceShell } from './composition/useWorkspaceShell.ts';
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { useStatus } from '#ui/shared/status/useStatus.ts';
+import { useCallback, useEffect, useMemo } from 'react';
 import { useZoomControl } from '#ui/shared/hooks/useZoomControl.ts';
 import { useInteractionLayer } from '#ui/shared/interaction/useInteractionLayer.tsx';
-import { emptyCompareWorkspaceRepository } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
-import {
-  reduceCompareWorkspaces,
-} from '#core/application/compare-workspace/compareWorkspaceRepository.ts';
 import { operationReviewPending } from '#core/application/operations/operationReview.ts';
 import { summarizeApplyReview, type ApplyReviewTotals } from '#ui/features/apply-review/model/applyReviewTotals.ts';
-import { JobEditorController } from '#ui/features/jobs/controllers/job-editor/JobEditorController.tsx';
+import { JobEditorController } from '#ui/features/jobs/controllers/JobEditorController.tsx';
 import { LogPanelController } from '#ui/features/logs/controllers/LogPanelController.tsx';
 import { SettingsSheetController } from '#ui/features/settings/controllers/SettingsSheetController.tsx';
 import { useCompareProgressSubscription } from '../runtime/compare/useCompareProgressSubscription.ts';
@@ -40,11 +35,7 @@ import { useJobExcludeMutation } from '../runtime/jobs/useJobExcludeMutation.ts'
 import { useWorkspaceJobState } from '../runtime/jobs/useWorkspaceJobState.ts';
 import { useWorkspaceReviewState } from '../runtime/reviews/useWorkspaceReviewState.ts';
 import { useWorkspacePreferences } from '../runtime/preferences/useWorkspacePreferences.ts';
-import { useWorkspaceSessionState } from '../runtime/session/useWorkspaceSessionState.ts';
-import { useRootEditorState } from '../runtime/roots/useRootEditorState.ts';
-import { useWorkspacePanels } from '../runtime/interaction/useWorkspacePanels.ts';
 import { useWorkspaceInteractionSnapshot } from '../runtime/interaction/useWorkspaceInteractionSnapshot.ts';
-import { useCompareRunState } from '../runtime/compare/useCompareRunState.ts';
 import { useWorkspaceSelectionActions } from '../runtime/session/useWorkspaceSelectionActions.ts';
 import { useJobEditorLifecycle } from '../runtime/jobs/useJobEditorLifecycle.ts';
 import { createWorkspaceMainPresentation } from './composition/createWorkspaceMainPresentation.ts';
@@ -52,66 +43,6 @@ import { createWorkspaceOverlayPresentation } from './composition/createWorkspac
 
 export function WorkspacePageController() {
   const {
-    jobs,
-    selectedJob,
-    refreshJobs,
-    setRegistrySelection,
-    selectedTargetIndex,
-    setSelectedTargetIndex,
-    selectionRef,
-    dispatchRootEditor,
-    liveRootEditor,
-    rootDraftOpen,
-    rootPickerRequestId,
-    rootSaveInFlight,
-    rootSaveRequestId,
-    selectedRootEditor,
-    reduceCompareWorkspaces,
-    emptyCompareWorkspaceRepository,
-    advancedFiltersAnchor,
-    askSwap,
-    candidateAdoption,
-    contextMenu,
-    dropScope,
-    dropTargetKey,
-    editor,
-    editorApi,
-    logOpen,
-    logReload,
-    resetTransientPanels,
-    resultViewportElement,
-    setAdvancedFiltersAnchor,
-    setAskSwap,
-    setCandidateAdoption,
-    setContextMenu,
-    setDropTargetKey,
-    setEditor,
-    setEditorScope,
-    setLogOpen,
-    setLogReload,
-    setPathScope,
-    setResultViewportElement,
-    setSettingsOpen,
-    settingsOpen,
-    status,
-    setStatus,
-    setStatusAction,
-    runStatusAction,
-    dismissStatusNotice,
-    compareActive,
-    compareActivityRequestId,
-    cancelCompare,
-    compareCancelling,
-    compareInFlight,
-    compareRateByPhase,
-    restoreRequestId,
-    compareRunFloor,
-    compareRunId,
-    compareRunReady,
-    setCompareActive,
-    setCompareCancelling,
-    setCompareStages,
-    compareStages,
     compareWorkspaceRepository,
     dispatchCompareWorkspace,
     busy,
@@ -123,14 +54,58 @@ export function WorkspacePageController() {
     statusApi,
     compareRun,
   } = useWorkspaceShell();
+  const {
+    selectedJob,
+    refreshJobs,
+    setRegistrySelection,
+    selectedTargetIndex,
+    setSelectedTargetIndex,
+    selectionRef,
+  } = session;
+  const {
+    dispatch: dispatchRootEditor,
+    liveRootEditor,
+    rootDraftOpen,
+    rootPickerRequestId,
+    rootSaveInFlight,
+    rootSaveRequestId,
+  } = rootEditorState;
+  const {
+    askSwap,
+    candidateAdoption,
+    contextMenu,
+    dropScope,
+    editor,
+    editorApi,
+    resetTransientPanels,
+    resultViewportElement,
+    setAdvancedFiltersAnchor,
+    setAskSwap,
+    setContextMenu,
+    setDropTargetKey,
+    setEditor,
+    setLogReload,
+    settingsOpen,
+  } = panels;
+  const { setMessage: setStatus, offerAction: setStatusAction } = statusApi;
+  const {
+    activityRequestId: compareActivityRequestId,
+    inFlight: compareInFlight,
+    rateByPhase: compareRateByPhase,
+    restoreRequestId,
+    runFloor: compareRunFloor,
+    runId: compareRunId,
+    runReady: compareRunReady,
+    setActive: setCompareActive,
+    setCancelling: setCompareCancelling,
+    setStages: setCompareStages,
+  } = compareRun;
 
   // AutoScan is backend-owned. The webview renders status and handles exact trigger tickets; it
   // never owns the clock or assumes that remaining mounted means the watcher is still alive.
   const autoScan = useAutoScanState();
-  const autoScanStatus = autoScan.status;
   const autoScanStatusRef = autoScan.statusRef;
   const autoScanTicket = autoScan.ticketRef;
-  const autoScanControlPending = autoScan.controlPending;
 
   const jobState = useWorkspaceJobState({
     selectedJob,
@@ -140,16 +115,12 @@ export function WorkspacePageController() {
     setStatus,
   });
   const {
-    appVersion,
     describeMutationFailure,
     expireDeletedJobState,
-    jobConfiguration,
-    jobsDir,
-    latestRunByJobId,
-    pathHistory,
     pushHistory,
     reconcileSavedWorkspaceJob,
     reconcileWorkspaceJob,
+    refreshJobsForAnnouncement,
     refreshLatestRunSummaries,
     setJobConfiguration,
   } = jobState;
@@ -170,33 +141,20 @@ export function WorkspacePageController() {
     setStatus,
   });
   const {
-    selectedScopeWorkspace,
     selectedCompareWorkspace,
     selectedCompareWorkspaceKeyRef,
     plan,
     includedRows,
     reversedRows,
-    selectedResultTypes,
-    searchDraft,
-    folderScope,
-    appliedAdvancedFilter,
-    expandedFolders,
     panelCollapsed,
     sort,
     grouped,
     pathMode,
-    collapsedFolderPaths,
     resultView,
-    workspaceExecutionAccess,
     reviewEditable,
     workspaceController,
-    recordDifferenceViewport,
-    searchPending,
     scopeCalculationPending,
     scopeCalculationFailed,
-    resultPanelId,
-    differencesTabId,
-    identicalTabId,
     inScopeIndices,
     executableIndices,
     reviewedRowDecisions,
@@ -205,10 +163,8 @@ export function WorkspacePageController() {
     currentCompareReviewKey,
     currentCompareReviewKeyRef,
     layout,
-    rowPlan,
     folderPathsInLayout,
     anyCollapsed,
-    stats,
     applyAvailability,
   } = result;
 
@@ -220,13 +176,11 @@ export function WorkspacePageController() {
     setStatus,
   });
   const {
-    applyChoices,
     applyExecutionRequest,
     applyReview,
     applyReviewRequest,
     applyReviewRequestId,
     compareApprovalRequest,
-    compareChoices,
     compareReview,
     compareReviewFetchRequest,
     compareReviewRequest,
@@ -238,8 +192,6 @@ export function WorkspacePageController() {
     dispatchCompareReview,
     resetCompareReview,
     resetConfirmation,
-    setApplyChoices,
-    setCompareChoices,
     setConfirmOpen,
     setConfirmReviewKey,
   } = reviews;
@@ -299,10 +251,7 @@ export function WorkspacePageController() {
     selectedTargetIndex,
     setWorkspaceStatus: setStatus,
   });
-  const {
-    acceptStatus: acceptAutoScanStatus,
-    toggle: toggleAutoScan,
-  } = autoScanControls;
+  const { acceptStatus: acceptAutoScanStatus } = autoScanControls;
 
   useEffect(() => {
     if (!selectedJob || selectedJob.targets.length === 0 || selectedTargetIndex < selectedJob.targets.length) return;
@@ -317,7 +266,6 @@ export function WorkspacePageController() {
     editor,
     compareReview,
     applyReview,
-    compareChoices,
     confirmOpen,
     selectedTargetIndex,
     workspacePreferences,
@@ -342,7 +290,6 @@ export function WorkspacePageController() {
     compareRunReady,
     dispatchCompareWorkspace,
     dispatchCompareReview,
-    setCompareChoices,
     setSelectedTargetIndex,
     setBusy,
     setCompareStages,
@@ -353,11 +300,7 @@ export function WorkspacePageController() {
     resetSafetyUi,
     setStatus,
   });
-  const {
-    requestResultRestore,
-    doCompare,
-    approveCompareReview,
-  } = compare;
+  const { requestResultRestore, doCompare } = compare;
 
 
   const apply = useApplyExecutionController({
@@ -370,7 +313,6 @@ export function WorkspacePageController() {
     applyAvailability,
     applyReview,
     compareReview,
-    applyChoices,
     busy,
     reviewedRowDecisions,
     selectedTargetIndex,
@@ -383,7 +325,6 @@ export function WorkspacePageController() {
     autoApplyInFlightRef: autoApplyInFlight,
     compareReviewFetchRequestRef: compareReviewFetchRequest,
     dispatchApplyReview,
-    setApplyChoices,
     setConfirmReviewKey,
     setConfirmOpen,
     setBusy,
@@ -420,6 +361,7 @@ export function WorkspacePageController() {
     setRegistrySelection,
     setSelectedTargetIndex,
     refreshJobs,
+    refreshJobsForAnnouncement,
     setJobConfiguration,
     pushHistory,
     setStatus,
@@ -443,7 +385,7 @@ export function WorkspacePageController() {
     reconcileSavedWorkspaceJob,
     resetSafetyUi,
     pushHistory,
-    refreshJobs,
+    refreshJobsForAnnouncement,
     setStatus,
     setStatusAction,
   });
@@ -453,7 +395,7 @@ export function WorkspacePageController() {
     selectedJob,
     describeMutationFailure,
     reconcileSavedWorkspaceJob,
-    refreshJobs,
+    refreshJobsForAnnouncement,
     resetSafetyUi,
     setStatus,
     offerStatusAction: setStatusAction,
@@ -466,13 +408,7 @@ export function WorkspacePageController() {
     pushHistory,
     setStatus,
   });
-  const {
-    changeRootDraft,
-    revertRootDraft,
-    acceptRootDraftConflict,
-    browseRoot,
-  } = rootActions;
-
+  const { changeRootDraft } = rootActions;
 
   const resultTable = useResultTableActions({
     workspace: selectedCompareWorkspace,
@@ -487,14 +423,6 @@ export function WorkspacePageController() {
     addExcludes,
     setStatus,
   });
-  const {
-    openRowMenu: rowMenu,
-    setRowIncluded,
-    setRowsIncluded,
-    toggleFolderFold,
-    toggleRowDirection,
-    toggleSort,
-  } = resultTable;
 
   useCompareProgressSubscription({
     runReady: compareRunReady,

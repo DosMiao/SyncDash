@@ -1,5 +1,5 @@
 import { Minus, Plus, X } from 'lucide-react';
-import { humanSize } from '#core/shared/format.ts';
+import { formatCount, humanSize } from '#core/shared/format.ts';
 import type { PlanDto } from '#core/domain/compare/plan.ts';
 import type { StatusState } from '#ui/shared/status/useStatus.ts';
 import type { CompareResultView } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
@@ -29,24 +29,24 @@ function counts(
   const header = plan.header;
   const identicalCount = plan.identical_count ?? 0;
   const parts: { text: string; warn?: boolean }[] = resultView === 'identical'
-    ? [{ text: `Identical ${identicalCount.toLocaleString()}` }]
-    : [{ text: `In Scope ${inScopeCount.toLocaleString()} / ${differenceCount.toLocaleString()}` }];
+    ? [{ text: `Identical ${formatCount(identicalCount)}` }]
+    : [{ text: `In Scope ${formatCount(inScopeCount)} / ${formatCount(differenceCount)}` }];
   if (resultView === 'differences' && inScopeCount < differenceCount) {
-    parts.push({ text: `${(differenceCount - inScopeCount).toLocaleString()} Outside Scope, Not Run` });
+    parts.push({ text: `${formatCount(differenceCount - inScopeCount)} Outside Scope, Not Run` });
   }
-  parts.push({ text: `Scanned ${header.source_entries.toLocaleString()} ⇄ ${header.target_entries.toLocaleString()}` });
-  if (resultView === 'differences') parts.push({ text: `Identical ${identicalCount.toLocaleString()}` });
+  parts.push({ text: `Scanned ${formatCount(header.source_entries)} ⇄ ${formatCount(header.target_entries)}` });
+  if (resultView === 'differences') parts.push({ text: `Identical ${formatCount(identicalCount)}` });
   // Excludes are always spelled out so an empty plan cannot become a whole-root identity claim.
   const sourceExcluded = header.source_excluded ?? 0;
   const targetExcluded = header.target_excluded ?? 0;
   if (sourceExcluded + targetExcluded > 0) {
-    parts.push({ text: `Excluded ${sourceExcluded.toLocaleString()} ⇄ ${targetExcluded.toLocaleString()}`, warn: true });
+    parts.push({ text: `Excluded ${formatCount(sourceExcluded)} ⇄ ${formatCount(targetExcluded)}`, warn: true });
   }
   return {
     parts,
-    title: `${differenceCount.toLocaleString()} differences planned; ${identicalCount.toLocaleString()} files identical on both sides (${humanSize(plan.identical_bytes ?? 0)})`
+    title: `${formatCount(differenceCount)} differences planned; ${formatCount(identicalCount)} files identical on both sides (${humanSize(plan.identical_bytes ?? 0)})`
       + (sourceExcluded + targetExcluded > 0
-        ? `\nSaved filters (including any junk-preset patterns) removed ${sourceExcluded} source / ${targetExcluded} target entries — they take no part in the Compare result or Synchronize. To include them, edit the job's Filters section and remove the matching exclude patterns.`
+        ? `\nSaved filters (including any junk-preset patterns) removed ${formatCount(sourceExcluded)} source / ${formatCount(targetExcluded)} target entries — they take no part in the Compare result or Synchronize. To include them, edit the job's Filters section and remove the matching exclude patterns.`
         : ''),
   };
 }

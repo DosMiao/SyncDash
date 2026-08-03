@@ -5,14 +5,14 @@ import type { FormValues } from '#core/domain/jobs/formSchema.ts';
 import type { JunkPresetDto } from '#core/types/generated/JunkPresetDto.ts';
 import { ConfirmDialog } from '#ui/shared/components/overlays/ConfirmDialog.tsx';
 import { Sheet } from '#ui/shared/components/overlays/Sheet.tsx';
-import { JunkPresets } from '../JunkPresets.tsx';
-import { SchemaSection } from '../SchemaSection.tsx';
+import { JunkPresets } from './JunkPresets.tsx';
+import { SchemaSection } from './SchemaSection.tsx';
 import {
   JOB_FORM_GROUPS,
   type LoadedJobForm,
   type MutationKind,
   type SaveError,
-} from '../../model/job-editor/jobEditorModel.ts';
+} from '../model/jobEditorModel.ts';
 
 interface JobEditorViewProps {
   name: string | null;
@@ -166,12 +166,12 @@ export function JobEditorView({
               '· Neither root is touched — no file on either side is read, moved or removed\n' +
               '· Past run logs and anything already in the trash are left alone'
             }
-            actions={[{
+            action={{
               label: 'Delete the job file',
               danger: true,
               disabled: busy || mutationKind !== null,
               onConfirm: onDelete,
-            }]}
+            }}
             onCancel={onCancelDelete}
           />
         )}
@@ -179,7 +179,7 @@ export function JobEditorView({
           <ConfirmDialog
             title={name ? `Discard unsaved changes to '${name}'?` : 'Discard this new job draft?'}
             message="The editor contains changes that have not been saved. Closing it now will discard this draft."
-            actions={[{ label: 'Discard unsaved changes', danger: true, onConfirm: onDiscard }]}
+            action={{ label: 'Discard unsaved changes', danger: true, onConfirm: onDiscard }}
             onCancel={onCancelDiscard}
           />
         )}

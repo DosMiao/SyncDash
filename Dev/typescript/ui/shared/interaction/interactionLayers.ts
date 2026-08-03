@@ -15,7 +15,7 @@ export type InteractionLayerKind =
   | 'menu'
   | 'modal';
 
-export interface InteractionKeyEvent {
+interface InteractionKeyEvent {
   key: string;
   altKey: boolean;
   ctrlKey: boolean;
@@ -34,7 +34,7 @@ export interface InteractionLayerEntry {
   root: HTMLElement | null;
 }
 
-export type InteractionCommandResolution =
+type InteractionCommandResolution =
   | { disposition: 'unhandled' }
   | { disposition: 'blocked'; layerId: symbol }
   | { disposition: 'handled'; layerId: symbol; run: () => void };

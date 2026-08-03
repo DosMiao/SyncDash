@@ -1,7 +1,11 @@
 import { useCallback, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
 import * as compareIpc from '#core/infrastructure/tauri/commands/compare.ts';
-import type { CompareResultKey, CompareWorkspace } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
+import type {
+  CompareResultKey,
+  CompareResultView,
+  CompareWorkspace,
+} from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import type { PlanLayout } from '#core/domain/compare/grouping.ts';
 import type { PlanDto } from '#core/domain/compare/plan.ts';
 import type { JobDto } from '#core/types/generated/JobDto.ts';
@@ -12,7 +16,7 @@ interface CsvExportOptions {
   workspace: CompareWorkspace | null;
   selectedWorkspaceKeyRef: MutableRefObject<CompareResultKey | null>;
   selectedJob: JobDto | null;
-  resultView: 'differences' | 'identical';
+  resultView: CompareResultView;
   scopeCalculationFailed: boolean;
   scopeCalculationPending: boolean;
   layout: PlanLayout;

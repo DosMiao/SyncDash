@@ -1,25 +1,17 @@
 import assert from 'node:assert/strict';
-import { readdir, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { dirname, join, relative, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import ts from 'typescript';
 
-const repositoryRoot = fileURLToPath(new URL('../..', import.meta.url));
+import { filesUnder, repositoryRoot } from './tree.mts';
 
-async function tsxFiles(directory: string): Promise<string[]> {
-  const entries = await readdir(directory, { withFileTypes: true });
-  const nested = await Promise.all(entries.map(async (entry) => {
-    const path = join(directory, entry.name);
-    if (entry.isDirectory()) return tsxFiles(path);
-    return entry.isFile() && entry.name.endsWith('.tsx') ? [path] : [];
-  }));
-  return nested.flat();
-}
+const isReactSource = (name: string) => name.endsWith('.tsx');
+const isFrontendSource = (name: string) => /\.tsx?$/.test(name);
 
 test('React source has no inline styles and every native button declares its type', async () => {
   const roots = [join(repositoryRoot, 'Dev/typescript/ui')];
-  const files = (await Promise.all(roots.map(tsxFiles))).flat();
+  const files = (await Promise.all(roots.map((root) => filesUnder(root, isReactSource)))).flat();
   assert.ok(files.length > 0, 'React source files must be discoverable');
 
   for (const path of files) {
@@ -47,16 +39,6 @@ test('React source has no inline styles and every native button declares its typ
     inspect(parsed);
   }
 });
-
-async function sourceFiles(directory: string): Promise<string[]> {
-  const entries = await readdir(directory, { withFileTypes: true });
-  const nested = await Promise.all(entries.map(async (entry) => {
-    const path = join(directory, entry.name);
-    if (entry.isDirectory()) return sourceFiles(path);
-    return entry.isFile() && /\.tsx?$/.test(entry.name) ? [path] : [];
-  }));
-  return nested.flat();
-}
 
 function staticImports(path: string, contents: string): string[] {
   const kind = path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
@@ -89,7 +71,7 @@ function repositoryTarget(sourcePath: string, specifier: string): string | null 
 
 test('frontend dependency layers follow the Dev tree', async () => {
   const frontendRoot = join(repositoryRoot, 'Dev/typescript');
-  const files = await sourceFiles(frontendRoot);
+  const files = await filesUnder(frontendRoot, isFrontendSource);
   assert.ok(files.length > 0, 'TypeScript source files must be discoverable');
 
   for (const path of files) {

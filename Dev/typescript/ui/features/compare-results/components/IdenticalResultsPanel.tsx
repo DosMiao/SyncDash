@@ -1,6 +1,6 @@
 import { useId, useRef } from 'react';
-import { formatFileTimestamp, humanSize } from '#core/shared/format.ts';
-import { MTIME_SLACK_MS } from '#core/domain/compare/plan.ts';
+import { formatCount, formatFileTimestamp, humanSize } from '#core/shared/format.ts';
+import { MTIME_SLACK_MS, MTIME_SLACK_SECONDS } from '#core/domain/compare/plan.ts';
 import { useInteractionLayer } from '#ui/shared/interaction/useInteractionLayer.tsx';
 import type { IdenticalWorkspace } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 
@@ -40,7 +40,7 @@ export function IdenticalResultsPanel(props: IdenticalResultsPanelProps) {
       <div className="identical-results-head">
         <h2 id={titleId}>Files Identical on Both Sides</h2>
         <span className="identical-results-drift-legend">
-          <i aria-hidden="true" /> Target Timestamp Differs by More Than 2 Seconds
+          <i aria-hidden="true" /> Target Timestamp Differs by More Than {MTIME_SLACK_SECONDS} Seconds
         </span>
         <input
           ref={searchRef}
@@ -52,7 +52,7 @@ export function IdenticalResultsPanel(props: IdenticalResultsPanelProps) {
           onChange={(event) => onSearchDraftChange(event.target.value)}
         />
         <span className="identical-results-count dim" aria-live="polite">
-          {error ? '' : `${rows.length} / ${total.toLocaleString()}`}
+          {error ? '' : `${formatCount(rows.length)} / ${formatCount(total)}`}
         </span>
       </div>
       <table className="identical-results-table">
@@ -84,7 +84,7 @@ export function IdenticalResultsPanel(props: IdenticalResultsPanelProps) {
                 <td className="c-meta mono">{formatFileTimestamp(row.source_mtime_ms)}</td>
                 <td
                   className={'c-meta mono' + (timestampDrift ? ' drift' : '')}
-                  title={timestampDrift ? 'Target timestamp differs from the source by more than 2 seconds' : undefined}
+                  title={timestampDrift ? `Target timestamp differs from the source by more than ${MTIME_SLACK_SECONDS} seconds` : undefined}
                 >
                   {timestampDrift && <span className="sr-only">Timestamp differs beyond tolerance. </span>}
                   {formatFileTimestamp(row.target_mtime_ms)}

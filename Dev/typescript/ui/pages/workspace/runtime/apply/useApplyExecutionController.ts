@@ -6,15 +6,12 @@ import type { ApplyAvailability } from '#core/application/apply/applyAvailabilit
 import type { CompareWorkspace } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import {
   directAuthorization,
-  EMPTY_APPROVAL_CHOICES,
-  normalizeApprovalChoices,
-  operationApprovalFromChoices,
+  INTERACTIVE_APPLY_APPROVAL,
   operationReviewCanSubmit,
   operationReviewPending,
   ownsOperationReviewRequest,
 } from '#core/application/operations/operationReview.ts';
 import type {
-  ApprovalChoices,
   OperationReviewAction,
   OperationReviewState,
   ReviewRequestFence,
@@ -35,7 +32,6 @@ interface ApplyExecutionControllerOptions {
   applyAvailability: ApplyAvailability;
   applyReview: OperationReviewState;
   compareReview: OperationReviewState;
-  applyChoices: ApprovalChoices;
   busy: boolean;
   reviewedRowDecisions: ReviewedRowDecisionDto[];
   selectedTargetIndex: number;
@@ -48,7 +44,6 @@ interface ApplyExecutionControllerOptions {
   autoApplyInFlightRef: MutableRefObject<boolean>;
   compareReviewFetchRequestRef: MutableRefObject<ReviewRequestFence | null>;
   dispatchApplyReview: Dispatch<OperationReviewAction>;
-  setApplyChoices: Dispatch<SetStateAction<ApprovalChoices>>;
   setConfirmReviewKey: Dispatch<SetStateAction<string | null>>;
   setConfirmOpen: Dispatch<SetStateAction<boolean>>;
   setBusy: Dispatch<SetStateAction<boolean>>;
@@ -76,7 +71,6 @@ export function useApplyExecutionController({
   applyAvailability,
   applyReview,
   compareReview,
-  applyChoices,
   busy,
   reviewedRowDecisions,
   selectedTargetIndex,
@@ -89,7 +83,6 @@ export function useApplyExecutionController({
   autoApplyInFlightRef,
   compareReviewFetchRequestRef,
   dispatchApplyReview,
-  setApplyChoices,
   setConfirmReviewKey,
   setConfirmOpen,
   setBusy,
@@ -124,7 +117,6 @@ export function useApplyExecutionController({
     applyReviewRequestRef.current = request;
     confirmReviewKeyRef.current = reviewKey;
     setConfirmReviewKey(reviewKey);
-    setApplyChoices(EMPTY_APPROVAL_CHOICES);
     dispatchApplyReview({ type: 'begin', request });
     setConfirmOpen(true);
     try {
@@ -160,7 +152,6 @@ export function useApplyExecutionController({
     reviewKey,
     reviewedRowDecisions,
     selectedJob,
-    setApplyChoices,
     setConfirmOpen,
     setConfirmReviewKey,
     setStatus,
@@ -175,7 +166,7 @@ export function useApplyExecutionController({
       || confirmReviewKey !== reviewKey
       || confirmReviewKeyRef.current !== reviewKey
       || !applyAvailability.available
-      || !operationReviewCanSubmit(applyReview, applyChoices)
+      || !operationReviewCanSubmit(applyReview)
     ) {
       setStatus('Apply is unavailable until this exact reviewed action set is authorized', 'err');
       return;
@@ -194,13 +185,12 @@ export function useApplyExecutionController({
     try {
       let authorization = directAuthorization(review);
       if (review.status === 'interactive_apply_confirmation_required') {
-        const choices = normalizeApprovalChoices(review, applyChoices);
         dispatchApplyReview({ type: 'begin_approval', request });
         setStatus('Authorizing this exact apply operation…');
         try {
           authorization = await operationsIpc.approveOperation(
             review.challenge_id,
-            operationApprovalFromChoices(review, choices),
+            INTERACTIVE_APPLY_APPROVAL,
           );
         } catch (error) {
           if (ownsOperationReviewRequest(applyReviewRequestRef.current, request, currentReviewKeyRef.current)) {
@@ -259,7 +249,6 @@ export function useApplyExecutionController({
     }
   }, [
     applyAvailability,
-    applyChoices,
     applyExecutionRequestRef,
     applyReview,
     applyReviewRequestRef,

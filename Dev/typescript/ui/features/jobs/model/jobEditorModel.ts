@@ -31,6 +31,18 @@ export type MutationKind = 'save' | 'delete';
 
 export const JOB_FORM_GROUPS = formGroupNames(JOB_FORM_FIELDS);
 
+/**
+ * The registry identity a loaded form carries, or `null` when it has none.
+ *
+ * A form has an identity only once every part of it is present. An unnamed draft has none because
+ * it does not exist in the registry yet; a named job missing its id or revision is corrupt evidence
+ * and must also read as `null` so callers fail closed rather than saving over an unfenced file.
+ */
+export function registeredIdentity(form: LoadedJobForm): JobEditorIdentity | null {
+  if (!form.originalName || !form.jobId || !form.configRevision) return null;
+  return { jobId: form.jobId, name: form.originalName, configRevision: form.configRevision };
+}
+
 export function sameFormValues(left: FormValues, right: FormValues): boolean {
   const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
   return [...keys].every((key) => left[key] === right[key]);

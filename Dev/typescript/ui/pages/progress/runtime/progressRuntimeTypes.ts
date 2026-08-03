@@ -18,5 +18,3 @@ export interface PowerActionRequest {
   runId: number;
   action: PowerAction;
 }
-
-export type StopState = 'idle' | 'stopping' | 'finished';

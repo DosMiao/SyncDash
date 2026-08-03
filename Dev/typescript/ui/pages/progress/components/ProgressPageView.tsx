@@ -12,8 +12,10 @@ import type {
   WhenFinishedAction,
 } from '#core/application/progress/postRunActions.ts';
 import type {
+  PausePending,
   PowerActionFailure,
   ProgressPresentation,
+  StopState,
 } from '../model/progressPresentation.ts';
 import { Graph } from './Graph.tsx';
 
@@ -36,8 +38,8 @@ interface ProgressPageViewProps {
   powerActionPending: PowerAction | null;
   onRetryPowerAction: (failure: PowerActionFailure) => void;
   onDismissPowerActionFailure: () => void;
-  pausePending: 'pause' | 'resume' | null;
-  stopState: 'idle' | 'stopping' | 'finished';
+  pausePending: PausePending;
+  stopState: StopState;
   onTogglePause: () => void;
   onStop: () => void;
   autoCloseEnabled: boolean;

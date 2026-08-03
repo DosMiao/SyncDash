@@ -1,7 +1,7 @@
-import { useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useId, useMemo, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
 import { ChevronDown, ChevronRight, PanelLeftClose, PanelLeftOpen, X } from 'lucide-react';
-import { humanSize } from '#core/shared/format.ts';
+import { formatCount, humanSize } from '#core/shared/format.ts';
 import { ROOT_FOLDER_PATH, ROOT_LEVEL_LABEL } from '#core/domain/compare/folders.ts';
 import { RESULT_TYPE_DEFINITIONS, RESULT_TYPES } from '#core/domain/compare/plan.ts';
 import type { PlanDto, ResultType } from '#core/domain/compare/plan.ts';
@@ -11,8 +11,9 @@ import {
 } from '#core/domain/compare/runScope.ts';
 import type { RunScopeFolderRow } from '#core/domain/compare/runScope.ts';
 import { RESULT_TYPE_ICON } from '#ui/shared/icons/compareIcons.tsx';
+import { useCssVariables } from '#ui/shared/hooks/useCssVariables.ts';
 
-export interface RunScopePanelProps {
+interface RunScopePanelProps {
   plan: PlanDto;
   reversedRows: boolean[];
   selectedResultTypes: Set<ResultType>;
@@ -28,10 +29,9 @@ export interface RunScopePanelProps {
 
 const ACTION_RESULT_TYPES = RESULT_TYPES.filter((type) => RESULT_TYPE_DEFINITIONS[type].group === 'action');
 const REPORT_RESULT_TYPES = RESULT_TYPES.filter((type) => RESULT_TYPE_DEFINITIONS[type].group === 'report');
-const COUNT_FORMAT = new Intl.NumberFormat('en-US');
 
 function resultCountLabel(count: number): string {
-  return `${COUNT_FORMAT.format(count)} ${count === 1 ? 'difference' : 'differences'}`;
+  return `${formatCount(count)} ${count === 1 ? 'difference' : 'differences'}`;
 }
 
 function ResultTypeFacet(props: {
@@ -58,7 +58,7 @@ function ResultTypeFacet(props: {
       onClick={() => onToggle(resultType)}
     >
       <span className="run-scope-facet-label">{RESULT_TYPE_ICON[resultType]}{definition.pluralLabel}</span>
-      <span className="run-scope-facet-count">{COUNT_FORMAT.format(count)}</span>
+      <span className="run-scope-facet-count">{formatCount(count)}</span>
     </button>
   );
 }
@@ -71,16 +71,14 @@ function RunScopeFolderLayout(props: {
 }) {
   const { children, depth, percent, selected } = props;
   const folderRef = useRef<HTMLDivElement>(null);
-  useLayoutEffect(() => {
-    const folder = folderRef.current;
-    if (!folder) return;
-    folder.style.setProperty('--run-scope-depth', String(depth));
-    folder.style.setProperty('--run-scope-share', `${Math.min(100, percent)}%`);
-    return () => {
-      folder.style.removeProperty('--run-scope-depth');
-      folder.style.removeProperty('--run-scope-share');
-    };
-  }, [depth, percent]);
+  useCssVariables(
+    folderRef,
+    {
+      '--run-scope-depth': String(depth),
+      '--run-scope-share': `${Math.min(100, percent)}%`,
+    },
+    [depth, percent],
+  );
   return (
     <div
       ref={folderRef}
@@ -219,7 +217,7 @@ export function RunScopePanel(props: RunScopePanelProps) {
           onClick={selectAnyResultType}
         >
           <span>Any Result Type</span>
-          <span>{COUNT_FORMAT.format(total)}</span>
+          <span>{formatCount(total)}</span>
         </button>
 
         <section className="run-scope-section" aria-labelledby={actionsTitleId}>
