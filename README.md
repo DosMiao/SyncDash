@@ -158,7 +158,7 @@ The supported multi-endpoint topology is hub-and-spoke: create one job and archi
 - Absolute, drive-prefixed, traversal-shaped, and SyncDash-internal operation paths are rejected before a backend opens.
 - Writes stage beside the destination, verify as configured, and publish atomically. Moves claim and verify the exact source before no-replace publication.
 - `.syncdash.lock` anchors an immutable generational lease ledger. Ownership is explicit; a missed heartbeat never guesses that another writer is dead.
-- Mount markers, free-space checks, capability reports, delete ratios, conflict limits, and plan health checks stop unsafe runs before writes.
+- Preflight blocks a run before any write when a root is missing, a mount marker is absent, or the volume cannot hold the planned bytes. Delete ratios, the free-space reserve, and plan health checks are reported for an operator to weigh rather than enforced, and capability reports record what the run will do without deciding anything. An unattended AutoScan auto-apply refuses on any of them, blockers and warnings alike.
 - Replaced or deleted content goes to local trash or, when enabled, the root's `.version_syncDash/` history. Restore is dry-run by default, validates the complete index/manifest and selected payloads, holds the root lease, and retains displaced current content under `.syncdash/restore/<session>/`.
 - Comparison keys normalize Unicode to NFC and fold case by default while I/O preserves each side's original spelling. Windows-illegal names and same-side normalization collisions become explicit plan issues.
 
