@@ -4,10 +4,12 @@
 //! - `space` reserves the configured free-space margin.
 //! - `ratio` reports unexpectedly destructive plans.
 //! - `scan` reports incomplete evidence.
+//! - `case_sensitivity` reports a root that cannot hold the case distinction the job declares.
 //! - `caps` reports unsupported backend requirements.
 //! - `roots` probes reachability; `stats` computes plan totals.
 
 pub mod caps;
+pub mod case_sensitivity;
 pub mod marker;
 pub mod ratio;
 pub mod roots;
@@ -17,6 +19,7 @@ pub mod stats;
 
 use crate::model::plan::{Op, PlanHeader};
 
+use case_sensitivity::check_case_declaration;
 use ratio::check_delete_ratio;
 use roots::check_root_vfs;
 use scan::{check_materialized, check_scan_complete};
@@ -32,6 +35,10 @@ pub struct Guards {
     /// Report a side's deletions prominently once they exceed this share of that side's total, and
     /// color the matching review row. <=0 or >=1 disables. Never withholds the run.
     pub max_delete_ratio: f64,
+    /// The job's declared case handling, carried here so the preflight can say when a root's
+    /// measured filesystem contradicts it. It is a declaration, not a probe result: nothing in the
+    /// engine overrides it from `VfsCaps`.
+    pub case_sensitive: bool,
 }
 
 impl Default for Guards {
@@ -40,6 +47,7 @@ impl Default for Guards {
             require_marker: false,
             min_free_pct: 0.01,
             max_delete_ratio: 0.5,
+            case_sensitive: false,
         }
     }
 }
@@ -112,6 +120,8 @@ pub fn run_all_vfs(
         &head.target_icloud_stub_samples,
         &mut v,
     );
+    check_case_declaration("source", source, g.case_sensitive, &mut v);
+    check_case_declaration("target", target, g.case_sensitive, &mut v);
     let st = stat_plan(ops);
     check_space(
         "target",
@@ -169,6 +179,42 @@ mod tests {
             source_icloud_stub_samples: Vec::new(),
             target_icloud_stub_samples: Vec::new(),
         }
+    }
+
+    /// The measurement is only load-bearing if the preflight consults it: an unwired check reads
+    /// exactly like no check at all. Judged as a difference from the same run without the
+    /// declaration, so this stays about the case verdict rather than about every other gate's
+    /// opinion of a bare `MemVfs`.
+    #[test]
+    fn the_preflight_reports_a_root_that_cannot_hold_the_declared_case_distinction() {
+        let source = root();
+        let target: std::sync::Arc<dyn Vfs> = std::sync::Arc::new(
+            MemVfs::new("mem")
+                .without(|caps| caps.case_sensitivity = crate::fs::vfs::CaseSense::Insensitive),
+        );
+        let declared = Guards {
+            case_sensitive: true,
+            ..Guards::default()
+        };
+
+        let silent = run_all_vfs(&[], &source, &target, &header(), &Guards::default());
+        let reported = run_all_vfs(&[], &source, &target, &header(), &declared);
+
+        assert_eq!(
+            reported.blockers, silent.blockers,
+            "a declaration mismatch must never refuse the run"
+        );
+        let added: Vec<&String> = reported
+            .warnings
+            .iter()
+            .filter(|warning| !silent.warnings.contains(warning))
+            .collect();
+        assert_eq!(added.len(), 1, "{reported:?} vs {silent:?}");
+        assert!(
+            added[0].starts_with("target:") && added[0].contains("case_sensitive = true"),
+            "the case verdict has to name the measured side and the declaration: {}",
+            added[0]
+        );
     }
 
     /// A reversed row is executed like any other, so the free-space gate has to judge it on the

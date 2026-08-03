@@ -17,7 +17,8 @@ targets = ['\\host\share\dir']          # one or more roots: local paths, smb://
 # --- rigor detail knobs (a value here overrides the preset's axis; the UI writes them all explicitly) ---
 # evidence = "sampled"                  # content evidence: none (0 reads) | sampled (256KB each at head/middle/tail) | full (whole file)
 # use_cache = false                     # trust the (path,size,mtime) cache? true in fast/balanced; false from standard up = a real read every round
-# escalate = true                       # disagreement escalation: digests equal but mtime differs >2s -> re-verify both sides in full
+# escalate = true                       # disagreement escalation: digests equal but mtime differs by more than the equality window
+#                                       # (at least 2s; coarse-timestamp backends widen it) -> re-verify both sides in full
 # verify_writes = true                  # verify after write: hash of the copy stream vs a re-read from disk
 # case_sensitive = false                # case-insensitive by default (the NTFS/APFS default)
 # symlinks = "exclude"                  # exclude | direct (sync the link itself)

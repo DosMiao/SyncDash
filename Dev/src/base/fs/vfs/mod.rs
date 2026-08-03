@@ -273,6 +273,10 @@ pub struct VfsCaps {
     /// instead. That prevents both network downloads and full cross-volume copies from removable
     /// or secondary disks.
     pub local_trash: bool,
+    /// What this root measures about its own case handling. It never decides matching — the job's
+    /// `case_sensitive` declaration does that, all the way through planning. Its one consumer is
+    /// `guard::case_sensitivity`, which reports the single case where the two disagree on a fact:
+    /// a declared-sensitive job against a measured `Insensitive` root.
     pub case_sensitivity: CaseSense,
     /// Naming rules writes to this root must satisfy. Drives the plan-time legality
     /// preflight; `Unknown` downgrades that from a refusal to a visible warning.

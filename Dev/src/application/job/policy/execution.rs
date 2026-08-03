@@ -57,6 +57,7 @@ impl Job {
             require_marker: self.require_marker,
             min_free_pct: self.min_free_pct,
             max_delete_ratio: self.max_delete_ratio,
+            case_sensitive: self.case_sensitive,
         }
     }
 
@@ -107,6 +108,18 @@ mod tests {
             rigor: rigor.into(),
             ..Default::default()
         }
+    }
+
+    /// The preflight can only report a declaration it is given, so the projection has to carry it.
+    #[test]
+    fn guards_carry_the_declared_case_handling() {
+        let mut j = job("standard");
+        assert!(
+            !j.guards().case_sensitive,
+            "the default job declares case-insensitive compare"
+        );
+        j.case_sensitive = true;
+        assert!(j.guards().case_sensitive);
     }
 
     #[test]
