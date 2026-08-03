@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::contracts::events::{RunEventDto, RunEventPurposeDto};
 use crate::features::operations::events::repository::RunEventRepository;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
 use crate::features::operations::lifecycle::model::RunPurpose;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::ipc::{require_window_role, WindowRole};
 
 #[tauri::command]

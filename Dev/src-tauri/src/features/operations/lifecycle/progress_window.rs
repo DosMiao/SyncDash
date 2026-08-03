@@ -6,15 +6,16 @@
 //! writing. A run whose progress window never armed would execute with no visible progress and no
 //! reachable cancel control.
 //!
-//! Both waits are bounded at five seconds and every failure path destroys the window. A half-built
-//! progress window left on screen is worse than none: it looks like a run that is being watched.
+//! Both waits are bounded at five seconds, and every failure path from the arm signal onward
+//! destroys the window. A half-built progress window left on screen is worse than none: it looks
+//! like a run that is being watched.
 //!
-//! This is desktop lifecycle policy, not delivery. It lived in an IPC command module, where it was
-//! the only `WebviewWindowBuilder` outside the composition root.
+//! This is desktop lifecycle policy, not delivery: it is the only place that builds the progress
+//! window, so nothing can put one on screen without completing this handshake.
 
 use tauri::{Emitter, Manager};
 
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::window::PROGRESS_WINDOW_LABEL;
 
 /// How long the mount and acknowledgement signals may take before the launch is abandoned.

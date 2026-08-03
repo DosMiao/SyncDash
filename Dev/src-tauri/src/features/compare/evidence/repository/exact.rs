@@ -15,6 +15,17 @@ impl CompareResultRepository {
         self.load_exact_locked(&mut store, identity)
     }
 
+    /// The exact result, or the one refusal that explains its absence. Every caller that cannot
+    /// proceed without the evidence goes through here, so a forgotten or evicted result is always
+    /// reported the same way.
+    pub(crate) fn require_exact(
+        &self,
+        identity: &CompareIdentity,
+    ) -> Result<RetainedCompareResult, CompareResultRepositoryError> {
+        self.get_exact(identity)?
+            .ok_or(CompareResultRepositoryError::NotRetained)
+    }
+
     pub(crate) fn get_fresh_exact(
         &self,
         identity: &CompareIdentity,

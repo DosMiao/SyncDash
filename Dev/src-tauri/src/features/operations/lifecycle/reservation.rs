@@ -2,8 +2,11 @@
 
 use std::sync::mpsc::{self, Receiver};
 
-use super::coordinator::RunLifecycle;
-use super::state::{LifecycleState, PendingProgressLaunch, ProgressLaunchPhase};
+use super::state::{
+    LifecycleState, PendingProgressLaunch, ProgressLaunchPhase, ANOTHER_RUN_IS_ACTIVE,
+    LAUNCH_IS_ALREADY_PREPARING, LAUNCH_IS_NO_LONGER_ACTIVE,
+};
+use super::RunLifecycle;
 
 impl RunLifecycle {
     pub(crate) fn reserve_progress_launch(&self) -> Result<u64, String> {
@@ -18,12 +21,10 @@ impl RunLifecycle {
             );
         }
         if state.active_run.is_some() {
-            return Err(
-                "Another run is already in progress — cancel it or wait for it to finish".into(),
-            );
+            return Err(ANOTHER_RUN_IS_ACTIVE.into());
         }
         if state.pending_progress_launch.is_some() {
-            return Err("A synchronization is already preparing to start".into());
+            return Err(LAUNCH_IS_ALREADY_PREPARING.into());
         }
         state.next_progress_launch_id =
             state
@@ -114,15 +115,17 @@ impl RunLifecycle {
     }
 }
 
-fn pending_progress_launch_mut(
+/// The one lookup that decides whether a launch id still names the reserved launch. Run admission
+/// asks the same question, so both go through here rather than re-deriving it.
+pub(super) fn pending_progress_launch_mut(
     state: &mut LifecycleState,
     launch_id: u64,
 ) -> Result<&mut PendingProgressLaunch, String> {
     let Some(pending) = state.pending_progress_launch.as_mut() else {
-        return Err("This synchronization launch is no longer active".into());
+        return Err(LAUNCH_IS_NO_LONGER_ACTIVE.into());
     };
     if pending.id != launch_id {
-        return Err("This synchronization launch is no longer active".into());
+        return Err(LAUNCH_IS_NO_LONGER_ACTIVE.into());
     }
     Ok(pending)
 }

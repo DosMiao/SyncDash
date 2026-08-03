@@ -2,6 +2,7 @@
 
 use crate::contracts::compare::CompareOwner;
 
+use super::super::model::error::CompareResultRepositoryError;
 use super::super::model::result::RetainedCompareResult;
 
 pub(crate) fn validate_retained_compare(
@@ -31,7 +32,7 @@ pub(crate) fn validate_retained_compare(
         ));
     }
     let Some(retained) = retained else {
-        return Err("This exact Compare result is no longer retained — run Compare again".into());
+        return Err(CompareResultRepositoryError::NotRetained.to_string());
     };
     if retained.identity() != &owner.identity {
         return Err("The retained Compare result identity changed — run Compare again".into());

@@ -1,9 +1,9 @@
-//! Whether the roots a job is being edited against actually look usable.
+//! What the job editor needs while a job is being edited: whether the roots it is being edited
+//! against actually look usable.
 //!
 //! This is desktop policy, not delivery: it probes the filesystem, classifies each endpoint, and
 //! decides which combinations are worth warning about — including the nested- and identical-root
-//! cases that would otherwise only surface once Compare had already run. It lived in an IPC
-//! command module, where it was 140 of that file's 190 production lines and carried its own tests.
+//! cases that would otherwise only surface once Compare had already run.
 //!
 //! The one promise it must never make is that a missing target will be created. A mistyped path
 //! that reads as "will be made for you" is how a mirror ends up writing a full tree into the wrong

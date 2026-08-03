@@ -4,10 +4,13 @@ use std::sync::Arc;
 
 use syncdash::obs::progress::RunCtl;
 
-use super::coordinator::RunLifecycle;
 use super::lease::{ActiveRunLease, RunCommandLease};
 use super::model::RunPurpose;
-use super::state::{ActiveRun, ProgressLaunchPhase};
+use super::reservation::pending_progress_launch_mut;
+use super::state::{
+    ActiveRun, ProgressLaunchPhase, ANOTHER_RUN_IS_ACTIVE, LAUNCH_IS_ALREADY_PREPARING,
+};
+use super::RunLifecycle;
 
 impl RunLifecycle {
     pub(crate) fn command_lease(self: &Arc<Self>) -> Result<RunCommandLease, String> {
@@ -33,18 +36,11 @@ impl RunLifecycle {
     ) -> Result<ActiveRunLease, String> {
         let mut state = self.state.lock().unwrap();
         if state.active_run.is_some() {
-            return Err(
-                "Another run is already in progress — cancel it or wait for it to finish".into(),
-            );
+            return Err(ANOTHER_RUN_IS_ACTIVE.into());
         }
         match progress_launch_id {
             Some(launch_id) => {
-                let Some(pending) = state.pending_progress_launch.as_ref() else {
-                    return Err("This synchronization launch is no longer active".into());
-                };
-                if pending.id != launch_id {
-                    return Err("This synchronization launch is no longer active".into());
-                }
+                let pending = pending_progress_launch_mut(&mut state, launch_id)?;
                 if !matches!(pending.phase, ProgressLaunchPhase::Ready) {
                     return Err(
                         "The progress window has not acknowledged this synchronization launch"
@@ -54,7 +50,7 @@ impl RunLifecycle {
                 state.pending_progress_launch = None;
             }
             None if state.pending_progress_launch.is_some() => {
-                return Err("A synchronization is already preparing to start".into())
+                return Err(LAUNCH_IS_ALREADY_PREPARING.into())
             }
             None => {}
         }

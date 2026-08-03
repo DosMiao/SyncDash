@@ -11,7 +11,6 @@ pub(crate) struct JobDto {
     pub(crate) mode: String,
     pub(crate) rigor: String,
     pub(crate) source: String,
-    pub(crate) has_archive: bool,
     /// Derived from the root phrase; no separate host field may duplicate that authority.
     pub(crate) is_peer_job: bool,
     pub(crate) versioning: bool,
@@ -49,7 +48,6 @@ pub(crate) struct JobSaveDto {
     pub(crate) name: String,
     pub(crate) config_revision: String,
     pub(crate) effect: syncdash::job::JobMutationEffect,
-    pub(crate) previous_name: Option<String>,
     pub(crate) status_delivery_warnings: Vec<String>,
 }
 
@@ -95,5 +93,4 @@ pub(crate) struct JunkPresetDto {
     pub(crate) label: String,
     pub(crate) hint: String,
     pub(crate) patterns: Vec<String>,
-    pub(crate) default_on: bool,
 }

@@ -10,13 +10,13 @@ use crate::features::autoscan::controller::AutoScanController;
 use crate::features::compare::evidence::repository::CompareResultRepository;
 use crate::features::operations::authorization::challenge::ReviewChallenge;
 use crate::features::operations::authorization::store::OperationAuthorizationStore;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
+use crate::features::operations::lifecycle::RunLifecycle;
 
 use super::super::projection::{authorization_dto, blocked_review, capability_dtos};
 use super::super::target::reload_prepared_target;
 use super::preparation::{
-    apply_facts, apply_review_messages, autoscan_health_refusals, build_apply_review,
-    prepare_apply, prepare_autoscan_apply,
+    apply_facts, apply_review_messages, build_apply_review, prepare_apply, prepare_autoscan_apply,
+    require_clean_autoscan_health,
 };
 
 pub(crate) async fn review_apply(
@@ -72,13 +72,7 @@ pub(crate) async fn authorize_autoscan_apply(
         let ticket = autoscan.claim_completed_auto_apply(generation, ticket_id)?;
         let prepared = prepare_autoscan_apply(&results, &ticket)?;
         let facts = apply_facts(&prepared)?;
-        let health_refusals = autoscan_health_refusals(&facts);
-        if !health_refusals.is_empty() {
-            return Err(format!(
-                "AutoScan Apply requires a completely clean health review:\n{}",
-                health_refusals.join("\n")
-            ));
-        }
+        require_clean_autoscan_health(&facts)?;
         reload_prepared_target(&prepared.target)?;
         let review = build_apply_review(&prepared, &facts)?;
         let compare_identity = review.compare_identity().clone();

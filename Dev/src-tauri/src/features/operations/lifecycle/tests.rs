@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use super::coordinator::RunLifecycle;
 use super::model::{ProgressWindowCloseDecisionDto, RunPurpose};
+use super::RunLifecycle;
 
 #[test]
 fn progress_launch_is_reserved_and_consumed_exactly_once() {

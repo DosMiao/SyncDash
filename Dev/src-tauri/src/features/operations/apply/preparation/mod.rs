@@ -5,6 +5,6 @@ mod preflight;
 mod retained;
 
 pub(super) use preflight::{
-    apply_facts, apply_review_messages, autoscan_health_refusals, build_apply_review,
+    apply_facts, apply_review_messages, build_apply_review, require_clean_autoscan_health,
 };
 pub(super) use retained::{prepare_apply, prepare_autoscan_apply};

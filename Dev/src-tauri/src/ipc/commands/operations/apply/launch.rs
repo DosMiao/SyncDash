@@ -7,7 +7,7 @@ use crate::features::autoscan::controller::AutoScanController;
 use crate::features::compare::evidence::repository::CompareResultRepository;
 use crate::features::operations::authorization::store::OperationAuthorizationStore;
 use crate::features::operations::events::repository::RunEventRepository;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::ipc::{require_window_role, WindowRole};
 
 #[allow(clippy::too_many_arguments)] // Tauri injects state and exposes the rest as flat IPC fields.

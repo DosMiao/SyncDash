@@ -6,7 +6,7 @@ use crate::contracts::compare::AutoScanCompareRequestDto;
 use crate::contracts::operations::OperationReviewDto;
 use crate::features::autoscan::controller::AutoScanController;
 use crate::features::operations::authorization::store::OperationAuthorizationStore;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::ipc::{require_window_role, WindowRole};
 
 #[tauri::command]

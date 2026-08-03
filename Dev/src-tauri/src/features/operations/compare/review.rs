@@ -11,7 +11,7 @@ use crate::features::autoscan::controller::AutoScanController;
 use crate::features::autoscan::model::AutoScanVerificationTerminal;
 use crate::features::operations::authorization::compare::CompareOrigin;
 use crate::features::operations::authorization::store::OperationAuthorizationStore;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
+use crate::features::operations::lifecycle::RunLifecycle;
 
 use super::super::execution::error::{format_run_io_error, verification_terminal_from_io};
 use super::super::projection::{authorization_dto, blocked_review, capability_dtos};

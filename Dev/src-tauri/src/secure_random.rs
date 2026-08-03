@@ -1,15 +1,11 @@
 //! Cryptographically secure opaque identifiers for desktop authorities and immutable evidence.
 
+/// The engine owns the hex spelling so a desktop identifier and an engine token are the same
+/// shape; only the entropy width and the failure message belong to this side.
 pub(crate) fn random_hex<const BYTE_COUNT: usize>(failure_context: &str) -> Result<String, String> {
     let mut bytes = [0_u8; BYTE_COUNT];
     getrandom::fill(&mut bytes).map_err(|error| format!("{failure_context}: {error}"))?;
-    let mut token = String::with_capacity(BYTE_COUNT * 2);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
-        token.push(HEX[(byte >> 4) as usize] as char);
-        token.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    Ok(token)
+    Ok(syncdash::foundation::token::hex_lower(&bytes))
 }
 
 #[cfg(test)]

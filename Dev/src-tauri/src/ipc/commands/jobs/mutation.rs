@@ -9,7 +9,7 @@ use crate::features::jobs::mutation::effects::{
     apply_saved_job_side_effects, delete_job_side_effects,
 };
 use crate::features::operations::authorization::store::OperationAuthorizationStore;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::ipc::{require_window_role, WindowRole};
 
 use super::delivery::deliver_statuses;

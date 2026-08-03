@@ -1,8 +1,9 @@
 //! Active-run controls, idle mutation exclusion, progress-window close, and power grants.
 
-use super::coordinator::RunLifecycle;
 use super::lease::RegistryMutationLease;
 use super::model::{ProgressWindowCloseDecisionDto, RunPurpose};
+use super::state::{ActiveRun, LifecycleState};
+use super::RunLifecycle;
 
 impl RunLifecycle {
     pub(crate) fn begin_progress_window_close(&self) -> ProgressWindowCloseDecisionDto {
@@ -32,11 +33,7 @@ impl RunLifecycle {
     }
 
     pub(crate) fn has_activity(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        state.active_run.is_some()
-            || state.pending_progress_launch.is_some()
-            || state.commands_in_flight > 0
-            || state.registry_mutation_in_progress
+        self.state.lock().unwrap().is_busy()
     }
 
     pub(crate) fn with_idle_mutation<T>(
@@ -45,11 +42,7 @@ impl RunLifecycle {
         mutate: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
         let mut state = self.state.lock().unwrap();
-        if state.active_run.is_some()
-            || state.pending_progress_launch.is_some()
-            || state.commands_in_flight > 0
-            || state.registry_mutation_in_progress
-        {
+        if state.is_busy() {
             return Err(format!(
                 "{operation} is unavailable while Compare or Synchronize is preparing or running"
             ));
@@ -68,22 +61,9 @@ impl RunLifecycle {
         expected_purpose: RunPurpose,
     ) -> Result<bool, String> {
         let state = self.state.lock().unwrap();
-        let Some(active) = state.active_run.as_ref() else {
+        let Some(active) = controlled_run(&state, run_id, expected_purpose)? else {
             return Ok(false);
         };
-        if active.run_id != run_id {
-            return Err(format!(
-                "Run {run_id} is no longer active; run {} is active now",
-                active.run_id
-            ));
-        }
-        if active.purpose != expected_purpose {
-            return Err(format!(
-                "Run {run_id} is an {} run and cannot be controlled as {}",
-                active.purpose.name(),
-                expected_purpose.name()
-            ));
-        }
         active.control.request_cancel();
         Ok(true)
     }
@@ -95,22 +75,9 @@ impl RunLifecycle {
         paused: bool,
     ) -> Result<bool, String> {
         let state = self.state.lock().unwrap();
-        let Some(active) = state.active_run.as_ref() else {
+        let Some(active) = controlled_run(&state, run_id, expected_purpose)? else {
             return Ok(false);
         };
-        if active.run_id != run_id {
-            return Err(format!(
-                "Run {run_id} is no longer active; run {} is active now",
-                active.run_id
-            ));
-        }
-        if active.purpose != expected_purpose {
-            return Err(format!(
-                "Run {run_id} is an {} run and cannot be controlled as {}",
-                active.purpose.name(),
-                expected_purpose.name()
-            ));
-        }
         active.control.set_paused(paused);
         Ok(true)
     }
@@ -149,4 +116,32 @@ impl RunLifecycle {
             state.post_run_power_action_grant = None;
         }
     }
+}
+
+/// Resolve the active run only when it is exactly the run the caller believes it is controlling.
+/// `Ok(None)` means nothing is running: a control click that lands after its run already finished
+/// is a no-op, while a click that lands on a *different* run is an error rather than a cancel of
+/// whatever happens to be running now.
+fn controlled_run(
+    state: &LifecycleState,
+    run_id: u64,
+    expected_purpose: RunPurpose,
+) -> Result<Option<&ActiveRun>, String> {
+    let Some(active) = state.active_run.as_ref() else {
+        return Ok(None);
+    };
+    if active.run_id != run_id {
+        return Err(format!(
+            "Run {run_id} is no longer active; run {} is active now",
+            active.run_id
+        ));
+    }
+    if active.purpose != expected_purpose {
+        return Err(format!(
+            "Run {run_id} is an {} run and cannot be controlled as {}",
+            active.purpose.name(),
+            expected_purpose.name()
+        ));
+    }
+    Ok(Some(active))
 }

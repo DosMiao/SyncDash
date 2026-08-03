@@ -7,7 +7,7 @@ use crate::contracts::operations::{AuthorizationDto, OperationReviewDto};
 use crate::features::autoscan::controller::AutoScanController;
 use crate::features::compare::evidence::repository::CompareResultRepository;
 use crate::features::operations::authorization::store::OperationAuthorizationStore;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::ipc::{require_window_role, WindowRole};
 
 #[tauri::command]

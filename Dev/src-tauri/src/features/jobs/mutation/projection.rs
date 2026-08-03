@@ -17,7 +17,6 @@ pub(crate) fn job_save_dto(
         name: saved.name,
         config_revision: saved.config_revision,
         effect: saved.effect,
-        previous_name: saved.previous_name,
         status_delivery_warnings,
     }
 }

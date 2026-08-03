@@ -47,9 +47,23 @@ pub(in crate::features::operations::apply) fn apply_review_messages(
     (facts.verdict.blockers.clone(), warnings)
 }
 
-pub(in crate::features::operations::apply) fn autoscan_health_refusals(
+/// An unattended Apply has no operator to weigh a warning, so AutoScan refuses on anything the
+/// interactive review would have shown — blockers and warnings alike. Authorization and execution
+/// both check this, so the predicate and its refusal have one home.
+pub(in crate::features::operations::apply) fn require_clean_autoscan_health(
     facts: &ApplyFacts,
-) -> Vec<String> {
+) -> Result<(), String> {
+    let health_refusals = autoscan_health_refusals(facts);
+    if health_refusals.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "AutoScan Apply requires a completely clean health review:\n{}",
+        health_refusals.join("\n")
+    ))
+}
+
+fn autoscan_health_refusals(facts: &ApplyFacts) -> Vec<String> {
     let mut messages = facts.verdict.blockers.clone();
     messages.extend(facts.verdict.warnings.clone());
     messages.sort();

@@ -1,7 +1,8 @@
 //! The Tauri commands, grouped by what they act on.
 //!
-//! Each one is thin: validate, call the library, project into a DTO. Anything longer than that
-//! belongs in `syncdash`, where the CLI can reach it too.
+//! Each one is thin: authorize the calling window, extract state and arguments, delegate, and
+//! project the result into a DTO. Desktop policy, authorization, and evidence rules belong in
+//! `features/`; only behavior the CLI must reach too belongs in `syncdash`.
 
 pub(crate) mod autoscan;
 pub(crate) mod compare;

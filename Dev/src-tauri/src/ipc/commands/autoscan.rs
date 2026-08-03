@@ -8,7 +8,7 @@ use syncdash::fs::vfs::spec::{parse, RootSpec};
 use crate::features::autoscan::controller::AutoScanController;
 use crate::features::autoscan::model::{AutoScanBinding, AutoScanStatusDto};
 use crate::features::autoscan::worker::configuration::configured_interval;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::ipc::{require_window_role, WindowRole};
 
 #[tauri::command]

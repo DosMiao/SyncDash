@@ -20,7 +20,6 @@ pub fn list_jobs(window: tauri::WebviewWindow) -> Result<Vec<JobDto>, String> {
                 mode: j.mode.clone(),
                 rigor: j.rigor.clone(),
                 source: j.source.clone(),
-                has_archive: j.archive.is_some(),
                 is_peer_job: run::is_peer_job(&j),
                 versioning: j.versioning,
                 delta: j.delta,

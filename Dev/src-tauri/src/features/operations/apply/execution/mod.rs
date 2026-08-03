@@ -15,14 +15,14 @@ use crate::features::operations::authorization::store::OperationAuthorizationSto
 use crate::features::operations::events::model::RunEventAudience;
 use crate::features::operations::events::repository::RunEventRepository;
 use crate::features::operations::events::sink::make_ctx;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::window::PROGRESS_WINDOW_LABEL;
 
 use self::launch::{revalidate_retained_before_apply, ApplyLaunch};
 use super::super::execution::error::format_run_io_error;
 use super::super::execution::guard::{AppliedResultGuard, RunRejected};
 use super::preparation::{
-    apply_facts, autoscan_health_refusals, build_apply_review, prepare_apply,
+    apply_facts, build_apply_review, prepare_apply, require_clean_autoscan_health,
 };
 
 #[allow(clippy::too_many_arguments)] // The use case coordinates independent state authorities.
@@ -66,16 +66,7 @@ pub(crate) async fn apply_job(
                 .verify_current(&current_review)
                 .map_err(|error| (error, false))?;
             if matches!(authorization, ApplyAuthorization::AutoScan(_)) {
-                let health_refusals = autoscan_health_refusals(&facts);
-                if !health_refusals.is_empty() {
-                    return Err((
-                        format!(
-                            "AutoScan Apply requires a completely clean health review:\n{}",
-                            health_refusals.join("\n")
-                        ),
-                        false,
-                    ));
-                }
+                require_clean_autoscan_health(&facts).map_err(|error| (error, false))?;
             }
             if !facts.verdict.ok() {
                 return Err((facts.verdict.blockers.join("\n"), false));
@@ -157,7 +148,6 @@ pub(crate) async fn apply_job(
                 done: outcome.done,
                 skipped: outcome.skipped,
                 errors: outcome.errors,
-                bytes_copied: outcome.bytes_copied,
                 cancelled: outcome.cancelled,
             })
         })

@@ -18,8 +18,8 @@ use crate::features::operations::authorization::store::OperationAuthorizationSto
 use crate::features::operations::events::model::RunEventAudience;
 use crate::features::operations::events::repository::RunEventRepository;
 use crate::features::operations::events::sink::make_ctx;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
 use crate::features::operations::lifecycle::model::RunPurpose;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::window::MAIN_WINDOW_LABEL;
 
 use self::publication::prepare_successful_result;
@@ -29,7 +29,6 @@ use super::super::target::{
     build_compare_authorization, load_bound_target, reload_prepared_target,
 };
 
-#[allow(clippy::too_many_arguments)] // The use case coordinates independent state authorities.
 pub(crate) async fn compare_job(
     app: tauri::AppHandle,
     lifecycle: Arc<RunLifecycle>,

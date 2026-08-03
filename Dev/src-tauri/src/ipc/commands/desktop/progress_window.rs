@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
 use crate::features::operations::lifecycle::model::ProgressWindowCloseDecisionDto;
 use crate::features::operations::lifecycle::progress_window;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::ipc::{require_window_role, WindowRole};
 
 #[tauri::command]

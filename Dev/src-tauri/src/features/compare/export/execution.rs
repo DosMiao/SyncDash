@@ -33,11 +33,8 @@ pub(crate) fn prepare(
     compare_identity: &CompareIdentity,
 ) -> Result<ExportSource, String> {
     let retained = results
-        .get_exact(compare_identity)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| {
-            "This exact Compare result is no longer retained — run Compare again".to_string()
-        })?;
+        .require_exact(compare_identity)
+        .map_err(|error| error.to_string())?;
     let default_filename = default_export_filename(
         &retained.owner().job_name,
         retained.identity().compare_run_id,

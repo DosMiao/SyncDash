@@ -3,18 +3,15 @@
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 
-use super::transition::terminalize_repository_verification;
+use super::transition::deactivate_generation;
 use super::AutoScanController;
-use crate::features::autoscan::model::{
-    AutoScanBinding, AutoScanStatusDto, AutoScanVerificationTerminal,
-};
+use crate::features::autoscan::model::{AutoScanBinding, AutoScanStatusDto};
 use crate::features::autoscan::runtime::{
     allocate_unique_id, ActiveAutoScan, AutoScanEvents, WorkerCommand,
 };
 use crate::features::autoscan::state::{
     AutoScanShared, AutoScanStatusCore, AutoScanTicketLifecycle,
 };
-use crate::features::autoscan::worker::observation::mark_shared_inactive;
 use crate::features::autoscan::worker::run_worker;
 
 impl AutoScanController {
@@ -74,22 +71,8 @@ impl AutoScanController {
     fn stop_locked(&self, detail: &str) -> Option<AutoScanStatusDto> {
         let mut active_guard = self.active.lock().unwrap();
         let active = active_guard.as_ref()?;
-        let (snapshot, execution_status, events) = {
-            let mut shared = active.shared.lock().unwrap();
-            let execution_status = shared.ticket.verification().and_then(|verification| {
-                terminalize_repository_verification(
-                    &self.execution,
-                    &active.binding,
-                    verification,
-                    &AutoScanVerificationTerminal::Cancelled,
-                )
-            });
-            (
-                mark_shared_inactive(&mut shared, detail),
-                execution_status,
-                active.events.clone(),
-            )
-        };
+        let (snapshot, execution_status) = deactivate_generation(&self.execution, active, detail);
+        let events = active.events.clone();
         *self.tombstone.lock().unwrap() = Some(snapshot.clone());
         let mut active = active_guard
             .take()

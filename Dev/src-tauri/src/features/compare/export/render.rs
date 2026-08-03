@@ -102,22 +102,8 @@ pub(crate) fn write_compare_csv(
 mod tests {
     use syncdash::model::plan::{Action, Side};
 
+    use super::super::fixtures::operation;
     use super::*;
-
-    fn operation(action: Action, side: Side, path: &str) -> Op {
-        Op {
-            side,
-            action,
-            path: path.into(),
-            from: None,
-            size: Some(10),
-            mtime_ms: Some(1_700_000_000_000),
-            hash: None,
-            link: None,
-            mode: None,
-            reason: "reviewed".into(),
-        }
-    }
 
     fn header() -> PlanHeader {
         PlanHeader {

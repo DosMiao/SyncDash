@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use syncdash::obs::progress::RunCtl;
 
-use super::coordinator::RunLifecycle;
 use super::model::RunPurpose;
+use super::RunLifecycle;
 
 pub(crate) struct RunCommandLease {
     pub(super) lifecycle: Arc<RunLifecycle>,

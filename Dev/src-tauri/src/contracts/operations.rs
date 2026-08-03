@@ -114,7 +114,5 @@ pub(crate) struct ApplyDto {
     pub(crate) skipped: u64,
     #[ts(type = "number")]
     pub(crate) errors: u64,
-    #[ts(type = "number")]
-    pub(crate) bytes_copied: u64,
     pub(crate) cancelled: bool,
 }

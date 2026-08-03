@@ -134,7 +134,7 @@ capability-owned command groups rather than implementing every command in one ma
 
 ```text
 Dev/src-tauri/src/
-├── app/                    state construction, window lifecycle, and command registration
+├── app.rs                  state construction, window lifecycle, and command registration
 ├── contracts/              Rust-to-TypeScript wire DTOs grouped by feature
 ├── features/
 │   ├── autoscan/           authority, model, state, controller, runtime, and worker

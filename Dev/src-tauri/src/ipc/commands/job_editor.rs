@@ -15,9 +15,7 @@ pub fn inspect_paths(
     target: String,
 ) -> Result<PathVerdict, String> {
     require_window_role(&window, WindowRole::Main)?;
-    Ok(crate::features::jobs::editor::readiness::inspect_paths(
-        source, target,
-    ))
+    Ok(crate::features::jobs::editor::inspect_paths(source, target))
 }
 
 /// Ad-hoc mask matching for Advanced Filters. The frontend **does not write its own glob** — the FFS mask
@@ -45,7 +43,6 @@ pub fn junk_presets(window: tauri::WebviewWindow) -> Result<Vec<JunkPresetDto>, 
             label: p.label.to_string(),
             hint: p.hint.to_string(),
             patterns: p.patterns.iter().map(|s| s.to_string()).collect(),
-            default_on: p.default_on,
         })
         .collect())
 }

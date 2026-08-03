@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::contracts::settings::SettingsSaveDto;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::features::settings::authorization::grant::SettingsAuthority;
 use crate::ipc::{require_window_role, WindowRole};
 

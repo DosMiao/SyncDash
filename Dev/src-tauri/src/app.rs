@@ -9,7 +9,7 @@ use crate::features::compare::evidence::repository::CompareResultRepository;
 use crate::features::compare::export::receipt::CsvExportReceiptRepository;
 use crate::features::operations::authorization::store::OperationAuthorizationStore;
 use crate::features::operations::events::repository::RunEventRepository;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::features::settings::authorization::grant::SettingsAuthority;
 use crate::window::{MAIN_WINDOW_LABEL, PROGRESS_WINDOW_LABEL};
 

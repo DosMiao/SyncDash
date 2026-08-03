@@ -10,7 +10,7 @@ use crate::features::compare::evidence::repository::{
 };
 use crate::features::compare::workspace;
 use crate::features::jobs::target::resolve_target;
-use crate::features::operations::lifecycle::coordinator::RunLifecycle;
+use crate::features::operations::lifecycle::RunLifecycle;
 use crate::ipc::{require_window_role, WindowRole};
 
 #[tauri::command]

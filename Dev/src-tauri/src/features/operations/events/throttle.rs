@@ -10,14 +10,13 @@ fn phase_slot(phase: Phase) -> usize {
         Phase::Apply => 3,
         Phase::Pack => 4,
         Phase::Ship => 5,
-        Phase::Verify => 6,
-        Phase::Refresh => 7,
-        Phase::Archive => 8,
+        Phase::Refresh => 6,
+        Phase::Archive => 7,
     }
 }
 
 pub(super) struct ProgressThrottle {
-    last_ms: [AtomicU64; 9],
+    last_ms: [AtomicU64; 8],
 }
 
 impl Default for ProgressThrottle {

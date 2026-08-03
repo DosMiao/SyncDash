@@ -1,8 +1,8 @@
-//! Workspace, execution-status, and latest-result queries.
+//! Workspace, execution-status, identical-page, and latest-result queries.
 
 use crate::contracts::compare::{
     CompareIdentity, CompareScopeExecutionStatusDto, CompareWorkspaceLookupDto,
-    CompareWorkspaceSnapshotDto,
+    CompareWorkspaceSnapshotDto, IdenticalPage,
 };
 
 use super::super::model::error::CompareResultRepositoryError;
@@ -10,6 +10,9 @@ use super::super::model::error::CompareResultRepositoryError;
 use super::super::model::result::RetainedCompareResult;
 use super::super::model::scope::CompareScope;
 use super::{CompareResultRepository, CompareWorkspaceJobState};
+
+/// The largest identical page a single request may materialize.
+const IDENTICAL_PAGE_LIMIT: usize = 2000;
 
 impl CompareResultRepository {
     /// Keep the freshness lock through a short reservation edge, so a newer verification cannot
@@ -47,6 +50,29 @@ impl CompareResultRepository {
             },
             |retained| Ok(Some(retained)),
         )
+    }
+
+    /// One page of the rows this exact result judged identical. The page size is capped here
+    /// rather than at the caller, so no request can ask for the whole identical table at once.
+    pub(crate) fn identical_page(
+        &self,
+        identity: &CompareIdentity,
+        query: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<IdenticalPage, String> {
+        let retained = self
+            .require_exact(identity)
+            .map_err(|error| error.to_string())?;
+        let (total, rows) = syncdash::pipeline::compare::evidence::identical_page(
+            retained.source(),
+            retained.target(),
+            retained.compare_options(),
+            query,
+            offset,
+            limit.min(IDENTICAL_PAGE_LIMIT),
+        );
+        Ok(IdenticalPage { total, rows })
     }
 
     pub(crate) fn reconcile_exact_workspace(

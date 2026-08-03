@@ -1,10 +1,5 @@
 //! The run-event envelope delivered to a window during a Compare or Apply.
 //!
-//! This was the one type crossing the IPC boundary without a generated contract: the frontend
-//! carried a hand-written mirror that flattened `ProgressEvent` into a wide bag of optional
-//! fields, which meant the discriminated union the engine emits was lost on arrival and every
-//! consumer read `event.phase` on faith.
-//!
 //! `purpose` is an enum rather than a string because it selects which window is allowed to see
 //! the event, and a typo in a string would silently deliver a Compare event to the progress
 //! window.

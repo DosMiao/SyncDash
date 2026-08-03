@@ -15,6 +15,7 @@ pub(crate) enum CompareResultRepositoryError {
         job_id: String,
     },
     DanglingLatestVersion(CompareIdentity),
+    NotRetained,
     AwaitingSuccessfulCompare(CompareScope),
     ResultIsNotExecutionFresh {
         requested_run_id: u64,
@@ -56,6 +57,8 @@ impl std::fmt::Display for CompareResultRepositoryError {
                 "The latest Compare pointer for run {} has no retained version",
                 identity.compare_run_id
             ),
+            Self::NotRetained => formatter
+                .write_str("This exact Compare result is no longer retained — run Compare again"),
             Self::AwaitingSuccessfulCompare(scope) => write!(
                 formatter,
                 "A newer Compare or AutoScan verification started for job '{}' target {} and has not published a successful result — wait for it to succeed or run Compare again",

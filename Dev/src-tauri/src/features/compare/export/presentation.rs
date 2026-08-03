@@ -114,22 +114,8 @@ pub(crate) fn operation_side_paths(operation: &Op) -> (Option<&str>, Option<&str
 
 #[cfg(test)]
 mod tests {
+    use super::super::fixtures::operation;
     use super::*;
-
-    fn operation(action: Action, side: Side, path: &str) -> Op {
-        Op {
-            side,
-            action,
-            path: path.into(),
-            from: None,
-            size: Some(10),
-            mtime_ms: Some(1_700_000_000_000),
-            hash: None,
-            link: None,
-            mode: None,
-            reason: "reviewed".into(),
-        }
-    }
 
     #[test]
     fn row_injection_duplicates_and_invalid_reversals_are_rejected() {
