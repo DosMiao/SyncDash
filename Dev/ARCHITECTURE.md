@@ -87,7 +87,9 @@ Dev/src/
 │       └── version/        format, content caps, writer, retention, and transactional restore
 ├── workflow/
 │   ├── pipeline/
-│   │   ├── scan/local/     model, state, progress, discovery, and stable hashing
+│   │   ├── scan/           the shared row and acceleration-table rules, over two lanes:
+│   │   │                   local/ (state, progress, discovery, stable hashing) and
+│   │   │                   vfs/ (discovery and streamed hashing)
 │   │   ├── compare/        matching, evidence, planning policy, and conflicts
 │   │   ├── guard/caps/     backend limitations, listed before a run and never gating it
 │   │   ├── name_safety.rs  the one Windows name-hazard decision, used by compare and apply
@@ -124,8 +126,11 @@ Within the workflow layer, `pipeline/compare/` separates matching from planning 
 while `transfer/pack/` separates its format, deterministic creation, staging, and application.
 `pipeline/scan/local/discovery/bulk/` separates the macOS traversal loop from the record decoder,
 because a misparsed `getattrlistbulk` record yields a plausible entry rather than an error.
-`pipeline/scan/local/` owns traversal and hashing as sibling capabilities, and
-`pipeline/apply/` keeps plan validation and lease/reporting policy outside the mutation executor.
+`pipeline/scan/local/` and `pipeline/scan/vfs/` each own traversal and hashing as sibling
+capabilities, while the decisions the two lanes are not allowed to answer differently — the row
+under construction, the evidence label it becomes, and how the acceleration tables are read — sit
+above both in `pipeline/scan/model.rs` and `pipeline/scan/state.rs`. `pipeline/apply/` keeps plan
+validation and lease/reporting policy outside the mutation executor.
 Application-level peer orchestration recursively separates connection configuration, probing,
 package lifetime, Compare, Apply policy, and execution. The CLI façade dispatches into
 capability-owned command groups rather than implementing every command in one match.
@@ -192,7 +197,7 @@ Dev/typescript/
 │   ├── domain/             pure compare, job, path, and run logic
 │   ├── application/        pure reducers, authorities, review state, and use-case policy
 │   │                       (compare-workspace/repository/ splits scope index, lookup,
-│   │                       lifecycle, and publication)
+│   │                       lifecycle, publication, and explicit forgetting)
 │   ├── infrastructure/     window-scoped Tauri adapters and durable browser preferences
 │   └── shared/             framework-free formatting helpers
 ├── ui/
@@ -223,7 +228,11 @@ Dev/typescript/
 necessarily re-derived in TypeScript — a direction toggle cannot cost an IPC round trip and a
 six-figure table cannot cost one per keystroke — so Rust emits its own answers there through the
 same `npm run gen:types` path as the wire contracts, and the frontend tests replay them. Rust stays
-the owner; the generated file is what makes that ownership checkable instead of stated.
+the owner; the generated file is what makes that ownership checkable instead of stated. The same
+file carries the compare-policy constants the frontend spells out to the operator, for the same
+reason: a hand-copied engine value is a second owner waiting to disagree. Values that vary per run
+— the mtime equality window, which each comparison widens for coarse backends — are published on
+the result instead and never re-derived.
 
 Dependencies point from `ui -> infrastructure/application -> domain -> generated types`. Domain
 and application code do not import React, Tauri, or browser persistence. All `@tauri-apps` imports
