@@ -1,2 +1,5 @@
 target/
 .operation.lock
+.checkout-id
+.builder-clean-receipt-*
+.builder-general-clean-receipt-*
