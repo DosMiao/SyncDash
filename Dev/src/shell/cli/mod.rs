@@ -4,8 +4,6 @@
 //! capability-owned handlers, while each leaf renders the core result it receives.
 
 pub mod args;
-#[path = "commands/history/logs.rs"]
-pub mod logs;
 
 mod commands;
 mod output;
@@ -17,6 +15,6 @@ use args::Cli;
 pub fn run_cli(cli: Cli) -> std::io::Result<i32> {
     match cli.cmd {
         Some(command) => commands::dispatch(command),
-        None => commands::launch_default_desktop(),
+        None => commands::system::launch_default_desktop(),
     }
 }

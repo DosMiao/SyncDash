@@ -16,10 +16,27 @@ pub mod vfs;
 
 use std::path::Path;
 
-use crate::model::table::TableArtifact;
+use crate::model::table::{TableArtifact, TableEvidence};
 
 use local::scan_local_root_impl;
 use vfs::scan_vfs;
+
+/// The evidence tier a scan actually ran at, from the two facts that decide it.
+///
+/// One mapping, three readers: both lanes stamp it into `TableHeader.evidence`, and
+/// `run::evidence_label` renders the same decision for the archive check and for the peer lane's
+/// `--evidence` argument. `sampled` is passed rather than read off `ScanOptions` because the
+/// generic lane may have been forced down a tier by a backend that cannot do ranged reads; the
+/// header has to record what ran, not what was asked for.
+pub fn evidence_tier(hash: bool, sampled: bool) -> TableEvidence {
+    if !hash {
+        TableEvidence::None
+    } else if sampled {
+        TableEvidence::Sampled
+    } else {
+        TableEvidence::Full
+    }
+}
 
 fn scan_local_path(
     root_path: &Path,
@@ -28,16 +45,8 @@ fn scan_local_path(
     context: Option<(&crate::obs::progress::RunCtx, crate::model::event::Phase)>,
 ) -> std::io::Result<TableArtifact> {
     use crate::fs::vfs::Vfs;
-    let local = crate::fs::vfs::local::LocalVfs::open(root_path.to_path_buf()).map_err(|error| {
-        let error = std::io::Error::from(error);
-        std::io::Error::new(
-            error.kind(),
-            format!(
-                "scan of '{}' could not read the root itself: {error} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
-                root_path.display()
-            ),
-        )
-    })?;
+    let local = crate::fs::vfs::local::LocalVfs::open(root_path.to_path_buf())
+        .map_err(|error| root_unreadable_error(root_path, std::io::Error::from(error)))?;
     scan_local_root_impl(
         local.local_root(),
         options,
@@ -168,6 +177,21 @@ pub fn scan_root(
     }
 }
 
+/// The refusal every lane makes when the root itself cannot be read.
+///
+/// It is one sentence in one place because the alternative — returning the bare I/O error — lets an
+/// unreachable root arrive at compare as an empty table, and an empty table is a mass deletion. The
+/// caller's error `kind()` is preserved so a retry can still classify the failure.
+pub(crate) fn root_unreadable_error(root: &Path, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!(
+            "scan of '{}' could not read the root itself: {error} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
+            root.display()
+        ),
+    )
+}
+
 /// A snapshot's self-description, written by both lanes so they cannot drift.
 ///
 /// `sampled` is passed rather than read off `opt` because the generic lane may have been forced
@@ -248,12 +272,7 @@ mod tests {
     #[test]
     fn scan_ctx_reports_exact_totals() {
         let root = mk_tree("totals", 20);
-        let store: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let s2 = store.clone();
-        let ctx = RunCtx::new(
-            RunCtl::new(),
-            Arc::new(move |ev| s2.lock().unwrap().push(ev)),
-        );
+        let (ctx, store) = RunCtx::collecting();
         let snap = scan_ctx(&root, &opts(), &ctx, Phase::ScanSource).unwrap();
         assert_eq!(
             snap.entries
@@ -306,14 +325,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("large.bin"), vec![7u8; SIZE]).unwrap();
 
-        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let copy = events.clone();
-        let ctx = RunCtx::new(
-            RunCtl::new(),
-            Arc::new(move |event| {
-                copy.lock().unwrap().push(event);
-            }),
-        );
+        let (ctx, events) = RunCtx::collecting();
 
         scan_ctx(&root, &opts(), &ctx, Phase::ScanSource).unwrap();
         assert!(
@@ -372,14 +384,7 @@ mod tests {
         let memory = Arc::new(MemVfs::new("scan-vfs-chunk-progress"));
         memory.seed_file("large.bin", SIZE, 1_700_000_000_000);
         let vfs: Arc<dyn Vfs> = memory;
-        let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let copy = events.clone();
-        let ctx = RunCtx::new(
-            RunCtl::new(),
-            Arc::new(move |event| {
-                copy.lock().unwrap().push(event);
-            }),
-        );
+        let (ctx, events) = RunCtx::collecting();
 
         scan_root(&vfs, &opts(), &ctx, Phase::ScanSource).unwrap();
         assert!(
@@ -462,12 +467,7 @@ mod tests {
     #[test]
     fn no_hash_scan_ends_with_all_discovered_items_done() {
         let root = mk_tree("no-hash-progress", 7);
-        let store: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let s2 = store.clone();
-        let ctx = RunCtx::new(
-            RunCtl::new(),
-            Arc::new(move |ev| s2.lock().unwrap().push(ev)),
-        );
+        let (ctx, store) = RunCtx::collecting();
         let mut opt = opts();
         opt.hash = false;
         scan_ctx(&root, &opt, &ctx, Phase::ScanSource).unwrap();
@@ -535,11 +535,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The reason `scan_impl` aborts instead of counting: walkdir emits a directory before it
-    /// descends, so a directory it cannot read is already in the table with zero children — and
-    /// compare cannot tell "no children" from "children deleted". Under mirror that is a delete
-    /// for every file the other side still holds. On macOS the everyday cause is TCC, not a chmod:
-    /// ~/Desktop, ~/Documents and every external volume are gated by default.
+    /// The reason `local::discovery` aborts instead of counting: a directory is recorded when its
+    /// parent lists it, before the walk descends into it, so a directory that cannot be read is
+    /// already in the table with zero children — and compare cannot tell "no children" from
+    /// "children deleted". Under mirror that is a delete for every file the other side still
+    /// holds. On macOS the everyday cause is TCC, not a chmod: ~/Desktop, ~/Documents and every
+    /// external volume are gated by default.
     #[cfg(unix)]
     #[test]
     fn an_unreadable_subdirectory_aborts_the_scan_rather_than_reading_as_empty() {

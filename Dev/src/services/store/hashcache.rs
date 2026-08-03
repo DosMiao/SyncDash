@@ -11,10 +11,12 @@
 //! pruned without discarding deliberately excluded acceleration state.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::foundation::path::RootRelativePath;
 use crate::model::table::{FileIdentityObservation, ObservedEntry};
+
+use super::scan_state::bound::BoundTable;
 
 const STATE_KIND: &str = "hashcache-v2";
 
@@ -26,18 +28,6 @@ pub struct CachedFileIdentity {
 }
 
 pub type HashCache = HashMap<RootRelativePath, CachedFileIdentity>;
-
-fn logical_file_for_key(key: &str) -> PathBuf {
-    super::scan_state::location::logical_file(key, "jsonl")
-}
-
-fn legacy_logical_file_for_key(key: &str) -> PathBuf {
-    super::scan_state::location::legacy_logical_file(key, "jsonl")
-}
-
-fn local_file_for_key(key: &str) -> PathBuf {
-    super::scan_state::location::local_file(key, "jsonl")
-}
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,85 +46,41 @@ struct CacheLineRef<'a> {
     identity: &'a FileIdentityObservation,
 }
 
-fn read_bound_from_file(
-    file: &Path,
-    binding: &[u8],
-) -> std::io::Result<(HashCache, super::scan_state::ReadStatus)> {
-    let mut map = HashMap::new();
-    let status = super::scan_state::read(file, STATE_KIND, binding, |c: CacheLine| {
-        if c.identity.digest().is_some() {
-            map.insert(
-                c.path,
-                CachedFileIdentity {
-                    size: c.size,
-                    mtime_ms: c.mtime_ms,
-                    identity: c.identity,
-                },
-            );
-        }
-    })?;
-    if status != super::scan_state::ReadStatus::Accepted {
-        map.clear();
+/// A persisted row without a digest has nothing worth accelerating with.
+fn keep_hashed(map: &mut HashCache, line: CacheLine) {
+    if line.identity.digest().is_some() {
+        map.insert(
+            line.path,
+            CachedFileIdentity {
+                size: line.size,
+                mtime_ms: line.mtime_ms,
+                identity: line.identity,
+            },
+        );
     }
-    Ok((map, status))
 }
 
-fn read_bound_best_effort(
-    file: &Path,
-    binding: &[u8],
-) -> Option<(HashCache, super::scan_state::ReadStatus)> {
-    super::scan_state::reporting::report_read(file, read_bound_from_file(file, binding))
-}
-
-fn load_bound_from_file(file: &Path, binding: &[u8]) -> HashCache {
-    read_bound_best_effort(file, binding).map_or_else(HashMap::new, |(map, _)| map)
-}
-
-fn load_logical_from_files(primary: &Path, legacy: &Path, key: &str) -> Option<HashCache> {
-    let binding = super::scan_state::binding::logical_binding(key);
-    let (map, status) = read_bound_best_effort(primary, &binding)?;
-    if status != super::scan_state::ReadStatus::Missing || primary == legacy {
-        return Some(map);
-    }
-    read_bound_best_effort(legacy, &binding).map(|(legacy_map, _)| legacy_map)
-}
+const TABLE: BoundTable<RootRelativePath, CachedFileIdentity, CacheLine> =
+    BoundTable::new(STATE_KIND, "jsonl", keep_hashed);
 
 pub fn load_by_key(key: &str) -> HashCache {
-    let primary = logical_file_for_key(key);
-    let legacy = legacy_logical_file_for_key(key);
-    load_logical_from_files(&primary, &legacy, key).unwrap_or_default()
-}
-
-pub fn load(root: &Path) -> HashCache {
-    let identity = super::localid::LocalScanStateIdentity::for_root(root);
-    load_local(&identity)
+    TABLE.load_by_key(key)
 }
 
 pub(crate) fn load_local(identity: &super::localid::LocalScanStateIdentity) -> HashCache {
-    if !identity.persistent_reuse() {
-        return HashMap::new();
-    }
-    load_bound_from_file(
-        &local_file_for_key(identity.cache_key()),
-        identity.binding(),
-    )
+    TABLE.load_local(identity)
 }
 
 fn rewrite_map(file: &Path, binding: &[u8], map: &HashCache) -> std::io::Result<bool> {
-    let mut rows: Vec<_> = map.iter().collect();
-    rows.sort_unstable_by(|left, right| left.0.cmp(right.0));
-    super::scan_state::rewrite(file, STATE_KIND, binding, |writer| {
-        for (path, cached) in rows {
-            let row = CacheLineRef {
-                path,
-                size: cached.size,
-                mtime_ms: cached.mtime_ms,
-                identity: &cached.identity,
-            };
-            serde_json::to_writer(&mut *writer, &row).map_err(std::io::Error::other)?;
-            writer.write_all(b"\n")?;
-        }
-        Ok(())
+    TABLE.rewrite(file, binding, map, |writer, path, cached| {
+        let row = CacheLineRef {
+            path,
+            size: cached.size,
+            mtime_ms: cached.mtime_ms,
+            identity: &cached.identity,
+        };
+        serde_json::to_writer(&mut *writer, &row).map_err(std::io::Error::other)?;
+        writer.write_all(b"\n")
     })
 }
 
@@ -185,10 +131,9 @@ pub fn save_by_key(
     coverage: super::ScanCoverage,
     retain_absent: &std::collections::HashSet<String>,
 ) -> super::StateWriteStatus {
-    let file = logical_file_for_key(key);
+    let file = TABLE.logical_file(key);
     let prior = if coverage == super::ScanCoverage::Partial || !retain_absent.is_empty() {
-        let legacy = legacy_logical_file_for_key(key);
-        let Some(map) = load_logical_from_files(&file, &legacy, key) else {
+        let Some(map) = TABLE.load_logical(key) else {
             return super::StateWriteStatus::Failed;
         };
         Some(map)
@@ -215,9 +160,9 @@ pub(crate) fn save_local(
     if !identity.persistent_reuse() {
         return super::StateWriteStatus::Unchanged;
     }
-    let file = local_file_for_key(identity.cache_key());
+    let file = TABLE.local_file(identity.cache_key());
     let prior = if coverage == super::ScanCoverage::Partial || !retain_absent.is_empty() {
-        let Some((map, _)) = read_bound_best_effort(&file, identity.binding()) else {
+        let Some((map, _)) = TABLE.read_best_effort(&file, identity.binding()) else {
             return super::StateWriteStatus::Failed;
         };
         Some(map)
@@ -240,6 +185,7 @@ mod tests {
     use super::*;
     use crate::model::digest::Blake3Digest;
     use crate::model::table::ObservedFile;
+    use std::path::PathBuf;
 
     fn temp_file(tag: &str) -> PathBuf {
         let directory =
@@ -302,7 +248,7 @@ mod tests {
             &binding,
             &[entry("a.txt", Some("aaa")), entry("b.txt", None)],
         );
-        let back = load_bound_from_file(&file, &binding);
+        let back = TABLE.load_file(&file, &binding);
         assert_eq!(cached_digest(&back, "a.txt"), Some(digest("aaa").as_str()));
         assert!(
             !back.contains_key("b.txt"),
@@ -335,11 +281,12 @@ mod tests {
             "{\"path\":\"old.txt\",\"size\":7,\"mtime_ms\":99,\"hash\":\"old-hash\"}\n",
         )
         .unwrap();
-        assert!(load_bound_from_file(
-            &file,
-            &crate::store::scan_state::binding::logical_binding(key)
-        )
-        .is_empty());
+        assert!(TABLE
+            .load_file(
+                &file,
+                &crate::store::scan_state::binding::logical_binding(key)
+            )
+            .is_empty());
         cleanup(&file);
     }
 
@@ -349,10 +296,10 @@ mod tests {
         let first = crate::store::scan_state::binding::logical_binding("root-a");
         let second = crate::store::scan_state::binding::logical_binding("root-b");
         write_complete(&file, &first, &[entry("a.txt", Some("aaa"))]);
-        assert!(load_bound_from_file(&file, &second).is_empty());
+        assert!(TABLE.load_file(&file, &second).is_empty());
 
         write_complete(&file, &second, &[entry("b.txt", Some("bbb"))]);
-        let rebuilt = load_bound_from_file(&file, &second);
+        let rebuilt = TABLE.load_file(&file, &second);
         assert_eq!(
             cached_digest(&rebuilt, "b.txt"),
             Some(digest("bbb").as_str())
@@ -374,17 +321,14 @@ mod tests {
         let different_user = identity("sftp://user@host/Share");
         let different_root = identity("sftp://User@host/share");
         assert_eq!(canonical, same);
-        assert_eq!(
-            logical_file_for_key(&canonical),
-            logical_file_for_key(&same)
+        assert_eq!(TABLE.logical_file(&canonical), TABLE.logical_file(&same));
+        assert_ne!(
+            TABLE.logical_file(&canonical),
+            TABLE.logical_file(&different_user)
         );
         assert_ne!(
-            logical_file_for_key(&canonical),
-            logical_file_for_key(&different_user)
-        );
-        assert_ne!(
-            logical_file_for_key(&canonical),
-            logical_file_for_key(&different_root)
+            TABLE.logical_file(&canonical),
+            TABLE.logical_file(&different_root)
         );
         assert_ne!(
             crate::store::scan_state::binding::logical_binding(&canonical),
@@ -392,40 +336,20 @@ mod tests {
         );
     }
 
+    /// Pre-versioning generations bound themselves to the raw identity bytes. The current binding
+    /// is domain-separated, so such a file is another root's state as far as a read is concerned.
     #[test]
-    fn legacy_filename_is_used_only_with_an_exact_bound_header() {
-        let primary = temp_file("logical-primary");
-        let legacy = primary.parent().unwrap().join("legacy.jsonl");
-        let key = "sftp://User@host:22/Share";
-        let exact = crate::store::scan_state::binding::logical_binding(key);
-        write_complete(&legacy, &exact, &[entry("a.txt", Some("exact"))]);
-        let migrated = load_logical_from_files(&primary, &legacy, key).unwrap();
-        assert_eq!(
-            cached_digest(&migrated, "a.txt"),
-            Some(digest("exact").as_str())
-        );
-
-        let folded = key.to_lowercase().into_bytes();
-        write_complete(&legacy, &folded, &[entry("a.txt", Some("ambiguous"))]);
-        assert!(load_logical_from_files(&primary, &legacy, key)
-            .unwrap()
-            .is_empty());
-        cleanup(&primary);
-    }
-
-    #[test]
-    fn old_folded_header_cannot_impersonate_an_all_lowercase_identity() {
-        let primary = temp_file("logical-lowercase");
+    fn a_raw_identity_header_cannot_impersonate_a_domain_separated_one() {
+        let file = temp_file("raw-identity");
         let key = "sftp://user@host:22/share";
-        write_complete(
-            &primary,
-            key.as_bytes(),
-            &[entry("a.txt", Some("ambiguous"))],
-        );
-        assert!(load_logical_from_files(&primary, &primary, key)
-            .unwrap()
+        write_complete(&file, key.as_bytes(), &[entry("a.txt", Some("ambiguous"))]);
+        assert!(TABLE
+            .load_file(
+                &file,
+                &crate::store::scan_state::binding::logical_binding(key)
+            )
             .is_empty());
-        cleanup(&primary);
+        cleanup(&file);
     }
 
     #[test]
@@ -441,7 +365,7 @@ mod tests {
             ],
         );
 
-        let prior = load_bound_from_file(&file, binding);
+        let prior = TABLE.load_file(&file, binding);
         reconcile_bound_to_file(
             &file,
             binding,
@@ -451,7 +375,7 @@ mod tests {
             &std::collections::HashSet::new(),
         )
         .unwrap();
-        let partial = load_bound_from_file(&file, binding);
+        let partial = TABLE.load_file(&file, binding);
         assert_eq!(
             cached_digest(&partial, "visible.txt"),
             Some(digest("new").as_str())
@@ -470,7 +394,7 @@ mod tests {
             &std::collections::HashSet::new(),
         )
         .unwrap();
-        let complete = load_bound_from_file(&file, binding);
+        let complete = TABLE.load_file(&file, binding);
         assert!(!complete.contains_key("excluded.txt"));
         cleanup(&file);
     }
@@ -488,7 +412,7 @@ mod tests {
                 entry(".syncdash/state", Some("self")),
             ],
         );
-        let prior = load_bound_from_file(&file, binding);
+        let prior = TABLE.load_file(&file, binding);
         let retain = std::collections::HashSet::from([
             "excluded/keep.txt".to_string(),
             ".syncdash/state".to_string(),
@@ -504,7 +428,7 @@ mod tests {
         )
         .unwrap();
 
-        let back = load_bound_from_file(&file, binding);
+        let back = TABLE.load_file(&file, binding);
         assert!(!back.contains_key("deleted-in-scope.txt"));
         assert!(back.contains_key("excluded/keep.txt"));
         assert!(back.contains_key(".syncdash/state"));
@@ -516,7 +440,7 @@ mod tests {
         let file = temp_file("unhashed");
         let binding = b"unhashed-root";
         write_complete(&file, binding, &[entry("changed.txt", Some("old"))]);
-        let prior = load_bound_from_file(&file, binding);
+        let prior = TABLE.load_file(&file, binding);
         reconcile_bound_to_file(
             &file,
             binding,
@@ -526,7 +450,7 @@ mod tests {
             &std::collections::HashSet::new(),
         )
         .unwrap();
-        assert!(load_bound_from_file(&file, binding).is_empty());
+        assert!(TABLE.load_file(&file, binding).is_empty());
         cleanup(&file);
     }
 
@@ -540,9 +464,9 @@ mod tests {
         let second = crate::store::localid::LocalScanStateIdentity::for_root(&roots.join("b"));
 
         write_complete(&file, first.binding(), &[entry("a.txt", Some("aaa"))]);
-        assert!(load_bound_from_file(&file, second.binding()).is_empty());
+        assert!(TABLE.load_file(&file, second.binding()).is_empty());
         assert_eq!(
-            cached_digest(&load_bound_from_file(&file, first.binding()), "a.txt"),
+            cached_digest(&TABLE.load_file(&file, first.binding()), "a.txt"),
             Some(digest("aaa").as_str())
         );
         cleanup(&file);
@@ -566,7 +490,7 @@ mod tests {
             binding.clone(),
             false,
         );
-        let file = local_file_for_key(&key);
+        let file = TABLE.local_file(&key);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         write_complete(
             &file,
@@ -604,14 +528,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(load_bound_from_file(&file, identity.binding()).is_empty());
+        assert!(TABLE.load_file(&file, identity.binding()).is_empty());
 
         write_complete(
             &file,
             identity.binding(),
             &[entry("fresh.txt", Some("fresh"))],
         );
-        let rebuilt = load_bound_from_file(&file, identity.binding());
+        let rebuilt = TABLE.load_file(&file, identity.binding());
         assert!(!rebuilt.contains_key("stale.txt"));
         assert_eq!(
             cached_digest(&rebuilt, "fresh.txt"),
@@ -633,7 +557,7 @@ mod tests {
     fn the_cache_key_formula_is_pinned_to_the_pre_vfs_one() {
         let root = r"D:\Some\Root";
         let expected_stem = &blake3::hash(root.to_lowercase().as_bytes()).to_hex()[..16];
-        let got = local_file_for_key(&std::path::PathBuf::from(root).to_string_lossy());
+        let got = TABLE.local_file(&std::path::PathBuf::from(root).to_string_lossy());
         assert_eq!(
             got.file_name().unwrap().to_string_lossy(),
             format!("{expected_stem}.jsonl")
@@ -644,7 +568,7 @@ mod tests {
     fn an_absent_cache_is_empty_rather_than_an_error() {
         let file = temp_file("absent");
         std::fs::remove_file(&file).unwrap_or(());
-        assert!(load_bound_from_file(&file, b"absent").is_empty());
+        assert!(TABLE.load_file(&file, b"absent").is_empty());
         cleanup(&file);
     }
 }

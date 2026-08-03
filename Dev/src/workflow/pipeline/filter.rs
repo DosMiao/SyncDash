@@ -293,7 +293,7 @@ impl PathFilter {
     /// Does this path hit a `!` exception
     fn is_excepted(&self, path_upper: &str, parent: Option<&str>) -> bool {
         self.except.file_masks.matches(path_upper, false)
-            || parent.map_or(false, |pp| self.except.folder_masks.matches(pp, true))
+            || parent.is_some_and(|pp| self.except.folder_masks.matches(pp, true))
     }
 
     /// rel is '/'-separated with no leading separator
@@ -306,12 +306,12 @@ impl PathFilter {
         let parent = path.rfind('/').map(|i| &path[..i]);
         if !self.is_excepted(&path, parent)
             && (self.exclude.file_masks.matches(&path, false)
-                || parent.map_or(false, |pp| self.exclude.folder_masks.matches(pp, true)))
+                || parent.is_some_and(|pp| self.exclude.folder_masks.matches(pp, true)))
         {
             return false;
         }
         self.include.file_masks.matches(&path, false)
-            || parent.map_or(false, |pp| self.include.folder_masks.matches(pp, true))
+            || parent.is_some_and(|pp| self.include.folder_masks.matches(pp, true))
     }
 
     /// Returns (does the dir itself enter the table, might a child match — decides whether to descend)
@@ -342,7 +342,7 @@ impl PathFilter {
         let path = crate::foundation::text::fold(rel);
         let parent = path.rfind('/').map(|i| &path[..i]);
         self.deletable.file_masks.matches(&path, false)
-            || parent.map_or(false, |pp| self.deletable.folder_masks.matches(pp, true))
+            || parent.is_some_and(|pp| self.deletable.folder_masks.matches(pp, true))
     }
 }
 
@@ -371,7 +371,7 @@ pub fn mask_hits(masks: &[String], rels: &[String]) -> Vec<bool> {
             set.file_masks.matches(&path, false)
                 || parent
                     .as_deref()
-                    .map_or(false, |pp| set.folder_masks.matches(pp, true))
+                    .is_some_and(|pp| set.folder_masks.matches(pp, true))
         })
         .collect()
 }

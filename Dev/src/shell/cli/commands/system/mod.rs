@@ -13,6 +13,6 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
     }
 }
 
-pub(super) fn launch_default_desktop() -> std::io::Result<i32> {
+pub(in crate::cli) fn launch_default_desktop() -> std::io::Result<i32> {
     desktop::launch_default()
 }

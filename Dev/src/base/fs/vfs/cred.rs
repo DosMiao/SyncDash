@@ -9,11 +9,10 @@
 //! `syncdash cred ls` lists.
 
 use std::io::Write as _;
-use std::sync::Arc;
 
 use super::error::{VfsError, VfsErrorKind, VfsResult};
 use super::spec::{default_port, EndpointSpec};
-use super::{CredentialProvider, Credentials};
+use super::Credentials;
 
 const SERVICE: &str = "syncdash";
 
@@ -133,38 +132,31 @@ fn index_remove(account: &str) {
     write_index(v);
 }
 
-// ---- the engine-side provider ----
+// ---- what the engine lanes resolve ----
 
-/// Keyring-backed, prompt-free. What the engine lanes use: a phrase's own options
-/// (keyfile, agent) pass through, the password comes from the OS store when present.
-/// It never prompts and never invents — a backend that still lacks a required secret
-/// raises `Auth` naming `syncdash cred set "<phrase>"` as the remedy, which is exactly
-/// the behavior a headless/watch run needs.
-pub struct KeyringProvider;
-
-impl CredentialProvider for KeyringProvider {
-    fn credentials_for(&self, spec: &EndpointSpec) -> VfsResult<Credentials> {
-        let keyfile = spec.opt("key").map(expand_tilde);
-        let password = match account_for(spec) {
-            Some(acc) => get_secret(&acc)?,
-            None => None,
-        };
-        let passphrase = match &keyfile {
-            Some(k) => get_secret(&passphrase_account(k))?,
-            None => None,
-        };
-        Ok(Credentials {
-            password,
-            keyfile,
-            passphrase,
-            use_agent: spec.has_flag("agent"),
-            anonymous: spec.user.as_deref() == Some("anonymous"),
-        })
-    }
-}
-
-pub fn default_provider() -> Arc<dyn CredentialProvider> {
-    Arc::new(KeyringProvider)
+/// The credentials for an endpoint, read from the OS store and never prompted for.
+///
+/// A phrase's own options (keyfile, agent) pass through and the password comes from the store
+/// when present. This never prompts and never invents: a backend that still lacks a required
+/// secret raises `Auth` naming `syncdash cred set "<phrase>"` as the remedy, which is what a
+/// headless or watch run needs. Backends call it lazily at connect time, so a root that is never
+/// reached never touches the store.
+pub fn credentials_for(spec: &EndpointSpec) -> VfsResult<Credentials> {
+    let keyfile = spec.opt("key").map(expand_tilde);
+    let password = match account_for(spec) {
+        Some(acc) => get_secret(&acc)?,
+        None => None,
+    };
+    let passphrase = match &keyfile {
+        Some(k) => get_secret(&passphrase_account(k))?,
+        None => None,
+    };
+    Ok(Credentials {
+        password,
+        keyfile,
+        passphrase,
+        use_agent: spec.has_flag("agent"),
+    })
 }
 
 /// `~/x` in a phrase option means the *local* home (keyfiles live on this machine).
@@ -207,9 +199,8 @@ mod tests {
         assert!(a.starts_with("sftp-pass://"));
     }
 
-    /// Touches the real OS credential store — run explicitly with `--ignored` once per machine.
     #[test]
-    #[ignore]
+    #[ignore = "touches the real OS credential store; run explicitly once per machine"]
     fn os_store_roundtrip() {
         let acc = "test://syncdash-selftest@localhost:1";
         set_secret(acc, "s3cret").unwrap();

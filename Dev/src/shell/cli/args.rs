@@ -47,7 +47,7 @@ pub enum Cmd {
         apply: bool,
         #[arg(short, long)]
         verbose: bool,
-        /// M6 watch: loop compare → (on differences, in auto mode) apply → sleep. Ctrl-C to stop
+        /// Watch: loop compare → (on differences, in auto mode) apply → sleep. Ctrl-C to stop
         #[arg(long)]
         watch: bool,
         /// Watch interval in seconds (defaults to the job's autoscan_interval_secs, then 30)
@@ -84,12 +84,6 @@ pub enum Cmd {
         /// Detail override: hash cache on | off (overrides the preset)
         #[arg(long)]
         cache: Option<String>,
-        /// [legacy flag] Ignore the cache and re-read everything
-        #[arg(long)]
-        force_rehash: bool,
-        /// [legacy flag] Sampling + cache (≈ --rigor fast)
-        #[arg(long)]
-        fast: bool,
         /// Record the symlink itself (its target string); symlinks are ignored by default
         #[arg(long)]
         symlinks_direct: bool,

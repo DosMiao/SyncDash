@@ -1,8 +1,15 @@
-//! Human-facing number formatting.
+//! Human-facing rendering shared by every command that reports what a run did.
 //!
 //! Units are KiB/MiB/GiB (base 1024, named for base 1024).
 //! `Dev/typescript/core/shared/format.ts` mirrors this
 //! rendering for the GUI; the two must agree, or one byte count reads two ways.
+
+/// What a command reports in place of its action verb when nothing was written.
+///
+/// Dry-run is the default for every writing command, so the same sentence has to name the same
+/// escape hatch everywhere: a summary that says "dry-run" without naming `--apply` reads as a
+/// failure, and one that names a flag the command does not have is worse.
+pub const DRY_RUN_HINT: &str = "dry-run (rerun with --apply)";
 
 /// Byte count → `1.5 MiB`. Under 1 KiB there are no decimals, just `938 B`.
 pub fn human_bytes(n: u64) -> String {

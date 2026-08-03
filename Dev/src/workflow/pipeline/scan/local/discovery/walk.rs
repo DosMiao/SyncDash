@@ -6,6 +6,8 @@ use crate::foundation::path::{RootRelativeDir, RootRelativePath};
 use crate::fs::local_root::LocalRoot;
 use crate::pipeline::filter::PathFilter;
 
+use super::{as_directory, child_path, subtree_error};
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum WalkKind {
     Dir,
@@ -126,12 +128,9 @@ where
         let mut children = match root.read_directory(&directory) {
             Ok(children) => children,
             Err(error) if directory.as_str().is_empty() => {
-                return Err(std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "scan of '{}' could not read the root itself: {error} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
-                        root.display_path().display()
-                    ),
+                return Err(crate::pipeline::scan::root_unreadable_error(
+                    root.display_path(),
+                    error,
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -146,7 +145,7 @@ where
 
         for child in children {
             checkpoint()?;
-            let relative = child_path(&directory, child.name.as_str());
+            let relative = child_path(&directory, &child.name);
             let relative_text = relative.as_str();
             let kind = kind_from_metadata(&child.metadata);
             let keep = match kind {
@@ -186,32 +185,10 @@ where
                 dataless,
             ));
             if kind == WalkKind::Dir {
-                directories.push(
-                    RootRelativeDir::new(relative.into_string())
-                        .expect("a validated child path is a valid directory path"),
-                );
+                directories.push(as_directory(relative));
             }
         }
     }
 
     Ok(stats)
-}
-
-fn child_path(directory: &RootRelativeDir, name: &str) -> RootRelativePath {
-    let relative = if directory.as_str().is_empty() {
-        name.to_owned()
-    } else {
-        format!("{}/{name}", directory.as_str())
-    };
-    RootRelativePath::new(relative).expect("validated directory and entry names form a valid path")
-}
-
-fn subtree_error(root: &LocalRoot, relative: &str, error: std::io::Error) -> std::io::Error {
-    std::io::Error::new(
-        error.kind(),
-        format!(
-            "scan of '{}' aborted at '{relative}': {error} — refusing to emit a half table (its missing subtrees would read as deletions)",
-            root.display_path().display()
-        ),
-    )
 }

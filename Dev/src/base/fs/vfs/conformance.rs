@@ -32,7 +32,6 @@ fn write_file(v: &Arc<dyn Vfs>, rel: &str, content: &[u8], mtime_ms: Option<i64>
         v.mkdir_all(parent).expect("mkdir_all");
     }
     let hint = WriteHint {
-        size_hint: Some(content.len() as u64),
         mtime_ms,
         mode: None,
     };
@@ -475,12 +474,11 @@ mod suite {
         let Ok(base_url) = std::env::var("SYNCDASH_SMB_URL") else {
             panic!("set SYNCDASH_SMB_URL to an smb://user@host/share/subdir phrase");
         };
-        let creds = crate::fs::vfs::cred::default_provider();
         let open = |url: &str| -> Arc<dyn Vfs> {
             let RootSpec::Endpoint(spec) = parse(url) else {
                 panic!("'{url}' is not an smb:// phrase");
             };
-            let b = SmbBackend::new(spec, creds.clone())
+            let b = SmbBackend::new(spec)
                 .unwrap_or_else(|e| panic!("building a backend for '{url}': {e}"));
             b.connect()
                 .unwrap_or_else(|e| panic!("connecting to '{url}': {e}"));

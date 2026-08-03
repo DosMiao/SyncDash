@@ -46,10 +46,7 @@ mod tests {
             deletes: 60,
             ..Default::default()
         };
-        let mut v = Verdict {
-            blockers: vec![],
-            warnings: vec![],
-        };
+        let mut v = Verdict::default();
         check_delete_ratio("target", &side, 100, &Guards::default(), &mut v);
         assert!(v.ok(), "a deletion share must never refuse the run");
         assert_eq!(v.warnings.len(), 1, "and it must always be reported");
@@ -62,10 +59,7 @@ mod tests {
             deletes: 3,
             ..Default::default()
         };
-        let mut v = Verdict {
-            blockers: vec![],
-            warnings: vec![],
-        };
+        let mut v = Verdict::default();
         check_delete_ratio("target", &side, 1000, &Guards::default(), &mut v);
         assert!(v.ok());
     }

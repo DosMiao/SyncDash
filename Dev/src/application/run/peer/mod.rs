@@ -16,10 +16,6 @@ mod probe;
 #[cfg(test)]
 mod tests;
 
-pub use apply::{
-    apply_capabilities, apply_peer_job_with, apply_peer_job_with_classified, preflight_peer_job,
-};
+pub use apply::{apply_capabilities, apply_peer_job_with_classified, preflight_peer_job};
 pub use compare::compare_peer_job_detailed;
-pub use controller::{run_peer_job, run_peer_job_with};
-pub use link::PeerLink;
-pub use probe::probe_peer;
+pub use controller::run_peer_job;

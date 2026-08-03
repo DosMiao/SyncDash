@@ -6,7 +6,8 @@
 //! enough to make `obs` and `store` mutually dependent.
 //!
 //! These types are exported to TypeScript by ts-rs, so they are the IPC contract as well:
-//! `ProgressEvent` is a discriminated union tagged on `kind`.
+//! `ProgressEvent` is a discriminated union tagged on `kind`, and it reaches the webview
+//! flattened into the desktop's `RunEventDto` rather than as a binding of its own.
 //!
 //! The transport (sinks, the registry) and the control plane (cancel/pause) stay in `obs`.
 
@@ -50,7 +51,6 @@ pub enum Phase {
     Apply,
     Pack,
     Ship,
-    Verify,
     /// Rescan after a successful Apply, before the refreshed archive is persisted.
     Refresh,
     /// Persist the refreshed sync archive after its source rescan completes.
@@ -69,8 +69,9 @@ pub enum PhaseStatus {
     Cancelled,
 }
 
+/// Not exported as a standalone binding: the desktop wire type flattens it into `RunEventDto`,
+/// so ts-rs inlines every variant there and a separate `ProgressEvent.ts` would have no importer.
 #[derive(Clone, Debug, Serialize, ts_rs::TS)]
-#[cfg_attr(feature = "export-types", ts(export))]
 #[ts(export_to = "../Dev/typescript/core/types/generated/")]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProgressEvent {

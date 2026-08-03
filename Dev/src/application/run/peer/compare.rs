@@ -31,29 +31,14 @@ pub fn compare_peer_job_detailed(
     let t = TableArtifact::read_snapshot(std::io::BufReader::new(&table_bytes[..]))?;
     pp_rs.finish()?;
 
-    let mut v = crate::pipeline::guard::Verdict {
-        blockers: Vec::new(),
-        warnings: Vec::new(),
-    };
+    let mut v = crate::pipeline::guard::Verdict::default();
     crate::pipeline::guard::roots::check_root(
         "source",
         configuration.source_path(),
         configuration.require_marker,
         &mut v,
     );
-    for w in &v.warnings {
-        ctx.log(
-            crate::model::event::LogLevel::Warn,
-            "compare",
-            format!("[{name}] warning: {w}"),
-        );
-    }
-    if !v.ok() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            v.blockers.join("; "),
-        ));
-    }
+    crate::run::fail_on_root_blockers(&v, ctx, Some(name))?;
     let options = scan_opts(configuration);
     let s = scan::scan_ctx(
         configuration.source_path(),

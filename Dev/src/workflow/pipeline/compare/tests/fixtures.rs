@@ -52,10 +52,19 @@ pub(super) fn snap(os: &str, entries: Vec<ObservedEntry>) -> TableArtifact {
     }
 }
 pub(super) fn file(path: &str, hash: &str) -> ObservedEntry {
+    file_with_metadata(path, hash, 1, 0)
+}
+/// A file carrying both measured values, for the suites that assert per-side size and mtime.
+pub(super) fn file_with_metadata(
+    path: &str,
+    hash: &str,
+    size: u64,
+    mtime_ms: i64,
+) -> ObservedEntry {
     ObservedEntry::File(ObservedFile {
         path: RootRelativePath::try_from(path).unwrap(),
-        size: 1,
-        mtime_ms: 0,
+        size,
+        mtime_ms,
         identity: FileIdentityObservation::FullBlake3 {
             digest: digest(hash),
         },
@@ -136,5 +145,3 @@ pub(super) fn actions(plan: &Plan) -> Vec<(&str, &str)> {
         })
         .collect()
 }
-
-// Empty files and ambiguous move pairing.

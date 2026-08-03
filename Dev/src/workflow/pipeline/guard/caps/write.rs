@@ -29,10 +29,11 @@ pub fn cap_report_write(
     use crate::fs::vfs::Support;
     let mut r = CapReport::default();
 
-    for (side, side_tag, caps, local) in [
-        (Side::Source, "source", src, q.src_local),
-        (Side::Target, "target", tgt, q.tgt_local),
+    for (side, caps, local) in [
+        (Side::Source, src, q.src_local),
+        (Side::Target, tgt, q.tgt_local),
     ] {
+        let side_tag = side.as_str();
         // Apply acquires both root leases before it mutates either side, so this item is not
         // conditional on this particular side having a visible operation in the plan.
         if caps.exclusive_staged_file_publish != Support::Yes {

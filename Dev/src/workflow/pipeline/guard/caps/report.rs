@@ -50,19 +50,9 @@ pub struct CapReport {
 
 impl CapReport {
     pub fn unavailable(&self) -> Vec<&CapItem> {
-        self.with_severity(CapSeverity::Unavailable)
-    }
-    pub fn degraded(&self) -> Vec<&CapItem> {
-        self.with_severity(CapSeverity::Degraded)
-    }
-    pub fn informational(&self) -> Vec<&CapItem> {
-        self.with_severity(CapSeverity::Info)
-    }
-
-    fn with_severity(&self, severity: CapSeverity) -> Vec<&CapItem> {
         self.items
             .iter()
-            .filter(|item| item.severity == severity)
+            .filter(|item| item.severity == CapSeverity::Unavailable)
             .collect()
     }
 
@@ -70,7 +60,7 @@ impl CapReport {
     /// within a severity so that adding a backend probe cannot reshuffle the rest of the list.
     pub fn listed(&self) -> Vec<&CapItem> {
         let mut items: Vec<&CapItem> = self.items.iter().collect();
-        items.sort_by(|left, right| right.severity.cmp(&left.severity));
+        items.sort_by_key(|right| std::cmp::Reverse(right.severity));
         items
     }
 }

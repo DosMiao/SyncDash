@@ -78,11 +78,7 @@ pub(in crate::pipeline::apply::execute) fn apply_commit_report(
     report: crate::fs::vfs::CommitReport,
     pp: &PhaseProgress<'_>,
 ) -> std::io::Result<()> {
-    let side = if op.side == Side::Target {
-        "target"
-    } else {
-        "source"
-    };
+    let side = op.side.as_str();
     if let Some(want) = intended_mtime_ms {
         if let Some(got) = report.mtime_ondisk_ms {
             if got != want {
@@ -366,7 +362,6 @@ pub(in crate::pipeline::apply::execute) fn copy_claimed_move(
 
     pp.add_total_bytes(moving.size);
     let hint = WriteHint {
-        size_hint: Some(moving.size),
         mtime_ms: op.mtime_ms.or(Some(moving.mtime_ms)),
         mode: op.mode.or(moving.mode),
     };

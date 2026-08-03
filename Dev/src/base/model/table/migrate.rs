@@ -196,7 +196,7 @@ fn migrate_evidence(
             entry
                 .hash
                 .as_deref()
-                .is_some_and(|hash| crate::model::digest::is_sampled_digest(hash))
+                .is_some_and(crate::model::digest::is_sampled_digest)
         }) =>
         {
             TableEvidence::Sampled

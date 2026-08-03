@@ -1,3 +1,14 @@
+use super::codec::{legacy_record_id, parse_current_record};
+use super::migration::{
+    ensure_current_schema_locked, migrate_current_schema_locked, migrate_legacy_record,
+};
+use super::model::{LegacyRunRecord, RUN_RECORD_SCHEMA};
+use super::paths::{run_identifier, sanitize};
+use super::recording::{create_run_dir, pending_record};
+use super::repository::{
+    artifact_lines_at, history_at, history_merged_at, with_validated_reveal_target_at,
+};
+use super::retention::{prune_at, sweep_orphans};
 use super::*;
 use std::collections::HashMap;
 

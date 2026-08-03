@@ -7,12 +7,22 @@ use crate::model::digest::Blake3Digest;
 /// Read granularity, and therefore how often cancel and pause are honored mid-file.
 const READ_CHUNK: u64 = 8 * 1024 * 1024;
 
+/// The file a content read is about, together with the identity that read is only valid for.
+///
+/// The five values travel as one because the post-read verification is what makes the digest
+/// trustworthy: a read that returns a hash without proving the bytes still belong to the size,
+/// mtime, and inode the walk recorded has produced evidence for a file that no longer exists.
+/// Threading them separately let a caller supply four of the five.
+pub(in crate::pipeline::scan::local) struct LocalFileRead<'a> {
+    pub root: &'a LocalRoot,
+    pub relative: &'a RootRelativePath,
+    pub size: u64,
+    pub raw_mtime_ms: i64,
+    pub expected_file_id: Option<&'a str>,
+}
+
 pub(in crate::pipeline::scan::local) fn full_hash_with_buffer<C, P>(
-    root: &LocalRoot,
-    relative: &RootRelativePath,
-    size: u64,
-    raw_mtime_ms: i64,
-    expected_file_id: Option<&str>,
+    target: &LocalFileRead<'_>,
     buffer: &mut Vec<u8>,
     mut checkpoint: C,
     mut on_read: P,
@@ -23,7 +33,8 @@ where
 {
     use std::io::Read;
 
-    let mut file = root.open_read(relative)?;
+    let size = target.size;
+    let mut file = target.root.open_read(target.relative)?;
     let width = size.clamp(1, READ_CHUNK) as usize;
     if buffer.len() < width {
         buffer.resize(width, 0);
@@ -47,46 +58,39 @@ where
         on_read(count as u64);
         remaining -= count as u64;
     }
-    verify_opened_file(&file, size, raw_mtime_ms, expected_file_id)?;
-    verify_current_file(root, relative, size, raw_mtime_ms, expected_file_id)?;
+    verify_opened_file(&file, target)?;
+    verify_current_file(target)?;
     Ok(Blake3Digest::from_hash(hasher.finalize()))
 }
 
 pub(super) fn sampled_hash_with_buffer<P>(
-    root: &LocalRoot,
-    relative: &RootRelativePath,
-    size: u64,
-    raw_mtime_ms: i64,
-    expected_file_id: Option<&str>,
+    target: &LocalFileRead<'_>,
     buffer: &mut Vec<u8>,
     on_read: P,
 ) -> std::io::Result<Blake3Digest>
 where
     P: FnMut(u64),
 {
-    let mut file = root.open_read(relative)?;
-    let digest =
-        crate::pipeline::scan::digest::sampled_digest_stream(&mut file, size, buffer, on_read);
-    let digest = match digest {
-        Ok(value) => value,
-        Err(error) => return Err(error),
-    };
-    verify_opened_file(&file, size, raw_mtime_ms, expected_file_id)?;
-    verify_current_file(root, relative, size, raw_mtime_ms, expected_file_id)?;
+    let mut file = target.root.open_read(target.relative)?;
+    let digest = crate::pipeline::scan::digest::sampled_digest_stream(
+        &mut file,
+        target.size,
+        buffer,
+        on_read,
+    )?;
+    verify_opened_file(&file, target)?;
+    verify_current_file(target)?;
     Ok(digest)
 }
 
-fn verify_opened_file(
-    file: &std::fs::File,
-    size: u64,
-    raw_mtime_ms: i64,
-    expected_file_id: Option<&str>,
-) -> std::io::Result<()> {
+/// The handle the bytes were read through still describes the recorded identity.
+fn verify_opened_file(file: &std::fs::File, target: &LocalFileRead<'_>) -> std::io::Result<()> {
     let metadata = file.metadata()?;
     if !metadata.is_file()
-        || metadata.len() != size
-        || standard_mtime_ms(&metadata) != raw_mtime_ms
-        || expected_file_id
+        || metadata.len() != target.size
+        || standard_mtime_ms(&metadata) != target.raw_mtime_ms
+        || target
+            .expected_file_id
             .is_some_and(|expected| standard_file_id(&metadata).as_deref() != Some(expected))
     {
         return Err(std::io::Error::other(
@@ -96,18 +100,16 @@ fn verify_opened_file(
     Ok(())
 }
 
-fn verify_current_file(
-    root: &LocalRoot,
-    relative: &RootRelativePath,
-    size: u64,
-    raw_mtime_ms: i64,
-    expected_file_id: Option<&str>,
-) -> std::io::Result<()> {
-    let metadata = root.metadata_path(relative)?;
+/// …and so does the name, re-stated through the capability root. Both checks are needed: the
+/// handle cannot see a replacement published under the same path, and the path cannot see a
+/// truncation of the object that was actually read.
+fn verify_current_file(target: &LocalFileRead<'_>) -> std::io::Result<()> {
+    let metadata = target.root.metadata_path(target.relative)?;
     if !metadata.is_file()
-        || metadata.len() != size
-        || capability_mtime_ms(&metadata) != raw_mtime_ms
-        || expected_file_id
+        || metadata.len() != target.size
+        || capability_mtime_ms(&metadata) != target.raw_mtime_ms
+        || target
+            .expected_file_id
             .is_some_and(|expected| capability_file_id(&metadata).as_deref() != Some(expected))
     {
         return Err(std::io::Error::other(

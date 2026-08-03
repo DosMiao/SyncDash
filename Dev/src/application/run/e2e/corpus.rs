@@ -35,7 +35,6 @@ pub fn write_bytes(vfs: &Arc<dyn Vfs>, path: &str, content: &[u8], mtime_ms: i64
         vfs.mkdir_all(parent).unwrap();
     }
     let hint = WriteHint {
-        size_hint: Some(content.len() as u64),
         mtime_ms: Some(mtime_ms),
         mode: None,
     };

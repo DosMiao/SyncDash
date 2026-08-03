@@ -181,11 +181,6 @@ impl SingleTargetJob {
     pub fn target(&self) -> &str {
         &self.configuration.targets[0]
     }
-
-    /// The target root as a filesystem path (valid for local roots; VFS roots use `vfs::open`).
-    pub fn target_path(&self) -> &Path {
-        Path::new(self.target())
-    }
 }
 
 pub(super) fn default_schema() -> u32 {

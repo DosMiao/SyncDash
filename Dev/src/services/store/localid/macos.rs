@@ -4,7 +4,9 @@
 //! the set of code compiled on each platform is unchanged.
 
 #[cfg(target_os = "macos")]
-use super::{named_filesystem_has_stable_file_ids, unix::device_root, PlatformIdentity};
+use super::{unix::device_root, PlatformIdentity};
+#[cfg(target_os = "macos")]
+use crate::fs::vfs::local::volume::file_ids_stable_for_fs;
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
 
@@ -30,7 +32,7 @@ pub(super) fn platform_identity(canonical: &Path) -> PlatformIdentity {
     PlatformIdentity {
         volume,
         relative_root,
-        file_ids_stable: named_filesystem_has_stable_file_ids(&fs_name),
+        file_ids_stable: file_ids_stable_for_fs(&fs_name),
         persistent_reuse: uuid.is_some(),
     }
 }

@@ -182,5 +182,3 @@ fn conflict_copies_over_the_limit_are_pruned() {
         "{pruned:?}"
     );
 }
-
-// Unix permission bits.

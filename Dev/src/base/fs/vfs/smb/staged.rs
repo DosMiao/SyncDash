@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::fs::vfs::error::{VfsError, VfsErrorKind, VfsResult};
-use crate::fs::vfs::{CommitReport, ReadStream, WriteHint, WriteStaged};
+use crate::fs::vfs::{block_with_timeout, CommitReport, ReadStream, WriteHint, WriteStaged};
 
 use smb2::client::connection::Connection;
 use smb2::client::stream::FileReader;
@@ -42,26 +42,6 @@ const WRITE_DATA_OFFSET: u16 = 0x70;
 /// What the engine's copy loop reads and writes in one go. SMB2 negotiates a maximum write
 /// of 1 MiB or more on every dialect this client speaks, so a 1 MiB block is one round-trip.
 const BLOCK: usize = 1024 * 1024;
-
-/// Run one async step under a timeout. A timeout is connection trouble, never a statement
-/// about a file.
-fn block_on<F, T>(
-    rt: &tokio::runtime::Handle,
-    timeout: Duration,
-    what: &str,
-    fut: F,
-) -> VfsResult<T>
-where
-    F: std::future::Future<Output = VfsResult<T>>,
-{
-    match rt.block_on(async { tokio::time::timeout(timeout, fut).await }) {
-        Ok(r) => r,
-        Err(_) => Err(VfsError::new(
-            VfsErrorKind::Transient,
-            format!("{what} timed out after {timeout:?}"),
-        )),
-    }
-}
 
 /// Blocking `Read` over the positioned SMB reader: the engine's hashing loops read through
 /// this without knowing an event loop exists.
@@ -95,7 +75,7 @@ impl std::io::Read for SmbRead {
             return Ok(0);
         };
         let (pos, len) = (self.pos, buf.len() as u64);
-        let got = block_on(&self.rt, self.timeout, "read", async move {
+        let got = block_with_timeout(&self.rt, self.timeout, "read", None, async move {
             reader
                 .read_at(pos, len)
                 .await
@@ -116,9 +96,13 @@ impl ReadStream for SmbRead {
 impl Drop for SmbRead {
     fn drop(&mut self) {
         if let Some(r) = self.reader.take() {
-            let _ = block_on(&self.rt, self.timeout, "close read handle", async move {
-                r.close().await.map_err(|e| map_smb_err("close", e))
-            });
+            let _ = block_with_timeout(
+                &self.rt,
+                self.timeout,
+                "close read handle",
+                None,
+                async move { r.close().await.map_err(|e| map_smb_err("close", e)) },
+            );
         }
     }
 }
@@ -150,7 +134,7 @@ impl SmbStaged {
     where
         F: std::future::Future<Output = VfsResult<T>>,
     {
-        block_on(&self.rt, self.timeout, what, fut)
+        block_with_timeout(&self.rt, self.timeout, what, None, fut)
     }
 
     /// Close the write handle if it is still open. Idempotent.
@@ -271,12 +255,6 @@ impl WriteStaged for SmbStaged {
 
     fn block_size(&self) -> usize {
         BLOCK
-    }
-
-    fn write_at(&mut self, _off: u64, _buf: &[u8]) -> VfsResult<()> {
-        Err(VfsError::unsupported(
-            "random-access writes are not offered on smb roots (caps().write_at says No; delta is a both-local affair)",
-        ))
     }
 
     fn seal(&mut self, fsync: bool) -> VfsResult<()> {

@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::foundation::names::LOCK_NAME;
+use crate::foundation::token::is_lower_hex;
 
 pub(super) const LOCK_PROTOCOL: u32 = 1;
 pub(super) const TOKEN_HEX_LEN: usize = 32;
@@ -58,13 +59,6 @@ pub(super) enum LedgerArtifact {
 
 pub(super) fn invalid_lock(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
-}
-
-pub(super) fn is_lower_hex(value: &str, expected_len: usize) -> bool {
-    value.len() == expected_len
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub(super) fn validate_anchor(anchor: &LockAnchor) -> std::io::Result<()> {

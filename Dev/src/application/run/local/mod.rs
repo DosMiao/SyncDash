@@ -10,12 +10,11 @@ mod compare;
 mod execute;
 
 pub use apply::{
-    apply_job_guarded_with, apply_job_guarded_with_classified, apply_requirements,
-    apply_requirements_resolved, apply_resolved, apply_resolved_classified, preflight_job,
-    preflight_resolved,
+    apply_job_guarded_with, apply_job_guarded_with_classified, apply_requirements, apply_resolved,
+    apply_resolved_classified, preflight_resolved,
 };
 pub use compare::{compare_capabilities, compare_job_detailed, compare_resolved};
-pub use execute::{run_local_job, run_local_single};
+pub use execute::run_local_job;
 
 /// Emit the pre-run capability list, most-departing first.
 ///

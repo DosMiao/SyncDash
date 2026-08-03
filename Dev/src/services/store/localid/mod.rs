@@ -109,31 +109,3 @@ fn canonical_or_absolute(root: &Path) -> PathBuf {
         }
     })
 }
-
-#[cfg(test)]
-fn fat_family(fs_name: &str) -> bool {
-    matches!(
-        fs_name.to_ascii_lowercase().as_str(),
-        "fat" | "fat12" | "fat16" | "fat32" | "msdos" | "vfat" | "exfat"
-    )
-}
-
-fn named_filesystem_has_stable_file_ids(fs_name: &str) -> bool {
-    matches!(
-        fs_name.to_ascii_lowercase().as_str(),
-        "apfs"
-            | "hfs"
-            | "hfsplus"
-            | "ext2"
-            | "ext3"
-            | "ext4"
-            | "btrfs"
-            | "xfs"
-            | "zfs"
-            | "f2fs"
-            | "jfs"
-            | "ntfs"
-            | "ntfs3"
-            | "refs"
-    )
-}

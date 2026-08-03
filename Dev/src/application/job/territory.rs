@@ -68,10 +68,6 @@ fn slug(rel: &str) -> String {
     s.trim_matches('-').to_string()
 }
 
-fn archive_dir() -> PathBuf {
-    crate::foundation::dirs::archive_dir()
-}
-
 pub struct GenOutcome {
     pub name: String,
     pub territory: String,
@@ -104,7 +100,7 @@ impl Default for GenOpts {
             mode: "sync".into(),
             rigor: "standard".into(),
             dest: crate::foundation::dirs::jobs_dir(),
-            archives: archive_dir(),
+            archives: crate::foundation::dirs::archive_dir(),
             // A `.ffs-sync` marker means "this is a code tree kept in step by git", and for such a tree
             // two-way syncing `.git` is not a preference — concurrent index and ref writes from two
             // machines corrupt the repository. Hence `dev` in the seed. It is a **default**, not a

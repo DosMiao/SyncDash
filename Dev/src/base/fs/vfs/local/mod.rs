@@ -87,7 +87,6 @@ impl Vfs for LocalVfs {
             mtime_precision_ms: mtime_precision_for(&vol.fs_name),
             set_mtime: Support::Yes,
             fsync: Support::Yes,
-            rename: Support::Yes,
             rename_overwrite: Support::Yes,
             exclusive_staged_file_publish: if cfg!(any(
                 target_os = "linux",

@@ -74,5 +74,3 @@ fn copies_carry_the_source_mode_when_enabled() {
         "a fresh copy must land with the right bits in one step"
     );
 }
-
-// Case collisions.

@@ -178,10 +178,9 @@ fn pack_delta(src: &Path, tgt: &Path, out: &Path, rel: &str) -> pack::PackSummar
 
 /// The delta lane end to end — the half of this module the roundtrip above never reached.
 ///
-/// `apply_pack` hashes the base off the target root and then re-reads it through the recipe. Both
-/// used to be separate opens with the hash coming from `update_mmap_rayon`; they are one handle and
-/// a chunked read now. The payload is deliberately larger than the 8 MiB read granularity so the
-/// hash loop runs more than once.
+/// `apply_pack` hashes the base off the target root and then re-reads it through the recipe, from
+/// one handle and with a chunked read. The payload is deliberately larger than the 8 MiB read
+/// granularity so the hash loop runs more than once.
 #[test]
 fn packs_and_applies_a_delta() {
     let src = tmp("src-delta");

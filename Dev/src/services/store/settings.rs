@@ -71,17 +71,12 @@ fn default_true() -> bool {
     true
 }
 
-/// Config root. Comes straight from `foundation::dirs`, not by walking up from the jobs dir.
-pub fn config_dir() -> PathBuf {
-    crate::foundation::dirs::config_dir()
-}
-
 pub fn settings_path() -> PathBuf {
-    config_dir().join("settings.toml")
+    crate::foundation::dirs::config_dir().join("settings.toml")
 }
 
 pub fn default_log_dir() -> PathBuf {
-    config_dir().join("logs")
+    crate::foundation::dirs::default_log_dir()
 }
 
 impl AppSettings {
@@ -219,7 +214,7 @@ impl AppSettingsUpdate {
 }
 
 fn load_snapshot_at(path: &std::path::Path) -> AppSettingsSnapshot {
-    match std::fs::read(&path) {
+    match std::fs::read(path) {
         Ok(bytes) => match std::str::from_utf8(&bytes)
             .map_err(|error| error.to_string())
             .and_then(|text| toml::from_str::<AppSettings>(text).map_err(|error| error.to_string()))
@@ -303,6 +298,8 @@ fn open_mutation_lock(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
         .create(true)
         .read(true)
         .write(true)
+        // A lock anchor must survive being acquired; acquiring it never rewrites its contents.
+        .truncate(false)
         .open(dir.join(".syncdash-settings.lock"))
 }
 
@@ -405,8 +402,10 @@ mod tests {
 
     #[test]
     fn invalid_settings_are_rejected_before_the_live_configuration_changes() {
-        let mut settings = AppSettings::default();
-        settings.log_compare = "everything".into();
+        let mut settings = AppSettings {
+            log_compare: "everything".into(),
+            ..Default::default()
+        };
         assert!(settings.validate().unwrap_err().contains("log_compare"));
 
         settings.log_compare = "summary".into();

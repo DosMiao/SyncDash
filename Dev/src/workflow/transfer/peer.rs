@@ -5,7 +5,6 @@
 //! non-ASCII paths off the OEM code page.
 
 use std::io::{Error, ErrorKind, Read};
-use std::sync::Arc;
 use std::time::Duration;
 
 type UploadStream<'a> = (std::fs::File, &'a mut dyn FnMut(u64) -> std::io::Result<()>);
@@ -13,7 +12,7 @@ type UploadStream<'a> = (std::fs::File, &'a mut dyn FnMut(u64) -> std::io::Resul
 use russh::ChannelMsg;
 
 use crate::fs::ssh;
-use crate::fs::vfs::cred::default_provider;
+use crate::fs::vfs::cred::credentials_for;
 use crate::fs::vfs::spec::{parse, RootSpec};
 
 /// Wrap in POSIX single quotes (an embedded single quote is escaped as '\'')
@@ -120,12 +119,11 @@ impl PeerSession {
             .enable_time()
             .thread_name("syncdash-peer")
             .build()?;
-        let creds = default_provider()
-            .credentials_for(&match parse(phrase) {
-                RootSpec::Endpoint(r) => r,
-                _ => unreachable!("addr_of already rejected a non-peer phrase"),
-            })
-            .map_err(std::io::Error::from)?;
+        let creds = credentials_for(&match parse(phrase) {
+            RootSpec::Endpoint(r) => r,
+            _ => unreachable!("addr_of already rejected a non-peer phrase"),
+        })
+        .map_err(std::io::Error::from)?;
         let session = rt
             .block_on(async {
                 ssh::connect(&a.host, a.port, &a.user, &creds, timeout, phrase).await
@@ -243,9 +241,6 @@ impl PeerSession {
         })
     }
 }
-
-/// Shared handle so a stage can pass one session down without threading a lifetime.
-pub type SharedPeer = Arc<PeerSession>;
 
 #[cfg(test)]
 mod tests {

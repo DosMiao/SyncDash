@@ -61,8 +61,7 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
                     Ok(0)
                 }
                 CredCmd::Test { phrase } => {
-                    let v = syncdash::fs::vfs::open(&phrase, &cred::default_provider())
-                        .map_err(std::io::Error::from)?;
+                    let v = syncdash::fs::vfs::open(&phrase).map_err(std::io::Error::from)?;
                     match v.connect() {
                         Ok(()) => {
                             println!("connected: {}", v.display());

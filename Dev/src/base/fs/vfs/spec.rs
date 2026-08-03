@@ -119,6 +119,16 @@ impl EndpointSpec {
     pub fn has_flag(&self, key: &str) -> bool {
         self.options.iter().any(|(k, _)| k == key)
     }
+
+    /// How long one operation may take before it counts as connection trouble. Every protocol
+    /// backend reads the same `timeout=` option and shares the same default, so the phrase means
+    /// one thing regardless of which backend the root routes to.
+    pub fn timeout(&self) -> std::time::Duration {
+        self.opt("timeout")
+            .and_then(|t| t.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(std::time::Duration::from_secs(20))
+    }
 }
 
 fn push_host(s: &mut String, host: &str) {

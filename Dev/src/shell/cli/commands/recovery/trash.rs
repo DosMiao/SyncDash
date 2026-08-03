@@ -48,14 +48,7 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
                         &into,
                         !do_apply,
                     )?;
-                    println!(
-                        "{}: {r} restored, {s} skipped, {e} error(s)",
-                        if do_apply {
-                            "restore"
-                        } else {
-                            "dry-run (rerun with --apply)"
-                        }
-                    );
+                    super::print_restore_summary(do_apply, r, s, e);
                     Ok(if e > 0 { 1 } else { 0 })
                 }
                 TrashCmd::Prune {
@@ -75,7 +68,7 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
                         if do_apply {
                             "pruned"
                         } else {
-                            "dry-run (rerun with --apply)"
+                            syncdash::foundation::fmt::DRY_RUN_HINT
                         },
                         human_bytes(freed)
                     );

@@ -1,5 +1,5 @@
 use super::super::roots::resolve_root;
-use super::compare::{escalate_sampled_disagreements, schedule_scans};
+use super::compare::{escalate_sampled_disagreements, schedule_scans, EscalationSide};
 use super::*;
 use crate::fs::vfs::memory::MemVfs;
 use crate::fs::vfs::Vfs;
@@ -11,7 +11,7 @@ use crate::model::table::TableArtifact;
 use crate::model::table::{FileIdentityObservation, TableEvidence};
 use crate::obs::progress::{PhaseProgress, RunCtl, RunCtx};
 use crate::pipeline::{compare, scan};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn escalation_fixture(
     tag: &str,
@@ -72,9 +72,11 @@ fn escalation_fixture(
     source_snapshot.header.evidence = TableEvidence::Sampled;
     target_snapshot.header.evidence = TableEvidence::Sampled;
 
-    let mut job = Job::default();
-    job.mode = "mirror".into();
-    job.rigor = "fast".into();
+    let job = Job {
+        mode: "mirror".into(),
+        rigor: "fast".into(),
+        ..Default::default()
+    };
     let plan = compare::compare(
         &source_snapshot,
         &target_snapshot,
@@ -116,12 +118,7 @@ fn escalation_read_failure_aborts_instead_of_retaining_identical() {
     let (source, target, mut source_snapshot, mut target_snapshot, plan, job) =
         escalation_fixture("read-failure");
     std::fs::remove_file(source.join("suspect.bin")).unwrap();
-    let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let copy = events.clone();
-    let ctx = RunCtx::new(
-        RunCtl::new(),
-        Arc::new(move |event| copy.lock().unwrap().push(event)),
-    );
+    let (ctx, events) = RunCtx::collecting();
     let pp = PhaseProgress::begin(&ctx, Phase::Compare, None, 0, 0);
     let source_vfs =
         Arc::new(crate::fs::vfs::local::LocalVfs::open(source.clone()).unwrap()) as Arc<dyn Vfs>;
@@ -131,11 +128,15 @@ fn escalation_read_failure_aborts_instead_of_retaining_identical() {
     let error = match escalate_sampled_disagreements(
         &job,
         plan,
-        &mut source_snapshot,
-        &mut target_snapshot,
+        EscalationSide {
+            table: &mut source_snapshot,
+            vfs: &source_vfs,
+        },
+        EscalationSide {
+            table: &mut target_snapshot,
+            vfs: &target_vfs,
+        },
         &ctx,
-        &source_vfs,
-        &target_vfs,
         &pp,
     ) {
         Ok(_) => panic!("an unreadable full-verification file must abort comparison"),
@@ -177,9 +178,7 @@ fn escalation_honors_cancellation_before_reopening_files() {
         escalation_fixture("cancel");
     let ctl = RunCtl::new();
     ctl.request_cancel();
-    let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let copy = events.clone();
-    let ctx = RunCtx::new(ctl, Arc::new(move |event| copy.lock().unwrap().push(event)));
+    let (ctx, events) = RunCtx::collecting_with(ctl);
     let pp = PhaseProgress::begin(&ctx, Phase::Compare, None, 0, 0);
     let source_vfs =
         Arc::new(crate::fs::vfs::local::LocalVfs::open(source.clone()).unwrap()) as Arc<dyn Vfs>;
@@ -189,11 +188,15 @@ fn escalation_honors_cancellation_before_reopening_files() {
     let error = match escalate_sampled_disagreements(
         &job,
         plan,
-        &mut source_snapshot,
-        &mut target_snapshot,
+        EscalationSide {
+            table: &mut source_snapshot,
+            vfs: &source_vfs,
+        },
+        EscalationSide {
+            table: &mut target_snapshot,
+            vfs: &target_vfs,
+        },
         &ctx,
-        &source_vfs,
-        &target_vfs,
         &pp,
     ) {
         Ok(_) => panic!("cancelled escalation must not complete"),
@@ -242,9 +245,11 @@ fn escalation_rechecks_nonlocal_vfs_roots_instead_of_skipping_them() {
         };
     source_snapshot.header.evidence = TableEvidence::Sampled;
     target_snapshot.header.evidence = TableEvidence::Sampled;
-    let mut job = Job::default();
-    job.mode = "mirror".into();
-    job.rigor = "fast".into();
+    let job = Job {
+        mode: "mirror".into(),
+        rigor: "fast".into(),
+        ..Default::default()
+    };
     let plan = compare::compare(
         &source_snapshot,
         &target_snapshot,
@@ -260,11 +265,15 @@ fn escalation_rechecks_nonlocal_vfs_roots_instead_of_skipping_them() {
     let plan = escalate_sampled_disagreements(
         &job,
         plan,
-        &mut source_snapshot,
-        &mut target_snapshot,
+        EscalationSide {
+            table: &mut source_snapshot,
+            vfs: &source,
+        },
+        EscalationSide {
+            table: &mut target_snapshot,
+            vfs: &target,
+        },
         &ctx,
-        &source,
-        &target,
         &pp,
     )
     .unwrap();
@@ -301,10 +310,12 @@ fn vfs_lane_compares_and_classifies_every_drift() {
     sv.seed_file("skipme/x.bin", 100, 0);
     tv.seed_file("skipme/x.bin", 100, 0);
 
-    let mut j = Job::default();
-    j.mode = "mirror".into();
-    j.rigor = "standard".into();
-    j.exclude = vec!["skipme/".into()];
+    let j = Job {
+        mode: "mirror".into(),
+        rigor: "standard".into(),
+        exclude: vec!["skipme/".into()],
+        ..Default::default()
+    };
     let (sv, tv) = (Arc::new(sv) as Arc<dyn Vfs>, Arc::new(tv) as Arc<dyn Vfs>);
     let out = compare_resolved(&j, &sv, &tv, &RunCtx::null()).unwrap();
 
@@ -521,9 +532,11 @@ fn degraded_caps_are_reported_and_land_on_the_table() {
     // Big enough that the sampled tier would sample, identical on both sides
     sv.seed_file("big.bin", 5 * 1024 * 1024, 1_000);
     tv.seed_file("big.bin", 5 * 1024 * 1024, 1_000);
-    let mut j = Job::default();
-    j.mode = "mirror".into();
-    j.rigor = "fast".into(); // the sampled tier
+    let j = Job {
+        mode: "mirror".into(),
+        rigor: "fast".into(), // the sampled tier
+        ..Default::default()
+    };
     let (sv, tv) = (Arc::new(sv) as Arc<dyn Vfs>, Arc::new(tv) as Arc<dyn Vfs>);
 
     // BOTH sides upgrade to full — a one-sided upgrade would make the identical file look
@@ -556,19 +569,16 @@ fn resolve_refuses_an_unknown_scheme() {
 fn apply_preflight_refusal_emits_exactly_one_terminal_summary() {
     let sv = Arc::new(MemVfs::new("terminal-src")) as Arc<dyn Vfs>;
     let tv = Arc::new(MemVfs::new("terminal-tgt")) as Arc<dyn Vfs>;
-    let mut job = Job::default();
-    job.source = "/definitely/missing/terminal-source".into();
-    job.targets = vec!["/definitely/missing/terminal-target".into()];
+    let job = Job {
+        source: "/definitely/missing/terminal-source".into(),
+        targets: vec!["/definitely/missing/terminal-target".into()],
+        ..Default::default()
+    };
     let plan = compare_resolved(&job, &sv, &tv, &RunCtx::null())
         .unwrap()
         .plan;
 
-    let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let copy = events.clone();
-    let ctx = RunCtx::new(
-        RunCtl::new(),
-        Arc::new(move |ev| copy.lock().unwrap().push(ev)),
-    );
+    let (ctx, events) = RunCtx::collecting();
     let selected = job.select_target(0).unwrap();
     let execution = apply_job_guarded_with_classified(&selected, &plan, &[], None, false, &ctx);
     assert!(
@@ -598,11 +608,9 @@ fn apply_preflight_refusal_emits_exactly_one_terminal_summary() {
 
 #[test]
 fn terminal_summary_observes_a_last_moment_cancel_request() {
-    let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let copy = events.clone();
     let ctl = RunCtl::new();
     ctl.request_cancel();
-    let ctx = RunCtx::new(ctl, Arc::new(move |ev| copy.lock().unwrap().push(ev)));
+    let (ctx, events) = RunCtx::collecting_with(ctl);
 
     let out = crate::obs::progress::ApplyOutcome::default().finish(&ctx, std::time::Instant::now());
     assert!(out.cancelled);

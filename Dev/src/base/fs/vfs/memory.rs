@@ -1,7 +1,7 @@
 //! An in-memory `Vfs`, for tests only.
 //!
 //! It intentionally exposes no retained local root, which makes `scan_root` take the generic
-//! `scan_vfs` lane instead of the walkdir fast path, so this is the only way the VFS lane — the
+//! `scan_vfs` lane instead of the local fast path, so this is the only way the VFS lane — the
 //! one every protocol backend rides — gets exercised without a live server. It also carries
 //! capability knobs, which is how the degraded-evidence consent gate is testable at all.
 //!
@@ -73,7 +73,6 @@ fn default_caps() -> VfsCaps {
         mtime_precision_ms: 1,
         set_mtime: Support::Yes,
         fsync: Support::Yes,
-        rename: Support::Yes,
         rename_overwrite: Support::Yes,
         exclusive_staged_file_publish: Support::Yes,
         exclusive_entry_rename: Support::Yes,
@@ -317,7 +316,6 @@ impl Vfs for MemVfs {
             mtime_ms: hint.mtime_ms,
             mode: hint.mode,
             caps_read_back: self.caps.read_back,
-            caps_write_at: self.caps.write_at,
             tree: self.tree.clone(),
             commit_hook: self.commit_hook.lock().unwrap().clone(),
             noreplace_pre_publish_hook: self.noreplace_pre_publish_hook.lock().unwrap().clone(),
@@ -491,7 +489,6 @@ struct MemStaged {
     mtime_ms: Option<i64>,
     mode: Option<u32>,
     caps_read_back: Support,
-    caps_write_at: Support,
     tree: Arc<Mutex<BTreeMap<String, Node>>>,
     commit_hook: Option<CommitHook>,
     noreplace_pre_publish_hook: Option<CommitHook>,
@@ -506,17 +503,6 @@ impl WriteStaged for MemStaged {
     }
     fn block_size(&self) -> usize {
         64 * 1024
-    }
-    fn write_at(&mut self, off: u64, buf: &[u8]) -> VfsResult<()> {
-        if !self.caps_write_at.yes() {
-            return Err(VfsError::unsupported("write_at"));
-        }
-        let end = off as usize + buf.len();
-        if self.buf.len() < end {
-            self.buf.resize(end, 0);
-        }
-        self.buf[off as usize..end].copy_from_slice(buf);
-        Ok(())
     }
     fn seal(&mut self, _fsync: bool) -> VfsResult<()> {
         Ok(())

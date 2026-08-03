@@ -4,12 +4,44 @@
 mod bulk;
 mod walk;
 
+use crate::foundation::path::{EntryName, RootRelativeDir, RootRelativePath};
+use crate::fs::local_root::LocalRoot;
 use crate::model::table::{ObservedDirectory, ObservedEntry, ObservedSymlink};
 
 use super::super::{ProgressFn, ScanOptions, ScanProgress};
 use super::model::PendingFile;
 use super::state::LocalScanState;
 use walk::WalkKind;
+
+/// The one spelling of a child's root-relative path. Both traversal lanes must produce byte-equal
+/// paths for the same tree, because the differential tests compare their tables entry for entry.
+fn child_path(directory: &RootRelativeDir, name: &EntryName) -> RootRelativePath {
+    let relative = if directory.as_str().is_empty() {
+        name.as_str().to_owned()
+    } else {
+        format!("{}/{}", directory.as_str(), name.as_str())
+    };
+    RootRelativePath::new(relative).expect("validated directory and entry names form a valid path")
+}
+
+fn as_directory(relative: RootRelativePath) -> RootRelativeDir {
+    RootRelativeDir::new(relative.into_string())
+        .expect("a validated child path is a valid directory path")
+}
+
+/// The refusal both lanes make when a subtree cannot be read.
+///
+/// Fail-closed: an unreadable subtree is dropped from the table, and a dropped subtree is
+/// indistinguishable from a deleted one at compare time. The caller's error `kind()` is preserved.
+fn subtree_error(root: &LocalRoot, relative: &str, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!(
+            "scan of '{}' aborted at '{relative}': {error} — refusing to emit a half table (its missing subtrees would read as deletions)",
+            root.display_path().display()
+        ),
+    )
+}
 
 #[cfg(target_os = "macos")]
 use bulk::walk as walk_local;

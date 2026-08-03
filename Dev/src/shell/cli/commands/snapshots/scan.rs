@@ -11,8 +11,6 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
             rigor,
             evidence,
             cache,
-            force_rehash,
-            fast,
             symlinks_direct,
             junk,
             include,
@@ -23,27 +21,17 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
                 eprintln!("error: not a directory: {}", root.display());
                 return Ok(2);
             }
-            // An unknown preset id is an error, never a silent no-op: a scan that quietly excluded less
-            // than asked is exactly the kind of near-miss that only shows up as a surprise in a plan
-            let ids: Vec<&str> = junk
-                .iter()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
-                .collect();
-            if let Some(bad) = ids.iter().find(|id| junk::junk_preset(id).is_none()) {
-                let known: Vec<&str> = junk::JUNK_PRESETS.iter().map(|p| p.id).collect();
-                eprintln!(
-                    "error: unknown junk preset '{bad}' (known: {}, or `none`)",
-                    known.join(", ")
-                );
-                return Ok(2);
-            }
+            let ids = match junk::parse_preset_ids(&junk) {
+                Ok(ids) => ids,
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    return Ok(2);
+                }
+            };
             let mut excludes = junk::expand_junk_presets(&ids);
             excludes.extend(exclude.iter().cloned());
-            // One ladder, shared with `Job::rigor_resolved`: preset → detail overrides → the two
-            // legacy flags this subcommand still accepts. `--fast` and `--force-rehash` predate
-            // `--evidence`/`--cache` and are applied after them, so an explicit flag still wins.
-            let mut r = job::rigor::RigorResolved::from_preset(&rigor)
+            // One ladder, shared with `Job::rigor_resolved`: preset → detail overrides.
+            let r = job::rigor::RigorResolved::from_preset(&rigor)
                 .with_evidence(evidence.as_deref())
                 .with_cache(match cache.as_deref() {
                     Some("on") => Some(true),
@@ -51,13 +39,6 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
                     _ => None,
                 })
                 .with_hash_disabled(no_hash);
-            if fast {
-                r.sampled = true;
-                r.use_cache = true;
-            }
-            if force_rehash {
-                r.use_cache = false;
-            }
             let sopt = scan::ScanOptions {
                 hash: r.hash,
                 sampled: r.sampled,

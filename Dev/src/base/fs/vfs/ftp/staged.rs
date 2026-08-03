@@ -98,10 +98,6 @@ impl WriteStaged for FtpStaged {
         64 * 1024
     }
 
-    fn write_at(&mut self, _off: u64, _buf: &[u8]) -> VfsResult<()> {
-        Err(VfsError::unsupported("FTP uploads are append-only streams"))
-    }
-
     fn seal(&mut self, _fsync: bool) -> VfsResult<()> {
         // fsync does not exist in this protocol; caps say No and the preflight
         // NeedsAck line covered it — the flag is knowingly moot here

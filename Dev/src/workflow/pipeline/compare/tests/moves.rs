@@ -179,5 +179,3 @@ fn roll_generations_builds_the_history_chain() {
     assert_eq!(same_history.len(), 1);
     assert_eq!(same_history[0].digest(), Some(&digest("H0")));
 }
-
-// Conflict copies.

@@ -13,7 +13,8 @@ mod tests;
 use self::compatibility::*;
 use self::record::*;
 use super::walk::{WalkEntry, WalkKind, WalkStats};
-use crate::foundation::path::{EntryName, RootRelativeDir, RootRelativePath};
+use super::{as_directory, child_path, subtree_error};
+use crate::foundation::path::{EntryName, RootRelativeDir};
 use crate::fs::local_root::LocalRoot;
 use crate::pipeline::filter::PathFilter;
 use std::os::fd::{AsRawFd, RawFd};
@@ -88,12 +89,9 @@ where
         let directory = match root.open_directory(&directory_relative) {
             Ok(directory) => directory,
             Err(error) if directory_relative.as_str().is_empty() => {
-                return Err(std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "scan of '{}' could not read the root itself: {error} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
-                        root.display_path().display()
-                    ),
+                return Err(crate::pipeline::scan::root_unreadable_error(
+                    root.display_path(),
+                    error,
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -125,13 +123,10 @@ where
                 }
                 Err(error) => {
                     if directory_relative.as_str().is_empty() {
-                        return Err(std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "scan of '{}' could not read the root itself: {error} — refusing to report it as an empty tree (that reads as a mass deletion on the other side)",
-                            root.display_path().display()
-                        ),
-                    ));
+                        return Err(crate::pipeline::scan::root_unreadable_error(
+                            root.display_path(),
+                            error,
+                        ));
                     }
                     if error.kind() == std::io::ErrorKind::NotFound {
                         stats.note_error(format!("{}: {error}", directory_relative.as_str()));
@@ -265,28 +260,4 @@ where
     }
 
     Ok(stats)
-}
-
-fn child_path(directory: &RootRelativeDir, name: &EntryName) -> RootRelativePath {
-    let relative = if directory.as_str().is_empty() {
-        name.as_str().to_owned()
-    } else {
-        format!("{}/{}", directory.as_str(), name.as_str())
-    };
-    RootRelativePath::new(relative).expect("validated directory and entry names form a valid path")
-}
-
-fn as_directory(relative: RootRelativePath) -> RootRelativeDir {
-    RootRelativeDir::new(relative.into_string())
-        .expect("a validated child path is a valid directory path")
-}
-
-fn subtree_error(root: &LocalRoot, relative: &str, error: std::io::Error) -> std::io::Error {
-    std::io::Error::new(
-        error.kind(),
-        format!(
-            "scan of '{}' aborted at '{relative}': {error} — refusing to emit a half table (its missing subtrees would read as deletions)",
-            root.display_path().display()
-        ),
-    )
 }

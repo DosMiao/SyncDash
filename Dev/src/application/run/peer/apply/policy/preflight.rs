@@ -9,10 +9,7 @@ pub fn preflight_peer_job(
 ) -> crate::pipeline::guard::Verdict {
     let g = job.configuration().guards();
     let st = crate::pipeline::guard::stats::stat_plan(ops);
-    let mut gv = crate::pipeline::guard::Verdict {
-        blockers: Vec::new(),
-        warnings: Vec::new(),
-    };
+    let mut gv = crate::pipeline::guard::Verdict::default();
     crate::pipeline::guard::ratio::check_delete_ratio(
         "target",
         &st.target,

@@ -7,7 +7,7 @@ mod jobs;
 mod packages;
 mod recovery;
 mod snapshots;
-mod system;
+pub(super) mod system;
 
 use super::args::Cmd;
 
@@ -33,8 +33,4 @@ pub(super) fn dispatch(command: Cmd) -> std::io::Result<i32> {
         command @ (Cmd::Logs { .. } | Cmd::History { .. }) => history::execute(command),
         command @ Cmd::Apply { .. } => execution::execute(command),
     }
-}
-
-pub(super) fn launch_default_desktop() -> std::io::Result<i32> {
-    system::launch_default_desktop()
 }

@@ -76,13 +76,12 @@ fn an_untrusted_plan_cannot_escape_either_root() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// The recorded ledger entries: one `(path, outcome, bytes)` row per `ItemResult`.
+type LedgerLog = std::sync::Arc<Mutex<Vec<(String, ItemOutcome, u64)>>>;
+
 /// A ctx that collects ItemResult: the contents of the execution ledger (items.jsonl) are exactly these events
-fn ledger_ctx() -> (
-    RunCtx,
-    std::sync::Arc<Mutex<Vec<(String, ItemOutcome, u64)>>>,
-) {
-    let store: std::sync::Arc<Mutex<Vec<(String, ItemOutcome, u64)>>> =
-        std::sync::Arc::new(Mutex::new(Vec::new()));
+fn ledger_ctx() -> (RunCtx, LedgerLog) {
+    let store: LedgerLog = std::sync::Arc::new(Mutex::new(Vec::new()));
     let s2 = store.clone();
     let sink = move |ev: syncdash::model::event::ProgressEvent| {
         if let syncdash::model::event::ProgressEvent::ItemResult {
@@ -764,9 +763,8 @@ fn delta_update_handles_shrinking_files() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// The paranoid tier on a local root. Both lanes used to read the staged file back through
-/// `update_mmap_rayon`; both now use a chunked read, and neither had a test. The payloads are
-/// deliberately larger than the 8 MiB read granularity so the loop runs more than once — a
+/// The paranoid tier on a local root: both lanes read the staged file back in chunks. The payloads
+/// are deliberately larger than the 8 MiB read granularity so the loop runs more than once — a
 /// single-shot read would satisfy a smaller fixture either way.
 #[test]
 fn verify_reads_the_staged_file_back_in_both_lanes() {
@@ -973,6 +971,93 @@ fn delete_dirs_deepest_first_regardless_of_input_order() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Pass-through `Vfs` methods for the fixtures below: each impl writes out the methods whose
+/// behavior it bends and names the rest here, so the injected fault is the only thing its impl
+/// shows. The first argument is the field holding the wrapped backend.
+macro_rules! forward_vfs {
+    ($inner:tt; $($method:ident),+ $(,)?) => {
+        $(forward_vfs!(@method $inner, $method);)+
+    };
+    (@method $inner:tt, caps) => {
+        fn caps(&self) -> VfsCaps { self.$inner.caps() }
+    };
+    (@method $inner:tt, display) => {
+        fn display(&self) -> String { self.$inner.display() }
+    };
+    (@method $inner:tt, identity) => {
+        fn identity(&self) -> String { self.$inner.identity() }
+    };
+    (@method $inner:tt, local_root) => {
+        fn local_root(&self) -> Option<&syncdash::fs::local_root::LocalRoot> {
+            self.$inner.local_root()
+        }
+    };
+    (@method $inner:tt, connect) => {
+        fn connect(&self) -> VfsResult<()> { self.$inner.connect() }
+    };
+    (@method $inner:tt, stat) => {
+        fn stat(&self, rel: &str) -> VfsResult<Option<VMeta>> { self.$inner.stat(rel) }
+    };
+    (@method $inner:tt, read_dir) => {
+        fn read_dir(&self, rel: &str) -> VfsResult<Vec<VDirEntry>> { self.$inner.read_dir(rel) }
+    };
+    (@method $inner:tt, open_read) => {
+        fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>> {
+            self.$inner.open_read(rel)
+        }
+    };
+    (@method $inner:tt, read_range) => {
+        fn read_range(&self, rel: &str, off: u64, len: u32) -> VfsResult<Vec<u8>> {
+            self.$inner.read_range(rel, off, len)
+        }
+    };
+    (@method $inner:tt, read_link) => {
+        fn read_link(&self, rel: &str) -> VfsResult<String> { self.$inner.read_link(rel) }
+    };
+    (@method $inner:tt, mkdir_all) => {
+        fn mkdir_all(&self, rel: &str) -> VfsResult<()> { self.$inner.mkdir_all(rel) }
+    };
+    (@method $inner:tt, open_write) => {
+        fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
+            self.$inner.open_write(rel, hint)
+        }
+    };
+    (@method $inner:tt, rename) => {
+        fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
+            self.$inner.rename(from_rel, to_rel)
+        }
+    };
+    (@method $inner:tt, rename_noreplace) => {
+        fn rename_noreplace(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
+            self.$inner.rename_noreplace(from_rel, to_rel)
+        }
+    };
+    (@method $inner:tt, remove_file) => {
+        fn remove_file(&self, rel: &str) -> VfsResult<()> { self.$inner.remove_file(rel) }
+    };
+    (@method $inner:tt, remove_dir) => {
+        fn remove_dir(&self, rel: &str) -> VfsResult<()> { self.$inner.remove_dir(rel) }
+    };
+    (@method $inner:tt, set_mtime) => {
+        fn set_mtime(&self, rel: &str, mtime_ms: i64) -> VfsResult<()> {
+            self.$inner.set_mtime(rel, mtime_ms)
+        }
+    };
+    (@method $inner:tt, set_mode) => {
+        fn set_mode(&self, rel: &str, mode: u32) -> VfsResult<()> {
+            self.$inner.set_mode(rel, mode)
+        }
+    };
+    (@method $inner:tt, make_symlink) => {
+        fn make_symlink(&self, rel: &str, target: &str) -> VfsResult<()> {
+            self.$inner.make_symlink(rel, target)
+        }
+    };
+    (@method $inner:tt, free_space) => {
+        fn free_space(&self) -> VfsResult<Option<(u64, u64)>> { self.$inner.free_space() }
+    };
+}
+
 /// A route fixture backed by real files. It can hide its local capability to model a protocol
 /// root, or expose it while denying `local_trash` to model a local root that cannot reach the
 /// default store. That distinction pins routing without depending on mounted media.
@@ -986,12 +1071,6 @@ impl syncdash::fs::vfs::Vfs for RouteFixture {
             ..self.0.caps()
         }
     }
-    fn display(&self) -> String {
-        self.0.display()
-    }
-    fn identity(&self) -> String {
-        self.0.identity()
-    }
     fn local_root(&self) -> Option<&syncdash::fs::local_root::LocalRoot> {
         if self.2 {
             Some(self.0.local_root())
@@ -999,95 +1078,16 @@ impl syncdash::fs::vfs::Vfs for RouteFixture {
             None
         }
     }
-    fn connect(&self) -> VfsResult<()> {
-        self.0.connect()
-    }
-    fn stat(&self, rel: &str) -> VfsResult<Option<VMeta>> {
-        self.0.stat(rel)
-    }
-    fn read_dir(&self, rel: &str) -> VfsResult<Vec<VDirEntry>> {
-        self.0.read_dir(rel)
-    }
-    fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>> {
-        self.0.open_read(rel)
-    }
-    fn read_range(&self, rel: &str, off: u64, len: u32) -> VfsResult<Vec<u8>> {
-        self.0.read_range(rel, off, len)
-    }
-    fn read_link(&self, rel: &str) -> VfsResult<String> {
-        self.0.read_link(rel)
-    }
-    fn mkdir_all(&self, rel: &str) -> VfsResult<()> {
-        self.0.mkdir_all(rel)
-    }
-    fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
-        self.0.open_write(rel, hint)
-    }
-    fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
-        self.0.rename(from_rel, to_rel)
-    }
-    fn rename_noreplace(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
-        self.0.rename_noreplace(from_rel, to_rel)
-    }
-    fn remove_file(&self, rel: &str) -> VfsResult<()> {
-        self.0.remove_file(rel)
-    }
-    fn remove_dir(&self, rel: &str) -> VfsResult<()> {
-        self.0.remove_dir(rel)
-    }
-    fn set_mtime(&self, rel: &str, mtime_ms: i64) -> VfsResult<()> {
-        self.0.set_mtime(rel, mtime_ms)
-    }
-    fn set_mode(&self, rel: &str, mode: u32) -> VfsResult<()> {
-        self.0.set_mode(rel, mode)
-    }
-    fn make_symlink(&self, rel: &str, target: &str) -> VfsResult<()> {
-        self.0.make_symlink(rel, target)
-    }
-    fn free_space(&self) -> VfsResult<Option<(u64, u64)>> {
-        self.0.free_space()
-    }
+    forward_vfs!(0;
+        display, identity, connect, stat, read_dir, open_read, read_range, read_link, mkdir_all,
+        open_write, rename, rename_noreplace, remove_file, remove_dir, set_mtime, set_mode,
+        make_symlink, free_space,
+    );
 }
 
 struct RenameDrift(RouteFixture);
 
 impl syncdash::fs::vfs::Vfs for RenameDrift {
-    fn caps(&self) -> VfsCaps {
-        self.0.caps()
-    }
-    fn display(&self) -> String {
-        self.0.display()
-    }
-    fn identity(&self) -> String {
-        self.0.identity()
-    }
-    fn local_root(&self) -> Option<&syncdash::fs::local_root::LocalRoot> {
-        self.0.local_root()
-    }
-    fn connect(&self) -> VfsResult<()> {
-        self.0.connect()
-    }
-    fn stat(&self, rel: &str) -> VfsResult<Option<VMeta>> {
-        self.0.stat(rel)
-    }
-    fn read_dir(&self, rel: &str) -> VfsResult<Vec<VDirEntry>> {
-        self.0.read_dir(rel)
-    }
-    fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>> {
-        self.0.open_read(rel)
-    }
-    fn read_range(&self, rel: &str, off: u64, len: u32) -> VfsResult<Vec<u8>> {
-        self.0.read_range(rel, off, len)
-    }
-    fn read_link(&self, rel: &str) -> VfsResult<String> {
-        self.0.read_link(rel)
-    }
-    fn mkdir_all(&self, rel: &str) -> VfsResult<()> {
-        self.0.mkdir_all(rel)
-    }
-    fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
-        self.0.open_write(rel, hint)
-    }
     fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
         if from_rel == "old.txt" && to_rel == "new.txt" {
             std::fs::write(
@@ -1110,24 +1110,11 @@ impl syncdash::fs::vfs::Vfs for RenameDrift {
         }
         self.0.rename_noreplace(from_rel, to_rel)
     }
-    fn remove_file(&self, rel: &str) -> VfsResult<()> {
-        self.0.remove_file(rel)
-    }
-    fn remove_dir(&self, rel: &str) -> VfsResult<()> {
-        self.0.remove_dir(rel)
-    }
-    fn set_mtime(&self, rel: &str, mtime_ms: i64) -> VfsResult<()> {
-        self.0.set_mtime(rel, mtime_ms)
-    }
-    fn set_mode(&self, rel: &str, mode: u32) -> VfsResult<()> {
-        self.0.set_mode(rel, mode)
-    }
-    fn make_symlink(&self, rel: &str, target: &str) -> VfsResult<()> {
-        self.0.make_symlink(rel, target)
-    }
-    fn free_space(&self) -> VfsResult<Option<(u64, u64)>> {
-        self.0.free_space()
-    }
+    forward_vfs!(0;
+        caps, display, identity, local_root, connect, stat, read_dir, open_read, read_range,
+        read_link, mkdir_all, open_write, remove_file, remove_dir, set_mtime, set_mode,
+        make_symlink, free_space,
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -1198,27 +1185,6 @@ impl ReadStream for FaultRead {
 }
 
 impl syncdash::fs::vfs::Vfs for FaultMoveVfs {
-    fn caps(&self) -> VfsCaps {
-        self.inner.caps()
-    }
-    fn display(&self) -> String {
-        self.inner.display()
-    }
-    fn identity(&self) -> String {
-        self.inner.identity()
-    }
-    fn local_root(&self) -> Option<&syncdash::fs::local_root::LocalRoot> {
-        self.inner.local_root()
-    }
-    fn connect(&self) -> VfsResult<()> {
-        self.inner.connect()
-    }
-    fn stat(&self, rel: &str) -> VfsResult<Option<VMeta>> {
-        self.inner.stat(rel)
-    }
-    fn read_dir(&self, rel: &str) -> VfsResult<Vec<VDirEntry>> {
-        self.inner.read_dir(rel)
-    }
     fn open_read(&self, rel: &str) -> VfsResult<Box<dyn ReadStream>> {
         let inner = self.inner.open_read(rel)?;
         if !syncdash::fs::staged::is_temp_rel(rel) {
@@ -1245,21 +1211,6 @@ impl syncdash::fs::vfs::Vfs for FaultMoveVfs {
             })),
             _ => Ok(inner),
         }
-    }
-    fn read_range(&self, rel: &str, off: u64, len: u32) -> VfsResult<Vec<u8>> {
-        self.inner.read_range(rel, off, len)
-    }
-    fn read_link(&self, rel: &str) -> VfsResult<String> {
-        self.inner.read_link(rel)
-    }
-    fn mkdir_all(&self, rel: &str) -> VfsResult<()> {
-        self.inner.mkdir_all(rel)
-    }
-    fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
-        self.inner.open_write(rel, hint)
-    }
-    fn rename(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
-        self.inner.rename(from_rel, to_rel)
     }
     fn rename_noreplace(&self, from_rel: &str, to_rel: &str) -> VfsResult<()> {
         if syncdash::fs::staged::is_temp_rel(from_rel)
@@ -1299,21 +1250,10 @@ impl syncdash::fs::vfs::Vfs for FaultMoveVfs {
         }
         self.inner.remove_file(rel)
     }
-    fn remove_dir(&self, rel: &str) -> VfsResult<()> {
-        self.inner.remove_dir(rel)
-    }
-    fn set_mtime(&self, rel: &str, mtime_ms: i64) -> VfsResult<()> {
-        self.inner.set_mtime(rel, mtime_ms)
-    }
-    fn set_mode(&self, rel: &str, mode: u32) -> VfsResult<()> {
-        self.inner.set_mode(rel, mode)
-    }
-    fn make_symlink(&self, rel: &str, target: &str) -> VfsResult<()> {
-        self.inner.make_symlink(rel, target)
-    }
-    fn free_space(&self) -> VfsResult<Option<(u64, u64)>> {
-        self.inner.free_space()
-    }
+    forward_vfs!(inner;
+        caps, display, identity, local_root, connect, stat, read_dir, read_range, read_link,
+        mkdir_all, open_write, rename, remove_dir, set_mtime, set_mode, make_symlink, free_space,
+    );
 }
 
 #[test]

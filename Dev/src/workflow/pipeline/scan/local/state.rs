@@ -11,7 +11,7 @@ use super::model::PendingFile;
 pub(super) struct LocalScanState {
     identity: crate::store::localid::LocalScanStateIdentity,
     cache: crate::store::hashcache::HashCache,
-    mtime_fixes: HashMap<String, (i64, i64)>,
+    mtime_fixes: crate::store::mtimefix::MtimeCorrections,
     matched_mtime_fixes: HashSet<String>,
 }
 
@@ -44,7 +44,6 @@ impl LocalScanState {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_file(
         &mut self,
         relative: crate::foundation::path::RootRelativePath,
@@ -56,9 +55,9 @@ impl LocalScanState {
     ) -> PendingFile {
         let relative_text = relative.as_str();
         let mtime_ms = match self.mtime_fixes.get(relative_text) {
-            Some((ondisk, intended)) if *ondisk == raw_mtime_ms => {
+            Some(correction) if correction.ondisk_ms == raw_mtime_ms => {
                 self.matched_mtime_fixes.insert(relative_text.to_owned());
-                *intended
+                correction.intended_ms
             }
             _ => raw_mtime_ms,
         };

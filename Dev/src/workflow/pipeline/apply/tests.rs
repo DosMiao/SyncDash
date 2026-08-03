@@ -4,7 +4,7 @@ use crate::fs::vfs::{NameRules, Vfs};
 use crate::model::event::Phase;
 use crate::model::plan::{Action, Side};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::validation::validate_operation_paths;
 
@@ -69,12 +69,7 @@ fn lease_loss_during_copy_never_publishes_the_staged_destination() {
 
     let source_vfs: Arc<dyn Vfs> = source;
     let target_vfs: Arc<dyn Vfs> = target.clone();
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let event_store = events.clone();
-    let ctx = RunCtx::new(
-        crate::obs::progress::RunCtl::new(),
-        Arc::new(move |event| event_store.lock().unwrap().push(event)),
-    );
+    let (ctx, events) = RunCtx::collecting();
     let out = apply_vfs(
         &[copy_op("large.bin", content.len())],
         &source_vfs,

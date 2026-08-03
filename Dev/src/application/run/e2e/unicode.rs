@@ -29,7 +29,6 @@ fn place(root: &Arc<dyn Vfs>, name: &str) {
     let payload = crate::fs::vfs::memory::filler(PAYLOAD_SEED, PAYLOAD_SIZE);
     root.mkdir_all("unicode").unwrap();
     let hint = WriteHint {
-        size_hint: Some(payload.len() as u64),
         mtime_ms: Some(STAMP),
         mode: None,
     };
@@ -65,9 +64,8 @@ fn the_same_name_in_nfc_and_nfd_is_one_file() {
 fn nfc_and_nfd_agree_across_a_real_windows_mac_pair() {
     let base_url = std::env::var("SYNCDASH_E2E_SFTP_URL")
         .expect("set SYNCDASH_E2E_SFTP_URL to an sftp://user@host/scratch phrase");
-    let creds = crate::fs::vfs::cred::default_provider();
     let open = |url: &str| -> Arc<dyn Vfs> {
-        let v = crate::fs::vfs::open(url, &creds).unwrap_or_else(|e| panic!("open {url}: {e}"));
+        let v = crate::fs::vfs::open(url).unwrap_or_else(|e| panic!("open {url}: {e}"));
         v.connect().unwrap_or_else(|e| panic!("connect {url}: {e}"));
         v
     };

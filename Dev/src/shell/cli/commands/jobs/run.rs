@@ -28,7 +28,7 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
                 eprintln!("no matching jobs");
                 return Ok(2);
             }
-            // M6 watch: fast/balanced jobs let unchanged content reuse the hash cache each tick;
+            // Fast/balanced jobs let unchanged content reuse the hash cache each tick;
             // RootLock stops both ends acting at once.
             if watch {
                 let iv = interval

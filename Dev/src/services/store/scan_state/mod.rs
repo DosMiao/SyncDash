@@ -1,11 +1,12 @@
 //! Versioned, root-bound JSONL state shared by scanner acceleration tables.
 //!
-//! This façade owns the format state machine. Binding derivation, file placement, atomic
-//! publication, and best-effort reporting live in independent leaves because they change for
-//! different reasons.
+//! This façade owns the format state machine. Binding derivation, file placement, the per-table
+//! load/publish skeleton, and best-effort reporting live in independent leaves because they change
+//! for different reasons.
 
 pub(crate) mod binding;
-pub(crate) mod location;
+pub(crate) mod bound;
+mod location;
 pub(crate) mod reporting;
 
 #[cfg(test)]

@@ -66,10 +66,7 @@ mod tests {
 
     #[test]
     fn placeholders_are_reported_and_say_why_excluding_them_will_not_help() {
-        let mut v = Verdict {
-            blockers: vec![],
-            warnings: vec![],
-        };
+        let mut v = Verdict::default();
         let s = ["Docs/.Report.pdf.icloud".to_string()];
         check_materialized("source", 1, &s, &mut v);
         assert!(v.ok(), "placeholders are reported, not refused");
@@ -81,20 +78,14 @@ mod tests {
 
     #[test]
     fn a_materialized_tree_says_nothing() {
-        let mut v = Verdict {
-            blockers: vec![],
-            warnings: vec![],
-        };
+        let mut v = Verdict::default();
         check_materialized("source", 0, &[], &mut v);
         assert!(v.ok() && v.warnings.is_empty());
     }
 
     #[test]
     fn a_complete_scan_says_nothing() {
-        let mut v = Verdict {
-            blockers: vec![],
-            warnings: vec![],
-        };
+        let mut v = Verdict::default();
         check_scan_complete("source", 0, &[], &mut v);
         assert!(v.ok());
         assert!(v.warnings.is_empty(), "a clean scan must not produce noise");
@@ -102,10 +93,7 @@ mod tests {
 
     #[test]
     fn one_skipped_entry_blocks_and_names_it() {
-        let mut v = Verdict {
-            blockers: vec![],
-            warnings: vec![],
-        };
+        let mut v = Verdict::default();
         let samples = ["/Users/x/Desktop: Operation not permitted (os error 1)".to_string()];
         check_scan_complete("source", 1, &samples, &mut v);
         assert!(v.ok(), "unread entries are reported, not refused");

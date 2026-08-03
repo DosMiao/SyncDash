@@ -2,8 +2,10 @@
 //!
 //! The transport router lives here. A job either executes in this process — reading and writing
 //! through the `Vfs` layer, whatever protocol the roots name — or it ships a package over ssh and
-//! has a peer apply it against its own disk. `compare`, `preflight`, `apply` and `run_job` are the
-//! only four places that choice is made; `local` and `peer` are the two sides of it.
+//! has a peer apply it against its own disk. Every dispatch on that choice is made in this module,
+//! through `is_peer_target` and `is_peer_job`; `local` and `peer` are the two sides of it. The only
+//! other reader of `spec::is_peer` is job validation, which judges a stored configuration rather
+//! than routing a run.
 //!
 //! `local` is about *who executes*, not about where the bytes are: an `sftp://` root runs down the
 //! local lane, because this process does the reading and writing.
@@ -26,7 +28,7 @@ use crate::model::plan::{Op, Plan};
 use crate::model::table::TableArtifact;
 
 use crate::pipeline::{compare::CompareOptions, scan};
-use local::{compare_job_detailed, preflight_job, run_local_job};
+use local::{compare_job_detailed, run_local_job};
 use peer::{compare_peer_job_detailed, preflight_peer_job, run_peer_job};
 pub use roots::resolve_root;
 
@@ -132,17 +134,11 @@ pub fn effective_scan_opts(
 
 /// The `none` | `sampled` | `full` vocabulary, from the options that produced a scan.
 ///
-/// One mapping, three readers: the snapshot header stamps it (`TableHeader.evidence`), the
-/// archive is checked against it on the way back in, and the peer lane sends it to the far side as
-/// `--evidence`. Spelled out separately, those drift into disagreeing about what a tier is called.
+/// It renders the same tier the scan lanes stamp into `TableHeader.evidence`, through the same
+/// mapping, so the archive check and the peer lane's `--evidence` argument cannot disagree with the
+/// header about what a tier is called.
 pub fn evidence_label(opt: &scan::ScanOptions) -> &'static str {
-    if !opt.hash {
-        "none"
-    } else if opt.sampled {
-        "sampled"
-    } else {
-        "full"
-    }
+    scan::evidence_tier(opt.hash, opt.sampled).as_str()
 }
 
 fn load_comparison_archive(
@@ -176,6 +172,33 @@ fn load_comparison_archive(
         return Ok(None);
     }
     Ok(Some(archive))
+}
+
+/// Report a Compare lane's root warnings, then refuse the run if any root check blocked it.
+///
+/// Both lanes check their own roots — the local lane opens two backends, the peer lane can only
+/// check the source it owns — but the refusal itself is one rule: `NotFound` carrying every blocker
+/// joined with `"; "`, which is the shape callers and the desktop already read. `prefix` names the
+/// job in the peer lane's log lines, where one process drives a remote run.
+pub(crate) fn fail_on_root_blockers(
+    verdict: &crate::pipeline::guard::Verdict,
+    ctx: &crate::obs::progress::RunCtx,
+    prefix: Option<&str>,
+) -> std::io::Result<()> {
+    for warning in &verdict.warnings {
+        let line = match prefix {
+            Some(name) => format!("[{name}] warning: {warning}"),
+            None => format!("warning: {warning}"),
+        };
+        ctx.log(crate::model::event::LogLevel::Warn, "compare", line);
+    }
+    if !verdict.ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            verdict.blockers.join("; "),
+        ));
+    }
+    Ok(())
 }
 
 /// Whether this job executes on a peer over ssh rather than here.
@@ -235,19 +258,6 @@ pub fn compare_capabilities(
     }
 }
 
-/// Gate a plan before applying it.
-pub fn preflight(
-    job: &SingleTargetJob,
-    plan: &Plan,
-    ops: &[Op],
-) -> std::io::Result<crate::pipeline::guard::Verdict> {
-    if is_peer_target(job) {
-        Ok(preflight_peer_job(job, plan, ops))
-    } else {
-        preflight_job(job, plan, ops)
-    }
-}
-
 pub fn apply_requirements(
     job: &SingleTargetJob,
     plan: &Plan,
@@ -265,7 +275,6 @@ pub fn apply_requirements(
 
 /// Apply with an explicit mutation boundary. New interactive callers should use this form so a
 /// refused run can preserve its reviewed Compare result without guessing from text or counters.
-#[allow(clippy::too_many_arguments)] // each argument is an independently reviewed apply decision
 pub fn apply_classified(
     name: &str,
     job: &SingleTargetJob,
@@ -280,6 +289,81 @@ pub fn apply_classified(
     } else {
         local::apply_job_guarded_with_classified(job, plan, ops, trash, verbose, ctx)
     }
+}
+
+/// The refusal both apply lanes raise when preflight blocks: one `Error` event per blocker, and an
+/// outcome that touched nothing. Each lane keeps its own report label and its own return shape —
+/// only the reported refusal is shared, so the two cannot describe the same stop differently.
+pub(crate) fn refused_by_preflight(
+    ctx: &crate::obs::progress::RunCtx,
+    blockers: &[String],
+    skipped: usize,
+) -> crate::obs::progress::ApplyOutcome {
+    use crate::model::event::{Phase, ProgressEvent};
+    for blocker in blockers {
+        ctx.sink.emit(ProgressEvent::Error {
+            phase: Phase::Apply,
+            ts_ms: crate::foundation::time::now_ms(),
+            path: String::new(),
+            action: "preflight".into(),
+            side: "target".into(),
+            message: blocker.clone(),
+        });
+    }
+    crate::obs::progress::ApplyOutcome {
+        done: 0,
+        skipped: skipped as u64,
+        errors: 1,
+        bytes_copied: 0,
+        cancelled: false,
+    }
+}
+
+/// The CLI's post-Compare tail, shared by both lanes: dump the plan, stop unless Apply was asked
+/// for, narrow to the executable subset, and record the run around the lane's own apply.
+///
+/// A dry run reports `plan.ops.len()` as skipped — every op the plan holds, not the executable
+/// subset — because nothing was filtered out yet at the point it returns. `apply` receives the
+/// recorder's context so the lane writes into the run being recorded.
+pub(crate) fn execute_planned_run(
+    name: &str,
+    job: &SingleTargetJob,
+    plan: &Plan,
+    do_apply: bool,
+    ctx: &crate::obs::progress::RunCtx,
+    apply: impl FnOnce(
+        &[Op],
+        &crate::obs::progress::RunCtx,
+    ) -> std::io::Result<crate::obs::progress::ApplyOutcome>,
+) -> std::io::Result<(u64, u64, u64, u64)> {
+    for op in &plan.ops {
+        println!("{}", serde_json::to_string(op)?);
+    }
+    if !do_apply {
+        println!("{}", crate::foundation::fmt::DRY_RUN_HINT);
+        return Ok((0, plan.ops.len() as u64, 0, plan.header.conflict_count));
+    }
+    let ops: Vec<Op> = plan
+        .ops
+        .iter()
+        .filter(|o| o.action.is_executable())
+        .cloned()
+        .collect();
+    let t0 = std::time::Instant::now();
+    let rec = history::Recorder::start(
+        history::RunSubject::for_job(name, job),
+        apply_run_kind(job),
+        ctx,
+        &ops,
+    );
+    let out = apply(&ops, &rec.ctx)?;
+    let _ = rec.finish(&out, t0.elapsed().as_millis() as u64);
+    Ok((
+        out.done,
+        out.skipped,
+        out.errors,
+        plan.header.conflict_count,
+    ))
 }
 
 /// One job end to end: compare, then apply if asked. Returns (done, skipped, errors, conflicts).

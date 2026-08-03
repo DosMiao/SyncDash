@@ -10,12 +10,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use crate::foundation::names::LOCK_NAME;
+use crate::foundation::token::is_lower_hex;
 use crate::fs::vfs::error::VfsResult;
 use crate::fs::vfs::{Vfs, VfsEntryKind};
 
 use super::artifact::{
-    claim_name, invalid_lock, is_lower_hex, parse_artifact, release_name, LedgerArtifact,
-    LockAnchor, LockClaim, LockHeartbeat, LockRelease, LOCK_PROTOCOL, TOKEN_HEX_LEN,
+    claim_name, invalid_lock, parse_artifact, release_name, LedgerArtifact, LockAnchor, LockClaim,
+    LockHeartbeat, LockRelease, LOCK_PROTOCOL, TOKEN_HEX_LEN,
 };
 use super::record_store::{publish_record, read_anchor, read_record};
 

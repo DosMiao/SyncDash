@@ -131,6 +131,31 @@ impl RunCtx {
         RunCtx { ctl, sink }
     }
 
+    /// A context whose sink records every event, for tests that assert on the emitted stream.
+    /// Owned here so the recording rule stays one definition rather than one per test module.
+    #[cfg(test)]
+    pub(crate) fn collecting() -> (RunCtx, Arc<std::sync::Mutex<Vec<ProgressEvent>>>) {
+        RunCtx::collecting_with(RunCtl::new())
+    }
+
+    /// The same recording sink over a caller-supplied control, for tests that pre-cancel the run
+    /// or hold the control to cancel it later.
+    #[cfg(test)]
+    pub(crate) fn collecting_with(
+        ctl: Arc<RunCtl>,
+    ) -> (RunCtx, Arc<std::sync::Mutex<Vec<ProgressEvent>>>) {
+        let events: Arc<std::sync::Mutex<Vec<ProgressEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = events.clone();
+        let sink = move |event: ProgressEvent| {
+            recorded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(event);
+        };
+        (RunCtx::new(ctl, Arc::new(sink)), events)
+    }
+
     /// Emit one line of pipeline narration. Use this wherever ctx is in hand; where it is not
     /// (trash / version / lock), the `logging::log_*!` macros reach the same bus via the process registry.
     pub fn log(&self, level: LogLevel, scope: &str, message: impl Into<String>) {
@@ -464,18 +489,9 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    fn collecting_ctx() -> (RunCtx, Arc<Mutex<Vec<ProgressEvent>>>) {
-        let store: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let s2 = store.clone();
-        let sink = move |ev: ProgressEvent| {
-            s2.lock().unwrap().push(ev);
-        };
-        (RunCtx::new(RunCtl::new(), Arc::new(sink)), store)
-    }
-
     #[test]
     fn cancel_makes_checkpoint_interrupt() {
-        let (ctx, _) = collecting_ctx();
+        let (ctx, _) = RunCtx::collecting();
         let prog = PhaseProgress::begin(&ctx, Phase::Apply, None, 10, 100);
         assert!(prog.checkpoint().is_ok());
         ctx.ctl.request_cancel();
@@ -485,7 +501,7 @@ mod tests {
 
     #[test]
     fn pause_blocks_and_accumulates() {
-        let (ctx, store) = collecting_ctx();
+        let (ctx, store) = RunCtx::collecting();
         ctx.ctl.set_paused(true);
         let ctx2 = ctx.clone();
         let (entered_send, entered_receive) = std::sync::mpsc::channel();
@@ -520,7 +536,7 @@ mod tests {
 
     #[test]
     fn concurrent_pause_announces_once() {
-        let (ctx, store) = collecting_ctx();
+        let (ctx, store) = RunCtx::collecting();
         ctx.ctl.set_paused(true);
         let start = Arc::new(std::sync::Barrier::new(5));
         let (done_send, done_receive) = std::sync::mpsc::channel();
@@ -568,7 +584,7 @@ mod tests {
 
     #[test]
     fn counters_and_events_flow() {
-        let (ctx, store) = collecting_ctx();
+        let (ctx, store) = RunCtx::collecting();
         let prog = PhaseProgress::begin(&ctx, Phase::ScanSource, Some("D:\\root".into()), 0, 0);
         prog.set_totals(2, 300);
         prog.item_done("a.txt");
@@ -625,7 +641,7 @@ mod tests {
 
     #[test]
     fn an_unfinished_phase_emits_a_failed_boundary_on_drop() {
-        let (ctx, store) = collecting_ctx();
+        let (ctx, store) = RunCtx::collecting();
         {
             let prog = PhaseProgress::begin(&ctx, Phase::ScanTarget, None, 10, 100);
             prog.item_done("one");
@@ -643,7 +659,7 @@ mod tests {
 
     #[test]
     fn a_cancelled_finish_propagates_interruption() {
-        let (ctx, store) = collecting_ctx();
+        let (ctx, store) = RunCtx::collecting();
         let prog = PhaseProgress::begin(&ctx, Phase::ScanSource, None, 1, 0);
         ctx.ctl.request_cancel();
 

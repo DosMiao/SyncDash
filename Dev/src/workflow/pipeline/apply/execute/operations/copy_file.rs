@@ -159,11 +159,7 @@ pub(in crate::pipeline::apply::execute) fn execute(
                             pp.error(
                                         &op.path,
                                         "set_mtime",
-                                        if op.side == Side::Target {
-                                            "target"
-                                        } else {
-                                            "source"
-                                        },
+                                        op.side.as_str(),
                                         &format!(
                                             "mtime could not be set ({error}); comparison will lean on size/content for this file"
                                         ),
@@ -185,7 +181,6 @@ pub(in crate::pipeline::apply::execute) fn execute(
         None => live_meta.as_ref().map(|m| m.mtime_ms),
     };
     let hint = WriteHint {
-        size_hint: Some(planned_size),
         mtime_ms: intended,
         mode: op.mode,
     };

@@ -26,8 +26,8 @@ use super::error::{VfsError, VfsErrorKind, VfsResult};
 use super::spec::EndpointSpec;
 use super::VfsEntryKind;
 use super::{
-    CaseSense, CredentialProvider, Credentials, ReadStream, Support, VDirEntry, VMeta, Vfs,
-    VfsCaps, WriteHint, WriteStaged,
+    CaseSense, Credentials, ReadStream, Support, VDirEntry, VMeta, Vfs, VfsCaps, WriteHint,
+    WriteStaged,
 };
 use crate::foundation::names::TEMP_PREFIX;
 
@@ -42,7 +42,6 @@ use staged::{SftpRead, SftpStaged};
 
 pub struct SftpBackend {
     spec: EndpointSpec,
-    creds: Arc<dyn CredentialProvider>,
     rt: tokio::runtime::Runtime,
     timeout: Duration,
     conn: OnceLock<Conn>,
@@ -60,22 +59,11 @@ struct Conn {
 }
 
 impl SftpBackend {
-    pub fn new(spec: EndpointSpec, creds: Arc<dyn CredentialProvider>) -> SftpBackend {
-        let timeout = spec
-            .opt("timeout")
-            .and_then(|t| t.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(20));
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_io()
-            .enable_time()
-            .thread_name("syncdash-sftp")
-            .build()
-            .expect("tokio runtime");
+    pub fn new(spec: EndpointSpec) -> SftpBackend {
+        let timeout = spec.timeout();
+        let rt = super::backend_runtime("syncdash-sftp");
         SftpBackend {
             spec,
-            creds,
             rt,
             timeout,
             conn: OnceLock::new(),
@@ -106,30 +94,19 @@ impl SftpBackend {
         }
     }
 
-    /// Run one sftp operation with the backend's timeout. A timeout is connection
-    /// trouble, i.e. `Transient` — never anything that could read as "file gone".
+    /// Run one sftp operation with the backend's timeout, translating the protocol's own error
+    /// into a `VfsError`.
     fn block<F, T>(&self, what: &str, fut: F) -> VfsResult<T>
     where
         F: std::future::Future<Output = Result<T, russh_sftp::client::error::Error>>,
     {
-        // The timeout future must be BUILT inside the runtime (it grabs the timer at
-        // construction), hence the async block rather than a bare block_on(timeout(..)).
-        let d = self.timeout;
-        match self
-            .rt
-            .block_on(async { tokio::time::timeout(d, fut).await })
-        {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(map_sftp_err(what, e)),
-            Err(_) => Err(VfsError::new(
-                VfsErrorKind::Transient,
-                format!(
-                    "{what} timed out after {:?} on '{}'",
-                    self.timeout,
-                    self.spec.display()
-                ),
-            )),
-        }
+        super::block_with_timeout(
+            self.rt.handle(),
+            self.timeout,
+            what,
+            Some(&self.spec.display()),
+            async move { fut.await.map_err(|e| map_sftp_err(what, e)) },
+        )
     }
 
     /// Absence is confirmed by [`super::absence::confirm_absent`]; this backend supplies only
@@ -214,22 +191,22 @@ pub(super) fn map_sftp_err(what: &str, e: russh_sftp::client::error::Error) -> V
     }
 }
 
-// ---- host-key verification ----
 impl Vfs for SftpBackend {
     fn caps(&self) -> VfsCaps {
         VfsCaps {
             protocol: "sftp",
             mtime_precision_ms: 1000, // v3 attributes carry whole seconds
             set_mtime: Support::Yes,  // setstat-by-path (write lane)
-            fsync: Support::Unknown,  // fsync@openssh.com probed when the write lane lands
-            rename: Support::Yes,
+            // fsync@openssh.com is never probed: `seal(true)` asks for it and the server either
+            // honours it or fails that file, which is the only moment the answer matters.
+            fsync: Support::Unknown,
             rename_overwrite: Support::No, // v3 rename refuses an existing target (relied upon)
             exclusive_staged_file_publish: *self.exclusive_staged_file_publish.lock().unwrap(),
             exclusive_entry_rename: Support::Unknown,
             exclusive_symlink_publish: Support::Unknown,
             durable_namespace: Support::Unknown,
             ranged_read: Support::Yes, // seekable file handles → real sampled evidence
-            write_at: Support::No,     // revisited with the write lane
+            write_at: Support::No,     // staged writes are sequential; delta is a both-local affair
             unix_mode: Support::Yes,
             symlink: Support::Yes,
             file_id: Support::No,
@@ -272,7 +249,7 @@ impl Vfs for SftpBackend {
                 ),
             )
         })?;
-        let creds = self.creds.credentials_for(&self.spec)?;
+        let creds = super::cred::credentials_for(&self.spec)?;
         let timeout = self.timeout;
         let root_spec = self.spec.root.clone();
         let display = self.spec.display();
@@ -414,12 +391,7 @@ impl Vfs for SftpBackend {
     fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
         use russh_sftp::protocol::OpenFlags;
         let conn = self.conn()?;
-        let (parent, base) = crate::foundation::path::split_parent(rel);
-        let token = super::random_name_token()?;
-        let tmp_rel = format!(
-            "{parent}{}{base}.{token}",
-            crate::foundation::names::TEMP_PREFIX,
-        );
+        let tmp_rel = super::staged_temp_rel(rel)?;
         let tmp_abs = self.abs(&tmp_rel);
         let dst_abs = self.abs(rel);
         let sftp = conn.sftp.clone();
@@ -639,7 +611,7 @@ mod tests {
         let RootSpec::Endpoint(r) = parse(s) else {
             panic!()
         };
-        SftpBackend::new(r, crate::fs::vfs::cred::default_provider())
+        SftpBackend::new(r)
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::fs::vfs::VfsEntryKind;
 use crate::model::digest::Blake3Digest;
 use crate::model::table::{
     FileIdentityObservation, ObservedDirectory, ObservedEntry, ObservedFile, ObservedSymlink,
-    TableArtifact, TableEvidence, TableHeader, TableKind, TABLE_SCHEMA,
+    TableArtifact, TableHeader, TableKind, TABLE_SCHEMA,
 };
 
 use super::digest::{effective_read, full_hash_vfs, sampled_digest_vfs, SAMPLE_MIN};
@@ -173,9 +173,9 @@ pub(super) fn scan_vfs(
                     let size = de.meta.size;
                     let raw_mt = de.meta.mtime_ms;
                     let mt = match mtime_fixes.get(&rel) {
-                        Some((ondisk, intended)) if *ondisk == raw_mt => {
+                        Some(correction) if correction.ondisk_ms == raw_mt => {
                             matched_mtime_fixes.insert(rel.clone());
-                            *intended
+                            correction.intended_ms
                         }
                         _ => raw_mt,
                     };
@@ -405,13 +405,7 @@ pub(super) fn scan_vfs(
             scanned_at_ms: started,
             duration_ms: t0.elapsed().as_millis() as u64,
             entry_count: entries.len() as u64,
-            evidence: if !opt.hash {
-                TableEvidence::None
-            } else if sampled {
-                TableEvidence::Sampled
-            } else {
-                TableEvidence::Full
-            },
+            evidence: super::evidence_tier(opt.hash, sampled),
             excluded_dirs: excl_dirs,
             excluded_files: excl_files,
             walk_errors,

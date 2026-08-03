@@ -15,7 +15,7 @@ mod tests;
 
 use crate::foundation::time::now_ms;
 use crate::fs::local_root::LocalRoot;
-use crate::model::table::{TableArtifact, TableEvidence, TableHeader, TableKind, TABLE_SCHEMA};
+use crate::model::table::{TableArtifact, TableHeader, TableKind, TABLE_SCHEMA};
 
 use super::{ProgressFn, ScanMetrics, ScanOptions, ScanProgress};
 
@@ -87,9 +87,11 @@ pub(crate) fn scan_local_root_impl(
         root,
         &mut discovered.pending_files,
         options,
-        phase_progress.as_ref(),
-        progress,
-        side,
+        &hashing::ScanReporting {
+            phase: phase_progress.as_ref(),
+            callback: progress,
+            side,
+        },
         max_parallel_streams,
         &mut metrics,
     )?;
@@ -133,13 +135,7 @@ pub(crate) fn scan_local_root_impl(
             scanned_at_ms,
             duration_ms: started.elapsed().as_millis() as u64,
             entry_count: discovered.entries.len() as u64,
-            evidence: if !options.hash {
-                TableEvidence::None
-            } else if options.sampled {
-                TableEvidence::Sampled
-            } else {
-                TableEvidence::Full
-            },
+            evidence: super::evidence_tier(options.hash, options.sampled),
             excluded_dirs: discovered.excluded_dirs,
             excluded_files: discovered.excluded_files,
             walk_errors: discovered.walk_errors,

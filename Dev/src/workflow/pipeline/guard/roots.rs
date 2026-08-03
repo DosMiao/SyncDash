@@ -166,18 +166,12 @@ mod tests {
     fn missing_marker_blocks_when_required() {
         let d = std::env::temp_dir().join(format!("syncdash-pf-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&d);
-        let mut v = Verdict {
-            blockers: vec![],
-            warnings: vec![],
-        };
+        let mut v = Verdict::default();
         check_root("target", &d, true, &mut v);
         assert_eq!(v.blockers.len(), 1);
 
         write_marker(&d, "test-job", "").unwrap();
-        let mut v2 = Verdict {
-            blockers: vec![],
-            warnings: vec![],
-        };
+        let mut v2 = Verdict::default();
         check_root("target", &d, true, &mut v2);
         assert!(v2.ok(), "marker present -> pass");
         let _ = std::fs::remove_dir_all(&d);
@@ -190,10 +184,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join(MARKER_NAME), b"not-json").unwrap();
-        let mut verdict = Verdict {
-            blockers: vec![],
-            warnings: vec![],
-        };
+        let mut verdict = Verdict::default();
 
         check_root("target", &d, true, &mut verdict);
 

@@ -41,14 +41,21 @@ pub(super) fn mtime_precision_for(fs_name: &str) -> u32 {
     }
 }
 
-pub(super) fn fat_family(fs_name: &str) -> bool {
+/// Whether the OS-reported filesystem name is one of the FAT variants, which have no unix modes,
+/// no symlinks, and no stable file ids.
+pub fn fat_family(fs_name: &str) -> bool {
     matches!(
         fs_name.to_ascii_lowercase().as_str(),
         "fat" | "fat12" | "fat16" | "fat32" | "msdos" | "vfat" | "exfat"
     )
 }
 
-pub(super) fn file_ids_stable_for_fs(fs_name: &str) -> bool {
+/// Whether a filesystem of this name keeps an inode/file id stable across a rename and a remount.
+///
+/// The single owner of that question. `LocalVfs::caps` uses it to decide whether to publish a
+/// `file_id` at all, and `store::localid` uses it to decide whether persistent scan state may be
+/// reused; two tables would let a scan reuse state keyed on an id the backend never promised.
+pub fn file_ids_stable_for_fs(fs_name: &str) -> bool {
     matches!(
         fs_name.to_ascii_lowercase().as_str(),
         "apfs"

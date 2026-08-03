@@ -186,11 +186,7 @@ pub(super) fn preserve(
             );
         }
         if shared.trash_reaches(&operation.side) {
-            let side = if operation.side == Side::Source {
-                "source"
-            } else {
-                "target"
-            };
+            let side = operation.side.as_str();
             let retained_relative = format!("{side}/{}", operation.path);
             let trash_root = shared
                 .central_trash_root

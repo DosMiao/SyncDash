@@ -1,7 +1,6 @@
 //! CLI-facing iteration over targets and one complete local Compare/Apply run.
 
 use crate::job::{Job, SingleTargetJob};
-use crate::model::plan::Op;
 
 use super::{apply_job_guarded_with, compare_job_detailed};
 
@@ -53,33 +52,13 @@ pub fn run_local_single(
         plan.header.op_count,
         plan.header.conflict_count
     );
-    for op in &plan.ops {
-        println!("{}", serde_json::to_string(op)?);
-    }
-    if !do_apply {
-        println!("dry-run (rerun with --apply)");
-        return Ok((0, plan.ops.len() as u64, 0, plan.header.conflict_count));
-    }
-    let ops: Vec<Op> = plan
-        .ops
-        .iter()
-        .filter(|o| o.action.is_executable())
-        .cloned()
-        .collect();
     // The CLI records here; the desktop records at its command boundary to retain its authorization identity.
-    let t0 = std::time::Instant::now();
-    let rec = crate::run::history::Recorder::start(
-        crate::run::history::RunSubject::for_job(name, job),
-        super::super::apply_run_kind(job),
+    super::super::execute_planned_run(
+        name,
+        job,
+        &plan,
+        do_apply,
         &crate::obs::progress::RunCtx::null(),
-        &ops,
-    );
-    let out = apply_job_guarded_with(job, &plan, &ops, None, verbose, &rec.ctx);
-    let _ = rec.finish(&out, t0.elapsed().as_millis() as u64);
-    Ok((
-        out.done,
-        out.skipped,
-        out.errors,
-        plan.header.conflict_count,
-    ))
+        |ops, ctx| Ok(apply_job_guarded_with(job, &plan, ops, None, verbose, ctx)),
+    )
 }

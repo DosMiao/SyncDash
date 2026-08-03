@@ -1,4 +1,4 @@
-//! Stable file placement for current and legacy scan-state indexes.
+//! Stable file placement for scan-state indexes.
 
 use std::path::PathBuf;
 
@@ -14,12 +14,9 @@ pub(crate) fn logical_file(key: &str, extension: &str) -> PathBuf {
     file(key.as_bytes(), extension)
 }
 
-/// Pre-versioned state lowercased its complete logical identity.
-pub(crate) fn legacy_logical_file(key: &str, extension: &str) -> PathBuf {
-    file(key.to_lowercase().as_bytes(), extension)
-}
-
-/// Local state retains its historical path-derived filename; the header supplies physical binding.
+/// Local state keeps its historical name — blake3 over the lowercased root string — because a
+/// changed formula silently invalidates every cache on every machine. The header, not the
+/// filename, supplies physical binding.
 pub(crate) fn local_file(key: &str, extension: &str) -> PathBuf {
-    legacy_logical_file(key, extension)
+    file(key.to_lowercase().as_bytes(), extension)
 }

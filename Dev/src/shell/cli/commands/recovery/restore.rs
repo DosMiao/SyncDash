@@ -10,14 +10,7 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
         } => {
             let (restored, skipped, errors) =
                 syncdash::store::version::restore(&root, &version, &files, !do_apply)?;
-            println!(
-                "{}: {restored} restored, {skipped} skipped, {errors} error(s)",
-                if do_apply {
-                    "restore"
-                } else {
-                    "dry-run (rerun with --apply)"
-                }
-            );
+            super::print_restore_summary(do_apply, restored, skipped, errors);
             Ok(if errors > 0 { 1 } else { 0 })
         }
         _ => unreachable!("version-restore handler received another command"),

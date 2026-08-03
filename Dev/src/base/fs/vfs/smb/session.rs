@@ -6,7 +6,7 @@
 
 use super::super::error::{VfsError, VfsErrorKind, VfsResult};
 use super::super::spec::EndpointSpec;
-use super::super::{CredentialProvider, Vfs};
+use super::super::Vfs;
 use super::errors::map_smb_err;
 use smb2::client::connection::Connection;
 use smb2::{SmbClient, Tree};
@@ -15,7 +15,6 @@ use std::time::Duration;
 
 pub struct SmbBackend {
     pub(super) spec: EndpointSpec,
-    pub(super) creds: Arc<dyn CredentialProvider>,
     /// Share name (first segment of the phrase root); the tree is connected to this.
     pub(super) share: String,
     /// Path below the share named by the phrase. Every `rel` is resolved under it.
@@ -40,7 +39,7 @@ pub(super) struct Conn {
 }
 
 impl SmbBackend {
-    pub fn new(spec: EndpointSpec, creds: Arc<dyn CredentialProvider>) -> VfsResult<SmbBackend> {
+    pub fn new(spec: EndpointSpec) -> VfsResult<SmbBackend> {
         let mut segs = spec.root.splitn(2, '/');
         let share = segs.next().unwrap_or("").to_string();
         if share.is_empty() {
@@ -53,21 +52,10 @@ impl SmbBackend {
             ));
         }
         let sub = segs.next().unwrap_or("").trim_matches('/').to_string();
-        let timeout = spec
-            .opt("timeout")
-            .and_then(|t| t.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(20));
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_io()
-            .enable_time()
-            .thread_name("syncdash-smb")
-            .build()
-            .expect("tokio runtime");
+        let timeout = spec.timeout();
+        let rt = super::super::backend_runtime("syncdash-smb");
         Ok(SmbBackend {
             spec,
-            creds,
             share,
             sub,
             timeout,
@@ -125,26 +113,16 @@ impl SmbBackend {
         }
     }
 
-    /// Run one operation under the backend's timeout. A timeout is connection trouble, i.e.
-    /// `Transient` — never anything a caller could read as "the file is gone".
+    /// Run one operation under the backend's timeout, translating the crate's own error into a
+    /// `VfsError`.
     pub(super) fn block<F, T>(&self, what: &str, fut: F) -> VfsResult<T>
     where
         F: std::future::Future<Output = smb2::Result<T>>,
     {
-        let d = self.timeout;
-        // The timeout future has to be built inside the runtime (it takes the timer at
-        // construction), hence the async block rather than a bare block_on(timeout(..)).
-        match self
-            .rt
-            .block_on(async { tokio::time::timeout(d, fut).await })
-        {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(map_smb_err(what, e)),
-            Err(_) => Err(VfsError::new(
-                VfsErrorKind::Transient,
-                format!("{what} timed out after {d:?} on '{}'", self.spec.display()),
-            )),
-        }
+        self.block_vfs(
+            what,
+            async move { fut.await.map_err(|e| map_smb_err(what, e)) },
+        )
     }
 
     /// `block` for a step that classifies its own failures (the hand-rolled compounds).
@@ -152,17 +130,13 @@ impl SmbBackend {
     where
         F: std::future::Future<Output = VfsResult<T>>,
     {
-        let d = self.timeout;
-        match self
-            .rt
-            .block_on(async { tokio::time::timeout(d, fut).await })
-        {
-            Ok(r) => r,
-            Err(_) => Err(VfsError::new(
-                VfsErrorKind::Transient,
-                format!("{what} timed out after {d:?} on '{}'", self.spec.display()),
-            )),
-        }
+        super::super::block_with_timeout(
+            self.rt.handle(),
+            self.timeout,
+            what,
+            Some(&self.spec.display()),
+            fut,
+        )
     }
 
     /// Absence is confirmed by [`super::super::absence::confirm_absent`]; this backend supplies only

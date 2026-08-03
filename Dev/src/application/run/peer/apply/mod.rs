@@ -13,7 +13,6 @@ use self::execution::apply_peer_inner;
 pub use policy::{apply_capabilities, preflight_peer_job};
 
 /// Apply a reviewed peer-plan subset and return its terminal counters.
-#[allow(clippy::too_many_arguments)] // each argument is an independently reviewed apply decision
 pub fn apply_peer_job_with(
     name: &str,
     job: &SingleTargetJob,
@@ -25,7 +24,6 @@ pub fn apply_peer_job_with(
     apply_peer_job_with_classified(name, job, plan, ops, verbose, ctx).into_result()
 }
 
-#[allow(clippy::too_many_arguments)] // each argument is an independently reviewed apply decision
 pub fn apply_peer_job_with_classified(
     name: &str,
     job: &SingleTargetJob,

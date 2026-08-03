@@ -14,19 +14,12 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
             }
             let rows = syncdash::run::history::history(job.as_deref(), limit)?;
             if rows.is_empty() {
-                println!("no runs recorded yet (runs are logged when a job actually applies)");
+                println!("{}", super::NO_RUNS_RECORDED);
                 return Ok(0);
             }
             let now = syncdash::foundation::time::now_ms() as i64;
             for r in rows {
-                let age_min = (now - r.ts_ms).max(0) / 60_000;
-                let age = if age_min < 60 {
-                    format!("{age_min}m ago")
-                } else if age_min < 48 * 60 {
-                    format!("{}h ago", age_min / 60)
-                } else {
-                    format!("{}d ago", age_min / 60 / 24)
-                };
+                let age = super::relative_age(now, r.ts_ms);
                 println!(
                     "{:>9}  {:<20} {:<12} {:>5} done {:>4} skip {:>3} err  {:>10}  {:>7.1}s{}",
                     age,

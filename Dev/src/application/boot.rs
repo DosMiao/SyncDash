@@ -38,7 +38,7 @@ pub fn init(sink_for: impl FnOnce(&AppSettings) -> Option<Arc<dyn ProgressSink>>
     }
 }
 
-/// Initialize the global rayon pool (hash worker threads): **lowered priority** —— a standard scan's BLAKE3
+/// Initialize the global rayon pool (hash worker threads): **lowered priority** — a standard scan's BLAKE3
 /// deliberately runs on every core (get the one-off cost over with) but must not grind the whole machine to a halt;
 /// at below-normal priority a full-core hash yields to foreground programs on its own, with no throughput loss on an idle box.
 /// `SYNCDASH_SCAN_THREADS=N` caps the thread count further. CLI and desktop each call this once at startup (idempotent).
@@ -47,7 +47,8 @@ pub fn init_worker_pool() {
     if let Some(threads) = crate::foundation::thread::configured_worker_limit() {
         b = b.num_threads(threads);
     }
-    // build_global returns Err when a global pool already exists (repeat call) —— swallowing it is fine
+    // build_global returns Err when a global pool already exists (repeat call) — the pool is
+    // process-global and this call is idempotent, so the second caller has nothing to do
     let _ = b
         .start_handler(|_| crate::foundation::thread::lower_priority())
         .build_global();

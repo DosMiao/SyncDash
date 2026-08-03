@@ -94,18 +94,6 @@ pub(super) fn legacy_summary_relative_path(run_id: &EntryName) -> RootRelativePa
 }
 
 pub(super) fn random_record_id() -> std::io::Result<String> {
-    let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| std::io::Error::other(format!("cannot create a run identity: {error}")))?;
-    Ok(hex_bytes(&bytes))
-}
-
-pub(super) fn hex_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut value = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        value.push(HEX[(byte >> 4) as usize] as char);
-        value.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    value
+    crate::foundation::token::random_token_128()
+        .map_err(|error| std::io::Error::other(format!("cannot create a run identity: {error}")))
 }

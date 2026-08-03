@@ -107,6 +107,32 @@ pub fn default_junk_patterns() -> Vec<String> {
     expand_junk_presets(JUNK_PRESETS.iter().filter(|p| p.default_on).map(|p| p.id))
 }
 
+/// A caller-supplied preset list (a `--junk` flag, a job's seed list) normalized to ids this table
+/// knows: entries are trimmed, blanks and the `none` opt-out drop out, and an unknown id is
+/// **refused** rather than dropped — a filter seeded with fewer rules than asked for is not the
+/// filter it says it is, and the shortfall would only surface as a surprise in a plan.
+/// The error carries the whole sentence a shell prints, so every caller refuses in the same words.
+pub fn parse_preset_ids<I: IntoIterator<Item = S>, S: AsRef<str>>(
+    ids: I,
+) -> Result<Vec<String>, String> {
+    let mut wanted = Vec::new();
+    for id in ids {
+        let id = id.as_ref().trim();
+        if id.is_empty() || id.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        if junk_preset(id).is_none() {
+            let known: Vec<&str> = JUNK_PRESETS.iter().map(|p| p.id).collect();
+            return Err(format!(
+                "unknown junk preset '{id}' (known: {}, or `none`)",
+                known.join(", ")
+            ));
+        }
+        wanted.push(id.to_string());
+    }
+    Ok(wanted)
+}
+
 /// Preset ids → their patterns, in table order, deduplicated. Unknown ids are the caller's problem
 /// (`junk_preset` returns None) — silently dropping one would be a filter that isn't what it says it is.
 pub fn expand_junk_presets<I: IntoIterator<Item = S>, S: AsRef<str>>(ids: I) -> Vec<String> {
@@ -214,6 +240,21 @@ mod tests {
         // An unknown id resolves to nothing — the caller decides what to do, we never guess
         assert!(junk_preset("no-such-preset").is_none());
         assert!(expand_junk_presets(["no-such-preset"]).is_empty());
+    }
+
+    /// The gate every shell shares: `none` and blanks are an opt-out, an unknown id is a refusal.
+    #[test]
+    fn preset_id_parsing_drops_the_opt_out_and_refuses_the_unknown() {
+        assert_eq!(
+            parse_preset_ids([" windows ", "", "none", "macos"]).unwrap(),
+            vec!["windows".to_string(), "macos".to_string()]
+        );
+        assert!(parse_preset_ids(["NONE"]).unwrap().is_empty());
+        let refusal = parse_preset_ids(["windows", "no-such-preset"]).unwrap_err();
+        assert!(
+            refusal.starts_with("unknown junk preset 'no-such-preset' (known: windows,"),
+            "the refusal names the id and lists the known ones: {refusal}"
+        );
     }
 
     /// The line-identity test that keeps a preset from being pasted in twice. It folds case and

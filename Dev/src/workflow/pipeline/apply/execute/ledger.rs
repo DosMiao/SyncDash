@@ -2,7 +2,7 @@
 
 use super::schedule::{Counters, Shared};
 use crate::model::event::ItemOutcome;
-use crate::model::plan::{Op, Side};
+use crate::model::plan::Op;
 use crate::obs::progress::PhaseProgress;
 use std::sync::atomic::Ordering;
 
@@ -16,21 +16,8 @@ pub(super) fn record(
     acc: &Counters,
     ms: u64,
 ) {
-    let label = format!(
-        "[{}] {:?} {}",
-        if op.side == Side::Target {
-            "target"
-        } else {
-            "source"
-        },
-        op.action,
-        op.path
-    );
-    let side = if op.side == Side::Target {
-        "target"
-    } else {
-        "source"
-    };
+    let label = crate::pipeline::apply::reporting::op_label(op);
+    let side = op.side.as_str();
     // Every op's outcome emits one ItemResult — this is the only place in the codebase that knows "did this one actually succeed";
     // outside this function all that remains are three aggregate counters. The execution ledger (items.jsonl) rests entirely on it.
     let ledger = |outcome: ItemOutcome| {

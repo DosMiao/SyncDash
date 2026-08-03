@@ -193,3 +193,20 @@ fn posix_targets_keep_names_windows_would_reject() {
         .iter()
         .all(|o| o.action != Action::Note && o.action != Action::Conflict));
 }
+
+#[test]
+fn normalization_twins_reported_not_merged() {
+    let s = snap(
+        "linux",
+        vec![
+            file("caf\u{00e9}.txt", "h1"),
+            file("cafe\u{0301}.txt", "h2"),
+        ],
+    );
+    let t = snap("windows", vec![file("caf\u{00e9}.txt", "h1")]);
+    let plan = compare(&s, &t, "mirror", None, false, &CompareOptions::default());
+    assert!(plan
+        .ops
+        .iter()
+        .any(|o| o.action == Action::Note && o.reason.contains("duplicate-after-normalization")));
+}

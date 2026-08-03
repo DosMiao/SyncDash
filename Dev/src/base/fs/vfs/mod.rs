@@ -32,25 +32,70 @@ pub mod conformance;
 pub mod memory;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::foundation::path::EntryName;
 use error::{VfsError, VfsErrorKind, VfsResult};
-use spec::{EndpointSpec, RootSpec};
+use spec::RootSpec;
 
 pub(crate) fn random_name_token() -> VfsResult<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|e| {
+    crate::foundation::token::random_token_128().map_err(|e| {
         VfsError::new(
             VfsErrorKind::Io,
             format!("could not generate a staged-name token: {e}"),
         )
-    })?;
-    let mut token = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(token, "{byte:02x}").expect("writing into a String cannot fail");
+    })
+}
+
+/// The staged temp name a protocol backend writes into: the destination's own directory (so the
+/// landing rename stays same-volume) plus `TEMP_PREFIX` and a fresh token. One spelling for every
+/// backend, because the filter rules and the debris sweeps recognize files by that prefix.
+pub(crate) fn staged_temp_rel(rel: &str) -> VfsResult<String> {
+    let (parent, base) = crate::foundation::path::split_parent(rel);
+    let token = random_name_token()?;
+    Ok(format!(
+        "{parent}{}{base}.{token}",
+        crate::foundation::names::TEMP_PREFIX,
+    ))
+}
+
+/// The private tokio runtime a protocol backend drives its async client from: two worker threads,
+/// entered only through `block_on` from engine threads, so the `Vfs` trait stays synchronous.
+pub(crate) fn backend_runtime(thread_name: &str) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_io()
+        .enable_time()
+        .thread_name(thread_name)
+        .build()
+        .expect("tokio runtime")
+}
+
+/// Run one backend operation under `timeout`. A timeout is connection trouble, i.e. `Transient` —
+/// never anything a caller could read as "the file is gone". `endpoint` names the root when the
+/// caller has its display spelling to hand.
+pub(crate) fn block_with_timeout<F, T>(
+    rt: &tokio::runtime::Handle,
+    timeout: Duration,
+    what: &str,
+    endpoint: Option<&str>,
+    fut: F,
+) -> VfsResult<T>
+where
+    F: std::future::Future<Output = VfsResult<T>>,
+{
+    // The timeout future must be BUILT inside the runtime (it grabs the timer at construction),
+    // hence the async block rather than a bare block_on(timeout(..)).
+    match rt.block_on(async { tokio::time::timeout(timeout, fut).await }) {
+        Ok(result) => result,
+        Err(_) => Err(VfsError::new(
+            VfsErrorKind::Transient,
+            match endpoint {
+                Some(endpoint) => format!("{what} timed out after {timeout:?} on '{endpoint}'"),
+                None => format!("{what} timed out after {timeout:?}"),
+            },
+        )),
     }
-    Ok(token)
 }
 
 /// A live probe result. `model::table::ObservedEntry` is the artifact format; `VMeta` is what
@@ -119,7 +164,7 @@ pub enum CaseSense {
 /// What kind of storage a root sits on.
 ///
 /// A local *path* says nothing about this: `D:\photos` and `\\nas\photos` are both
-/// `RootSpec::Local` and both take the walkdir fast path, yet only one of them can have its
+/// `RootSpec::Local` and both take the local fast path, yet only one of them can have its
 /// deletions renamed into a trash store on this machine. Local roots probe it on first use
 /// (`local::LocalVfs::volume`); protocol backends know it by construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,14 +216,6 @@ impl NameRules {
         }
     }
 
-    pub fn parse(s: &str) -> NameRules {
-        match s {
-            "windows" => NameRules::Windows,
-            "posix" => NameRules::Posix,
-            _ => NameRules::Unknown,
-        }
-    }
-
     /// What a root reached through this process's own path layer is subject to.
     pub fn host() -> NameRules {
         if cfg!(windows) {
@@ -199,7 +236,6 @@ pub struct VfsCaps {
     pub mtime_precision_ms: u32,
     pub set_mtime: Support,
     pub fsync: Support,
-    pub rename: Support,
     /// No = the engine clears the destination first (it does anyway; this simply
     /// records whose job the overwrite is).
     pub rename_overwrite: Support,
@@ -218,7 +254,8 @@ pub struct VfsCaps {
     /// Random-access reads (sampled evidence = 3 windows). No → preflight degrades
     /// the evidence tier, out loud.
     pub ranged_read: Support,
-    /// Random-access writes into the staged file (delta updates).
+    /// Random-access writes into the staged file. Listed by the caps report; the delta lane that
+    /// would use them runs only when both roots are local, through `fs::local_root`.
     pub write_at: Support,
     pub unix_mode: Support,
     pub symlink: Support,
@@ -245,12 +282,11 @@ pub struct VfsCaps {
     pub max_parallel_streams: usize,
 }
 
-/// Advance notice for a staged write. The backend chooses when to apply what
+/// The metadata a staged write must end up carrying. The backend chooses when to apply what
 /// (local sets mtime on the temp file; SFTP sets it after close by path; FTP can
 /// only MFMT after rename) — the engine only states intent.
 #[derive(Clone, Debug, Default)]
 pub struct WriteHint {
-    pub size_hint: Option<u64>,
     pub mtime_ms: Option<i64>,
     pub mode: Option<u32>,
 }
@@ -283,8 +319,6 @@ pub trait ReadStream: std::io::Read + Send {
 pub trait WriteStaged: Send {
     fn write(&mut self, buf: &[u8]) -> VfsResult<()>;
     fn block_size(&self) -> usize;
-    /// Random-access patch (delta path). Only when `caps().write_at` says Yes.
-    fn write_at(&mut self, off: u64, buf: &[u8]) -> VfsResult<()>;
     /// Flush (+fsync when asked and able) and close the data handle. Must precede
     /// commit — Windows renames fail with an open write handle.
     fn seal(&mut self, fsync: bool) -> VfsResult<()>;
@@ -396,32 +430,30 @@ pub struct Credentials {
     pub password: Option<String>,
     pub keyfile: Option<std::path::PathBuf>,
     pub passphrase: Option<String>,
+    /// Parsed from the phrase's `agent` flag. Nothing reads it yet — ssh-agent auth is not
+    /// implemented, and `spec::EndpointSpec::options` says so where the grammar is documented.
     pub use_agent: bool,
-    /// Explicit anonymous (phrase said `anonymous@`). Never a fallback value.
-    pub anonymous: bool,
-}
-
-/// Where credentials come from. Three impls by shell: CLI = tty prompt, desktop =
-/// dialog round-trip, headless = `NoPrompt` (hard error with the remedy spelled out).
-pub trait CredentialProvider: Send + Sync {
-    fn credentials_for(&self, spec: &EndpointSpec) -> VfsResult<Credentials>;
 }
 
 /// Route a root phrase to a live backend. Every scheme here is spoken in this process; an
 /// unknown one is refused rather than quietly read as a local path.
-pub fn open(phrase: &str, creds: &Arc<dyn CredentialProvider>) -> VfsResult<Arc<dyn Vfs>> {
+///
+/// Credentials are not a parameter: every backend resolves its own through `cred::credentials_for`
+/// at connect time, and that lane never prompts. A prompting shell would have to change the
+/// credential owner, not slip a different one past the router.
+pub fn open(phrase: &str) -> VfsResult<Arc<dyn Vfs>> {
     match spec::parse(phrase) {
         RootSpec::Local(path) => Ok(Arc::new(local::LocalVfs::open(path)?)),
         // Needs a stored credential where `\\host\share` needs none — `smb`'s module doc has
         // the whole trade.
         RootSpec::Endpoint(r) if r.scheme == "smb" => {
-            Ok(Arc::new(smb::SmbBackend::new(r, creds.clone())?))
+            Ok(Arc::new(smb::SmbBackend::new(r)?))
         }
         RootSpec::Endpoint(r) if r.scheme == "sftp" => {
-            Ok(Arc::new(sftp::SftpBackend::new(r, creds.clone())))
+            Ok(Arc::new(sftp::SftpBackend::new(r)))
         }
         RootSpec::Endpoint(r) if r.scheme == "ftp" || r.scheme == "ftps" => {
-            Ok(Arc::new(ftp::FtpBackend::new(r, creds.clone())))
+            Ok(Arc::new(ftp::FtpBackend::new(r)))
         }
         // A peer root is not something this process opens: the far side's own syncdash reads and
         // writes it, and `run::peer` drives that over ssh. Reaching here means a caller took a

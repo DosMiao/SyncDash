@@ -2,7 +2,6 @@
 
 use super::super::error::{VfsError, VfsErrorKind, VfsResult};
 use super::super::spec::EndpointSpec;
-use super::super::CredentialProvider;
 use super::stream::*;
 use super::tls::*;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -12,7 +11,6 @@ use suppaftp::FtpError;
 
 pub struct FtpBackend {
     pub(super) spec: EndpointSpec,
-    pub(super) creds: Arc<dyn CredentialProvider>,
     pub(super) timeout: Duration,
     pub(super) conn: ConnSlot,
     pub(super) feats: OnceLock<Feats>,
@@ -38,15 +36,10 @@ pub(super) fn map_ftp_err(what: &str, e: FtpError) -> VfsError {
 }
 
 impl FtpBackend {
-    pub fn new(spec: EndpointSpec, creds: Arc<dyn CredentialProvider>) -> FtpBackend {
-        let timeout = spec
-            .opt("timeout")
-            .and_then(|t| t.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(20));
+    pub fn new(spec: EndpointSpec) -> FtpBackend {
+        let timeout = spec.timeout();
         FtpBackend {
             spec,
-            creds,
             timeout,
             conn: Arc::new(Mutex::new(None)),
             feats: OnceLock::new(),

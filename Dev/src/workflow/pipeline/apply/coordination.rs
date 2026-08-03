@@ -71,16 +71,7 @@ pub(super) fn execute(
     if opt.dry_run {
         for op in ops.iter().filter(|o| o.action.is_executable()) {
             if opt.verbose {
-                let label = format!(
-                    "[{}] {:?} {}",
-                    if op.side == Side::Target {
-                        "target"
-                    } else {
-                        "source"
-                    },
-                    op.action,
-                    op.path
-                );
+                let label = super::reporting::op_label(op);
                 println!("DRY  {label}  ({})", op.reason);
             }
             acc.skipped.fetch_add(1, Ordering::Relaxed);
@@ -335,10 +326,7 @@ fn finalize_version_side(
     let Some(writer) = writer else {
         return;
     };
-    let label = match side {
-        Side::Source => "source",
-        Side::Target => "target",
-    };
+    let label = side.as_str();
     let store_path = |root: &crate::fs::local_root::LocalRoot| {
         root.display_path()
             .join(crate::foundation::names::VERSION_STORE_DIR)

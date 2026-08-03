@@ -7,25 +7,6 @@ use crate::pipeline::apply;
 use super::super::archive::refresh_archive_with;
 use super::super::roots::resolve_root;
 
-/// Run the gates without executing — the GUI calls this before raising the confirmation sheet, so
-/// refusal reasons are shown in full instead of landing only on an unseen stderr stream.
-pub fn preflight_job(
-    job: &SingleTargetJob,
-    plan: &Plan,
-    ops: &[Op],
-) -> std::io::Result<crate::pipeline::guard::Verdict> {
-    let configuration = job.configuration();
-    let source = resolve_root(&configuration.source)?;
-    let target = resolve_root(job.target())?;
-    Ok(preflight_resolved(
-        configuration,
-        plan,
-        ops,
-        &source,
-        &target,
-    ))
-}
-
 pub fn apply_requirements(
     job: &SingleTargetJob,
     plan: &Plan,
@@ -67,10 +48,7 @@ pub fn preflight_resolved(
     source: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     target: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
 ) -> crate::pipeline::guard::Verdict {
-    let mut verdict = crate::pipeline::guard::Verdict {
-        blockers: Vec::new(),
-        warnings: Vec::new(),
-    };
+    let mut verdict = crate::pipeline::guard::Verdict::default();
     let source_label = root_label(source);
     let target_label = root_label(target);
     if source_label != plan.header.source_root || target_label != plan.header.target_root {
@@ -132,7 +110,6 @@ pub fn apply_job_guarded_with(
         .expect("the local apply lane represents every refusal as an ApplyOutcome")
 }
 
-#[allow(clippy::too_many_arguments)] // each argument is an independently reviewed apply decision
 pub fn apply_job_guarded_with_classified(
     job: &SingleTargetJob,
     plan: &Plan,
@@ -197,7 +174,6 @@ pub fn apply_resolved_classified(
     t0: std::time::Instant,
     ctx: &crate::obs::progress::RunCtx,
 ) -> super::super::ApplyExecution {
-    use crate::model::event::{Phase, ProgressEvent};
     use crate::obs::progress::ApplyOutcome;
     // The plan must be the one made for THESE roots. The header carries the label the
     // scan wrote: the local (possibly translated) path for local lanes, the display
@@ -237,23 +213,7 @@ pub fn apply_resolved_classified(
         );
     }
     if !verdict.report("preflight") {
-        for b in &verdict.blockers {
-            ctx.sink.emit(ProgressEvent::Error {
-                phase: Phase::Apply,
-                ts_ms: crate::foundation::time::now_ms(),
-                path: String::new(),
-                action: "preflight".into(),
-                side: "target".into(),
-                message: b.clone(),
-            });
-        }
-        let out = ApplyOutcome {
-            done: 0,
-            skipped: ops.len() as u64,
-            errors: 1,
-            bytes_copied: 0,
-            cancelled: false,
-        };
+        let out = super::super::refused_by_preflight(ctx, &verdict.blockers, ops.len());
         return super::super::ApplyExecution::rejected(out.finish(ctx, t0));
     }
     let ap = apply::apply_vfs(ops, sv, tv, &job.apply_opts(trash, verbose), ctx);

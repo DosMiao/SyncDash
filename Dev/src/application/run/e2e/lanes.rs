@@ -108,10 +108,9 @@ fn ftp_list_only_compares_but_refuses_before_write() {
 }
 
 fn live_lane(lane: &str, base_url: &str, pipeline_required: bool) {
-    let credentials = crate::fs::vfs::cred::default_provider();
     let open = |url: &str| -> Arc<dyn Vfs> {
-        let root = crate::fs::vfs::open(url, &credentials)
-            .unwrap_or_else(|error| panic!("opening '{url}': {error}"));
+        let root =
+            crate::fs::vfs::open(url).unwrap_or_else(|error| panic!("opening '{url}': {error}"));
         root.connect()
             .unwrap_or_else(|error| panic!("connecting to '{url}': {error}"));
         root

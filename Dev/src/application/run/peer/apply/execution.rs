@@ -6,7 +6,6 @@ use super::super::package::TemporaryPeerPackage;
 use super::super::probe::probe_peer;
 use super::policy::preflight_peer_job;
 
-#[allow(clippy::too_many_arguments)] // reviewed inputs and the write-boundary witness remain explicit
 pub(super) fn apply_peer_inner(
     name: &str,
     job: &SingleTargetJob,
@@ -23,23 +22,11 @@ pub(super) fn apply_peer_inner(
     let configuration = job.configuration();
     let gv = preflight_peer_job(job, plan_full, sel_ops);
     if !gv.report(name) {
-        for b in &gv.blockers {
-            ctx.sink.emit(ProgressEvent::Error {
-                phase: Phase::Apply,
-                ts_ms: crate::foundation::time::now_ms(),
-                path: String::new(),
-                action: "preflight".into(),
-                side: "target".into(),
-                message: b.clone(),
-            });
-        }
-        return Ok(ApplyOutcome {
-            done: 0,
-            skipped: sel_ops.len() as u64,
-            errors: 1,
-            bytes_copied: 0,
-            cancelled: false,
-        });
+        return Ok(crate::run::refused_by_preflight(
+            ctx,
+            &gv.blockers,
+            sel_ops.len(),
+        ));
     }
 
     let link = probe_peer(name, job, ctx)?;

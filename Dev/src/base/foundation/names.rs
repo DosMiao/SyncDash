@@ -8,9 +8,6 @@ use crate::foundation::path::RootRelativePath;
 /// Prefix for same-directory temp files. Local names also carry the process and stage IDs.
 pub const TEMP_PREFIX: &str = ".syncdash.tmp.";
 
-/// Maximum temp-file lifetime; anything older counts as debris from a previous crash.
-pub const TEMP_LIFETIME_MS: i64 = 24 * 60 * 60 * 1000;
-
 /// Root lock-ledger anchor and prefix, guards against two machines applying concurrently.
 pub const LOCK_NAME: &str = ".syncdash.lock";
 

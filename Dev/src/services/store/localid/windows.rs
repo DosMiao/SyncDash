@@ -3,7 +3,9 @@
 //! Every item keeps the `cfg` it had before this file existed; the module itself is ungated.
 
 #[cfg(windows)]
-use super::{named_filesystem_has_stable_file_ids, PlatformIdentity};
+use super::PlatformIdentity;
+#[cfg(windows)]
+use crate::fs::vfs::local::volume::file_ids_stable_for_fs;
 #[cfg(windows)]
 use std::path::Path;
 
@@ -108,7 +110,7 @@ pub(super) fn platform_identity(canonical: &Path) -> PlatformIdentity {
     PlatformIdentity {
         volume,
         relative_root,
-        file_ids_stable: got_info && named_filesystem_has_stable_file_ids(&fs_name),
+        file_ids_stable: got_info && file_ids_stable_for_fs(&fs_name),
         persistent_reuse,
     }
 }

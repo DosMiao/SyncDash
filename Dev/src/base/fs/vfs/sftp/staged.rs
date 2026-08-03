@@ -73,18 +73,9 @@ impl SftpStaged {
     where
         F: std::future::Future<Output = Result<T, russh_sftp::client::error::Error>>,
     {
-        let d = self.timeout;
-        match self
-            .rt
-            .block_on(async { tokio::time::timeout(d, fut).await })
-        {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(map_sftp_err(what, e)),
-            Err(_) => Err(VfsError::new(
-                VfsErrorKind::Transient,
-                format!("{what} timed out after {d:?}"),
-            )),
-        }
+        crate::fs::vfs::block_with_timeout(&self.rt, self.timeout, what, None, async move {
+            fut.await.map_err(|e| map_sftp_err(what, e))
+        })
     }
 
     fn commit_inner(&mut self, replace: bool) -> VfsResult<CommitReport> {
@@ -190,12 +181,6 @@ impl WriteStaged for SftpStaged {
 
     fn block_size(&self) -> usize {
         480 * 1024
-    }
-
-    fn write_at(&mut self, _off: u64, _buf: &[u8]) -> VfsResult<()> {
-        Err(VfsError::unsupported(
-            "random-access writes are not offered on sftp roots (delta is a both-local affair)",
-        ))
     }
 
     fn seal(&mut self, fsync: bool) -> VfsResult<()> {

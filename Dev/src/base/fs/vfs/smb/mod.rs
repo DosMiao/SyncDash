@@ -161,7 +161,6 @@ impl Vfs for SmbBackend {
             mtime_precision_ms: 1,
             set_mtime: Support::Yes, // compound CREATE + SET_INFO(FileBasicInformation) + CLOSE
             fsync: Support::Yes,     // the writer's finish() issues a server-side FLUSH first
-            rename: Support::Yes,
             // FileRenameInformation goes out with ReplaceIfExists = 0, so an occupied target
             // is refused. The engine clears the destination itself; this records whose job it is.
             rename_overwrite: Support::No,
@@ -213,7 +212,7 @@ impl Vfs for SmbBackend {
                 ),
             )
         })?;
-        let creds = self.creds.credentials_for(&self.spec)?;
+        let creds = super::cred::credentials_for(&self.spec)?;
         let password = creds.password.clone().ok_or_else(|| {
             VfsError::new(
                 VfsErrorKind::Auth,
@@ -381,12 +380,7 @@ impl Vfs for SmbBackend {
 
     fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
         let c = self.conn()?;
-        let (parent, base) = crate::foundation::path::split_parent(rel);
-        let token = super::random_name_token()?;
-        let tmp_rel = format!(
-            "{parent}{}{base}.{token}",
-            crate::foundation::names::TEMP_PREFIX,
-        );
+        let tmp_rel = super::staged_temp_rel(rel)?;
         let tmp_share_rel = self.share_rel(&tmp_rel);
 
         let (tree, conn) = (c.tree.clone(), c.conn.clone());

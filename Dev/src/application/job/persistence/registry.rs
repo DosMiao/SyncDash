@@ -133,31 +133,22 @@ pub fn load_by_id(job_id: &str) -> std::io::Result<(String, Job)> {
 }
 
 pub(super) fn validate_job_id(job_id: &str) -> std::io::Result<()> {
-    if job_id.len() == 32
-        && job_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+    if crate::foundation::token::is_lower_hex(job_id, crate::foundation::token::TOKEN_HEX_LEN) {
         Ok(())
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "job_id must be 32 lowercase hexadecimal characters",
+            format!(
+                "job_id must be {} lowercase hexadecimal characters",
+                crate::foundation::token::TOKEN_HEX_LEN
+            ),
         ))
     }
 }
 
 pub(super) fn new_job_id() -> std::io::Result<String> {
-    let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| std::io::Error::other(format!("cannot create a job identity: {error}")))?;
-    let mut id = String::with_capacity(bytes.len() * 2);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
-        id.push(HEX[(byte >> 4) as usize] as char);
-        id.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    Ok(id)
+    crate::foundation::token::random_token_128()
+        .map_err(|error| std::io::Error::other(format!("cannot create a job identity: {error}")))
 }
 
 /// Materialize identity metadata without serializing the whole job. Prepending one top-level key
@@ -198,10 +189,13 @@ pub(super) struct JobMutationLock {
 
 pub(super) fn lock_job_mutations(dir: &Path) -> std::io::Result<JobMutationLock> {
     std::fs::create_dir_all(dir)?;
+    // The lock file carries no content; it is opened only to hold an advisory lock. Truncation is
+    // named explicitly so a concurrent holder's open descriptor is never emptied out from under it.
     let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(dir.join(".syncdash-jobs.lock"))?;
     file.lock()?;
     Ok(JobMutationLock { _file: file })

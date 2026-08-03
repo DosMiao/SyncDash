@@ -19,21 +19,13 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
                 root_base: peer_root_base.unwrap_or_default(),
                 exe: peer_exe,
             });
-            // An unknown preset id is refused rather than dropped: a job seeded with fewer rules than
-            // asked for is a filter that isn't what it says it is, and it would only surface as a surprise
-            let ids: Vec<String> = junk
-                .iter()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
-                .collect();
-            if let Some(bad) = ids.iter().find(|id| junk::junk_preset(id).is_none()) {
-                let known: Vec<&str> = junk::JUNK_PRESETS.iter().map(|p| p.id).collect();
-                eprintln!(
-                    "error: unknown junk preset '{bad}' (known: {}, or `none`)",
-                    known.join(", ")
-                );
-                return Ok(2);
-            }
+            let ids = match junk::parse_preset_ids(&junk) {
+                Ok(ids) => ids,
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    return Ok(2);
+                }
+            };
             let n_pat = junk::expand_junk_presets(&ids).len();
             let opts = territory::GenOpts {
                 mode,

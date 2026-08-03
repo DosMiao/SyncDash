@@ -11,15 +11,9 @@ impl TemporaryPeerPackage {
     pub(super) fn create() -> std::io::Result<Self> {
         let root = LocalRoot::open(std::env::temp_dir())?;
         for _ in 0..16 {
-            let mut random = [0u8; 16];
-            getrandom::fill(&mut random).map_err(|error| {
+            let token = crate::foundation::token::random_token_128().map_err(|error| {
                 std::io::Error::other(format!("random token generation failed: {error}"))
             })?;
-            let mut token = String::with_capacity(random.len() * 2);
-            for byte in random {
-                use std::fmt::Write as _;
-                write!(token, "{byte:02x}").expect("writing into a String cannot fail");
-            }
             let relative = RootRelativePath::try_from(format!("syncdash-peer-{token}.tar"))
                 .expect("generated peer package names satisfy the relative-path contract");
             match root.create_regular_file_new(&relative) {

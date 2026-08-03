@@ -15,7 +15,6 @@ pub fn run_peer_job(
 
 /// Keep the CLI's combined Compare/Apply flow on the same progress contract as the desktop's
 /// separate commands, including a terminal Summary when Compare is cancelled.
-#[allow(clippy::too_many_arguments)] // each argument is an independently reviewed run decision
 pub fn run_peer_job_with(
     name: &str,
     job: &SingleTargetJob,
@@ -41,34 +40,9 @@ pub fn run_peer_job_with(
             plan.header.op_count, plan.header.conflict_count
         ),
     );
-    for op in &plan.ops {
-        println!("{}", serde_json::to_string(op)?);
-    }
-    if !do_apply {
-        println!("dry-run (rerun with --apply)");
-        return Ok((0, plan.ops.len() as u64, 0, plan.header.conflict_count));
-    }
-    let ops: Vec<Op> = plan
-        .ops
-        .iter()
-        .filter(|o| o.action.is_executable())
-        .cloned()
-        .collect();
-    let t0 = std::time::Instant::now();
-    let rec = crate::run::history::Recorder::start(
-        crate::run::history::RunSubject::for_job(name, job),
-        crate::run::apply_run_kind(job),
-        ctx,
-        &ops,
-    );
-    let out = apply_peer_job_with(name, job, &plan, &ops, verbose, &rec.ctx)?;
-    let _ = rec.finish(&out, t0.elapsed().as_millis() as u64);
-    Ok((
-        out.done,
-        out.skipped,
-        out.errors,
-        plan.header.conflict_count,
-    ))
+    crate::run::execute_planned_run(name, job, &plan, do_apply, ctx, |ops, run_ctx| {
+        apply_peer_job_with(name, job, &plan, ops, verbose, run_ctx)
+    })
 }
 
 fn emit_cancel_summary(ctx: &crate::obs::progress::RunCtx, t0: std::time::Instant) {
@@ -80,6 +54,5 @@ fn emit_cancel_summary(ctx: &crate::obs::progress::RunCtx, t0: std::time::Instan
 }
 
 use crate::job::SingleTargetJob;
-use crate::model::plan::Op;
 
 use super::apply::apply_peer_job_with;

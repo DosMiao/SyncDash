@@ -28,23 +28,4 @@ pub use repository::{
 pub use retention::prune;
 
 #[cfg(test)]
-use codec::{legacy_record_id, parse_current_record};
-#[cfg(test)]
-use migration::{
-    ensure_current_schema_locked, migrate_current_schema_locked, migrate_legacy_record,
-};
-#[cfg(test)]
-use model::{LegacyRunRecord, RUN_RECORD_SCHEMA};
-#[cfg(test)]
-use paths::{run_identifier, sanitize};
-#[cfg(test)]
-use recording::{create_run_dir, pending_record};
-#[cfg(test)]
-use repository::{
-    artifact_lines_at, history_at, history_merged_at, with_validated_reveal_target_at,
-};
-#[cfg(test)]
-use retention::{prune_at, sweep_orphans};
-
-#[cfg(test)]
 mod tests;

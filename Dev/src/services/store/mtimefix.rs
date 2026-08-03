@@ -17,21 +17,20 @@
 //! invalidates that row. An error-free scan also removes absent in-domain corrections.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use super::scan_state::bound::BoundTable;
 
 const STATE_KIND: &str = "mtimefix";
 
-fn logical_file_for_key(key: &str) -> PathBuf {
-    super::scan_state::location::logical_file(key, "mtimefix.jsonl")
+/// What the filesystem reports for an object, and what the write that produced it intended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MtimeCorrection {
+    pub ondisk_ms: i64,
+    pub intended_ms: i64,
 }
 
-fn legacy_logical_file_for_key(key: &str) -> PathBuf {
-    super::scan_state::location::legacy_logical_file(key, "mtimefix.jsonl")
-}
-
-fn local_file_for_key(key: &str) -> PathBuf {
-    super::scan_state::location::local_file(key, "mtimefix.jsonl")
-}
+pub type MtimeCorrections = HashMap<String, MtimeCorrection>;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MtimeFix {
@@ -40,88 +39,44 @@ struct MtimeFix {
     intended_ms: i64,
 }
 
-fn read_bound_from_file(
-    file: &Path,
-    binding: &[u8],
-) -> std::io::Result<(HashMap<String, (i64, i64)>, super::scan_state::ReadStatus)> {
-    let mut map = HashMap::new();
-    let status = super::scan_state::read(file, STATE_KIND, binding, |c: MtimeFix| {
-        map.insert(c.path, (c.ondisk_ms, c.intended_ms));
-    })?;
-    if status != super::scan_state::ReadStatus::Accepted {
-        map.clear();
-    }
-    Ok((map, status))
+fn keep_correction(map: &mut MtimeCorrections, row: MtimeFix) {
+    map.insert(
+        row.path,
+        MtimeCorrection {
+            ondisk_ms: row.ondisk_ms,
+            intended_ms: row.intended_ms,
+        },
+    );
 }
 
-fn read_bound_best_effort(
-    file: &Path,
-    binding: &[u8],
-) -> Option<(HashMap<String, (i64, i64)>, super::scan_state::ReadStatus)> {
-    super::scan_state::reporting::report_read(file, read_bound_from_file(file, binding))
+const TABLE: BoundTable<String, MtimeCorrection, MtimeFix> =
+    BoundTable::new(STATE_KIND, "mtimefix.jsonl", keep_correction);
+
+pub fn load_by_key(key: &str) -> MtimeCorrections {
+    TABLE.load_by_key(key)
 }
 
-fn load_bound_from_file(file: &Path, binding: &[u8]) -> HashMap<String, (i64, i64)> {
-    read_bound_best_effort(file, binding).map_or_else(HashMap::new, |(map, _)| map)
-}
-
-fn load_logical_from_files(
-    primary: &Path,
-    legacy: &Path,
-    key: &str,
-) -> Option<HashMap<String, (i64, i64)>> {
-    let binding = super::scan_state::binding::logical_binding(key);
-    let (map, status) = read_bound_best_effort(primary, &binding)?;
-    if status != super::scan_state::ReadStatus::Missing || primary == legacy {
-        return Some(map);
-    }
-    read_bound_best_effort(legacy, &binding).map(|(legacy_map, _)| legacy_map)
-}
-
-pub fn load_by_key(key: &str) -> HashMap<String, (i64, i64)> {
-    let primary = logical_file_for_key(key);
-    let legacy = legacy_logical_file_for_key(key);
-    load_logical_from_files(&primary, &legacy, key).unwrap_or_default()
-}
-
-pub fn load(root: &Path) -> HashMap<String, (i64, i64)> {
-    let identity = super::localid::LocalScanStateIdentity::for_root(root);
-    load_local(&identity)
-}
-
-pub(crate) fn load_local(
-    identity: &super::localid::LocalScanStateIdentity,
-) -> HashMap<String, (i64, i64)> {
-    if !identity.persistent_reuse() {
-        return HashMap::new();
-    }
-    load_bound_from_file(
-        &local_file_for_key(identity.cache_key()),
-        identity.binding(),
-    )
+pub(crate) fn load_local(identity: &super::localid::LocalScanStateIdentity) -> MtimeCorrections {
+    TABLE.load_local(identity)
 }
 
 fn rewrite_map(
     file: &Path,
     binding: &[u8],
-    map: &HashMap<String, (i64, i64)>,
+    map: &MtimeCorrections,
     keep: impl Fn(&str) -> bool,
 ) -> std::io::Result<bool> {
-    let mut rows: Vec<_> = map.iter().collect();
-    rows.sort_unstable_by(|left, right| left.0.cmp(right.0));
-    super::scan_state::rewrite(file, STATE_KIND, binding, |writer| {
-        for (path, (ondisk_ms, intended_ms)) in rows {
-            if keep(path) {
-                let rec = MtimeFix {
-                    path: path.clone(),
-                    ondisk_ms: *ondisk_ms,
-                    intended_ms: *intended_ms,
-                };
-                serde_json::to_writer(&mut *writer, &rec).map_err(std::io::Error::other)?;
-                writer.write_all(b"\n")?;
-            }
+    TABLE.rewrite(file, binding, map, |writer, path, correction| {
+        if !keep(path) {
+            return Ok(());
         }
-        Ok(())
+        let rec = MtimeFix {
+            path: path.clone(),
+            ondisk_ms: correction.ondisk_ms,
+            intended_ms: correction.intended_ms,
+        };
+        serde_json::to_writer(&mut *writer, &rec).map_err(std::io::Error::other)?;
+        writer.write_all(b"\n")
     })
 }
 
@@ -129,11 +84,17 @@ fn rewrite_map(
 fn record_bound_file(
     file: &Path,
     binding: &[u8],
-    mut map: HashMap<String, (i64, i64)>,
+    mut map: MtimeCorrections,
     fixes: &[(String, i64, i64)],
 ) -> std::io::Result<bool> {
     for (p, ondisk, intended) in fixes {
-        map.insert(p.clone(), (*ondisk, *intended));
+        map.insert(
+            p.clone(),
+            MtimeCorrection {
+                ondisk_ms: *ondisk,
+                intended_ms: *intended,
+            },
+        );
     }
     rewrite_map(file, binding, &map, |_| true)
 }
@@ -142,9 +103,8 @@ pub fn record_by_key(key: &str, fixes: &[(String, i64, i64)]) -> super::StateWri
     if fixes.is_empty() {
         return super::StateWriteStatus::Unchanged;
     }
-    let file = logical_file_for_key(key);
-    let legacy = legacy_logical_file_for_key(key);
-    let Some(map) = load_logical_from_files(&file, &legacy, key) else {
+    let file = TABLE.logical_file(key);
+    let Some(map) = TABLE.load_logical(key) else {
         return super::StateWriteStatus::Failed;
     };
     let result = record_bound_file(
@@ -166,8 +126,8 @@ pub(crate) fn record_local(
     if !identity.persistent_reuse() {
         return super::StateWriteStatus::Unchanged;
     }
-    let file = local_file_for_key(identity.cache_key());
-    let Some((map, _)) = read_bound_best_effort(&file, identity.binding()) else {
+    let file = TABLE.local_file(identity.cache_key());
+    let Some((map, _)) = TABLE.read_best_effort(&file, identity.binding()) else {
         return super::StateWriteStatus::Failed;
     };
     let result = record_bound_file(&file, identity.binding(), map, fixes);
@@ -177,7 +137,7 @@ pub(crate) fn record_local(
 fn reconcile_bound_file(
     file: &Path,
     binding: &[u8],
-    fixes: &HashMap<String, (i64, i64)>,
+    fixes: &MtimeCorrections,
     entries: &[crate::model::table::ObservedEntry],
     coverage: super::ScanCoverage,
     matched: &std::collections::HashSet<String>,
@@ -210,13 +170,13 @@ fn reconcile_bound_file(
 
 pub fn reconcile_by_key(
     key: &str,
-    fixes: &HashMap<String, (i64, i64)>,
+    fixes: &MtimeCorrections,
     entries: &[crate::model::table::ObservedEntry],
     coverage: super::ScanCoverage,
     matched: &std::collections::HashSet<String>,
     retain_absent: &std::collections::HashSet<String>,
 ) -> super::StateWriteStatus {
-    let file = logical_file_for_key(key);
+    let file = TABLE.logical_file(key);
     match reconcile_bound_file(
         &file,
         &super::scan_state::binding::logical_binding(key),
@@ -234,7 +194,7 @@ pub fn reconcile_by_key(
 
 pub(crate) fn reconcile_local(
     identity: &super::localid::LocalScanStateIdentity,
-    fixes: &HashMap<String, (i64, i64)>,
+    fixes: &MtimeCorrections,
     entries: &[crate::model::table::ObservedEntry],
     coverage: super::ScanCoverage,
     matched: &std::collections::HashSet<String>,
@@ -243,7 +203,7 @@ pub(crate) fn reconcile_local(
     if !identity.persistent_reuse() {
         return super::StateWriteStatus::Unchanged;
     }
-    let file = local_file_for_key(identity.cache_key());
+    let file = TABLE.local_file(identity.cache_key());
     match reconcile_bound_file(
         &file,
         identity.binding(),
@@ -262,6 +222,7 @@ pub(crate) fn reconcile_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_file(tag: &str) -> PathBuf {
         let directory =
@@ -289,7 +250,7 @@ mod tests {
 
     fn record_file(file: &Path, key: &str, fixes: &[(String, i64, i64)]) {
         let binding = crate::store::scan_state::binding::logical_binding(key);
-        let map = load_bound_from_file(file, &binding);
+        let map = TABLE.load_file(file, &binding);
         record_bound_file(file, &binding, map, fixes).unwrap();
     }
 
@@ -301,17 +262,26 @@ mod tests {
         record_file(&file, key, &[("b.txt".into(), 2_000, 2_500)]);
         record_file(&file, key, &[("a.txt".into(), 9_000, 9_500)]);
 
-        let back = load_bound_from_file(
+        let back = TABLE.load_file(
             &file,
             &crate::store::scan_state::binding::logical_binding(key),
         );
         assert_eq!(back.len(), 2, "one row per path, not one per write");
         assert_eq!(
             back.get("a.txt"),
-            Some(&(9_000, 9_500)),
+            Some(&MtimeCorrection {
+                ondisk_ms: 9_000,
+                intended_ms: 9_500,
+            }),
             "the newest correction wins"
         );
-        assert_eq!(back.get("b.txt"), Some(&(2_000, 2_500)));
+        assert_eq!(
+            back.get("b.txt"),
+            Some(&MtimeCorrection {
+                ondisk_ms: 2_000,
+                intended_ms: 2_500,
+            })
+        );
         cleanup(&file);
     }
 
@@ -328,7 +298,7 @@ mod tests {
             ],
         );
         let binding = crate::store::scan_state::binding::logical_binding(key);
-        let fixes = load_bound_from_file(&file, &binding);
+        let fixes = TABLE.load_file(&file, &binding);
         let matched = std::collections::HashSet::from(["live.txt".to_string()]);
 
         assert_eq!(
@@ -344,7 +314,7 @@ mod tests {
             .unwrap(),
             None
         );
-        assert_eq!(load_bound_from_file(&file, &binding).len(), 2);
+        assert_eq!(TABLE.load_file(&file, &binding).len(), 2);
 
         assert!(reconcile_bound_file(
             &file,
@@ -357,9 +327,15 @@ mod tests {
         )
         .unwrap()
         .unwrap());
-        let back = load_bound_from_file(&file, &binding);
+        let back = TABLE.load_file(&file, &binding);
         assert_eq!(back.len(), 1);
-        assert_eq!(back.get("live.txt"), Some(&(1_000, 1_500)));
+        assert_eq!(
+            back.get("live.txt"),
+            Some(&MtimeCorrection {
+                ondisk_ms: 1_000,
+                intended_ms: 1_500,
+            })
+        );
         cleanup(&file);
     }
 
@@ -376,7 +352,7 @@ mod tests {
             ],
         );
         let binding = crate::store::scan_state::binding::logical_binding(key);
-        let fixes = load_bound_from_file(&file, &binding);
+        let fixes = TABLE.load_file(&file, &binding);
 
         reconcile_bound_file(
             &file,
@@ -389,7 +365,7 @@ mod tests {
         )
         .unwrap();
 
-        let back = load_bound_from_file(&file, &binding);
+        let back = TABLE.load_file(&file, &binding);
         assert!(!back.contains_key("changed.txt"));
         assert!(back.contains_key("unseen.txt"));
         cleanup(&file);
@@ -408,7 +384,7 @@ mod tests {
             ],
         );
         let binding = crate::store::scan_state::binding::logical_binding(key);
-        let fixes = load_bound_from_file(&file, &binding);
+        let fixes = TABLE.load_file(&file, &binding);
         let retain = std::collections::HashSet::from(["excluded/keep.txt".to_string()]);
 
         reconcile_bound_file(
@@ -422,7 +398,7 @@ mod tests {
         )
         .unwrap();
 
-        let back = load_bound_from_file(&file, &binding);
+        let back = TABLE.load_file(&file, &binding);
         assert!(!back.contains_key("deleted.txt"));
         assert!(back.contains_key("excluded/keep.txt"));
         cleanup(&file);
@@ -436,7 +412,7 @@ mod tests {
             "{\"path\":\"old.txt\",\"ondisk_ms\":1000,\"intended_ms\":1500}\n",
         )
         .unwrap();
-        assert!(load_bound_from_file(&file, b"headerless-root").is_empty());
+        assert!(TABLE.load_file(&file, b"headerless-root").is_empty());
         cleanup(&file);
     }
 
@@ -444,11 +420,12 @@ mod tests {
     fn corrections_bound_to_another_root_are_not_applied() {
         let file = temp_file("binding");
         record_file(&file, "root-a", &[("a.txt".into(), 1_000, 1_500)]);
-        assert!(load_bound_from_file(
-            &file,
-            &crate::store::scan_state::binding::logical_binding("root-b")
-        )
-        .is_empty());
+        assert!(TABLE
+            .load_file(
+                &file,
+                &crate::store::scan_state::binding::logical_binding("root-b")
+            )
+            .is_empty());
         cleanup(&file);
     }
 
@@ -467,7 +444,7 @@ mod tests {
         );
         let nondurable =
             crate::store::localid::LocalScanStateIdentity::injected(key.clone(), binding, false);
-        let file = local_file_for_key(&key);
+        let file = TABLE.local_file(&key);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         record_bound_file(
             &file,
@@ -494,7 +471,13 @@ mod tests {
             crate::store::StateWriteStatus::Unchanged
         );
         let loaded = load_local(&durable);
-        assert_eq!(loaded.get("old.txt"), Some(&(1_000, 1_500)));
+        assert_eq!(
+            loaded.get("old.txt"),
+            Some(&MtimeCorrection {
+                ondisk_ms: 1_000,
+                intended_ms: 1_500,
+            })
+        );
         assert!(!loaded.contains_key("new.txt"));
         let _ = std::fs::remove_file(file);
     }
@@ -511,7 +494,7 @@ mod tests {
         )
         .unwrap();
 
-        let fixes = load_bound_from_file(&file, identity.binding());
+        let fixes = TABLE.load_file(&file, identity.binding());
         assert!(fixes.is_empty());
         assert!(reconcile_bound_file(
             &file,
@@ -524,7 +507,7 @@ mod tests {
         )
         .unwrap()
         .unwrap());
-        assert!(load_bound_from_file(&file, identity.binding()).is_empty());
+        assert!(TABLE.load_file(&file, identity.binding()).is_empty());
         assert!(!crate::store::scan_state::needs_rebuild(
             &file,
             STATE_KIND,

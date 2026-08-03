@@ -106,12 +106,6 @@ impl WriteStaged for LocalStaged {
         1024 * 1024
     }
 
-    fn write_at(&mut self, off: u64, buf: &[u8]) -> VfsResult<()> {
-        let s = self.staged.as_mut().expect("write after commit");
-        s.write_at(off, buf)?;
-        Ok(())
-    }
-
     fn seal(&mut self, fsync: bool) -> VfsResult<()> {
         let s = self.staged.as_mut().expect("seal after commit");
         self.sync_requested |= fsync;

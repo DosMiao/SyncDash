@@ -92,9 +92,9 @@ impl CheckpointStore {
             )));
         }
         if stored.owner_binding != owner_binding(&self.owner) {
-            return Ok(CheckpointLoad::Invalid(format!(
-                "watch checkpoint owner binding does not match the active job"
-            )));
+            return Ok(CheckpointLoad::Invalid(
+                "watch checkpoint owner binding does not match the active job".to_string(),
+            ));
         }
         if let Err(reason) = stored.position.validate() {
             return Ok(CheckpointLoad::Invalid(reason));

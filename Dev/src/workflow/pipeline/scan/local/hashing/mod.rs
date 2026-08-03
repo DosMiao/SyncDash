@@ -16,16 +16,30 @@ pub(super) struct HashOutcome {
     pub errors: u64,
 }
 
+/// Where one collection pass reports what it is doing.
+///
+/// The three travel together because they are only meaningful together: the phase stream places an
+/// event in the run, the callback drives the legacy CLI meter, and `side` is what tells a reader
+/// which root a hash error happened on.
+pub(super) struct ScanReporting<'a, 'phase> {
+    pub phase: Option<&'a crate::obs::progress::PhaseProgress<'phase>>,
+    pub callback: Option<ProgressFn<'a>>,
+    pub side: &'a str,
+}
+
 pub(super) fn collect(
     root: &crate::fs::local_root::LocalRoot,
     pending: &mut [PendingFile],
     options: &ScanOptions,
-    phase_progress: Option<&crate::obs::progress::PhaseProgress<'_>>,
-    progress: Option<ProgressFn<'_>>,
-    side: &str,
+    reporting: &ScanReporting<'_, '_>,
     max_parallel_streams: usize,
     metrics: &mut ScanMetrics,
 ) -> std::io::Result<HashOutcome> {
+    let ScanReporting {
+        phase: phase_progress,
+        callback: progress,
+        side,
+    } = *reporting;
     let bytes_to_hash = if options.hash {
         pending
             .iter()
@@ -120,28 +134,23 @@ pub(super) fn collect(
                             }
                         }
                         if file.hash.is_none() {
+                            let target = reader::LocalFileRead {
+                                root,
+                                relative: &file.relative,
+                                size: file.size,
+                                raw_mtime_ms: file.raw_mtime_ms,
+                                expected_file_id: file.observed_file_id.as_deref(),
+                            };
                             let result = if options.sampled && file.size >= SAMPLE_MIN {
-                                reader::sampled_hash_with_buffer(
-                                    root,
-                                    &file.relative,
-                                    file.size,
-                                    file.raw_mtime_ms,
-                                    file.observed_file_id.as_deref(),
-                                    buffer,
-                                    |count| {
-                                        bytes_done.fetch_add(count, Ordering::Relaxed);
-                                        if let Some(progress) = phase_progress {
-                                            progress.add_bytes(count, file.relative.as_str());
-                                        }
-                                    },
-                                )
+                                reader::sampled_hash_with_buffer(&target, buffer, |count| {
+                                    bytes_done.fetch_add(count, Ordering::Relaxed);
+                                    if let Some(progress) = phase_progress {
+                                        progress.add_bytes(count, target.relative.as_str());
+                                    }
+                                })
                             } else {
                                 reader::full_hash_with_buffer(
-                                    root,
-                                    &file.relative,
-                                    file.size,
-                                    file.raw_mtime_ms,
-                                    file.observed_file_id.as_deref(),
+                                    &target,
                                     buffer,
                                     || match phase_progress {
                                         Some(progress) => progress.checkpoint(),
@@ -150,7 +159,7 @@ pub(super) fn collect(
                                     |count| {
                                         bytes_done.fetch_add(count, Ordering::Relaxed);
                                         if let Some(progress) = phase_progress {
-                                            progress.add_bytes(count, file.relative.as_str());
+                                            progress.add_bytes(count, target.relative.as_str());
                                         }
                                     },
                                 )

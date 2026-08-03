@@ -104,11 +104,7 @@ pub(super) fn validate_operation_paths(ops: &[Op]) -> Result<(), String> {
             if !move_sources.insert(source_key) {
                 return Err(format!(
                     "duplicate move source for {} path: {from}",
-                    if op.side == Side::Source {
-                        "source"
-                    } else {
-                        "target"
-                    }
+                    op.side.as_str()
                 ));
             }
             let planned_recreation = ops.iter().any(|mutation| {
@@ -134,11 +130,7 @@ pub(super) fn validate_operation_paths(ops: &[Op]) -> Result<(), String> {
             if !mutations.insert(mutation_key) {
                 return Err(format!(
                     "duplicate mutation for {} path: {}",
-                    if op.side == Side::Source {
-                        "source"
-                    } else {
-                        "target"
-                    },
+                    op.side.as_str(),
                     op.path
                 ));
             }

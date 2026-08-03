@@ -1,8 +1,16 @@
-//! Reporting for the preservation routes actually used by an Apply run.
+//! Reporting for an Apply run: how one op is named in the log, and which preservation routes the
+//! run actually used.
 
-use crate::model::plan::Side;
+use crate::model::plan::{Op, Side};
 
 use super::execute::schedule::Shared;
+
+/// The verbose log line for a single op. The dry-run preview and the executed-outcome record must
+/// name the same op identically, otherwise a `DRY` line cannot be matched against the `OK`/`ERR`
+/// line it predicted.
+pub(super) fn op_label(op: &Op) -> String {
+    format!("[{}] {:?} {}", op.side.as_str(), op.action, op.path)
+}
 
 fn in_root_retention_display(sh: &Shared<'_>, side: &Side) -> String {
     if let Some(root) = sh.local_root_of(side) {
@@ -40,8 +48,9 @@ pub(super) fn report_preservation_routes(sh: &Shared<'_>) {
             ),
         );
     }
-    for (side, label) in [(Side::Source, "source"), (Side::Target, "target")] {
+    for side in [Side::Source, Side::Target] {
         if sh.in_root_preservation_used(&side) {
+            let label = side.as_str();
             sh.ctx.log(
                 LogLevel::Info,
                 "apply",

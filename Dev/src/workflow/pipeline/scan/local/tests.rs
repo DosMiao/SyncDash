@@ -1,4 +1,4 @@
-use super::hashing::reader::{full_hash_with_buffer, standard_mtime_ms};
+use super::hashing::reader::{full_hash_with_buffer, standard_mtime_ms, LocalFileRead};
 use super::progress::{hash_sample_due, walk_sample_due, WALK_INTERVAL};
 use super::*;
 use crate::foundation::path::RootRelativePath;
@@ -34,11 +34,13 @@ fn full_hash_reuses_the_worker_buffer_across_files() {
 
     let mut buf = Vec::new();
     let first = full_hash_with_buffer(
-        &local_root,
-        &large_relative,
-        large.len() as u64,
-        standard_mtime_ms(&std::fs::metadata(&large_path).unwrap()),
-        None,
+        &LocalFileRead {
+            root: &local_root,
+            relative: &large_relative,
+            size: large.len() as u64,
+            raw_mtime_ms: standard_mtime_ms(&std::fs::metadata(&large_path).unwrap()),
+            expected_file_id: None,
+        },
         &mut buf,
         || Ok(()),
         |_| {},
@@ -48,11 +50,13 @@ fn full_hash_reuses_the_worker_buffer_across_files() {
     let capacity = buf.capacity();
 
     let second = full_hash_with_buffer(
-        &local_root,
-        &small_relative,
-        small.len() as u64,
-        standard_mtime_ms(&std::fs::metadata(&small_path).unwrap()),
-        None,
+        &LocalFileRead {
+            root: &local_root,
+            relative: &small_relative,
+            size: small.len() as u64,
+            raw_mtime_ms: standard_mtime_ms(&std::fs::metadata(&small_path).unwrap()),
+            expected_file_id: None,
+        },
         &mut buf,
         || Ok(()),
         |_| {},

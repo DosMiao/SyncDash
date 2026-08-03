@@ -14,9 +14,7 @@ pub(super) fn walk_sample_due(
     last: &mut Option<std::time::Duration>,
     now: std::time::Duration,
 ) -> bool {
-    let due = last.map_or(true, |previous| {
-        now.saturating_sub(previous) >= WALK_INTERVAL
-    });
+    let due = last.is_none_or(|previous| now.saturating_sub(previous) >= WALK_INTERVAL);
     if due {
         *last = Some(now);
     }

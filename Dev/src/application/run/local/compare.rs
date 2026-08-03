@@ -97,25 +97,10 @@ pub fn compare_resolved(
     let opt = super::super::effective_scan_opts(job, sv, tv);
     // When a share is not mounted, its path often looks like an empty directory,
     // and comparing as usual yields a plan that either "wipes the other side" or "re-sends everything".
-    let mut v = crate::pipeline::guard::Verdict {
-        blockers: Vec::new(),
-        warnings: Vec::new(),
-    };
+    let mut v = crate::pipeline::guard::Verdict::default();
     crate::pipeline::guard::roots::check_root_vfs("source", sv, job.require_marker, &mut v);
     crate::pipeline::guard::roots::check_root_vfs("target", tv, job.require_marker, &mut v);
-    for w in &v.warnings {
-        ctx.log(
-            crate::model::event::LogLevel::Warn,
-            "compare",
-            format!("warning: {w}"),
-        );
-    }
-    if !v.ok() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            v.blockers.join("; "),
-        ));
-    }
+    super::super::fail_on_root_blockers(&v, ctx, None)?;
     // The no-hash equality window widens to the coarser of the two backends' declared
     // mtime precision (an FTP LIST root thinks in minutes). Hash evidence is unaffected.
     let mut copts = job.compare_opts();
@@ -177,7 +162,20 @@ pub fn compare_resolved(
     // Disagreement escalation: in the sampled evidence tier, a file whose digests match but whose mtimes differ by >2s may not simply be ruled identical (the knob can turn this off)
     let rr = job.rigor_resolved();
     let plan = if rr.sampled && rr.escalate {
-        escalate_sampled_disagreements(job, plan, &mut s, &mut t, ctx, sv, tv, &pp)?
+        escalate_sampled_disagreements(
+            job,
+            plan,
+            EscalationSide {
+                table: &mut s,
+                vfs: sv,
+            },
+            EscalationSide {
+                table: &mut t,
+                vfs: tv,
+            },
+            ctx,
+            &pp,
+        )?
     } else {
         plan
     };
@@ -190,6 +188,17 @@ pub fn compare_resolved(
     })
 }
 
+/// One side of an escalation: the snapshot whose evidence is corrected, together with the backend
+/// the file is re-read through.
+///
+/// They travel as one value because they must describe the same root. As two independent
+/// parameters, handing the source table with the target backend type-checks, and the resulting
+/// plan would be built from a full hash of the wrong file.
+pub(super) struct EscalationSide<'a> {
+    pub(super) table: &'a mut TableArtifact,
+    pub(super) vfs: &'a std::sync::Arc<dyn crate::fs::vfs::Vfs>,
+}
+
 /// The escalation rule: when the two signals fight (the sampled digest says "identical", mtime says "touched"), believe neither silently —
 /// **escalate that file to a full hash on both sides** and rule again. This shrinks the blind spot of fast/balanced/standard from
 /// "any change outside the sampling window" to "outside the sampling window *and* timestamp-preserving" (≈ the timestomp case).
@@ -199,17 +208,24 @@ pub fn compare_resolved(
 pub(super) fn escalate_sampled_disagreements(
     job: &Job,
     mut plan: Plan,
-    s: &mut TableArtifact,
-    t: &mut TableArtifact,
+    source: EscalationSide<'_>,
+    target: EscalationSide<'_>,
     ctx: &crate::obs::progress::RunCtx,
-    source: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
-    target: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     pp: &crate::obs::progress::PhaseProgress<'_>,
 ) -> std::io::Result<Plan> {
     use crate::model::digest::Blake3Digest;
     use crate::model::event::LogLevel;
     use crate::model::plan::Side;
     use crate::model::table::{FileIdentityObservation, ObservedFile};
+
+    let EscalationSide {
+        table: s,
+        vfs: source,
+    } = source;
+    let EscalationSide {
+        table: t,
+        vfs: target,
+    } = target;
     // The same equality window used by the comparison above. Protocol roots such as FTP can be
     // coarser than the job default, and that precision must not manufacture escalation work.
     let slack_ms = job
@@ -321,8 +337,8 @@ pub(super) fn escalate_sampled_disagreements(
                 Blake3Digest,
                 Option<Op>,
             )> {
-                let hs = full_hash(source, "source", se.path.as_str(), pp)?;
-                let ht = full_hash(target, "target", te.path.as_str(), pp)?;
+                let hs = full_hash(source, Side::Source.as_str(), se.path.as_str(), pp)?;
+                let ht = full_hash(target, Side::Target.as_str(), te.path.as_str(), pp)?;
                 let op = if hs == ht {
                     None
                 } else {

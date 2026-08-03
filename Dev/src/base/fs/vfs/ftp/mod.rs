@@ -64,7 +64,6 @@ impl Vfs for FtpBackend {
                 None => Support::Unknown,
             },
             fsync: Support::No,
-            rename: Support::Yes,
             rename_overwrite: Support::Unknown, // varies by server; the engine clears targets anyway
             exclusive_staged_file_publish: Support::No,
             exclusive_entry_rename: Support::Unknown,
@@ -142,7 +141,7 @@ impl Vfs for FtpBackend {
                 ),
             )
         })?;
-        let creds = self.creds.credentials_for(&self.spec)?;
+        let creds = super::cred::credentials_for(&self.spec)?;
         let password = if user == "anonymous" {
             creds
                 .password
@@ -341,12 +340,7 @@ impl Vfs for FtpBackend {
     }
 
     fn open_write(&self, rel: &str, hint: &WriteHint) -> VfsResult<Box<dyn WriteStaged>> {
-        let (parent, base) = crate::foundation::path::split_parent(rel);
-        let token = super::random_name_token()?;
-        let tmp_rel = format!(
-            "{parent}{}{base}.{token}",
-            crate::foundation::names::TEMP_PREFIX,
-        );
+        let tmp_rel = super::staged_temp_rel(rel)?;
         let tmp_abs = self.abs(&tmp_rel);
         let dst_abs = self.abs(rel);
         let data = self.with_conn("open staged", |c| c.stream.put_with_stream(&tmp_abs))?;

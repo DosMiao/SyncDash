@@ -59,6 +59,21 @@ pub enum Side {
     Target,
 }
 
+impl Side {
+    /// The one spelling of a side in log lines, `ItemResult` events, capability rows and apply
+    /// reports, matching the `snake_case` serde representation.
+    ///
+    /// Stated once here rather than re-spelled at each site: an event consumer and a report row
+    /// that disagree about which side they name misattribute a write, so the mapping is not left
+    /// to a hand-written conditional in every stage that renders it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Target => "target",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, ts_rs::TS)]
 #[cfg_attr(feature = "export-types", ts(export))]
 #[ts(export_to = "../Dev/typescript/core/types/generated/")]

@@ -1,34 +1,27 @@
 //! `syncdash logs` — listing runs and reading back their artifacts.
 //!
 //! The widest rendering in the CLI, and the reason it is here rather than inline in the dispatch:
-//! column layout and age wording are presentation, and the library returns records.
+//! column layout is presentation, and the library returns records.
 
 use syncdash::run::history;
 
-use super::args::LogsCmd;
+use crate::cli::args::LogsCmd;
 
 /// Every read goes through runlog's descriptor-confined API; the CLI never constructs an artifact
 /// path from a run identifier.
-pub fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
+pub(super) fn run_logs(cmd: LogsCmd) -> std::io::Result<i32> {
     match cmd {
         LogsCmd::List { job, limit } => {
             // history_merged rather than history: an interrupted run has only a directory and no index line,
             // and that is precisely the run that most needs to be seen
             let rows = history::history_merged(job.as_deref(), limit)?;
             if rows.is_empty() {
-                println!("no runs recorded yet (runs are logged when a job actually applies)");
+                println!("{}", super::NO_RUNS_RECORDED);
                 return Ok(0);
             }
             let now = syncdash::foundation::time::now_ms() as i64;
             for r in &rows {
-                let age_min = (now - r.ts_ms).max(0) / 60_000;
-                let age = if age_min < 60 {
-                    format!("{age_min}m ago")
-                } else if age_min < 48 * 60 {
-                    format!("{}h ago", age_min / 60)
-                } else {
-                    format!("{}d ago", age_min / 60 / 24)
-                };
+                let age = super::relative_age(now, r.ts_ms);
                 // compare rows have no directory; "-" holds the slot so the column stays visually aligned
                 let state = if !r.finished {
                     "  [INTERRUPTED]"

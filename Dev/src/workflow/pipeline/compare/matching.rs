@@ -6,6 +6,7 @@
 pub(super) mod moves;
 pub(super) mod name_rules;
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
 use crate::foundation::text::norm_key;
@@ -59,19 +60,20 @@ pub(super) fn generation_of(e: &ObservedEntry, r: &ObservedEntry, win_ms: i64) -
 }
 
 /// Normalized key → entry; on a collision (NFD/NFC or case twins) the first one seen is kept and recorded
-pub(super) fn map_of<'a>(
-    snap: &'a TableArtifact,
+pub(super) fn map_of(
+    snap: &TableArtifact,
     kind: ObservedEntryKind,
     ci: bool,
-) -> (BTreeMap<String, &'a ObservedEntry>, Vec<String>) {
+) -> (BTreeMap<String, &ObservedEntry>, Vec<String>) {
     let mut m: BTreeMap<String, &ObservedEntry> = BTreeMap::new();
     let mut dups = Vec::new();
     for e in snap.entries.iter().filter(|entry| entry.kind() == kind) {
         let k = norm_key(e.path().as_str(), ci);
-        if m.contains_key(&k) {
-            dups.push(e.path().as_str().to_owned());
-        } else {
-            m.insert(k, e);
+        match m.entry(k) {
+            Entry::Occupied(_) => dups.push(e.path().as_str().to_owned()),
+            Entry::Vacant(slot) => {
+                slot.insert(e);
+            }
         }
     }
     (m, dups)

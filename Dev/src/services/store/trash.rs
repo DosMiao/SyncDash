@@ -103,7 +103,7 @@ pub fn find(needle: &str) -> Vec<Found> {
             }
         }
     }
-    out.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+    out.sort_by_key(|b| std::cmp::Reverse(b.at_ms));
     out
 }
 
@@ -336,7 +336,7 @@ mod tests {
         let rm = staggered_removals(&times, now);
         let kept = times.len() - rm.len();
         assert!(
-            kept >= 3 && kept <= 6,
+            (3..=6).contains(&kept),
             "12 runs 10s apart should thin to ~4, got {kept}"
         );
     }

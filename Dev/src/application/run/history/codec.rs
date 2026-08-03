@@ -1,24 +1,21 @@
 //! Strict current-schema parsing and legacy value decoding.
 
 use crate::foundation::path::EntryName;
+use crate::foundation::token::{hex_lower, is_lower_hex, TOKEN_BYTES, TOKEN_HEX_LEN};
 
 use super::model::{RunArtifacts, RunJobBinding, RunKind, RunRecord, RUN_RECORD_SCHEMA};
-use super::paths::{hex_bytes, run_identifier};
+use super::paths::run_identifier;
 
 pub(super) fn invalid_data(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
 }
 
 pub(super) fn validate_hex_identity(value: &str, label: &str) -> std::io::Result<()> {
-    if value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+    if is_lower_hex(value, TOKEN_HEX_LEN) {
         Ok(())
     } else {
         Err(invalid_data(format!(
-            "{label} must be 32 lowercase hexadecimal characters"
+            "{label} must be {TOKEN_HEX_LEN} lowercase hexadecimal characters"
         )))
     }
 }
@@ -89,7 +86,7 @@ pub(super) fn legacy_record_id(raw: &str, discriminator: &str) -> String {
     digest.update(discriminator.as_bytes());
     digest.update(b"\0");
     digest.update(raw.as_bytes());
-    hex_bytes(&digest.finalize().as_bytes()[..16])
+    hex_lower(&digest.finalize().as_bytes()[..TOKEN_BYTES])
 }
 
 pub(super) fn legacy_kind(kind: &str) -> std::io::Result<RunKind> {

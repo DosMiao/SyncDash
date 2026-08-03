@@ -31,16 +31,8 @@ pub(super) fn split_parent(relative: &str) -> (RootRelativeDir, EntryName) {
 }
 
 pub(super) fn random_token() -> std::io::Result<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| {
-        std::io::Error::other(format!("random token generation failed: {error}"))
-    })?;
-    let mut token = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(token, "{byte:02x}").expect("writing into a String cannot fail");
-    }
-    Ok(token)
+    crate::foundation::token::random_token_128()
+        .map_err(|error| std::io::Error::other(format!("random token generation failed: {error}")))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

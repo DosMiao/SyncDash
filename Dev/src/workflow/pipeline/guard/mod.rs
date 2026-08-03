@@ -47,7 +47,7 @@ impl Default for Guards {
 /// The verdict of one preflight. `blockers` carry the preconditions a run cannot proceed without —
 /// a root that is not there, or a disk that cannot hold the writes. Everything the operator should
 /// weigh rather than have decided for them arrives as a `warning` instead.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Verdict {
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
@@ -82,10 +82,7 @@ pub fn run_all_vfs(
     head: &PlanHeader,
     g: &Guards,
 ) -> Verdict {
-    let mut v = Verdict {
-        blockers: Vec::new(),
-        warnings: Vec::new(),
-    };
+    let mut v = Verdict::default();
     check_root_vfs("source", source, g.require_marker, &mut v);
     check_root_vfs("target", target, g.require_marker, &mut v);
     if !v.ok() {
