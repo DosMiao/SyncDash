@@ -16,6 +16,25 @@ use crate::foundation::path::EntryName;
 use super::identity::{file_identity, EntryNameOsStr, FileIdentity};
 use super::{LocalDirectory, LocalEntry, LocalStagedFile};
 
+/// Placeholder body for a symlink claim. It is overwritten by the rename that follows within the
+/// same call, and is only ever observable to a reader racing a publication in progress.
+#[cfg(target_os = "macos")]
+const CLAIM_LINK_TARGET: &[u8] = b".syncdash-claim\0";
+
+/// The raw-syscall rename paths need owned NUL-terminated names. An embedded NUL is a caller bug
+/// rather than a filesystem condition, so it is reported as invalid input instead of an OS error.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn nul_terminated(name: &OsStr, role: &str) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{role} name contains NUL"),
+        )
+    })
+}
+
 impl LocalDirectory {
     pub(super) fn new(handle: std::fs::File) -> Self {
         Self {
@@ -288,19 +307,10 @@ impl LocalDirectory {
         destination_parent: &Self,
         destination_name: &OsStr,
     ) -> std::io::Result<()> {
-        use std::ffi::CString;
         use std::os::fd::AsRawFd;
-        use std::os::unix::ffi::OsStrExt;
 
-        let source_name = CString::new(source_name.as_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "source name contains NUL")
-        })?;
-        let destination_name = CString::new(destination_name.as_bytes()).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "destination name contains NUL",
-            )
-        })?;
+        let source_name = nul_terminated(source_name, "source")?;
+        let destination_name = nul_terminated(destination_name, "destination")?;
         let result = unsafe {
             libc::renameat2(
                 self.handle.as_raw_fd(),
@@ -324,19 +334,10 @@ impl LocalDirectory {
         destination_parent: &Self,
         destination_name: &OsStr,
     ) -> std::io::Result<()> {
-        use std::ffi::CString;
         use std::os::fd::AsRawFd;
-        use std::os::unix::ffi::OsStrExt;
 
-        let source_name = CString::new(source_name.as_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "source name contains NUL")
-        })?;
-        let destination_name = CString::new(destination_name.as_bytes()).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "destination name contains NUL",
-            )
-        })?;
+        let source_name = nul_terminated(source_name, "source")?;
+        let destination_name = nul_terminated(destination_name, "destination")?;
         let result = unsafe {
             libc::renameatx_np(
                 self.handle.as_raw_fd(),
@@ -347,10 +348,110 @@ impl LocalDirectory {
             )
         };
         if result == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
+            return Ok(());
         }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOTSUP) {
+            return Err(error);
+        }
+        self.rename_noreplace_by_claim(&source_name, destination_parent, &destination_name)
+    }
+
+    /// The no-replace rename for macOS volumes whose driver has no `renameatx_np` at all.
+    ///
+    /// Measured on macOS 27 (Darwin 27.0.0): the FSKit exFAT driver answers `ENOTSUP` for every
+    /// `RENAME_EXCL` caller, so an exFAT root cannot take a lock lease or publish a single file
+    /// through the primitive path. `O_CREAT|O_EXCL`, `mkdirat`, and `symlinkat` are implemented
+    /// there and each fails when the name is taken, so claiming the destination first expresses
+    /// the same exclusion: one writer wins the claim and only that winner performs the replacing
+    /// rename it now owns. Publication stays atomic — the rename still swaps a complete entry into
+    /// place — and the claim narrows the exclusion guarantee only against writers that bypass this
+    /// protocol entirely, which `RENAME_EXCL` never covered either.
+    #[cfg(target_os = "macos")]
+    fn rename_noreplace_by_claim(
+        &self,
+        source_name: &std::ffi::CString,
+        destination_parent: &Self,
+        destination_name: &std::ffi::CString,
+    ) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let source_kind = {
+            let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let result = unsafe {
+                libc::fstatat(
+                    self.handle.as_raw_fd(),
+                    source_name.as_ptr(),
+                    status.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            unsafe { status.assume_init() }.st_mode & libc::S_IFMT
+        };
+
+        let destination_fd = destination_parent.handle.as_raw_fd();
+        // The claim has to be the source's own entry kind: POSIX `rename` replaces a directory
+        // only with a directory, and a non-directory only with a non-directory.
+        let claimed = match source_kind {
+            libc::S_IFDIR => unsafe {
+                libc::mkdirat(destination_fd, destination_name.as_ptr(), 0o700)
+            },
+            libc::S_IFLNK => unsafe {
+                libc::symlinkat(
+                    CLAIM_LINK_TARGET.as_ptr().cast(),
+                    destination_fd,
+                    destination_name.as_ptr(),
+                )
+            },
+            _ => {
+                let descriptor = unsafe {
+                    libc::openat(
+                        destination_fd,
+                        destination_name.as_ptr(),
+                        libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY,
+                        libc::c_int::from(0o600),
+                    )
+                };
+                if descriptor < 0 {
+                    -1
+                } else {
+                    unsafe { libc::close(descriptor) }
+                }
+            }
+        };
+        if claimed != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let renamed = unsafe {
+            libc::renameat(
+                self.handle.as_raw_fd(),
+                source_name.as_ptr(),
+                destination_fd,
+                destination_name.as_ptr(),
+            )
+        };
+        if renamed == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // The claim reserves a name and holds no content. Leaving it behind would turn a failed
+        // publication into an empty entry the next compare reports as a real difference.
+        unsafe {
+            libc::unlinkat(
+                destination_fd,
+                destination_name.as_ptr(),
+                if source_kind == libc::S_IFDIR {
+                    libc::AT_REMOVEDIR
+                } else {
+                    0
+                },
+            )
+        };
+        Err(error)
     }
 
     #[cfg(windows)]
