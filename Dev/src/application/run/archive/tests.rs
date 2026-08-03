@@ -251,10 +251,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         job.archive = Some(dir.clone()); // File::create on a directory must fail on every platform.
-        let plan =
-            crate::run::local::compare_resolved(&job, &source, &target, &RunCtx::null(), false)
-                .unwrap()
-                .plan;
+        let plan = crate::run::local::compare_resolved(&job, &source, &target, &RunCtx::null())
+            .unwrap()
+            .plan;
         let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let copy = events.clone();
         let ctx = RunCtx::new(
@@ -290,10 +289,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         job.archive = Some(dir.join("archive.jsonl"));
-        let plan =
-            crate::run::local::compare_resolved(&job, &source, &target, &RunCtx::null(), false)
-                .unwrap()
-                .plan;
+        let plan = crate::run::local::compare_resolved(&job, &source, &target, &RunCtx::null())
+            .unwrap()
+            .plan;
         let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let copy = events.clone();
         let ctl = RunCtl::new();
@@ -332,10 +330,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let archive = dir.join("archive.jsonl");
         job.archive = Some(archive.clone());
-        let plan =
-            crate::run::local::compare_resolved(&job, &source, &target, &RunCtx::null(), false)
-                .unwrap()
-                .plan;
+        let plan = crate::run::local::compare_resolved(&job, &source, &target, &RunCtx::null())
+            .unwrap()
+            .plan;
         let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let copy = events.clone();
         let ctl = RunCtl::new();

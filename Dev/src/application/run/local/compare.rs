@@ -36,25 +36,11 @@ where
     }
 }
 
-/// The same pipeline, but it also hands back both snapshots (throwing them away would force the UI to scan all over again)
-/// `accept_caps` = the user consented (--accept-caps / a ticked confirmation box) to the
-/// NeedsAck lines of the capability report. Without consent a degraded run refuses to start.
+/// The same pipeline, but it also hands back both snapshots (throwing them away would force the UI
+/// to scan all over again).
 pub fn compare_job_detailed(
     job: &SingleTargetJob,
     ctx: &crate::obs::progress::RunCtx,
-    accept_caps: bool,
-) -> std::io::Result<CompareOutcome> {
-    compare_job_detailed_with_consent(
-        job,
-        ctx,
-        &crate::pipeline::guard::caps::CapabilityConsent::explicit_cli(accept_caps),
-    )
-}
-
-pub fn compare_job_detailed_with_consent(
-    job: &SingleTargetJob,
-    ctx: &crate::obs::progress::RunCtx,
-    consent: &crate::pipeline::guard::caps::CapabilityConsent,
 ) -> std::io::Result<CompareOutcome> {
     let configuration = job.configuration();
     // Resolve both roots to live backends before anything else: local stays local, a
@@ -62,7 +48,7 @@ pub fn compare_job_detailed_with_consent(
     // errors surface here, never mid-scan.
     let sv = resolve_root(&configuration.source)?;
     let tv = resolve_root(job.target())?;
-    compare_resolved_with_consent(configuration, &sv, &tv, ctx, consent)
+    compare_resolved(configuration, &sv, &tv, ctx)
 }
 
 pub fn compare_capabilities(
@@ -106,23 +92,6 @@ pub fn compare_resolved(
     sv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     tv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     ctx: &crate::obs::progress::RunCtx,
-    accept_caps: bool,
-) -> std::io::Result<CompareOutcome> {
-    compare_resolved_with_consent(
-        job,
-        sv,
-        tv,
-        ctx,
-        &crate::pipeline::guard::caps::CapabilityConsent::explicit_cli(accept_caps),
-    )
-}
-
-pub fn compare_resolved_with_consent(
-    job: &Job,
-    sv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
-    tv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
-    ctx: &crate::obs::progress::RunCtx,
-    consent: &crate::pipeline::guard::caps::CapabilityConsent,
 ) -> std::io::Result<CompareOutcome> {
     use crate::model::event::Phase;
     let opt = super::super::effective_scan_opts(job, sv, tv);
@@ -154,55 +123,11 @@ pub fn compare_resolved_with_consent(
         .mtime_window_ms
         .max(sv.caps().mtime_precision_ms as i64)
         .max(tv.caps().mtime_precision_ms as i64);
-    // The capability report: every gap between what the job asks and what the backends
-    // can give is listed BEFORE any scanning — blockers refuse, NeedsAck lines demand
-    // explicit consent, Info lines go to the log. Nothing degrades silently.
+    // The capability report: every gap between what the job asks and what the backends can give
+    // is listed BEFORE any scanning, so nothing degrades silently. It is a list, not a gate —
+    // the comparison is read-only and proceeds on its own.
     let caps_report = read_capabilities_resolved(job, sv, tv, copts.mtime_window_ms);
-    {
-        use crate::model::event::LogLevel;
-        use crate::pipeline::guard::caps::CapSeverity;
-        for i in &caps_report.items {
-            let lvl = match i.severity {
-                CapSeverity::Block => LogLevel::Error,
-                CapSeverity::NeedsAck => LogLevel::Warn,
-                CapSeverity::Info => LogLevel::Info,
-            };
-            ctx.log(lvl, "caps", i.render());
-        }
-        let blockers = caps_report.blockers();
-        if !blockers.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                blockers
-                    .iter()
-                    .map(|i| i.render())
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ));
-        }
-        let acks = caps_report.needs_ack();
-        if !caps_report.consent_satisfied(
-            crate::pipeline::guard::caps::CapabilityScope::CompareRead,
-            consent,
-        ) {
-            let instruction = match consent {
-                crate::pipeline::guard::caps::CapabilityConsent::ExactDigest(_) => {
-                    "the capability report changed after it was reviewed — review Compare again"
-                }
-                _ => "rerun with --accept-caps to consent",
-            };
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "this run degrades on capabilities the backends lack — {instruction}:\n  {}",
-                    acks.iter()
-                        .map(|i| i.render())
-                        .collect::<Vec<_>>()
-                        .join("\n  ")
-                ),
-            ));
-        }
-    }
+    super::log_capability_list(ctx, "compare", &caps_report);
     // Different volumes/links scan in parallel, so wall clock is approximately the slower side.
     // Two roots on the same mounted volume scan sequentially to avoid competing metadata walks;
     // this is a filesystem identity (`st_dev`/volume root), not a claim about the physical disk.

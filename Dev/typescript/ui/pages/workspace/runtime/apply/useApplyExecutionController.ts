@@ -130,14 +130,6 @@ export function useApplyExecutionController({
     try {
       const review = await operationsIpc.reviewApply(plan.owner.identity, reviewedRowDecisions);
       if (!ownsOperationReviewRequest(applyReviewRequestRef.current, request, currentReviewKeyRef.current)) return;
-      if (review.status === 'compare_confirmation_required') {
-        dispatchApplyReview({
-          type: 'failed',
-          request,
-          error: 'The Apply review returned a Compare approval challenge and was rejected',
-        });
-        return;
-      }
       if (review.status === 'direct_authorized' && !directAuthorization(review)) {
         dispatchApplyReview({
           type: 'failed',

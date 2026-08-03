@@ -78,7 +78,7 @@ fn the_archive_and_the_comparison_must_agree_on_evidence_tier() {
     // and the delete propagates back to the source.
     tv.remove_file(BIG.path).expect("remove on target");
     let (_, ctx) = watched();
-    let out = crate::run::local::compare_resolved(&job, &sv, &tv, &ctx, true).expect("compare");
+    let out = crate::run::local::compare_resolved(&job, &sv, &tv, &ctx).expect("compare");
 
     let reasons: Vec<&str> = out.plan.ops.iter().map(|o| o.reason.as_str()).collect();
     assert!(
@@ -130,9 +130,8 @@ fn an_archive_from_a_different_rigor_is_refused_not_misread() {
     // The user raises rigor. `paranoid` reads every byte, so nothing it produces can match.
     tv.remove_file(BIG.path).expect("remove on target");
     let (said, ctx) = watched();
-    let out =
-        crate::run::local::compare_resolved(&archive_job("paranoid", &arch), &sv, &tv, &ctx, true)
-            .expect("compare");
+    let out = crate::run::local::compare_resolved(&archive_job("paranoid", &arch), &sv, &tv, &ctx)
+        .expect("compare");
 
     let text = said.text();
     assert!(

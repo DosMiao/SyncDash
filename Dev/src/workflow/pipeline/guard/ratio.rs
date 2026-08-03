@@ -1,11 +1,13 @@
-//! The deletion-ratio gate. A plan that deletes most of a root is far more often a wrong filter,
-//! a swapped source and target, or an unmounted share than an intended mass delete.
+//! The deletion-share observation. A plan that deletes most of a root is far more often a wrong
+//! filter, a swapped source and target, or an unmounted share than an intended mass delete — so it
+//! is stated prominently and the review panel colors it. It does not withhold the run: the operator
+//! reading the panel is the one who knows which of those it is.
 
 use super::stats::SideStats;
 use super::Guards;
 use super::Verdict;
 
-/// Plan health check: deletion share. `entries` is that side's snapshot entry count (0 = nothing to judge against, skip).
+/// Deletion share. `entries` is that side's snapshot entry count (0 = nothing to judge against).
 pub fn check_delete_ratio(
     label: &str,
     side: &SideStats,
@@ -24,19 +26,12 @@ pub fn check_delete_ratio(
     if ratio < g.max_delete_ratio {
         return;
     }
-    let msg = format!(
-        "{label}: plan deletes {removals} of {entries} entries ({:.0}%) — over the {:.0}% guard. \
+    v.warnings.push(format!(
+        "{label}: plan deletes {removals} of {entries} entries ({:.0}%) — over the {:.0}% mark. \
          A wrong filter, an unmounted share, or swapped source/target all look exactly like this.",
         ratio * 100.0,
         g.max_delete_ratio * 100.0
-    );
-    if g.acknowledged {
-        v.warnings.push(format!("{msg} (allowed by --i-know)"));
-    } else {
-        v.blockers.push(format!(
-            "{msg} Re-run with --i-know if this is really intended."
-        ));
-    }
+    ));
 }
 
 #[cfg(test)]
@@ -44,31 +39,21 @@ mod tests {
     use super::super::Guards;
     use super::*;
 
+    /// The share is evidence for the operator, not a decision the engine makes for them.
     #[test]
-    fn delete_ratio_blocks_and_can_be_acknowledged() {
+    fn a_mass_deletion_is_reported_without_withholding_the_run() {
         let side = SideStats {
             deletes: 60,
             ..Default::default()
         };
-        let g = Guards::default();
         let mut v = Verdict {
             blockers: vec![],
             warnings: vec![],
         };
-        check_delete_ratio("target", &side, 100, &g, &mut v);
-        assert_eq!(v.blockers.len(), 1, "60% deletion must be blocked");
-
-        let g2 = Guards {
-            acknowledged: true,
-            ..Guards::default()
-        };
-        let mut v2 = Verdict {
-            blockers: vec![],
-            warnings: vec![],
-        };
-        check_delete_ratio("target", &side, 100, &g2, &mut v2);
-        assert!(v2.ok(), "--i-know must let it through");
-        assert_eq!(v2.warnings.len(), 1, "but it must still be reported");
+        check_delete_ratio("target", &side, 100, &Guards::default(), &mut v);
+        assert!(v.ok(), "a deletion share must never refuse the run");
+        assert_eq!(v.warnings.len(), 1, "and it must always be reported");
+        assert!(v.warnings[0].contains("60 of 100"));
     }
 
     #[test]

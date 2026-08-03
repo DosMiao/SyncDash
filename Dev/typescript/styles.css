@@ -1108,8 +1108,8 @@ td.c-path { max-width: 330px; overflow: hidden; text-overflow: ellipsis; white-s
   border-radius: var(--r-sm);
   background: var(--surface);
 }
-.capability-card.severity-block { border-left-color: var(--c-red); }
-.capability-card.severity-needs_ack { border-left-color: var(--c-orange); }
+.capability-card.severity-unavailable { border-left-color: var(--c-red); }
+.capability-card.severity-degraded { border-left-color: var(--c-orange); }
 .capability-card.severity-info { border-left-color: var(--accent); }
 .capability-card header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px 10px; }
 .capability-card header > span { color: var(--text-2); font-size: var(--fs-sm); }

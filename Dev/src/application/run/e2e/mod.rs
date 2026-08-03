@@ -89,10 +89,9 @@ pub fn try_cycle(
     job: &Job,
     source: &Arc<dyn Vfs>,
     target: &Arc<dyn Vfs>,
-    acknowledged: bool,
 ) -> (crate::model::plan::Plan, ApplyOutcome, String) {
     let (transcript, context) = watched();
-    let comparison = super::local::compare_resolved(job, source, target, &context, true)
+    let comparison = super::local::compare_resolved(job, source, target, &context)
         .unwrap_or_else(|error| panic!("compare: {error}\n{}", transcript.text()));
     let outcome = super::local::apply_resolved(
         job,
@@ -102,8 +101,6 @@ pub fn try_cycle(
         target,
         None,
         false,
-        acknowledged,
-        true,
         std::time::Instant::now(),
         &context,
     );
@@ -111,7 +108,7 @@ pub fn try_cycle(
 }
 
 pub fn cycle(job: &Job, source: &Arc<dyn Vfs>, target: &Arc<dyn Vfs>) -> crate::model::plan::Plan {
-    let (plan, outcome, transcript) = try_cycle(job, source, target, false);
+    let (plan, outcome, transcript) = try_cycle(job, source, target);
     assert_eq!(outcome.errors, 0, "apply errored\n{transcript}");
     plan
 }
@@ -202,7 +199,7 @@ pub fn run_pipeline_smoke(
     }
 
     let (transcript, context) = watched();
-    let comparison = super::local::compare_resolved(&job, source, target, &context, true)
+    let comparison = super::local::compare_resolved(&job, source, target, &context)
         .unwrap_or_else(|error| panic!("[{lane}] compare: {error}\n{}", transcript.text()));
     for (action, path) in [
         (Action::Copy, "new.txt"),
@@ -244,8 +241,6 @@ pub fn run_pipeline_smoke(
         target,
         trash.clone(),
         false,
-        false,
-        true,
         std::time::Instant::now(),
         &context,
     );
@@ -282,8 +277,7 @@ pub fn run_pipeline_smoke(
         mode: "enrich".into(),
         ..bare_job()
     };
-    let comparison =
-        super::local::compare_resolved(&enrich, source, target, &context, true).unwrap();
+    let comparison = super::local::compare_resolved(&enrich, source, target, &context).unwrap();
     assert!(!comparison
         .plan
         .ops

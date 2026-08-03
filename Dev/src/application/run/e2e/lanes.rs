@@ -80,7 +80,7 @@ fn ftp_list_only_compares_but_refuses_before_write() {
 
     let job = bare_job();
     let (transcript, context) = watched();
-    let comparison = crate::run::local::compare_resolved(&job, &source, &target, &context, true)
+    let comparison = crate::run::local::compare_resolved(&job, &source, &target, &context)
         .expect("a read-only backend must still compare");
     assert_eq!(comparison.plan.ops.len(), 1);
     assert_eq!(
@@ -96,14 +96,15 @@ fn ftp_list_only_compares_but_refuses_before_write() {
         &target,
         None,
         false,
-        false,
-        true,
         std::time::Instant::now(),
         &context,
     );
     assert_eq!((outcome.done, outcome.errors), (0, 1));
     let text = transcript.text();
-    assert!(text.contains("root lock") && text.contains("refusing to write"));
+    assert!(
+        text.contains("root lock"),
+        "the missing exclusive publication must still be listed before the run: {text}"
+    );
 }
 
 fn live_lane(lane: &str, base_url: &str, pipeline_required: bool) {

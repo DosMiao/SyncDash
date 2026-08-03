@@ -10,9 +10,6 @@ impl OperationAuthorizationStore {
     pub(crate) fn revoke_job_authority(&self, job_id: &str) {
         let mut state = self.0.lock().unwrap();
         state.challenges.retain(|record| match &record.challenge {
-            ReviewChallenge::Compare { authorization, .. } => {
-                authorization.target().job_id() != job_id
-            }
             ReviewChallenge::InteractiveApply { review, .. } => {
                 review.compare_identity().job_id != job_id
             }
@@ -30,15 +27,11 @@ impl OperationAuthorizationStore {
                     authorization.review().compare_identity().job_id != job_id
                 }
             });
-        state
-            .grants
-            .retain(|record| record.target.job_id() != job_id);
     }
 
     pub(crate) fn revoke_apply_authority(&self, scope: &CompareScope) {
         let mut state = self.0.lock().unwrap();
         state.challenges.retain(|record| match &record.challenge {
-            ReviewChallenge::Compare { .. } => true,
             ReviewChallenge::InteractiveApply { review, .. } => {
                 !scope.contains(review.compare_identity())
             }

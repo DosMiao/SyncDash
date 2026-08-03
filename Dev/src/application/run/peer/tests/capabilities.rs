@@ -58,7 +58,7 @@ mod apply_capability_tests {
         let selected = job.select_target(0).unwrap();
         let report = apply_capabilities(&selected, &[target_write()]);
         assert!(report.items.iter().any(|item| {
-            item.feature == "min_free_pct" && item.severity == CapSeverity::NeedsAck
+            item.feature == "min_free_pct" && item.severity == CapSeverity::Degraded
         }));
 
         let mut source = target_write();
@@ -77,17 +77,15 @@ mod apply_capability_tests {
         let selected = job.select_target(0).unwrap();
         let report = apply_capabilities(&selected, &[target_write()]);
         assert!(report.items.iter().any(|item| {
-            item.feature == "require_marker" && item.severity == CapSeverity::Block
+            item.feature == "require_marker" && item.severity == CapSeverity::Unavailable
         }));
     }
 
-    /// The gate must live in the lane. Asserting it through `apply_capabilities` alone proves only
-    /// that the report is computable — it cannot catch an entry point that never asks for one, and
-    /// that is exactly the shape the CLI peer path had: `run_job` reached the lane through
-    /// `run_peer_job`, which ran no check and dropped `--accept-caps`.
+    /// An unprovable safeguard is reported, not enforced: the lane runs on and whatever happens
+    /// next is the transport's own business. Pinned because the previous shape refused here, and a
+    /// silent return of that refusal would strand a peer job with no way past it.
     #[test]
-    fn a_blocked_peer_apply_is_refused_through_the_lane_before_any_write() {
-        use crate::pipeline::guard::caps::CapabilityConsent;
+    fn an_unprovable_peer_safeguard_no_longer_withholds_the_lane() {
         use crate::run::peer::apply_peer_job_with_classified;
 
         let job = Job {
@@ -109,19 +107,16 @@ mod apply_capability_tests {
             &plan,
             &ops,
             false,
-            false,
-            // Even a blanket --accept-caps cannot buy past a Block; only NeedsAck is consentable.
-            &CapabilityConsent::explicit_cli(true),
             &crate::obs::progress::RunCtx::null(),
         );
 
-        assert!(
-            !execution.writes_started(),
-            "a capability refusal must classify as before-write so the reviewed result survives"
-        );
         let error = execution
             .into_result()
-            .expect_err("a required marker the protocol cannot prove must refuse the apply");
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            .expect_err("this peer host does not exist, so the run fails reaching it");
+        assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::Unsupported,
+            "the unprovable marker must not be what stops the run: {error}"
+        );
     }
 }

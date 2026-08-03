@@ -1,39 +1,18 @@
 //! One-use review challenge, approval, and issued-token vocabulary.
 
 use super::apply::ApplyReview;
-use super::compare::CompareAuthorization;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ReviewChallenge {
-    Compare {
-        authorization: CompareAuthorization,
-        requires_capability_ack: bool,
-    },
-    InteractiveApply {
-        review: ApplyReview,
-        requires_health_ack: bool,
-        requires_capability_ack: bool,
-    },
+    InteractiveApply { review: ApplyReview },
 }
 
+/// The approval carries no choices: the review panel presents evidence, not conditions. It exists
+/// so an approval names the one challenge it answers, which is what binds a token to the exact
+/// reviewed plan.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ReviewApproval {
-    Compare {
-        accept_capabilities: bool,
-        remember_for_session: bool,
-    },
-    InteractiveApply {
-        acknowledge_health: bool,
-        accept_capabilities: bool,
-        session_grant: ApplySessionGrantDecision,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ApplySessionGrantDecision {
-    None,
-    RememberCapabilities,
-    AllowAutoApply,
+    InteractiveApply,
 }
 
 #[derive(Clone, Debug)]

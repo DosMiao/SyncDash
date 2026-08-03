@@ -84,7 +84,7 @@ function configPills(job: JobFull, presets: JunkPresetDto[]): Pill[] {
       key: 'Gates',
       value: `≤${formatPercentage(job.max_delete_ratio)} del · ≥${formatPercentage(job.min_free_pct)} free${job.require_marker ? ' · marker' : ''}`,
       group: 'Guardrails',
-      title: `A run is blocked if it would delete more than ${formatPercentage(job.max_delete_ratio)} of the target, or if free disk is under ${formatPercentage(job.min_free_pct)}.`
+      title: `Review & Apply colors a category red once it touches more than ${formatPercentage(job.max_delete_ratio)} of the target. A run is blocked only if free disk is under ${formatPercentage(job.min_free_pct)}.`
         + (job.require_marker ? '\nBoth roots must also carry a .syncdash-root marker.' : ''),
     },
     {

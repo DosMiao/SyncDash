@@ -33,12 +33,10 @@ pub fn cap_report_read(
             r.items.push(CapItem {
                 feature: "symlinks=direct".into(),
                 side: side.into(),
-                severity: CapSeverity::Block,
+                severity: CapSeverity::Unavailable,
                 requested: "symlinks recorded in the table".into(),
                 actual: "backend cannot represent symlinks".into(),
-                effect:
-                    "the table would silently omit every link — refusing to produce a false picture"
-                        .into(),
+                effect: "the table omits every link on this side, so links are invisible to this comparison".into(),
             });
         }
     }
@@ -50,7 +48,7 @@ pub fn cap_report_read(
                 r.items.push(CapItem {
                     feature: "evidence=sampled".into(),
                     side: side.into(),
-                    severity: CapSeverity::NeedsAck,
+                    severity: CapSeverity::Degraded,
                     requested: "3-window sampled digests".into(),
                     actual: "no ranged reads".into(),
                     effect: "sampled digests only match other sampled digests, so BOTH sides upgrade to full reads — every changed file is read whole over its link; set evidence=none to skip content reads instead".into(),
@@ -65,7 +63,7 @@ pub fn cap_report_read(
         r.items.push(CapItem {
             feature: "mtime window".into(),
             side: "both".into(),
-            severity: if q.hash { CapSeverity::Info } else { CapSeverity::NeedsAck },
+            severity: if q.hash { CapSeverity::Info } else { CapSeverity::Degraded },
             requested: format!("±{}s equality window", crate::pipeline::compare::MTIME_SLACK_MS / 1000),
             actual: format!("backend timestamps are only ±{secs}s precise"),
             effect: if q.hash {

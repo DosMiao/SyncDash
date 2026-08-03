@@ -23,7 +23,6 @@ pub(in crate::features::operations::apply) struct RetainedApplyPlan {
 }
 
 pub(in crate::features::operations::apply) struct ApplyFacts {
-    pub(in crate::features::operations::apply) unacknowledged: Verdict,
-    pub(in crate::features::operations::apply) acknowledged: Verdict,
+    pub(in crate::features::operations::apply) verdict: Verdict,
     pub(in crate::features::operations::apply) capabilities: CapReport,
 }

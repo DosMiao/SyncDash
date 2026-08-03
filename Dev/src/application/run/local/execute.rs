@@ -11,8 +11,6 @@ pub fn run_local_job(
     job: &Job,
     do_apply: bool,
     verbose: bool,
-    acknowledged: bool,
-    accept_caps: bool,
 ) -> std::io::Result<(u64, u64, u64, u64)> {
     // 1:N (the original requirement): one source → each target compared and executed independently.
     // One plan and one run log per target; source-side hashing is absorbed by the cache (in the fast tier, near-zero reads from the second target on).
@@ -33,14 +31,7 @@ pub fn run_local_job(
         } else {
             name.to_string()
         };
-        let r = run_local_single(
-            &label,
-            &selected,
-            do_apply,
-            verbose,
-            acknowledged,
-            accept_caps,
-        )?;
+        let r = run_local_single(&label, &selected, do_apply, verbose)?;
         tot.0 += r.0;
         tot.1 += r.1;
         tot.2 += r.2;
@@ -54,10 +45,8 @@ pub fn run_local_single(
     job: &SingleTargetJob,
     do_apply: bool,
     verbose: bool,
-    acknowledged: bool,
-    accept_caps: bool,
 ) -> std::io::Result<(u64, u64, u64, u64)> {
-    let plan = compare_job_detailed(job, &crate::obs::progress::RunCtx::null(), accept_caps)?.plan;
+    let plan = compare_job_detailed(job, &crate::obs::progress::RunCtx::null())?.plan;
     crate::log_info!(
         "run",
         "[{name}] {} op(s), {} conflict(s)",
@@ -85,16 +74,7 @@ pub fn run_local_single(
         &crate::obs::progress::RunCtx::null(),
         &ops,
     );
-    let out = apply_job_guarded_with(
-        job,
-        &plan,
-        &ops,
-        None,
-        verbose,
-        acknowledged,
-        accept_caps,
-        &rec.ctx,
-    );
+    let out = apply_job_guarded_with(job, &plan, &ops, None, verbose, &rec.ctx);
     let _ = rec.finish(&out, t0.elapsed().as_millis() as u64);
     Ok((
         out.done,

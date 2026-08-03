@@ -23,6 +23,9 @@ pub(crate) struct JobDto {
     #[ts(type = "number | null")]
     pub(crate) autoscan_interval_secs: Option<u64>,
     pub(crate) autoscan_auto_apply: bool,
+    /// The share of a side's entries past which the review panel colors a category. It is the same
+    /// number the job's Gates chip shows, so what the operator configured is what turns red.
+    pub(crate) max_delete_ratio: f64,
     /// The canonical target roots; a single-target job has exactly one entry.
     pub(crate) targets: Vec<String>,
     pub(crate) config_revision: String,

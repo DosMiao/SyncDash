@@ -42,16 +42,10 @@ test('Tauri argument mapping uses camelCase only at the boundary', () => {
   });
   assert.deepEqual(approveOperationArgs('challenge', {
     operation: 'interactive_apply',
-    acknowledge_health: true,
-    accept_capabilities: false,
-    session_grant: 'remember_capabilities',
   }), {
     challengeId: 'challenge',
     approval: {
       operation: 'interactive_apply',
-      acknowledge_health: true,
-      accept_capabilities: false,
-      session_grant: 'remember_capabilities',
     },
   });
   assert.deepEqual(compareAuthorizationArgs('compare-token'), { authorizationToken: 'compare-token' });

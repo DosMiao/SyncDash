@@ -12,7 +12,6 @@ use super::*;
 fn compare_authorization() -> CompareAuthorization {
     CompareAuthorization::new(
         JobTargetRevision::new("job-a".into(), "revision-a".into(), 1).unwrap(),
-        "caps-a".into(),
         CompareOrigin::Interactive,
     )
     .unwrap()
@@ -37,7 +36,6 @@ fn apply_review() -> ApplyReview {
             direction_reversed: true,
         }],
         "health-a".into(),
-        "caps-a".into(),
     )
     .unwrap()
 }
@@ -89,33 +87,17 @@ fn apply_review_verifies_the_stable_compare_identity() {
         "plan-a".into(),
         expected.reviewed_row_decisions().to_vec(),
         "health-a".into(),
-        "caps-a".into(),
     )
     .unwrap();
     assert!(expected.verify_current(&current).is_ok());
 }
 
-fn approve_apply_grant(
-    store: &OperationAuthorizationStore,
-    review: ApplyReview,
-    session_grant: ApplySessionGrantDecision,
-) -> IssuedAuthorization {
+fn approve_apply(store: &OperationAuthorizationStore, review: ApplyReview) -> IssuedAuthorization {
     let challenge = store
-        .create_review_challenge(ReviewChallenge::InteractiveApply {
-            review,
-            requires_health_ack: false,
-            requires_capability_ack: true,
-        })
+        .create_review_challenge(ReviewChallenge::InteractiveApply { review })
         .unwrap();
     store
-        .approve_review_challenge(
-            &challenge.challenge_id,
-            ReviewApproval::InteractiveApply {
-                acknowledge_health: false,
-                accept_capabilities: true,
-                session_grant,
-            },
-        )
+        .approve_review_challenge(&challenge.challenge_id, ReviewApproval::InteractiveApply)
         .unwrap()
 }
 
@@ -158,60 +140,28 @@ fn wrong_consumer_burns_token_and_parallel_consume_has_one_winner() {
 }
 
 #[test]
-fn wrong_approval_variant_burns_challenge() {
-    let store = OperationAuthorizationStore::default();
-    let challenge = store
-        .create_review_challenge(ReviewChallenge::Compare {
-            authorization: compare_authorization(),
-            requires_capability_ack: true,
-        })
-        .unwrap();
-    let wrong = ReviewApproval::InteractiveApply {
-        acknowledge_health: false,
-        accept_capabilities: true,
-        session_grant: ApplySessionGrantDecision::None,
-    };
-    assert!(store
-        .approve_review_challenge(&challenge.challenge_id, wrong)
-        .is_err());
-    assert!(store
-        .approve_review_challenge(
-            &challenge.challenge_id,
-            ReviewApproval::Compare {
-                accept_capabilities: true,
-                remember_for_session: false,
-            },
-        )
-        .is_err());
-}
-
-#[test]
-fn failed_token_creation_cannot_commit_a_session_grant() {
+fn failed_token_creation_leaves_no_half_committed_authority() {
     let store = OperationAuthorizationStore::default();
     let challenge = store
         .create_review_challenge(ReviewChallenge::InteractiveApply {
             review: apply_review(),
-            requires_health_ack: false,
-            requires_capability_ack: true,
         })
         .unwrap();
 
     let result = store.approve_review_challenge_at_with_token(
         &challenge.challenge_id,
-        ReviewApproval::InteractiveApply {
-            acknowledge_health: false,
-            accept_capabilities: true,
-            session_grant: ApplySessionGrantDecision::AllowAutoApply,
-        },
+        ReviewApproval::InteractiveApply,
         Instant::now(),
         || Err("entropy source unavailable".into()),
     );
 
     assert!(result.is_err());
     let state = store.0.lock().unwrap();
-    assert!(state.challenges.is_empty());
+    assert!(
+        state.challenges.is_empty(),
+        "the challenge is burned either way"
+    );
     assert!(state.authorizations.is_empty());
-    assert!(state.grants.is_empty());
 }
 
 #[test]
@@ -239,94 +189,15 @@ fn expired_authorization_is_burned_before_it_is_reported() {
 }
 
 #[test]
-fn grants_cannot_cross_scope_revision_target_or_capability_digest() {
-    let store = OperationAuthorizationStore::default();
-    let compare = compare_authorization();
-    let challenge = store
-        .create_review_challenge(ReviewChallenge::Compare {
-            authorization: compare.clone(),
-            requires_capability_ack: true,
-        })
-        .unwrap();
-    store
-        .approve_review_challenge(
-            &challenge.challenge_id,
-            ReviewApproval::Compare {
-                accept_capabilities: true,
-                remember_for_session: true,
-            },
-        )
-        .unwrap();
-    assert!(store.has_compare_capability_grant(&compare));
-
-    let revised = CompareAuthorization::new(
-        JobTargetRevision::new("job-a".into(), "revision-b".into(), 1).unwrap(),
-        "caps-a".into(),
-        CompareOrigin::Interactive,
-    )
-    .unwrap();
-    let retargeted = CompareAuthorization::new(
-        JobTargetRevision::new("job-a".into(), "revision-a".into(), 0).unwrap(),
-        "caps-a".into(),
-        CompareOrigin::Interactive,
-    )
-    .unwrap();
-    let recapped = CompareAuthorization::new(
-        JobTargetRevision::new("job-a".into(), "revision-a".into(), 1).unwrap(),
-        "caps-b".into(),
-        CompareOrigin::Interactive,
-    )
-    .unwrap();
-    assert!(!store.has_compare_capability_grant(&revised));
-    assert!(!store.has_compare_capability_grant(&retargeted));
-    assert!(!store.has_compare_capability_grant(&recapped));
-    assert!(!store.has_interactive_apply_capability_grant(&apply_review()));
-}
-
-#[test]
-fn auto_apply_requires_an_exact_grant_and_downgrade_revokes_issued_tokens() {
-    let store = OperationAuthorizationStore::default();
-    let review = apply_review();
-    let ticket = AutoApplyTicket::for_test(4, 12, identity());
-    assert!(store
-        .issue_auto_apply_authorization(review.clone(), ticket.clone())
-        .is_err());
-
-    approve_apply_grant(
-        &store,
-        review.clone(),
-        ApplySessionGrantDecision::AllowAutoApply,
-    );
-    let issued = store
-        .issue_auto_apply_authorization(review.clone(), ticket)
-        .unwrap();
-
-    approve_apply_grant(
-        &store,
-        review,
-        ApplySessionGrantDecision::RememberCapabilities,
-    );
-    assert!(store
-        .consume_apply_authorization(&issued.authorization_token)
-        .is_err());
-}
-
-#[test]
-fn dirty_scope_revokes_apply_challenges_and_tokens_but_retains_session_consent() {
+fn dirty_scope_revokes_every_pending_challenge_and_issued_apply_token() {
     let store = OperationAuthorizationStore::default();
     let review = apply_review();
     let pending = store
         .create_review_challenge(ReviewChallenge::InteractiveApply {
             review: review.clone(),
-            requires_health_ack: false,
-            requires_capability_ack: false,
         })
         .unwrap();
-    let interactive = approve_apply_grant(
-        &store,
-        review.clone(),
-        ApplySessionGrantDecision::AllowAutoApply,
-    );
+    let interactive = approve_apply(&store, review.clone());
     let automatic = store
         .issue_auto_apply_authorization(
             review.clone(),
@@ -337,14 +208,7 @@ fn dirty_scope_revokes_apply_challenges_and_tokens_but_retains_session_consent()
     store.revoke_apply_authority(&CompareScope::new("job-a", 1, "revision-a"));
 
     assert!(store
-        .approve_review_challenge(
-            &pending.challenge_id,
-            ReviewApproval::InteractiveApply {
-                acknowledge_health: false,
-                accept_capabilities: false,
-                session_grant: ApplySessionGrantDecision::None,
-            },
-        )
+        .approve_review_challenge(&pending.challenge_id, ReviewApproval::InteractiveApply)
         .is_err());
     assert!(store
         .consume_apply_authorization(&interactive.authorization_token)
@@ -352,8 +216,6 @@ fn dirty_scope_revokes_apply_challenges_and_tokens_but_retains_session_consent()
     assert!(store
         .consume_apply_authorization(&automatic.authorization_token)
         .is_err());
-    assert!(store.has_interactive_apply_capability_grant(&review));
-    assert!(store.find_grant(|grant| grant.allows_apply(&review, true)));
 }
 
 #[test]
@@ -366,7 +228,6 @@ fn every_apply_fingerprint_and_health_message_set_is_exact() {
         "plan-a".into(),
         expected.reviewed_row_decisions().to_vec(),
         "health-a".into(),
-        "caps-a".into(),
     )
     .unwrap();
     assert!(expected.verify_current(&changed).is_err());
@@ -379,17 +240,20 @@ fn every_apply_fingerprint_and_health_message_set_is_exact() {
         blockers: vec!["a".into(), "b".into()],
         warnings: vec!["w".into()],
     };
-    let acknowledged = syncdash::pipeline::guard::Verdict {
-        blockers: Vec::new(),
-        warnings: vec!["w".into()],
-    };
     assert_eq!(
-        health_review_digest(&first, &acknowledged),
-        health_review_digest(&reordered, &acknowledged)
+        health_review_digest(&first),
+        health_review_digest(&reordered),
+        "message order must not change the fingerprint"
     );
+    // Blockers and warnings are separate fields, so the same message set in the other role is a
+    // different review — a fingerprint that folded them together could authorize the wrong one.
+    let swapped_roles = syncdash::pipeline::guard::Verdict {
+        blockers: vec!["w".into()],
+        warnings: vec!["a".into(), "b".into()],
+    };
     assert_ne!(
-        health_review_digest(&first, &acknowledged),
-        health_review_digest(&acknowledged, &first)
+        health_review_digest(&first),
+        health_review_digest(&swapped_roles)
     );
 }
 
@@ -402,7 +266,6 @@ fn authorization_capacity_and_job_revocation_remain_exact() {
             .issue_compare_authorization(
                 CompareAuthorization::new(
                     JobTargetRevision::new(job_id.into(), "revision-a".into(), 0).unwrap(),
-                    format!("caps-{index}"),
                     CompareOrigin::Interactive,
                 )
                 .unwrap(),
@@ -425,29 +288,4 @@ fn authorization_capacity_and_job_revocation_remain_exact() {
             _ => false,
         }));
     assert!(state.authorizations.iter().any(|_| true));
-}
-
-#[test]
-fn remembered_apply_capability_consent_is_reused_without_auto_apply_permission() {
-    let store = OperationAuthorizationStore::default();
-    let review = apply_review();
-    let challenge = store
-        .create_review_challenge(ReviewChallenge::InteractiveApply {
-            review: review.clone(),
-            requires_health_ack: false,
-            requires_capability_ack: true,
-        })
-        .unwrap();
-    store
-        .approve_review_challenge(
-            &challenge.challenge_id,
-            ReviewApproval::InteractiveApply {
-                acknowledge_health: false,
-                accept_capabilities: true,
-                session_grant: ApplySessionGrantDecision::RememberCapabilities,
-            },
-        )
-        .unwrap();
-    assert!(store.has_interactive_apply_capability_grant(&review));
-    assert!(!store.find_grant(|grant| grant.allows_apply(&review, true)));
 }

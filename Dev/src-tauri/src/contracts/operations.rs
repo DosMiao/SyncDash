@@ -24,16 +24,16 @@ pub(crate) struct PostRunPowerActionReadyDto {
 #[cfg_attr(feature = "export-types", ts(export))]
 #[ts(export_to = "../Dev/typescript/core/types/generated/")]
 pub(crate) enum CapabilitySeverityDto {
-    Block,
-    NeedsAck,
+    Unavailable,
+    Degraded,
     Info,
 }
 
 impl From<syncdash::pipeline::guard::caps::CapSeverity> for CapabilitySeverityDto {
     fn from(value: syncdash::pipeline::guard::caps::CapSeverity) -> Self {
         match value {
-            syncdash::pipeline::guard::caps::CapSeverity::Block => Self::Block,
-            syncdash::pipeline::guard::caps::CapSeverity::NeedsAck => Self::NeedsAck,
+            syncdash::pipeline::guard::caps::CapSeverity::Unavailable => Self::Unavailable,
+            syncdash::pipeline::guard::caps::CapSeverity::Degraded => Self::Degraded,
             syncdash::pipeline::guard::caps::CapSeverity::Info => Self::Info,
         }
     }
@@ -87,23 +87,12 @@ pub(crate) enum OperationReviewDto {
         authorization: AuthorizationDto,
         capabilities: Vec<CapabilityIssueDto>,
     },
-    CompareConfirmationRequired {
-        challenge_id: String,
-        #[ts(type = "number")]
-        expires_at_ms: u64,
-        capabilities: Vec<CapabilityIssueDto>,
-        can_remember_for_session: bool,
-    },
     InteractiveApplyConfirmationRequired {
         challenge_id: String,
         #[ts(type = "number")]
         expires_at_ms: u64,
         warnings: Vec<String>,
         capabilities: Vec<CapabilityIssueDto>,
-        requires_health_ack: bool,
-        requires_capability_ack: bool,
-        can_remember_for_session: bool,
-        can_allow_unattended: bool,
     },
 }
 
@@ -112,25 +101,7 @@ pub(crate) enum OperationReviewDto {
 #[cfg_attr(feature = "export-types", ts(export))]
 #[ts(export_to = "../Dev/typescript/core/types/generated/")]
 pub(crate) enum OperationApprovalDto {
-    Compare {
-        accept_capabilities: bool,
-        remember_for_session: bool,
-    },
-    InteractiveApply {
-        acknowledge_health: bool,
-        accept_capabilities: bool,
-        session_grant: ApplySessionGrantDecisionDto,
-    },
-}
-
-#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
-#[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "export-types", ts(export))]
-#[ts(export_to = "../Dev/typescript/core/types/generated/")]
-pub(crate) enum ApplySessionGrantDecisionDto {
-    None,
-    RememberCapabilities,
-    AllowAutoApply,
+    InteractiveApply,
 }
 
 #[derive(Serialize, ts_rs::TS)]

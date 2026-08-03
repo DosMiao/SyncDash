@@ -1,7 +1,6 @@
 //! Serialized in-process authority store with one-use challenge and token edges.
 
 mod challenge;
-mod grant;
 mod issuance;
 mod retention;
 mod revocation;

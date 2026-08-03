@@ -22,16 +22,11 @@ pub(super) fn reviewed_row_decisions_digest(
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-pub(crate) fn health_review_digest(
-    unacknowledged: &syncdash::pipeline::guard::Verdict,
-    acknowledged: &syncdash::pipeline::guard::Verdict,
-) -> String {
+pub(crate) fn health_review_digest(verdict: &syncdash::pipeline::guard::Verdict) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"syncdash-health-review-v1\0");
-    hash_messages(&mut hasher, b"unack-blockers", &unacknowledged.blockers);
-    hash_messages(&mut hasher, b"unack-warnings", &unacknowledged.warnings);
-    hash_messages(&mut hasher, b"ack-blockers", &acknowledged.blockers);
-    hash_messages(&mut hasher, b"ack-warnings", &acknowledged.warnings);
+    hasher.update(b"syncdash-health-review-v2\0");
+    hash_messages(&mut hasher, b"blockers", &verdict.blockers);
+    hash_messages(&mut hasher, b"warnings", &verdict.warnings);
     hasher.finalize().to_hex().to_string()
 }
 

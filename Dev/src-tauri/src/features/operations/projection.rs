@@ -10,16 +10,9 @@ pub(super) fn authorization_dto(issued: IssuedAuthorization) -> AuthorizationDto
     }
 }
 
+/// The pre-run capability list, in the engine's display order. It is shown and never enforced.
 pub(super) fn capability_dtos(capabilities: &CapReport) -> Vec<CapabilityIssueDto> {
-    capabilities.items.iter().map(Into::into).collect()
-}
-
-pub(super) fn capability_blockers(capabilities: &CapReport) -> Vec<String> {
-    capabilities
-        .blockers()
-        .into_iter()
-        .map(|item| item.render())
-        .collect()
+    capabilities.listed().into_iter().map(Into::into).collect()
 }
 
 pub(super) fn blocked_review(

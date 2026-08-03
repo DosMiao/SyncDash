@@ -6,6 +6,11 @@ export type JobDto = { job_id: string, name: string, mode: string, rigor: string
  */
 is_peer_job: boolean, versioning: boolean, delta: boolean, parallel: number | null, include: Array<string>, exclude: Array<string>, autoscan_interval_secs: number | null, autoscan_auto_apply: boolean,
 /**
+ * The share of a side's entries past which the review panel colors a category. It is the same
+ * number the job's Gates chip shows, so what the operator configured is what turns red.
+ */
+max_delete_ratio: number,
+/**
  * The canonical target roots; a single-target job has exactly one entry.
  */
 targets: Array<string>, config_revision: string, };

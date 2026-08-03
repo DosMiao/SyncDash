@@ -12,9 +12,7 @@ use crate::features::operations::authorization::challenge::ReviewChallenge;
 use crate::features::operations::authorization::store::OperationAuthorizationStore;
 use crate::features::operations::lifecycle::coordinator::RunLifecycle;
 
-use super::super::projection::{
-    authorization_dto, blocked_review, capability_blockers, capability_dtos,
-};
+use super::super::projection::{authorization_dto, blocked_review, capability_dtos};
 use super::super::target::reload_prepared_target;
 use super::preparation::{
     apply_facts, apply_review_messages, autoscan_health_refusals, build_apply_review,
@@ -41,30 +39,20 @@ pub(crate) async fn review_apply(
                 ))
             }
         };
-        let (blockers, warnings, requires_health_ack) = apply_review_messages(&facts);
+        let (blockers, warnings) = apply_review_messages(&facts);
         if !blockers.is_empty() {
             return Ok(blocked_review(blockers, warnings, &facts.capabilities));
         }
         let review = build_apply_review(&prepared, &facts)?;
-        let requires_capability_ack = !facts.capabilities.needs_ack().is_empty()
-            && !authorizations.has_interactive_apply_capability_grant(&review);
         let compare_identity = review.compare_identity().clone();
         let challenge = results.with_fresh_execution_eligibility(&compare_identity, || {
-            authorizations.create_review_challenge(ReviewChallenge::InteractiveApply {
-                review,
-                requires_health_ack,
-                requires_capability_ack,
-            })
+            authorizations.create_review_challenge(ReviewChallenge::InteractiveApply { review })
         })?;
         Ok(OperationReviewDto::InteractiveApplyConfirmationRequired {
             challenge_id: challenge.challenge_id,
             expires_at_ms: challenge.expires_at_ms,
             warnings,
             capabilities: capability_dtos(&facts.capabilities),
-            requires_health_ack,
-            requires_capability_ack,
-            can_remember_for_session: true,
-            can_allow_unattended: true,
         })
     })
     .await
@@ -90,10 +78,6 @@ pub(crate) async fn authorize_autoscan_apply(
                 "AutoScan Apply requires a completely clean health review:\n{}",
                 health_refusals.join("\n")
             ));
-        }
-        let blockers = capability_blockers(&facts.capabilities);
-        if !blockers.is_empty() {
-            return Err(blockers.join("\n"));
         }
         reload_prepared_target(&prepared.target)?;
         let review = build_apply_review(&prepared, &facts)?;

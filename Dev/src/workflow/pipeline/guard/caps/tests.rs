@@ -1,6 +1,5 @@
-//! Capability reporting and consent behavior.
+//! Capability reporting behavior.
 
-use super::consent::*;
 use super::report::*;
 use super::write::*;
 use crate::model::plan::{Action, Op, Side};
@@ -43,63 +42,38 @@ mod tests {
         )
     }
 
-    fn item(feature: &str, side: &str, actual: &str) -> CapItem {
-        CapItem {
-            feature: feature.into(),
-            side: side.into(),
-            severity: CapSeverity::NeedsAck,
-            requested: "requested".into(),
-            actual: actual.into(),
-            effect: "effect".into(),
-        }
-    }
-
+    /// A plan that only adds files displaces nothing, so it has no preservation story to tell.
+    /// Counting `Copy` as destructive described a trash or version-store effect for runs that
+    /// never reach one — the report has to match the plan it was given.
     #[test]
-    fn consent_digest_is_order_independent_but_field_and_scope_exact() {
-        let left = CapReport {
-            items: vec![
-                item("fsync", "target", "no"),
-                item("trash", "source", "network"),
-            ],
-        };
-        let right = CapReport {
-            items: vec![
-                item("trash", "source", "network"),
-                item("fsync", "target", "no"),
-            ],
-        };
-        let digest = left.consent_digest(CapabilityScope::ApplyWrite);
-        assert_eq!(digest, right.consent_digest(CapabilityScope::ApplyWrite));
-        assert_ne!(digest, left.consent_digest(CapabilityScope::CompareRead));
+    fn a_copy_only_plan_reports_no_preservation_effect() {
+        use crate::fs::vfs::{memory::MemVfs, Vfs};
 
-        let mut changed = right;
-        changed.items[0].effect.push_str(" changed");
-        assert_ne!(digest, changed.consent_digest(CapabilityScope::ApplyWrite));
-    }
-
-    #[test]
-    fn exact_consent_accepts_only_the_report_and_scope_that_was_reviewed() {
-        let report = CapReport {
-            items: vec![item("fsync", "target", "no")],
+        let source = MemVfs::new("caps-source").caps();
+        let mut target = MemVfs::new("caps-target").caps();
+        target.local_trash = false;
+        let query = WriteCapsQuery {
+            fsync: false,
+            verify: false,
+            versioning: false,
+            delta: false,
+            src_local: false,
+            tgt_local: false,
         };
-        let consent =
-            CapabilityConsent::ExactDigest(report.consent_digest(CapabilityScope::ApplyWrite));
-        assert!(report.consent_satisfied(CapabilityScope::ApplyWrite, &consent));
-        assert!(!report.consent_satisfied(CapabilityScope::CompareRead, &consent));
-        assert!(!report.consent_satisfied(CapabilityScope::ApplyWrite, &CapabilityConsent::None));
-        assert!(
-            report.consent_satisfied(CapabilityScope::ApplyWrite, &CapabilityConsent::ExplicitCli)
-        );
-    }
 
-    #[test]
-    fn no_consent_is_needed_when_the_report_has_only_information() {
-        let mut informational = item("space", "target", "unobservable");
-        informational.severity = CapSeverity::Info;
-        let report = CapReport {
-            items: vec![informational],
-        };
-        assert!(report.consent_satisfied(CapabilityScope::ApplyWrite, &CapabilityConsent::None));
+        let copy_only = cap_report_write(&query, &[copy_to_target()], &source, &target);
+        assert!(copy_only
+            .items
+            .iter()
+            .all(|item| item.feature != "trash" && item.feature != "versioning"));
+
+        let mut overwrite = copy_to_target();
+        overwrite.action = Action::Update;
+        let displacing = cap_report_write(&query, &[overwrite], &source, &target);
+        assert!(displacing
+            .items
+            .iter()
+            .any(|item| item.feature == "trash" && item.side == "target"));
     }
 
     #[test]
@@ -114,7 +88,7 @@ mod tests {
     }
 
     #[test]
-    fn root_lock_fails_closed_when_exclusive_staged_publish_is_not_established() {
+    fn root_lock_is_reported_when_exclusive_staged_publish_is_not_established() {
         use crate::fs::vfs::{memory::MemVfs, Support, Vfs};
 
         for (support, expected_actual) in [
@@ -131,12 +105,12 @@ mod tests {
             target.set_mtime = Support::Yes;
             target.exclusive_staged_file_publish = support;
             let report = write_report_with_target_caps(target);
-            let blocker = report
-                .blockers()
+            let reported = report
+                .unavailable()
                 .into_iter()
                 .find(|item| item.feature == "root lock")
-                .expect("missing exclusive staged-file publication must block apply");
-            assert_eq!(blocker.actual, expected_actual);
+                .expect("missing exclusive staged-file publication must be reported");
+            assert_eq!(reported.actual, expected_actual);
         }
     }
 
@@ -161,13 +135,13 @@ mod tests {
             &target,
         );
         assert!(report
-            .blockers()
+            .unavailable()
             .into_iter()
             .any(|item| item.feature == "root lock" && item.side == "source"));
     }
 
     #[test]
-    fn existing_entry_rename_is_gated_independently_from_staged_publication() {
+    fn existing_entry_rename_is_reported_independently_from_staged_publication() {
         use crate::fs::vfs::{memory::MemVfs, Support, Vfs};
 
         let mut target = MemVfs::new("caps-target").caps();
@@ -175,7 +149,7 @@ mod tests {
         target.exclusive_entry_rename = Support::Unknown;
         let report = write_report_with_target_caps(target);
         assert!(report
-            .blockers()
+            .unavailable()
             .into_iter()
             .any(|item| item.feature == "entry rename" && item.side == "target"));
     }
@@ -204,7 +178,7 @@ mod tests {
             &target,
         );
         assert!(report
-            .blockers()
+            .unavailable()
             .into_iter()
             .any(|item| item.feature == "symlink publication"));
     }
@@ -233,7 +207,7 @@ mod tests {
         assert!(report.items.iter().any(|item| {
             item.feature == "fsync namespace"
                 && item.side == "target"
-                && item.severity == CapSeverity::NeedsAck
+                && item.severity == CapSeverity::Degraded
         }));
     }
 }

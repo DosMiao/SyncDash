@@ -8,8 +8,6 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
             all,
             prefix,
             apply: do_apply,
-            i_know,
-            accept_caps,
             verbose,
             watch,
             interval,
@@ -45,7 +43,7 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
                 loop {
                     for (name, j) in &list {
                         let auto = auto_apply || j.autoscan_auto_apply;
-                        let res = run::run_job(name, j, auto, verbose, i_know, accept_caps);
+                        let res = run::run_job(name, j, auto, verbose);
                         match res {
                             Ok((d, _s, e, c)) if d + e + c > 0 => {
                                 eprintln!(
@@ -62,7 +60,7 @@ pub(super) fn execute(command: Cmd) -> std::io::Result<i32> {
             let many = list.len() > 1;
             let mut tot = (0u64, 0u64, 0u64, 0u64);
             for (name, j) in &list {
-                let res = run::run_job(name, j, do_apply, verbose, i_know, accept_caps);
+                let res = run::run_job(name, j, do_apply, verbose);
                 match res {
                     Ok((d, s, e, c)) => {
                         if do_apply {

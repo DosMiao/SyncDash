@@ -10,7 +10,7 @@ export interface ReviewRequestFence {
 }
 
 export type ConfirmationReview = Extract<OperationReviewDto, {
-  status: 'compare_confirmation_required' | 'interactive_apply_confirmation_required';
+  status: 'interactive_apply_confirmation_required';
 }>;
 type ReviewReadyReview = Exclude<OperationReviewDto, { status: 'direct_authorized' }>;
 type AuthorizedReview = Exclude<OperationReviewDto, { status: 'blocked' }>;
@@ -191,86 +191,47 @@ export function operationReviewReducer(
   }
 }
 
-export interface ApprovalChoices {
-  acknowledgeHealth: boolean;
-  acceptCapabilities: boolean;
-  rememberForSession: boolean;
-  allowUnattended: boolean;
-}
+/**
+ * The review panel presents evidence and takes no decisions from the operator, so an approval has
+ * nothing to carry. The type stays as the seam the sheet and its controller already speak through.
+ */
+export type ApprovalChoices = Record<string, never>;
 
-export const EMPTY_APPROVAL_CHOICES: ApprovalChoices = {
-  acknowledgeHealth: false,
-  acceptCapabilities: false,
-  rememberForSession: false,
-  allowUnattended: false,
-};
+export const EMPTY_APPROVAL_CHOICES: ApprovalChoices = {};
 
 export function isConfirmationReview(review: OperationReviewDto): review is ConfirmationReview {
-  return review.status === 'compare_confirmation_required'
-    || review.status === 'interactive_apply_confirmation_required';
+  return review.status === 'interactive_apply_confirmation_required';
 }
 
 export function normalizeApprovalChoices(
-  review: ConfirmationReview,
-  choices: ApprovalChoices,
+  _review: ConfirmationReview,
+  _choices: ApprovalChoices,
 ): ApprovalChoices {
-  const rememberForSession = review.can_remember_for_session && choices.rememberForSession;
-  const interactiveApply = review.status === 'interactive_apply_confirmation_required';
-  return {
-    acknowledgeHealth: interactiveApply && review.requires_health_ack && choices.acknowledgeHealth,
-    acceptCapabilities: interactiveApply
-      ? review.requires_capability_ack && choices.acceptCapabilities
-      : choices.acceptCapabilities,
-    rememberForSession,
-    allowUnattended: interactiveApply
-      && rememberForSession
-      && review.can_allow_unattended
-      && choices.allowUnattended,
-  };
+  return EMPTY_APPROVAL_CHOICES;
 }
 
 export function operationApprovalFromChoices(
-  review: ConfirmationReview,
-  choices: ApprovalChoices,
+  _review: ConfirmationReview,
+  _choices: ApprovalChoices,
 ): OperationApprovalDto {
-  const normalized = normalizeApprovalChoices(review, choices);
-  if (review.status === 'compare_confirmation_required') {
-    return {
-      operation: 'compare',
-      accept_capabilities: normalized.acceptCapabilities,
-      remember_for_session: normalized.rememberForSession,
-    };
-  }
-  return {
-    operation: 'interactive_apply',
-    acknowledge_health: normalized.acknowledgeHealth,
-    accept_capabilities: normalized.acceptCapabilities,
-    session_grant: normalized.allowUnattended
-      ? 'allow_auto_apply'
-      : normalized.rememberForSession
-        ? 'remember_capabilities'
-        : 'none',
-  };
+  return { operation: 'interactive_apply' };
 }
 
+/**
+ * Nothing in the review panel withholds approval any more. The capability list and the plan-share
+ * warnings are there so the operator knows what this run will do; a review that reached the
+ * confirmation stage at all is one the server is willing to authorize.
+ */
 export function reviewAllowsApproval(
   review: OperationReviewDto,
-  choices: ApprovalChoices,
+  _choices: ApprovalChoices,
 ): boolean {
   switch (review.status) {
     case 'blocked':
       return false;
     case 'direct_authorized':
       return directAuthorization(review) !== null;
-    case 'compare_confirmation_required':
-      return !review.capabilities.some((capability) => capability.severity === 'block')
-        && choices.acceptCapabilities;
     case 'interactive_apply_confirmation_required':
-      if (review.capabilities.some((capability) => capability.severity === 'block')) return false;
-      if (review.requires_health_ack && !choices.acknowledgeHealth) return false;
-      if (review.requires_capability_ack && !choices.acceptCapabilities) return false;
-      if (choices.allowUnattended
-        && (!choices.rememberForSession || !review.can_allow_unattended)) return false;
       return true;
     default:
       return false;
@@ -278,9 +239,7 @@ export function reviewAllowsApproval(
 }
 
 export function directAuthorization(review: OperationReviewDto): AuthorizationDto | null {
-  if (review.status !== 'direct_authorized'
-    || review.capabilities.some((capability) => capability.severity === 'block')) return null;
-  return review.authorization;
+  return review.status === 'direct_authorized' ? review.authorization : null;
 }
 
 export function operationReviewCanSubmit(

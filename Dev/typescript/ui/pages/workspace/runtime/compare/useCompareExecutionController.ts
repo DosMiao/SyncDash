@@ -507,8 +507,6 @@ export function useCompareExecutionController(options: CompareExecutionControlle
       }
       if (review.status === 'blocked') {
         setStatus(`Compare is blocked for '${comparedJob.name}' — review the required fixes`, 'err');
-      } else if (review.status === 'compare_confirmation_required') {
-        setStatus(`Compare requires your approval for '${comparedJob.name}'`);
       }
       return null;
     } catch (error) {
@@ -526,41 +524,9 @@ export function useCompareExecutionController(options: CompareExecutionControlle
     }
   }, [selectedJob, busy, editor, compareReview, applyReview, confirmOpen, selectedTargetIndex, beginCompareActivity, failCompareActivity, runAuthorizedCompare, setStatus]);
 
-  const approveCompareReview = useCallback(async () => {
-    const request = compareReviewRequest.current;
-    const review = compareReview.review;
-    if (!request || !review || !operationReviewCanSubmit(compareReview, compareChoices)) return;
-    if (review.status !== 'compare_confirmation_required') return;
-    if (compareApprovalRequest.current?.requestId === request.requestId
-      && compareApprovalRequest.current.key === request.key) return;
-    compareApprovalRequest.current = request;
-    const choices = normalizeApprovalChoices(review, compareChoices);
-    dispatchCompareReview({ type: 'begin_approval', request });
-    setStatus('Authorizing this exact Compare operation…');
-    try {
-      const authorization = await operationsIpc.approveOperation(
-        review.challenge_id,
-        operationApprovalFromChoices(review, choices),
-      );
-      if (!ownsOperationReviewRequest(compareReviewRequest.current, request, currentCompareReviewKeyRef.current)) return;
-      const selected = selectionRef.current;
-      if (!selected.job) return;
-      dispatchCompareReview({ type: 'authorized', request, authorization });
-      await runAuthorizedCompare(
-        authorization.authorization_token,
-        snapshotJobIdentity(selected.job),
-        selected.targetIndex,
-      );
-    } catch (error) {
-      if (!ownsOperationReviewRequest(compareReviewRequest.current, request, currentCompareReviewKeyRef.current)) return;
-      dispatchCompareReview({ type: 'approval_failed', request, error: String(error) });
-      setStatus(`Compare authorization failed: ${error}`, 'err');
-    } finally {
-      if (compareApprovalRequest.current?.requestId === request.requestId
-        && compareApprovalRequest.current.key === request.key) {
-        compareApprovalRequest.current = null;
-      }
-    }
-  }, [compareChoices, compareReview, runAuthorizedCompare, setStatus]);
+  // Compare only reads, so it is always authorized directly and never raises an approval
+  // challenge. The sheet still opens to report a blocked Compare, where nothing is approvable.
+  const approveCompareReview = useCallback(async () => {}, []);
+
   return { requestResultRestore, doCompare, approveCompareReview };
 }

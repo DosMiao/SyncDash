@@ -306,7 +306,7 @@ fn vfs_lane_compares_and_classifies_every_drift() {
     j.rigor = "standard".into();
     j.exclude = vec!["skipme/".into()];
     let (sv, tv) = (Arc::new(sv) as Arc<dyn Vfs>, Arc::new(tv) as Arc<dyn Vfs>);
-    let out = compare_resolved(&j, &sv, &tv, &RunCtx::null(), false).unwrap();
+    let out = compare_resolved(&j, &sv, &tv, &RunCtx::null()).unwrap();
 
     assert_eq!(
         out.source.header.excluded_dirs, 1,
@@ -364,11 +364,11 @@ fn preflight_uses_the_open_vfs_roots_instead_of_display_paths() {
         require_marker: true,
         ..Default::default()
     };
-    let plan = compare_resolved(&job, &source, &target, &RunCtx::null(), false)
+    let plan = compare_resolved(&job, &source, &target, &RunCtx::null())
         .unwrap()
         .plan;
 
-    let verdict = preflight_resolved(&job, &plan, &[], false, &source, &target);
+    let verdict = preflight_resolved(&job, &plan, &[], &source, &target);
 
     assert!(
         verdict.ok(),
@@ -382,17 +382,17 @@ fn preflight_rejects_a_plan_for_different_resolved_roots() {
     let source = Arc::new(MemVfs::new("preflight-source")) as Arc<dyn Vfs>;
     let target = Arc::new(MemVfs::new("preflight-target")) as Arc<dyn Vfs>;
     let job = Job::default();
-    let mut plan = compare_resolved(&job, &source, &target, &RunCtx::null(), false)
+    let mut plan = compare_resolved(&job, &source, &target, &RunCtx::null())
         .unwrap()
         .plan;
     plan.header.target_root = "mem://another-target".into();
 
-    let verdict = preflight_resolved(&job, &plan, &[], false, &source, &target);
+    let verdict = preflight_resolved(&job, &plan, &[], &source, &target);
 
     assert!(!verdict.ok());
     assert!(verdict.blockers[0].contains("run Compare again"));
 
-    let execution = apply_resolved_with_consent_classified(
+    let execution = apply_resolved_classified(
         &job,
         &plan,
         &[],
@@ -400,8 +400,6 @@ fn preflight_rejects_a_plan_for_different_resolved_roots() {
         &target,
         None,
         false,
-        false,
-        &crate::pipeline::guard::caps::CapabilityConsent::None,
         std::time::Instant::now(),
         &RunCtx::null(),
     );
@@ -412,14 +410,18 @@ fn preflight_rejects_a_plan_for_different_resolved_roots() {
     assert_eq!(execution.into_result().unwrap().errors, 1);
 }
 
+/// A capability shortfall is a list entry, not a refusal: the run starts and the operation that
+/// actually needs the missing primitive is the thing that fails. Only a health refusal still
+/// stops an apply before the write lane, and it must classify as before-write so the reviewed
+/// Compare result survives.
 #[test]
-fn capability_and_health_refusals_are_classified_before_write() {
+fn a_capability_shortfall_reaches_the_write_lane_while_health_still_refuses_before_it() {
     let source = Arc::new(MemVfs::new("gate-source")) as Arc<dyn Vfs>;
     let target = Arc::new(MemVfs::new("gate-target").without(|caps| {
         caps.symlink = crate::fs::vfs::Support::No;
     })) as Arc<dyn Vfs>;
     let job = Job::default();
-    let mut plan = compare_resolved(&job, &source, &target, &RunCtx::null(), false)
+    let mut plan = compare_resolved(&job, &source, &target, &RunCtx::null())
         .unwrap()
         .plan;
     let symlink = Op {
@@ -435,7 +437,7 @@ fn capability_and_health_refusals_are_classified_before_write() {
         reason: "test capability boundary".into(),
     };
     plan.ops.push(symlink.clone());
-    let capability_refusal = apply_resolved_with_consent_classified(
+    let capability_shortfall = apply_resolved_classified(
         &job,
         &plan,
         &[symlink],
@@ -443,23 +445,28 @@ fn capability_and_health_refusals_are_classified_before_write() {
         &target,
         None,
         false,
-        false,
-        &crate::pipeline::guard::caps::CapabilityConsent::ExplicitCli,
         std::time::Instant::now(),
         &RunCtx::null(),
     );
-    assert!(!capability_refusal.writes_started());
-    assert_eq!(capability_refusal.into_result().unwrap().errors, 1);
+    assert!(
+        capability_shortfall.writes_started(),
+        "a backend that cannot create symlinks no longer withholds the whole apply"
+    );
+    assert_eq!(
+        capability_shortfall.into_result().unwrap().errors,
+        1,
+        "the link operation itself is what fails"
+    );
 
     let source = Arc::new(MemVfs::new("health-source")) as Arc<dyn Vfs>;
     let target = Arc::new(MemVfs::new("health-target")) as Arc<dyn Vfs>;
     let healthy_job = Job::default();
-    let plan = compare_resolved(&healthy_job, &source, &target, &RunCtx::null(), false)
+    let plan = compare_resolved(&healthy_job, &source, &target, &RunCtx::null())
         .unwrap()
         .plan;
     let mut marker_required = healthy_job;
     marker_required.require_marker = true;
-    let health_refusal = apply_resolved_with_consent_classified(
+    let health_refusal = apply_resolved_classified(
         &marker_required,
         &plan,
         &[],
@@ -467,8 +474,6 @@ fn capability_and_health_refusals_are_classified_before_write() {
         &target,
         None,
         false,
-        false,
-        &crate::pipeline::guard::caps::CapabilityConsent::ExplicitCli,
         std::time::Instant::now(),
         &RunCtx::null(),
     );
@@ -484,12 +489,12 @@ fn entering_the_local_write_lane_is_never_a_safe_rejection() {
     let source = Arc::new(source_mem) as Arc<dyn Vfs>;
     let target = Arc::new(target_mem) as Arc<dyn Vfs>;
     let job = Job::default();
-    let plan = compare_resolved(&job, &source, &target, &RunCtx::null(), false)
+    let plan = compare_resolved(&job, &source, &target, &RunCtx::null())
         .unwrap()
         .plan;
     assert_eq!(plan.ops.len(), 1);
 
-    let execution = apply_resolved_with_consent_classified(
+    let execution = apply_resolved_classified(
         &job,
         &plan,
         &plan.ops,
@@ -497,8 +502,6 @@ fn entering_the_local_write_lane_is_never_a_safe_rejection() {
         &target,
         None,
         false,
-        false,
-        &crate::pipeline::guard::caps::CapabilityConsent::ExplicitCli,
         std::time::Instant::now(),
         &RunCtx::null(),
     );
@@ -508,10 +511,11 @@ fn entering_the_local_write_lane_is_never_a_safe_rejection() {
     assert_eq!(outcome.done, 1);
 }
 
-/// A backend that cannot serve ranged reads degrades the sampled evidence tier. That must
-/// cost an explicit consent, and the consented degradation must ride on the snapshot.
+/// A backend that cannot serve ranged reads degrades the sampled evidence tier. The degradation
+/// is reported and the run proceeds, and it must ride on the snapshot rather than being inferred
+/// from the log — a table that does not carry its own evidence tier cannot be reasoned about later.
 #[test]
-fn degraded_caps_demand_consent_and_land_on_the_table() {
+fn degraded_caps_are_reported_and_land_on_the_table() {
     let sv = MemVfs::new("ack-src");
     let tv = MemVfs::new("ack-tgt").without(|c| c.ranged_read = crate::fs::vfs::Support::No);
     // Big enough that the sampled tier would sample, identical on both sides
@@ -522,20 +526,14 @@ fn degraded_caps_demand_consent_and_land_on_the_table() {
     j.rigor = "fast".into(); // the sampled tier
     let (sv, tv) = (Arc::new(sv) as Arc<dyn Vfs>, Arc::new(tv) as Arc<dyn Vfs>);
 
-    let e = match compare_resolved(&j, &sv, &tv, &RunCtx::null(), false) {
-        Err(e) => e,
-        Ok(_) => panic!("a degraded run must refuse without consent"),
-    };
-    assert!(e.to_string().contains("--accept-caps"), "{e}");
-
-    // With consent: BOTH sides upgrade to full — a one-sided upgrade would make the
-    // identical file look different — and the plan stays empty.
-    let out = compare_resolved(&j, &sv, &tv, &RunCtx::null(), true).unwrap();
+    // BOTH sides upgrade to full — a one-sided upgrade would make the identical file look
+    // different — and the plan stays empty.
+    let out = compare_resolved(&j, &sv, &tv, &RunCtx::null()).unwrap();
     assert_eq!(out.source.header.evidence, TableEvidence::Full);
     assert_eq!(out.target.header.evidence, TableEvidence::Full);
     assert!(
         !out.target.header.vfs.as_ref().unwrap().degraded.is_empty(),
-        "the consented degradation must ride on the snapshot"
+        "the reported degradation must ride on the snapshot"
     );
     assert_eq!(
         out.plan.ops.len(),
@@ -561,7 +559,7 @@ fn apply_preflight_refusal_emits_exactly_one_terminal_summary() {
     let mut job = Job::default();
     job.source = "/definitely/missing/terminal-source".into();
     job.targets = vec!["/definitely/missing/terminal-target".into()];
-    let plan = compare_resolved(&job, &sv, &tv, &RunCtx::null(), false)
+    let plan = compare_resolved(&job, &sv, &tv, &RunCtx::null())
         .unwrap()
         .plan;
 
@@ -572,16 +570,7 @@ fn apply_preflight_refusal_emits_exactly_one_terminal_summary() {
         Arc::new(move |ev| copy.lock().unwrap().push(ev)),
     );
     let selected = job.select_target(0).unwrap();
-    let execution = apply_job_guarded_with_consent_classified(
-        &selected,
-        &plan,
-        &[],
-        None,
-        false,
-        false,
-        &crate::pipeline::guard::caps::CapabilityConsent::None,
-        &ctx,
-    );
+    let execution = apply_job_guarded_with_classified(&selected, &plan, &[], None, false, &ctx);
     assert!(
         !execution.writes_started(),
         "a root that cannot open is a proven pre-write refusal"

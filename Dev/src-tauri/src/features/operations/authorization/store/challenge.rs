@@ -4,14 +4,11 @@ use std::time::Instant;
 
 use super::super::apply::{InteractiveApplyAuthorization, OperationAuthorization};
 use super::super::challenge::{
-    ApplySessionGrantDecision, IssuedAuthorization, IssuedChallenge, ReviewApproval,
-    ReviewChallenge,
+    IssuedAuthorization, IssuedChallenge, ReviewApproval, ReviewChallenge,
 };
 use super::issuance::{commit_authorization, prepare_authorization, random_token, wall_expiry_ms};
 use super::retention::{purge, trim_front};
-use super::state::{
-    ChallengeRecord, GrantRecord, GrantScope, CHALLENGE_CAPACITY, CHALLENGE_TTL, GRANT_CAPACITY,
-};
+use super::state::{ChallengeRecord, CHALLENGE_CAPACITY, CHALLENGE_TTL};
 use super::OperationAuthorizationStore;
 
 impl OperationAuthorizationStore {
@@ -81,93 +78,13 @@ impl OperationAuthorizationStore {
             return Err("This review challenge expired — review again".into());
         }
 
-        let (authorization, grant) = match (challenge.challenge, approval) {
-            (
-                ReviewChallenge::Compare {
-                    authorization,
-                    requires_capability_ack,
-                },
-                ReviewApproval::Compare {
-                    accept_capabilities,
-                    remember_for_session,
-                },
-            ) => {
-                if requires_capability_ack && !accept_capabilities {
-                    return Err("The reviewed capability limitations were not accepted".into());
-                }
-                if remember_for_session && !requires_capability_ack {
-                    return Err(
-                        "There is no reviewed Compare capability limitation to remember".into(),
-                    );
-                }
-                let grant = remember_for_session.then(|| GrantRecord {
-                    scope: GrantScope::Compare,
-                    target: authorization.target().clone(),
-                    capability_review_digest: authorization.capability_review_digest().to_string(),
-                    allow_auto_apply: false,
-                });
-                (OperationAuthorization::Compare(authorization), grant)
+        let authorization = match (challenge.challenge, approval) {
+            (ReviewChallenge::InteractiveApply { review }, ReviewApproval::InteractiveApply) => {
+                OperationAuthorization::InteractiveApply(InteractiveApplyAuthorization::new(review))
             }
-            (
-                ReviewChallenge::InteractiveApply {
-                    review,
-                    requires_health_ack,
-                    requires_capability_ack,
-                },
-                ReviewApproval::InteractiveApply {
-                    acknowledge_health,
-                    accept_capabilities,
-                    session_grant,
-                },
-            ) => {
-                if requires_health_ack && !acknowledge_health {
-                    return Err("The reviewed health warning was not acknowledged".into());
-                }
-                if requires_capability_ack && !accept_capabilities {
-                    return Err("The reviewed capability limitations were not accepted".into());
-                }
-                let allow_auto_apply = session_grant == ApplySessionGrantDecision::AllowAutoApply;
-                let grant =
-                    (session_grant != ApplySessionGrantDecision::None).then(|| GrantRecord {
-                        scope: GrantScope::Apply,
-                        target: review.target(),
-                        capability_review_digest: review.capability_review_digest().to_string(),
-                        allow_auto_apply,
-                    });
-                (
-                    OperationAuthorization::InteractiveApply(InteractiveApplyAuthorization::new(
-                        review,
-                        acknowledge_health,
-                    )),
-                    grant,
-                )
-            }
-            _ => return Err("This approval belongs to a different review operation".into()),
         };
 
         let prepared = prepare_authorization(authorization, now, create_token)?;
-
-        if let Some(grant) = grant {
-            if let Some(existing) = state
-                .grants
-                .iter()
-                .position(|candidate| candidate.same_key(&grant))
-            {
-                state.grants.remove(existing);
-            }
-            if grant.scope == GrantScope::Apply && !grant.allow_auto_apply {
-                state
-                    .authorizations
-                    .retain(|record| match &record.authorization {
-                        OperationAuthorization::AutoApply(authorization) => {
-                            !grant.allows_apply(authorization.review(), false)
-                        }
-                        _ => true,
-                    });
-            }
-            state.grants.push_back(grant);
-            trim_front(&mut state.grants, GRANT_CAPACITY);
-        }
 
         Ok(commit_authorization(&mut state, prepared))
     }

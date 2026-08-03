@@ -48,8 +48,7 @@ fn the_same_name_in_nfc_and_nfd_is_one_file() {
     place(&tv, NFD_NAME);
 
     let (_, ctx) = watched();
-    let out =
-        crate::run::local::compare_resolved(&bare_job(), &sv, &tv, &ctx, true).expect("compare");
+    let out = crate::run::local::compare_resolved(&bare_job(), &sv, &tv, &ctx).expect("compare");
     assert!(
         out.plan.ops.is_empty(),
         "the same name spelled two ways is one file — any op here is a re-transfer that would \
@@ -87,8 +86,7 @@ fn nfc_and_nfd_agree_across_a_real_windows_mac_pair() {
     place(&tv, NFD_NAME);
 
     let (_, ctx) = watched();
-    let out =
-        crate::run::local::compare_resolved(&bare_job(), &sv, &tv, &ctx, true).expect("compare");
+    let out = crate::run::local::compare_resolved(&bare_job(), &sv, &tv, &ctx).expect("compare");
     let ops = out.plan.ops.clone();
 
     crate::fs::vfs::conformance::remove_tree(&base, &name).unwrap();

@@ -13,7 +13,6 @@ pub fn preflight_job(
     job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
-    acknowledged: bool,
 ) -> std::io::Result<crate::pipeline::guard::Verdict> {
     let configuration = job.configuration();
     let source = resolve_root(&configuration.source)?;
@@ -22,7 +21,6 @@ pub fn preflight_job(
         configuration,
         plan,
         ops,
-        acknowledged,
         &source,
         &target,
     ))
@@ -32,7 +30,6 @@ pub fn apply_requirements(
     job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
-    acknowledged: bool,
 ) -> std::io::Result<super::super::ApplyRequirements> {
     let configuration = job.configuration();
     let source = resolve_root(&configuration.source)?;
@@ -41,7 +38,6 @@ pub fn apply_requirements(
         configuration,
         plan,
         ops,
-        acknowledged,
         &source,
         &target,
     ))
@@ -51,11 +47,10 @@ pub fn apply_requirements_resolved(
     job: &Job,
     plan: &Plan,
     ops: &[Op],
-    acknowledged: bool,
     source: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     target: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
 ) -> super::super::ApplyRequirements {
-    let verdict = preflight_resolved(job, plan, ops, acknowledged, source, target);
+    let verdict = preflight_resolved(job, plan, ops, source, target);
     let query = job.write_caps_query(source.local_root().is_some(), target.local_root().is_some());
     let capabilities =
         crate::pipeline::guard::caps::cap_report_write(&query, ops, &source.caps(), &target.caps());
@@ -69,7 +64,6 @@ pub fn preflight_resolved(
     job: &Job,
     plan: &Plan,
     ops: &[Op],
-    acknowledged: bool,
     source: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     target: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
 ) -> crate::pipeline::guard::Verdict {
@@ -89,13 +83,7 @@ pub fn preflight_resolved(
         ));
         return verdict;
     }
-    crate::pipeline::guard::run_all_vfs(
-        ops,
-        source,
-        target,
-        &plan.header,
-        &job.guards(acknowledged),
-    )
+    crate::pipeline::guard::run_all_vfs(ops, source, target, &plan.header, &job.guards())
 }
 
 fn root_label(vfs: &std::sync::Arc<dyn crate::fs::vfs::Vfs>) -> String {
@@ -137,56 +125,20 @@ pub fn apply_job_guarded_with(
     ops: &[Op],
     trash: Option<std::path::PathBuf>,
     verbose: bool,
-    acknowledged: bool,
-    accept_caps: bool,
     ctx: &crate::obs::progress::RunCtx,
 ) -> crate::obs::progress::ApplyOutcome {
-    apply_job_guarded_with_consent(
-        job,
-        plan,
-        ops,
-        trash,
-        verbose,
-        acknowledged,
-        &crate::pipeline::guard::caps::CapabilityConsent::explicit_cli(accept_caps),
-        ctx,
-    )
+    apply_job_guarded_with_classified(job, plan, ops, trash, verbose, ctx)
+        .into_result()
+        .expect("the local apply lane represents every refusal as an ApplyOutcome")
 }
 
 #[allow(clippy::too_many_arguments)] // each argument is an independently reviewed apply decision
-pub fn apply_job_guarded_with_consent(
+pub fn apply_job_guarded_with_classified(
     job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
     trash: Option<std::path::PathBuf>,
     verbose: bool,
-    acknowledged: bool,
-    consent: &crate::pipeline::guard::caps::CapabilityConsent,
-    ctx: &crate::obs::progress::RunCtx,
-) -> crate::obs::progress::ApplyOutcome {
-    apply_job_guarded_with_consent_classified(
-        job,
-        plan,
-        ops,
-        trash,
-        verbose,
-        acknowledged,
-        consent,
-        ctx,
-    )
-    .into_result()
-    .expect("the local apply lane represents every refusal as an ApplyOutcome")
-}
-
-#[allow(clippy::too_many_arguments)] // each argument is an independently reviewed apply decision
-pub fn apply_job_guarded_with_consent_classified(
-    job: &SingleTargetJob,
-    plan: &Plan,
-    ops: &[Op],
-    trash: Option<std::path::PathBuf>,
-    verbose: bool,
-    acknowledged: bool,
-    consent: &crate::pipeline::guard::caps::CapabilityConsent,
     ctx: &crate::obs::progress::RunCtx,
 ) -> super::super::ApplyExecution {
     let t0 = std::time::Instant::now();
@@ -207,19 +159,7 @@ pub fn apply_job_guarded_with_consent_classified(
             )
         }
     };
-    apply_resolved_with_consent_classified(
-        configuration,
-        plan,
-        ops,
-        &sv,
-        &tv,
-        trash,
-        verbose,
-        acknowledged,
-        consent,
-        t0,
-        ctx,
-    )
+    apply_resolved_classified(configuration, plan, ops, &sv, &tv, trash, verbose, t0, ctx)
 }
 
 /// Apply a plan to two roots that are already open. Split out from `apply_job_guarded_with` the same
@@ -237,28 +177,16 @@ pub fn apply_resolved(
     tv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     trash: Option<std::path::PathBuf>,
     verbose: bool,
-    acknowledged: bool,
-    accept_caps: bool,
     t0: std::time::Instant,
     ctx: &crate::obs::progress::RunCtx,
 ) -> crate::obs::progress::ApplyOutcome {
-    apply_resolved_with_consent(
-        job,
-        plan,
-        ops,
-        sv,
-        tv,
-        trash,
-        verbose,
-        acknowledged,
-        &crate::pipeline::guard::caps::CapabilityConsent::explicit_cli(accept_caps),
-        t0,
-        ctx,
-    )
+    apply_resolved_classified(job, plan, ops, sv, tv, trash, verbose, t0, ctx)
+        .into_result()
+        .expect("the local apply lane represents every refusal as an ApplyOutcome")
 }
 
 #[allow(clippy::too_many_arguments)] // resolved roots and apply decisions remain explicit at this boundary
-pub fn apply_resolved_with_consent(
+pub fn apply_resolved_classified(
     job: &Job,
     plan: &Plan,
     ops: &[Op],
@@ -266,39 +194,6 @@ pub fn apply_resolved_with_consent(
     tv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
     trash: Option<std::path::PathBuf>,
     verbose: bool,
-    acknowledged: bool,
-    consent: &crate::pipeline::guard::caps::CapabilityConsent,
-    t0: std::time::Instant,
-    ctx: &crate::obs::progress::RunCtx,
-) -> crate::obs::progress::ApplyOutcome {
-    apply_resolved_with_consent_classified(
-        job,
-        plan,
-        ops,
-        sv,
-        tv,
-        trash,
-        verbose,
-        acknowledged,
-        consent,
-        t0,
-        ctx,
-    )
-    .into_result()
-    .expect("the local apply lane represents every refusal as an ApplyOutcome")
-}
-
-#[allow(clippy::too_many_arguments)] // resolved roots and apply decisions remain explicit at this boundary
-pub fn apply_resolved_with_consent_classified(
-    job: &Job,
-    plan: &Plan,
-    ops: &[Op],
-    sv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
-    tv: &std::sync::Arc<dyn crate::fs::vfs::Vfs>,
-    trash: Option<std::path::PathBuf>,
-    verbose: bool,
-    acknowledged: bool,
-    consent: &crate::pipeline::guard::caps::CapabilityConsent,
     t0: std::time::Instant,
     ctx: &crate::obs::progress::RunCtx,
 ) -> super::super::ApplyExecution {
@@ -322,60 +217,25 @@ pub fn apply_resolved_with_consent_classified(
         );
         return super::super::ApplyExecution::rejected(out.finish(ctx, t0));
     }
-    // Write-side capability report: gaps listed BEFORE anything is touched
+    // Write-side capability report: every gap is listed BEFORE anything is touched, so a run that
+    // departs from what the job asked for says so first. The list does not hold the run back; a
+    // capability the backend truly lacks surfaces as the failure of the operation that needs it.
     {
-        use crate::model::event::LogLevel;
-        use crate::pipeline::guard::caps::CapSeverity;
         let q = job.write_caps_query(sv.local_root().is_some(), tv.local_root().is_some());
         let wr = crate::pipeline::guard::caps::cap_report_write(&q, ops, &sv.caps(), &tv.caps());
-        for i in &wr.items {
-            let lvl = match i.severity {
-                CapSeverity::Block => LogLevel::Error,
-                CapSeverity::NeedsAck => LogLevel::Warn,
-                CapSeverity::Info => LogLevel::Info,
-            };
-            ctx.log(lvl, "caps", i.render());
-        }
-        let blockers = wr.blockers();
-        if !blockers.is_empty() {
-            let out = refuse_apply(
-                ctx,
-                ops.len(),
-                "caps",
-                blockers
-                    .iter()
-                    .map(|i| i.render())
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            );
-            return super::super::ApplyExecution::rejected(out.finish(ctx, t0));
-        }
-        let acks = wr.needs_ack();
-        if !wr.consent_satisfied(
-            crate::pipeline::guard::caps::CapabilityScope::ApplyWrite,
-            consent,
-        ) {
-            let instruction = match consent {
-                crate::pipeline::guard::caps::CapabilityConsent::ExactDigest(_) => {
-                    "the capability report changed after it was authorized — review Apply again"
-                }
-                _ => "rerun with --accept-caps to consent",
-            };
-            let out =
-                refuse_apply(
-                    ctx,
-                    ops.len(),
-                    "caps",
-                    format!(
-                    "this apply degrades on capabilities the backends lack — {instruction}:\n  {}",
-                    acks.iter().map(|i| i.render()).collect::<Vec<_>>().join("\n  ")
-                ),
-                );
-            return super::super::ApplyExecution::rejected(out.finish(ctx, t0));
-        }
+        super::log_capability_list(ctx, "caps", &wr);
     }
-    let verdict =
-        crate::pipeline::guard::run_all_vfs(ops, sv, tv, &plan.header, &job.guards(acknowledged));
+    let verdict = crate::pipeline::guard::run_all_vfs(ops, sv, tv, &plan.header, &job.guards());
+    // Every warning reaches the run's own event stream, not only the process log. A deletion share
+    // or an incomplete scan is now the whole signal rather than the preamble to a refusal, so a
+    // reader of this run's transcript has to see it without going looking somewhere else.
+    for warning in &verdict.warnings {
+        ctx.log(
+            crate::model::event::LogLevel::Warn,
+            "preflight",
+            warning.clone(),
+        );
+    }
     if !verdict.report("preflight") {
         for b in &verdict.blockers {
             ctx.sink.emit(ProgressEvent::Error {

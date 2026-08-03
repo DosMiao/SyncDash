@@ -42,25 +42,10 @@ function applyConfirmation(
     expires_at_ms: 10_000,
     warnings: ['deletion ratio is high'],
     capabilities: [],
-    requires_health_ack: true,
-    requires_capability_ack: true,
-    can_remember_for_session: true,
-    can_allow_unattended: true,
     ...overrides,
   };
 }
 
-function compareConfirmation(): Extract<OperationReviewDto, {
-  status: 'compare_confirmation_required';
-}> {
-  return {
-    status: 'compare_confirmation_required',
-    challenge_id: 'compare-challenge',
-    expires_at_ms: 10_000,
-    capabilities: [],
-    can_remember_for_session: true,
-  };
-}
 
 test('reducer accepts only explicit transitions owned by the current request fence', () => {
   const first: ReviewRequestFence = {
@@ -114,13 +99,24 @@ test('external async fencing requires request id and current semantic identity',
   assert.equal(ownsOperationReviewRequest(null, request, request.key), false);
 });
 
-test('approval is gated by each exact acknowledgement and blocked reviews never submit', () => {
+test('a review that reached confirmation is approvable, and blocked reviews never submit', () => {
   const requested = applyConfirmation();
-  const healthOnly: ApprovalChoices = { ...EMPTY_APPROVAL_CHOICES, acknowledgeHealth: true };
-  const allRequired: ApprovalChoices = { ...healthOnly, acceptCapabilities: true };
-  assert.equal(reviewAllowsApproval(requested, EMPTY_APPROVAL_CHOICES), false);
-  assert.equal(reviewAllowsApproval(requested, healthOnly), false);
+  const allRequired: ApprovalChoices = EMPTY_APPROVAL_CHOICES;
+  // Nothing in the panel is a condition of approval: no choice at all still submits.
+  assert.equal(reviewAllowsApproval(requested, EMPTY_APPROVAL_CHOICES), true);
   assert.equal(reviewAllowsApproval(requested, allRequired), true);
+  // A capability shortfall is reported, never a reason to withhold approval.
+  assert.equal(reviewAllowsApproval({
+    ...requested,
+    capabilities: [{
+      feature: 'root lock',
+      side: 'target',
+      severity: 'unavailable',
+      requested: 'exclusion',
+      actual: 'none',
+      effect: 'stated',
+    }],
+  }, allRequired), true);
   assert.equal(reviewAllowsApproval({
     status: 'blocked',
     blockers: ['offline'],
@@ -145,11 +141,7 @@ test('approval is gated by each exact acknowledgement and blocked reviews never 
 
 test('challenge and authorization deadlines are executable state, not display text', () => {
   const request = { key: 'apply', requestId: 4 };
-  const choices: ApprovalChoices = {
-    ...EMPTY_APPROVAL_CHOICES,
-    acknowledgeHealth: true,
-    acceptCapabilities: true,
-  };
+  const choices: ApprovalChoices = EMPTY_APPROVAL_CHOICES;
   let state = operationReviewReducer(INITIAL_OPERATION_REVIEW, { type: 'begin', request });
   state = operationReviewReducer(state, {
     type: 'resolved', request, review: applyConfirmation({ expires_at_ms: 10_000 }),
@@ -188,46 +180,25 @@ test('direct authorization accepts only its tagged variant and rejects capabilit
     capabilities: [],
   };
   assert.equal(directAuthorization(authorized)?.authorization_token, 'token');
+  // A direct authorization stands on its own; the capability list rides along as information.
   assert.equal(directAuthorization({
     ...authorized,
     capabilities: [{
       feature: 'write',
       side: 'target',
-      severity: 'block',
+      severity: 'unavailable',
       requested: 'yes',
       actual: 'no',
-      effect: 'cannot run',
+      effect: 'stated',
     }],
-  }), null);
+  })?.authorization_token, 'token');
 });
 
-test('approval payload variants cannot contain fields from another operation', () => {
+test('an approval names the reviewed operation and carries no decisions of its own', () => {
   const requested = applyConfirmation();
-  const askUnattended: ApprovalChoices = {
-    acknowledgeHealth: true,
-    acceptCapabilities: true,
-    rememberForSession: false,
-    allowUnattended: true,
-  };
-  assert.deepEqual(normalizeApprovalChoices(requested, askUnattended), {
-    acknowledgeHealth: true,
-    acceptCapabilities: true,
-    rememberForSession: false,
-    allowUnattended: false,
-  });
-  assert.equal(reviewAllowsApproval(requested, askUnattended), false);
-  const remembered = { ...askUnattended, rememberForSession: true };
-  assert.equal(normalizeApprovalChoices(requested, remembered).allowUnattended, true);
-  assert.deepEqual(operationApprovalFromChoices(requested, remembered), {
+  assert.deepEqual(normalizeApprovalChoices(requested, EMPTY_APPROVAL_CHOICES), {});
+  assert.deepEqual(operationApprovalFromChoices(requested, EMPTY_APPROVAL_CHOICES), {
     operation: 'interactive_apply',
-    acknowledge_health: true,
-    accept_capabilities: true,
-    session_grant: 'allow_auto_apply',
-  });
-  assert.deepEqual(operationApprovalFromChoices(compareConfirmation(), remembered), {
-    operation: 'compare',
-    accept_capabilities: true,
-    remember_for_session: true,
   });
 });
 

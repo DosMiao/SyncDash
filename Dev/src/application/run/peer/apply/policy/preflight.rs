@@ -6,9 +6,8 @@ pub fn preflight_peer_job(
     job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
-    acknowledged: bool,
 ) -> crate::pipeline::guard::Verdict {
-    let g = job.configuration().guards(acknowledged);
+    let g = job.configuration().guards();
     let st = crate::pipeline::guard::stats::stat_plan(ops);
     let mut gv = crate::pipeline::guard::Verdict {
         blockers: Vec::new(),

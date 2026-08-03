@@ -4,7 +4,6 @@ mod publication;
 
 use std::sync::Arc;
 
-use syncdash::pipeline::guard::caps::CapabilityConsent;
 use syncdash::run;
 use tauri::Emitter;
 
@@ -26,7 +25,6 @@ use crate::window::MAIN_WINDOW_LABEL;
 use self::publication::prepare_successful_result;
 use super::super::execution::error::{format_run_io_error, verification_terminal_from_io};
 use super::super::execution::guard::{emit_compare_execution_status, AutoScanCompareTerminalGuard};
-use super::super::projection::capability_blockers;
 use super::super::target::{
     build_compare_authorization, load_bound_target, reload_prepared_target,
 };
@@ -65,7 +63,7 @@ pub(crate) async fn compare_job(
                 return Err(message);
             }
         };
-        let capabilities = match run::compare_capabilities(&target.target_job) {
+        let _capabilities = match run::compare_capabilities(&target.target_job) {
             Ok(capabilities) => capabilities,
             Err(error) => {
                 let terminal = verification_terminal_from_io(&error);
@@ -74,12 +72,6 @@ pub(crate) async fn compare_job(
                 return Err(message);
             }
         };
-        let blockers = capability_blockers(&capabilities);
-        if !blockers.is_empty() {
-            let message = blockers.join("\n");
-            terminalize_auto_scan(AutoScanVerificationTerminal::Failed(message.clone()));
-            return Err(message);
-        }
         let target = match reload_prepared_target(&target) {
             Ok(target) => target,
             Err(message) => {
@@ -87,11 +79,7 @@ pub(crate) async fn compare_job(
                 return Err(message);
             }
         };
-        let current = match build_compare_authorization(
-            &target,
-            &capabilities,
-            authorization.origin().clone(),
-        ) {
+        let current = match build_compare_authorization(&target, authorization.origin().clone()) {
             Ok(current) => current,
             Err(message) => {
                 terminalize_auto_scan(AutoScanVerificationTerminal::Failed(message.clone()));
@@ -102,9 +90,6 @@ pub(crate) async fn compare_job(
             terminalize_auto_scan(AutoScanVerificationTerminal::Failed(message.clone()));
             return Err(message);
         }
-        let consent =
-            CapabilityConsent::ExactDigest(current.capability_review_digest().to_string());
-
         let active_run = match command.start_run(RunPurpose::Compare) {
             Ok(active_run) => active_run,
             Err(message) => {
@@ -165,12 +150,7 @@ pub(crate) async fn compare_job(
         let _log_guard = syncdash::obs::progress::install(outlet);
         let t0 = std::time::Instant::now();
         let ts_ms = syncdash::foundation::time::now_ms() as i64;
-        let result = run::compare_with_capability_consent(
-            &target.job_name,
-            &target.target_job,
-            &ctx,
-            &consent,
-        );
+        let result = run::compare(&target.job_name, &target.target_job, &ctx);
         syncdash::run::history::compare_summary(
             syncdash::run::history::RunSubject::registered(
                 &target.job_name,

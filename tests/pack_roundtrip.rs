@@ -156,13 +156,9 @@ fn compare_plan(src: &Path, tgt: &Path, rigor: &str) -> Plan {
         ..Default::default()
     };
     let selected = job.select_target(0).unwrap();
-    syncdash::run::local::compare_job_detailed(
-        &selected,
-        &syncdash::obs::progress::RunCtx::null(),
-        false,
-    )
-    .unwrap()
-    .plan
+    syncdash::run::local::compare_job_detailed(&selected, &syncdash::obs::progress::RunCtx::null())
+        .unwrap()
+        .plan
 }
 
 /// Pack `rel` as a delta against the copy the target already holds.

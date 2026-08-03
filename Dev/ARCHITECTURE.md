@@ -89,7 +89,7 @@ Dev/src/
 │   ├── pipeline/
 │   │   ├── scan/local/     model, state, progress, discovery, and stable hashing
 │   │   ├── compare/        matching, evidence, planning policy, and conflicts
-│   │   ├── guard/caps/     reviewable limitations and the consent digest that binds to them
+│   │   ├── guard/caps/     backend limitations, listed before a run and never gating it
 │   │   ├── name_safety.rs  the one Windows name-hazard decision, used by compare and apply
 │   │   └── apply/          validation, lease, reporting, coordination, and execution
 │   └── transfer/           peer transport and verified packages

@@ -29,6 +29,7 @@ pub fn list_jobs(window: tauri::WebviewWindow) -> Result<Vec<JobDto>, String> {
                 exclude: j.exclude.clone(),
                 autoscan_interval_secs: j.autoscan_interval_secs,
                 autoscan_auto_apply: j.autoscan_auto_apply,
+                max_delete_ratio: j.max_delete_ratio,
                 targets: j.targets.clone(),
             })
         })

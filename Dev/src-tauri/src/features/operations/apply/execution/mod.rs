@@ -4,7 +4,6 @@ mod launch;
 
 use std::sync::Arc;
 
-use syncdash::pipeline::guard::caps::CapabilityConsent;
 use syncdash::run;
 use tauri::Emitter;
 
@@ -22,7 +21,6 @@ use crate::window::PROGRESS_WINDOW_LABEL;
 use self::launch::{revalidate_retained_before_apply, ApplyLaunch};
 use super::super::execution::error::format_run_io_error;
 use super::super::execution::guard::{AppliedResultGuard, RunRejected};
-use super::super::projection::capability_blockers;
 use super::preparation::{
     apply_facts, autoscan_health_refusals, build_apply_review, prepare_apply,
 };
@@ -51,7 +49,6 @@ pub(crate) async fn apply_job(
             let apply_launch = ApplyLaunch::bind(authorization.kind(), launch_id)
                 .map_err(|error| (error, false))?;
             let reviewed = authorization.review().clone();
-            let health_warning_acknowledged = authorization.health_warning_acknowledged();
             let auto_apply_ticket = match &authorization {
                 ApplyAuthorization::Interactive(_) => None,
                 ApplyAuthorization::AutoScan(authorization) => Some(authorization.ticket().clone()),
@@ -68,10 +65,6 @@ pub(crate) async fn apply_job(
             reviewed
                 .verify_current(&current_review)
                 .map_err(|error| (error, false))?;
-            let blockers = capability_blockers(&facts.capabilities);
-            if !blockers.is_empty() {
-                return Err((blockers.join("\n"), false));
-            }
             if matches!(authorization, ApplyAuthorization::AutoScan(_)) {
                 let health_refusals = autoscan_health_refusals(&facts);
                 if !health_refusals.is_empty() {
@@ -84,17 +77,9 @@ pub(crate) async fn apply_job(
                     ));
                 }
             }
-            let verdict = if health_warning_acknowledged {
-                &facts.acknowledged
-            } else {
-                &facts.unacknowledged
-            };
-            if !verdict.ok() {
-                return Err((verdict.blockers.join("\n"), false));
+            if !facts.verdict.ok() {
+                return Err((facts.verdict.blockers.join("\n"), false));
             }
-            let consent = CapabilityConsent::ExactDigest(
-                current_review.capability_review_digest().to_string(),
-            );
             let reserve =
                 || revalidate_retained_before_apply(&results, &prepared, &command, apply_launch);
             let active_run = match auto_apply_ticket.as_ref() {
@@ -122,15 +107,13 @@ pub(crate) async fn apply_job(
                 &ctx,
                 &prepared.reviewed_operations,
             );
-            let execution = run::apply_with_capability_consent_classified(
+            let execution = run::apply_classified(
                 &prepared.target.job_name,
                 &prepared.target.target_job,
                 &prepared.plan,
                 &prepared.reviewed_operations,
                 None,
                 false,
-                health_warning_acknowledged,
-                &consent,
                 &recorder.ctx,
             );
             let writes_started = execution.writes_started();

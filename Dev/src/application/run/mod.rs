@@ -26,7 +26,7 @@ use crate::model::plan::{Op, Plan};
 use crate::model::table::TableArtifact;
 
 use crate::pipeline::{compare::CompareOptions, scan};
-use local::{compare_job_detailed_with_consent, preflight_job, run_local_job};
+use local::{compare_job_detailed, preflight_job, run_local_job};
 use peer::{compare_peer_job_detailed, preflight_peer_job, run_peer_job};
 pub use roots::resolve_root;
 
@@ -213,18 +213,15 @@ pub fn apply_run_kind(job: &SingleTargetJob) -> crate::run::history::RunKind {
     }
 }
 
-pub fn compare_with_capability_consent(
+pub fn compare(
     name: &str,
     job: &SingleTargetJob,
     ctx: &crate::obs::progress::RunCtx,
-    consent: &crate::pipeline::guard::caps::CapabilityConsent,
 ) -> std::io::Result<CompareOutcome> {
     if is_peer_target(job) {
-        // The peer scans its own disk and sends back a table; capability consent is a property of
-        // the roots this process opens, so it has nothing to apply to.
         compare_peer_job_detailed(name, job, ctx)
     } else {
-        compare_job_detailed_with_consent(job, ctx, consent)
+        compare_job_detailed(job, ctx)
     }
 }
 
@@ -243,12 +240,11 @@ pub fn preflight(
     job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
-    acknowledged: bool,
 ) -> std::io::Result<crate::pipeline::guard::Verdict> {
     if is_peer_target(job) {
-        Ok(preflight_peer_job(job, plan, ops, acknowledged))
+        Ok(preflight_peer_job(job, plan, ops))
     } else {
-        preflight_job(job, plan, ops, acknowledged)
+        preflight_job(job, plan, ops)
     }
 }
 
@@ -256,54 +252,33 @@ pub fn apply_requirements(
     job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
-    acknowledged: bool,
 ) -> std::io::Result<ApplyRequirements> {
     if is_peer_target(job) {
         Ok(ApplyRequirements {
-            verdict: preflight_peer_job(job, plan, ops, acknowledged),
+            verdict: preflight_peer_job(job, plan, ops),
             capabilities: peer::apply_capabilities(job, ops),
         })
     } else {
-        local::apply_requirements(job, plan, ops, acknowledged)
+        local::apply_requirements(job, plan, ops)
     }
 }
 
 /// Apply with an explicit mutation boundary. New interactive callers should use this form so a
 /// refused run can preserve its reviewed Compare result without guessing from text or counters.
 #[allow(clippy::too_many_arguments)] // each argument is an independently reviewed apply decision
-pub fn apply_with_capability_consent_classified(
+pub fn apply_classified(
     name: &str,
     job: &SingleTargetJob,
     plan: &Plan,
     ops: &[Op],
     trash: Option<std::path::PathBuf>,
     verbose: bool,
-    acknowledged: bool,
-    consent: &crate::pipeline::guard::caps::CapabilityConsent,
     ctx: &crate::obs::progress::RunCtx,
 ) -> ApplyExecution {
     if is_peer_target(job) {
-        peer::apply_peer_job_with_classified(
-            name,
-            job,
-            plan,
-            ops,
-            verbose,
-            acknowledged,
-            consent,
-            ctx,
-        )
+        peer::apply_peer_job_with_classified(name, job, plan, ops, verbose, ctx)
     } else {
-        local::apply_job_guarded_with_consent_classified(
-            job,
-            plan,
-            ops,
-            trash,
-            verbose,
-            acknowledged,
-            consent,
-            ctx,
-        )
+        local::apply_job_guarded_with_classified(job, plan, ops, trash, verbose, ctx)
     }
 }
 
@@ -313,17 +288,15 @@ pub fn run_job(
     job: &Job,
     do_apply: bool,
     verbose: bool,
-    acknowledged: bool,
-    accept_caps: bool,
 ) -> std::io::Result<(u64, u64, u64, u64)> {
     validate_job(job)?;
     if is_peer_job(job) {
         let target = job
             .select_target(0)
             .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))?;
-        run_peer_job(name, &target, do_apply, verbose, acknowledged, accept_caps)
+        run_peer_job(name, &target, do_apply, verbose)
     } else {
-        run_local_job(name, job, do_apply, verbose, acknowledged, accept_caps)
+        run_local_job(name, job, do_apply, verbose)
     }
 }
 

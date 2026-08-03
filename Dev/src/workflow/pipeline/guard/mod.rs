@@ -2,8 +2,8 @@
 //!
 //! - `marker` proves a root is mounted with its data.
 //! - `space` reserves the configured free-space margin.
-//! - `ratio` blocks unexpectedly destructive plans.
-//! - `scan` rejects incomplete evidence.
+//! - `ratio` reports unexpectedly destructive plans.
+//! - `scan` reports incomplete evidence.
 //! - `caps` reports unsupported backend requirements.
 //! - `roots` probes reachability; `stats` computes plan totals.
 
@@ -29,10 +29,9 @@ pub struct Guards {
     pub require_marker: bool,
     /// Minimum free ratio to keep (0.01 = 1%). <=0 disables
     pub min_free_pct: f64,
-    /// Refuse to run when one side's deleted entries exceed this share of that side's total. <=0 or >=1 disables
+    /// Report a side's deletions prominently once they exceed this share of that side's total, and
+    /// color the matching review row. <=0 or >=1 disables. Never withholds the run.
     pub max_delete_ratio: f64,
-    /// User allowed it through explicitly (--i-know); only lets the health-check gates pass, marker/space still block
-    pub acknowledged: bool,
 }
 
 impl Default for Guards {
@@ -41,12 +40,13 @@ impl Default for Guards {
             require_marker: false,
             min_free_pct: 0.01,
             max_delete_ratio: 0.5,
-            acknowledged: false,
         }
     }
 }
 
-/// The verdict of one preflight. Non-empty `blockers` = refuse to run.
+/// The verdict of one preflight. `blockers` carry the preconditions a run cannot proceed without —
+/// a root that is not there, or a disk that cannot hold the writes. Everything the operator should
+/// weigh rather than have decided for them arrives as a `warning` instead.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Verdict {
     pub blockers: Vec<String>,
@@ -95,28 +95,24 @@ pub fn run_all_vfs(
         "source",
         head.source_walk_errors,
         &head.source_walk_err_samples,
-        g,
         &mut v,
     );
     check_scan_complete(
         "target",
         head.target_walk_errors,
         &head.target_walk_err_samples,
-        g,
         &mut v,
     );
     check_materialized(
         "source",
         head.source_icloud_stubs,
         &head.source_icloud_stub_samples,
-        g,
         &mut v,
     );
     check_materialized(
         "target",
         head.target_icloud_stubs,
         &head.target_icloud_stub_samples,
-        g,
         &mut v,
     );
     let st = stat_plan(ops);

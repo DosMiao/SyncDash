@@ -33,7 +33,7 @@ pub fn cap_report_write(
         (Side::Source, "source", src, q.src_local),
         (Side::Target, "target", tgt, q.tgt_local),
     ] {
-        // Apply acquires both root leases before it mutates either side, so this gate is not
+        // Apply acquires both root leases before it mutates either side, so this item is not
         // conditional on this particular side having a visible operation in the plan.
         if caps.exclusive_staged_file_publish != Support::Yes {
             let actual = match caps.exclusive_staged_file_publish {
@@ -48,10 +48,10 @@ pub fn cap_report_write(
             r.items.push(CapItem {
                 feature: "root lock".into(),
                 side: side_tag.into(),
-                severity: CapSeverity::Block,
+                severity: CapSeverity::Unavailable,
                 requested: "safe concurrent-write exclusion".into(),
                 actual: actual.into(),
-                effect: "the exclusive lease claim cannot be guaranteed — refusing to write; comparing (read-only) still works".into(),
+                effect: "the lease is still claimed when apply starts; a backend that cannot claim it exclusively fails the run there, before anything is written".into(),
             });
         }
 
@@ -63,25 +63,26 @@ pub fn cap_report_write(
             continue;
         }
 
-        // A plan the backend cannot execute in full is a plan the table would lie about
+        // A plan the backend cannot execute in full is a plan the table would otherwise lie about,
+        // so each such shortfall is named with the exact number of rows it covers.
         if caps.unix_mode == Support::No && side_ops.iter().any(|o| o.action == Action::Chmod) {
             r.items.push(CapItem {
                 feature: "chmod ops".into(),
                 side: side_tag.into(),
-                severity: CapSeverity::Block,
+                severity: CapSeverity::Unavailable,
                 requested: format!("{} permission change(s) from the plan", side_ops.iter().filter(|o| o.action == Action::Chmod).count()),
                 actual: "backend has no unix modes".into(),
-                effect: "the plan cannot be executed in full — refusing rather than silently dropping ops".into(),
+                effect: "those permission changes are skipped on this side; every other operation in the plan still runs".into(),
             });
         }
         if caps.symlink == Support::No && side_ops.iter().any(|o| o.link.is_some()) {
             r.items.push(CapItem {
                 feature: "symlink ops".into(),
                 side: side_tag.into(),
-                severity: CapSeverity::Block,
+                severity: CapSeverity::Unavailable,
                 requested: "symlink creation from the plan".into(),
                 actual: "backend cannot create symlinks".into(),
-                effect: "the plan cannot be executed in full — refusing rather than silently dropping ops".into(),
+                effect: "each link operation is attempted and reported as a failed path; the rest of the plan still runs".into(),
             });
         }
 
@@ -98,10 +99,10 @@ pub fn cap_report_write(
             r.items.push(CapItem {
                 feature: "symlink publication".into(),
                 side: side_tag.into(),
-                severity: CapSeverity::Block,
+                severity: CapSeverity::Unavailable,
                 requested: "atomic symlink creation without replacement".into(),
                 actual: actual.into(),
-                effect: "a concurrent entry could be overwritten or misreported — refusing the symlink operation".into(),
+                effect: "a symlink that cannot claim its name exclusively could overwrite or misreport a concurrent entry".into(),
             });
         }
 
@@ -122,10 +123,10 @@ pub fn cap_report_write(
             r.items.push(CapItem {
                 feature: "entry rename".into(),
                 side: side_tag.into(),
-                severity: CapSeverity::Block,
+                severity: CapSeverity::Unavailable,
                 requested: "exclusive claim or in-root preservation of an existing entry".into(),
                 actual: actual.into(),
-                effect: "the operation cannot safely claim or retain the original name — refusing before mutation".into(),
+                effect: "an operation that cannot safely claim or retain its original name fails that path instead of publishing it".into(),
             });
         }
 
@@ -134,7 +135,7 @@ pub fn cap_report_write(
                 Support::No => r.items.push(CapItem {
                     feature: "fsync=true".into(),
                     side: side_tag.into(),
-                    severity: CapSeverity::NeedsAck,
+                    severity: CapSeverity::Degraded,
                     requested: "fsync before rename".into(),
                     actual: "backend has no fsync".into(),
                     effect: "renamed files may not be durable across a crash on this side — continuing means accepting the server's own caching".into(),
@@ -142,7 +143,7 @@ pub fn cap_report_write(
                 Support::Unknown => r.items.push(CapItem {
                     feature: "fsync=true".into(),
                     side: side_tag.into(),
-                    severity: CapSeverity::NeedsAck,
+                    severity: CapSeverity::Degraded,
                     requested: "fsync before rename".into(),
                     actual: "support unknown until tried".into(),
                     effect: "fsync is attempted per file; where the server refuses it, that file counts as failed (set fsync=false to skip the attempt)".into(),
@@ -153,7 +154,7 @@ pub fn cap_report_write(
                 Support::No => r.items.push(CapItem {
                     feature: "fsync namespace".into(),
                     side: side_tag.into(),
-                    severity: CapSeverity::NeedsAck,
+                    severity: CapSeverity::Degraded,
                     requested: "crash-durable rename, publication, and removal entries".into(),
                     actual: "backend cannot durably flush namespace changes".into(),
                     effect: "file contents may survive a crash while their final names do not — continuing accepts that durability gap".into(),
@@ -161,7 +162,7 @@ pub fn cap_report_write(
                 Support::Unknown => r.items.push(CapItem {
                     feature: "fsync namespace".into(),
                     side: side_tag.into(),
-                    severity: CapSeverity::NeedsAck,
+                    severity: CapSeverity::Degraded,
                     requested: "crash-durable rename, publication, and removal entries".into(),
                     actual: "namespace durability is not established for this backend".into(),
                     effect: "the backend may acknowledge file flushes without durably recording the directory entries — continuing accepts that uncertainty".into(),
@@ -174,16 +175,20 @@ pub fn cap_report_write(
             r.items.push(CapItem {
                 feature: "verify_writes".into(),
                 side: side_tag.into(),
-                severity: CapSeverity::NeedsAck,
+                severity: CapSeverity::Degraded,
                 requested: "re-read the staged file before rename".into(),
                 actual: "backend cannot read the staged file back".into(),
                 effect: "verification degrades to the copy-stream hash plus a length reconciliation — no on-disk read-back".into(),
             });
         }
 
+        // Only an operation that displaces existing data can send anything to a trash or version
+        // store. `Copy` publishes onto a name that compare found absent and `DeleteDir` removes
+        // only an already-empty directory, so neither preserves an original — reporting a
+        // preservation effect for a plan made purely of them describes a run that cannot happen.
         let destructive = side_ops
             .iter()
-            .any(|o| matches!(o.action, Action::Delete | Action::Update | Action::Copy));
+            .any(|o| matches!(o.action, Action::Delete | Action::Update));
         if destructive {
             // The version store writes through a retained local-root capability. Protocol roots
             // preserve whole entries in their own trash namespace instead.
@@ -191,7 +196,7 @@ pub fn cap_report_write(
                 r.items.push(CapItem {
                     feature: "versioning".into(),
                     side: side_tag.into(),
-                    severity: CapSeverity::NeedsAck,
+                    severity: CapSeverity::Degraded,
                     requested: "rdelta version store on this root".into(),
                     actual: "network/VFS backend (no local version machinery)".into(),
                     effect: "overwritten/deleted files are kept as whole files under <root>/.syncdash/trash/<run>/ instead — recover with any file browser; rdelta history does not accrue on this side".into(),
@@ -202,7 +207,7 @@ pub fn cap_report_write(
                 r.items.push(CapItem {
                     feature: "trash".into(),
                     side: side_tag.into(),
-                    severity: CapSeverity::NeedsAck,
+                    severity: CapSeverity::Degraded,
                     requested: "deleted/overwritten files into the central trash store".into(),
                     // Reads through the template as "wanted …, backend has a network share, the
                     // central store is on this machine — …"
@@ -217,7 +222,7 @@ pub fn cap_report_write(
         r.items.push(CapItem {
             feature: "delta".into(),
             side: "both".into(),
-            severity: CapSeverity::NeedsAck,
+            severity: CapSeverity::Degraded,
             requested: "chunk-wise delta updates".into(),
             actual: "a root uses a network/VFS backend".into(),
             effect: "delta is disabled this run — updates rewrite files in full over the link"

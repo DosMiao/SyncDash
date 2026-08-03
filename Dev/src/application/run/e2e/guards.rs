@@ -60,65 +60,52 @@ fn guarded_job(max_delete_ratio: f64, require_marker: bool) -> Job {
     }
 }
 
-/// The guard that exists because a wrong filter and a real mass deletion are indistinguishable from
-/// inside the plan. It refuses, and nothing is touched.
+/// A mass deletion is reported, loudly and with its numbers, and then it runs. A wrong filter and a
+/// real mass delete are indistinguishable from inside the plan, so the engine states the share and
+/// leaves the call to the operator reading it rather than withholding their data.
 #[test]
-fn the_delete_ratio_guard_blocks_a_mass_delete() {
+fn a_mass_delete_is_reported_in_full_and_then_runs() {
     let (sv, tv) = mass_delete_pair();
-    let before = tree::shape_of(&tv);
-    let (plan, ap, said) = try_cycle(&guarded_job(0.5, false), &sv, &tv, false);
+    let (plan, ap, said) = try_cycle(&guarded_job(0.5, false), &sv, &tv);
 
     assert_eq!(
         plan.ops.len(),
         3,
         "the plan really does propose all three deletions"
     );
-    assert_eq!(ap.errors, 1, "the run must refuse\n{said}");
-    assert_eq!(ap.done, 0, "and must not have deleted anything first");
-    assert!(
-        said.contains("over the 50% guard"),
-        "the refusal has to say what tripped and why:\n{said}"
-    );
     assert_eq!(
-        tree::shape_of(&tv),
-        before,
-        "the target is untouched after a refusal"
+        ap.errors, 0,
+        "a deletion share must not refuse the run\n{said}"
     );
-}
-
-/// `--i-know` is the user overruling a judgment call. It turns that one blocker into a warning and
-/// the deletions go through.
-#[test]
-fn the_delete_ratio_guard_yields_to_i_know() {
-    let (sv, tv) = mass_delete_pair();
-    let (_, ap, said) = try_cycle(&guarded_job(0.5, false), &sv, &tv, true);
-    assert_eq!(ap.errors, 0, "acknowledged, it should proceed\n{said}");
     assert!(
         ap.done >= 3,
         "every proposed deletion should have run, got {}",
         ap.done
+    );
+    assert!(
+        said.contains("over the 50% mark"),
+        "the run has to say what tripped and why:\n{said}"
     );
     let tol = tree::Tolerance::between(&sv, &tv);
     tree::assert_same(
         &tree::shape_of(&sv),
         &tree::shape_of(&tv),
         &tol,
-        "after --i-know",
+        "after a reported mass delete",
     );
 }
 
-/// The marker gate fires at *compare*, before a plan exists — so there is nothing to acknowledge,
-/// and `--i-know` cannot reach it however emphatically it is passed.
+/// The marker gate fires at *compare*, before a plan exists. It is a precondition, not a judgment
+/// call: a root without its marker is a root that may not be mounted, and there is nothing to weigh.
 #[test]
-fn i_know_does_not_reach_the_mount_marker() {
+fn a_missing_mount_marker_still_refuses_before_any_plan_exists() {
     let (sv, tv) = mass_delete_pair();
     let (_, ctx) = watched();
     // `expect_err` would need `CompareOutcome: Debug`; a shipped type does not grow a derive to
     // suit a test.
-    let Err(err) =
-        crate::run::local::compare_resolved(&guarded_job(0.0, true), &sv, &tv, &ctx, true)
+    let Err(err) = crate::run::local::compare_resolved(&guarded_job(0.0, true), &sv, &tv, &ctx)
     else {
-        panic!("a missing marker must refuse even with --i-know in hand");
+        panic!("a missing marker must refuse");
     };
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     let msg = err.to_string();
@@ -136,7 +123,7 @@ fn an_empty_unmarked_target_warns_but_proceeds() {
     let sv: Arc<dyn Vfs> = Arc::new(MemVfs::new("empty-src"));
     let tv: Arc<dyn Vfs> = Arc::new(MemVfs::new("empty-tgt"));
     corpus::seed_into(&sv, corpus::BASE);
-    let (_, ap, said) = try_cycle(&guarded_job(0.0, false), &sv, &tv, false);
+    let (_, ap, said) = try_cycle(&guarded_job(0.0, false), &sv, &tv);
     assert_eq!(
         ap.errors, 0,
         "an empty target is filled, not refused\n{said}"

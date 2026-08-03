@@ -13,7 +13,6 @@ pub(super) fn apply_peer_inner(
     plan_full: &Plan,
     sel_ops: &[Op],
     verbose: bool,
-    acknowledged: bool,
     ctx: &crate::obs::progress::RunCtx,
     writes_started: &mut bool,
 ) -> std::io::Result<crate::obs::progress::ApplyOutcome> {
@@ -22,7 +21,7 @@ pub(super) fn apply_peer_inner(
     use crate::obs::progress::{ApplyOutcome, PhaseProgress};
 
     let configuration = job.configuration();
-    let gv = preflight_peer_job(job, plan_full, sel_ops, acknowledged);
+    let gv = preflight_peer_job(job, plan_full, sel_ops);
     if !gv.report(name) {
         for b in &gv.blockers {
             ctx.sink.emit(ProgressEvent::Error {

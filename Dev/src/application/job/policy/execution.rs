@@ -52,12 +52,11 @@ impl Job {
         }
     }
 
-    pub fn guards(&self, acknowledged: bool) -> crate::pipeline::guard::Guards {
+    pub fn guards(&self) -> crate::pipeline::guard::Guards {
         crate::pipeline::guard::Guards {
             require_marker: self.require_marker,
             min_free_pct: self.min_free_pct,
             max_delete_ratio: self.max_delete_ratio,
-            acknowledged,
         }
     }
 

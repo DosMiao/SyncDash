@@ -45,13 +45,6 @@ pub enum Cmd {
         prefix: Option<String>,
         #[arg(long)]
         apply: bool,
-        /// Allow the "plan health check" through (deletion share too high). A missing marker / insufficient space still blocks
-        #[arg(long = "i-know")]
-        i_know: bool,
-        /// Consent to the capability degradations a VFS backend forces (each one is listed first).
-        /// Separate from --i-know on purpose: two different risks, two separate nods
-        #[arg(long = "accept-caps")]
-        accept_caps: bool,
         #[arg(short, long)]
         verbose: bool,
         /// M6 watch: loop compare → (on differences, in auto mode) apply → sleep. Ctrl-C to stop

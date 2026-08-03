@@ -10,7 +10,7 @@ use super::super::apply::{
 use super::super::challenge::IssuedAuthorization;
 use super::super::compare::CompareAuthorization;
 use super::issuance::{commit_authorization, issue_into, prepare_authorization, random_token};
-use super::retention::{purge, touch_grant};
+use super::retention::purge;
 use super::OperationAuthorizationStore;
 
 impl OperationAuthorizationStore {
@@ -33,26 +33,17 @@ impl OperationAuthorizationStore {
         review: ApplyReview,
         ticket: AutoApplyTicket,
     ) -> Result<IssuedAuthorization, String> {
+        // Whether AutoScan may apply unattended is `autoscan_auto_apply` in the job, checked where
+        // the scan is scheduled. There is no second per-session permission on top of it.
         let authorization = AutoApplyAuthorization::new(review, ticket)?;
         let mut state = self.0.lock().unwrap();
         let now = Instant::now();
         purge(&mut state, now);
-        let Some(index) = state
-            .grants
-            .iter()
-            .position(|grant| grant.allows_apply(authorization.review(), true))
-        else {
-            return Err(
-                "This AutoScan Apply has no exact session grant — review Apply interactively"
-                    .into(),
-            );
-        };
         let prepared = prepare_authorization(
             OperationAuthorization::AutoApply(authorization),
             now,
             random_token,
         )?;
-        touch_grant(&mut state.grants, index);
         Ok(commit_authorization(&mut state, prepared))
     }
 
