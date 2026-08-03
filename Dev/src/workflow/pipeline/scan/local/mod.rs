@@ -1,12 +1,13 @@
 //! Local scan façade: discover metadata, collect content evidence, and publish one snapshot.
 //!
 //! The three stages have separate change axes: platform traversal lives in `discovery`, stable
-//! content reads in `hashing`, and persistent acceleration tables in `state`. This façade alone
-//! owns their ordering and the externally visible snapshot contract.
+//! content reads in `hashing`, and this root's acceleration-table binding in `state`. This façade
+//! alone owns their ordering and the externally visible snapshot contract. The row being built and
+//! the rules for reading acceleration state are `scan::model` and `scan::state`, shared with the
+//! generic lane so the two cannot answer the same question differently.
 
 mod discovery;
 mod hashing;
-mod model;
 mod progress;
 mod state;
 

@@ -8,8 +8,8 @@ use crate::foundation::path::{EntryName, RootRelativeDir, RootRelativePath};
 use crate::fs::local_root::LocalRoot;
 use crate::model::table::{ObservedDirectory, ObservedEntry, ObservedSymlink};
 
+use super::super::model::PendingFile;
 use super::super::{ProgressFn, ScanOptions, ScanProgress};
-use super::model::PendingFile;
 use super::state::LocalScanState;
 use walk::WalkKind;
 

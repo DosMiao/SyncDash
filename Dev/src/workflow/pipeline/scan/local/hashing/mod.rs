@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rayon::prelude::*;
 
 use super::super::digest::{effective_read, SAMPLE_MIN};
+use super::super::model::PendingFile;
 use super::super::{ProgressFn, ScanMetrics, ScanOptions, ScanProgress};
-use super::model::PendingFile;
 
 pub(super) struct HashOutcome {
     pub bytes_to_hash: u64,

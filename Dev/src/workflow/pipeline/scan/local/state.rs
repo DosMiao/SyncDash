@@ -1,12 +1,17 @@
-//! Loading, interpreting, and publishing per-root scanner acceleration state.
+//! This root's binding to the scanner acceleration tables: which identity they belong to, when
+//! they may be reused at all, and publishing what the scan observed back into them.
+//!
+//! The interpretation rules themselves are `scan::state`, shared with the generic lane. What is
+//! local here is the `LocalScanStateIdentity` — the `_local` store entry points, and
+//! `file_ids_stable`, which is a fact this filesystem reports about itself rather than a scanning
+//! decision, and so does not belong in a rule both lanes run.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::table::{FileIdentityObservation, ObservedEntry};
+use crate::model::table::ObservedEntry;
 
-use super::super::digest::SAMPLE_MIN;
-use super::super::{ScanMetrics, ScanOptions};
-use super::model::PendingFile;
+use super::super::model::PendingFile;
+use super::super::{state as rules, ScanMetrics, ScanOptions};
 
 pub(super) struct LocalScanState {
     identity: crate::store::localid::LocalScanStateIdentity,
@@ -54,32 +59,23 @@ impl LocalScanState {
         options: &ScanOptions,
     ) -> PendingFile {
         let relative_text = relative.as_str();
-        let mtime_ms = match self.mtime_fixes.get(relative_text) {
-            Some(correction) if correction.ondisk_ms == raw_mtime_ms => {
-                self.matched_mtime_fixes.insert(relative_text.to_owned());
-                correction.intended_ms
-            }
-            _ => raw_mtime_ms,
-        };
-        let hash = if options.hash
-            && options.use_cache
-            && !self.matched_mtime_fixes.contains(relative_text)
-        {
-            self.cache.get(relative_text).and_then(|cached| {
-                let wants_sampled = options.sampled && size >= SAMPLE_MIN;
-                let cached_is_sampled = matches!(
-                    cached.identity,
-                    FileIdentityObservation::SampledBlake3 { .. }
-                );
-                (cached.size == size
-                    && cached.mtime_ms == mtime_ms
-                    && cached_is_sampled == wants_sampled)
-                    .then(|| cached.identity.digest().cloned())
-                    .flatten()
-            })
-        } else {
-            None
-        };
+        let mtime_ms = rules::resolve_mtime(
+            &self.mtime_fixes,
+            &mut self.matched_mtime_fixes,
+            relative_text,
+            raw_mtime_ms,
+        );
+        // This lane always runs the tier it was asked for: a retained local root has every
+        // primitive, so nothing can force it up from sampled to full reads mid-scan.
+        let hash = rules::reusable_cached_digest(
+            &self.cache,
+            &self.matched_mtime_fixes,
+            options,
+            options.sampled,
+            relative_text,
+            size,
+            mtime_ms,
+        );
         PendingFile {
             relative,
             size,
@@ -102,16 +98,7 @@ impl LocalScanState {
         coverage: crate::store::ScanCoverage,
         options: &ScanOptions,
     ) -> HashSet<String> {
-        if coverage != crate::store::ScanCoverage::Complete {
-            return HashSet::new();
-        }
-        self.cache
-            .keys()
-            .map(crate::foundation::path::RootRelativePath::as_str)
-            .chain(self.mtime_fixes.keys().map(String::as_str))
-            .filter(|path| !options.filter.pass_file(path))
-            .map(str::to_owned)
-            .collect()
+        rules::retain_absent(&self.cache, &self.mtime_fixes, coverage, &options.filter)
     }
 
     pub(super) fn publish(
