@@ -5,7 +5,9 @@
 //! on one side used to fall through to the size+mtime line and declare them the same forever,
 //! because the read keeps failing.
 
-use super::super::evidence::{evidence, identical_page, reverse_op};
+use super::super::evidence::{
+    evidence, identical_page, implied_row_meta, reverse_op, row_meta, RowMeta, SideMeta,
+};
 use super::super::*;
 use super::fixtures::*;
 use crate::model::plan::{Action, Op, Side};
@@ -58,8 +60,11 @@ fn a_hashless_comparison_is_still_judged_on_size_and_mtime() {
 /// content-copy lane instead. `mode` is inert only until Copy/Update start carrying it, at which
 /// point the loss would be *selective* — the one row the user looked hardest at is the one
 /// written without its mode.
+///
+/// This row is a symlink Update, which is also the one Update shape that stays sizeless after the
+/// reversal: it publishes a link rather than content, and neither side is ever measured for it.
 #[test]
-fn a_reversed_op_keeps_the_fields_that_decide_how_it_is_written() {
+fn a_reversed_symlink_op_keeps_the_fields_that_decide_how_it_is_written() {
     let source_operation = Op {
         side: Side::Target,
         action: Action::Update,
@@ -72,7 +77,8 @@ fn a_reversed_op_keeps_the_fields_that_decide_how_it_is_written() {
         mode: Some(0o755),
         reason: "differs".into(),
     };
-    let reversed = reverse_op(&source_operation).expect("an Update is reversible");
+    let reversed = reverse_op(&source_operation, &RowMeta::default())
+        .expect("a symlink Update reverses without any measurement of either side");
     assert_eq!(
         reversed.side,
         Side::Source,
@@ -85,9 +91,87 @@ fn a_reversed_op_keeps_the_fields_that_decide_how_it_is_written() {
     );
     assert_eq!(reversed.mode, Some(0o755), "the mode survives the reversal");
     assert_eq!(reversed.path, "bin/node");
-    // The content evidence belonged to the side that just lost, so it is dropped deliberately.
+    // The digest described the content of the side that just lost, and there is no digest of the
+    // winner to put in its place, so it is dropped deliberately.
     assert_eq!(reversed.hash, None);
-    assert_eq!(reversed.size, None);
+    assert_eq!(
+        reversed.size, None,
+        "a symlink op writes a link, not bytes — it stays unmeasured in either direction"
+    );
+}
+
+/// The row the free-space gate has to be able to judge. A reversed Update writes onto the side that
+/// was going to be written, reading the side that was going to be read from — so the bytes it will
+/// write are exactly what compare measured on its new origin. Leaving `size` empty here made
+/// `guard::stats` read the row as zero bytes and `check_space` skip the volume entirely.
+#[test]
+fn a_reversed_content_update_carries_its_new_origins_measured_size() {
+    let onto_target = Op {
+        side: Side::Target,
+        action: Action::Update,
+        path: "report.bin".into(),
+        from: None,
+        size: Some(100),
+        mtime_ms: Some(9_000),
+        hash: Some("source-digest".into()),
+        link: None,
+        mode: None,
+        reason: "differs-master-wins".into(),
+    };
+    let metadata = RowMeta {
+        src: Some(SideMeta {
+            size: 100,
+            mtime_ms: 9_000,
+        }),
+        dst: Some(SideMeta {
+            size: 40,
+            mtime_ms: 2_000,
+        }),
+    };
+
+    let onto_source = reverse_op(&onto_target, &metadata).expect("an Update is reversible");
+    assert_eq!(onto_source.side, Side::Source);
+    assert_eq!(
+        onto_source.size,
+        Some(40),
+        "reversed onto source, the bytes come from the target the user chose to keep"
+    );
+    assert_eq!(onto_source.hash, None, "no digest of the winner exists");
+
+    let back_onto_target = reverse_op(&onto_source, &metadata).expect("an Update is reversible");
+    assert_eq!(back_onto_target.side, Side::Target);
+    assert_eq!(
+        back_onto_target.size,
+        Some(100),
+        "the mirror case reads the source measurement"
+    );
+}
+
+/// Fail closed: a content Update whose new origin was never measured cannot be reversed into a
+/// write row, because a row with no size is a row the free-space gate silently passes.
+#[test]
+fn a_reversed_content_update_without_its_origin_measurement_is_refused() {
+    let onto_target = Op {
+        side: Side::Target,
+        action: Action::Update,
+        path: "report.bin".into(),
+        from: None,
+        size: Some(100),
+        mtime_ms: Some(9_000),
+        hash: None,
+        link: None,
+        mode: None,
+        reason: "differs-master-wins".into(),
+    };
+    let source_side_only = RowMeta {
+        src: Some(SideMeta {
+            size: 100,
+            mtime_ms: 9_000,
+        }),
+        dst: None,
+    };
+    assert!(reverse_op(&onto_target, &source_side_only).is_none());
+    assert!(reverse_op(&onto_target, &RowMeta::default()).is_none());
 }
 
 #[test]
@@ -104,7 +188,7 @@ fn reverse_op_semantics() {
         mode: None,
         reason: "only-in-source".into(),
     };
-    let r = reverse_op(&copy).unwrap();
+    let r = reverse_op(&copy, &RowMeta::default()).unwrap();
     assert_eq!((r.side, r.action), (Side::Source, Action::Delete));
 
     let del = Op {
@@ -119,7 +203,7 @@ fn reverse_op_semantics() {
         mode: None,
         reason: "gone-from-source".into(),
     };
-    let r = reverse_op(&del).unwrap();
+    let r = reverse_op(&del, &RowMeta::default()).unwrap();
     assert_eq!((r.side, r.action), (Side::Source, Action::Copy));
 
     let upd = Op {
@@ -134,7 +218,17 @@ fn reverse_op_semantics() {
         mode: None,
         reason: "differs".into(),
     };
-    let r = reverse_op(&upd).unwrap();
+    let measured = RowMeta {
+        src: Some(SideMeta {
+            size: 5,
+            mtime_ms: 1,
+        }),
+        dst: Some(SideMeta {
+            size: 9,
+            mtime_ms: 2,
+        }),
+    };
+    let r = reverse_op(&upd, &measured).unwrap();
     assert_eq!((r.side, r.action), (Side::Source, Action::Update));
 
     let mv = Op {
@@ -149,7 +243,7 @@ fn reverse_op_semantics() {
         mode: None,
         reason: "m".into(),
     };
-    assert!(reverse_op(&mv).is_none());
+    assert!(reverse_op(&mv, &RowMeta::default()).is_none());
 }
 
 #[test]
@@ -297,4 +391,76 @@ fn evidence_follows_move_naming_on_each_side() {
         4_000,
         "the target side is looked up under the old name a.bin"
     );
+}
+
+/// The wire elides a `Copy` row's `metas` entry because the row already carries its sole side's
+/// measurement. Publication, artifact validation, the CSV/reveal decoder, and the desktop table all
+/// read `implied_row_meta` for that decision, so what is dropped and what is rebuilt cannot drift
+/// apart — a row whose entry is elided but not reconstructible would display as unmeasured on one
+/// side and sort to the bottom of every size and time column.
+#[test]
+fn only_a_row_that_rebuilds_its_own_evidence_may_have_it_elided() {
+    let measured = |side: Side, size, mtime_ms| Op {
+        side,
+        action: Action::Copy,
+        path: "a.bin".into(),
+        from: None,
+        size: Some(size),
+        mtime_ms: Some(mtime_ms),
+        hash: None,
+        link: None,
+        mode: None,
+        reason: "only-in-source".into(),
+    };
+
+    // The side a copy writes *to* has nothing to measure, so exactly one side is rebuilt.
+    let onto_target = measured(Side::Target, 42, 8_000);
+    assert_eq!(
+        implied_row_meta(&onto_target),
+        Some(RowMeta {
+            src: Some(SideMeta {
+                size: 42,
+                mtime_ms: 8_000
+            }),
+            dst: None,
+        })
+    );
+    let onto_source = measured(Side::Source, 42, 8_000);
+    assert_eq!(
+        implied_row_meta(&onto_source).unwrap().dst.unwrap().size,
+        42,
+        "a copy onto the source implies the target-side measurement instead"
+    );
+    assert_eq!(
+        row_meta(&onto_target, None),
+        implied_row_meta(&onto_target).unwrap(),
+        "a reader with no retained entry rebuilds exactly what publication was allowed to drop"
+    );
+
+    // A symlink copy publishes a link rather than content and is measured on neither side, so it
+    // implies nothing and its entry has to survive the wire.
+    let mut symlink = measured(Side::Target, 0, 0);
+    symlink.size = None;
+    symlink.mtime_ms = None;
+    symlink.link = Some("../elsewhere".into());
+    assert_eq!(implied_row_meta(&symlink), None);
+    assert_eq!(row_meta(&symlink, None), RowMeta::default());
+
+    // Only Copy rows are elidable: every other action can be present on both sides at once.
+    let mut update = measured(Side::Target, 42, 8_000);
+    update.action = Action::Update;
+    assert_eq!(implied_row_meta(&update), None);
+
+    // A retained entry always wins over the row's own implication.
+    let retained = RowMeta {
+        src: Some(SideMeta {
+            size: 1,
+            mtime_ms: 2,
+        }),
+        dst: Some(SideMeta {
+            size: 3,
+            mtime_ms: 4,
+        }),
+    };
+    assert_eq!(row_meta(&onto_target, Some(&retained)), retained);
 }

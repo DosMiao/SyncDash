@@ -131,3 +131,114 @@ pub fn run_all_vfs(
     check_delete_ratio("source", &st.source, head.source_entries, g, &mut v);
     v
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::vfs::memory::MemVfs;
+    use crate::fs::vfs::Vfs;
+    use crate::model::plan::{Action, Side, PLAN_SCHEMA};
+    use crate::pipeline::compare::evidence::{reverse_op, RowMeta, SideMeta};
+
+    fn root() -> std::sync::Arc<dyn Vfs> {
+        std::sync::Arc::new(MemVfs::new("mem"))
+    }
+
+    fn header() -> PlanHeader {
+        PlanHeader {
+            schema: PLAN_SCHEMA,
+            kind: "plan".into(),
+            mode: "mirror".into(),
+            generated_at_ms: 1_700_000_000_000,
+            source_root: "mem://source".into(),
+            source_host: "host".into(),
+            target_root: "mem://target".into(),
+            target_host: "host".into(),
+            op_count: 1,
+            conflict_count: 0,
+            source_entries: 100,
+            target_entries: 100,
+            source_excluded: 0,
+            target_excluded: 0,
+            source_walk_errors: 0,
+            target_walk_errors: 0,
+            source_walk_err_samples: Vec::new(),
+            target_walk_err_samples: Vec::new(),
+            source_icloud_stubs: 0,
+            target_icloud_stubs: 0,
+            source_icloud_stub_samples: Vec::new(),
+            target_icloud_stub_samples: Vec::new(),
+        }
+    }
+
+    /// A reversed row is executed like any other, so the free-space gate has to judge it on the
+    /// same bytes. The reversal clears `Op.size` for the side that just lost; if it did not put the
+    /// new origin's measurement back, `stat_plan` would read the row as zero and `check_space`
+    /// would return before probing the volume — a mirror plan whose reversed rows were all Updates
+    /// would start with no free-space verdict at all.
+    #[test]
+    fn a_reversed_update_reaches_the_same_free_space_verdict_as_the_forward_row() {
+        let (source, target) = (root(), root());
+        let oversized = source
+            .free_space()
+            .expect("MemVfs answers the free-space probe")
+            .expect("MemVfs reports free space")
+            .0
+            * 2;
+        let forward_source_write = Op {
+            side: Side::Source,
+            action: Action::Update,
+            path: "big.bin".into(),
+            from: None,
+            size: Some(oversized),
+            mtime_ms: Some(1),
+            hash: None,
+            link: None,
+            mode: None,
+            reason: "differs".into(),
+        };
+        let reviewed = Op {
+            side: Side::Target,
+            size: Some(7),
+            ..forward_source_write.clone()
+        };
+        let metadata = RowMeta {
+            src: Some(SideMeta {
+                size: 7,
+                mtime_ms: 1,
+            }),
+            dst: Some(SideMeta {
+                size: oversized,
+                mtime_ms: 2,
+            }),
+        };
+        let reversed = reverse_op(&reviewed, &metadata).expect("an Update is reversible");
+        assert_eq!(
+            reversed.side,
+            Side::Source,
+            "the reversal writes onto source"
+        );
+
+        let guards = Guards::default();
+        let forward = run_all_vfs(
+            &[forward_source_write],
+            &source,
+            &target,
+            &header(),
+            &guards,
+        );
+        let after_reversal = run_all_vfs(&[reversed], &source, &target, &header(), &guards);
+
+        assert!(
+            forward
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("source: not enough free space")),
+            "{forward:?}"
+        );
+        assert_eq!(
+            after_reversal, forward,
+            "a reversed Update writing the same bytes must reach the same verdict"
+        );
+    }
+}

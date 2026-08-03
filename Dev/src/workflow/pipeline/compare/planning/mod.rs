@@ -539,25 +539,20 @@ pub fn compare(
 
     names::validate_backend_legality(source, target, &mut ops);
 
-    let rank = |o: &Op| match o.action {
-        Action::Move => 0,
-        Action::Copy | Action::Update => 1,
-        Action::Chmod => 2,
-        Action::Delete => 3,
-        Action::DeleteDir => 4,
-        Action::Conflict | Action::Note => 5,
-    };
     ops.sort_by(|a, b| {
-        rank(a).cmp(&rank(b)).then_with(|| {
-            if a.action == Action::DeleteDir {
-                b.path
-                    .matches('/')
-                    .count()
-                    .cmp(&a.path.matches('/').count())
-            } else {
-                a.path.cmp(&b.path)
-            }
-        })
+        a.action
+            .plan_rank()
+            .cmp(&b.action.plan_rank())
+            .then_with(|| {
+                if a.action == Action::DeleteDir {
+                    b.path
+                        .matches('/')
+                        .count()
+                        .cmp(&a.path.matches('/').count())
+                } else {
+                    a.path.cmp(&b.path)
+                }
+            })
     });
 
     let conflict_count = ops.iter().filter(|o| o.action == Action::Conflict).count() as u64;

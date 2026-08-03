@@ -43,6 +43,63 @@ pub(super) fn check_space(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::fs::vfs::memory::MemVfs;
+    use crate::fs::vfs::Vfs;
+
+    fn volume() -> std::sync::Arc<dyn Vfs> {
+        std::sync::Arc::new(MemVfs::new("mem"))
+    }
+
+    /// What the fixture volume says about itself, so these tests judge the policy rather than a
+    /// restatement of `MemVfs`.
+    fn available(volume: &std::sync::Arc<dyn Vfs>) -> u64 {
+        volume
+            .free_space()
+            .expect("MemVfs answers the free-space probe")
+            .expect("MemVfs reports free space")
+            .0
+    }
+
+    /// The gate has to be able to say no. Everything else in this module — the padding, the
+    /// reserve, the degraded-backend warning — only matters if a plan that cannot fit is refused.
+    #[test]
+    fn a_plan_larger_than_the_volume_is_blocked() {
+        let volume = volume();
+        let mut verdict = Verdict::default();
+        check_space(
+            "target",
+            &volume,
+            available(&volume) * 2,
+            0.01,
+            &mut verdict,
+        );
+        assert_eq!(verdict.blockers.len(), 1, "{verdict:?}");
+        assert!(
+            verdict.blockers[0].contains("not enough free space"),
+            "{}",
+            verdict.blockers[0]
+        );
+        assert!(verdict.warnings.is_empty(), "{verdict:?}");
+    }
+
+    /// The reserve is the whole point of `min_free_pct`: a plan that fits into the last of the
+    /// volume still has to leave the configured margin behind.
+    #[test]
+    fn the_reserve_is_what_refuses_a_plan_that_would_otherwise_just_fit() {
+        let volume = volume();
+        // Padded by the 10% check_space adds, this lands just inside the volume and just outside
+        // the 1% reserve.
+        let need = available(&volume) / 11 * 10 - 1_000_000_000;
+
+        let mut without_reserve = Verdict::default();
+        check_space("target", &volume, need, 0.0, &mut without_reserve);
+        assert!(without_reserve.ok(), "{without_reserve:?}");
+
+        let mut with_reserve = Verdict::default();
+        check_space("target", &volume, need, 0.01, &mut with_reserve);
+        assert_eq!(with_reserve.blockers.len(), 1, "{with_reserve:?}");
+    }
 
     #[test]
     fn disk_space_reports_something_for_temp_dir() {

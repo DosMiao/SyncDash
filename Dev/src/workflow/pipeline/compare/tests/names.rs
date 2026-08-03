@@ -6,7 +6,7 @@
 
 use super::super::*;
 use super::fixtures::*;
-use crate::model::plan::Action;
+use crate::model::plan::{Action, Side};
 use crate::model::table::ObservedNameRules;
 
 #[test]
@@ -27,6 +27,150 @@ fn case_sensitive_mode_flags_a_write_that_would_clobber_a_case_twin() {
         .expect("Foo.txt must be planned somehow");
     assert_eq!(c.action, Action::Conflict, "{:?}", c.reason);
     assert!(c.reason.contains("case-collision"), "{}", c.reason);
+}
+
+/// The target holds *neither* twin, so the entry map has nothing to catch: the collision is
+/// between the two planned writes themselves. On APFS/NTFS/SMB the second copy lands on the first
+/// and the run reports two successes for one surviving file.
+#[test]
+fn two_planned_writes_that_fold_together_are_both_refused() {
+    let s = snap("windows", vec![file("Foo.txt", "A"), file("foo.txt", "B")]);
+    let t = snap("windows", vec![]);
+    let opts = CompareOptions {
+        case_insensitive: false,
+        ..Default::default()
+    };
+    let plan = compare(&s, &t, "mirror", None, false, &opts);
+    assert!(
+        plan.ops.iter().all(|o| o.action != Action::Copy),
+        "neither twin may be copied: {:?}",
+        actions(&plan)
+    );
+    for path in ["Foo.txt", "foo.txt"] {
+        let op = plan
+            .ops
+            .iter()
+            .find(|o| o.path == path)
+            .unwrap_or_else(|| panic!("{path} must be planned somehow"));
+        assert_eq!(op.action, Action::Conflict, "{}", op.reason);
+        assert!(op.reason.contains("case-collision"), "{}", op.reason);
+    }
+    // Both colliding names must be named, so the report says what is actually in conflict.
+    let why = |p: &str| {
+        plan.ops
+            .iter()
+            .find(|o| o.path == p)
+            .unwrap()
+            .reason
+            .clone()
+    };
+    assert!(why("Foo.txt").contains("'foo.txt'"), "{}", why("Foo.txt"));
+    assert!(why("foo.txt").contains("'Foo.txt'"), "{}", why("foo.txt"));
+    assert_eq!(plan.header.conflict_count, 2);
+}
+
+/// Sync without an archive plans writes onto the *source* root, so the same fold applies there.
+#[test]
+fn planned_writes_onto_the_source_root_fold_together_too() {
+    let s = snap("windows", vec![]);
+    let t = snap("windows", vec![file("Bar.txt", "A"), file("bar.txt", "B")]);
+    let opts = CompareOptions {
+        case_insensitive: false,
+        ..Default::default()
+    };
+    let plan = compare(&s, &t, "sync", None, false, &opts);
+    for path in ["Bar.txt", "bar.txt"] {
+        let op = plan
+            .ops
+            .iter()
+            .find(|o| o.path == path)
+            .unwrap_or_else(|| panic!("{path} must be planned somehow"));
+        assert_eq!(op.side, Side::Source, "{:?}", actions(&plan));
+        assert_eq!(op.action, Action::Conflict, "{}", op.reason);
+        assert!(op.reason.contains("case-collision"), "{}", op.reason);
+    }
+}
+
+/// A Move destination is a name being created just like a Copy destination, so it folds with one.
+#[test]
+fn a_move_destination_folding_onto_a_copy_destination_refuses_both() {
+    let s = snap("windows", vec![file("New.txt", "H"), file("new.txt", "K")]);
+    let t = snap("windows", vec![file("old.txt", "H")]);
+    let opts = CompareOptions {
+        case_insensitive: false,
+        ..Default::default()
+    };
+    let plan = compare(&s, &t, "mirror", None, false, &opts);
+    assert!(
+        plan.ops
+            .iter()
+            .all(|o| !matches!(o.action, Action::Copy | Action::Move)),
+        "the rename and the copy both land on one name: {:?}",
+        actions(&plan)
+    );
+    for path in ["New.txt", "new.txt"] {
+        let op = plan.ops.iter().find(|o| o.path == path).unwrap();
+        assert_eq!(op.action, Action::Conflict, "{}", op.reason);
+        assert!(op.reason.contains("case-collision"), "{}", op.reason);
+    }
+}
+
+/// Three writes fold to one name. Letting any one of them through would pick an arbitrary
+/// winner and lose the other two, so all three are refused.
+#[test]
+fn three_way_folding_refuses_every_member_of_the_group() {
+    let s = snap(
+        "windows",
+        vec![file("A.txt", "1"), file("a.txt", "2"), file("A.TXT", "3")],
+    );
+    let t = snap("windows", vec![]);
+    let opts = CompareOptions {
+        case_insensitive: false,
+        ..Default::default()
+    };
+    let plan = compare(&s, &t, "mirror", None, false, &opts);
+    assert_eq!(
+        plan.ops
+            .iter()
+            .filter(|o| o.action == Action::Conflict && o.reason.contains("case-collision"))
+            .count(),
+        3,
+        "{:?}",
+        actions(&plan)
+    );
+    let op = plan.ops.iter().find(|o| o.path == "a.txt").unwrap();
+    assert!(op.reason.contains("'A.txt'"), "{}", op.reason);
+    assert!(op.reason.contains("'A.TXT'"), "{}", op.reason);
+}
+
+/// Case-insensitive mode declares the two names to be one file, so they are matched, deduplicated,
+/// and reported as normalization twins — never re-litigated as a collision.
+#[test]
+fn case_insensitive_mode_reports_twins_instead_of_collisions() {
+    let s = snap("windows", vec![file("Foo.txt", "A"), file("foo.txt", "B")]);
+    let t = snap("windows", vec![]);
+    let opts = CompareOptions {
+        case_insensitive: true,
+        ..Default::default()
+    };
+    let plan = compare(&s, &t, "mirror", None, false, &opts);
+    assert!(
+        plan.ops
+            .iter()
+            .all(|o| !o.reason.contains("case-collision")),
+        "{:?}",
+        actions(&plan)
+    );
+    assert_eq!(
+        plan.ops.iter().filter(|o| o.action == Action::Copy).count(),
+        1,
+        "{:?}",
+        actions(&plan)
+    );
+    assert!(plan
+        .ops
+        .iter()
+        .any(|o| o.action == Action::Note && o.reason.contains("duplicate-after-normalization")));
 }
 
 /// A VFS observation records its protocol in `header.os`, while `vfs.name_rules` records the

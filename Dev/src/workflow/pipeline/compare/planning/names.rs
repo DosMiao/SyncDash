@@ -11,6 +11,13 @@ use crate::model::table::TableArtifact;
 use super::super::super::name_safety::{hazard_sides, NameRoles};
 use super::super::matching::name_rules::name_rules_of;
 
+/// Copy and Move are the actions that bring a *new* name into existence on the side they run on.
+/// Update writes a name the destination snapshot already holds, so it is covered by the existing-
+/// entry branch below rather than by the planned-write grouping.
+fn creates_a_destination_name(operation: &Op) -> bool {
+    matches!(operation.action, Action::Copy | Action::Move)
+}
+
 pub(super) fn reject_case_collisions(
     source: &TableArtifact,
     target: &TableArtifact,
@@ -30,8 +37,50 @@ pub(super) fn reject_case_collisions(
                 .push(path);
         }
     }
-    for operation in operations {
-        if !matches!(operation.action, Action::Copy | Action::Move) {
+
+    // Two planned writes can fold onto each other with neither destination present in any
+    // snapshot, and that case is invisible to the entry map above: on a case-insensitive
+    // destination the later write lands on the earlier one and the run reports N successes for one
+    // surviving file. Grouping the planned destinations against each other is the only place that
+    // can see it — apply-side validation keys on the exact byte path, so the twins look distinct
+    // there, and by then the plan is already authorized.
+    //
+    // Every member of a folding group is refused, not all-but-one. Allowing one through would make
+    // the engine pick a winner out of plan order, which is arbitrary and destroys the losers'
+    // bytes without ever saying so; refusing the whole group loses nothing and names the choice
+    // the user has to make.
+    let mut groups: HashMap<(bool, String), Vec<usize>> = HashMap::new();
+    for (index, operation) in operations.iter().enumerate() {
+        if creates_a_destination_name(operation) {
+            groups
+                .entry((operation.side == Side::Target, fold(&operation.path)))
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut collisions: Vec<Option<String>> = vec![None; operations.len()];
+    for indexes in groups.into_values() {
+        if indexes.len() < 2 {
+            continue;
+        }
+        for &index in &indexes {
+            let others = indexes
+                .iter()
+                .filter(|&&other| other != index)
+                .map(|&other| format!("'{}'", operations[other].path))
+                .collect::<Vec<_>>()
+                .join(", ");
+            collisions[index] = Some(format!(
+                "case-collision: writing '{}' and {others} would leave a single file on a \
+                 case-insensitive filesystem, so every one of them is refused rather than \
+                 picking a winner (set case_sensitive = false, or rename one side)",
+                operations[index].path
+            ));
+        }
+    }
+
+    for (index, operation) in operations.iter_mut().enumerate() {
+        if !creates_a_destination_name(operation) {
             continue;
         }
         let is_target = operation.side == Side::Target;
@@ -47,7 +96,12 @@ pub(super) fn reject_case_collisions(
                      case-insensitive filesystem (set case_sensitive = false, or rename one side)",
                     operation.path
                 );
+                continue;
             }
+        }
+        if let Some(reason) = collisions[index].take() {
+            operation.action = Action::Conflict;
+            operation.reason = reason;
         }
     }
 }
