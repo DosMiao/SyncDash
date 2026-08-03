@@ -21,7 +21,6 @@ interface JobEditorLifecycleOptions {
   setSelectedTargetIndex: Dispatch<SetStateAction<number>>;
   refreshJobs: () => Promise<JobDto[]>;
   refreshJobsForAnnouncement: () => Promise<JobListRefreshOutcome>;
-  setJobConfiguration: Dispatch<SetStateAction<JobFull | null>>;
   pushHistory: (path: string) => void;
   setStatus: StatusApi['setMessage'];
 }
@@ -38,7 +37,6 @@ export function useJobEditorLifecycle({
   setSelectedTargetIndex,
   refreshJobs,
   refreshJobsForAnnouncement,
-  setJobConfiguration,
   pushHistory,
   setStatus,
 }: JobEditorLifecycleOptions) {
@@ -60,7 +58,6 @@ export function useJobEditorLifecycle({
       setStatus(`Saved '${saved.name}'${warning}${refresh.suffix}`, 'err');
       return;
     }
-    if (selectedIdentity) setJobConfiguration(job);
     setStatus(
       (saved.effect === 'no_op' ? `No changes to save for '${saved.name}'` : `Saved '${saved.name}'`) + warning,
       warning ? 'err' : 'ok',
@@ -72,7 +69,6 @@ export function useJobEditorLifecycle({
     resetSafetyUi,
     selectedJob?.job_id,
     setEditor,
-    setJobConfiguration,
     setStatus,
   ]);
 

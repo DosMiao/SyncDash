@@ -3,6 +3,18 @@ import type { PlanDto as GeneratedPlanDto } from '#core/types/generated/PlanDto.
 import type { RowMeta } from '#core/types/generated/RowMeta.ts';
 import type { ReviewedRowDecisionDto } from '#core/types/generated/ReviewedRowDecisionDto.ts';
 
+/// Four rules in this module are re-derivations of `syncdash::pipeline::compare::evidence`, which
+/// owns all four. They are here because the window cannot ask the backend per click for a direction
+/// toggle or per keystroke for a six-figure table, and they are held to the engine by
+/// Rust-generated vectors — see `Script/tests/compare-plan-rules.test.mts`.
+///
+/// `reverseOperation` mirrors engine semantics: Apply sends `{index, direction_reversed}` and Rust
+/// reconstructs the executed operation from the authenticated plan, so this copy only ever previews
+/// and totals. `sidePaths` and `rowMetadata` are presentation and wire decoding respectively.
+/// `actionRank` recovers the engine's own grouping so an action sort cannot invent a new one.
+/// Execution membership stays with Run Scope in engine plan order; grouping, sorting, folding, and
+/// path shortening are this layer's alone and have no counterpart in Rust.
+
 export type PlanOperation = Op;
 export type PlanDto = GeneratedPlanDto;
 
@@ -45,25 +57,46 @@ export const MTIME_SLACK_MS = 2000;
 export const MTIME_SLACK_SECONDS = MTIME_SLACK_MS / 1000;
 
 // Materialize and cache reversals only for requested rows; eager copies duplicate large plan graphs.
+// Keyed by the operation because `metas[i]` is defined as one entry per op: a row's retained
+// evidence cannot vary while the row does not.
 const reverseCache = new WeakMap<PlanOperation, PlanOperation | null>();
 
-function reverseOperation(operation: PlanOperation): PlanOperation | null {
+/// Mirrors `pipeline::compare::evidence::reverse_op` arm for arm. Move, directory, conflict, and
+/// note rows are not reversible, and neither is a content Update whose new origin side was never
+/// measured: the reversed row writes the bytes that side was observed to hold, and a sizeless write
+/// row is read as zero bytes by the free-space gate. Returning null is how both languages say so.
+function reverseOperation(operation: PlanOperation, metadata: RowMeta): PlanOperation | null {
   if (reverseCache.has(operation)) return reverseCache.get(operation) ?? null;
   const side = operation.side === 'source' ? 'target' : 'source';
   const reason = `reversed(${operation.reason})`;
   let reversedOperation: PlanOperation | null;
   switch (operation.action) {
     case 'copy':
+      // The content evidence describes a file about to be removed, not written. `size` stays: it is
+      // what the deletion tally is measured in.
       reversedOperation = {
         ...operation, side, action: 'delete', from: null, mtime_ms: null,
         hash: null, link: null, reason,
       };
       break;
-    case 'update':
+    case 'update': {
+      // The other side's content wins, so the row no longer describes this side's bytes: the new
+      // origin is the side that was about to be written. A symlink op publishes a link rather than
+      // content and is measured on neither side, so it keeps its absent size.
+      let size: number | null = null;
+      if (operation.link == null) {
+        const newOrigin = operation.side === 'source' ? metadata.src : metadata.dst;
+        if (!newOrigin) {
+          reversedOperation = null;
+          break;
+        }
+        size = newOrigin.size;
+      }
       reversedOperation = {
-        ...operation, side, from: null, size: null, mtime_ms: null, hash: null, reason,
+        ...operation, side, from: null, size, mtime_ms: null, hash: null, reason,
       };
       break;
+    }
     case 'delete':
       reversedOperation = {
         ...operation, side, action: 'copy', from: null, mtime_ms: null, hash: null, reason,
@@ -76,9 +109,15 @@ function reverseOperation(operation: PlanOperation): PlanOperation | null {
   return reversedOperation;
 }
 
+/// Throws where the engine refuses. Answering with the forward operation instead would offer the
+/// operator the opposite direction from the one they asked for, and Rust rejects the row at Apply
+/// regardless — `canReverseOperation` is the gate every caller has to pass first.
 export function effectiveOperation(plan: PlanDto, rowReversed: boolean[], index: number): PlanOperation {
   const operation = plan.ops[index];
-  return rowReversed[index] ? (reverseOperation(operation) ?? operation) : operation;
+  if (rowReversed[index] !== true) return operation;
+  const reversed = reverseOperation(operation, rowMetadata(plan, index));
+  if (reversed === null) throw new Error(`Compare row ${index + 1} cannot be reversed`);
+  return reversed;
 }
 
 /// Apply sends decisions only; Rust reconstructs operations from the authenticated plan.
@@ -92,6 +131,8 @@ export function buildReviewedRowDecisions(
   }));
 }
 
+/// Decodes the wire compression `pipeline::compare::evidence::implied_row_meta` defines: a `Copy`
+/// row's sole side is already in the row, so its `metas` entry is elided and rebuilt here.
 export function rowMetadata(plan: PlanDto, index: number): RowMeta {
   const metadata = plan.metas?.[index];
   if (metadata) return metadata;
@@ -110,9 +151,10 @@ export function isExecutableOperation(operation: PlanOperation): boolean {
   return RESULT_TYPE_DEFINITIONS[resultTypeOf(operation)].group === 'action';
 }
 
+/// Asks the reversal itself rather than re-listing the actions, so the toggle a row offers and the
+/// row the engine will accept can never be answered by two different rules.
 export function canReverseOperation(plan: PlanDto, index: number): boolean {
-  const action = plan.ops[index].action;
-  return action === 'copy' || action === 'update' || action === 'delete';
+  return reverseOperation(plan.ops[index], rowMetadata(plan, index)) !== null;
 }
 
 export function resultTypeOf(operation: PlanOperation): ResultType {
@@ -128,6 +170,8 @@ export function resultTypeOf(operation: PlanOperation): ResultType {
 
 /// Returns paths that exist at compare time, before executing the operation.
 /// Copies and deletes have one present side; moves use `from` on the executing side.
+/// Mirrors `pipeline::compare::evidence::side_paths`, which the CSV export and File-Manager reveal
+/// read. Shortening a rendered path is this layer's own and deliberately has no Rust counterpart.
 export function sidePaths(operation: PlanOperation): [string | null, string | null] {
   const executesOnTarget = operation.side === 'target';
   switch (operation.action) {
@@ -161,7 +205,7 @@ export function describeRowAction(operation: PlanOperation): { direction: Action
   };
 }
 
-/// Must match the action rank in `Dev/src/workflow/pipeline/compare/planning/mod.rs`; the wire plan does not carry this rank.
+/// Mirrors `Action::plan_rank`; the wire plan records the order it produced but not the rank itself.
 function actionRank(operation: PlanOperation): number {
   switch (operation.action) {
     case 'move': return 0;
@@ -225,7 +269,8 @@ export function rowSize(plan: PlanDto, rowReversed: boolean[], index: number): n
   );
 }
 
-/// Reversed updates clear `Op.size`; transfer bytes therefore come from immutable per-side evidence.
+/// The origin side's immutable evidence is the arbiter: a reversed row's own `size` was rebuilt
+/// from that same measurement, and `Op.size` is only the fallback for a row that retained none.
 export function rowTransferBytes(plan: PlanDto, rowReversed: boolean[], index: number): number {
   const operation = effectiveOperation(plan, rowReversed, index);
   if (operation.action !== 'copy' && operation.action !== 'update') return 0;

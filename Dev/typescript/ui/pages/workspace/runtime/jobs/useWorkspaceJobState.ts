@@ -8,7 +8,7 @@ import type { RootEditorAction } from '#core/application/jobs/rootEditor.ts';
 import { RequestFence } from '#core/application/coordination/requestFence.ts';
 import { addPathToHistory, loadPathHistory, savePathHistory } from '#core/infrastructure/preferences/pathHistory.ts';
 import type { JobDto } from '#core/types/generated/JobDto.ts';
-import type { Job as JobFull } from '#core/types/generated/Job.ts';
+import type { JobDetailDto } from '#core/types/generated/JobDetailDto.ts';
 import type { RunRecord } from '#core/types/generated/RunRecord.ts';
 import type { StatusApi } from '#ui/shared/status/useStatus.ts';
 import type { JobIdentitySnapshot } from '../../model/workspacePageModel.ts';
@@ -40,7 +40,10 @@ export function useWorkspaceJobState({
   dispatchRootEditor,
   setStatus,
 }: WorkspaceJobStateOptions) {
-  const [jobConfiguration, setJobConfiguration] = useState<JobFull | null>(null);
+  // One payload, one state: `get_job` answers both what the job is configured to do and what the
+  // engine derived from its target phrases, and the pill row states the two side by side. Holding
+  // them apart would let the row mix a fresh configuration with a stale peer verdict.
+  const [jobDetail, setJobDetail] = useState<JobDetailDto | null>(null);
   const [latestRunByJobId, setLatestRunByJobId] = useState<Record<string, RunRecord>>({});
   const latestRunSummaryFence = useRef(new RequestFence());
   const [appVersion, setAppVersion] = useState('');
@@ -146,14 +149,17 @@ export function useWorkspaceJobState({
 
   useWorkspaceBootstrap({ refreshJobs, refreshLatestRunSummaries, setJobsDir, setAppVersion, setStatus });
 
+  // The sole writer of the detail snapshot. Every mutation re-reads the registry, which hands back
+  // a fresh `selectedJob`, so this effect re-runs and the derived peer verdict is never carried
+  // over from the phrase the job had before the save.
   useEffect(() => {
-    if (!selectedJob) { setJobConfiguration(null); return; }
+    if (!selectedJob) { setJobDetail(null); return; }
     let live = true;
     jobsIpc.getJob(selectedJob.name).then((detail) => {
-      if (live) setJobConfiguration(detail.job);
+      if (live) setJobDetail(detail);
     }).catch((error) => {
       if (!live) return;
-      setJobConfiguration(null);
+      setJobDetail(null);
       setStatus(`Failed to load '${selectedJob.name}' settings: ${error}`, 'err');
     });
     return () => { live = false; };
@@ -163,7 +169,8 @@ export function useWorkspaceJobState({
     appVersion,
     describeMutationFailure,
     expireDeletedJobState,
-    jobConfiguration,
+    jobConfiguration: jobDetail?.job ?? null,
+    jobPeerLink: jobDetail?.peer_link ?? null,
     jobsDir,
     latestRunByJobId,
     pathHistory,
@@ -172,6 +179,5 @@ export function useWorkspaceJobState({
     reconcileWorkspaceJob,
     refreshJobsForAnnouncement,
     refreshLatestRunSummaries,
-    setJobConfiguration,
   };
 }

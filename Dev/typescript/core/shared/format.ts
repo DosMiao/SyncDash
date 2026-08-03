@@ -11,7 +11,15 @@ export function formatCount(value: number): string {
   return COUNT_FORMAT.format(value);
 }
 
-/// Must remain identical to `foundation::fmt::human_bytes`: binary units and one decimal above bytes.
+/// Byte count → `1.5 MiB`, spelled the way `foundation::fmt::human_bytes` spells it.
+///
+/// Rust is the arbiter, and the rule it applies at one decimal is round-half-to-even, because
+/// `format!("{v:.1}")` rounds the exact binary value that way. Ties are reachable rather than
+/// theoretical: `n / 1024^k` is a dyadic rational and therefore exact in f64, so the fraction can
+/// land on `.25` or `.75` — the only two dyadic tie fractions. `toFixed` breaks both ties away from
+/// zero, which spelled every `.25` one tenth higher than the CLI did for the very same run total.
+/// The tie test multiplies by 4 and 2, which are exponent shifts and so exact; multiplying by 10
+/// would introduce a rounding step into the test for the rounding.
 /// Iteration avoids JavaScript's 32-bit bitwise-operand limit for TiB values.
 export function humanSize(bytes?: number): string {
   if (bytes === undefined) return '';
@@ -22,7 +30,15 @@ export function humanSize(bytes?: number): string {
     scaledBytes /= 1024;
     unitIndex++;
   }
-  return unitIndex === 0 ? `${bytes} B` : `${scaledBytes.toFixed(1)} ${units[unitIndex]}`;
+  if (unitIndex === 0) return `${bytes} B`;
+  const isTie = Number.isInteger(scaledBytes * 4) && !Number.isInteger(scaledBytes * 2);
+  if (isTie) {
+    const whole = Math.floor(scaledBytes);
+    // `.25` sits between the 2 and 3 tenth, `.75` between the 7 and 8: the even tenth is 2 and 8.
+    const evenTenth = scaledBytes - whole < 0.5 ? 2 : 8;
+    return `${whole}.${evenTenth} ${units[unitIndex]}`;
+  }
+  return `${scaledBytes.toFixed(1)} ${units[unitIndex]}`;
 }
 
 export function formatFileTimestamp(timestampMs: number): string {

@@ -10,6 +10,8 @@ import { Sheet } from '#ui/shared/components/overlays/Sheet.tsx';
 import type { JobDto } from '#core/types/generated/JobDto.ts';
 
 import {
+  flaggedDeletionSide,
+  formatDeletionShare,
   formatPlanShare,
   planShareIsHigh,
   type ApplyReviewTotals,
@@ -27,18 +29,18 @@ interface ConfirmSheetProps {
 export function ConfirmSheet(props: ConfirmSheetProps) {
   const { job, totals, reviewState, onCancel, onConfirm, onReviewAgain } = props;
   const blocked = reviewState.review?.status === 'blocked';
-  // The same share the engine reports and the job's Gates chip advertises. It colors the row and
-  // names the number; it never decides whether Apply may run.
+  // The deletion share is the engine's rule, recomputed here over the reviewed rows so the sheet
+  // can mark the row before the preflight answers: `delete` rows only, per side, against that
+  // side's own snapshot entry count. It colors the row and names the number; it never decides
+  // whether Apply may run.
   //
-  // The Copy/Update row keys on updates alone: an update overwrites an entry the target already
-  // has, while a copy adds a name it does not, so only the update half can displace anything.
+  // The overwrite and move shares are the panel's own, and the engine defines no rule for either —
+  // they reuse `max_delete_ratio` as a threshold and measure against the target's entries. The
+  // Copy/Update row keys on updates alone: an update overwrites an entry the target already has,
+  // while a copy adds a name it does not, so only the update half can displace anything.
   const updateIsHigh = planShareIsHigh(totals.updateCount, totals.targetEntries, job.max_delete_ratio);
   const moveIsHigh = planShareIsHigh(totals.moveCount, totals.targetEntries, job.max_delete_ratio);
-  const deleteIsHigh = planShareIsHigh(
-    totals.deleteCount,
-    totals.targetEntries,
-    job.max_delete_ratio,
-  );
+  const flaggedDeletion = flaggedDeletionSide(totals, job.max_delete_ratio);
   const canApply = operationReviewCanSubmit(reviewState);
   const actionLabel = reviewState.phase === 'reviewing'
     ? 'Reviewing…'
@@ -92,10 +94,8 @@ export function ConfirmSheet(props: ConfirmSheetProps) {
       <div className={'mrow' + (totals.deleteCount ? ' danger' : '')}>
         <span>Delete (Into the Trash)</span><b>{totals.deleteCount}</b>
         <span className="dim">{totals.deleteCount ? humanSize(totals.deletionBytes) : ''}</span>
-        {deleteIsHigh && (
-          <span className="dim">
-            {formatPlanShare(totals.deleteCount, totals.targetEntries)} deleted
-          </span>
+        {flaggedDeletion && (
+          <span className="dim">{formatDeletionShare(flaggedDeletion)} deleted</span>
         )}
       </div>
       {totals.reversedCount > 0 && (

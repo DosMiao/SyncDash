@@ -203,6 +203,7 @@ export function createWorkspaceMainPresentation({
       job: session.selectedJob,
       rootEditor: roots.selectedRootEditor,
       jobConfiguration: jobState.jobConfiguration,
+      peerLink: jobState.jobPeerLink,
       busy,
       reviewing: reviewBusy,
       selectedTargetIndex: session.selectedTargetIndex,

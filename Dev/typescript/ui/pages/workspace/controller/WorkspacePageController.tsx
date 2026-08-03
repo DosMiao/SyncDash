@@ -122,7 +122,6 @@ export function WorkspacePageController() {
     reconcileWorkspaceJob,
     refreshJobsForAnnouncement,
     refreshLatestRunSummaries,
-    setJobConfiguration,
   } = jobState;
   const {
     preferences: workspacePreferences,
@@ -362,7 +361,6 @@ export function WorkspacePageController() {
     setSelectedTargetIndex,
     refreshJobs,
     refreshJobsForAnnouncement,
-    setJobConfiguration,
     pushHistory,
     setStatus,
   });
