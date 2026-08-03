@@ -11,9 +11,9 @@ import type {
   WhenFinishedAction,
 } from '#core/application/progress/postRunActions.ts';
 import type { RunState } from '#core/application/progress/runstate.ts';
-import type { PowerActionFailure } from '../../model/progressPresentation.ts';
-import { progressPlatformActions } from '../actions/progressPlatformActions.ts';
-import type { PowerActionRequest } from '../progressRuntimeTypes.ts';
+import type { PowerActionFailure } from '../model/progressPresentation.ts';
+import { progressPlatformActions } from './progressPlatformActions.ts';
+import type { PowerActionRequest } from './progressRuntimeTypes.ts';
 
 interface ProgressPowerActionsOptions {
   runStateRef: MutableRefObject<RunState>;

@@ -226,4 +226,7 @@ Use the equivalent `builder.bat` commands on Windows. Tiers `1`, `2`, and `3` ar
 Backend behavior is checked by `Dev/src/base/fs/vfs/conformance.rs`; end-to-end mode behavior lives
 in `Dev/src/application/run/e2e/`. Live SFTP, SMB, FTP, FTPS, and exFAT lanes require their
 documented `SYNCDASH_E2E_*` environment variables and an explicit
-`cargo test -- --ignored` invocation.
+`cargo test -- --ignored` invocation; the SMB conformance lanes read `SYNCDASH_SMB_ROOT` and
+`SYNCDASH_SMB_URL` instead. `--ignored` also reaches two lanes that take no environment variable:
+the macOS FSEvents delivery acceptance test and the OS-credential-store round trip, which touches
+the real credential store and is meant to be run explicitly once per machine.

@@ -12,8 +12,9 @@ import type {
 } from '#core/application/progress/postRunActions.ts';
 import type { ProgressRateSample, RunProgressEvent, RunState } from '#core/application/progress/runstate.ts';
 import { activeElapsedMs, endStage, newRunState, startStage } from '#core/application/progress/runstate.ts';
-import { formatStageProgress, type PowerActionFailure } from '../../model/progressPresentation.ts';
-import type { PauseRequest, PendingLaunch, StopRequest, StopState } from '../progressRuntimeTypes.ts';
+import { formatStageProgress } from '../model/progressPresentation.ts';
+import type { PausePending, PowerActionFailure, StopState } from '../model/progressPresentation.ts';
+import type { PauseRequest, PendingLaunch, StopRequest } from './progressRuntimeTypes.ts';
 
 interface RunRejectionEvent {
   launch_id: number;
@@ -29,7 +30,7 @@ interface ProgressRunEventsOptions {
   autoCloseEnabledRef: MutableRefObject<boolean>;
   whenFinishedActionRef: MutableRefObject<WhenFinishedAction>;
   setRunRejectionMessage: Dispatch<SetStateAction<string | null>>;
-  setPausePending: Dispatch<SetStateAction<'pause' | 'resume' | null>>;
+  setPausePending: Dispatch<SetStateAction<PausePending>>;
   setStopState: Dispatch<SetStateAction<StopState>>;
   setScheduledAutoClose: Dispatch<SetStateAction<AutoCloseRequest | null>>;
   setPowerActionCountdown: Dispatch<SetStateAction<PowerActionCountdown | null>>;

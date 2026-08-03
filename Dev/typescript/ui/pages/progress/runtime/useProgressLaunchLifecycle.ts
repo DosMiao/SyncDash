@@ -2,8 +2,8 @@ import { useCallback, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
 import { newRunState } from '#core/application/progress/runstate.ts';
 import type { RunState } from '#core/application/progress/runstate.ts';
-import { progressPlatformActions } from '../actions/progressPlatformActions.ts';
-import type { PendingLaunch } from '../progressRuntimeTypes.ts';
+import { progressPlatformActions } from './progressPlatformActions.ts';
+import type { PendingLaunch } from './progressRuntimeTypes.ts';
 
 interface ProgressLaunchLifecycleOptions {
   runStateRef: MutableRefObject<RunState>;

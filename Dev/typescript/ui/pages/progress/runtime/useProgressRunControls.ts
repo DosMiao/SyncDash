@@ -1,8 +1,9 @@
 import { useCallback, useRef, useState } from 'react';
 import type { MutableRefObject } from 'react';
 import type { RunState } from '#core/application/progress/runstate.ts';
-import { progressPlatformActions } from '../actions/progressPlatformActions.ts';
-import type { PauseRequest, StopRequest, StopState } from '../progressRuntimeTypes.ts';
+import { progressPlatformActions } from './progressPlatformActions.ts';
+import type { PausePending, StopState } from '../model/progressPresentation.ts';
+import type { PauseRequest, StopRequest } from './progressRuntimeTypes.ts';
 
 interface ProgressRunControlsOptions {
   runStateRef: MutableRefObject<RunState>;
@@ -17,7 +18,7 @@ export function useProgressRunControls({
   reportControlError,
 }: ProgressRunControlsOptions) {
   const pauseRequestRef = useRef<PauseRequest | null>(null);
-  const [pausePending, setPausePending] = useState<'pause' | 'resume' | null>(null);
+  const [pausePending, setPausePending] = useState<PausePending>(null);
   const stopRequestRef = useRef<StopRequest | null>(null);
   const [stopState, setStopState] = useState<StopState>('idle');
 
