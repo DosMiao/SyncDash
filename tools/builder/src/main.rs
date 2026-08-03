@@ -392,7 +392,7 @@ fn build_app_self(runtime: &Runtime) -> BuildResult<()> {
         })?;
         let app = runtime.newest_entry(&release_dir(runtime).join("bundle/macos"), ".app")?;
         let installed = runtime.install_macos_app(&app, &[BUNDLE_ID])?;
-        runtime.run("open", [installed.as_os_str()], runtime.root(), &[])
+        runtime.launch_macos_app(&installed)
     })
 }
 
