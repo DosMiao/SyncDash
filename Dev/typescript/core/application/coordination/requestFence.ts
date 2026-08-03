@@ -18,12 +18,6 @@ export class RequestFence {
     this.generation += 1;
   }
 
-  invalidateOwner(owner: string): boolean {
-    if (this.owner !== owner) return false;
-    this.invalidate();
-    return true;
-  }
-
   owns(ticket: RequestTicket): boolean {
     return ticket.owner === this.owner && ticket.generation === this.generation;
   }

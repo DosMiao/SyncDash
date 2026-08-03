@@ -27,6 +27,7 @@ import {
 } from '#core/infrastructure/preferences/compareWorkspacePreferences.ts';
 import { createCompareWorkspace } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
 import { deriveWorkspaceExecutionAccess } from '#core/application/compare-workspace/compareWorkspaceExecution.ts';
+import { denyingStorage, memoryStorage } from './preferenceStorageDouble.mts';
 
 function operation(path: string, action: PlanOperation['action'] = 'copy'): PlanOperation {
   return { side: 'target', action, path, reason: 'fixture' };
@@ -137,26 +138,23 @@ test('scope masks normalize one shared draft format', () => {
   assert.equal(isMaskMatchResult([true, 'false'], 2), false);
 });
 
-test('compare workspace preferences migrate once and write one coherent preference set', () => {
-  const values = new Map<string, string>([['sd.ov', 'open']]);
-  const storage = {
-    getItem: (key: string) => values.get(key) ?? null,
-    setItem: (key: string, value: string) => { values.set(key, value); },
-    removeItem: (key: string) => { values.delete(key); },
-  };
+test('a first load seeds the defaults and writes one coherent preference set', () => {
+  const storage = memoryStorage();
   const loaded = loadCompareWorkspacePreferences(storage);
   const preferences = loaded.preferences;
   assert.equal(loaded.warning, null);
-  assert.equal(preferences.scopePanelCollapsed, false);
-  assert.deepEqual(JSON.parse(values.get('sd.compare-workspace-preferences.v1')!), preferences);
-  assert.equal(values.has('sd.ov'), false);
+  assert.deepEqual(preferences, { grouped: true, pathMode: 'relative', scopePanelCollapsed: true });
+  assert.deepEqual(
+    JSON.parse(storage.values.get('sd.compare-workspace-preferences.v1')!),
+    preferences,
+  );
   assert.equal(saveCompareWorkspacePreferences(storage, {
     ...preferences,
     scopePanelCollapsed: true,
     grouped: false,
     pathMode: 'full',
   }), null);
-  assert.deepEqual(JSON.parse(values.get('sd.compare-workspace-preferences.v1')!), {
+  assert.deepEqual(JSON.parse(storage.values.get('sd.compare-workspace-preferences.v1')!), {
     scopePanelCollapsed: true,
     grouped: false,
     pathMode: 'full',
@@ -164,11 +162,7 @@ test('compare workspace preferences migrate once and write one coherent preferen
 });
 
 test('compare workspace preference storage failures return defaults and diagnostics', () => {
-  const storage = {
-    getItem: () => { throw new Error('storage denied'); },
-    setItem: () => { throw new Error('storage denied'); },
-    removeItem: () => { throw new Error('storage denied'); },
-  };
+  const storage = denyingStorage('storage denied');
   const loaded = loadCompareWorkspacePreferences(storage);
   assert.equal(loaded.preferences.pathMode, 'relative');
   assert.match(loaded.warning ?? '', /storage denied/);

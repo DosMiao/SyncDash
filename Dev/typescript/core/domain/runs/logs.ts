@@ -6,8 +6,6 @@ import type { RunRecord } from '#core/types/generated/RunRecord.ts';
 export type LogArtifactView = Exclude<LogArtifactKind, 'summary'>;
 export type LogLevelFilter = LogLevel | 'all';
 
-export type { LogLevel };
-
 export const LOG_ARTIFACT_VIEW_OPTIONS: ReadonlyArray<readonly [LogArtifactView, string]> = [
   ['run', 'Events'], ['errors', 'Errors'], ['items', 'Items'], ['plan', 'Plan'],
 ];

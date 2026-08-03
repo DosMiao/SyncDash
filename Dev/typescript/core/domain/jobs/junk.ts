@@ -20,11 +20,11 @@ import type { JunkPresetDto } from '#core/types/generated/JunkPresetDto.ts';
 ///
 /// This is a **line identity** test, not mask matching. Whether two globs mean the same thing is not
 /// guessed at here; mask semantics keep their single implementation in Rust (see `maskMatch`).
-export function foldExcludeEntry(s: string): string {
+function foldExcludeEntry(s: string): string {
   return s.trim().normalize('NFC').toUpperCase().replace(/\\/g, '/');
 }
 
-export function sameExcludeEntry(a: string, b: string): boolean {
+function sameExcludeEntry(a: string, b: string): boolean {
   return foldExcludeEntry(a) === foldExcludeEntry(b);
 }
 

@@ -2,12 +2,7 @@ import {
   defaultCompareWorkspacePreferences,
   type CompareWorkspacePreferences,
 } from '#core/application/compare-workspace/compareWorkspaceModel.ts';
-
-interface PreferenceStorage {
-  getItem(key: string): string | null;
-  setItem(key: string, value: string): void;
-  removeItem(key: string): void;
-}
+import { preferenceErrorMessage, type PreferenceStorage } from './preferenceStorage.ts';
 
 export interface CompareWorkspacePreferenceLoad {
   preferences: CompareWorkspacePreferences;
@@ -15,10 +10,6 @@ export interface CompareWorkspacePreferenceLoad {
 }
 
 const PREFERENCES_KEY = 'sd.compare-workspace-preferences.v1';
-const LEGACY_GROUPING_KEY = 'sd.grouped';
-const LEGACY_PATH_MODE_KEY = 'sd.pathmode';
-const LEGACY_RUN_SCOPE_PANEL_KEY = 'sd.scope';
-const LEGACY_OVERVIEW_PANEL_KEY = 'sd.ov';
 
 function validatePreferences(value: unknown): CompareWorkspacePreferences | null {
   if (!value || typeof value !== 'object') return null;
@@ -31,10 +22,6 @@ function validatePreferences(value: unknown): CompareWorkspacePreferences | null
     pathMode: record.pathMode,
     scopePanelCollapsed: record.scopePanelCollapsed,
   };
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 export function loadCompareWorkspacePreferences(
@@ -51,32 +38,20 @@ export function loadCompareWorkspacePreferences(
       };
     }
 
-    const legacyScopePanel = storage.getItem(LEGACY_RUN_SCOPE_PANEL_KEY)
-      ?? storage.getItem(LEGACY_OVERVIEW_PANEL_KEY);
-    const preferences: CompareWorkspacePreferences = {
-      grouped: storage.getItem(LEGACY_GROUPING_KEY) !== 'off',
-      pathMode: storage.getItem(LEGACY_PATH_MODE_KEY) === 'full' ? 'full' : 'relative',
-      scopePanelCollapsed: legacyScopePanel !== 'open',
-    };
+    const preferences = defaultCompareWorkspacePreferences;
     try {
       storage.setItem(PREFERENCES_KEY, JSON.stringify(preferences));
-      for (const key of [
-        LEGACY_GROUPING_KEY,
-        LEGACY_PATH_MODE_KEY,
-        LEGACY_RUN_SCOPE_PANEL_KEY,
-        LEGACY_OVERVIEW_PANEL_KEY,
-      ]) storage.removeItem(key);
     } catch (error) {
       return {
         preferences,
-        warning: `Compare workspace preferences were loaded but could not be migrated: ${errorMessage(error)}`,
+        warning: `Default Compare workspace preferences could not be stored: ${preferenceErrorMessage(error)}`,
       };
     }
     return { preferences, warning: null };
   } catch (error) {
     return {
       preferences: defaultCompareWorkspacePreferences,
-      warning: `Compare workspace preferences could not be loaded: ${errorMessage(error)}`,
+      warning: `Compare workspace preferences could not be loaded: ${preferenceErrorMessage(error)}`,
     };
   }
 }
@@ -89,6 +64,6 @@ export function saveCompareWorkspacePreferences(
     storage.setItem(PREFERENCES_KEY, JSON.stringify(preferences));
     return null;
   } catch (error) {
-    return `Compare workspace preferences could not be saved: ${errorMessage(error)}`;
+    return `Compare workspace preferences could not be saved: ${preferenceErrorMessage(error)}`;
   }
 }

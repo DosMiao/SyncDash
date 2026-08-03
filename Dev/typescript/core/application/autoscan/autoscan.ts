@@ -1,7 +1,7 @@
 import type { AutoScanStatusDto } from '#core/types/generated/AutoScanStatusDto.ts';
 import type { CompareOwner } from '#core/types/generated/CompareOwner.ts';
 
-export const autoScanTicketLedgerCapacity = 64;
+const autoScanTicketLedgerCapacity = 64;
 
 export interface AutoScanTicket {
   generation: number;

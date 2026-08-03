@@ -6,31 +6,18 @@ import type { CompareScopeExecutionStatusDto } from '#core/types/generated/Compa
 import type { CompareWorkspaceLookupDto } from '#core/types/generated/CompareWorkspaceLookupDto.ts';
 import type { CompareWorkspaceSnapshotDto } from '#core/types/generated/CompareWorkspaceSnapshotDto.ts';
 import {
-  compareResultKey,
-  compareScopeFromIdentity,
   compareScopeKey,
-  createCompareWorkspace,
   defaultCompareWorkspacePreferences,
-  sameCompareScope,
 } from './compareWorkspaceModel.ts';
 import type {
   CompareActivityOrigin,
   CompareResultKey,
   CompareScopeKey,
-  CompareScopeWorkspace,
   CompareWorkspace,
   CompareWorkspacePreferences,
   CompareWorkspaceRepository,
-  ScopeRestorationState,
-  StagedCompareCandidate,
 } from './compareWorkspaceModel.ts';
-import {
-  deriveWorkspaceExecutionAccess,
-  isConsistentCompareExecutionStatus,
-  isConsistentComparePublication,
-  isConsistentCompareWorkspaceSnapshot,
-  reconcileExecutionStatus,
-} from './compareWorkspaceExecution.ts';
+import { reconcileExecutionStatus } from './compareWorkspaceExecution.ts';
 import { reduceCompareWorkspaceReview } from './compareWorkspaceReview.ts';
 import type { CompareWorkspaceReviewAction } from './compareWorkspaceReview.ts';
 
@@ -89,8 +76,8 @@ type CompareWorkspaceRepositoryAction =
     reason: 'job_deleted';
   };
 import { createScopeWorkspace, promoteScope, replaceExactWorkspace, replaceExecutableActiveWorkspace, replaceScope } from './repository/scopeIndex.ts';
-import { beginExactWorkspaceLookup, completeExactWorkspaceLookup, exactWorkspaceLookupProblem, scopeWorkspaceLookupProblem } from './repository/lookup.ts';
-import { expireJobExecution, finishPendingRestoration, markWorkspaceMissing, refreshPublishedWorkspace } from './repository/lifecycle.ts';
+import { beginExactWorkspaceLookup, completeExactWorkspaceLookup } from './repository/lookup.ts';
+import { expireJobExecution } from './repository/lifecycle.ts';
 import { completeScopeRestoration, publishAutoScanWorkspace, publishManualWorkspace } from './repository/publication.ts';
 
 export type CompareWorkspaceAction = CompareWorkspaceRepositoryAction | CompareWorkspaceReviewAction;

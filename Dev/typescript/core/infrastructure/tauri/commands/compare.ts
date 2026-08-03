@@ -10,9 +10,6 @@ import type { CompareWorkspaceSnapshotDto } from '#core/types/generated/CompareW
 import type { CsvExportDto } from '#core/types/generated/CsvExportDto.ts';
 import type { CsvRowPresentationDto } from '#core/types/generated/CsvRowPresentationDto.ts';
 import type { IdenticalPage } from '#core/types/generated/IdenticalPage.ts';
-import type { IdenticalRow } from '#core/types/generated/IdenticalRow.ts';
-
-export type { IdenticalPage, IdenticalRow };
 
 export const compareJob = (authorizationToken: string) =>
   invoke<CompareWorkspaceSnapshotDto>('compare_job', compareAuthorizationArgs(authorizationToken));

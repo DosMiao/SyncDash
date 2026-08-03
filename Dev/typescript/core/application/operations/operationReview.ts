@@ -191,41 +191,23 @@ export function operationReviewReducer(
   }
 }
 
-/**
- * The review panel presents evidence and takes no decisions from the operator, so an approval has
- * nothing to carry. The type stays as the seam the sheet and its controller already speak through.
- */
-export type ApprovalChoices = Record<string, never>;
-
-export const EMPTY_APPROVAL_CHOICES: ApprovalChoices = {};
-
 export function isConfirmationReview(review: OperationReviewDto): review is ConfirmationReview {
   return review.status === 'interactive_apply_confirmation_required';
 }
 
-export function normalizeApprovalChoices(
-  _review: ConfirmationReview,
-  _choices: ApprovalChoices,
-): ApprovalChoices {
-  return EMPTY_APPROVAL_CHOICES;
-}
-
-export function operationApprovalFromChoices(
-  _review: ConfirmationReview,
-  _choices: ApprovalChoices,
-): OperationApprovalDto {
-  return { operation: 'interactive_apply' };
-}
+/**
+ * The approval carries no conditions: the review panel presents evidence, not choices. It names the
+ * one challenge kind it answers, mirroring `ReviewApproval::InteractiveApply` on the Rust side. The
+ * challenge id passed alongside it is what binds a token to the exact reviewed plan.
+ */
+export const INTERACTIVE_APPLY_APPROVAL: OperationApprovalDto = { operation: 'interactive_apply' };
 
 /**
  * Nothing in the review panel withholds approval any more. The capability list and the plan-share
  * warnings are there so the operator knows what this run will do; a review that reached the
  * confirmation stage at all is one the server is willing to authorize.
  */
-export function reviewAllowsApproval(
-  review: OperationReviewDto,
-  _choices: ApprovalChoices,
-): boolean {
+export function reviewAllowsApproval(review: OperationReviewDto): boolean {
   switch (review.status) {
     case 'blocked':
       return false;
@@ -244,7 +226,6 @@ export function directAuthorization(review: OperationReviewDto): AuthorizationDt
 
 export function operationReviewCanSubmit(
   state: OperationReviewState,
-  choices: ApprovalChoices,
   nowMs = Date.now(),
 ): boolean {
   const expiresAtMs = operationReviewExpiresAtMs(state);
@@ -252,7 +233,7 @@ export function operationReviewCanSubmit(
     return false;
   }
   if (state.phase === 'authorized') return true;
-  return state.phase === 'ready' && reviewAllowsApproval(state.review, choices);
+  return state.phase === 'ready' && reviewAllowsApproval(state.review);
 }
 
 export function operationReviewExpiresAtMs(state: OperationReviewState): number | null {

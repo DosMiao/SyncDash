@@ -1,7 +1,4 @@
-import type { ItemOutcome } from '#core/types/generated/ItemOutcome.ts';
-import type { LogLevel } from '#core/types/generated/LogLevel.ts';
 import type { Phase } from '#core/types/generated/Phase.ts';
-import type { PhaseStatus } from '#core/types/generated/PhaseStatus.ts';
 import type { RunEventDto } from '#core/types/generated/RunEventDto.ts';
 
 /**
@@ -18,10 +15,6 @@ export type RunSummaryEvent = Extract<RunEventDto, { kind: 'summary' }>;
 
 /** The variants that carry item/byte counters. */
 export type RunCountedEvent = Extract<RunEventDto, { items_total: number }>;
-
-export function isSummaryEvent(event: RunEventEnvelope): event is RunSummaryEvent {
-  return event.kind === 'summary';
-}
 
 export function isCountedEvent(event: RunEventEnvelope): event is RunCountedEvent {
   return event.kind === 'phase_start' || event.kind === 'totals'

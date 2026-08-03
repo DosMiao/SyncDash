@@ -5,7 +5,6 @@ import type { PhaseStatus } from '#core/types/generated/PhaseStatus.ts';
 
 export type RunPhase = Phase;
 export type RunProgressEvent = RunEventEnvelope;
-export type { RunSummaryEvent } from '#core/domain/runs/runEvents.ts';
 
 export const PHASE_LABELS: Record<RunPhase, string> = {
   'scan-source': 'Scan source',
@@ -14,7 +13,6 @@ export const PHASE_LABELS: Record<RunPhase, string> = {
   'apply': 'Sync',
   'pack': 'Pack',
   'ship': 'Transfer',
-  'verify': 'Verify',
   'refresh': 'Refresh archive',
   'archive': 'Save archive',
 };

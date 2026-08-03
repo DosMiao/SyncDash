@@ -15,38 +15,8 @@ import {
   loadZoomPreference,
   saveZoomPreference,
 } from '#core/infrastructure/preferences/zoomPreference.ts';
-
-function storage(value: string | null): Storage {
-  return {
-    getItem: () => value,
-    setItem: () => {},
-    removeItem: () => {},
-    clear: () => {},
-    key: () => null,
-    length: value === null ? 0 : 1,
-  };
-}
-
-interface Deferred {
-  promise: Promise<void>;
-  resolve(): void;
-  reject(error: unknown): void;
-}
-
-function deferred(): Deferred {
-  let resolvePromise!: () => void;
-  let rejectPromise!: (error: unknown) => void;
-  const promise = new Promise<void>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  return { promise, resolve: resolvePromise, reject: rejectPromise };
-}
-
-async function flushAsyncWork(): Promise<void> {
-  await Promise.resolve();
-  await Promise.resolve();
-}
+import { deferred, flushMicrotasks, type Deferred } from './asyncSettlement.mts';
+import { denyingStorage, memoryStorage } from './preferenceStorageDouble.mts';
 
 function initialAuthorityState(): ZoomAuthorityState {
   return createInitialZoomAuthorityState({
@@ -57,32 +27,29 @@ function initialAuthorityState(): ZoomAuthorityState {
 }
 
 test('zoom preference accepts only supported discrete factors', () => {
-  assert.deepEqual(loadZoomPreference(storage(null)), {
+  assert.deepEqual(loadZoomPreference(memoryStorage()), {
     factor: 1,
     persistedFactor: null,
     warning: null,
   });
-  assert.deepEqual(loadZoomPreference(storage('1.25')), {
+  assert.deepEqual(loadZoomPreference(memoryStorage({ 'sd.zoom': '1.25' })), {
     factor: 1.25,
     persistedFactor: 1.25,
     warning: null,
   });
-  const invalid = loadZoomPreference(storage('1.234'));
+  const invalid = loadZoomPreference(memoryStorage({ 'sd.zoom': '1.234' }));
   assert.equal(invalid.factor, 1);
   assert.equal(invalid.persistedFactor, null);
   assert.match(invalid.warning ?? '', /invalid interface zoom/i);
 });
 
 test('zoom storage failures are explicit and stepping rejects unknown state', () => {
-  const failingRead = storage(null);
-  failingRead.getItem = () => { throw new Error('read denied'); };
-  const loaded = loadZoomPreference(failingRead);
+  const loaded = loadZoomPreference(denyingStorage('read denied'));
   assert.equal(loaded.factor, 1);
   assert.equal(loaded.persistedFactor, null);
   assert.match(loaded.warning ?? '', /read denied/);
 
-  const failingWrite = storage(null);
-  failingWrite.setItem = () => { throw new Error('write denied'); };
+  const failingWrite = denyingStorage('write denied');
   assert.match(saveZoomPreference(1.25, failingWrite) ?? '', /write denied/);
   assert.throws(() => saveZoomPreference(1.234, failingWrite), /Invalid interface zoom factor/);
 
@@ -117,7 +84,7 @@ test('rapid requests coalesce behind a monotonic fence and persist only the late
   assert.deepEqual(applications.map((application) => application.factor), [1.1]);
 
   applications[0].completion.resolve();
-  await flushAsyncWork();
+  await flushMicrotasks();
   assert.deepEqual(applications.map((application) => application.factor), [1.1, 1.25]);
   assert.equal(states.some((state) => state.appliedFactor === 1.1), false);
   assert.deepEqual(authority.getState(), {
@@ -130,7 +97,7 @@ test('rapid requests coalesce behind a monotonic fence and persist only the late
   assert.deepEqual(persistedFactors, []);
 
   applications[1].completion.resolve();
-  await flushAsyncWork();
+  await flushMicrotasks();
   assert.deepEqual(authority.getState(), {
     desiredFactor: 1.25,
     appliedFactor: 1.25,
@@ -160,7 +127,7 @@ test('restoring a persisted factor applies it without rewriting storage', async 
   });
 
   authority.requestZoom(1.25, { persist: false, reason: 'restore' });
-  await flushAsyncWork();
+  await flushMicrotasks();
 
   assert.equal(persistenceCalls, 0);
   assert.deepEqual(authority.getState(), {
@@ -193,9 +160,9 @@ test('webview failure never persists and stale failure cannot regress or report'
   authority.requestZoom(1.1, { persist: true, reason: 'change' });
   authority.requestZoom(1.25, { persist: true, reason: 'change' });
   applications[0].completion.reject(new Error('stale failure'));
-  await flushAsyncWork();
+  await flushMicrotasks();
   applications[1].completion.reject(new Error('latest failure'));
-  await flushAsyncWork();
+  await flushMicrotasks();
 
   assert.deepEqual(persistedFactors, []);
   assert.equal(failures.length, 1);
@@ -227,10 +194,10 @@ test('latest failure reconciles to a successful intermediate webview factor', as
   authority.requestZoom(1.1, { persist: true, reason: 'change' });
   authority.requestZoom(1.25, { persist: true, reason: 'change' });
   applications[0].resolve();
-  await flushAsyncWork();
+  await flushMicrotasks();
   assert.equal(displayedFactors.includes(1.1), false);
   applications[1].reject(new Error('latest failure'));
-  await flushAsyncWork();
+  await flushMicrotasks();
 
   assert.equal(authority.getState().desiredFactor, 1.1);
   assert.equal(authority.getState().appliedFactor, 1.1);
@@ -247,7 +214,7 @@ test('persistence failure keeps the successfully applied session zoom', async ()
   });
 
   authority.requestZoom(1.4, { persist: true, reason: 'change' });
-  await flushAsyncWork();
+  await flushMicrotasks();
 
   assert.deepEqual(authority.getState(), {
     desiredFactor: 1.4,

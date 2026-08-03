@@ -68,7 +68,7 @@ export const emptyRootEditorRepository: RootEditorRepository = {
   workspaces: [],
 };
 
-export function rootEditorKey(owner: Pick<RootEditorOwner, 'jobId' | 'targetIndex'>): RootEditorKey {
+function rootEditorKey(owner: Pick<RootEditorOwner, 'jobId' | 'targetIndex'>): RootEditorKey {
   return JSON.stringify([owner.jobId, owner.targetIndex]) as RootEditorKey;
 }
 

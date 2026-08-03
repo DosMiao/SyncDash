@@ -40,6 +40,10 @@ export const SORT_LABEL: Record<SortKey, string> = {
 /// timestamp granularity. Presentation only — the engine's own comparison already applied it.
 export const MTIME_SLACK_MS = 2000;
 
+/// Every sentence that spells the tolerance out to the user derives it from the constant above, so
+/// changing the engine value cannot leave prose claiming a tolerance the product no longer applies.
+export const MTIME_SLACK_SECONDS = MTIME_SLACK_MS / 1000;
+
 // Materialize and cache reversals only for requested rows; eager copies duplicate large plan graphs.
 const reverseCache = new WeakMap<PlanOperation, PlanOperation | null>();
 
@@ -158,7 +162,7 @@ export function describeRowAction(operation: PlanOperation): { direction: Action
 }
 
 /// Must match the action rank in `Dev/src/workflow/pipeline/compare/planning/mod.rs`; the wire plan does not carry this rank.
-export function actionRank(operation: PlanOperation): number {
+function actionRank(operation: PlanOperation): number {
   switch (operation.action) {
     case 'move': return 0;
     case 'copy': case 'update': return 1;

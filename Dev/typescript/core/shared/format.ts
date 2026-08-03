@@ -1,4 +1,15 @@
-const padTwoDigits = (value: number) => String(value).padStart(2, '0');
+const padDigits = (value: number, width = 2) => String(value).padStart(width, '0');
+
+/// The one grouping rule for every integer count the product renders.
+///
+/// Pinned to en-US rather than the webview locale because the product text is en-US and because two
+/// panels of the same screen used to disagree: the run-scope facets pinned en-US while the result
+/// bar and the status bar followed the host locale, so the same number was spelled two ways at once.
+const COUNT_FORMAT = new Intl.NumberFormat('en-US');
+
+export function formatCount(value: number): string {
+  return COUNT_FORMAT.format(value);
+}
 
 /// Must remain identical to `foundation::fmt::human_bytes`: binary units and one decimal above bytes.
 /// Iteration avoids JavaScript's 32-bit bitwise-operand limit for TiB values.
@@ -17,7 +28,7 @@ export function humanSize(bytes?: number): string {
 export function formatFileTimestamp(timestampMs: number): string {
   if (!timestampMs) return '';
   const date = new Date(timestampMs);
-  const monthDayAndTime = `${padTwoDigits(date.getMonth() + 1)}-${padTwoDigits(date.getDate())} ${padTwoDigits(date.getHours())}:${padTwoDigits(date.getMinutes())}`;
+  const monthDayAndTime = `${padDigits(date.getMonth() + 1)}-${padDigits(date.getDate())} ${padDigits(date.getHours())}:${padDigits(date.getMinutes())}`;
   return date.getFullYear() === new Date().getFullYear()
     ? monthDayAndTime
     : `${date.getFullYear()}-${monthDayAndTime}`;
@@ -33,8 +44,7 @@ export function formatRelativeTimestamp(timestampMs: number): string {
 
 export function formatLogTimestamp(timestampMs: number): string {
   const date = new Date(timestampMs);
-  const pad = (value: number, width = 2) => String(value).padStart(width, '0');
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+  return `${padDigits(date.getHours())}:${padDigits(date.getMinutes())}:${padDigits(date.getSeconds())}.${padDigits(date.getMilliseconds(), 3)}`;
 }
 
 export function humanDuration(ms: number): string {
@@ -43,8 +53,22 @@ export function humanDuration(ms: number): string {
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
   return hours > 0
-    ? `${hours}:${padTwoDigits(minutes)}:${padTwoDigits(seconds)}`
-    : `${minutes}:${padTwoDigits(seconds)}`;
+    ? `${hours}:${padDigits(minutes)}:${padDigits(seconds)}`
+    : `${minutes}:${padDigits(seconds)}`;
+}
+
+/// Throughput in the same binary unit family as `humanSize`, for every window.
+///
+/// Two decimals, deliberately: the Compare panel used one, but it only ever renders rates above its
+/// own display floor, while the progress window shows the real instantaneous rate, and one decimal
+/// spells every transfer slower than 50 KiB/s as `0.0 MiB/s`. Two decimals is the rule that neither
+/// surface has to round a live rate away.
+///
+/// Formatting only. Whether a rate is worth showing at all is a per-surface decision — the Compare
+/// stage row suppresses its own sub-512-KiB/s rates so a compact row does not flicker — and putting
+/// that floor here would silence the progress window's slow-transfer readout.
+export function humanByteRate(bytesPerSecond: number): string {
+  return `${(bytesPerSecond / (1 << 20)).toFixed(2)} MiB/s`;
 }
 
 export function parentRelativePath(relativePath: string): string {

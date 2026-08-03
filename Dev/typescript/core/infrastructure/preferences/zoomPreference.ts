@@ -5,19 +5,16 @@ import {
 import type {
   ZoomPreferenceLoad,
 } from '#core/application/zoom/zoomAuthority.ts';
+import {
+  preferenceErrorMessage,
+  type PreferenceStorageReader,
+  type PreferenceStorageWriter,
+} from './preferenceStorage.ts';
 
 const ZOOM_PREFERENCE_KEY = 'sd.zoom';
 
-interface StorageReader {
-  getItem(key: string): string | null;
-}
-
-interface StorageWriter {
-  setItem(key: string, value: string): void;
-}
-
 export function loadZoomPreference(
-  storage: StorageReader = localStorage,
+  storage: PreferenceStorageReader = localStorage,
 ): ZoomPreferenceLoad {
   let storedFactor: string | null;
   try {
@@ -26,7 +23,7 @@ export function loadZoomPreference(
     return {
       factor: 1,
       persistedFactor: null,
-      warning: `Could not read the interface zoom preference: ${String(error)}`,
+      warning: `Could not read the interface zoom preference: ${preferenceErrorMessage(error)}`,
     };
   }
   if (storedFactor === null) {
@@ -45,13 +42,13 @@ export function loadZoomPreference(
 
 export function saveZoomPreference(
   factor: number,
-  storage: StorageWriter = localStorage,
+  storage: PreferenceStorageWriter = localStorage,
 ): string | null {
   const validatedFactor = requireZoomFactor(factor);
   try {
     storage.setItem(ZOOM_PREFERENCE_KEY, String(validatedFactor));
     return null;
   } catch (error) {
-    return String(error);
+    return preferenceErrorMessage(error);
   }
 }

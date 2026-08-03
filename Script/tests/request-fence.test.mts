@@ -22,13 +22,3 @@ test('changing owner or invalidating retires every earlier response', () => {
   fence.invalidate();
   assert.equal(fence.owns(current), false);
 });
-
-test('owner-scoped invalidation retires only the matching in-flight request', () => {
-  const fence = new RequestFence();
-  const current = fence.start('job-b');
-
-  assert.equal(fence.invalidateOwner('job-a'), false);
-  assert.equal(fence.owns(current), true);
-  assert.equal(fence.invalidateOwner('job-b'), true);
-  assert.equal(fence.owns(current), false);
-});

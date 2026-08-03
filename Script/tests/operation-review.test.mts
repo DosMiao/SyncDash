@@ -5,16 +5,12 @@ import {
   applyReviewKey,
   compareReviewKey,
   directAuthorization,
-  EMPTY_APPROVAL_CHOICES,
   INITIAL_OPERATION_REVIEW,
-  normalizeApprovalChoices,
-  operationApprovalFromChoices,
   normalizedReviewedRowDecisions,
   operationReviewCanSubmit,
   operationReviewReducer,
   ownsOperationReviewRequest,
   reviewAllowsApproval,
-  type ApprovalChoices,
   type ReviewRequestFence,
 } from '#core/application/operations/operationReview.ts';
 import type { CompareIdentity } from '#core/types/generated/CompareIdentity.ts';
@@ -101,10 +97,8 @@ test('external async fencing requires request id and current semantic identity',
 
 test('a review that reached confirmation is approvable, and blocked reviews never submit', () => {
   const requested = applyConfirmation();
-  const allRequired: ApprovalChoices = EMPTY_APPROVAL_CHOICES;
-  // Nothing in the panel is a condition of approval: no choice at all still submits.
-  assert.equal(reviewAllowsApproval(requested, EMPTY_APPROVAL_CHOICES), true);
-  assert.equal(reviewAllowsApproval(requested, allRequired), true);
+  // Nothing in the panel is a condition of approval: reaching confirmation is the whole gate.
+  assert.equal(reviewAllowsApproval(requested), true);
   // A capability shortfall is reported, never a reason to withhold approval.
   assert.equal(reviewAllowsApproval({
     ...requested,
@@ -116,43 +110,43 @@ test('a review that reached confirmation is approvable, and blocked reviews neve
       actual: 'none',
       effect: 'stated',
     }],
-  }, allRequired), true);
+  }), true);
   assert.equal(reviewAllowsApproval({
     status: 'blocked',
     blockers: ['offline'],
     warnings: [],
     capabilities: [],
-  }, allRequired), false);
+  }), false);
+  // A wire status this build does not understand is never approvable.
   assert.equal(
-    reviewAllowsApproval({ ...requested, status: 'unexpected' } as unknown as OperationReviewDto, allRequired),
+    reviewAllowsApproval({ ...requested, status: 'unexpected' } as unknown as OperationReviewDto),
     false,
   );
 
   const request = { key: 'apply', requestId: 1 };
   let state = operationReviewReducer(INITIAL_OPERATION_REVIEW, { type: 'begin', request });
   state = operationReviewReducer(state, { type: 'resolved', request, review: requested });
-  assert.equal(operationReviewCanSubmit(state, allRequired, 0), true);
+  assert.equal(operationReviewCanSubmit(state, 0), true);
   state = operationReviewReducer(state, { type: 'begin_approval', request });
-  assert.equal(operationReviewCanSubmit(state, allRequired, 0), false);
+  assert.equal(operationReviewCanSubmit(state, 0), false);
   state = operationReviewReducer(state, { type: 'approval_failed', request, error: 'expired' });
   assert.equal(state.phase, 'approval_failed');
-  assert.equal(operationReviewCanSubmit(state, allRequired, 0), false);
+  assert.equal(operationReviewCanSubmit(state, 0), false);
 });
 
 test('challenge and authorization deadlines are executable state, not display text', () => {
   const request = { key: 'apply', requestId: 4 };
-  const choices: ApprovalChoices = EMPTY_APPROVAL_CHOICES;
   let state = operationReviewReducer(INITIAL_OPERATION_REVIEW, { type: 'begin', request });
   state = operationReviewReducer(state, {
     type: 'resolved', request, review: applyConfirmation({ expires_at_ms: 10_000 }),
   });
-  assert.equal(operationReviewCanSubmit(state, choices, 8_999), true);
-  assert.equal(operationReviewCanSubmit(state, choices, 9_000), false);
+  assert.equal(operationReviewCanSubmit(state, 8_999), true);
+  assert.equal(operationReviewCanSubmit(state, 9_000), false);
   state = operationReviewReducer(state, {
     type: 'expired', request, error: 'review again',
   });
   assert.equal(state.phase, 'expired');
-  assert.equal(operationReviewCanSubmit(state, choices, 0), false);
+  assert.equal(operationReviewCanSubmit(state, 0), false);
 
   const stale = operationReviewReducer(state, {
     type: 'expired', request: { ...request, requestId: 5 }, error: 'stale',
@@ -169,8 +163,8 @@ test('challenge and authorization deadlines are executable state, not display te
     request,
     authorization: { authorization_token: 'token', expires_at_ms: 20_000 },
   });
-  assert.equal(operationReviewCanSubmit(authorized, choices, 18_999), true);
-  assert.equal(operationReviewCanSubmit(authorized, choices, 19_000), false);
+  assert.equal(operationReviewCanSubmit(authorized, 18_999), true);
+  assert.equal(operationReviewCanSubmit(authorized, 19_000), false);
 });
 
 test('direct authorization accepts only its tagged variant and rejects capability blockers', () => {
@@ -194,12 +188,21 @@ test('direct authorization accepts only its tagged variant and rejects capabilit
   })?.authorization_token, 'token');
 });
 
-test('an approval names the reviewed operation and carries no decisions of its own', () => {
-  const requested = applyConfirmation();
-  assert.deepEqual(normalizeApprovalChoices(requested, EMPTY_APPROVAL_CHOICES), {});
-  assert.deepEqual(operationApprovalFromChoices(requested, EMPTY_APPROVAL_CHOICES), {
-    operation: 'interactive_apply',
-  });
+test('a direct authorization is approvable only when it actually carries its authorization', () => {
+  const authorized: OperationReviewDto = {
+    status: 'direct_authorized',
+    authorization: { authorization_token: 'token', expires_at_ms: 20_000 },
+    capabilities: [],
+  };
+  assert.equal(reviewAllowsApproval(authorized), true);
+  // A direct_authorized status that contradicts itself by carrying no authorization is malformed
+  // evidence, never an implicit approval.
+  assert.equal(
+    reviewAllowsApproval(
+      { ...authorized, authorization: null } as unknown as OperationReviewDto,
+    ),
+    false,
+  );
 });
 
 test('keys fence result identity, job revision, target, and reviewed row decisions', () => {
