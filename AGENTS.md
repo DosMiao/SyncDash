@@ -51,6 +51,13 @@ cargo clippy -p syncdash-desktop --all-targets --no-deps -- -D warnings
 npm run typecheck
 ```
 
+Platform-conditional code follows the "Platform seams" section of `Dev/ARCHITECTURE.md`. After
+changing a platform seam (`base/fs`, `base/foundation/host.rs`, watch, local discovery, localid,
+or the desktop autoscan worker), also run `npm run check:cross`; it type-checks the library and
+CLI for the foreign supported hosts and names any target it cannot verify on this machine. A
+target it reports as unverified must be checked natively (`cargo check --workspace --all-targets`
+on that host) before the change is considered complete.
+
 After changing a Rust type annotated with `#[ts(export_to = ...)]`, regenerate the frontend contract:
 
 ```bash
