@@ -38,8 +38,8 @@ impl WalkEntry {
             kind,
             size: metadata.len(),
             mtime_ms: metadata_mtime_ms(metadata),
-            file_id: crate::fs::meta::file_id_cap(metadata),
-            mode: crate::fs::meta::unix_mode_cap(metadata),
+            file_id: crate::fs::meta::capability_file_id(metadata),
+            mode: crate::fs::meta::capability_unix_mode(metadata),
             dataless,
         }
     }

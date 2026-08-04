@@ -90,7 +90,7 @@ fn verify_opened_file(file: &std::fs::File, target: &LocalFileRead<'_>) -> std::
         || metadata.len() != target.size
         || standard_mtime_ms(&metadata) != target.raw_mtime_ms
         || target.expected_file_id.is_some_and(|expected| {
-            crate::fs::meta::file_id_std(&metadata).as_deref() != Some(expected)
+            crate::fs::meta::standard_file_id(&metadata).as_deref() != Some(expected)
         })
     {
         return Err(std::io::Error::other(
@@ -109,7 +109,7 @@ fn verify_current_file(target: &LocalFileRead<'_>) -> std::io::Result<()> {
         || metadata.len() != target.size
         || capability_mtime_ms(&metadata) != target.raw_mtime_ms
         || target.expected_file_id.is_some_and(|expected| {
-            crate::fs::meta::file_id_cap(&metadata).as_deref() != Some(expected)
+            crate::fs::meta::capability_file_id(&metadata).as_deref() != Some(expected)
         })
     {
         return Err(std::io::Error::other(

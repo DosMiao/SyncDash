@@ -194,7 +194,7 @@ impl VersionWriter {
             )?;
             let regular_metadata = regular_metadata.expect("regular metadata was collected above");
             let old_mtime_ms = file_mtime_ms(&regular_metadata)?;
-            let old_mode = crate::fs::meta::unix_mode_std(&regular_metadata);
+            let old_mode = crate::fs::meta::standard_unix_mode(&regular_metadata);
             self.bytes = updated_bytes;
             self.entries.push(PreservedEntry {
                 relative_path: rel.clone(),
@@ -227,7 +227,7 @@ impl VersionWriter {
             let preserved_metadata = self.root.metadata_path(&preserved_path)?;
             let old_size = preserved_metadata.len();
             let old_mtime_ms = capability_mtime_ms(&preserved_metadata)?;
-            let old_mode = crate::fs::meta::unix_mode_cap(&preserved_metadata);
+            let old_mode = crate::fs::meta::capability_unix_mode(&preserved_metadata);
             let old_hash = if preserved_metadata.file_type().is_symlink() {
                 String::new()
             } else if preserved_metadata.is_file() {

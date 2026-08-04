@@ -19,8 +19,8 @@ pub(super) fn meta_of(metadata: &cap_primitives::fs::Metadata) -> VMeta {
         kind,
         size: metadata.len(),
         mtime_ms: metadata_mtime_ms(metadata),
-        mode: crate::fs::meta::unix_mode_cap(metadata),
-        file_id: crate::fs::meta::file_id_cap(metadata),
+        mode: crate::fs::meta::capability_unix_mode(metadata),
+        file_id: crate::fs::meta::capability_file_id(metadata),
         link: None,
     }
 }
