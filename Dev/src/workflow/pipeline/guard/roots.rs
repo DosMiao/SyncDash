@@ -49,7 +49,7 @@ pub fn check_root(label: &str, root: &Path, require_marker: bool, v: &mut Verdic
     if !require_marker && !marker {
         let empty = local_root
             .read_directory(&RootRelativeDir::new("").expect("empty path names the root"))
-            .map(|entries| entries.is_empty())
+            .map(|listing| listing.entries.is_empty())
             .unwrap_or(false);
         if empty {
             v.warnings.push(format!(

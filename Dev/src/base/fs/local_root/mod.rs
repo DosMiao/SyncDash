@@ -33,6 +33,16 @@ pub(crate) struct LocalEntry {
     pub(crate) metadata: capability_fs::Metadata,
 }
 
+/// One directory read, with the names the platform returned but Unicode cannot spell kept
+/// separate. Such a name has no faithful table rel — a lossy substitution would point at a file
+/// that does not exist — so it is skipped, never respelled, and each caller decides how loudly
+/// to say so.
+#[derive(Debug)]
+pub(crate) struct DirectoryListing {
+    pub(crate) entries: Vec<LocalEntry>,
+    pub(crate) invalid_names: Vec<std::ffi::OsString>,
+}
+
 pub struct LocalStagedFile {
     parent: LocalDirectory,
     temporary_name: EntryName,
@@ -94,7 +104,7 @@ impl LocalRoot {
     pub(crate) fn read_directory(
         &self,
         relative: &RootRelativeDir,
-    ) -> std::io::Result<Vec<LocalEntry>> {
+    ) -> std::io::Result<DirectoryListing> {
         self.open_directory(relative)?.read_entries()
     }
 
@@ -102,8 +112,13 @@ impl LocalRoot {
         &self,
         relative: &RootRelativeDir,
     ) -> std::io::Result<Vec<EntryName>> {
-        self.read_directory(relative)
-            .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
+        self.read_directory(relative).map(|listing| {
+            listing
+                .entries
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect()
+        })
     }
 
     pub fn open_read(&self, relative: &RootRelativePath) -> std::io::Result<std::fs::File> {

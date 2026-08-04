@@ -37,22 +37,59 @@ fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::rename(source, destination)
 }
 
+/// `MoveFileExW` takes the spelling it is given: unlike `std::fs` it never upgrades a long
+/// absolute path to the verbatim (`\\?\`) form, so once a full spelling passes `MAX_PATH` the
+/// move fails with `ERROR_PATH_NOT_FOUND` even though every component is legal — a destination
+/// basename near NAME_MAX inside an ordinary temp directory is enough. Upgrade exactly the
+/// spellings std would: absolute drive or UNC paths with no `.`/`..` segments. Anything else is
+/// passed through and fails at the API with its own honest error.
+#[cfg(windows)]
+fn wide_path_for_move(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    const MAX_PATH_WITH_NUL: usize = 260;
+
+    let spelled: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    if spelled.len() <= MAX_PATH_WITH_NUL {
+        return spelled;
+    }
+    let mut components = path.components();
+    let mut long = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(letter) => std::path::PathBuf::from(format!(r"\\?\{}:", letter as char)),
+            Prefix::UNC(server, share) => {
+                let mut base = std::path::PathBuf::from(r"\\?\UNC");
+                base.push(server);
+                base.push(share);
+                base
+            }
+            _ => return spelled,
+        },
+        _ => return spelled,
+    };
+    for component in components {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => long.push(name),
+            // `.`/`..` cannot be spelled verbatim, and a prefix cannot recur past the front;
+            // hand such a path to the API unchanged for its own honest error.
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => return spelled,
+        }
+    }
+    long.into_os_string().encode_wide().chain(Some(0)).collect()
+}
+
 #[cfg(windows)]
 fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
     extern "system" {
         fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     }
 
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    let source = wide_path_for_move(source);
+    let destination = wide_path_for_move(destination);
     let replaced = unsafe {
         MoveFileExW(
             source.as_ptr(),
@@ -123,18 +160,12 @@ pub(crate) fn atomic_rename_noreplace(source: &Path, destination: &Path) -> std:
 
 #[cfg(windows)]
 pub(crate) fn atomic_rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
     extern "system" {
         fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     }
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    let source = wide_path_for_move(source);
+    let destination = wide_path_for_move(destination);
     let moved = unsafe {
         MoveFileExW(
             source.as_ptr(),

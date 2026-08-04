@@ -95,8 +95,25 @@ impl LocalStagedFile {
         Ok(())
     }
 
+    #[cfg(not(windows))]
     pub fn sync_file(&self) -> std::io::Result<()> {
         self.try_clone_file()?.sync_all()
+    }
+
+    /// The sealed reopen cannot share [`Self::try_clone_file`]'s read-only lane here:
+    /// `FlushFileBuffers` demands write access (denied through a read handle, measured on Win11
+    /// 26200). Unix keeps the read-only reopen because a staged payload may already carry a
+    /// read-only mode, and fsync through `O_RDONLY` is valid there; on Windows `set_mode` does
+    /// not exist, so the temporary stays writable until commit.
+    #[cfg(windows)]
+    pub fn sync_file(&self) -> std::io::Result<()> {
+        match &self.file {
+            Some(file) => file.sync_all(),
+            None => self
+                .parent
+                .open_read_write(self.temporary_name.as_os_str())?
+                .sync_all(),
+        }
     }
 
     pub fn commit(mut self) -> std::io::Result<()> {

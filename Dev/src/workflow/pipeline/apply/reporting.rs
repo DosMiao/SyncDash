@@ -23,11 +23,9 @@ fn in_root_retention_display(sh: &Shared<'_>, side: &Side) -> String {
             Side::Source => sh.source,
             Side::Target => sh.target,
         };
-        format!(
-            "{}/{}",
-            exec.display().trim_end_matches('/'),
-            sh.in_root_keep_rel
-        )
+        // The root phrase decides the separator: a windows-spelled root routed over a protocol
+        // must still report a path its own machine can open.
+        crate::foundation::path::join_display(&exec.display(), &sh.in_root_keep_rel)
     }
 }
 

@@ -148,8 +148,8 @@ pub(super) fn history_merged_at(
         .filter_map(|record| record.artifacts.run_id().map(str::to_owned))
         .collect();
     match root.read_directory(&root_directory()) {
-        Ok(entries) => {
-            for entry in entries {
+        Ok(listing) => {
+            for entry in listing.entries {
                 if !entry.metadata.is_dir() || reveal_run_identifier(entry.name.as_str()).is_err() {
                     continue;
                 }

@@ -127,8 +127,8 @@ where
 
     while let Some(directory) = directories.pop() {
         checkpoint()?;
-        let mut children = match root.read_directory(&directory) {
-            Ok(children) => children,
+        let listing = match root.read_directory(&directory) {
+            Ok(listing) => listing,
             Err(error) if directory.as_str().is_empty() => {
                 return Err(crate::pipeline::scan::root_unreadable_error(
                     root.display_path(),
@@ -143,6 +143,10 @@ where
                 return Err(subtree_error(root, directory.as_str(), error));
             }
         };
+        for name in &listing.invalid_names {
+            stats.note_invalid_name(Path::new(name));
+        }
+        let mut children = listing.entries;
         children.sort_by(|left, right| left.name.cmp(&right.name));
 
         for child in children {

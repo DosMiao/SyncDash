@@ -14,7 +14,7 @@ use cap_primitives::fs::{self as capability_fs, OpenOptions};
 use crate::foundation::path::EntryName;
 
 use super::identity::{file_identity, EntryNameOsStr, FileIdentity};
-use super::{LocalDirectory, LocalEntry, LocalStagedFile};
+use super::{DirectoryListing, LocalDirectory, LocalEntry, LocalStagedFile};
 
 /// Placeholder body for a symlink claim. It is overwritten by the rename that follows within the
 /// same call, and is only ever observable to a reader racing a publication in progress.
@@ -91,24 +91,31 @@ impl LocalDirectory {
         capability_fs::stat(&self.handle, Path::new(name), FollowSymlinks::No)
     }
 
-    pub(super) fn read_entries(&self) -> std::io::Result<Vec<LocalEntry>> {
+    pub(super) fn read_entries(&self) -> std::io::Result<DirectoryListing> {
         let mut entries = Vec::new();
+        let mut invalid_names = Vec::new();
         for entry in capability_fs::read_base_dir(&self.handle)? {
             let entry = entry?;
-            let os_name = entry.file_name();
-            let name = os_name.into_string().map_err(|name| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("directory entry name is not valid Unicode: {name:?}"),
-                )
-            })?;
+            let name = match entry.file_name().into_string() {
+                Ok(name) => name,
+                // The cross-platform contract for a name Unicode cannot spell is skip-and-count,
+                // never substitute: a lossy respelling is a path that resolves to nothing, which
+                // apply would miss and mirror would read as a deletion on the other side.
+                Err(raw_name) => {
+                    invalid_names.push(raw_name);
+                    continue;
+                }
+            };
             let name = EntryName::try_from(name).map_err(|error| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
             })?;
             let metadata = self.metadata(name.as_os_str())?;
             entries.push(LocalEntry { name, metadata });
         }
-        Ok(entries)
+        Ok(DirectoryListing {
+            entries,
+            invalid_names,
+        })
     }
 
     pub(super) fn open_subdirectory(&self, name: &OsStr) -> std::io::Result<Self> {
@@ -134,6 +141,13 @@ impl LocalDirectory {
             .write(true)
             .create_new(true)
             .follow(FollowSymlinks::No);
+        capability_fs::open(&self.handle, Path::new(name), &options)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn open_read_write(&self, name: &OsStr) -> std::io::Result<std::fs::File> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).follow(FollowSymlinks::No);
         capability_fs::open(&self.handle, Path::new(name), &options)
     }
 
@@ -464,6 +478,17 @@ impl LocalDirectory {
         self.rename_windows(source_name, destination_parent, destination_name, false)
     }
 
+    /// Both Windows rename flavors submit `FILE_RENAME_INFORMATION` to `NtSetInformationFile`
+    /// directly. The Win32 wrapper (`SetFileInformationByHandle`) accepts the same record only
+    /// with `RootDirectory = NULL` and a full destination path; handing it a real directory
+    /// handle fails with `ERROR_INVALID_PARAMETER` (measured on Win11 26200). Only the NT call
+    /// performs the directory-relative form, which keeps the destination anchored to the held
+    /// handle instead of a re-resolved path.
+    ///
+    /// Failures surface as the Win32 error `RtlNtStatusToDosError` assigns, so a taken
+    /// destination under `replace_existing = false` reports `AlreadyExists`
+    /// (`STATUS_OBJECT_NAME_COLLISION` → `ERROR_ALREADY_EXISTS`), which no-replace callers
+    /// match on.
     #[cfg(windows)]
     pub(super) fn rename_windows(
         &self,
@@ -474,9 +499,11 @@ impl LocalDirectory {
     ) -> std::io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO,
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FileRenameInformation, NtSetInformationFile, FILE_RENAME_INFORMATION,
         };
+        use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
         const DELETE_ACCESS: u32 = 0x0001_0000;
         const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
@@ -501,7 +528,7 @@ impl LocalDirectory {
                     "destination name is too long",
                 )
             })?;
-        let allocation = std::mem::size_of::<FILE_RENAME_INFO>()
+        let allocation = std::mem::size_of::<FILE_RENAME_INFORMATION>()
             .checked_add(bytes.saturating_sub(std::mem::size_of::<u16>()))
             .ok_or_else(|| {
                 std::io::Error::new(
@@ -511,7 +538,7 @@ impl LocalDirectory {
             })?;
         let words = allocation.div_ceil(std::mem::size_of::<usize>());
         let mut storage = vec![0usize; words];
-        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         unsafe {
             (*information).Anonymous.ReplaceIfExists = replace_existing;
             (*information).RootDirectory = destination_parent.handle.as_raw_handle();
@@ -521,14 +548,18 @@ impl LocalDirectory {
                 std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
                 destination_name.len(),
             );
-            if SetFileInformationByHandle(
+            let mut status_block: IO_STATUS_BLOCK = std::mem::zeroed();
+            let status = NtSetInformationFile(
                 source.as_raw_handle(),
-                FileRenameInfo,
+                &mut status_block,
                 information.cast(),
                 allocation as u32,
-            ) == 0
-            {
-                Err(std::io::Error::last_os_error())
+                FileRenameInformation,
+            );
+            if status < 0 {
+                Err(std::io::Error::from_raw_os_error(
+                    RtlNtStatusToDosError(status) as i32,
+                ))
             } else {
                 Ok(())
             }
@@ -611,8 +642,66 @@ impl LocalDirectory {
         })
     }
 
+    #[cfg(not(windows))]
     pub(super) fn sync_all(&self) -> std::io::Result<()> {
         self.handle.sync_all()
+    }
+
+    /// `FlushFileBuffers` demands a write-access handle, and the held directory handle is opened
+    /// without write access — flushing through it fails with `ERROR_ACCESS_DENIED` (measured on
+    /// Win11 26200). The flush therefore goes through a second handle produced by `NtOpenFile`
+    /// with the held handle as `RootDirectory` and an empty relative name, which reopens the same
+    /// directory object without consulting any path, so a concurrent rename of the tree cannot
+    /// retarget the flush.
+    #[cfg(windows)]
+    pub(super) fn sync_all(&self) -> std::io::Result<()> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            NtOpenFile, FILE_OPEN_FOR_BACKUP_INTENT, FILE_SYNCHRONOUS_IO_NONALERT,
+        };
+        use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, UNICODE_STRING};
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+        const SHARE_READ: u32 = 0x0000_0001;
+        const SHARE_WRITE: u32 = 0x0000_0002;
+        const SHARE_DELETE: u32 = 0x0000_0004;
+
+        let mut empty_buffer = [0u16; 1];
+        let empty_name = UNICODE_STRING {
+            Length: 0,
+            MaximumLength: 0,
+            Buffer: empty_buffer.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: self.handle.as_raw_handle(),
+            ObjectName: &empty_name,
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        let mut flush_handle = std::ptr::null_mut();
+        let status = unsafe {
+            NtOpenFile(
+                &mut flush_handle,
+                GENERIC_WRITE | SYNCHRONIZE_ACCESS,
+                &attributes,
+                &mut status_block,
+                SHARE_READ | SHARE_WRITE | SHARE_DELETE,
+                FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_FOR_BACKUP_INTENT,
+            )
+        };
+        if status < 0 {
+            return Err(std::io::Error::from_raw_os_error(
+                unsafe { RtlNtStatusToDosError(status) } as i32,
+            ));
+        }
+        let writable = unsafe { std::fs::File::from_raw_handle(flush_handle) };
+        writable.sync_all()
     }
 
     pub(super) fn identity(&self) -> std::io::Result<FileIdentity> {

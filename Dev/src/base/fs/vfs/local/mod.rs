@@ -174,9 +174,20 @@ impl Vfs for LocalVfs {
     }
 
     fn read_dir(&self, rel: &str) -> VfsResult<Vec<VDirEntry>> {
-        Ok(self
-            .root
-            .read_directory(&relative_directory(rel)?)?
+        let listing = self.root.read_directory(&relative_directory(rel)?)?;
+        // A name Unicode cannot spell is skipped loudly rather than handed to the engine under a
+        // substituted spelling it cannot act on. The scan lanes count such a skip into the
+        // snapshot's walk errors; here the visible consequence is honest too — a directory kept
+        // alive by an unrepresentable name fails remove_dir as NotEmpty and is reported as kept.
+        for name in &listing.invalid_names {
+            crate::log_warn!(
+                "vfs",
+                "skipping '{}' in '{rel}': name is not valid Unicode on this platform",
+                name.to_string_lossy()
+            );
+        }
+        Ok(listing
+            .entries
             .into_iter()
             .map(|entry| VDirEntry {
                 name: entry.name,

@@ -26,7 +26,7 @@ fn child_directory(parent: &RootRelativeDir, name: &EntryName) -> RootRelativeDi
 
 fn directory_size(root: &LocalRoot, directory: &RootRelativeDir) -> std::io::Result<u64> {
     let mut bytes = 0;
-    for entry in root.read_directory(directory)? {
+    for entry in root.read_directory(directory)?.entries {
         bytes += if entry.metadata.is_dir() {
             directory_size(root, &child_directory(directory, &entry.name))?
         } else {
@@ -253,7 +253,7 @@ pub(super) fn sweep_orphans(
     live: &std::collections::HashSet<&str>,
     cutoff: i64,
 ) -> std::io::Result<()> {
-    for entry in root.read_directory(&root_directory())? {
+    for entry in root.read_directory(&root_directory())?.entries {
         if !entry.metadata.is_dir() {
             continue;
         }
