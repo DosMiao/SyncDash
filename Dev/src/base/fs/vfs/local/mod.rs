@@ -2,9 +2,10 @@
 //!
 //! Every operation resolves segment-by-segment from that handle, so a path can never address
 //! outside the root it was opened against. `read_dir` delegates to `LocalRoot::read_directory`,
-//! which fails an entry whose name is not valid Unicode rather than skipping it: a name this
-//! process cannot spell is a name it cannot later address, and a scan that silently omits one
-//! would report a deletion the user never made.
+//! which reports an entry whose name is not valid Unicode separately instead of returning it:
+//! such a name has no faithful rel, and the lossy spelling `to_string_lossy` would supply names
+//! a different, nonexistent file. Skipping it is never silent — the scan lanes count it into the
+//! snapshot's walk errors, and this backend logs each one.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
