@@ -112,13 +112,7 @@ pub(crate) fn pack_to_open_file(
         let metadata = source_file.metadata()?;
         let size = metadata.len();
         let mtime_ms = crate::foundation::time::meta_mtime_ms(&metadata);
-        #[cfg(unix)]
-        let mode = {
-            use std::os::unix::fs::MetadataExt;
-            Some(metadata.mode() & 0o7777)
-        };
-        #[cfg(not(unix))]
-        let mode: Option<u32> = None;
+        let mode = crate::fs::meta::unix_mode_std(&metadata);
 
         let base = peer_chunks
             .and_then(|chunks| chunks.get(&operation.path))

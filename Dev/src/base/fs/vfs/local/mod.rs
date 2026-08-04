@@ -94,11 +94,11 @@ impl Vfs for LocalVfs {
             exclusive_staged_file_publish: Support::Yes,
             exclusive_entry_rename: Support::Yes,
             exclusive_symlink_publish: symlink,
-            durable_namespace: if cfg!(unix) {
-                Support::Yes
-            } else {
-                Support::Unknown
-            },
+            // Unix flushes the parent directory explicitly; Windows requests write-through on the
+            // rename itself (`MOVEFILE_WRITE_THROUGH`) and the handle-relative lane reopens the
+            // directory for FlushFileBuffers. `fs::staged::sync_directory` and
+            // `local_root::sync_parent` own those mechanisms; this claim must follow them.
+            durable_namespace: Support::Yes,
             ranged_read: Support::Yes,
             write_at: Support::Yes,
             // Host syscalls are not the filesystem contract: FAT/exFAT synthesize permission

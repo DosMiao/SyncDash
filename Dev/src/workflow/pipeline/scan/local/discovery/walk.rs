@@ -38,8 +38,8 @@ impl WalkEntry {
             kind,
             size: metadata.len(),
             mtime_ms: metadata_mtime_ms(metadata),
-            file_id: metadata_file_id(metadata),
-            mode: metadata_mode(metadata),
+            file_id: crate::fs::meta::file_id_cap(metadata),
+            mode: crate::fs::meta::unix_mode_cap(metadata),
             dataless,
         }
     }
@@ -69,28 +69,6 @@ impl WalkStats {
             relative.to_string_lossy()
         ));
     }
-}
-
-#[cfg(unix)]
-fn metadata_file_id(metadata: &cap_primitives::fs::Metadata) -> Option<String> {
-    use cap_primitives::fs::MetadataExt;
-    Some(format!("{}:{}", metadata.dev(), metadata.ino()))
-}
-
-#[cfg(not(unix))]
-fn metadata_file_id(_metadata: &cap_primitives::fs::Metadata) -> Option<String> {
-    None
-}
-
-#[cfg(unix)]
-fn metadata_mode(metadata: &cap_primitives::fs::Metadata) -> Option<u32> {
-    use cap_primitives::fs::MetadataExt;
-    Some(metadata.mode() & 0o7777)
-}
-
-#[cfg(not(unix))]
-fn metadata_mode(_metadata: &cap_primitives::fs::Metadata) -> Option<u32> {
-    None
 }
 
 fn metadata_mtime_ms(metadata: &cap_primitives::fs::Metadata) -> i64 {

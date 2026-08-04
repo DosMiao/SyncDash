@@ -12,6 +12,7 @@
 pub mod chunk;
 pub mod local_root;
 pub mod lock;
+pub mod meta;
 pub mod ssh;
 pub mod staged;
 pub mod vfs;

@@ -89,9 +89,9 @@ fn verify_opened_file(file: &std::fs::File, target: &LocalFileRead<'_>) -> std::
     if !metadata.is_file()
         || metadata.len() != target.size
         || standard_mtime_ms(&metadata) != target.raw_mtime_ms
-        || target
-            .expected_file_id
-            .is_some_and(|expected| standard_file_id(&metadata).as_deref() != Some(expected))
+        || target.expected_file_id.is_some_and(|expected| {
+            crate::fs::meta::file_id_std(&metadata).as_deref() != Some(expected)
+        })
     {
         return Err(std::io::Error::other(
             "file changed while content evidence was being read",
@@ -108,9 +108,9 @@ fn verify_current_file(target: &LocalFileRead<'_>) -> std::io::Result<()> {
     if !metadata.is_file()
         || metadata.len() != target.size
         || capability_mtime_ms(&metadata) != target.raw_mtime_ms
-        || target
-            .expected_file_id
-            .is_some_and(|expected| capability_file_id(&metadata).as_deref() != Some(expected))
+        || target.expected_file_id.is_some_and(|expected| {
+            crate::fs::meta::file_id_cap(&metadata).as_deref() != Some(expected)
+        })
     {
         return Err(std::io::Error::other(
             "file changed while content evidence was being read",
@@ -135,26 +135,4 @@ fn capability_mtime_ms(metadata: &cap_primitives::fs::Metadata) -> i64 {
         .and_then(|time| time.into_std().duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn standard_file_id(metadata: &std::fs::Metadata) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    Some(format!("{}:{}", metadata.dev(), metadata.ino()))
-}
-
-#[cfg(not(unix))]
-fn standard_file_id(_metadata: &std::fs::Metadata) -> Option<String> {
-    None
-}
-
-#[cfg(unix)]
-fn capability_file_id(metadata: &cap_primitives::fs::Metadata) -> Option<String> {
-    use cap_primitives::fs::MetadataExt;
-    Some(format!("{}:{}", metadata.dev(), metadata.ino()))
-}
-
-#[cfg(not(unix))]
-fn capability_file_id(_metadata: &cap_primitives::fs::Metadata) -> Option<String> {
-    None
 }
