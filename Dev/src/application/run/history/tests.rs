@@ -5,17 +5,23 @@ use super::migration::{
 use super::model::{LegacyRunRecord, RUN_RECORD_SCHEMA};
 use super::paths::{run_identifier, sanitize};
 use super::recording::{create_run_dir, pending_record};
-use super::repository::{
-    artifact_lines_at, history_at, history_merged_at, with_validated_reveal_target_at,
-};
-use super::retention::{prune_at, sweep_orphans};
+use super::repository::with_validated_reveal_target_at;
+// The symlink-confinement tests exist only where symlinks can be created without privilege.
+#[cfg(unix)]
+use super::repository::{artifact_lines_at, history_at, history_merged_at};
+#[cfg(unix)]
+use super::retention::prune_at;
+use super::retention::sweep_orphans;
 use super::*;
 use std::collections::HashMap;
 
+#[cfg(unix)]
+use crate::foundation::names::RUNLOG_RUN_FILE;
 use crate::foundation::names::{
     RUNLOG_INDEX_FILE as INDEX_FILE, RUNLOG_LEGACY_INDEX_FILE, RUNLOG_LEGACY_SUMMARY_FILE,
-    RUNLOG_RUN_FILE, RUNLOG_SCHEMA_FILE, RUNLOG_SUMMARY_FILE as SUMMARY_FILE,
+    RUNLOG_SCHEMA_FILE, RUNLOG_SUMMARY_FILE as SUMMARY_FILE,
 };
+#[cfg(unix)]
 use crate::foundation::path::EntryName;
 use crate::fs::local_root::LocalRoot;
 

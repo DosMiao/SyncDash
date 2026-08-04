@@ -29,10 +29,10 @@ use objc2_core_services::{
     FSEventsGetLastEventIdForDeviceBeforeTime,
 };
 
+use super::reducer::{EventReducer, RawEvent, RawFlags, StreamSeed};
 use super::{
-    watch_channel, ArmedWatch, EventReducer, InvalidationKind, RawEvent, RawFlags, RootCursor,
-    StreamSeed, WatchInvalidation, WatchMessage, WatchPosition, WatchReceiver, SOURCE_STREAM,
-    TARGET_STREAM,
+    watch_channel, ArmedWatch, InvalidationKind, RootCursor, WatchInvalidation, WatchMessage,
+    WatchPosition, WatchReceiver, SOURCE_STREAM, TARGET_STREAM,
 };
 
 #[derive(Clone, Copy, Debug)]

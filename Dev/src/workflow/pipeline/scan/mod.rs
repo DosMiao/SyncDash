@@ -315,6 +315,8 @@ mod tests {
         ]
     }
 
+    /// Symlinks join the differential fixture only where creating one needs no privilege.
+    #[cfg(unix)]
     const DIFFERENTIAL_LINK: (&str, &str) = ("link.rel", "sub/deep/leaf.dat");
 
     fn differential_local_root(tag: &str) -> std::path::PathBuf {

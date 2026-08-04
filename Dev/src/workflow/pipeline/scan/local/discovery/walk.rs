@@ -61,6 +61,8 @@ impl WalkStats {
         }
     }
 
+    /// A name the platform returned but Unicode cannot spell, on any lane: it is counted into the
+    /// walk-error channel and skipped, never recorded under a substituted spelling.
     pub(super) fn note_invalid_name(&mut self, relative: &Path) {
         self.note_error(format!(
             "{}: name is not valid Unicode on this platform — skipped rather than recorded under a substituted spelling",

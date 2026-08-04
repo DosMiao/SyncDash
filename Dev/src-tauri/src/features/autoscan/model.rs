@@ -24,6 +24,8 @@ impl AutoScanBinding {
         Duration::from_secs(self.interval_secs.max(1))
     }
 
+    /// Only the native FSEvents lane persists a resume cursor, so only it names a checkpoint owner.
+    #[cfg(target_os = "macos")]
     pub(super) fn checkpoint_owner(&self) -> String {
         format!(
             "autoscan-v2\0{}\0{}\0{}",
@@ -52,6 +54,12 @@ pub(crate) enum AutoScanStatusMode {
     Polling,
 }
 
+/// The generated TypeScript union is one contract for every platform, so the full variant set is
+/// compiled everywhere even though only macOS builds contain a producer for `NativeFsevents`.
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "no native detection lane on this platform")
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "export-types", ts(export))]
@@ -70,6 +78,12 @@ impl From<AutoScanDetectionMode> for AutoScanStatusMode {
     }
 }
 
+/// Both filesystem-event reasons are reported by the native lane alone; the remaining two are
+/// reported everywhere. The union stays whole so the wire vocabulary does not vary by platform.
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "no native detection lane on this platform")
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "export-types", ts(export))]

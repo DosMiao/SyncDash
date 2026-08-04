@@ -1124,6 +1124,8 @@ enum MoveFault {
     RefuseHoldCleanup,
     DriftAfterClaim,
     DriftDuringSameVolumePublish,
+    /// Only the Unix mode-preservation test needs a fault-free cross-device fallback.
+    #[cfg(unix)]
     CrossDeviceOnly,
 }
 
