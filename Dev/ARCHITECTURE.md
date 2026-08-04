@@ -74,15 +74,20 @@ perform only the minimal composition that belongs to the whole branch.
 Dev/src/
 ├── base/
 │   ├── foundation/         paths, time, formatting, naming, machine and volume identity
+│   │   └── host.rs         the supported-host set, behind a compile_error! backstop
 │   ├── model/              persisted plan, event, table, chunk, and digest vocabulary
 │   └── fs/                 filesystem boundaries, VFS backends, staging, locks, and watches
+│       ├── local_root/     confined handles, per-host namespace transactions, cloud placeholders
 │       ├── lock/           ledger format, record store, fail-closed policy, and the guard
+│       ├── meta.rs         the one spelling of the file-id and unix mode a snapshot records
+│       ├── watch/          platform-neutral cursors over a pure reducer and the FSEvents backend
 │       └── vfs/
 │           ├── absence.rs  confirming a name is gone rather than momentarily unreachable
 │           └── local/      the backend, its volume tables, staged writes, and metadata
 ├── services/
 │   ├── obs/                logging and live progress
 │   └── store/
+│       ├── localid/        per-host volume identity binding machine-local scan state
 │       ├── scan_state/     bound format, location, reporting, and rebuild policy
 │       └── version/        format, content caps, writer, retention, and transactional restore
 ├── workflow/
@@ -264,10 +269,11 @@ Five rules govern every platform-conditional line:
    root phrase, the host is the wrong authority.
 2. **One seam per domain, shaped like `services/store/localid/`.** The domain's `mod.rs` owns the
    platform-neutral contract vocabulary plus a router whose `cfg` predicates mirror the sibling
-   files that implement it. Siblings are named for their mechanism (`fsevents.rs`, `bulk/`) when
-   the mechanism is the identity, or for their platform (`windows.rs`, `unix.rs`, `macos.rs`) when
-   they group syscalls. `cfg` lives in exactly three places: the router, the sibling heads, and
-   Cargo target dependencies — never mid-function in shared logic.
+   files that implement it. Siblings are named for their mechanism (`fsevents.rs`, `bulk/`,
+   `dataless.rs`) when the mechanism is the identity, or for their host (`windows.rs`, `macos.rs`,
+   `linux.rs`) when they group syscalls — never `unix.rs`, which names a family rather than one of
+   the three supported hosts. `cfg` lives in exactly three places: the router, the sibling heads,
+   and Cargo target dependencies — never mid-function in shared logic.
 3. **Pure halves compile everywhere.** Every mechanism splits into a pure half — decoding,
    reduction, classification — compiled under `#[cfg(any(target_os = "…", test))]` so every host
    type-checks and unit-tests it (`base/fs/watch/reducer.rs` is the reference), and a syscall half
@@ -276,7 +282,9 @@ Five rules govern every platform-conditional line:
 4. **Wire vocabulary is platform-complete.** A ts-rs type keeps its full variant set on every
    target; a platform-gated producer is acknowledged with
    `cfg_attr(not(...), expect(dead_code, reason = "…"))` at the type, never by removing variants.
-   The generated TypeScript union is one contract for all hosts.
+   The generated TypeScript union is one contract for all hosts. The same acknowledgement fits an
+   internal seam vocabulary whose outcomes are host-independent even where one arm cannot produce
+   them all — `expect` rather than `allow`, so it lapses loudly once a new lane does.
 5. **Foreign drift is caught before the other machine boots.** `npm run check:cross` type-checks
    the workspace for the non-host targets where toolchains permit, and changes under a platform
    seam are checked natively on both a Windows and a macOS checkout before handoff. The pure-half

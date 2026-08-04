@@ -108,7 +108,7 @@ Other commands manage territories and generated jobs, credentials and backend ca
 
 ## Job configuration
 
-Jobs are TOML files in `%APPDATA%\syncdash\jobs\` on Windows and `~/.config/syncdash/jobs/` on macOS:
+Jobs are TOML files in `%APPDATA%\syncdash\jobs\` on Windows and `~/.config/syncdash/jobs/` on macOS and Linux:
 
 ```toml
 schema = 4
