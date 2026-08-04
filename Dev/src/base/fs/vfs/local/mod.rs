@@ -2,10 +2,17 @@
 //!
 //! Every operation resolves segment-by-segment from that handle, so a path can never address
 //! outside the root it was opened against. `read_dir` delegates to `LocalRoot::read_directory`,
-//! which reports an entry whose name is not valid Unicode separately instead of returning it:
-//! such a name has no faithful rel, and the lossy spelling `to_string_lossy` would supply names
-//! a different, nonexistent file. Skipping it is never silent — the scan lanes count it into the
-//! snapshot's walk errors, and this backend logs each one.
+//! which reports a name that is not valid Unicode separately instead of returning it: such a name
+//! has no faithful rel, and `to_string_lossy` would name a different, nonexistent file. Every one
+//! dropped is logged here.
+//!
+//! Those logs are not what makes the drop accountable to a scan, because scanning does not come
+//! through this path: `scan_root` sends every root that answers `local_root()` — which a
+//! `LocalVfs` always does — down the local lane, which reads `LocalRoot` directly and turns each
+//! unrepresentable name into a walk error. That is what the scan reports out loud and what
+//! downgrades its coverage to `Partial`. What reaches this `read_dir` is apply's directory sweep
+//! and the conformance harness, where the consequence stays visible a different way: a directory
+//! held open by a name we cannot spell fails `remove_dir` as NotEmpty and is reported as kept.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -161,10 +168,8 @@ impl Vfs for LocalVfs {
 
     fn read_dir(&self, rel: &str) -> VfsResult<Vec<VDirEntry>> {
         let listing = self.root.read_directory(&relative_directory(rel)?)?;
-        // A name Unicode cannot spell is skipped loudly rather than handed to the engine under a
-        // substituted spelling it cannot act on. The scan lanes count such a skip into the
-        // snapshot's walk errors; here the visible consequence is honest too — a directory kept
-        // alive by an unrepresentable name fails remove_dir as NotEmpty and is reported as kept.
+        // Dropped rather than handed over under a substituted spelling that names a different
+        // file. The module header covers who accounts for the drop on each path in.
         for name in &listing.invalid_names {
             crate::log_warn!(
                 "vfs",
