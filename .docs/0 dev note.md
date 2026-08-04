@@ -101,3 +101,6 @@ audit over comment cross all part over my code D:\Code\AlexQuant\Dev\Desktop, by
 
 
 上个版本在这里 m83524a57f1ebc0914e109605100420ed8f8eff37，写一个release log, 说明从这个版本到现在，介绍增/删了什么功能，修复了那些bug（大略就行）
+
+
+we have to further dig out, For a file-syncing app like ours, we rely heavily on the differences between macOS and Windows. Please conduct an audit and design, for a clean, long terms maintainable switching OS switching logic for us (for now, Mac, Win only, linux only).
