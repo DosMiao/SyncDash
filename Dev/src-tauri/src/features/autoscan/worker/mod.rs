@@ -23,7 +23,7 @@ pub(super) fn run_worker(
     shared: Arc<Mutex<AutoScanShared>>,
     execution: AutoScanExecutionServices,
 ) {
-    let Some(start) = detection_start(
+    match detect(
         app,
         generation,
         &binding,
@@ -31,22 +31,35 @@ pub(super) fn run_worker(
         &commands,
         &shared,
         &execution,
-    ) else {
-        return;
-    };
-    polling::run_polling(
-        app, generation, &binding, &commands, &shared, &execution, start,
-    );
+    ) {
+        DetectionOutcome::Complete => {}
+        DetectionOutcome::HandOffToPolling(start) => polling::run_polling(
+            app, generation, &binding, &commands, &shared, &execution, start,
+        ),
+    }
 }
 
-/// The per-host native-detection seam: exactly one arm compiles for any target, mirroring the
-/// predicates on the lane modules. The macOS arm runs FSEvents detection, which may serve the
-/// worker's whole generation (`None`) or hand over to polling with its cursor state preserved.
-/// A host without a native lane answers with an immediate polling start; Windows USN journals
-/// and Linux inotify are future arms that replace the stub rather than growing new cfg in
-/// `run_worker`.
+/// How a worker generation leaves the detection stage. Naming both exits keeps the one that ends
+/// the worker from hiding inside an `Option`.
+///
+/// The pair is the seam's contract and does not vary by host; which arm can produce which does.
+/// The expectation lapses — loudly — on the day this host grows a native lane.
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "no native lane can own a generation on this host")
+)]
+enum DetectionOutcome {
+    /// A native lane owned the whole generation and has stopped; the worker is done.
+    Complete,
+    /// Polling owns the rest of this generation, resuming from this state.
+    HandOffToPolling(polling::PollingStart),
+}
+
+/// The per-host detection seam: exactly one arm compiles for any target, mirroring the predicates
+/// on the lane modules. Windows USN journals and Linux inotify are future arms that replace the
+/// no-native-lane one rather than growing new cfg in `run_worker`.
 #[cfg(target_os = "macos")]
-fn detection_start(
+fn detect(
     app: &tauri::AppHandle,
     generation: u64,
     binding: &AutoScanBinding,
@@ -54,9 +67,9 @@ fn detection_start(
     commands: &mpsc::Receiver<WorkerCommand>,
     shared: &Arc<Mutex<AutoScanShared>>,
     execution: &AutoScanExecutionServices,
-) -> Option<polling::PollingStart> {
+) -> DetectionOutcome {
     let Some((source, target)) = local_roots else {
-        return Some(polling::PollingStart {
+        return DetectionOutcome::HandOffToPolling(polling::PollingStart {
             detail:
                 "These roots do not expose a local FSEvents journal; polling while SyncDash is open"
                     .into(),
@@ -73,11 +86,11 @@ fn detection_start(
         shared,
         execution,
     ) {
-        native_macos::NativeExit::Stopped => None,
+        native_macos::NativeExit::Stopped => DetectionOutcome::Complete,
         native_macos::NativeExit::PollingRequired {
             detail,
             next_ticket,
-        } => Some(polling::PollingStart {
+        } => DetectionOutcome::HandOffToPolling(polling::PollingStart {
             detail,
             next_ticket,
             immediate: false,
@@ -86,7 +99,7 @@ fn detection_start(
 }
 
 #[cfg(not(target_os = "macos"))]
-fn detection_start(
+fn detect(
     _app: &tauri::AppHandle,
     _generation: u64,
     _binding: &AutoScanBinding,
@@ -94,13 +107,13 @@ fn detection_start(
     _commands: &mpsc::Receiver<WorkerCommand>,
     _shared: &Arc<Mutex<AutoScanShared>>,
     _execution: &AutoScanExecutionServices,
-) -> Option<polling::PollingStart> {
+) -> DetectionOutcome {
     let detail = if local_roots.is_some() {
         "Native filesystem events are not available on this platform; polling while SyncDash is open"
     } else {
         "These roots do not expose a local event journal; polling while SyncDash is open"
     };
-    Some(polling::PollingStart {
+    DetectionOutcome::HandOffToPolling(polling::PollingStart {
         detail: detail.into(),
         next_ticket: 1,
         immediate: true,
