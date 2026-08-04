@@ -1,4 +1,11 @@
 //! Descriptor-relative access to one local filesystem root.
+//!
+//! The counterpart of `fs::staged`, split by whose files they touch: everything under a user's
+//! synced root mutates through these handles, which resolve each path segment against a retained
+//! root descriptor so no engine path can address outside the root it was opened against.
+//! SyncDash's own state files use `fs::staged` instead. The per-OS rename/flush primitives here
+//! (`directory.rs`) are deliberately not shared with that stack — they answer to handle-relative
+//! APIs — so a platform fact fixed in one stack must be checked against the other's assumptions.
 
 use std::ffi::OsStr;
 use std::io::{Read, Seek};

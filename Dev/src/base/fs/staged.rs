@@ -1,7 +1,17 @@
-//! Atomic local writes.
+//! Atomic local writes for SyncDash's own state, addressed by ambient path.
 //!
 //! Data is written and optionally synced in a same-directory temporary file, then renamed into
 //! place. Interruption can leave a temporary file, never a partial destination.
+//!
+//! This is one of two atomic-write stacks, split by whose files they touch. This one serves
+//! SyncDash's own artifacts — settings, caches, run history, lock and checkpoint files — at
+//! ordinary paths. User files inside a synced root go through `local_root`, whose staged writes
+//! and renames resolve every segment against a retained root descriptor precisely so an engine
+//! path can never address outside its root. The two stacks therefore carry parallel per-OS rename
+//! primitives against different API surfaces (full-path `MoveFileExW`/`renamex_np`/`renameat2`
+//! here, handle-relative NT rename information and `renameat2(fd, ..)` there). When a platform
+//! fact changes in one — a flag, an error mapping, a path-length rule — ask whether the sibling
+//! stack holds the same assumption before closing the change.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
