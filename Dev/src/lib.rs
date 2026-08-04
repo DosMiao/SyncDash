@@ -33,6 +33,10 @@
 //!
 //! A `peer://` root executes on the far-side SyncDash. Protocol roots such as `sftp://` are
 //! scanned and written by this process through `Vfs`.
+//!
+//! Platform-conditional code follows the seam rules in `Dev/ARCHITECTURE.md` ("Platform seams"):
+//! the supported hosts are declared once in `foundation::host`, `cfg` selects mechanisms rather
+//! than semantics, and per-domain seams keep the localid router shape.
 
 #[path = "base/foundation/mod.rs"]
 pub mod foundation;

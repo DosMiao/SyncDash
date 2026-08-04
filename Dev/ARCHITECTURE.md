@@ -247,6 +247,46 @@ import exactly one controller. Generic file or directory names such as `support`
 `utils` are rejected by the source-tree audit because every branch must name the responsibility it
 owns; empty ceremonial branches are rejected as well.
 
+## Platform seams
+
+SyncDash supports exactly three hosts — Windows, macOS, and Linux — declared once in
+`Dev/src/base/foundation/host.rs` behind a `compile_error!` backstop. Because that backstop exists,
+platform routers are written as exhaustive arms over the supported set and carry no "some other OS"
+fallback; porting to a fourth host is a compiler-driven checklist, not an archaeology project.
+
+Five rules govern every platform-conditional line:
+
+1. **`cfg` selects mechanisms, never semantics.** A `#[cfg]` or `cfg!` may decide which syscall
+   this host calls. It may never decide what a tree's semantics are — case sensitivity, mtime
+   precision, symlink support, name rules, placeholder hydration state. Those are capabilities:
+   probed from the volume, declared by the far side, or `Unknown`, carried through `VfsCaps` and
+   recorded in evidence. `cfg!(windows)` describes this build's host; for anything reachable over a
+   root phrase, the host is the wrong authority.
+2. **One seam per domain, shaped like `services/store/localid/`.** The domain's `mod.rs` owns the
+   platform-neutral contract vocabulary plus a router whose `cfg` predicates mirror the sibling
+   files that implement it. Siblings are named for their mechanism (`fsevents.rs`, `bulk/`) when
+   the mechanism is the identity, or for their platform (`windows.rs`, `unix.rs`, `macos.rs`) when
+   they group syscalls. `cfg` lives in exactly three places: the router, the sibling heads, and
+   Cargo target dependencies — never mid-function in shared logic.
+3. **Pure halves compile everywhere.** Every mechanism splits into a pure half — decoding,
+   reduction, classification — compiled under `#[cfg(any(target_os = "…", test))]` so every host
+   type-checks and unit-tests it (`base/fs/watch/reducer.rs` is the reference), and a syscall half
+   exercised by host-specific tests. Cross-platform behavior contracts stay ungated so each lane
+   answers to the same specification.
+4. **Wire vocabulary is platform-complete.** A ts-rs type keeps its full variant set on every
+   target; a platform-gated producer is acknowledged with
+   `cfg_attr(not(...), expect(dead_code, reason = "…"))` at the type, never by removing variants.
+   The generated TypeScript union is one contract for all hosts.
+5. **Foreign drift is caught before the other machine boots.** `npm run check:cross` type-checks
+   the workspace for the non-host targets where toolchains permit, and changes under a platform
+   seam are checked natively on both a Windows and a macOS checkout before handoff. The pure-half
+   rule is the primary net: foreign logic that compiles under `test` cannot silently rot.
+
+The host-facing exceptions are deliberate: `NameRules::host()` really is about this process's path
+layer, shell conveniences (`ipc/native/reveal.rs`, `power.rs`) really do run on this host, and
+`foundation::machine::os_name()` exists to stamp provenance into artifacts — the string is the
+data, so `std::env::consts::OS` is correct there and nowhere else.
+
 ## Placement guide
 
 | New responsibility | Owner |
@@ -254,6 +294,7 @@ owns; empty ceremonial branches are rejected as well.
 | Persisted engine vocabulary or codec | `Dev/src/base/model/` |
 | Content identity, or whether a digest is verifiable | `Dev/src/base/model/digest.rs` |
 | A fact this machine or a volume reports about itself | `Dev/src/base/foundation/` |
+| A per-OS syscall lane | its domain's seam, shaped per "Platform seams" |
 | Filesystem/VFS capability | `Dev/src/base/fs/` |
 | Settings, cache, trash, or version storage | `Dev/src/services/store/` |
 | Scan/compare/apply behavior | `Dev/src/workflow/pipeline/` |
