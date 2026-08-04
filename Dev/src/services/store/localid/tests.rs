@@ -1,13 +1,13 @@
 use super::*;
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::path::Path;
 use std::path::PathBuf;
 
 // macos.rs contributes nothing on other platforms, so an ungated glob would be an unused
-// import there. unix.rs and windows.rs both expose items to the cross-platform tests below.
+// import there. linux.rs and windows.rs both expose items to the cross-platform tests below.
+use super::linux::*;
 #[cfg(target_os = "macos")]
 use super::macos::*;
-use super::unix::*;
 use super::windows::*;
 
 fn temp_root(tag: &str) -> PathBuf {
@@ -109,7 +109,7 @@ fn windows_requires_a_volume_guid_even_when_serial_and_mount_path_match() {
     assert!(unc_or_probe_failure.starts_with(b"windows-nondurable-root:"));
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn linux_mountinfo_parser_decodes_paths_and_chooses_the_deepest_mount() {
     let mountinfo = b"not a mountinfo row\n\
@@ -134,7 +134,7 @@ fn linux_mountinfo_parser_decodes_paths_and_chooses_the_deepest_mount() {
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn linux_prefers_a_persistent_filesystem_uuid_over_mount_numbers() {
     let first = linux_volume_identity(
@@ -161,7 +161,7 @@ fn linux_prefers_a_persistent_filesystem_uuid_over_mount_numbers() {
     assert!(first.starts_with(b"linux-fs-uuid:"));
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn linux_fallbacks_fail_closed_when_st_dev_is_reused() {
     let mounted = linux_volume_identity(

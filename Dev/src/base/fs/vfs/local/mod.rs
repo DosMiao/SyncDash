@@ -88,26 +88,11 @@ impl Vfs for LocalVfs {
             set_mtime: Support::Yes,
             fsync: Support::Yes,
             rename_overwrite: Support::Yes,
-            exclusive_staged_file_publish: if cfg!(any(
-                target_os = "linux",
-                target_os = "android",
-                target_os = "macos",
-                windows
-            )) {
-                Support::Yes
-            } else {
-                Support::No
-            },
-            exclusive_entry_rename: if cfg!(any(
-                target_os = "linux",
-                target_os = "android",
-                target_os = "macos",
-                windows
-            )) {
-                Support::Yes
-            } else {
-                Support::No
-            },
+            // Every supported host has a no-replace primitive: renameat2 on Linux, renamex_np on
+            // macOS, and the NT rename information class on Windows. `foundation::host` keeps a
+            // fourth host from inheriting this claim unreviewed.
+            exclusive_staged_file_publish: Support::Yes,
+            exclusive_entry_rename: Support::Yes,
             exclusive_symlink_publish: symlink,
             durable_namespace: if cfg!(unix) {
                 Support::Yes

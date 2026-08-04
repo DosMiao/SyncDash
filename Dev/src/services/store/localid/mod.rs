@@ -6,8 +6,8 @@
 //! after an unplug/replug. This helper binds a cache generation to both the mounted volume and the
 //! canonical root within it, without changing the historical filename key.
 
+mod linux;
 mod macos;
-mod unix;
 mod windows;
 
 #[cfg(test)]
@@ -15,11 +15,12 @@ mod tests;
 
 // Exactly one arm defines `platform_identity` for any given target, so the router below carries
 // the same predicates the definitions do. A target matching none of them fails to build here
-// rather than silently binding scan state to an identity nobody verified.
+// rather than silently binding scan state to an identity nobody verified; `foundation::host`
+// guarantees the three arms cover every target this crate compiles for.
+#[cfg(target_os = "linux")]
+use self::linux::platform_identity;
 #[cfg(target_os = "macos")]
 use self::macos::platform_identity;
-#[cfg(all(unix, not(target_os = "macos")))]
-use self::unix::platform_identity;
 #[cfg(windows)]
 use self::windows::platform_identity;
 use std::path::{Path, PathBuf};
@@ -98,6 +99,28 @@ fn encode_binding(volume: &[u8], relative_root: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&(relative_root.len() as u64).to_le_bytes());
     out.extend_from_slice(relative_root);
     out
+}
+
+/// Walk up while the parent stays on the same device, yielding the volume's visible root. Shared
+/// by the Linux and macOS identities, so it lives with the contract rather than inside one lane.
+#[cfg(unix)]
+fn device_root(path: &Path, device: Option<u64>) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(device) = device else {
+        return path.to_path_buf();
+    };
+    let mut current = path.to_path_buf();
+    while let Some(parent) = current.parent() {
+        if parent == current {
+            break;
+        }
+        match std::fs::metadata(parent) {
+            Ok(metadata) if metadata.dev() == device => current = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    current
 }
 
 fn canonical_or_absolute(root: &Path) -> PathBuf {

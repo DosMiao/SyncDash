@@ -23,7 +23,7 @@ const CLAIM_LINK_TARGET: &[u8] = b".syncdash-claim\0";
 
 /// The raw-syscall rename paths need owned NUL-terminated names. An embedded NUL is a caller bug
 /// rather than a filesystem condition, so it is reported as invalid input instead of an OS error.
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn nul_terminated(name: &OsStr, role: &str) -> std::io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -314,7 +314,7 @@ impl LocalDirectory {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "linux")]
     pub(super) fn rename_noreplace(
         &self,
         source_name: &OsStr,
@@ -564,24 +564,6 @@ impl LocalDirectory {
                 Ok(())
             }
         }
-    }
-
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        windows
-    )))]
-    pub(super) fn rename_noreplace(
-        &self,
-        _source_name: &OsStr,
-        _destination_parent: &Self,
-        _destination_name: &OsStr,
-    ) -> std::io::Result<()> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "descriptor-relative exclusive rename is unavailable on this platform",
-        ))
     }
 
     #[cfg(windows)]

@@ -216,12 +216,15 @@ impl NameRules {
         }
     }
 
-    /// What a root reached through this process's own path layer is subject to.
+    /// What a root reached through this process's own path layer is subject to. This is a true
+    /// host fact, not a volume capability: Win32 name parsing applies to every path this process
+    /// opens, including an SMB share served by Samba.
     pub fn host() -> NameRules {
-        if cfg!(windows) {
-            NameRules::Windows
-        } else {
-            NameRules::Posix
+        match crate::foundation::host::HostOs::CURRENT {
+            crate::foundation::host::HostOs::Windows => NameRules::Windows,
+            crate::foundation::host::HostOs::MacOs | crate::foundation::host::HostOs::Linux => {
+                NameRules::Posix
+            }
         }
     }
 }

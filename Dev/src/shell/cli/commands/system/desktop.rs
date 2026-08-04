@@ -14,10 +14,11 @@ fn detach_console() {
 }
 
 fn launch_desktop() -> std::io::Result<i32> {
-    let executable_name = if cfg!(windows) {
-        "syncdash-desktop.exe"
-    } else {
-        "syncdash-desktop"
+    use syncdash::foundation::host::HostOs;
+
+    let executable_name = match HostOs::CURRENT {
+        HostOs::Windows => "syncdash-desktop.exe",
+        HostOs::MacOs | HostOs::Linux => "syncdash-desktop",
     };
     let candidate = std::env::current_exe().ok().and_then(|path| {
         path.parent()

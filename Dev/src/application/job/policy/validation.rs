@@ -208,8 +208,15 @@ fn comparable_local_root(raw: &str) -> Option<ComparableLocalRoot> {
     };
 
     let unified = raw.trim().replace('\\', "/");
-    let windows =
-        cfg!(windows) || unified.starts_with("//") || unified.as_bytes().get(1) == Some(&b':');
+    // Case folding is decided per root spelling, plus one true host fact: on a Windows host every
+    // local root passes through Win32 name folding regardless of how it is spelled. The host check
+    // deliberately stops there — a UNC or drive-lettered spelling folds on any host, and a posix
+    // spelling on macOS is left alone because APFS may be case-sensitive; overlap detection here
+    // may claim less than the volume folds, never more than the spelling proves.
+    let windows = crate::foundation::host::HostOs::CURRENT
+        == crate::foundation::host::HostOs::Windows
+        || unified.starts_with("//")
+        || unified.as_bytes().get(1) == Some(&b':');
     let normalized = if windows {
         unified.to_lowercase()
     } else {

@@ -4,7 +4,7 @@
 //! the set of code compiled on each platform is unchanged.
 
 #[cfg(target_os = "macos")]
-use super::{unix::device_root, PlatformIdentity};
+use super::{device_root, PlatformIdentity};
 #[cfg(target_os = "macos")]
 use crate::fs::vfs::local::volume::file_ids_stable_for_fs;
 #[cfg(target_os = "macos")]

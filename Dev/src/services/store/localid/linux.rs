@@ -1,17 +1,18 @@
-//! Volume identity on Linux, Android, and the remaining unix targets.
+//! Volume identity on Linux.
 //!
 //! Linux can offer a durable answer — a filesystem UUID plus a unique mount instance — and falls
 //! back to a process-scoped ephemeral identity when it cannot. The distinction matters because a
 //! scan state bound to an ephemeral identity must not be reused after a restart.
 //!
-//! Every item keeps the `cfg` it had before this file existed; the module itself is ungated.
+//! The module is ungated so its pure classification helpers stay compiled for the macOS test
+//! suite; each item carries the narrowest gate its imports allow.
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
 use super::PlatformIdentity;
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 use std::path::{Path, PathBuf};
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 pub(super) fn platform_identity(canonical: &Path) -> PlatformIdentity {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
@@ -19,7 +20,7 @@ pub(super) fn platform_identity(canonical: &Path) -> PlatformIdentity {
     let dev = std::fs::metadata(canonical)
         .ok()
         .map(|metadata| metadata.dev());
-    let mount_root = device_root(canonical, dev);
+    let mount_root = super::device_root(canonical, dev);
     let relative = canonical.strip_prefix(&mount_root).unwrap_or(canonical);
     let filesystem_uuid = dev.and_then(linux_filesystem_uuid);
     let unique_mount = linux_unique_mount_instance(canonical, dev);
@@ -32,10 +33,10 @@ pub(super) fn platform_identity(canonical: &Path) -> PlatformIdentity {
             filesystem_uuid.as_deref(),
             unique_mount.as_deref().or(ordinary_mount.as_deref()),
             dev,
-            unix_process_nonce(),
+            linux_process_nonce(),
         ),
         relative_root: relative.as_os_str().as_bytes().to_vec(),
-        file_ids_stable: unix_file_ids_stable(canonical),
+        file_ids_stable: linux_file_ids_stable(canonical),
         persistent_reuse: linux_identity_is_durable(
             filesystem_uuid.as_deref(),
             unique_mount.as_deref(),
@@ -43,38 +44,7 @@ pub(super) fn platform_identity(canonical: &Path) -> PlatformIdentity {
     }
 }
 
-/// Other Unix targets do not yet have a portable filesystem-UUID probe here. Include a process
-/// nonce so their reusable device number is never treated as durable replacement-media evidence.
-/// This deliberately sacrifices cross-process cache reuse instead of accepting state from another
-/// filesystem that later acquired the same `st_dev` value.
-#[cfg(all(
-    unix,
-    not(target_os = "macos"),
-    not(target_os = "linux"),
-    not(target_os = "android")
-))]
-pub(super) fn platform_identity(canonical: &Path) -> PlatformIdentity {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-
-    let dev = std::fs::metadata(canonical)
-        .ok()
-        .map(|metadata| metadata.dev());
-    let mount_root = device_root(canonical, dev);
-    let relative = canonical.strip_prefix(&mount_root).unwrap_or(canonical);
-    PlatformIdentity {
-        volume: ephemeral_unix_volume_identity(dev, unix_process_nonce()),
-        relative_root: relative.as_os_str().as_bytes().to_vec(),
-        file_ids_stable: unix_file_ids_stable(canonical),
-        persistent_reuse: false,
-    }
-}
-
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    all(test, target_os = "macos")
-))]
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 pub(super) fn normalize_linux_identifier(raw: &str) -> Option<String> {
     let value = raw.trim();
     (!value.is_empty()
@@ -87,11 +57,7 @@ pub(super) fn normalize_linux_identifier(raw: &str) -> Option<String> {
 /// Select Linux's durable volume evidence. `st_dev` participates only in discovering the UUID and
 /// distinguishing a live mount instance; it is never accepted by itself because its major/minor
 /// pair can be reused when removable media is replaced.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    all(test, target_os = "macos")
-))]
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 pub(super) fn linux_volume_identity(
     filesystem_uuid: Option<&str>,
     mount_instance: Option<&str>,
@@ -107,11 +73,7 @@ pub(super) fn linux_volume_identity(
     ephemeral_unix_volume_identity(dev, process_nonce)
 }
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    all(test, target_os = "macos")
-))]
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 pub(super) fn linux_identity_is_durable(
     filesystem_uuid: Option<&str>,
     unique_mount: Option<&str>,
@@ -122,7 +84,9 @@ pub(super) fn linux_identity_is_durable(
         || unique_mount.is_some_and(|value| !value.is_empty())
 }
 
-#[cfg(any(all(unix, not(target_os = "macos")), all(test, target_os = "macos")))]
+/// The wire spelling still says "unix": it is a persisted identity prefix, and renaming it would
+/// orphan every cache generation bound under the old bytes.
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 pub(super) fn ephemeral_unix_volume_identity(dev: Option<u64>, process_nonce: &[u8]) -> Vec<u8> {
     let mut volume = Vec::with_capacity(40 + process_nonce.len());
     volume.extend_from_slice(b"unix-ephemeral-volume\0");
@@ -135,7 +99,7 @@ pub(super) fn ephemeral_unix_volume_identity(dev: Option<u64>, process_nonce: &[
 /// Resolve the mounted block device through udev's filesystem-UUID aliases. Reading the symlink's
 /// target metadata compares its `rdev` with the mounted root's `st_dev`, so the mount source's
 /// spelling (`/dev/sda1`, `/dev/mapper/...`, and so on) is irrelevant.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 pub(super) fn linux_filesystem_uuid(dev: u64) -> Option<String> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
@@ -164,11 +128,7 @@ pub(super) fn linux_filesystem_uuid(dev: u64) -> Option<String> {
     (!matches.is_empty()).then(|| matches.join(":"))
 }
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    all(test, target_os = "macos")
-))]
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 pub(super) fn decode_mountinfo_path(field: &[u8]) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
 
@@ -192,11 +152,7 @@ pub(super) fn decode_mountinfo_path(field: &[u8]) -> Option<PathBuf> {
 
 /// Return the visible mount with the longest component prefix. Linux escapes whitespace and
 /// backslashes in mountinfo fields as octal bytes, which must be decoded before path matching.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    all(test, target_os = "macos")
-))]
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 pub(super) fn mountinfo_mount_id(contents: &[u8], canonical: &Path) -> Option<u64> {
     let mut best = None;
     for line in contents.split(|byte| *byte == b'\n') {
@@ -227,7 +183,7 @@ pub(super) fn mountinfo_mount_id(contents: &[u8], canonical: &Path) -> Option<u6
     best.map(|(_, id)| id)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 pub(super) fn linux_mount_instance(canonical: &Path, dev: Option<u64>) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
 
@@ -246,7 +202,7 @@ pub(super) fn linux_mount_instance(canonical: &Path, dev: Option<u64>) -> Option
 /// Linux 6.8 added a mount identifier that is never reused during one boot. Pair it with boot_id
 /// so the value is also unambiguous after reboot. Older kernels report the request bit absent (or
 /// reject it); ordinary mountinfo IDs remain useful diagnostics but are not durable cache evidence.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 pub(super) fn linux_unique_mount_instance(canonical: &Path, dev: Option<u64>) -> Option<String> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -276,8 +232,8 @@ pub(super) fn linux_unique_mount_instance(canonical: &Path, dev: Option<u64>) ->
     ))
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-pub(super) fn unix_process_nonce() -> &'static [u8] {
+#[cfg(target_os = "linux")]
+pub(super) fn linux_process_nonce() -> &'static [u8] {
     use std::io::Read;
     use std::sync::OnceLock;
 
@@ -303,28 +259,8 @@ pub(super) fn unix_process_nonce() -> &'static [u8] {
         .as_slice()
 }
 
-#[cfg(unix)]
-pub(super) fn device_root(path: &Path, device: Option<u64>) -> PathBuf {
-    use std::os::unix::fs::MetadataExt;
-
-    let Some(device) = device else {
-        return path.to_path_buf();
-    };
-    let mut current = path.to_path_buf();
-    while let Some(parent) = current.parent() {
-        if parent == current {
-            break;
-        }
-        match std::fs::metadata(parent) {
-            Ok(metadata) if metadata.dev() == device => current = parent.to_path_buf(),
-            _ => break,
-        }
-    }
-    current
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub(super) fn unix_file_ids_stable(path: &Path) -> bool {
+#[cfg(target_os = "linux")]
+pub(super) fn linux_file_ids_stable(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
 
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
@@ -343,7 +279,7 @@ pub(super) fn unix_file_ids_stable(path: &Path) -> bool {
 /// Filesystems for which Linux exposes object numbers with stable inode semantics. This must be
 /// a positive list: overlay/network/FUSE and future filesystems remain ineligible until their
 /// identity guarantees are understood, rather than silently becoming rename evidence.
-#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn linux_file_ids_stable_magic(magic: u64) -> bool {
     matches!(
         magic,
@@ -354,14 +290,4 @@ pub(super) fn linux_file_ids_stable_magic(magic: u64) -> bool {
             | 0xf2f5_2010 // f2fs
             | 0x3153_464a // jfs
     )
-}
-
-#[cfg(all(
-    unix,
-    not(target_os = "macos"),
-    not(target_os = "linux"),
-    not(target_os = "android")
-))]
-pub(super) fn unix_file_ids_stable(_path: &Path) -> bool {
-    false
 }

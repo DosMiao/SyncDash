@@ -27,11 +27,6 @@ fn os_name_digest(name: &std::ffi::OsStr) -> blake3::Hash {
     hasher.finalize()
 }
 
-#[cfg(not(any(unix, windows)))]
-fn os_name_digest(name: &std::ffi::OsStr) -> blake3::Hash {
-    blake3::hash(name.to_string_lossy().as_bytes())
-}
-
 #[cfg(not(windows))]
 fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::rename(source, destination)
@@ -128,7 +123,7 @@ pub(crate) fn atomic_rename_noreplace(source: &Path, destination: &Path) -> std:
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn atomic_rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -180,19 +175,6 @@ pub(crate) fn atomic_rename_noreplace(source: &Path, destination: &Path) -> std:
     }
 }
 
-#[cfg(not(any(
-    target_os = "macos",
-    target_os = "linux",
-    target_os = "android",
-    windows
-)))]
-pub(crate) fn atomic_rename_noreplace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "atomic no-replace rename is unavailable on this platform",
-    ))
-}
-
 /// Persist directory-entry changes after an atomic local rename. Unix requires an explicit fsync
 /// of the containing directory; syncing only the file does not make the new name crash-durable.
 #[cfg(unix)]
@@ -206,14 +188,6 @@ pub(crate) fn sync_directory(directory: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 pub(crate) fn sync_directory(_directory: &Path) -> std::io::Result<()> {
     Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn sync_directory(_directory: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "directory fsync is unavailable on this platform",
-    ))
 }
 
 /// Whether a file name (no directory part) is one of our temp files

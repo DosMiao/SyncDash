@@ -6,6 +6,7 @@
 pub mod dirs;
 pub mod disk;
 pub mod fmt;
+pub mod host;
 pub mod machine;
 pub mod names;
 pub mod path;
