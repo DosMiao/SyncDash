@@ -153,15 +153,12 @@ where
                 continue;
             }
 
-            #[cfg(target_os = "macos")]
             let dataless = if kind == WalkKind::File {
-                root.is_dataless_file(&relative)
+                root.is_dataless_file(&relative, &child.metadata)
                     .map_err(|error| subtree_error(root, relative.as_str(), error))?
             } else {
                 false
             };
-            #[cfg(not(target_os = "macos"))]
-            let dataless = false;
 
             visit(WalkEntry::from_metadata(
                 relative.clone(),

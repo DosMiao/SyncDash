@@ -244,7 +244,7 @@ where
                         },
                     };
                     let dataless = if kind == WalkKind::File {
-                        root.is_dataless_file(&relative)?
+                        root.is_dataless_file(&relative, &metadata)?
                     } else {
                         false
                     };

@@ -133,12 +133,47 @@ impl LocalRoot {
         parent.open_read(name.as_os_str())
     }
 
+    /// Whether a file's content is not locally present — a cloud placeholder or dataless stub
+    /// whose bytes are fetched on first read. Scans count these so a compare can say up front
+    /// that hashing the tree would hydrate them, instead of silently downloading content.
+    /// Exactly one arm compiles per target; `foundation::host` guarantees the set is covered.
     #[cfg(target_os = "macos")]
-    pub(crate) fn is_dataless_file(&self, relative: &RootRelativePath) -> std::io::Result<bool> {
+    pub(crate) fn is_dataless_file(
+        &self,
+        relative: &RootRelativePath,
+        _metadata: &capability_fs::Metadata,
+    ) -> std::io::Result<bool> {
         use std::os::macos::fs::MetadataExt;
         const SF_DATALESS: u32 = 0x4000_0000;
 
+        // st_flags is not carried by the capability metadata record, so the file is opened and
+        // asked. Opening a dataless file does not materialize it; only reading does.
         Ok(self.open_read(relative)?.metadata()?.st_flags() & SF_DATALESS != 0)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn is_dataless_file(
+        &self,
+        _relative: &RootRelativePath,
+        metadata: &capability_fs::Metadata,
+    ) -> std::io::Result<bool> {
+        use capability_fs::MetadataExt;
+
+        // Cloud sync engines mark placeholders in the directory listing itself. The answer must
+        // come from these listing attributes: a RECALL_ON_OPEN placeholder hydrates on open, so
+        // probing by opening would download the very content the flag exists to protect.
+        Ok(win_placeholder_attributes(metadata.file_attributes()))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn is_dataless_file(
+        &self,
+        _relative: &RootRelativePath,
+        _metadata: &capability_fs::Metadata,
+    ) -> std::io::Result<bool> {
+        // Linux cloud mounts arrive as FUSE filesystems that present complete files; there is no
+        // kernel placeholder vocabulary to read here.
+        Ok(false)
     }
 
     pub fn read(&self, relative: &RootRelativePath) -> std::io::Result<Vec<u8>> {
@@ -388,6 +423,45 @@ impl LocalRoot {
         }
         let (parent, name) = split_parent(relative.as_str());
         Ok((self.open_directory(&parent)?, name))
+    }
+}
+
+/// The Win32 attribute bits after which a file's content is no longer locally present. Pure so
+/// every host tests the classification; only the Windows probe consults it.
+#[cfg(any(windows, test))]
+pub(crate) fn win_placeholder_attributes(attributes: u32) -> bool {
+    const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+
+    attributes
+        & (FILE_ATTRIBUTE_OFFLINE
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+        != 0
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::win_placeholder_attributes;
+
+    #[test]
+    fn placeholder_bits_are_flagged_and_resident_bits_are_not() {
+        const ARCHIVE: u32 = 0x0000_0020;
+        const NORMAL: u32 = 0x0000_0080;
+        // OneDrive "always keep on this device": content is fully resident, and treating it as
+        // dataless would misreport exactly the files the user pinned to avoid hydration stalls.
+        const PINNED: u32 = 0x0008_0000;
+
+        for resident in [0, ARCHIVE, NORMAL, ARCHIVE | PINNED] {
+            assert!(!win_placeholder_attributes(resident), "{resident:#x}");
+        }
+        for placeholder in [0x0000_1000, 0x0004_0000, 0x0040_0000] {
+            assert!(
+                win_placeholder_attributes(ARCHIVE | placeholder),
+                "{placeholder:#x}"
+            );
+        }
     }
 }
 
