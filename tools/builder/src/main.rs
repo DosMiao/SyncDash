@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use builder_core::{
     confirm_cleanup, execute_cleanup, format_duration, load_cleanup_manifest,
-    normalize_standard_command, parse_common_args, parse_tier_selection, plan_cleanup,
-    print_cleanup_plan, print_standard_info, project_root_from_environment,
+    normalize_process_path, normalize_standard_command, parse_common_args, parse_tier_selection,
+    plan_cleanup, print_cleanup_plan, print_standard_info, project_root_from_environment,
     standard_project_command, verify_cleanup_plan_authorization, ArtifactBundleEntry,
     ArtifactSourceKind, BuildError, BuildResult, BuildTier as Tier, CleanLevel, CleanPlan,
     CleanTargetSelection, CleanupManifest, Host, InfoLine, Runtime,
@@ -180,6 +180,28 @@ fn is_syncdash_desktop_process(name: &str) -> bool {
     )
 }
 
+/// Stops any process running exactly this executable and waits for its file
+/// lock to clear. Returns whether a process had to be stopped, so a pack step
+/// can relaunch precisely what it displaced.
+fn free_exact_executable(runtime: &Runtime, executable: &Path, label: &str) -> BuildResult<bool> {
+    let stopped = if runtime.dry_run() {
+        runtime.print_dry_run(&format!("stop exact {label} process"));
+        false
+    } else {
+        let expected = normalize_process_path(&executable.display().to_string(), runtime.host());
+        let processes = runtime
+            .processes()?
+            .into_iter()
+            .filter(|process| {
+                normalize_process_path(&process.executable, runtime.host()) == expected
+            })
+            .collect::<Vec<_>>();
+        runtime.kill_processes(&processes, label)? > 0
+    };
+    runtime.wait_unlocked(executable)?;
+    Ok(stopped)
+}
+
 fn free_cli(runtime: &Runtime) -> BuildResult<()> {
     if runtime.dry_run() {
         runtime.print_dry_run("inspect running syncdash CLI and ask before stopping it");
@@ -241,6 +263,9 @@ fn dev(runtime: &Runtime) -> BuildResult<()> {
     )
 }
 
+/// Builds never take an upfront kill: a running packaged copy stays alive
+/// through compilation and is displaced only by its own pack step, which
+/// relaunches it as soon as the new copy is in place.
 fn build_tiers(runtime: &Runtime, tiers: &[Tier]) -> BuildResult<()> {
     if tiers.is_empty() {
         return Err(BuildError::new("at least one build tier is required"));
@@ -249,8 +274,7 @@ fn build_tiers(runtime: &Runtime, tiers: &[Tier]) -> BuildResult<()> {
         Host::Windows => runtime.ensure_node_modules(runtime.root())?,
         Host::Macos => require_committed_dist(runtime)?,
     }
-    free_desktop(runtime)?;
-    runtime.wait_unlocked(&desktop_binary(runtime))?;
+    free_exact_executable(runtime, &desktop_binary(runtime), "syncdash-desktop source")?;
     runtime.total(|| {
         let frontend_steps = usize::from(runtime.host() == Host::Windows);
         let step_count = frontend_steps + tiers.len();
@@ -270,7 +294,10 @@ fn build_tiers(runtime: &Runtime, tiers: &[Tier]) -> BuildResult<()> {
                 &environment,
             )?;
             step += 1;
-            let desktop_mb = pack_desktop_tier(runtime, tier)?;
+            let (desktop_mb, displaced) = pack_desktop_tier(runtime, tier)?;
+            if displaced {
+                runtime.launch(&tier_desktop_binary(runtime, tier)?)?;
+            }
             results.push((tier, started.elapsed(), desktop_mb));
         }
 
@@ -364,7 +391,10 @@ fn cli_step(
         .map(|_| ())
 }
 
-fn pack_desktop_tier(runtime: &Runtime, tier: Tier) -> BuildResult<u64> {
+/// Packs the built desktop binary into the tier's published copy. Returns the
+/// packed size and whether a running instance of that copy had to be stopped
+/// for the overwrite — the caller relaunches it once the pack is complete.
+fn pack_desktop_tier(runtime: &Runtime, tier: Tier) -> BuildResult<(u64, bool)> {
     let relative_directory = PathBuf::from("tiers").join(tier.key());
     let source = desktop_binary(runtime);
     if runtime.host() == Host::Macos {
@@ -375,10 +405,13 @@ fn pack_desktop_tier(runtime: &Runtime, tier: Tier) -> BuildResult<u64> {
             &[],
         )?;
     }
-    free_desktop(runtime)?;
-    runtime.wait_unlocked(&source)?;
+    free_exact_executable(runtime, &source, "syncdash-desktop source")?;
     let destination = tier_desktop_binary(runtime, tier)?;
-    runtime.wait_unlocked(&destination)?;
+    let displaced = free_exact_executable(
+        runtime,
+        &destination,
+        &format!("SyncDash {} tier", tier.output_label()),
+    )?;
     let desktop = runtime.publish_artifact_file(
         PROJECT_ID,
         &source,
@@ -393,15 +426,16 @@ fn pack_desktop_tier(runtime: &Runtime, tier: Tier) -> BuildResult<u64> {
         &desktop,
         &format!("PACKAGED - SyncDash {}", tier.output_label()),
     )?;
-    Ok(desktop_mb)
+    Ok((desktop_mb, displaced))
 }
 
 fn build_installer(runtime: &Runtime) -> BuildResult<()> {
     runtime.ensure_node_modules(runtime.root())?;
     require_installer_processes_stopped(runtime)?;
     require_installer_disk_images_unmounted(runtime)?;
-    free_desktop(runtime)?;
-    runtime.wait_unlocked(&desktop_binary(runtime))?;
+    // The installer relinks only the release desktop binary; running packaged
+    // tier copies never block it and stay up.
+    free_exact_executable(runtime, &desktop_binary(runtime), "syncdash-desktop source")?;
     let environment = Tier::Release.release_environment(runtime.host());
     let environment = cargo_environment(runtime, &environment);
     let tauri_root = runtime.path("Dev");
@@ -485,7 +519,7 @@ fn build_app_self(runtime: &Runtime) -> BuildResult<()> {
         return Err(BuildError::new("app-self is available only on macOS"));
     }
     runtime.ensure_node_modules(runtime.root())?;
-    free_desktop(runtime)?;
+    free_exact_executable(runtime, &desktop_binary(runtime), "syncdash-desktop source")?;
     let environment = Tier::Max.release_environment(runtime.host());
     let environment = cargo_environment(runtime, &environment);
     let tauri_root = runtime.path("Dev");
