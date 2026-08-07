@@ -9,6 +9,19 @@ use super::super::model::result::CompareResultVersion;
 use super::error::invalid_data;
 use super::{DIGEST_HEX_LENGTH, RESULT_ID_HEX_LENGTH};
 
+/// Whether the plan's record of a side's unread subtrees still matches that side's snapshot.
+///
+/// Compared as strings because the plan carries them flattened for the webview, while the snapshot
+/// keeps them typed. Order is part of the claim: both are written strictly sorted, so a difference
+/// in order is a difference in content.
+fn attests_unread(claimed: &[String], snapshot: &TableArtifact) -> bool {
+    claimed.len() == snapshot.header.unread_paths.len()
+        && claimed
+            .iter()
+            .zip(snapshot.header.unread_paths.iter())
+            .all(|(claimed, observed)| claimed == observed.as_str())
+}
+
 pub(super) fn validate_compare_result(version: &CompareResultVersion) -> std::io::Result<()> {
     validate_identity(&version.identity)?;
     validate_digest(&version.plan_digest, "Compare plan digest")?;
@@ -57,6 +70,8 @@ pub(super) fn validate_compare_result(version: &CompareResultVersion) -> std::io
         || plan_header.target_icloud_stubs != version.target.header.icloud_stubs
         || plan_header.source_icloud_stub_samples != version.source.header.icloud_stub_samples
         || plan_header.target_icloud_stub_samples != version.target.header.icloud_stub_samples
+        || !attests_unread(&plan_header.source_unread_paths, &version.source)
+        || !attests_unread(&plan_header.target_unread_paths, &version.target)
     {
         return Err(invalid_data(
             "retained Compare plan header does not attest to its exact snapshots",

@@ -179,6 +179,23 @@ pub struct PlanHeader {
     pub source_icloud_stub_samples: Vec<String>,
     #[serde(default)]
     pub target_icloud_stub_samples: Vec<String>,
+    /// Subtrees a scan was not allowed to read, and which this comparison therefore left out on
+    /// both sides. Distinct from the walk errors above and the opposite consequence: those entries
+    /// are absent and read as deletions, these took no part in the compare at all, so nothing
+    /// under them is copied or deleted. Complete rather than sampled — the remedy is per path, and
+    /// a user who fixes the one path shown would re-run only to meet the next.
+    #[serde(default)]
+    pub source_unread_paths: Vec<String>,
+    #[serde(default)]
+    pub target_unread_paths: Vec<String>,
+    /// Entries dropped from each side by that suppression, so the plan can attest that the counts
+    /// above do not describe the whole tree.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub source_unread_entries: u64,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub target_unread_entries: u64,
 }
 
 pub struct Plan {
@@ -347,6 +364,10 @@ mod tests {
             target_icloud_stubs: 0,
             source_icloud_stub_samples: Vec::new(),
             target_icloud_stub_samples: Vec::new(),
+            source_unread_paths: Vec::new(),
+            target_unread_paths: Vec::new(),
+            source_unread_entries: 0,
+            target_unread_entries: 0,
         }
     }
 

@@ -165,6 +165,9 @@ pub(crate) fn migrate_v1_archive(reader: impl BufRead) -> std::io::Result<TableA
         excluded_files: legacy_header.excluded_files.unwrap_or(0),
         walk_errors: legacy_header.walk_errors.unwrap_or(0),
         walk_err_samples: legacy_header.walk_err_samples.unwrap_or_default(),
+        // v1 predates the concept, and its producers aborted rather than emit a partial table:
+        // a v1 archive that exists was observed whole.
+        unread_paths: Vec::new(),
         icloud_stubs: legacy_header.icloud_stubs.unwrap_or(0),
         icloud_stub_samples: legacy_header.icloud_stub_samples.unwrap_or_default(),
         skipped_symlinks: legacy_header.skipped_symlinks.unwrap_or(0),

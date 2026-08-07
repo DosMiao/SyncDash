@@ -827,15 +827,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The reason `local::discovery` aborts instead of counting: a directory is recorded when its
-    /// parent lists it, before the walk descends into it, so a directory that cannot be read is
-    /// already in the table with zero children — and compare cannot tell "no children" from
-    /// "children deleted". Under mirror that is a delete for every file the other side still
-    /// holds. On macOS the everyday cause is TCC, not a chmod: ~/Desktop, ~/Documents and every
-    /// external volume are gated by default.
+    /// Why an unreadable directory needs a channel of its own: a directory is recorded when its
+    /// parent lists it, before the walk descends into it, so one that cannot be read is already in
+    /// the table with zero children — and compare cannot tell "no children" from "children
+    /// deleted". Under mirror that is a delete for every file the other side still holds. Naming
+    /// the path is what lets compare suppress both sides there instead. On macOS the everyday
+    /// cause is TCC, not a chmod: ~/Desktop, ~/Documents and every external volume are gated by
+    /// default.
     #[cfg(unix)]
     #[test]
-    fn an_unreadable_subdirectory_aborts_the_scan_rather_than_reading_as_empty() {
+    fn an_unreadable_subdirectory_is_named_rather_than_read_as_empty() {
         use std::os::unix::fs::PermissionsExt;
         let root = mk_tree("denied", 3);
         let locked = root.join("locked");
@@ -847,17 +848,28 @@ mod tests {
         // rather than reporting a pass that proved nothing.
         let denied = std::fs::read_dir(&locked).is_err();
         if denied {
-            match scan(&root, &opts()) {
-                Ok(s) => panic!(
-                    "an unreadable subtree scanned clean with {} entries — that table says the tree is empty",
-                    s.entries.len()
-                ),
-                Err(e) => {
-                    let msg = e.to_string();
-                    assert!(msg.contains("refusing to emit a half table"), "{msg}");
-                    assert!(msg.contains("locked"), "the refusal must name what it could not read: {msg}");
-                }
-            }
+            let snapshot = scan(&root, &opts()).expect("a denied subtree must not fail the scan");
+            assert!(
+                snapshot
+                    .header
+                    .unread_paths
+                    .iter()
+                    .any(|path| path.as_str() == "locked"),
+                "the scan must name what it could not read: {:?}",
+                snapshot.header.unread_paths
+            );
+            // The readable remainder is the whole point of not aborting.
+            assert!(
+                snapshot
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path().as_str().starts_with("sub/")),
+                "one denied subtree must not cost its readable siblings"
+            );
+            // Not a walk error: that channel means "was listed, now gone", which compare is right
+            // to read as a deletion. This one is suppressed instead, so conflating them would
+            // produce a warning about deletions that cannot happen.
+            assert_eq!(snapshot.header.walk_errors, 0);
         }
 
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -865,6 +877,78 @@ mod tests {
         assert!(
             denied,
             "precondition absent: this process can read a 0o000 directory (running as root?)"
+        );
+    }
+
+    /// The complaint that motivated the change: aborting at the first denial means fixing one
+    /// permission, re-walking the whole root, and only then learning about the second.
+    #[cfg(unix)]
+    #[test]
+    fn every_unreadable_subdirectory_is_reported_in_one_pass() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = mk_tree("denied-many", 2);
+        for name in ["locked_a", "locked_b"] {
+            let locked = root.join(name);
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::write(locked.join("secret.txt"), b"x").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        let denied = std::fs::read_dir(root.join("locked_a")).is_err();
+        if denied {
+            let snapshot = scan(&root, &opts()).unwrap();
+            let named: Vec<&str> = snapshot
+                .header
+                .unread_paths
+                .iter()
+                .map(|path| path.as_str())
+                .collect();
+            assert_eq!(
+                named,
+                vec!["locked_a", "locked_b"],
+                "one pass must name every denied subtree, in sorted order"
+            );
+        }
+
+        for name in ["locked_a", "locked_b"] {
+            std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            denied,
+            "precondition absent: 0o000 directories are readable"
+        );
+    }
+
+    /// Excluding the denied path has to work, and used to not: the walk stat-ed every child while
+    /// listing its parent, so the failure landed before the filter was ever consulted.
+    #[cfg(unix)]
+    #[test]
+    fn an_excluded_unreadable_subdirectory_is_not_reported_at_all() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = mk_tree("denied-excluded", 2);
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let denied = std::fs::read_dir(&locked).is_err();
+        if denied {
+            let mut options = opts();
+            options.filter = crate::pipeline::filter::PathFilter::build(&[], &["*/locked/".into()]);
+            let snapshot = scan(&root, &options).unwrap();
+            assert!(
+                snapshot.header.unread_paths.is_empty(),
+                "a path the user excluded is not evidence anyone is missing: {:?}",
+                snapshot.header.unread_paths
+            );
+        }
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            denied,
+            "precondition absent: 0o000 directories are readable"
         );
     }
 

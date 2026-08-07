@@ -13,7 +13,7 @@ mod tests;
 use self::compatibility::*;
 use self::record::*;
 use super::walk::{WalkEntry, WalkKind, WalkStats};
-use super::{as_directory, child_path, subtree_error};
+use super::{as_directory, child_path, directory_path, out_of_scope};
 use crate::foundation::path::{EntryName, RootRelativeDir};
 use crate::fs::local_root::LocalRoot;
 use crate::pipeline::filter::PathFilter;
@@ -98,7 +98,10 @@ where
                 stats.note_error(format!("{}: {error}", directory_relative.as_str()));
                 continue;
             }
-            Err(error) => return Err(subtree_error(root, directory_relative.as_str(), error)),
+            Err(error) => {
+                stats.note_unread(directory_path(&directory_relative), &error);
+                continue;
+            }
         };
         let directory_handle = directory.try_clone_handle()?;
 
@@ -132,7 +135,11 @@ where
                         stats.note_error(format!("{}: {error}", directory_relative.as_str()));
                         break;
                     }
-                    return Err(subtree_error(root, directory_relative.as_str(), error));
+                    // Mid-enumeration: whatever this directory still held is unobserved, so the
+                    // whole of it is left out rather than the prefix already emitted being passed
+                    // off as complete.
+                    stats.note_unread(directory_path(&directory_relative), &error);
+                    break;
                 }
             };
             if count == 0 {
@@ -195,7 +202,14 @@ where
                             stats.note_error(format!("{}: {error}", relative.as_str()));
                             continue;
                         }
-                        Err(error) => return Err(subtree_error(root, relative.as_str(), error)),
+                        // The stat that would have told us the kind is the stat that failed, so
+                        // the filter has to be asked in a kind-agnostic way — see `out_of_scope`.
+                        Err(error) => {
+                            if !out_of_scope(filter, relative.as_str()) {
+                                stats.note_unread(relative, &error);
+                            }
+                            continue;
+                        }
                     },
                 };
 
@@ -234,17 +248,22 @@ where
                                 }
                                 continue;
                             }
-                            Err(error) if kind != WalkKind::Dir => {
-                                stats.note_error(format!("{}: {error}", relative.as_str()));
-                                continue;
-                            }
+                            // One rule for both kinds, matching the WalkDir lane entry for entry:
+                            // a child that will not stat is unobserved, not vanished.
                             Err(error) => {
-                                return Err(subtree_error(root, relative.as_str(), error));
+                                stats.note_unread(relative, &error);
+                                continue;
                             }
                         },
                     };
                     let dataless = if kind == WalkKind::File {
-                        root.is_dataless_file(&relative, &metadata)?
+                        match root.is_dataless_file(&relative, &metadata) {
+                            Ok(dataless) => dataless,
+                            Err(error) => {
+                                stats.note_unread(relative, &error);
+                                continue;
+                            }
+                        }
                     } else {
                         false
                     };

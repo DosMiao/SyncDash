@@ -22,7 +22,7 @@ use crate::model::plan::{Op, PlanHeader};
 use case_sensitivity::check_case_declaration;
 use ratio::check_delete_ratio;
 use roots::check_root_vfs;
-use scan::{check_materialized, check_scan_complete};
+use scan::{check_materialized, check_scan_complete, check_scan_coverage};
 use space::check_space;
 use stats::stat_plan;
 
@@ -108,6 +108,8 @@ pub fn run_all_vfs(
         &head.target_walk_err_samples,
         &mut v,
     );
+    check_scan_coverage("source", &head.source_unread_paths, &mut v);
+    check_scan_coverage("target", &head.target_unread_paths, &mut v);
     check_materialized(
         "source",
         head.source_icloud_stubs,
@@ -178,6 +180,10 @@ mod tests {
             target_icloud_stubs: 0,
             source_icloud_stub_samples: Vec::new(),
             target_icloud_stub_samples: Vec::new(),
+            source_unread_paths: Vec::new(),
+            target_unread_paths: Vec::new(),
+            source_unread_entries: 0,
+            target_unread_entries: 0,
         }
     }
 

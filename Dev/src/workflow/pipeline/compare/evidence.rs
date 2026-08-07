@@ -38,7 +38,7 @@ use crate::model::table::{ObservedEntry, ObservedEntryKind, TableArtifact};
 
 use std::collections::BTreeMap;
 
-use super::matching::{files_equal, map_of};
+use super::matching::{files_equal, map_of, UnreadScope};
 use super::CompareOptions;
 use crate::foundation::text::norm_key;
 
@@ -97,10 +97,11 @@ pub fn evidence_for_operations(
 ) -> Evidence {
     let ci = copts.case_insensitive;
     let win = copts.mtime_window_ms;
-    let (s_files, _) = map_of(source, ObservedEntryKind::File, ci);
-    let (t_files, _) = map_of(target, ObservedEntryKind::File, ci);
-    let (s_dirs, _) = map_of(source, ObservedEntryKind::Directory, ci);
-    let (t_dirs, _) = map_of(target, ObservedEntryKind::Directory, ci);
+    let unread = UnreadScope::of(source, target, ci);
+    let (s_files, _) = map_of(source, ObservedEntryKind::File, ci, &unread);
+    let (t_files, _) = map_of(target, ObservedEntryKind::File, ci, &unread);
+    let (s_dirs, _) = map_of(source, ObservedEntryKind::Directory, ci, &unread);
+    let (t_dirs, _) = map_of(target, ObservedEntryKind::Directory, ci, &unread);
 
     let meta = |entry: &ObservedEntry| SideMeta {
         size: entry.size(),
@@ -188,8 +189,9 @@ pub fn identical_page(
 ) -> (u64, Vec<IdenticalRow>) {
     let case_insensitive = compare_options.case_insensitive;
     let mtime_window_ms = compare_options.mtime_window_ms;
-    let (source_files, _) = map_of(source, ObservedEntryKind::File, case_insensitive);
-    let (target_files, _) = map_of(target, ObservedEntryKind::File, case_insensitive);
+    let unread = UnreadScope::of(source, target, case_insensitive);
+    let (source_files, _) = map_of(source, ObservedEntryKind::File, case_insensitive, &unread);
+    let (target_files, _) = map_of(target, ObservedEntryKind::File, case_insensitive, &unread);
     let normalized_query = query.trim().to_lowercase();
     let mut total = 0u64;
     let mut rows = Vec::new();

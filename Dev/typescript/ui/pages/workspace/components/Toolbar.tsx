@@ -11,12 +11,17 @@ import { RESULT_TYPE_ICON } from '#ui/shared/icons/compareIcons.tsx';
 import type { ReactNode } from 'react';
 import type { JobDto } from '#core/types/generated/JobDto.ts';
 import type { AutoScanStatusDto } from '#core/types/generated/AutoScanStatusDto.ts';
+import type { PlanHeader } from '#core/types/generated/PlanHeader.ts';
 import { autoScanButtonLabel } from '#core/application/autoscan/autoscan.ts';
+import { ScanFaultIndicator } from '#ui/features/compare-results/components/ScanFaultIndicator.tsx';
 import type { SelectedRunStats } from '#ui/features/compare-results/model/selectedRunStats.ts';
 
 interface ToolbarProps {
   job: JobDto | null;
   hasPlan: boolean;
+  /// The current plan's header, for the scan-fault mark. Null before the first compare, and the
+  /// mark renders nothing when the scan saw both trees whole.
+  planHeader: PlanHeader | null;
   executableCount: number;
   stats: SelectedRunStats | null;
   busy: boolean;
@@ -47,6 +52,7 @@ export function Toolbar(props: ToolbarProps) {
   const {
     job,
     hasPlan,
+    planHeader,
     executableCount,
     stats,
     busy,
@@ -112,6 +118,8 @@ export function Toolbar(props: ToolbarProps) {
       </div>
 
       <div className="tb-side">
+        <ScanFaultIndicator header={planHeader} />
+
         <button type="button" className="btn" title="Show the run log" onClick={onToggleLog}>
           <ScrollText size={13} /> Log
         </button>

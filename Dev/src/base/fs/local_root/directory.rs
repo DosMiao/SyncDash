@@ -14,7 +14,7 @@ use cap_primitives::fs::{self as capability_fs, OpenOptions};
 use crate::foundation::path::EntryName;
 
 use super::identity::{file_identity, EntryNameOsStr, FileIdentity};
-use super::{DirectoryListing, LocalDirectory, LocalEntry, LocalStagedFile};
+use super::{DirectoryListing, LocalDirectory, LocalEntry, LocalStagedFile, UnreadableChild};
 
 /// Placeholder body for a symlink claim. It is overwritten by the rename that follows within the
 /// same call, and is only ever observable to a reader racing a publication in progress.
@@ -94,6 +94,7 @@ impl LocalDirectory {
     pub(super) fn read_entries(&self) -> std::io::Result<DirectoryListing> {
         let mut entries = Vec::new();
         let mut invalid_names = Vec::new();
+        let mut unreadable = Vec::new();
         for entry in capability_fs::read_base_dir(&self.handle)? {
             let entry = entry?;
             let name = match entry.file_name().into_string() {
@@ -109,12 +110,18 @@ impl LocalDirectory {
             let name = EntryName::try_from(name).map_err(|error| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
             })?;
-            let metadata = self.metadata(name.as_os_str())?;
-            entries.push(LocalEntry { name, metadata });
+            // Enumerating a directory and stat-ing its children are separately permissioned on
+            // Windows: a child can carry a DACL that denies this process everything while its
+            // parent lists fine. Raising here would blame the parent for the child's ACL.
+            match self.metadata(name.as_os_str()) {
+                Ok(metadata) => entries.push(LocalEntry { name, metadata }),
+                Err(error) => unreadable.push(UnreadableChild { name, error }),
+            }
         }
         Ok(DirectoryListing {
             entries,
             invalid_names,
+            unreadable,
         })
     }
 

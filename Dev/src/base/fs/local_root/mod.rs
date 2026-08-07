@@ -45,10 +45,25 @@ pub(crate) struct LocalEntry {
 /// separate. Such a name has no faithful table rel — a lossy substitution would point at a file
 /// that does not exist — so it is skipped, never respelled, and each caller decides how loudly
 /// to say so.
+///
+/// `unreadable` is the same shape of decision for a child the platform named but would not stat.
+/// It is kept per child rather than failing the whole read, because the enclosing directory was
+/// listed fine and the caller — not this layer — knows whether one unreadable child invalidates
+/// the rest. `read_directory` and `read_directory_partial` are the two answers.
 #[derive(Debug)]
 pub(crate) struct DirectoryListing {
     pub(crate) entries: Vec<LocalEntry>,
     pub(crate) invalid_names: Vec<std::ffi::OsString>,
+    pub(crate) unreadable: Vec<UnreadableChild>,
+}
+
+/// A child that exists under a name the platform returned, whose metadata this process cannot
+/// read. The name is kept beside the error because the error alone names nothing the caller can
+/// act on — the OS reports the denial, not the path it denied.
+#[derive(Debug)]
+pub(crate) struct UnreadableChild {
+    pub(crate) name: EntryName,
+    pub(crate) error: std::io::Error,
 }
 
 pub struct LocalStagedFile {
@@ -109,7 +124,33 @@ impl LocalRoot {
         self.open_directory(relative)?.metadata_self()
     }
 
+    /// Every child, or the first one that could not be stat'd.
+    ///
+    /// The strict exit, and the one everything outside the scanner takes: these callers walk
+    /// SyncDash's own state directories, where a child that will not stat is a damaged store
+    /// rather than a fact about a user's tree. The name is folded into the message because the
+    /// raw OS error names nothing — `Access is denied` without a path sends the reader hunting.
     pub(crate) fn read_directory(
+        &self,
+        relative: &RootRelativeDir,
+    ) -> std::io::Result<DirectoryListing> {
+        let mut listing = self.read_directory_partial(relative)?;
+        if !listing.unreadable.is_empty() {
+            let child = listing.unreadable.remove(0);
+            return Err(std::io::Error::new(
+                child.error.kind(),
+                format!("{}: {}", child.name.as_str(), child.error),
+            ));
+        }
+        Ok(listing)
+    }
+
+    /// Every child, with the ones that could not be stat'd handed back rather than raised.
+    ///
+    /// The scanner's exit. A user's tree may legitimately contain a directory this process cannot
+    /// open, and one such child must not cost the evidence for its readable siblings — so the
+    /// walker decides per child, and records what it could not see instead of guessing.
+    pub(crate) fn read_directory_partial(
         &self,
         relative: &RootRelativeDir,
     ) -> std::io::Result<DirectoryListing> {

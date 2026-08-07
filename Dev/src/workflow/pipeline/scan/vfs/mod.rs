@@ -76,7 +76,9 @@ pub(super) fn scan_vfs(
         .iter()
         .filter(|file| file.hash.is_some())
         .count() as u64;
-    let coverage = if discovered.walk_errors == 0 {
+    // An unread subtree makes this scan partial for the same reason a walk error does: the cache
+    // must not retire rows for paths this round was never allowed to look at.
+    let coverage = if discovered.walk_errors == 0 && discovered.unread_paths.is_empty() {
         crate::store::ScanCoverage::Complete
     } else {
         crate::store::ScanCoverage::Partial
@@ -164,6 +166,7 @@ pub(super) fn scan_vfs(
             excluded_files: discovered.excluded_files,
             walk_errors: discovered.walk_errors,
             walk_err_samples: discovered.walk_error_samples,
+            unread_paths: discovered.unread_paths,
             // iCloud eviction is a property of a local macOS filesystem. A root reached over
             // sftp/smb/ftp has no such state to report, and inventing a zero that means "checked
             // and found none" would be a different claim from "not applicable here".

@@ -81,7 +81,7 @@ Use the repository Builder for project builds, development launches, optimized a
 ./builder.command run dist
 ```
 
-On Windows, use the corresponding `builder.bat` commands. `cargo check`/`test`, type generation, and the documented `npm run build` dist refresh remain direct commands. Optimized Dist, Max, Release, and compact numbered tiers build only the desktop artifact under `target/builder-tiers/<tier>/`. `build cli` is the sole standalone-CLI Builder path, uses Dist policy, and writes `target/release/syncdash[.exe]`; optimized desktop tiers never build it implicitly.
+On Windows, use the corresponding `builder.bat` commands. `cargo check`/`test`, type generation, and the documented `npm run build` dist refresh remain direct commands. Optimized Dist, Max, Release, and compact numbered tiers build only the desktop artifact; on Windows it stays inside the checkout under `target/builder-tiers/<tier>/` (build/deep cleanup holds it in `tools/builder/.rescue/` across the deletion), while macOS publishes it to the durable Builder artifact store. `build cli` is the sole standalone-CLI Builder path, uses Dist policy, and writes `target/release/syncdash[.exe]` (macOS additionally publishes a durable copy); optimized desktop tiers never build it implicitly.
 
 A desktop process may be closed by Builder when replacing its binary. A running `syncdash` CLI may be applying changes and holding root leases, so report it and obtain explicit approval before terminating it. Interactive GUI acceptance remains the user's step unless they ask for a launch.
 

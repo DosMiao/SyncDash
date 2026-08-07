@@ -3,10 +3,14 @@
 //! Every other gate here judges the plan. This one judges the *evidence*, because a plan built on
 //! a partial scan is not a wrong plan — it is a plausible one. Compare cannot distinguish "this
 //! file is gone" from "this file was never read": both are an absent entry, and under mirror both
-//! produce a delete. The scan lanes refuse to emit a table whose subtrees are missing, so anything
-//! that survives to here is a race (an entry that vanished mid-walk) — rare, self-limiting, and
-//! still worth refusing over, because the one case that matters is indistinguishable from the many
-//! that do not.
+//! produce a delete.
+//!
+//! Two unrelated shortfalls reach here, and the difference is what the plan does about them. A
+//! *walk error* is an entry that vanished mid-walk: nothing downstream knows to treat it
+//! specially, so it really is absent from this side's table and really would read as a deletion.
+//! An *unread path* is a subtree the scan was refused: compare knows about those and suppressed
+//! both sides at and under each one, so nothing there is planned either way. Both are worth
+//! saying; only the first is a warning about what this plan would do.
 
 use super::Verdict;
 
@@ -28,6 +32,26 @@ pub fn check_scan_complete(label: &str, walk_errors: u64, samples: &[String], v:
     );
     v.warnings.push(format!(
         "{msg} Re-scan if those entries are not really gone."
+    ));
+}
+
+/// Report the subtrees this comparison left out because a scan was not allowed to read them.
+///
+/// Not a warning about what the plan would do — compare already suppressed both sides there, so
+/// nothing under these paths is copied or deleted. It is a warning about what the plan *does not
+/// cover*, which a clean-looking Difference count would otherwise hide. Every path is named rather
+/// than sampled: each one is a separate permission to fix, and a list that stops at the first
+/// sends the user back for another round per path.
+pub fn check_scan_coverage(label: &str, unread_paths: &[String], v: &mut Verdict) {
+    if unread_paths.is_empty() {
+        return;
+    }
+    v.warnings.push(format!(
+        "{label}: {} subtree(s) could not be read, so this comparison left them out on both sides \
+         — nothing under them will be copied or deleted, and nothing there has been compared: {}. \
+         Grant access and compare again to include them.",
+        unread_paths.len(),
+        unread_paths.join(" | ")
     ));
 }
 

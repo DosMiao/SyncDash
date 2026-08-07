@@ -79,6 +79,8 @@ Files below 4 MiB are fully read when sampling; larger files use 256 KiB windows
 
 Two timestamps within the run's mtime equality window count as the same instant. The 2-second default is a floor for FAT and SMB rounding, not a fixed tolerance: each run raises the window to the coarser of the two backends' declared mtime precision, so a root that reports whole minutes — an FTP LIST listing — is compared on a minute-wide window. The window a comparison used is recorded with its result, and the desktop's timestamp cues read that number rather than the default.
 
+A directory the scan is refused — a Windows ACL that excludes the running account, a macOS TCC gate on `~/Desktop` or an external volume — does not stop the walk. The scan records the subtree as unread, keeps going, and reports every such path in one pass; the snapshot header carries them, and compare then leaves both sides blind at and under each one. Nothing inside an unread subtree is copied, deleted, or counted as a difference, and the desktop banner, the CLI preflight warning, and the plan header all name the paths so the remedy is per path rather than per run. This matters because a directory is recorded when its parent lists it: without the suppression it would sit in the table with zero children, and under `mirror` zero children is a delete for every file the other side still holds. Excluding an unreadable path in the job's filter also works — the filter is consulted before the path is reported. Only an unreadable *root* still fails the scan, because there is no evidence left to suppress against.
+
 Current snapshot tables use strict schema 2. Headers, evidence kinds, entry shapes, root-relative paths, and content identities are validated exactly; missing or unknown fields are rejected. Move pairing requires a full BLAKE3 identity on each candidate, so a fully hashed small file in a sampled scan can still pair while a sampled digest can never authorize a move. Legacy schema 1 is accepted only at the archive-migration boundary, which retains an immutable backup and migration receipt.
 
 ## CLI quick start
@@ -163,6 +165,7 @@ The supported multi-endpoint topology is hub-and-spoke: create one job and archi
 - Preflight blocks a run before any write when a root is missing, a mount marker is absent, or the volume cannot hold the planned bytes. Delete ratios, the free-space reserve, plan health checks, and a root whose measured filesystem is case-insensitive while the job declares `case_sensitive = true` are reported for an operator to weigh rather than enforced, and capability reports record what the run will do without deciding anything. An unattended AutoScan auto-apply refuses on any of them, blockers and warnings alike.
 - Replaced or deleted content goes to local trash or, when enabled, the root's `.version_syncDash/` history. Restore is dry-run by default, validates the complete index/manifest and selected payloads, holds the root lease, and retains displaced current content under `.syncdash/restore/<session>/`.
 - Comparison keys normalize Unicode to NFC and fold case by default while I/O preserves each side's original spelling. Windows-illegal names and same-side normalization collisions become explicit plan issues.
+- A subtree no scan could read is excluded from the comparison on both sides rather than treated as empty, so a permission problem on one root can never delete the other root's copies. Entries that vanished mid-walk are the separate, genuinely-absent case and are reported as such.
 
 ## Desktop app
 
@@ -223,7 +226,7 @@ Use the repository Builder for builds and launches. Its Windows and macOS launch
 ./builder.command run dist
 ```
 
-Use the equivalent `builder.bat` commands on Windows. Tiers `1`, `2`, and `3` are Dist, Max, and Release; compact inputs build them sequentially. These optimized tiers package only the desktop artifact under `target/builder-tiers/<tier>/`. `build cli` is the sole standalone-CLI path, uses the Dist policy, and writes `target/release/syncdash[.exe]`; desktop tier builds never build the CLI implicitly. `--dry-run --host windows|macos` prints the complete plan without building or launching anything.
+Use the equivalent `builder.bat` commands on Windows. Tiers `1`, `2`, and `3` are Dist, Max, and Release; compact inputs build them sequentially. These optimized tiers package only the desktop artifact: on Windows it stays inside the checkout under `target/builder-tiers/<tier>/` (build/deep cleanup holds it in `tools/builder/.rescue/` across the deletion and restores it afterwards), while macOS publishes it to the durable Builder artifact store. `build cli` is the sole standalone-CLI path, uses the Dist policy, and writes `target/release/syncdash[.exe]`; macOS additionally publishes a durable CLI copy, and desktop tier builds never build the CLI implicitly. `--dry-run --host windows|macos` prints the complete plan without building or launching anything.
 
 Backend behavior is checked by `Dev/src/base/fs/vfs/conformance.rs`; end-to-end mode behavior lives
 in `Dev/src/application/run/e2e/`. Live SFTP, SMB, FTP, FTPS, and exFAT lanes require their

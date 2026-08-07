@@ -6,7 +6,7 @@ use crate::foundation::path::{RootRelativeDir, RootRelativePath};
 use crate::fs::local_root::LocalRoot;
 use crate::pipeline::filter::PathFilter;
 
-use super::{as_directory, child_path, subtree_error};
+use super::{as_directory, child_path, directory_path, out_of_scope};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum WalkKind {
@@ -51,6 +51,7 @@ pub(super) struct WalkStats {
     pub excluded_files: u64,
     pub walk_errors: u64,
     pub walk_err_samples: Vec<String>,
+    pub unread_paths: Vec<RootRelativePath>,
 }
 
 impl WalkStats {
@@ -59,6 +60,22 @@ impl WalkStats {
         if self.walk_err_samples.len() < 5 {
             self.walk_err_samples.push(sample);
         }
+    }
+
+    /// Record a path whose content this process is not allowed to observe, and say why in the log.
+    ///
+    /// Deliberately not a walk error. That channel means "an entry that was listed is now gone",
+    /// which compare is right to read as a deletion. This is the opposite claim — the content may
+    /// well still be there, this process just cannot see it — so compare suppresses the path on
+    /// both sides instead. The table carries the path because that is what suppression matches on;
+    /// the OS error goes to the log, where a reader chasing *why* will be looking.
+    pub(super) fn note_unread(&mut self, relative: RootRelativePath, error: &std::io::Error) {
+        crate::log_warn!(
+            "scan",
+            "cannot read '{}': {error} — leaving it out of the comparison on both sides",
+            relative.as_str()
+        );
+        self.unread_paths.push(relative);
     }
 
     /// A name the platform returned but Unicode cannot spell, on any lane: it is counted into the
@@ -105,8 +122,10 @@ where
 
     while let Some(directory) = directories.pop() {
         checkpoint()?;
-        let listing = match root.read_directory(&directory) {
+        let listing = match root.read_directory_partial(&directory) {
             Ok(listing) => listing,
+            // An unreadable root is not a subtree that can be left out: there is no evidence at
+            // all, and every entry on the other side would read as deleted.
             Err(error) if directory.as_str().is_empty() => {
                 return Err(crate::pipeline::scan::root_unreadable_error(
                     root.display_path(),
@@ -118,11 +137,22 @@ where
                 continue;
             }
             Err(error) => {
-                return Err(subtree_error(root, directory.as_str(), error));
+                stats.note_unread(directory_path(&directory), &error);
+                continue;
             }
         };
         for name in &listing.invalid_names {
             stats.note_invalid_name(Path::new(name));
+        }
+        for child in listing.unreadable {
+            let relative = child_path(&directory, &child.name);
+            // An excluded path this process cannot stat is nobody's missing evidence. Checking the
+            // filter first is what makes excluding such a path actually work — the alternative
+            // reports a path the user has already said is none of this job's business.
+            if out_of_scope(filter, relative.as_str()) {
+                continue;
+            }
+            stats.note_unread(relative, &child.error);
         }
         let mut children = listing.entries;
         children.sort_by(|left, right| left.name.cmp(&right.name));
@@ -153,9 +183,17 @@ where
                 continue;
             }
 
+            // A file whose cloud-placeholder state cannot be probed is a file whose bytes may or
+            // may not be on this disk. Recording it either way is a guess, so it joins the paths
+            // left out of the comparison instead.
             let dataless = if kind == WalkKind::File {
-                root.is_dataless_file(&relative, &child.metadata)
-                    .map_err(|error| subtree_error(root, relative.as_str(), error))?
+                match root.is_dataless_file(&relative, &child.metadata) {
+                    Ok(dataless) => dataless,
+                    Err(error) => {
+                        stats.note_unread(relative, &error);
+                        continue;
+                    }
+                }
             } else {
                 false
             };

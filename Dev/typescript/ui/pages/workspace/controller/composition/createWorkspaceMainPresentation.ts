@@ -193,6 +193,7 @@ export function createWorkspaceMainPresentation({
     toolbar: {
       job: session.selectedJob,
       hasPlan: !!plan,
+      planHeader: plan?.header ?? null,
       executableCount: executableIndices.length,
       stats,
       busy: busy || reviewBusy || autoScanVerificationPending || roots.rootDraftOpen,

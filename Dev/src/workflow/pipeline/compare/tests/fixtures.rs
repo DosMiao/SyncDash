@@ -42,6 +42,7 @@ pub(super) fn snap(os: &str, entries: Vec<ObservedEntry>) -> TableArtifact {
             excluded_files: 0,
             walk_errors: 0,
             walk_err_samples: Vec::new(),
+            unread_paths: Vec::new(),
             icloud_stubs: 0,
             icloud_stub_samples: Vec::new(),
             dataless_files: 0,
@@ -102,6 +103,24 @@ pub(super) fn arch(path: &str, hash: &str, previous: &[&str]) -> ObservedEntry {
         .collect();
     entry
 }
+/// A snapshot whose scan was refused these subtrees. Written strictly sorted, as the scan lanes
+/// write them and as the table validator requires.
+pub(super) fn snap_unread(os: &str, entries: Vec<ObservedEntry>, unread: &[&str]) -> TableArtifact {
+    let mut table = snap(os, entries);
+    table.header.unread_paths = unread
+        .iter()
+        .map(|path| RootRelativePath::try_from(*path).unwrap())
+        .collect();
+    table
+}
+
+pub(super) fn directory(path: &str) -> ObservedEntry {
+    ObservedEntry::Directory(crate::model::table::ObservedDirectory {
+        path: RootRelativePath::try_from(path).unwrap(),
+        mtime_ms: 0,
+    })
+}
+
 pub(super) fn snap_named(os: &str, host: &str, entries: Vec<ObservedEntry>) -> TableArtifact {
     let mut s = snap(os, entries);
     s.header.host = host.into();

@@ -106,12 +106,41 @@ pub struct TableHeader {
     pub excluded_files: u64,
     pub walk_errors: u64,
     pub walk_err_samples: Vec<String>,
+    /// Subtree roots this scan could not observe, strictly sorted.
+    ///
+    /// Distinct from `walk_errors`, which counts entries that vanished mid-walk: a raced entry
+    /// really is absent, whereas these paths hold an unknown amount of content this process was
+    /// not allowed to look at. Compare suppresses both sides at and under each of them, because
+    /// the table records such a directory (its parent listed it) with zero children, and zero
+    /// children is indistinguishable from "children deleted" — under mirror, a delete for every
+    /// file the other side still holds.
+    ///
+    /// Absent from a table written before this field existed, and the default is the true reading
+    /// rather than a guess: those builds aborted the scan instead of emitting a table at all, so
+    /// any table they did produce was observed whole.
+    #[serde(default)]
+    pub unread_paths: Vec<RootRelativePath>,
     pub icloud_stubs: u64,
     pub icloud_stub_samples: Vec<String>,
     pub skipped_symlinks: u64,
     pub dataless_files: u64,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub vfs: Option<VfsNote>,
+}
+
+impl TableHeader {
+    /// Whether `path` lies at or under a subtree this scan could not observe.
+    ///
+    /// Prefix matching is on whole segments: `docs` covers `docs/a.txt` and not `docs-old/a.txt`.
+    pub fn is_unread(&self, path: &str) -> bool {
+        self.unread_paths.iter().any(|unread| {
+            let unread = unread.as_str();
+            path == unread
+                || (path.len() > unread.len()
+                    && path.as_bytes()[unread.len()] == b'/'
+                    && path.starts_with(unread))
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -363,6 +392,15 @@ impl TableArtifact {
             self.header.icloud_stubs,
             &self.header.icloud_stub_samples,
         )?;
+        for pair in self.header.unread_paths.windows(2) {
+            if pair[0].as_str() >= pair[1].as_str() {
+                return Err(table_error(format!(
+                    "unread paths must be unique and strictly sorted: {:?} then {:?}",
+                    pair[0].as_str(),
+                    pair[1].as_str()
+                )));
+            }
+        }
         if let Some(vfs) = &self.header.vfs {
             if vfs.protocol.is_empty() || vfs.display_root.is_empty() {
                 return Err(table_error(
@@ -525,6 +563,7 @@ mod tests {
             excluded_files: 0,
             walk_errors: 0,
             walk_err_samples: Vec::new(),
+            unread_paths: Vec::new(),
             icloud_stubs: 0,
             icloud_stub_samples: Vec::new(),
             skipped_symlinks: 0,

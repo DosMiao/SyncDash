@@ -15,8 +15,31 @@ use crate::model::table::{
 
 use super::entries::{observed_file, observed_path, push_copy};
 use super::matching::moves::{detect_moves, move_reason};
-use super::matching::{evidence_missing, files_equal, generation_of, map_of};
+use super::matching::{evidence_missing, files_equal, generation_of, map_of, UnreadScope};
 use super::policy::CompareOptions;
+
+fn unread_paths(snapshot: &TableArtifact) -> Vec<String> {
+    snapshot
+        .header
+        .unread_paths
+        .iter()
+        .map(|path| path.as_str().to_owned())
+        .collect()
+}
+
+/// How many of this side's entries the unread scope kept out of the comparison.
+///
+/// Counted against the union of both sides, which is why it is not simply "entries under this
+/// side's own unread paths": a subtree only the *other* side could not read is suppressed here
+/// too, and that is exactly the count worth showing — those are the entries that would otherwise
+/// have been planned away.
+fn suppressed_entries(snapshot: &TableArtifact, unread: &UnreadScope) -> u64 {
+    snapshot
+        .entries
+        .iter()
+        .filter(|entry| unread.covers(entry.path().as_str()))
+        .count() as u64
+}
 
 pub fn compare(
     source: &TableArtifact,
@@ -28,10 +51,11 @@ pub fn compare(
 ) -> Plan {
     let ci = copts.case_insensitive;
     let win = copts.mtime_window_ms;
-    let (s_files, s_dups) = map_of(source, ObservedEntryKind::File, ci);
-    let (t_files, t_dups) = map_of(target, ObservedEntryKind::File, ci);
-    let (s_dirs, _) = map_of(source, ObservedEntryKind::Directory, ci);
-    let (t_dirs, _) = map_of(target, ObservedEntryKind::Directory, ci);
+    let unread = UnreadScope::of(source, target, ci);
+    let (s_files, s_dups) = map_of(source, ObservedEntryKind::File, ci, &unread);
+    let (t_files, t_dups) = map_of(target, ObservedEntryKind::File, ci, &unread);
+    let (s_dirs, _) = map_of(source, ObservedEntryKind::Directory, ci, &unread);
+    let (t_dirs, _) = map_of(target, ObservedEntryKind::Directory, ci, &unread);
     let mut ops: Vec<Op> = Vec::new();
 
     for d in s_dups {
@@ -162,7 +186,10 @@ pub fn compare(
                     });
                 }
                 for (p, te) in &t_dirs {
-                    if !s_dirs.contains_key(p) {
+                    // An ancestor of an unread subtree stays: removing it would remove the subtree
+                    // too, which is the loss the suppression exists to prevent arriving one level
+                    // up. The directory outliving its contents is the safe half of that trade.
+                    if !s_dirs.contains_key(p) && !unread.encloses_unread(&observed_path(te)) {
                         ops.push(Op {
                             side: Side::Target,
                             action: Action::DeleteDir,
@@ -185,7 +212,7 @@ pub fn compare(
         }
         "sync" => {
             let (arch_files, _) = archive
-                .map(|a| map_of(a, ObservedEntryKind::File, ci))
+                .map(|a| map_of(a, ObservedEntryKind::File, ci, &unread))
                 .unwrap_or_default();
             let has_archive = archive.is_some();
             let mut s_adds: Vec<&ObservedEntry> = Vec::new();
@@ -580,6 +607,10 @@ pub fn compare(
             target_icloud_stubs: target.header.icloud_stubs,
             source_icloud_stub_samples: source.header.icloud_stub_samples.clone(),
             target_icloud_stub_samples: target.header.icloud_stub_samples.clone(),
+            source_unread_paths: unread_paths(source),
+            target_unread_paths: unread_paths(target),
+            source_unread_entries: suppressed_entries(source, &unread),
+            target_unread_entries: suppressed_entries(target, &unread),
         },
         ops,
     }

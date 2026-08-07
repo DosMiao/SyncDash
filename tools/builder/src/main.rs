@@ -16,6 +16,8 @@ const PROJECT_ID: &str = "syncdash";
 const PROJECT_NAME: &str = "SyncDash";
 const VITE_PORT: u16 = 5173;
 const BUNDLE_ID: &str = "com.dosmiao.syncdash";
+const RESCUE_DIRECTORY: &str = "tools/builder/.rescue";
+const PACKAGED_TIERS: [Tier; 3] = [Tier::Dist, Tier::Max, Tier::Release];
 
 fn main() -> ExitCode {
     match run() {
@@ -42,6 +44,9 @@ fn run() -> BuildResult<()> {
     } else {
         None
     };
+    if command_requires_restored_outputs(&command) {
+        restore_rescued_outputs(&runtime)?;
+    }
 
     match command.as_slice() {
         [action] if action == "quit" => Ok(()),
@@ -97,6 +102,25 @@ fn command_requires_operation_lock(command: &[String]) -> bool {
     })
 }
 
+/// Commands that read or write a packaged output, so an interrupted cleanup's
+/// held executables must be back in place before they run.
+fn command_requires_restored_outputs(command: &[String]) -> bool {
+    match command {
+        [action] => action == "clean",
+        [action, value] => match action.as_str() {
+            "clean" => CleanLevel::parse(value).is_ok(),
+            // `build installer` restores first so a held same-name setup from
+            // an interrupted cleanup can never overwrite the fresh installer.
+            "build" => {
+                value == "cli" || value == "installer" || parse_tier_selection(value).is_ok()
+            }
+            "run" => Tier::parse(value).is_ok(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn cleanup_manifest(runtime: &Runtime) -> BuildResult<CleanupManifest> {
     let manifest = load_cleanup_manifest(runtime.root())?;
     if manifest.project() != PROJECT_ID {
@@ -136,20 +160,40 @@ fn cargo_environment(
     environment
 }
 
-fn tier_root(runtime: &Runtime) -> BuildResult<PathBuf> {
-    runtime.artifact_path(PROJECT_ID, "tiers")
-}
-
-fn tier_dir(runtime: &Runtime, tier: Tier) -> BuildResult<PathBuf> {
-    Ok(tier_root(runtime)?.join(tier.key()))
-}
-
-fn tier_desktop_binary(runtime: &Runtime, tier: Tier) -> BuildResult<PathBuf> {
-    Ok(tier_dir(runtime, tier)?.join(format!(
+fn tier_file_name(runtime: &Runtime, tier: Tier) -> String {
+    format!(
         "SyncDash-{}{}",
         tier.output_label(),
         runtime.host().exe_suffix()
-    )))
+    )
+}
+
+fn tier_store_relative(runtime: &Runtime, tier: Tier) -> PathBuf {
+    Path::new("tiers")
+        .join(tier.key())
+        .join(tier_file_name(runtime, tier))
+}
+
+fn cli_file_name(runtime: &Runtime) -> String {
+    format!("syncdash{}", runtime.host().exe_suffix())
+}
+
+fn cli_store_relative(runtime: &Runtime) -> PathBuf {
+    Path::new("cli").join(cli_file_name(runtime))
+}
+
+/// Windows keeps each packaged tier inside the checkout at the documented
+/// `target/builder-tiers/<tier>/` home; build/deep cleanup rescues the
+/// executable across the deletion and restores it afterwards. macOS keeps
+/// publishing tiers to the durable Builder artifact store.
+fn tier_desktop_binary(runtime: &Runtime, tier: Tier) -> BuildResult<PathBuf> {
+    match runtime.host() {
+        Host::Windows => Ok(runtime
+            .path("target/builder-tiers")
+            .join(tier.key())
+            .join(tier_file_name(runtime, tier))),
+        Host::Macos => runtime.artifact_path(PROJECT_ID, tier_store_relative(runtime, tier)),
+    }
 }
 
 fn free_desktop(runtime: &Runtime) -> BuildResult<()> {
@@ -319,24 +363,31 @@ fn build_cli(runtime: &Runtime) -> BuildResult<()> {
     runtime.require_program("cargo")?;
     free_cli(runtime)?;
     runtime.wait_unlocked(&cli_binary(runtime))?;
-    let published_cli = runtime.artifact_path(
-        PROJECT_ID,
-        PathBuf::from("cli").join(format!("syncdash{}", runtime.host().exe_suffix())),
-    )?;
-    runtime.wait_unlocked(&published_cli)?;
     let environment = Tier::Dist.release_environment(runtime.host());
-    runtime.total(|| {
-        cli_step(runtime, "[1/1]", Tier::Dist, &environment)?;
-        free_cli(runtime)?;
-        runtime.wait_unlocked(&cli_binary(runtime))?;
-        runtime.wait_unlocked(&published_cli)?;
-        let published = runtime.publish_artifact_file(
-            PROJECT_ID,
-            &cli_binary(runtime),
-            PathBuf::from("cli").join(format!("syncdash{}", runtime.host().exe_suffix())),
-        )?;
-        runtime.print_artifact(&published, "CLI OK - syncdash")
-    })
+    match runtime.host() {
+        // Windows keeps the CLI at its Cargo output inside the checkout;
+        // build/deep cleanup rescues it alongside the packaged tiers.
+        Host::Windows => runtime.total(|| {
+            cli_step(runtime, "[1/1]", Tier::Dist, &environment)?;
+            runtime.print_artifact(&cli_binary(runtime), "CLI OK - syncdash")
+        }),
+        Host::Macos => {
+            let published_cli = runtime.artifact_path(PROJECT_ID, cli_store_relative(runtime))?;
+            runtime.wait_unlocked(&published_cli)?;
+            runtime.total(|| {
+                cli_step(runtime, "[1/1]", Tier::Dist, &environment)?;
+                free_cli(runtime)?;
+                runtime.wait_unlocked(&cli_binary(runtime))?;
+                runtime.wait_unlocked(&published_cli)?;
+                let published = runtime.publish_artifact_file(
+                    PROJECT_ID,
+                    &cli_binary(runtime),
+                    cli_store_relative(runtime),
+                )?;
+                runtime.print_artifact(&published, "CLI OK - syncdash")
+            })
+        }
+    }
 }
 
 fn frontend_step(runtime: &Runtime, counter: &str) -> BuildResult<()> {
@@ -391,11 +442,10 @@ fn cli_step(
         .map(|_| ())
 }
 
-/// Packs the built desktop binary into the tier's published copy. Returns the
+/// Packs the built desktop binary into the tier's packaged copy. Returns the
 /// packed size and whether a running instance of that copy had to be stopped
 /// for the overwrite — the caller relaunches it once the pack is complete.
 fn pack_desktop_tier(runtime: &Runtime, tier: Tier) -> BuildResult<(u64, bool)> {
-    let relative_directory = PathBuf::from("tiers").join(tier.key());
     let source = desktop_binary(runtime);
     if runtime.host() == Host::Macos {
         runtime.run(
@@ -412,15 +462,16 @@ fn pack_desktop_tier(runtime: &Runtime, tier: Tier) -> BuildResult<(u64, bool)> 
         &destination,
         &format!("SyncDash {} tier", tier.output_label()),
     )?;
-    let desktop = runtime.publish_artifact_file(
-        PROJECT_ID,
-        &source,
-        relative_directory.join(format!(
-            "SyncDash-{}{}",
-            tier.output_label(),
-            runtime.host().exe_suffix()
-        )),
-    )?;
+    let desktop = match runtime.host() {
+        Host::Windows => {
+            runtime.create_directory(parent_directory(&destination)?)?;
+            runtime.copy_file(&source, &destination)?;
+            destination
+        }
+        Host::Macos => {
+            runtime.publish_artifact_file(PROJECT_ID, &source, tier_store_relative(runtime, tier))?
+        }
+    };
     let desktop_mb = runtime.file_size_mb(&desktop)?;
     runtime.print_artifact(
         &desktop,
@@ -454,12 +505,12 @@ fn build_installer(runtime: &Runtime) -> BuildResult<()> {
                 BuildError::new(format!("installer has no file name: {}", setup.display()))
             })?;
             require_installer_processes_stopped(runtime)?;
-            let relative = PathBuf::from("installers").join(name);
-            let destination = runtime.artifact_path(PROJECT_ID, &relative)?;
+            let destination = windows_installer_home(runtime).join(name);
             runtime.wait_unlocked(&destination)?;
-            let published = runtime.publish_artifact_file(PROJECT_ID, &setup, relative)?;
-            runtime.print_artifact(&published, "INSTALLER SUCCESS")?;
-            runtime.reveal(&published)
+            runtime.create_directory(parent_directory(&destination)?)?;
+            runtime.copy_file(&setup, &destination)?;
+            runtime.print_artifact(&destination, "INSTALLER SUCCESS")?;
+            runtime.reveal(&destination)
         }),
         Host::Macos => runtime.total(|| {
             runtime.capture("xcode-select", ["-p"], runtime.root(), &[])?;
@@ -574,7 +625,7 @@ fn kill_and_unlock(runtime: &Runtime) -> BuildResult<()> {
             runtime.wait_unlocked(&desktop_binary(runtime))?;
             runtime.wait_unlocked(&runtime.path("target/debug/syncdash-desktop.exe"))?;
             runtime.wait_unlocked(&cli_binary(runtime))?;
-            for tier in [Tier::Dist, Tier::Max, Tier::Release] {
+            for tier in PACKAGED_TIERS {
                 runtime.wait_unlocked(&tier_desktop_binary(runtime, tier)?)?;
             }
             Ok(())
@@ -609,12 +660,17 @@ fn clean(runtime: &Runtime, level: CleanLevel) -> BuildResult<()> {
     release_cleanup_desktop(runtime, level)?;
     if level != CleanLevel::Purge {
         adopt_legacy_artifacts(runtime)?;
+        rescue_packaged_outputs(runtime)?;
     }
     require_cleanup_preconditions(runtime, level)?;
     release_cleanup_desktop(runtime, level)?;
     require_cleanup_process_safety(runtime, &plan, false)?;
-    let report = execute_cleanup(runtime, &plan)?;
-    report.require_success()?;
+    // A failed cleanup must still hand the rescued executables back before it
+    // reports, so both results are collected and then raised.
+    let cleaned = execute_cleanup(runtime, &plan).and_then(|report| report.require_success());
+    let restored = restore_rescued_outputs(runtime);
+    cleaned?;
+    restored?;
     if runtime.dry_run() {
         println!("  Cleanup dry run complete; committed dist/ would be preserved.");
     } else {
@@ -669,47 +725,208 @@ fn require_cleanup_process_safety(
     )))
 }
 
-fn adopt_legacy_artifacts(runtime: &Runtime) -> BuildResult<()> {
-    for tier in [Tier::Dist, Tier::Max, Tier::Release] {
-        let legacy = runtime.path("target/builder-tiers").join(tier.key());
-        let desktop = legacy.join(format!(
-            "SyncDash-{}{}",
-            tier.output_label(),
-            runtime.host().exe_suffix()
-        ));
-        if desktop.is_file() {
-            runtime.adopt_artifact_file(
-                PROJECT_ID,
-                &desktop,
-                PathBuf::from("tiers")
-                    .join(tier.key())
-                    .join(desktop.file_name().expect("known desktop file name")),
-            )?;
+fn rescue_root(runtime: &Runtime) -> PathBuf {
+    runtime.path(RESCUE_DIRECTORY)
+}
+
+/// Windows installers live inside the checkout beside the tier homes; nothing
+/// a Windows build produces is published to the external Builder store.
+fn windows_installer_home(runtime: &Runtime) -> PathBuf {
+    runtime.path("target/builder-installers")
+}
+
+fn rescued_installer_root(runtime: &Runtime) -> PathBuf {
+    rescue_root(runtime).join("installers")
+}
+
+fn rescued_tier_path(runtime: &Runtime, tier: Tier) -> PathBuf {
+    rescue_root(runtime)
+        .join("tiers")
+        .join(tier.key())
+        .join(tier_file_name(runtime, tier))
+}
+
+fn rescued_cli_path(runtime: &Runtime) -> PathBuf {
+    rescue_root(runtime).join("cli").join(cli_file_name(runtime))
+}
+
+fn parent_directory(path: &Path) -> BuildResult<&Path> {
+    path.parent()
+        .ok_or_else(|| BuildError::new(format!("path has no parent directory: {}", path.display())))
+}
+
+/// Holds the packaged executables outside the Cargo target tree so a build or
+/// deep cleanup can delete that tree without destroying them. Copying rather
+/// than moving leaves the confirmed plan's target fingerprint intact, so this
+/// runs after the plan is accepted; `restore_rescued_outputs` hands them back.
+fn rescue_packaged_outputs(runtime: &Runtime) -> BuildResult<()> {
+    if runtime.host() != Host::Windows {
+        return Ok(());
+    }
+    let mut holdings = Vec::new();
+    for tier in PACKAGED_TIERS {
+        holdings.push((tier_desktop_binary(runtime, tier)?, rescued_tier_path(runtime, tier)));
+    }
+    holdings.push((cli_binary(runtime), rescued_cli_path(runtime)));
+    for (output, rescued) in holdings {
+        if !output.is_file() {
+            continue;
+        }
+        runtime.create_directory(parent_directory(&rescued)?)?;
+        runtime.copy_file(&output, &rescued)?;
+        if !runtime.dry_run() {
+            println!("  [Rescue] holding {}", output.display());
         }
     }
+    for installer in direct_entries_with_suffix(&windows_installer_home(runtime), ".exe", false)? {
+        let name = installer.file_name().ok_or_else(|| {
+            BuildError::new(format!(
+                "installer has no file name: {}",
+                installer.display()
+            ))
+        })?;
+        let rescued = rescued_installer_root(runtime).join(name);
+        runtime.create_directory(parent_directory(&rescued)?)?;
+        runtime.copy_file(&installer, &rescued)?;
+        if !runtime.dry_run() {
+            println!("  [Rescue] holding {}", installer.display());
+        }
+    }
+    Ok(())
+}
 
-    let cli = cli_binary(runtime);
-    if cli.is_file() {
-        runtime.adopt_artifact_file(
-            PROJECT_ID,
-            &cli,
-            PathBuf::from("cli").join(format!("syncdash{}", runtime.host().exe_suffix())),
+/// Returns the held executables to their in-checkout homes. A cleanup that
+/// fails or is interrupted leaves the holding directory behind, so every
+/// command that reads or writes a packaged output restores it before it runs.
+/// Rescue and restore are one Windows-only mechanism: only Windows has
+/// in-checkout output homes, and restoring into the macOS artifact store would
+/// trip the project-root guard on `copy_file`.
+fn restore_rescued_outputs(runtime: &Runtime) -> BuildResult<()> {
+    if runtime.host() != Host::Windows {
+        return Ok(());
+    }
+    let root = rescue_root(runtime);
+    if !root.exists() {
+        return Ok(());
+    }
+    if runtime.dry_run() {
+        runtime.print_dry_run("restore held packaged executables");
+        return Ok(());
+    }
+    for tier in PACKAGED_TIERS {
+        let rescued = rescued_tier_path(runtime, tier);
+        if !rescued.is_file() {
+            continue;
+        }
+        let output = tier_desktop_binary(runtime, tier)?;
+        free_exact_executable(
+            runtime,
+            &output,
+            &format!("SyncDash {} tier", tier.output_label()),
         )?;
+        runtime.create_directory(parent_directory(&output)?)?;
+        runtime.copy_file(&rescued, &output)?;
+        runtime.remove_file(&rescued)?;
+        println!("  [Rescue] restored {}", output.display());
+    }
+    let rescued_cli = rescued_cli_path(runtime);
+    if rescued_cli.is_file() {
+        let output = cli_binary(runtime);
+        // The CLI may be mid-apply and holding root leases, so its release
+        // stays interactive instead of an exact-process kill.
+        free_cli(runtime)?;
+        runtime.wait_unlocked(&output)?;
+        runtime.create_directory(parent_directory(&output)?)?;
+        runtime.copy_file(&rescued_cli, &output)?;
+        runtime.remove_file(&rescued_cli)?;
+        println!("  [Rescue] restored {}", output.display());
+    }
+    let home = windows_installer_home(runtime);
+    for rescued in direct_entries_with_suffix(&rescued_installer_root(runtime), ".exe", false)? {
+        let name = rescued.file_name().ok_or_else(|| {
+            BuildError::new(format!("installer has no file name: {}", rescued.display()))
+        })?;
+        let output = home.join(name);
+        free_exact_executable(runtime, &output, "held SyncDash installer")?;
+        runtime.create_directory(&home)?;
+        runtime.copy_file(&rescued, &output)?;
+        runtime.remove_file(&rescued)?;
+        println!("  [Rescue] restored {}", output.display());
+    }
+    require_empty_rescue_root(&root)?;
+    runtime.remove_directory(&root)
+}
+
+fn require_empty_rescue_root(root: &Path) -> BuildResult<()> {
+    let mut remaining = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|error| {
+            BuildError::new(format!("failed to read {}: {error}", directory.display()))
+        })? {
+            let path = entry
+                .map_err(|error| {
+                    BuildError::new(format!("failed to read {}: {error}", directory.display()))
+                })?
+                .path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                remaining.push(path.display().to_string());
+            }
+        }
+    }
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    Err(BuildError::new(format!(
+        "unrecognized files remain in the Builder rescue directory: {}",
+        remaining.join(", ")
+    )))
+}
+
+fn adopt_legacy_artifacts(runtime: &Runtime) -> BuildResult<()> {
+    // On Windows `target/builder-tiers/` and the CLI's Cargo output are the
+    // live in-checkout homes protected by rescue, not legacy copies; only
+    // macOS still adopts them into the durable artifact store.
+    if runtime.host() == Host::Macos {
+        for tier in PACKAGED_TIERS {
+            let legacy = runtime.path("target/builder-tiers").join(tier.key());
+            let desktop = legacy.join(tier_file_name(runtime, tier));
+            if desktop.is_file() {
+                runtime.adopt_artifact_file(
+                    PROJECT_ID,
+                    &desktop,
+                    tier_store_relative(runtime, tier),
+                )?;
+            }
+        }
+
+        let cli = cli_binary(runtime);
+        if cli.is_file() {
+            runtime.adopt_artifact_file(PROJECT_ID, &cli, cli_store_relative(runtime))?;
+        }
     }
 
     let bundle = release_dir(runtime).join("bundle");
     match runtime.host() {
+        // Windows adoption keeps a not-yet-kept setup inside the checkout
+        // installer home; a same-name copy there is the durable one.
         Host::Windows => {
-            let directory = bundle.join("nsis");
-            for setup in direct_entries_with_suffix(&directory, ".exe", false)? {
+            let home = windows_installer_home(runtime);
+            for setup in direct_entries_with_suffix(&bundle.join("nsis"), ".exe", false)? {
                 let name = setup.file_name().ok_or_else(|| {
                     BuildError::new(format!("installer has no file name: {}", setup.display()))
                 })?;
-                runtime.adopt_artifact_file(
-                    PROJECT_ID,
-                    &setup,
-                    PathBuf::from("installers").join(name),
-                )?;
+                let destination = home.join(name);
+                if destination.is_file() {
+                    continue;
+                }
+                runtime.create_directory(&home)?;
+                runtime.copy_file(&setup, &destination)?;
+                if !runtime.dry_run() {
+                    println!("  [Adopt] kept installer {}", destination.display());
+                }
             }
         }
         Host::Macos => {
@@ -1123,7 +1340,22 @@ fn release_cleanup_desktop(runtime: &Runtime, level: CleanLevel) -> BuildResult<
 }
 
 fn reveal(runtime: &Runtime) -> BuildResult<()> {
-    runtime.reveal(&runtime.project_artifact_root(PROJECT_ID)?)
+    match runtime.host() {
+        // Windows keeps every packaged output inside the checkout.
+        Host::Windows => {
+            let installers = windows_installer_home(runtime);
+            let tiers = runtime.path("target/builder-tiers");
+            let target = if installers.is_dir() {
+                installers
+            } else if tiers.is_dir() {
+                tiers
+            } else {
+                runtime.root().to_path_buf()
+            };
+            runtime.reveal(&target)
+        }
+        Host::Macos => runtime.reveal(&runtime.project_artifact_root(PROJECT_ID)?),
+    }
 }
 
 fn info(runtime: &Runtime) -> BuildResult<()> {
@@ -1209,8 +1441,8 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_requires_operation_lock, direct_candidate_paths, is_syncdash_desktop_process,
-        normalize_command, require_real_entry, require_single_pair,
+        command_requires_operation_lock, command_requires_restored_outputs, direct_candidate_paths,
+        is_syncdash_desktop_process, normalize_command, require_real_entry, require_single_pair,
         validate_existing_macos_installer,
     };
     use builder_core::ArtifactSourceKind;
@@ -1277,6 +1509,31 @@ mod tests {
             normalize_command(&["CLEAN".to_owned(), "PURGE".to_owned()]),
             ["clean", "purge"]
         );
+    }
+
+    #[test]
+    fn output_touching_commands_restore_held_executables_first() {
+        for command in [
+            vec!["clean".to_owned()],
+            vec!["clean".to_owned(), "deep".to_owned()],
+            vec!["clean".to_owned(), "purge".to_owned()],
+            vec!["build".to_owned(), "dist".to_owned()],
+            vec!["build".to_owned(), "123".to_owned()],
+            vec!["build".to_owned(), "cli".to_owned()],
+            vec!["build".to_owned(), "installer".to_owned()],
+            vec!["run".to_owned(), "dist".to_owned()],
+        ] {
+            assert!(command_requires_restored_outputs(&command), "{command:?}");
+        }
+        for command in [
+            vec!["dev".to_owned()],
+            vec!["run".to_owned(), "dev".to_owned()],
+            vec!["kill".to_owned()],
+            vec!["unlock".to_owned()],
+            vec!["doctor".to_owned()],
+        ] {
+            assert!(!command_requires_restored_outputs(&command), "{command:?}");
+        }
     }
 
     #[test]

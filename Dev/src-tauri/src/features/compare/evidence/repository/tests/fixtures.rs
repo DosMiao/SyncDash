@@ -91,6 +91,10 @@ pub(super) fn version_with_compare_options(
         target_icloud_stubs: 0,
         source_icloud_stub_samples: Vec::new(),
         target_icloud_stub_samples: Vec::new(),
+        source_unread_paths: Vec::new(),
+        target_unread_paths: Vec::new(),
+        source_unread_entries: 0,
+        target_unread_entries: 0,
     };
     let plan_digest = syncdash::model::plan::Plan::digest_parts(&plan_header, &[]);
     let snapshot = |root: &str| TableArtifact {
@@ -108,6 +112,7 @@ pub(super) fn version_with_compare_options(
             excluded_files: 0,
             walk_errors: 0,
             walk_err_samples: Vec::new(),
+            unread_paths: Vec::new(),
             icloud_stubs: 0,
             icloud_stub_samples: Vec::new(),
             skipped_symlinks: 0,

@@ -78,7 +78,37 @@ pub(crate) fn scan_local_root_impl(
         }
     }
 
-    let coverage = if discovered.walk_errors == 0 {
+    if !discovered.unread_paths.is_empty() {
+        let named = discovered
+            .unread_paths
+            .iter()
+            .map(|path| path.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        crate::log_warn!(
+            "scan",
+            "{} subtree(s) under {} could not be read and are left out of this comparison on both sides: {}",
+            discovered.unread_paths.len(),
+            root.display_path().display(),
+            named
+        );
+        if let Some(phase_progress) = &phase_progress {
+            phase_progress.error(
+                "",
+                "walk",
+                side,
+                &format!(
+                    "{} subtree(s) could not be read; they are left out of this comparison on both sides (nothing under them will be copied or deleted): {}",
+                    discovered.unread_paths.len(),
+                    named
+                ),
+            );
+        }
+    }
+
+    // An unread subtree makes this scan partial for the same reason a walk error does: the cache
+    // must not retire rows for paths this round was never allowed to look at.
+    let coverage = if discovered.walk_errors == 0 && discovered.unread_paths.is_empty() {
         crate::store::ScanCoverage::Complete
     } else {
         crate::store::ScanCoverage::Partial
@@ -141,6 +171,7 @@ pub(crate) fn scan_local_root_impl(
             excluded_files: discovered.excluded_files,
             walk_errors: discovered.walk_errors,
             walk_err_samples: discovered.walk_error_samples,
+            unread_paths: discovered.unread_paths,
             icloud_stubs: discovered.icloud_stubs,
             icloud_stub_samples: discovered.icloud_stub_samples,
             dataless_files: discovered.dataless_files,

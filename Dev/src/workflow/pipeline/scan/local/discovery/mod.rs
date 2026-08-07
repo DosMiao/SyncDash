@@ -1,11 +1,18 @@
 //! Metadata discovery for a local root, independent from content evidence collection.
+//!
+//! Three shortfalls, three answers, and the differences are load-bearing. An entry that vanished
+//! mid-walk is a *walk error*: counted, sampled, genuinely absent, and read downstream as a
+//! deletion. A path this process may not read is an *unread path*: named in the table so compare
+//! can suppress both sides at and under it, because such a directory is already recorded by its
+//! parent and would otherwise read as empty rather than as unseen. An unreadable *root* is still
+//! fatal, since suppressing everything is not a comparison. Both lanes here answer the same way —
+//! `both_lanes_produce_the_same_table_for_the_same_tree` compares them entry for entry.
 
 #[cfg(target_os = "macos")]
 mod bulk;
 mod walk;
 
 use crate::foundation::path::{EntryName, RootRelativeDir, RootRelativePath};
-use crate::fs::local_root::LocalRoot;
 use crate::model::table::{ObservedDirectory, ObservedEntry, ObservedSymlink};
 
 use super::super::model::PendingFile;
@@ -29,18 +36,21 @@ fn as_directory(relative: RootRelativePath) -> RootRelativeDir {
         .expect("a validated child path is a valid directory path")
 }
 
-/// The refusal both lanes make when a subtree cannot be read.
+/// The same spelling read back as a path. Only ever called for a non-root directory, because the
+/// root's rel is the empty string and no entry is named by it.
+fn directory_path(directory: &RootRelativeDir) -> RootRelativePath {
+    RootRelativePath::new(directory.as_str().to_owned())
+        .expect("a non-root directory rel is a valid path")
+}
+
+/// Whether the filter excludes `relative` whatever it turns out to be.
 ///
-/// Fail-closed: an unreadable subtree is dropped from the table, and a dropped subtree is
-/// indistinguishable from a deleted one at compare time. The caller's error `kind()` is preserved.
-fn subtree_error(root: &LocalRoot, relative: &str, error: std::io::Error) -> std::io::Error {
-    std::io::Error::new(
-        error.kind(),
-        format!(
-            "scan of '{}' aborted at '{relative}': {error} — refusing to emit a half table (its missing subtrees would read as deletions)",
-            root.display_path().display()
-        ),
-    )
+/// Asked only of paths whose kind could not be determined, which is why it has to hold for every
+/// kind at once: a path that cannot be stat'd could be a file or a directory, and reporting it as
+/// unread when the user already excluded it would put a path they disclaimed in front of them.
+fn out_of_scope(filter: &crate::pipeline::filter::PathFilter, relative: &str) -> bool {
+    let (dir_pass, child_might_match) = filter.pass_dir(relative);
+    !dir_pass && !child_might_match && !filter.pass_file(relative)
 }
 
 #[cfg(target_os = "macos")]
@@ -55,6 +65,7 @@ pub(super) struct Discovery {
     pub excluded_files: u64,
     pub walk_errors: u64,
     pub walk_error_samples: Vec<String>,
+    pub unread_paths: Vec<RootRelativePath>,
     pub icloud_stubs: u64,
     pub icloud_stub_samples: Vec<String>,
     pub dataless_files: u64,
@@ -166,6 +177,12 @@ pub(super) fn discover(
         ));
     }
 
+    // The table validator requires strict sort order, and compare's prefix suppression is happier
+    // with one entry per path than with whichever duplicate a retry produced.
+    let mut unread_paths = stats.unread_paths;
+    unread_paths.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    unread_paths.dedup_by(|left, right| left.as_str() == right.as_str());
+
     Ok(Discovery {
         entries,
         pending_files,
@@ -173,6 +190,7 @@ pub(super) fn discover(
         excluded_files: stats.excluded_files,
         walk_errors: stats.walk_errors,
         walk_error_samples: stats.walk_err_samples,
+        unread_paths,
         icloud_stubs,
         icloud_stub_samples,
         dataless_files,

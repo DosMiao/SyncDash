@@ -27,15 +27,37 @@ pub(super) struct VfsDiscovery {
     pub excluded_files: u64,
     pub walk_errors: u64,
     pub walk_error_samples: Vec<String>,
+    pub unread_paths: Vec<RootRelativePath>,
     pub skipped_symlinks: u64,
 }
 
-/// Walk the whole root, or refuse.
+impl VfsDiscovery {
+    /// See `WalkStats::note_unread` in the local lane: same channel, same reason for keeping it
+    /// separate from the walk-error count.
+    fn note_unread(&mut self, relative: RootRelativePath, error: &std::io::Error) {
+        crate::log_warn!(
+            "scan",
+            "cannot read '{}': {error} — leaving it out of the comparison on both sides",
+            relative.as_str()
+        );
+        self.unread_paths.push(relative);
+    }
+}
+
+/// Every rel pushed onto the traversal stack was validated before it got there, so reading one
+/// back is an invariant rather than a parse.
+fn validated(rel: &str) -> RootRelativePath {
+    RootRelativePath::try_from(rel).expect("every queued rel was validated when it was discovered")
+}
+
+/// Walk the whole root, recording what it was not allowed to see.
 ///
-/// The error discipline is the one place this lane differs from the local one on purpose: an
-/// entry-level NotFound is a scan race (counted and sampled, like local walk errors), but a
-/// directory-level Transient/Auth/Protocol failure aborts the whole scan, because a half table
-/// would make its missing half read as deletions on the next compare.
+/// The error discipline matches the local lane entry for entry. An entry-level NotFound is a scan
+/// race (counted and sampled, like local walk errors). A directory-level Transient/Auth/Protocol
+/// failure is *unread*, not absent: the subtree is named in `unread_paths` so compare suppresses
+/// it on both sides, because a table that recorded such a directory with zero children would make
+/// its real contents read as deletions. Only an unreadable root still aborts — there is no
+/// evidence left to suppress against.
 ///
 /// `sampled` is the tier that will actually run rather than `options.sampled`; see
 /// `scan::state::reusable_cached_digest` for why a cache row is judged against it.
@@ -57,6 +79,7 @@ pub(super) fn discover(
         excluded_files: 0,
         walk_errors: 0,
         walk_error_samples: Vec::new(),
+        unread_paths: Vec::new(),
         skipped_symlinks: 0,
     };
 
@@ -65,7 +88,17 @@ pub(super) fn discover(
         phase_progress.checkpoint()?;
         let list = match vfs.read_dir(&dir) {
             Ok(l) => l,
-            Err(e) if e.kind == VfsErrorKind::NotFound && !dir.is_empty() => {
+            Err(e) if dir.is_empty() => {
+                let ioe: std::io::Error = e.into();
+                return Err(std::io::Error::new(
+                    ioe.kind(),
+                    format!(
+                        "scan of '{}' could not read the root directory: {ioe} — with no evidence at all, every entry on the other side would read as deleted",
+                        vfs.display()
+                    ),
+                ));
+            }
+            Err(e) if e.kind == VfsErrorKind::NotFound => {
                 // The directory vanished between being listed and being read: a scan race,
                 // same class as a local walk error
                 found.walk_errors += 1;
@@ -76,13 +109,8 @@ pub(super) fn discover(
             }
             Err(e) => {
                 let ioe: std::io::Error = e.into();
-                return Err(std::io::Error::new(
-                    ioe.kind(),
-                    format!(
-                        "scan of '{}' aborted at directory '{dir}': {ioe} — refusing to emit a half table (its missing subtrees would read as deletions)",
-                        vfs.display()
-                    ),
-                ));
+                found.note_unread(validated(&dir), &ioe);
+                continue;
             }
         };
         for de in list {
@@ -122,7 +150,16 @@ pub(super) fn discover(
                     if options.symlinks_direct {
                         let target = match de.meta.link {
                             Some(target) => target,
-                            None => vfs.read_link(&rel).map_err(std::io::Error::from)?,
+                            None => match vfs.read_link(&rel) {
+                                Ok(target) => target,
+                                // A symlink whose target will not read has no faithful row: an
+                                // invented one points somewhere it does not, and omitting it
+                                // silently is a deletion on the other side.
+                                Err(error) => {
+                                    found.note_unread(relative, &std::io::Error::from(error));
+                                    continue;
+                                }
+                            },
                         };
                         found.entries.push(ObservedEntry::Symlink(ObservedSymlink {
                             path: relative,
@@ -166,5 +203,12 @@ pub(super) fn discover(
         }
     }
 
+    // Strict sort order is a table-validator requirement; see the local lane for the same step.
+    found
+        .unread_paths
+        .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    found
+        .unread_paths
+        .dedup_by(|left, right| left.as_str() == right.as_str());
     Ok(found)
 }

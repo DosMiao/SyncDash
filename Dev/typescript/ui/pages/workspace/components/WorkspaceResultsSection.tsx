@@ -6,7 +6,6 @@ import { ComparePanel } from '#ui/features/compare-run/components/ComparePanel.t
 import { IdenticalResultsPanel } from '#ui/features/compare-results/components/IdenticalResultsPanel.tsx';
 import { PlanTable } from '#ui/features/compare-results/components/PlanTable.tsx';
 import { RunScopePanel } from '#ui/features/compare-results/components/RunScopePanel.tsx';
-import { ScanFaultBanner } from '#ui/features/compare-results/components/ScanFaultBanner.tsx';
 import { Placeholder } from '#ui/shared/components/feedback/Placeholder.tsx';
 
 interface WorkspaceResultsSectionProps {
@@ -42,7 +41,6 @@ export function WorkspaceResultsSection({
 }: WorkspaceResultsSectionProps) {
   return (
     <>
-      {plan && <ScanFaultBanner header={plan.header} />}
       <div className="results-layout">
         {runScopeProps && <RunScopePanel {...runScopeProps} />}
         {/* A callback ref into state, not a useRef: the table measures this element, and a child's

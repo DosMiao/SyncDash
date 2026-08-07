@@ -4,7 +4,7 @@ use crate::model::plan::{Action, Op, Side};
 use crate::model::table::{ObservedEntry, ObservedEntryKind, TableArtifact};
 
 use super::super::entries::observed_symlink;
-use super::super::matching::map_of;
+use super::super::matching::{map_of, UnreadScope};
 
 pub(super) fn plan(
     source: &TableArtifact,
@@ -13,8 +13,19 @@ pub(super) fn plan(
     case_insensitive: bool,
     operations: &mut Vec<Op>,
 ) {
-    let (source_links, _) = map_of(source, ObservedEntryKind::Symlink, case_insensitive);
-    let (target_links, _) = map_of(target, ObservedEntryKind::Symlink, case_insensitive);
+    let unread = UnreadScope::of(source, target, case_insensitive);
+    let (source_links, _) = map_of(
+        source,
+        ObservedEntryKind::Symlink,
+        case_insensitive,
+        &unread,
+    );
+    let (target_links, _) = map_of(
+        target,
+        ObservedEntryKind::Symlink,
+        case_insensitive,
+        &unread,
+    );
     let link_operation = |side: Side, action: Action, entry: &ObservedEntry, reason: &str| {
         let symlink = observed_symlink(entry);
         Op {

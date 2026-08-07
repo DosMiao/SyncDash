@@ -30,6 +30,10 @@ mod apply_capability_tests {
             target_icloud_stubs: 0,
             source_icloud_stub_samples: Vec::new(),
             target_icloud_stub_samples: Vec::new(),
+            source_unread_paths: Vec::new(),
+            target_unread_paths: Vec::new(),
+            source_unread_entries: 0,
+            target_unread_entries: 0,
         }
     }
 
