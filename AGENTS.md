@@ -70,7 +70,7 @@ After any frontend change, refresh the committed bundle:
 npm run build
 ```
 
-Use the repository Builder for project builds, development launches, optimized artifacts, installers, and running built artifacts. Before any Builder or maintenance action, read `../../Experience/builder/skills/builder-workflow/SKILL.md`.
+Use the repository Builder for project builds, development launches, optimized artifacts, installers, and running built artifacts. Before any Builder or maintenance action, read `../../0_devControl/builder/skills/builder-workflow/SKILL.md` on macOS or Windows.
 
 ```bash
 ./builder.command info
@@ -120,7 +120,7 @@ A desktop process may be closed by Builder when replacing its binary. A running 
 Preserve unrelated work in the shared worktree. Check `git status` and the targeted diff before broad edits, then use focused patches and explicit pathspecs. Commit only when the user asks in the current message; commit directly on `main` unless they request a branch, and push only when requested.
 ## Shared Agent Skills
 
-- The canonical shared catalog is `/Users/xuanbomiao/Code/Experience/agent-skills` on macOS and `D:\Code\Experience\agent-skills` on Windows. Do not infer its location relative to this project.
+- The canonical shared catalog is `/Users/xuanbomiao/Code/0_devControl/agent-skills` on macOS and `D:\Code\0_devControl\agent-skills` on Windows. Do not infer its location relative to this project.
 - Read `CATALOG.md` in that catalog and refer to workflows by canonical skill name; `skills/` is source, while `dist/` is generated host output.
 - Codex discovers user skills in `~/.agents/skills` on macOS or `%USERPROFILE%\.agents\skills` on Windows, and project skills in `<project-root>/.agents/skills`.
 - Claude Code discovers user skills in `~/.claude/skills` on macOS or `%USERPROFILE%\.claude\skills` on Windows, and project skills in `<project-root>/.claude/skills`.

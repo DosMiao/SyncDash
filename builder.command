@@ -8,8 +8,8 @@ builder_root=${BUILDER_HOME:-}
 if [ -z "$builder_root" ]; then
   search_root=$project_root
   while :; do
-    if [ -f "$search_root/Experience/builder/Cargo.toml" ]; then
-      builder_root=$search_root/Experience/builder
+    if [ -f "$search_root/0_devControl/builder/Cargo.toml" ]; then
+      builder_root=$search_root/0_devControl/builder
       break
     fi
     parent_root=$(dirname -- "$search_root")

@@ -46,8 +46,8 @@ if "%~1"=="" pause
 exit /b %BUILDER_RC%
 
 :find_builder
-if exist "%SEARCH_ROOT%\Experience\builder\Cargo.toml" (
-    set "BUILDER_ROOT=%SEARCH_ROOT%\Experience\builder"
+if exist "%SEARCH_ROOT%\0_devControl\builder\Cargo.toml" (
+    set "BUILDER_ROOT=%SEARCH_ROOT%\0_devControl\builder"
     exit /b 0
 )
 for %%I in ("%SEARCH_ROOT%\..") do set "PARENT_ROOT=%%~fI"
