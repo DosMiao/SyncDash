@@ -82,3 +82,55 @@ export function reduceCompareStages(
     ? previousStages.map((stage) => (stage.phase === event.phase ? next : stage))
     : [...previousStages, next];
 }
+
+/// One error the engine reported mid-run, kept past the status line that first announced it.
+export interface CompareRunFault {
+  path: string;
+  action: string;
+  side: string;
+  message: string;
+}
+
+/// Errors from the run in progress, with what was dropped stated rather than implied.
+///
+/// `total` counts every error the run reported; `retained` holds the ones kept for display. They
+/// differ only past the cap, and the reader is told so — a list that silently stopped at 50 reads
+/// as "50 problems" when it might be thousands.
+export interface CompareRunFaults {
+  total: number;
+  retained: CompareRunFault[];
+}
+
+export const NO_COMPARE_RUN_FAULTS: CompareRunFaults = { total: 0, retained: [] };
+
+/// Enough failing files to establish the shape of the problem; past this the count is the message.
+const RETAINED_RUN_FAULTS = 50;
+
+/// Pure fault accumulation, so "which errors survive the status line" is executable in tests.
+///
+/// `walk` is deliberately dropped: those events summarize the unread subtrees and skipped entries
+/// that the finished plan header carries in full and in a better form, so keeping them here would
+/// count the same problem twice — once live and once from the header. Everything else (a file that
+/// changed while its content was being read, an unreadable file) appears in no header list at all,
+/// and the path it names is the only place the user can learn which file it was.
+export function recordCompareFault(
+  previous: CompareRunFaults,
+  event: CompareProgressEvent,
+): CompareRunFaults {
+  if (event.kind !== 'error' || event.action === 'walk') return previous;
+  const fault: CompareRunFault = {
+    path: event.path,
+    action: event.action,
+    side: event.side,
+    message: event.message,
+  };
+  const known = previous.retained.some((seen) => (
+    seen.path === fault.path && seen.action === fault.action && seen.message === fault.message
+  ));
+  return {
+    total: previous.total + 1,
+    retained: known || previous.retained.length >= RETAINED_RUN_FAULTS
+      ? previous.retained
+      : [...previous.retained, fault],
+  };
+}

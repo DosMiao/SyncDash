@@ -3,7 +3,11 @@ import type { Phase } from '#core/types/generated/Phase.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { reduceCompareStages } from '#core/domain/compare/compareProgress.ts';
+import {
+  NO_COMPARE_RUN_FAULTS,
+  recordCompareFault,
+  reduceCompareStages,
+} from '#core/domain/compare/compareProgress.ts';
 import type { CompareProgressEvent } from '#core/domain/compare/compareProgress.ts';
 import { mergeRunEventReplay } from '#core/domain/runs/runEvents.ts';
 import {
@@ -24,6 +28,48 @@ const event = (
 ): CompareProgressEvent => ({
   sequence: 1, kind, phase, run_id: 1, purpose: 'compare', ts_ms: 1, ...extra,
 } as unknown as CompareProgressEvent);
+
+const errorEvent = (extra: Record<string, unknown>): CompareProgressEvent => ({
+  sequence: 1, kind: 'error', phase: 'scan-source', run_id: 1, purpose: 'compare', ts_ms: 1,
+  path: '', action: 'hash', side: 'source', message: '', ...extra,
+} as unknown as CompareProgressEvent);
+
+/// A walk error event restates what the finished plan header carries in full, so counting it here
+/// too would show one denied subtree as two problems.
+test('walk errors stay out of the run faults the header already reports', () => {
+  const faults = recordCompareFault(NO_COMPARE_RUN_FAULTS, errorEvent({
+    action: 'walk', message: '2 subtree(s) could not be read',
+  }));
+  assert.deepEqual(faults, NO_COMPARE_RUN_FAULTS);
+});
+
+/// A per-file read failure appears in no header list, and the path it names is the only place the
+/// user can learn which file it was.
+test('a per-file read failure is retained with its path', () => {
+  const faults = recordCompareFault(NO_COMPARE_RUN_FAULTS, errorEvent({
+    path: 'a/b.dat', message: 'file changed while content evidence was being read',
+  }));
+  assert.equal(faults.total, 1);
+  assert.equal(faults.retained[0].path, 'a/b.dat');
+});
+
+test('an identical repeat still counts but is listed once', () => {
+  const one = recordCompareFault(NO_COMPARE_RUN_FAULTS, errorEvent({ path: 'a', message: 'x' }));
+  const two = recordCompareFault(one, errorEvent({ path: 'a', message: 'x' }));
+  assert.equal(two.total, 2);
+  assert.equal(two.retained.length, 1);
+});
+
+/// The cap is what makes the count and the list diverge, and the reader is told rather than shown
+/// a list that silently stopped.
+test('past the retention cap the total keeps counting', () => {
+  let faults = NO_COMPARE_RUN_FAULTS;
+  for (let index = 0; index < 60; index += 1) {
+    faults = recordCompareFault(faults, errorEvent({ path: `f${index}`, message: 'unreadable' }));
+  }
+  assert.equal(faults.total, 60);
+  assert.equal(faults.retained.length, 50);
+});
 
 test('parallel scan start does not complete the other scan', () => {
   let stages = reduceCompareStages([], event('phase_start', 'scan-target'));

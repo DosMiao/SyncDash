@@ -3,8 +3,16 @@ import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } 
 import { listenToMainWindowEvent } from '#core/infrastructure/tauri/mainWindow.ts';
 import { replayCompareEvents } from '#core/infrastructure/tauri/commands/compare.ts';
 import { mergeRunEventReplay } from '#core/domain/runs/runEvents.ts';
-import { reduceCompareStages } from '#core/domain/compare/compareProgress.ts';
-import type { CompareProgressEvent, CompareStage } from '#core/domain/compare/compareProgress.ts';
+import {
+  NO_COMPARE_RUN_FAULTS,
+  recordCompareFault,
+  reduceCompareStages,
+} from '#core/domain/compare/compareProgress.ts';
+import type {
+  CompareProgressEvent,
+  CompareRunFaults,
+  CompareStage,
+} from '#core/domain/compare/compareProgress.ts';
 import type { StatusApi } from '#ui/shared/status/useStatus.ts';
 
 export interface CompareRateSample {
@@ -18,6 +26,7 @@ interface CompareProgressSubscription {
   runFloor: MutableRefObject<number>;
   runId: MutableRefObject<number>;
   rateByPhase: MutableRefObject<Map<string, CompareRateSample>>;
+  setFaults: Dispatch<SetStateAction<CompareRunFaults>>;
   setStages: Dispatch<SetStateAction<CompareStage[]>>;
   setStatus: StatusApi['setMessage'];
 }
@@ -29,6 +38,7 @@ export function useCompareProgressSubscription({
   runFloor,
   runId,
   rateByPhase,
+  setFaults,
   setStages,
   setStatus,
 }: CompareProgressSubscription) {
@@ -46,11 +56,16 @@ export function useCompareProgressSubscription({
         runId.current = event.run_id;
         rateByPhase.current.clear();
         setStages([]);
+        // A new run's faults are its own. Carrying the previous run's over would report a file the
+        // user may already have fixed.
+        setFaults(NO_COMPARE_RUN_FAULTS);
       }
       runReady.current = true;
       // Error events are actionable even when the producer cannot associate them with a phase.
       if (event.kind === 'error') {
         setStatus(`${event.action === 'walk' ? 'Scan could not read' : 'Error'}: ${event.message ?? ''}`, 'err');
+        // The status line is one slot the next message overwrites; the mark keeps it.
+        setFaults((previous) => recordCompareFault(previous, event));
         return;
       }
       if (!eventPhase(event)) return;
@@ -120,5 +135,5 @@ export function useCompareProgressSubscription({
       disposed = true;
       dispose?.();
     };
-  }, [rateByPhase, runFloor, runId, runReady, setStages, setStatus]);
+  }, [rateByPhase, runFloor, runId, runReady, setFaults, setStages, setStatus]);
 }

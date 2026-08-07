@@ -1,12 +1,17 @@
 import { useCallback, useRef, useState } from 'react';
 import { cancelCompareRun } from '#core/infrastructure/tauri/commands/compare.ts';
-import type { CompareStage } from '#core/domain/compare/compareProgress.ts';
+import { NO_COMPARE_RUN_FAULTS } from '#core/domain/compare/compareProgress.ts';
+import type { CompareRunFaults, CompareStage } from '#core/domain/compare/compareProgress.ts';
 import type { StatusApi } from '#ui/shared/status/useStatus.ts';
 
 /** Mutable state and fences that belong to one compare execution stream. */
 export function useCompareRunState(setStatus: StatusApi['setMessage']) {
   const [active, setActive] = useState(false);
   const [stages, setStages] = useState<CompareStage[]>([]);
+  /// Held in page state rather than only announced through the status line: the status line is one
+  /// slot that the next message overwrites, so an error raised at 30% of a five-minute scan was
+  /// gone long before the user could read it.
+  const [faults, setFaults] = useState<CompareRunFaults>(NO_COMPARE_RUN_FAULTS);
   const [cancelling, setCancelling] = useState(false);
   // The 0.7/0.3 EMA prevents per-file size swings from dominating the compare rate.
   const rateByPhase = useRef(new Map<string, {
@@ -44,6 +49,7 @@ export function useCompareRunState(setStatus: StatusApi['setMessage']) {
     activityRequestId,
     cancel,
     cancelling,
+    faults,
     inFlight,
     rateByPhase,
     restoreRequestId,
@@ -52,6 +58,7 @@ export function useCompareRunState(setStatus: StatusApi['setMessage']) {
     runReady,
     setActive,
     setCancelling,
+    setFaults,
     setStages,
     stages,
   };

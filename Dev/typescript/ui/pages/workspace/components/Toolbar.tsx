@@ -12,6 +12,7 @@ import type { ReactNode } from 'react';
 import type { JobDto } from '#core/types/generated/JobDto.ts';
 import type { AutoScanStatusDto } from '#core/types/generated/AutoScanStatusDto.ts';
 import type { PlanHeader } from '#core/types/generated/PlanHeader.ts';
+import type { CompareRunFaults } from '#core/domain/compare/compareProgress.ts';
 import { autoScanButtonLabel } from '#core/application/autoscan/autoscan.ts';
 import { ScanFaultIndicator } from '#ui/features/compare-results/components/ScanFaultIndicator.tsx';
 import type { SelectedRunStats } from '#ui/features/compare-results/model/selectedRunStats.ts';
@@ -22,6 +23,9 @@ interface ToolbarProps {
   /// The current plan's header, for the scan-fault mark. Null before the first compare, and the
   /// mark renders nothing when the scan saw both trees whole.
   planHeader: PlanHeader | null;
+  /// Errors the run in progress has reported. Live, so the mark appears mid-scan rather than only
+  /// once a plan exists — and survives, unlike the status line that first announced them.
+  runFaults: CompareRunFaults;
   executableCount: number;
   stats: SelectedRunStats | null;
   busy: boolean;
@@ -53,6 +57,7 @@ export function Toolbar(props: ToolbarProps) {
     job,
     hasPlan,
     planHeader,
+    runFaults,
     executableCount,
     stats,
     busy,
@@ -118,7 +123,7 @@ export function Toolbar(props: ToolbarProps) {
       </div>
 
       <div className="tb-side">
-        <ScanFaultIndicator header={planHeader} />
+        <ScanFaultIndicator header={planHeader} runFaults={runFaults} />
 
         <button type="button" className="btn" title="Show the run log" onClick={onToggleLog}>
           <ScrollText size={13} /> Log

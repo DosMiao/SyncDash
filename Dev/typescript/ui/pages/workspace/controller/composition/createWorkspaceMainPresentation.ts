@@ -194,6 +194,7 @@ export function createWorkspaceMainPresentation({
       job: session.selectedJob,
       hasPlan: !!plan,
       planHeader: plan?.header ?? null,
+      runFaults: compareRun.faults,
       executableCount: executableIndices.length,
       stats,
       busy: busy || reviewBusy || autoScanVerificationPending || roots.rootDraftOpen,

@@ -100,6 +100,7 @@ export function WorkspacePageController() {
     runReady: compareRunReady,
     setActive: setCompareActive,
     setCancelling: setCompareCancelling,
+    setFaults: setCompareFaults,
     setStages: setCompareStages,
   } = compareRun;
 
@@ -450,6 +451,7 @@ export function WorkspacePageController() {
     runFloor: compareRunFloor,
     runId: compareRunId,
     rateByPhase: compareRateByPhase,
+    setFaults: setCompareFaults,
     setStages: setCompareStages,
     setStatus,
   });
